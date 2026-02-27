@@ -35,15 +35,54 @@ except Exception:
 # Configuration & Constants
 # ============================================================================
 
-DEFAULT_OUTPUT_DIR = "guidance"
-DEFAULT_OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
-DEFAULT_MODEL = "code:latest"
 _CHAT_MIN_PREDICT = 100
 OLLAMA_TIMEOUT = 30
 
 PROJECT_ROOT = Path(__file__).parent.parent
-GUIDANCE_DIR = PROJECT_ROOT / "guidance"
 SRC_DIR = PROJECT_ROOT / "src"
+
+
+def _load_project_config() -> dict:
+    """Load ast-guidance-config.json with two-level fallback chain.
+
+    1. {PROJECT_ROOT}/.ast-guidance/ast-guidance-config.json  (project-local)
+    2. ~/.config/ast-guidance/ast-guidance-config.json         (user global)
+    3. Built-in defaults
+    """
+    candidates = [
+        PROJECT_ROOT / ".ast-guidance" / "ast-guidance-config.json",
+        Path.home() / ".config" / "ast-guidance" / "ast-guidance-config.json",
+    ]
+    for path in candidates:
+        try:
+            if path.exists():
+                return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+    return {}
+
+
+def _cfg_output_dir(cfg: dict) -> str:
+    return cfg.get("guidance_dir", ".ast-guidance")
+
+
+def _cfg_model(cfg: dict) -> str:
+    models = cfg.get("models", {})
+    return models.get("infill") or models.get("default") or "code:latest"
+
+
+def _cfg_api_url(cfg: dict) -> str:
+    ollama = cfg.get("ollama", {})
+    base = ollama.get("base_url", "http://localhost:11434")
+    ep = ollama.get("chat_endpoint", "/api/chat")
+    return f"{base}{ep}"
+
+
+_PROJECT_CONFIG = _load_project_config()
+DEFAULT_OUTPUT_DIR = _cfg_output_dir(_PROJECT_CONFIG)
+DEFAULT_OLLAMA_CHAT_URL = _cfg_api_url(_PROJECT_CONFIG)
+DEFAULT_MODEL = _cfg_model(_PROJECT_CONFIG)
+GUIDANCE_DIR = PROJECT_ROOT / DEFAULT_OUTPUT_DIR
 
 # ============================================================================
 # Core Utilities

@@ -18,70 +18,70 @@
           "type": "enum_field",
           "name": "sync",
           "is_pub": false,
-          "line": 15
+          "line": 16
         }
     ,    {
           "type": "enum_field",
           "name": "query",
           "is_pub": false,
-          "line": 16
+          "line": 17
         }
     ,    {
           "type": "enum_field",
           "name": "explore",
           "is_pub": false,
-          "line": 17
+          "line": 18
         }
     ,    {
           "type": "enum_field",
           "name": "explain",
           "is_pub": false,
-          "line": 18
+          "line": 19
         }
     ,    {
           "type": "enum_field",
           "name": "clean",
           "is_pub": false,
-          "line": 19
+          "line": 20
         }
     ,    {
           "type": "enum_field",
           "name": "structure",
           "is_pub": false,
-          "line": 20
+          "line": 21
         }
     ,    {
           "type": "enum_field",
           "name": "diary",
           "is_pub": false,
-          "line": 21
+          "line": 22
         }
     ,    {
           "type": "enum_field",
           "name": "commit",
           "is_pub": false,
-          "line": 22
+          "line": 23
         }
     ,    {
           "type": "enum_field",
           "name": "learn",
           "is_pub": false,
-          "line": 23
+          "line": 24
         }
     ,    {
           "type": "enum_field",
           "name": "deps",
           "is_pub": false,
-          "line": 24
+          "line": 25
         }
     ,    {
           "type": "enum_field",
           "name": "triage",
           "is_pub": false,
-          "line": 25
+          "line": 26
         }
       ],
-      "line": 14
+      "line": 15
     },
     {
       "type": "fn_decl",
@@ -90,7 +90,7 @@
       "signature": "fn main() -> void",
       "returns": "void",
       "is_pub": true,
-      "line": 28
+      "line": 29
     },
     {
       "type": "fn_private",
@@ -99,7 +99,7 @@
       "signature": "fn printHelp() -> void",
       "returns": "void",
       "is_pub": false,
-      "line": 68
+      "line": 69
     },
     {
       "type": "struct",
@@ -107,7 +107,7 @@
       "match_hash": "9bb11b43df2d63bc63ce6c586f204547fc96fca73f4aa942298564c555ee3e44",
       "signature": "keyword_struct SyncArgs { ... }",
       "is_pub": false,
-      "line": 174
+      "line": 175
     },
     {
       "type": "fn_private",
@@ -120,7 +120,7 @@
       ],
       "returns": "void",
       "is_pub": false,
-      "line": 189
+      "line": 190
     },
     {
       "type": "struct",
@@ -128,7 +128,7 @@
       "match_hash": "6d8aabe491471d5f27a013ee15a8d0899ebad5953898854842ee46488fa6a0c7",
       "signature": "keyword_struct QueryArgs { ... }",
       "is_pub": false,
-      "line": 336
+      "line": 337
     },
     {
       "type": "fn_private",
@@ -141,7 +141,7 @@
       ],
       "returns": "void",
       "is_pub": false,
-      "line": 346
+      "line": 347
     },
     {
       "type": "struct",
@@ -162,10 +162,10 @@
           ],
           "returns": "void",
           "is_pub": false,
-          "line": 421
+          "line": 424
         }
       ],
-      "line": 409
+      "line": 412
     },
     {
       "type": "fn_private",
@@ -181,7 +181,7 @@
       ],
       "returns": "ExploreDoc",
       "is_pub": false,
-      "line": 442
+      "line": 445
     },
     {
       "type": "fn_private",
@@ -196,7 +196,7 @@
       ],
       "returns": "bool",
       "is_pub": false,
-      "line": 477
+      "line": 480
     },
     {
       "type": "fn_private",
@@ -211,7 +211,7 @@
       ],
       "returns": "[]const u8",
       "is_pub": false,
-      "line": 522
+      "line": 525
     },
     {
       "type": "fn_private",
@@ -226,7 +226,7 @@
       ],
       "returns": "[]const u8",
       "is_pub": false,
-      "line": 585
+      "line": 588
     },
     {
       "type": "fn_private",
@@ -241,7 +241,7 @@
       ],
       "returns": "[]GrepMatch",
       "is_pub": false,
-      "line": 651
+      "line": 654
     },
     {
       "type": "fn_private",
@@ -254,7 +254,7 @@
       ],
       "returns": "void",
       "is_pub": false,
-      "line": 690
+      "line": 693
     },
     {
       "type": "fn_private",
@@ -267,7 +267,7 @@
       ],
       "returns": "void",
       "is_pub": false,
-      "line": 1647
+      "line": 1639
     },
     {
       "type": "fn_private",
@@ -280,7 +280,7 @@
       ],
       "returns": "void",
       "is_pub": false,
-      "line": 2484
+      "line": 2472
     },
     {
       "type": "fn_private",
@@ -293,7 +293,7 @@
       ],
       "returns": "void",
       "is_pub": false,
-      "line": 2515
+      "line": 2503
     },
     {
       "type": "fn_private",
@@ -306,7 +306,7 @@
       ],
       "returns": "void",
       "is_pub": false,
-      "line": 2667
+      "line": 2655
     },
     {
       "type": "struct",
@@ -314,7 +314,7 @@
       "match_hash": "440f6ddc3fe40bbbb29810de3f4774c46130b797030d37d7f460e41bf06ae7fa",
       "signature": "keyword_struct PosixTm { ... }",
       "is_pub": true,
-      "line": 2793
+      "line": 2781
     },
     {
       "type": "struct",
@@ -322,7 +322,7 @@
       "match_hash": "44f52fbd3120e943d9fe37da8bfb258a97d915daa189ef325dbe92e29dc96444",
       "signature": "keyword_struct CStructTm { ... }",
       "is_pub": false,
-      "line": 2803
+      "line": 2791
     },
     {
       "type": "fn_decl",
@@ -334,7 +334,7 @@
       ],
       "returns": "PosixTm",
       "is_pub": true,
-      "line": 2819
+      "line": 2807
     },
     {
       "type": "fn_private",
@@ -348,7 +348,20 @@
       ],
       "returns": "[]const u8",
       "is_pub": false,
-      "line": 2833
+      "line": 2821
+    },
+    {
+      "type": "fn_private",
+      "name": "loadCommitModel",
+      "match_hash": "cb9d769a41185084ccbdaf0912202c30bc9d4e0547f8391eef20d8416cf0de2f",
+      "signature": "fn loadCommitModel(allocator: std.mem.Allocator, cwd: []const u8) -> []const u8",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "cwd", "type": "[]const u8" }
+      ],
+      "returns": "[]const u8",
+      "is_pub": false,
+      "line": 2841
     },
     {
       "type": "fn_private",
@@ -361,7 +374,7 @@
       ],
       "returns": "void",
       "is_pub": false,
-      "line": 2850
+      "line": 2867
     },
     {
       "type": "fn_private",
@@ -375,7 +388,7 @@
       ],
       "returns": "[]u8",
       "is_pub": false,
-      "line": 2978
+      "line": 3032
     },
     {
       "type": "fn_private",
@@ -389,7 +402,7 @@
       ],
       "returns": "void",
       "is_pub": false,
-      "line": 2997
+      "line": 3051
     },
     {
       "type": "fn_private",
@@ -401,7 +414,7 @@
       ],
       "returns": "[]const u8",
       "is_pub": false,
-      "line": 3015
+      "line": 3069
     },
     {
       "type": "fn_private",
@@ -413,24 +426,104 @@
       ],
       "returns": "bool",
       "is_pub": false,
-      "line": 3027
+      "line": 3081
+    },
+    {
+      "type": "struct",
+      "name": "CommitMemberInfo",
+      "match_hash": "6019dd5770b81fce562320627ed1bfaa2a1e0fe0f263c0416bae3310c49c08a6",
+      "signature": "keyword_struct CommitMemberInfo { ... }",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "fn_decl",
+          "name": "deinit",
+          "match_hash": "042783b2c7d1799953f4e60a7a88a2547ce835045b075796b877679379a8ca0d",
+          "signature": "fn deinit(self: CommitMemberInfo, allocator: std.mem.Allocator) -> void",
+          "params": [
+            { "name": "self", "type": "CommitMemberInfo" },
+            { "name": "allocator", "type": "std.mem.Allocator" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 3096
+        }
+      ],
+      "line": 3090
+    },
+    {
+      "type": "fn_decl",
+      "name": "parseHunkRangesPub",
+      "match_hash": "bfcd78f146390ba27b671ff6b96dd2ce39bf7d64e4de449efb8370bbd4e83f99",
+      "signature": "fn parseHunkRangesPub(allocator: std.mem.Allocator, chunk: []const u8) -> [][2]u32",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "chunk", "type": "[]const u8" }
+      ],
+      "returns": "[][2]u32",
+      "is_pub": true,
+      "line": 3104
+    },
+    {
+      "type": "fn_decl",
+      "name": "loadChangedMembersPub",
+      "match_hash": "10e07163398d2283afaf51c27c6ab78f535d153fae185351307dbe2d7e8ee621",
+      "signature": "fn loadChangedMembersPub(allocator: std.mem.Allocator, json_base: []const u8, rel_path: []const u8, hunk_ranges: []const [2]u32) -> []CommitMemberInfo",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "json_base", "type": "[]const u8" },
+        { "name": "rel_path", "type": "[]const u8" },
+        { "name": "hunk_ranges", "type": "[]const [2]u32" }
+      ],
+      "returns": "[]CommitMemberInfo",
+      "is_pub": true,
+      "line": 3109
+    },
+    {
+      "type": "fn_private",
+      "name": "parseHunkRanges",
+      "match_hash": "043a4711d602994c84cf80601bd5259aa67c5514d36b629c642002db8149d6e7",
+      "signature": "fn parseHunkRanges(allocator: std.mem.Allocator, chunk: []const u8) -> [][2]u32",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "chunk", "type": "[]const u8" }
+      ],
+      "returns": "[][2]u32",
+      "is_pub": false,
+      "line": 3120
+    },
+    {
+      "type": "fn_private",
+      "name": "loadChangedMembers",
+      "match_hash": "f5cced804cf7cc6c76ce0eeeb2649e9718fc30c25f4b21806ccfac237ff3ae53",
+      "signature": "fn loadChangedMembers(allocator: std.mem.Allocator, json_base: []const u8, rel_path: []const u8, hunk_ranges: []const [2]u32) -> []CommitMemberInfo",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "json_base", "type": "[]const u8" },
+        { "name": "rel_path", "type": "[]const u8" },
+        { "name": "hunk_ranges", "type": "[]const [2]u32" }
+      ],
+      "returns": "[]CommitMemberInfo",
+      "is_pub": false,
+      "line": 3147
     },
     {
       "type": "fn_private",
       "name": "generateCommitMessage",
-      "match_hash": "b86a77a7d53e86b233567e576edb29660fe4bd80ce531799a38540ad6184176d",
-      "signature": "fn generateCommitMessage(allocator: std.mem.Allocator, diff: []const u8, changed_files: []const []const u8, api_url: []const u8, model: []const u8, debug: bool) -> []u8",
+      "match_hash": "7307335d092feda1e6f100db87f4d846dca38acbdc76463684c57a9ab95940c3",
+      "signature": "fn generateCommitMessage(allocator: std.mem.Allocator, diff: []const u8, changed_files: []const []const u8, json_base: []const u8, api_url: []const u8, model: []const u8, debug: bool) -> []u8",
       "params": [
         { "name": "allocator", "type": "std.mem.Allocator" },
         { "name": "diff", "type": "[]const u8" },
         { "name": "changed_files", "type": "[]const []const u8" },
+        { "name": "json_base", "type": "[]const u8" },
         { "name": "api_url", "type": "[]const u8" },
         { "name": "model", "type": "[]const u8" },
         { "name": "debug", "type": "bool" }
       ],
       "returns": "[]u8",
       "is_pub": false,
-      "line": 3033
+      "line": 3268
     },
     {
       "type": "fn_private",
@@ -443,7 +536,7 @@
       ],
       "returns": "[]u8",
       "is_pub": false,
-      "line": 3169
+      "line": 3461
     },
     {
       "type": "fn_private",
@@ -456,7 +549,7 @@
       ],
       "returns": "void",
       "is_pub": false,
-      "line": 3185
+      "line": 3477
     },
     {
       "type": "fn_private",
@@ -472,7 +565,7 @@
       ],
       "returns": "?[]const u8",
       "is_pub": false,
-      "line": 3338
+      "line": 3628
     },
     {
       "type": "fn_private",
@@ -487,7 +580,7 @@
       ],
       "returns": "?[]const u8",
       "is_pub": false,
-      "line": 3429
+      "line": 3708
     },
     {
       "type": "fn_private",
@@ -500,7 +593,7 @@
       ],
       "returns": "void",
       "is_pub": false,
-      "line": 3471
+      "line": 3750
     },
     {
       "type": "fn_private",
@@ -513,13 +606,13 @@
       ],
       "returns": "void",
       "is_pub": false,
-      "line": 3628
+      "line": 3907
     },
     {
       "type": "test_decl",
       "name": "main compiles",
       "is_pub": false,
-      "line": 3655
+      "line": 3934
     }
   ]
 }

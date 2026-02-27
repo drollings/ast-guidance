@@ -25,6 +25,7 @@
     "go": "ast-guidance-go"
   },
   "guidance_dir": ".ast-guidance",
+  "src_dirs": ["src" ],
   "sync": {
     "infill": true,
     "regen": false,

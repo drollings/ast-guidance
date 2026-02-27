@@ -18,7 +18,7 @@
       ],
       "returns": "void",
       "is_pub": true,
-      "line": 12
+      "line": 13
     },
     {
       "type": "fn_decl",
@@ -31,7 +31,7 @@
       ],
       "returns": "void",
       "is_pub": true,
-      "line": 19
+      "line": 20
     },
     {
       "type": "fn_decl",
@@ -45,7 +45,7 @@
       ],
       "returns": "void",
       "is_pub": true,
-      "line": 34
+      "line": 35
     },
     {
       "type": "fn_decl",
@@ -59,30 +59,31 @@
       ],
       "returns": "void",
       "is_pub": true,
-      "line": 47
+      "line": 48
     },
     {
       "type": "struct",
       "name": "QueryEngine",
-      "match_hash": "710773482829376cfcaac9cd38a24fe557af05824ccab6b96ef1b1febec2d166",
+      "match_hash": "398e6803a5f3927b130e1df99f4ae59aefaf71de8c4c9c6b8cefa8c3527676c7",
       "signature": "keyword_struct QueryEngine { ... }",
       "is_pub": true,
       "members": [
         {
           "type": "fn_decl",
           "name": "init",
-          "match_hash": "bd566a62cc0787e6593352dd0de3ce27ff49a0481bef6714be1959085aa62b41",
-          "signature": "fn init(allocator: std.mem.Allocator, query_str: []const u8, project_root: []const u8, use_ast: bool, debug: bool) -> QueryEngine",
+          "match_hash": "4f579060862ef3ba8399c7548358a22b00f8fe0a8cb4e76bb566bea40552d15a",
+          "signature": "fn init(allocator: std.mem.Allocator, query_str: []const u8, project_root: []const u8, use_ast: bool, debug: bool, cfg: config_mod.ProjectConfig) -> QueryEngine",
           "params": [
             { "name": "allocator", "type": "std.mem.Allocator" },
             { "name": "query_str", "type": "[]const u8" },
             { "name": "project_root", "type": "[]const u8" },
             { "name": "use_ast", "type": "bool" },
-            { "name": "debug", "type": "bool" }
+            { "name": "debug", "type": "bool" },
+            { "name": "cfg", "type": "config_mod.ProjectConfig" }
           ],
           "returns": "QueryEngine",
           "is_pub": true,
-          "line": 82
+          "line": 85
         }
     ,    {
           "type": "fn_decl",
@@ -94,7 +95,7 @@
           ],
           "returns": "void",
           "is_pub": true,
-          "line": 98
+          "line": 102
         }
     ,    {
           "type": "fn_decl",
@@ -106,20 +107,33 @@
           ],
           "returns": "types.QueryResult",
           "is_pub": true,
-          "line": 114
+          "line": 119
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "readInboxBulletsTest",
+          "match_hash": "cc5328c1a5e3099d343f60d19841af513ea5cd8fee6618aa1194b23777a8ea7a",
+          "signature": "fn readInboxBulletsTest(self: *QueryEngine, abs_path: []const u8) -> []const []const u8",
+          "params": [
+            { "name": "self", "type": "*QueryEngine" },
+            { "name": "abs_path", "type": "[]const u8" }
+          ],
+          "returns": "[]const []const u8",
+          "is_pub": true,
+          "line": 149
         }
     ,    {
           "type": "fn_private",
           "name": "readInboxBullets",
-          "match_hash": "19ae0a10607246bdd50735a03632ffe92442d7e08a0e9b910b186277520cea72",
-          "signature": "fn readInboxBullets(self: *QueryEngine, rel_file: []const u8) -> []const []const u8",
+          "match_hash": "33205bac48cef7e255f968f1c0749c9e5e557aa9cfce84a0f57ed67c86dae83f",
+          "signature": "fn readInboxBullets(self: *QueryEngine, abs_path: []const u8) -> []const []const u8",
           "params": [
             { "name": "self", "type": "*QueryEngine" },
-            { "name": "rel_file", "type": "[]const u8" }
+            { "name": "abs_path", "type": "[]const u8" }
           ],
           "returns": "[]const []const u8",
           "is_pub": false,
-          "line": 141
+          "line": 155
         }
     ,    {
           "type": "fn_private",
@@ -133,7 +147,7 @@
           ],
           "returns": "bool",
           "is_pub": false,
-          "line": 188
+          "line": 199
         }
     ,    {
           "type": "fn_private",
@@ -145,7 +159,7 @@
           ],
           "returns": "void",
           "is_pub": false,
-          "line": 196
+          "line": 207
         }
     ,    {
           "type": "fn_private",
@@ -158,7 +172,7 @@
           ],
           "returns": "?types.FileMatch",
           "is_pub": false,
-          "line": 215
+          "line": 226
         }
     ,    {
           "type": "fn_private",
@@ -171,7 +185,7 @@
           ],
           "returns": "[]const u8",
           "is_pub": false,
-          "line": 248
+          "line": 259
         }
     ,    {
           "type": "fn_private",
@@ -183,7 +197,7 @@
           ],
           "returns": "void",
           "is_pub": false,
-          "line": 273
+          "line": 277
         }
     ,    {
           "type": "fn_private",
@@ -195,7 +209,7 @@
           ],
           "returns": "void",
           "is_pub": false,
-          "line": 316
+          "line": 319
         }
     ,    {
           "type": "fn_private",
@@ -208,7 +222,7 @@
           ],
           "returns": "[]const u8",
           "is_pub": false,
-          "line": 334
+          "line": 335
         }
     ,    {
           "type": "fn_private",
@@ -221,7 +235,7 @@
           ],
           "returns": "void",
           "is_pub": false,
-          "line": 343
+          "line": 344
         }
     ,    {
           "type": "fn_private",
@@ -233,7 +247,7 @@
           ],
           "returns": "void",
           "is_pub": false,
-          "line": 400
+          "line": 401
         }
     ,    {
           "type": "fn_private",
@@ -245,10 +259,10 @@
           ],
           "returns": "void",
           "is_pub": false,
-          "line": 446
+          "line": 447
         }
       ],
-      "line": 69
+      "line": 70
     },
     {
       "type": "fn_decl",
@@ -262,7 +276,7 @@
       ],
       "returns": "[]u8",
       "is_pub": true,
-      "line": 477
+      "line": 475
     },
     {
       "type": "fn_private",
@@ -275,7 +289,7 @@
       ],
       "returns": "[]const u8",
       "is_pub": false,
-      "line": 691
+      "line": 689
     }
   ]
 }

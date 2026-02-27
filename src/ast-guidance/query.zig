@@ -3,6 +3,7 @@ const types = @import("types.zig");
 const ast_parser = @import("ast_parser.zig");
 const json_store = @import("json_store.zig");
 const gitignore = @import("gitignore.zig");
+const config_mod = @import("config.zig");
 
 // ---------------------------------------------------------------------------
 // Free helpers for QueryResult and its nested types.
@@ -72,6 +73,7 @@ pub const QueryEngine = struct {
     project_root: []const u8,
     use_ast: bool,
     debug: bool,
+    config: config_mod.ProjectConfig,
     file_matches: std.ArrayList(types.FileMatch),
     guidance_files: std.ArrayList(types.GuidanceInfo),
     ast_analyses: std.ArrayList(types.ASTAnalysis),
@@ -79,13 +81,15 @@ pub const QueryEngine = struct {
     gitignore_filter: gitignore.GitignoreFilter,
     store: json_store.JsonStore,
 
-    pub fn init(allocator: std.mem.Allocator, query_str: []const u8, project_root: []const u8, use_ast: bool, debug: bool) QueryEngine {
+    /// Takes ownership of `cfg` — caller must NOT call cfg.deinit() after this.
+    pub fn init(allocator: std.mem.Allocator, query_str: []const u8, project_root: []const u8, use_ast: bool, debug: bool, cfg: config_mod.ProjectConfig) QueryEngine {
         return .{
             .allocator = allocator,
             .query = query_str,
             .project_root = project_root,
             .use_ast = use_ast,
             .debug = debug,
+            .config = cfg,
             .file_matches = .{},
             .guidance_files = .{},
             .ast_analyses = .{},
@@ -96,6 +100,7 @@ pub const QueryEngine = struct {
     }
 
     pub fn deinit(self: *QueryEngine) void {
+        self.config.deinit();
         self.gitignore_filter.deinit();
 
         for (self.file_matches.items) |m| freeFileMatch(self.allocator, m);
@@ -122,8 +127,12 @@ pub const QueryEngine = struct {
 
         try self.findRelatedSkills();
 
-        const insights = try self.readInboxBullets(".ast-guidance/.doc/inbox/INSIGHTS.md");
-        const capabilities = try self.readInboxBullets(".ast-guidance/.doc/inbox/CAPABILITIES.md");
+        const insights_path = try std.fs.path.join(self.allocator, &.{ self.config.inbox_dir, "INSIGHTS.md" });
+        defer self.allocator.free(insights_path);
+        const capabilities_path = try std.fs.path.join(self.allocator, &.{ self.config.inbox_dir, "CAPABILITIES.md" });
+        defer self.allocator.free(capabilities_path);
+        const insights = try self.readInboxBullets(insights_path);
+        const capabilities = try self.readInboxBullets(capabilities_path);
 
         return .{
             .query = self.query,
@@ -136,13 +145,15 @@ pub const QueryEngine = struct {
         };
     }
 
-    /// Read markdown bullet lines from an inbox file that score > 0 against the query.
-    /// Each returned string is freshly allocated and owned by the caller.
-    fn readInboxBullets(self: *QueryEngine, rel_file: []const u8) ![]const []const u8 {
-        const path = try std.fs.path.join(self.allocator, &.{ self.project_root, rel_file });
-        defer self.allocator.free(path);
+    /// Test accessor for readInboxBullets (exposed for unit testing).
+    pub fn readInboxBulletsTest(self: *QueryEngine, abs_path: []const u8) ![]const []const u8 {
+        return self.readInboxBullets(abs_path);
+    }
 
-        const file = std.fs.openFileAbsolute(path, .{}) catch return &.{};
+    /// Read markdown bullet lines from an inbox file (absolute path) that score > 0 against the query.
+    /// Each returned string is freshly allocated and owned by the caller.
+    fn readInboxBullets(self: *QueryEngine, abs_path: []const u8) ![]const []const u8 {
+        const file = std.fs.openFileAbsolute(abs_path, .{}) catch return &.{};
         defer file.close();
 
         const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch return &.{};
@@ -246,19 +257,9 @@ pub const QueryEngine = struct {
     }
 
     fn resolveFilepath(self: *QueryEngine, filename: []const u8) ![]const u8 {
-        const search_dirs = [_][]const u8{
-            "src",
-            "src/guidance",
-            "src/sandbox",
-            "",
-        };
-
-        for (search_dirs) |subdir| {
-            const full_path = if (subdir.len > 0)
-                try std.fs.path.join(self.allocator, &.{ self.project_root, subdir, filename })
-            else
-                try std.fs.path.join(self.allocator, &.{ self.project_root, filename });
-
+        // Search config src_dirs first, then fall back to the project root itself.
+        for (self.config.src_dirs) |subdir| {
+            const full_path = try std.fs.path.join(self.allocator, &.{ self.project_root, subdir, filename });
             std.fs.accessAbsolute(full_path, .{}) catch {
                 self.allocator.free(full_path);
                 continue;
@@ -266,13 +267,15 @@ pub const QueryEngine = struct {
             return full_path;
         }
 
-        return try std.fs.path.join(self.allocator, &.{ self.project_root, filename });
+        // Try directly under project root.
+        const root_path = try std.fs.path.join(self.allocator, &.{ self.project_root, filename });
+        std.fs.accessAbsolute(root_path, .{}) catch return root_path;
+        return root_path;
     }
 
-    /// Search src/ for files whose name contains the query.
+    /// Search configured src_dirs for files whose name contains the query.
     fn deepFileSearch(self: *QueryEngine) !void {
-        const search_dirs = [_][]const u8{"src"};
-        for (search_dirs) |subdir| {
+        for (self.config.src_dirs) |subdir| {
             const dir_path = try std.fs.path.join(self.allocator, &.{ self.project_root, subdir });
             defer self.allocator.free(dir_path);
 
@@ -320,14 +323,12 @@ pub const QueryEngine = struct {
                 try self.loadGuidanceDoc(match.filepath);
                 continue;
             }
-            // Source .zig file — derive guidance path
-            if (std.mem.endsWith(u8, match.filepath, ".zig")) {
-                // Try guidance/<rel>.json
-                const rel = self.relPath(match.filepath);
-                const gpath = try std.fmt.allocPrint(self.allocator, "{s}/guidance/{s}.json", .{ self.project_root, rel });
-                defer self.allocator.free(gpath);
-                try self.loadGuidanceDoc(gpath);
-            }
+            // Any source file — derive guidance path as {json_base}/{rel}.json
+            // e.g. src/ast-guidance/query.zig → .ast-guidance/src/ast-guidance/query.zig.json
+            const rel = self.relPath(match.filepath);
+            const gpath = try std.fmt.allocPrint(self.allocator, "{s}/{s}.json", .{ self.config.json_base, rel });
+            defer self.allocator.free(gpath);
+            try self.loadGuidanceDoc(gpath);
         }
     }
 
@@ -444,10 +445,7 @@ pub const QueryEngine = struct {
     }
 
     fn findRelatedSkills(self: *QueryEngine) !void {
-        const skills_dir = try std.fs.path.join(self.allocator, &.{ self.project_root, ".opencode", "skills" });
-        defer self.allocator.free(skills_dir);
-
-        var dir = std.fs.openDirAbsolute(skills_dir, .{ .iterate = true }) catch return;
+        var dir = std.fs.openDirAbsolute(self.config.skills_dir, .{ .iterate = true }) catch return;
         defer dir.close();
 
         const query_lower = try std.ascii.allocLowerString(self.allocator, self.query);
@@ -462,7 +460,7 @@ pub const QueryEngine = struct {
                 if (std.mem.indexOf(u8, name_lower, query_lower) != null or
                     std.mem.indexOf(u8, query_lower, name_lower) != null)
                 {
-                    const skill_path = try std.fmt.allocPrint(self.allocator, ".opencode/skills/{s}/SKILL.md", .{entry.name});
+                    const skill_path = try std.fs.path.join(self.allocator, &.{ self.config.skills_dir, entry.name, "SKILL.md" });
                     try self.related_skills.append(self.allocator, skill_path);
                 }
             }

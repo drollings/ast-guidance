@@ -12,15 +12,57 @@
   "members": [
     {
       "type": "test_decl",
-      "name": "getLocalTime returns valid ranges",
+      "name": "parseHunkRanges returns empty for non-hunk input",
       "is_pub": false,
-      "line": 15
+      "line": 16
     },
     {
       "type": "test_decl",
-      "name": "classifyBulletKeyword returns path under .opencode/skills",
+      "name": "parseHunkRanges parses single @@ header",
       "is_pub": false,
-      "line": 38
+      "line": 27
+    },
+    {
+      "type": "test_decl",
+      "name": "parseHunkRanges parses multiple @@ headers",
+      "is_pub": false,
+      "line": 41
+    },
+    {
+      "type": "test_decl",
+      "name": "parseHunkRanges handles @@ without count (implicit 1)",
+      "is_pub": false,
+      "line": 65
+    },
+    {
+      "type": "test_decl",
+      "name": "loadChangedMembers returns empty for missing JSON file",
+      "is_pub": false,
+      "line": 84
+    },
+    {
+      "type": "test_decl",
+      "name": "loadChangedMembers returns all members when hunk_ranges is empty",
+      "is_pub": false,
+      "line": 102
+    },
+    {
+      "type": "test_decl",
+      "name": "loadChangedMembers filters by hunk range with context window",
+      "is_pub": false,
+      "line": 146
+    },
+    {
+      "type": "test_decl",
+      "name": "getLocalTime returns valid ranges",
+      "is_pub": false,
+      "line": 191
+    },
+    {
+      "type": "test_decl",
+      "name": "classifyBulletKeyword returns path under skills_dir",
+      "is_pub": false,
+      "line": 214
     },
     {
       "type": "fn_private",
@@ -37,91 +79,91 @@
         { "name": "Factory (GoF)", "type": "GoF", "ref": "guidance/skills/gof-patterns/SKILL.md#factory" }
       ],
       "is_pub": false,
-      "line": 73
+      "line": 249
     },
     {
       "type": "test_decl",
       "name": "dupeMember produces independent copies",
       "is_pub": false,
-      "line": 86
+      "line": 262
     },
     {
       "type": "test_decl",
       "name": "dupeMember with params",
       "is_pub": false,
-      "line": 120
+      "line": 296
     },
     {
       "type": "test_decl",
       "name": "dupeMember with nested members",
       "is_pub": false,
-      "line": 150
+      "line": 326
     },
     {
       "type": "test_decl",
       "name": "mergeMembers with no existing produces all new members",
       "is_pub": false,
-      "line": 180
+      "line": 356
     },
     {
       "type": "test_decl",
       "name": "mergeMembers preserves comment when hash unchanged",
       "is_pub": false,
-      "line": 206
+      "line": 382
     },
     {
       "type": "test_decl",
       "name": "mergeMembers counts update when hash changed",
       "is_pub": false,
-      "line": 233
+      "line": 409
     },
     {
       "type": "test_decl",
       "name": "mergeMembers counts removed members",
       "is_pub": false,
-      "line": 257
+      "line": 433
     },
     {
       "type": "test_decl",
       "name": "mergeMembers no changes when source matches existing exactly",
       "is_pub": false,
-      "line": 285
+      "line": 461
     },
     {
       "type": "test_decl",
       "name": "mergeMembers clears stale comment when hash changes",
       "is_pub": false,
-      "line": 311
+      "line": 487
     },
     {
       "type": "test_decl",
       "name": "mergeMembers preserves tags when hash unchanged",
       "is_pub": false,
-      "line": 339
+      "line": 515
     },
     {
       "type": "test_decl",
       "name": "freeGuidanceDoc frees all fields without double-free",
       "is_pub": false,
-      "line": 368
+      "line": 544
     },
     {
       "type": "test_decl",
       "name": "dupeSkills produces independent copies",
       "is_pub": false,
-      "line": 395
+      "line": 571
     },
     {
       "type": "test_decl",
       "name": "mergeMembers result is independent after source freed",
       "is_pub": false,
-      "line": 428
+      "line": 604
     },
     {
       "type": "test_decl",
       "name": "mergeMembers result is independent after existing freed",
       "is_pub": false,
-      "line": 464
+      "line": 640
     },
     {
       "type": "fn_private",
@@ -136,13 +178,13 @@
       ],
       "returns": "[]u8",
       "is_pub": false,
-      "line": 512
+      "line": 688
     },
     {
       "type": "test_decl",
       "name": "QueryEngine.execute no leaks with empty query results",
       "is_pub": false,
-      "line": 537
+      "line": 713
     },
     {
       "type": "fn_private",
@@ -157,79 +199,167 @@
       ],
       "returns": "void",
       "is_pub": false,
-      "line": 567
+      "line": 744
     },
     {
       "type": "test_decl",
       "name": "infillJsonFile returns false when no enhancer configured",
       "is_pub": false,
-      "line": 587
+      "line": 764
     },
     {
       "type": "test_decl",
       "name": "infillJsonFile returns false when no infill/regen flag set",
       "is_pub": false,
-      "line": 611
+      "line": 788
     },
     {
       "type": "test_decl",
       "name": "infillJsonFile returns false for nonexistent path",
       "is_pub": false,
-      "line": 634
+      "line": 811
     },
     {
       "type": "test_decl",
       "name": "infillAllJson returns 0 when no enhancer configured",
       "is_pub": false,
-      "line": 657
+      "line": 834
     },
     {
       "type": "test_decl",
       "name": "infillAllJson returns 0 when cross-language flags not set",
       "is_pub": false,
-      "line": 681
+      "line": 858
     },
     {
       "type": "test_decl",
       "name": "infillAllJson skips files in skip_paths",
       "is_pub": false,
-      "line": 705
+      "line": 882
     },
     {
       "type": "test_decl",
       "name": "infillAllJson ignores non-json files",
       "is_pub": false,
-      "line": 733
+      "line": 910
     },
     {
       "type": "test_decl",
       "name": "infillAllJson processes .py.json files alongside .zig.json files",
       "is_pub": false,
-      "line": 760
+      "line": 937
     },
     {
       "type": "test_decl",
       "name": "freeQueryResult handles all empty slices",
       "is_pub": false,
-      "line": 787
+      "line": 964
     },
     {
       "type": "test_decl",
       "name": "freeQueryResult frees FileMatch strings",
       "is_pub": false,
-      "line": 809
+      "line": 986
     },
     {
       "type": "test_decl",
       "name": "freeQueryResult frees GuidanceInfo strings and slices",
       "is_pub": false,
-      "line": 846
+      "line": 1023
     },
     {
       "type": "test_decl",
       "name": "QueryEngine deinit with no execute is safe",
       "is_pub": false,
-      "line": 883
+      "line": 1060
+    },
+    {
+      "type": "test_decl",
+      "name": "loadConfig falls back to built-in defaults when no config file exists",
+      "is_pub": false,
+      "line": 1082
+    },
+    {
+      "type": "test_decl",
+      "name": "loadConfig deinit releases all memory (no leaks)",
+      "is_pub": false,
+      "line": 1125
+    },
+    {
+      "type": "test_decl",
+      "name": "loadConfig reads guidance_dir from project config JSON",
+      "is_pub": false,
+      "line": 1142
+    },
+    {
+      "type": "test_decl",
+      "name": "loadConfig reads src_dirs array from JSON",
+      "is_pub": false,
+      "line": 1169
+    },
+    {
+      "type": "test_decl",
+      "name": "loadConfig reads models.infill as model",
+      "is_pub": false,
+      "line": 1196
+    },
+    {
+      "type": "test_decl",
+      "name": "loadConfig falls back to models.default when infill absent",
+      "is_pub": false,
+      "line": 1221
+    },
+    {
+      "type": "test_decl",
+      "name": "loadConfig constructs api_url from ollama base_url and chat_endpoint",
+      "is_pub": false,
+      "line": 1245
+    },
+    {
+      "type": "test_decl",
+      "name": "loadConfig with invalid JSON falls back to defaults",
+      "is_pub": false,
+      "line": 1269
+    },
+    {
+      "type": "fn_private",
+      "name": "writeInboxFile",
+      "match_hash": "6c65ce258d32e24ad6de3934c509ea69e99256212afa6894b4921400ebe9eaee",
+      "signature": "fn writeInboxFile(allocator: std.mem.Allocator, dir: std.fs.Dir, dir_path: []const u8, filename: []const u8, content: []const u8) -> []u8",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "dir", "type": "std.fs.Dir" },
+        { "name": "dir_path", "type": "[]const u8" },
+        { "name": "filename", "type": "[]const u8" },
+        { "name": "content", "type": "[]const u8" }
+      ],
+      "returns": "[]u8",
+      "is_pub": false,
+      "line": 1296
+    },
+    {
+      "type": "test_decl",
+      "name": "readInboxBullets returns empty slice for missing file",
+      "is_pub": false,
+      "line": 1305
+    },
+    {
+      "type": "test_decl",
+      "name": "readInboxBullets returns matching bullets and skips non-matching",
+      "is_pub": false,
+      "line": 1331
+    },
+    {
+      "type": "test_decl",
+      "name": "readInboxBullets skips heading lines",
+      "is_pub": false,
+      "line": 1370
+    },
+    {
+      "type": "test_decl",
+      "name": "QueryEngine.execute finds guidance JSON matching query",
+      "is_pub": false,
+      "line": 1407
     }
   ]
 }

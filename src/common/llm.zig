@@ -275,12 +275,10 @@ pub const LlmClient = struct {
             }
             try writer.writeAll("{\"role\":\"user\",\"content\":\"");
             try writeEscapedString(writer, prompt);
-            // "think":false is a top-level Ollama field (not inside "options").
-            // It disables chain-of-thought for models that support it (DeepSeek-R1,
-            // qwen3, etc.) so reasoning tokens don't consume the num_predict budget
-            // before the model can emit a <comment> tag.
+            // "think":false disables chain-of-thought for models that support it
+            // (DeepSeek-R1, qwen3, etc.) so reasoning tokens don't consume the
+            // num_predict budget before the model can emit a useful response.
             try writer.writeAll("\"}],\"stream\":false,\"think\":false,\"options\":{\"temperature\":");
-            // Write temperature as string to avoid format issues with braces
             if (temperature < 1.0) {
                 try writer.writeAll("0.");
                 try writer.print("{d}", .{@as(u32, @intFromFloat(temperature * 10))});
@@ -293,48 +291,42 @@ pub const LlmClient = struct {
         }
 
         const url = if (self.is_openai_format) self.config.api_url else self.chat_url;
-
-        // Use curl via shell to handle the request
-        return self.completeViaShell(url, body.items);
+        return self.postJson(url, body.items);
     }
 
-    fn completeViaShell(self: *LlmClient, url: []const u8, json_body: []const u8) LlmError!?[]const u8 {
-        // Write body to temp file
-        const tmp_path = "/tmp/llm_request.json";
-        if (std.fs.createFileAbsolute(tmp_path, .{ .truncate = true })) |f| {
-            defer f.close();
-            f.writeAll(json_body) catch return LlmError.RequestFailed;
-        } else |_| {
+    /// POST `json_body` to `url` and return the extracted response text.
+    /// Uses Zig's native HTTP client; no subprocess or temp files.
+    fn postJson(self: *LlmClient, url: []const u8, json_body: []const u8) LlmError!?[]const u8 {
+        if (self.config.debug) std.debug.print("DEBUG: POST {s} ({d} bytes)\n", .{ url, json_body.len });
+
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+
+        const result = self.http_client.fetch(.{
+            .method = .POST,
+            .location = .{ .url = url },
+            .extra_headers = &[_]std.http.Header{
+                .{ .name = "Content-Type", .value = "application/json" },
+            },
+            .payload = json_body,
+            .response_writer = &aw.writer,
+        }) catch |err| {
+            if (self.config.debug) std.debug.print("DEBUG: HTTP POST failed: {}\n", .{err});
             return LlmError.RequestFailed;
-        }
+        };
 
-        // Use curl with -d @filename syntax
-        const cmd = try std.fmt.allocPrint(self.allocator, "curl -s -X POST -H 'Content-Type: application/json' -d @{s} {s}", .{ tmp_path, url });
-        defer self.allocator.free(cmd);
+        const response_bytes = aw.writer.buffer[0..aw.writer.end];
 
         if (self.config.debug) {
-            std.debug.print("DEBUG: running curl: {s}\n", .{cmd});
+            std.debug.print("DEBUG: HTTP status {d}, response ({d} bytes): {s}\n", .{
+                @intFromEnum(result.status),
+                response_bytes.len,
+                response_bytes[0..@min(300, response_bytes.len)],
+            });
         }
 
-        var child = std.process.Child.init(&[_][]const u8{ "sh", "-c", cmd }, self.allocator);
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
-
-        child.spawn() catch return LlmError.RequestFailed;
-
-        const stdout = child.stdout.?.readToEndAlloc(self.allocator, 1024 * 1024) catch return LlmError.RequestFailed;
-        defer self.allocator.free(stdout);
-
-        if (self.config.debug) {
-            std.debug.print("DEBUG: curl response: {s}\n", .{stdout[0..@min(200, stdout.len)]});
-        }
-
-        const term = child.wait() catch return LlmError.RequestFailed;
-        if (term != .Exited or term.Exited != 0) {
-            return null;
-        }
-
-        return self.extractResponseText(stdout);
+        if (result.status != .ok) return null;
+        return self.extractResponseText(response_bytes);
     }
 
     fn extractResponseText(self: *LlmClient, resp: []const u8) ?[]const u8 {
@@ -387,42 +379,39 @@ pub const LlmClient = struct {
         return null;
     }
 
+    /// Check whether the LLM endpoint is reachable.
+    /// Uses Zig's native HTTP client (GET request to the health-check endpoint).
+    /// Returns true when the endpoint responds with HTTP 200.
+    ///   OpenAI  → <base>/v1/models
+    ///   Ollama  → <scheme>://<host:port>/api/tags
     pub fn available(self: *LlmClient) bool {
-        // Build the health-check URL based on format:
-        // OpenAI: .../v1/models
-        // Ollama /api/chat → check /api/tags
-        // Ollama /v1/completions → check /api/tags
         const check_url = if (self.is_openai_format) blk: {
-            // OpenAI: replace last path segment with /v1/models
             if (std.mem.indexOf(u8, self.config.api_url, "/v1/")) |pos| {
-                const base = self.config.api_url[0..pos];
-                break :blk std.fmt.allocPrint(self.allocator, "{s}/v1/models", .{base}) catch return false;
+                break :blk std.fmt.allocPrint(self.allocator, "{s}/v1/models", .{self.config.api_url[0..pos]}) catch return false;
             }
-            break :blk std.mem.replaceOwned(u8, self.allocator, self.config.api_url, "/v1/completions", "/v1/models") catch return false;
+            break :blk self.allocator.dupe(u8, self.config.api_url) catch return false;
         } else blk: {
-            // Ollama: derive base URL and append /api/tags
             const url = self.config.api_url;
-            // Find the scheme://host:port part (up to the first path component after /)
-            // e.g. "http://localhost:11434/api/chat" → "http://localhost:11434"
             const scheme_end = std.mem.indexOf(u8, url, "://") orelse 0;
             const host_start = if (scheme_end > 0) scheme_end + 3 else 0;
             const path_start = std.mem.indexOfScalarPos(u8, url, host_start, '/') orelse url.len;
-            const base = url[0..path_start];
-            break :blk std.fmt.allocPrint(self.allocator, "{s}/api/tags", .{base}) catch return false;
+            break :blk std.fmt.allocPrint(self.allocator, "{s}/api/tags", .{url[0..path_start]}) catch return false;
         };
         defer self.allocator.free(check_url);
 
-        const uri = std.Uri.parse(check_url) catch return false;
+        if (self.config.debug) std.debug.print("DEBUG: availability check GET {s}\n", .{check_url});
 
-        var req = self.http_client.request(.GET, uri, .{}) catch return false;
-        defer req.deinit();
+        // We only care about the status code — discard the body.
+        const result = self.http_client.fetch(.{
+            .method = .GET,
+            .location = .{ .url = check_url },
+        }) catch |err| {
+            if (self.config.debug) std.debug.print("DEBUG: availability check failed: {}\n", .{err});
+            return false;
+        };
 
-        req.sendBodiless() catch return false;
-
-        var redirect_buffer: [1024]u8 = undefined;
-        const response = req.receiveHead(&redirect_buffer) catch return false;
-
-        return response.head.status == .ok;
+        if (self.config.debug) std.debug.print("DEBUG: availability HTTP status {d}\n", .{@intFromEnum(result.status)});
+        return result.status == .ok;
     }
 };
 

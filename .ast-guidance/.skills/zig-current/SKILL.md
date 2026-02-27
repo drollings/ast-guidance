@@ -52,6 +52,50 @@ var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{}
 defer parsed.deinit();
 ```
 
+## HTTP Client (`std.http.Client`)
+
+Use `client.fetch()` — `client.request()` no longer exists.
+
+### POST with response body capture
+
+```zig
+var client = std.http.Client{ .allocator = allocator };
+defer client.deinit();
+
+// Capture response into a growable buffer.
+var aw: std.Io.Writer.Allocating = .init(allocator);
+defer aw.deinit();
+
+const result = try client.fetch(.{
+    .method = .POST,
+    .location = .{ .url = "http://localhost:11434/api/chat" },
+    .extra_headers = &[_]std.http.Header{
+        .{ .name = "Content-Type", .value = "application/json" },
+    },
+    .payload = json_body_slice,
+    .response_writer = &aw.writer,
+});
+// result.status is std.http.Status (.ok == 200)
+const body: []const u8 = aw.writer.buffer[0..aw.writer.end];
+```
+
+### GET (health-check / discard body)
+
+```zig
+const result = try client.fetch(.{
+    .method = .GET,
+    .location = .{ .url = check_url },
+    // Omit response_writer — body is discarded automatically.
+});
+const ok = result.status == .ok;
+```
+
+**Rules**:
+- `std.Io.Writer.Allocating` is the standard sink for dynamic response bodies.
+- `response_writer` is `?*std.Io.Writer`; pass `&aw.writer` (not `&aw`).
+- Omit `response_writer` when you only need the status code.
+- Never use shell subprocesses (curl) when Zig native HTTP is available.
+
 ## Child Process
 
 ```zig
@@ -121,3 +165,6 @@ defer if (gpa.deinit() == .leak) @panic("leak");
 | Shell sed/awk braces | Escape as `{{` `}}` |
 | `readToEndAlloc` for AST | Use `readToEndAllocOptions` with sentinel 0 |
 | Alignment as usize | Use `.@"1"` enum |
+| `client.request()` | Use `client.fetch()` (request API removed) |
+| HTTP response body | Use `std.Io.Writer.Allocating`; pass `&aw.writer` |
+| Curl subprocess for HTTP | Use `std.http.Client.fetch()` instead |

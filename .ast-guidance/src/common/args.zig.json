@@ -10,7 +10,7 @@
     {
       "type": "struct",
       "name": "CommonArgs",
-      "match_hash": "0b2cfeed08192c014708b989745c44c41e2237ed3dd0b5e42ae23fb035a364b8",
+      "match_hash": "b9340fa17af85a207012d6a3cf7aaa2e7c264f70a640bfdf7a78578f9223add3",
       "signature": "keyword_struct CommonArgs { ... }",
       "is_pub": true,
       "line": 3
@@ -25,7 +25,7 @@
       ],
       "returns": "CommonArgs",
       "is_pub": true,
-      "line": 11
+      "line": 15
     }
   ]
 }

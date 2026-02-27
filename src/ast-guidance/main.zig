@@ -8,6 +8,7 @@ const structure_mod = @import("structure.zig");
 const triage_mod = @import("triage.zig");
 const llm = @import("common");
 const enhancer_mod = @import("enhancer.zig");
+const config_mod = @import("config.zig");
 
 pub const version = "0.2.0";
 
@@ -382,7 +383,9 @@ fn cmdQuery(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const cwd = try std.process.getCwdAlloc(allocator);
     defer allocator.free(cwd);
 
-    var engine = query.QueryEngine.init(allocator, query_text, cwd, query_args.use_ast, query_args.debug);
+    // Load config (ownership transferred to engine — do NOT free cfg separately).
+    const cfg = try config_mod.loadConfig(allocator, cwd);
+    var engine = query.QueryEngine.init(allocator, query_text, cwd, query_args.use_ast, query_args.debug, cfg);
     defer engine.deinit();
 
     const result = try engine.execute();
@@ -1216,21 +1219,16 @@ fn cmdExplore(allocator: std.mem.Allocator, args: []const []const u8) !void {
                         break :blk if (parent_slash > 0) ref_trimmed[parent_slash + 1 ..] else ref_trimmed;
                     } else after_slash;
 
-                    // Try {guidance_dir}/.skills/<name>/SKILL.md first, then .opencode/skills/ and doc/skills/.
+                    // Try {guidance_dir}/.skills/<name>/SKILL.md first, then doc/skills/.
                     const path1 = try std.fs.path.join(allocator, &.{ guidance_dir, ".skills", skill_name, "SKILL.md" });
                     defer allocator.free(path1);
-                    const path2 = try std.fs.path.join(allocator, &.{ cwd, ".opencode", "skills", skill_name, "SKILL.md" });
+                    const path2 = try std.fs.path.join(allocator, &.{ cwd, "doc", "skills", skill_name, "SKILL.md" });
                     defer allocator.free(path2);
-                    const path3 = try std.fs.path.join(allocator, &.{ cwd, "doc", "skills", skill_name, "SKILL.md" });
-                    defer allocator.free(path3);
 
                     const skill_path = if (std.fs.openFileAbsolute(path1, .{})) |sf| blk: {
                         sf.close();
                         break :blk path1;
-                    } else |_| if (std.fs.openFileAbsolute(path2, .{})) |sf| blk: {
-                        sf.close();
-                        break :blk path2;
-                    } else |_| path3;
+                    } else |_| path2;
 
                     const sf = std.fs.openFileAbsolute(skill_path, .{}) catch continue;
                     defer sf.close();
@@ -1313,12 +1311,9 @@ fn cmdExplore(allocator: std.mem.Allocator, args: []const []const u8) !void {
         }
 
         // Inbox bullets.
-        const inbox_files = [_][]const u8{
-            ".ast-guidance/.doc/inbox/INSIGHTS.md",
-            ".ast-guidance/.doc/inbox/CAPABILITIES.md",
-        };
-        for (inbox_files) |rel_inbox| {
-            const inbox_path = try std.fs.path.join(allocator, &.{ cwd, rel_inbox });
+        const inbox_names = [_][]const u8{ "INSIGHTS.md", "CAPABILITIES.md" };
+        for (inbox_names) |inbox_name| {
+            const inbox_path = try std.fs.path.join(allocator, &.{ guidance_dir, ".doc", "inbox", inbox_name });
             defer allocator.free(inbox_path);
             const inbox_file = std.fs.openFileAbsolute(inbox_path, .{}) catch continue;
             defer inbox_file.close();
@@ -1591,13 +1586,10 @@ fn cmdExplore(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
             // Inbox bullets matching query.
             {
-                const inbox_files2 = [_][]const u8{
-                    ".ast-guidance/.doc/inbox/INSIGHTS.md",
-                    ".ast-guidance/.doc/inbox/CAPABILITIES.md",
-                };
+                const inbox_names2 = [_][]const u8{ "INSIGHTS.md", "CAPABILITIES.md" };
                 var inbox_header_printed = false;
-                for (inbox_files2) |rel_inbox| {
-                    const inbox_path = try std.fs.path.join(allocator, &.{ cwd, rel_inbox });
+                for (inbox_names2) |inbox_name| {
+                    const inbox_path = try std.fs.path.join(allocator, &.{ guidance_dir, ".doc", "inbox", inbox_name });
                     defer allocator.free(inbox_path);
                     const inbox_file = std.fs.openFileAbsolute(inbox_path, .{}) catch continue;
                     defer inbox_file.close();
@@ -1924,13 +1916,12 @@ fn cmdExplain(allocator: std.mem.Allocator, args: []const []const u8) !void {
         defer seen_skills.deinit(allocator);
 
         // Helper: load first paragraph of a SKILL.md file (up to 600 chars).
-        // Searches {guidance_dir}/.skills/, .opencode/skills/, doc/skills/ in order.
+        // Searches {guidance_dir}/.skills/ and doc/skills/ in order.
         // Returns an owned allocation or null if not found.
         const loadSkillPara = struct {
             fn call(alloc: std.mem.Allocator, guidance_dir_path: []const u8, cwd_path: []const u8, skill_name: []const u8) ?[]const u8 {
                 const prefixes = [_]struct { base: []const u8, rel: []const u8 }{
                     .{ .base = guidance_dir_path, .rel = ".skills" },
-                    .{ .base = cwd_path, .rel = ".opencode/skills" },
                     .{ .base = cwd_path, .rel = "doc/skills" },
                 };
                 for (prefixes) |prefix_info| {
@@ -2271,12 +2262,9 @@ fn cmdExplain(allocator: std.mem.Allocator, args: []const []const u8) !void {
         }
 
         // 3. Inbox bullets matching search terms.
-        const inbox_candidates = [_][]const u8{
-            ".ast-guidance/.doc/inbox/INSIGHTS.md",
-            ".ast-guidance/.doc/inbox/CAPABILITIES.md",
-        };
-        for (inbox_candidates) |rel_inbox| {
-            const inbox_path = try std.fs.path.join(allocator, &.{ cwd, rel_inbox });
+        const inbox_candidate_names = [_][]const u8{ "INSIGHTS.md", "CAPABILITIES.md" };
+        for (inbox_candidate_names) |inbox_name| {
+            const inbox_path = try std.fs.path.join(allocator, &.{ guidance_dir, ".doc", "inbox", inbox_name });
             defer allocator.free(inbox_path);
             const inbox_file = std.fs.openFileAbsolute(inbox_path, .{}) catch continue;
             defer inbox_file.close();
@@ -2847,16 +2835,82 @@ fn getGitAuthor(allocator: std.mem.Allocator, cwd: []const u8, buf: []u8) ![]con
 // commit
 // =============================================================================
 
+/// Read `models.commit` (preferred) or `models.default` from the project-local
+/// config JSON.  Returns an owned slice; caller must free.  Returns error when
+/// the config is absent or neither key is present.
+fn loadCommitModel(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
+    const path = try std.fs.path.join(allocator, &.{ cwd, config_mod.DEFAULT_GUIDANCE_DIR, "ast-guidance-config.json" });
+    defer allocator.free(path);
+
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    if (root != .object) return error.InvalidConfig;
+
+    if (root.object.get("models")) |models| {
+        if (models == .object) {
+            if (models.object.get("commit")) |m| if (m == .string and m.string.len > 0)
+                return allocator.dupe(u8, m.string);
+            if (models.object.get("default")) |m| if (m == .string and m.string.len > 0)
+                return allocator.dupe(u8, m.string);
+        }
+    }
+    return error.NoCommitModel;
+}
+
 fn cmdCommit(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const common = llm.parseCommonArgs(args);
-
-    const api_url = common.api_url;
-    const model = common.model;
     const dry_run = common.dry_run;
     const debug = common.debug;
 
     const cwd = try std.process.getCwdAlloc(allocator);
     defer allocator.free(cwd);
+
+    // Load config — resolves guidance JSON base, api_url, and model.
+    // CLI flags (--api-url, --model) override config values when provided.
+    // Each variable owns its slice; a single defer per variable frees it.
+    var json_base: []const u8 = try allocator.dupe(u8, "");
+    defer allocator.free(json_base);
+    var cfg_api_url: []const u8 = try allocator.dupe(u8, common.api_url);
+    defer allocator.free(cfg_api_url);
+    var cfg_model: []const u8 = try allocator.dupe(u8, common.model);
+    defer allocator.free(cfg_model);
+
+    if (config_mod.loadConfig(allocator, cwd)) |cfg_val| {
+        var cfg = cfg_val;
+        defer cfg.deinit();
+
+        // Replace the initial empty-string with the config value.
+        const new_jb = try allocator.dupe(u8, cfg.json_base);
+        allocator.free(json_base);
+        json_base = new_jb;
+
+        // Use config api_url unless the caller passed --api-url explicitly.
+        if (!common.api_url_set) {
+            const new_url = try allocator.dupe(u8, cfg.api_url);
+            allocator.free(cfg_api_url);
+            cfg_api_url = new_url;
+        }
+
+        // Use models.commit > models.default from raw JSON; fall back to cfg.model.
+        if (!common.model_set) {
+            const new_model = if (loadCommitModel(allocator, cwd) catch null) |m|
+                m
+            else
+                try allocator.dupe(u8, cfg.model);
+            allocator.free(cfg_model);
+            cfg_model = new_model;
+        }
+    } else |_| {}
+
+    const api_url = cfg_api_url;
+    const model = cfg_model;
 
     // Only evaluate staged changes (git diff --staged).
     const effective_diff = try gitDiff(allocator, cwd, true);
@@ -2886,7 +2940,7 @@ fn cmdCommit(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     // Generate commit message via LLM or deterministic fallback.
-    const commit_msg = try generateCommitMessage(allocator, effective_diff, changed_files.items, api_url, model, debug);
+    const commit_msg = try generateCommitMessage(allocator, effective_diff, changed_files.items, json_base, api_url, model, debug);
     defer allocator.free(commit_msg);
 
     if (debug) {
@@ -3023,17 +3077,199 @@ fn chunkFilePath(chunk: []const u8) []const u8 {
 }
 
 /// Return true if this diff chunk belongs to a path that should be ignored
-/// when generating commit messages (e.g. auto-generated guidance/ files).
+/// when generating commit messages (e.g. auto-generated .ast-guidance/ JSON files).
 fn chunkIsIgnored(chunk: []const u8) bool {
     const path = chunkFilePath(chunk);
-    return std.mem.startsWith(u8, path, "guidance/") or
+    return std.mem.startsWith(u8, path, ".ast-guidance/") or
+        std.mem.startsWith(u8, path, ".ast-guidance\\") or
+        std.mem.startsWith(u8, path, "guidance/") or
         std.mem.startsWith(u8, path, "guidance\\");
+}
+
+/// A member extracted from a guidance JSON file for commit context.
+pub const CommitMemberInfo = struct {
+    name: []const u8, // owned
+    line: ?u32,
+    comment: []const u8, // owned (may be empty)
+    signature: []const u8, // owned (may be empty)
+
+    pub fn deinit(self: CommitMemberInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.comment);
+        allocator.free(self.signature);
+    }
+};
+
+/// Test accessor for parseHunkRanges.
+pub fn parseHunkRangesPub(allocator: std.mem.Allocator, chunk: []const u8) ![][2]u32 {
+    return parseHunkRanges(allocator, chunk);
+}
+
+/// Test accessor for loadChangedMembers.
+pub fn loadChangedMembersPub(
+    allocator: std.mem.Allocator,
+    json_base: []const u8,
+    rel_path: []const u8,
+    hunk_ranges: []const [2]u32,
+) ![]CommitMemberInfo {
+    return loadChangedMembers(allocator, json_base, rel_path, hunk_ranges);
+}
+
+/// Parse `@@ -X,Y +A,B @@` hunk headers from a diff chunk.
+/// Returns owned slice of [start, end) pairs in new-file coordinates.
+fn parseHunkRanges(allocator: std.mem.Allocator, chunk: []const u8) ![][2]u32 {
+    var ranges: std.ArrayList([2]u32) = .{};
+    errdefer ranges.deinit(allocator);
+
+    var lines = std.mem.splitScalar(u8, chunk, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "@@ ")) continue;
+        // Find " +A,B " portion.
+        const plus_pos = std.mem.indexOf(u8, line, " +") orelse continue;
+        const after_plus = line[plus_pos + 2 ..];
+        const space_pos = std.mem.indexOfScalar(u8, after_plus, ' ') orelse after_plus.len;
+        const range_part = after_plus[0..space_pos]; // "A,B" or "A"
+        const comma = std.mem.indexOfScalar(u8, range_part, ',');
+        const start_str = if (comma) |c| range_part[0..c] else range_part;
+        const count_str = if (comma) |c| range_part[c + 1 ..] else "1";
+        const start = std.fmt.parseInt(u32, start_str, 10) catch continue;
+        const count = std.fmt.parseInt(u32, count_str, 10) catch 1;
+        try ranges.append(allocator, .{ start, start + count });
+    }
+
+    return ranges.toOwnedSlice(allocator);
+}
+
+/// Load guidance JSON for `rel_path` from `json_base` and return members
+/// whose line numbers fall within or near any of the `hunk_ranges`.
+/// If `hunk_ranges` is empty, all members are returned.
+/// Caller owns the returned slice and must call `.deinit(allocator)` on each element.
+fn loadChangedMembers(
+    allocator: std.mem.Allocator,
+    json_base: []const u8,
+    rel_path: []const u8,
+    hunk_ranges: []const [2]u32,
+) ![]CommitMemberInfo {
+    const json_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ json_base, rel_path });
+    defer allocator.free(json_path);
+
+    const file = std.fs.openFileAbsolute(json_path, .{}) catch return &.{};
+    defer file.close();
+    const content = file.readToEndAlloc(allocator, 256 * 1024) catch return &.{};
+    defer allocator.free(content);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return &.{};
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    if (root != .object) return &.{};
+    const members_val = root.object.get("members") orelse return &.{};
+    if (members_val != .array) return &.{};
+
+    var result: std.ArrayList(CommitMemberInfo) = .{};
+    errdefer {
+        for (result.items) |m| m.deinit(allocator);
+        result.deinit(allocator);
+    }
+
+    const CONTEXT_LINES: u32 = 15; // include members within this many lines of a hunk
+
+    for (members_val.array.items) |member| {
+        if (member != .object) continue;
+        const name_val = member.object.get("name") orelse continue;
+        if (name_val != .string or name_val.string.len == 0) continue;
+
+        const line_num: ?u32 = blk: {
+            if (member.object.get("line")) |lv| {
+                break :blk switch (lv) {
+                    .integer => |n| if (n >= 0) @as(u32, @intCast(n)) else null,
+                    .float => |f| if (f >= 0) @as(u32, @intFromFloat(f)) else null,
+                    else => null,
+                };
+            }
+            break :blk null;
+        };
+
+        // Decide whether this member overlaps a changed hunk.
+        const include = if (hunk_ranges.len == 0 or line_num == null)
+            true
+        else blk: {
+            const ln = line_num.?;
+            for (hunk_ranges) |range| {
+                const lo = if (range[0] > CONTEXT_LINES) range[0] - CONTEXT_LINES else 0;
+                const hi = range[1] + CONTEXT_LINES;
+                if (ln >= lo and ln <= hi) break :blk true;
+            }
+            break :blk false;
+        };
+
+        if (!include) continue;
+
+        const comment = if (member.object.get("comment")) |cv|
+            if (cv == .string) cv.string else ""
+        else
+            "";
+        const sig = if (member.object.get("signature")) |sv|
+            if (sv == .string) sv.string else ""
+        else
+            "";
+
+        try result.append(allocator, .{
+            .name = try allocator.dupe(u8, name_val.string),
+            .line = line_num,
+            .comment = try allocator.dupe(u8, comment),
+            .signature = try allocator.dupe(u8, sig),
+        });
+
+        // Recurse one level into nested members (struct methods).
+        if (member.object.get("members")) |nested_val| {
+            if (nested_val == .array) {
+                for (nested_val.array.items) |nested| {
+                    if (nested != .object) continue;
+                    const nn = nested.object.get("name") orelse continue;
+                    if (nn != .string or nn.string.len == 0) continue;
+                    const nl_num: ?u32 = blk: {
+                        if (nested.object.get("line")) |lv| {
+                            break :blk switch (lv) {
+                                .integer => |n| if (n >= 0) @as(u32, @intCast(n)) else null,
+                                else => null,
+                            };
+                        }
+                        break :blk null;
+                    };
+                    const n_include = if (hunk_ranges.len == 0 or nl_num == null)
+                        true
+                    else blk: {
+                        const ln = nl_num.?;
+                        for (hunk_ranges) |range| {
+                            const lo = if (range[0] > CONTEXT_LINES) range[0] - CONTEXT_LINES else 0;
+                            const hi = range[1] + CONTEXT_LINES;
+                            if (ln >= lo and ln <= hi) break :blk true;
+                        }
+                        break :blk false;
+                    };
+                    if (!n_include) continue;
+                    const nc = if (nested.object.get("comment")) |cv| if (cv == .string) cv.string else "" else "";
+                    const ns = if (nested.object.get("signature")) |sv| if (sv == .string) sv.string else "" else "";
+                    try result.append(allocator, .{
+                        .name = try allocator.dupe(u8, nn.string),
+                        .line = nl_num,
+                        .comment = try allocator.dupe(u8, nc),
+                        .signature = try allocator.dupe(u8, ns),
+                    });
+                }
+            }
+        }
+    }
+
+    return result.toOwnedSlice(allocator);
 }
 
 fn generateCommitMessage(
     allocator: std.mem.Allocator,
     diff: []const u8,
     changed_files: []const []const u8,
+    json_base: []const u8,
     api_url: []const u8,
     model: []const u8,
     debug: bool,
@@ -3044,7 +3280,8 @@ fn generateCommitMessage(
         var client = client_val;
         defer client.deinit();
         if (client.available()) {
-            // Split diff into per-file chunks and discard guidance/ tree.
+            // LLM is reachable — proceed with AI-generated message.
+            // Split diff into per-file chunks and discard .ast-guidance/ tree.
             var all_chunks: std.ArrayList([]const u8) = .{};
             defer all_chunks.deinit(allocator);
             try splitDiffByFile(diff, &all_chunks, allocator);
@@ -3056,35 +3293,93 @@ fn generateCommitMessage(
             }
 
             if (debug) {
-                std.debug.print("[commit] {} total chunk(s), {} after filtering guidance/\n", .{ all_chunks.items.len, code_chunks.items.len });
+                std.debug.print("[commit] {} total chunk(s), {} after filtering .ast-guidance/\n", .{ all_chunks.items.len, code_chunks.items.len });
                 for (code_chunks.items) |chunk| {
                     std.debug.print("[commit]   file: {s}\n", .{chunkFilePath(chunk)});
                 }
             }
 
             if (code_chunks.items.len > 0) {
-                // Concatenate code chunks into a single diff context, capped at 8 KB.
+                // Build an enriched context block per file:
+                //   ### Functions in <path>:
+                //   - funcName (line N): description from guidance JSON
+                //   <diff chunk (truncated)>
+                //
+                // Total cap: 12 KB.  Each file gets an equal share.
+                const TOTAL_CAP: usize = 12_000;
+                const per_file_cap: usize = @max(1000, TOTAL_CAP / code_chunks.items.len);
+
                 var combined: std.ArrayList(u8) = .{};
                 defer combined.deinit(allocator);
-                const cap: usize = 8000;
+                const cw = combined.writer(allocator);
+
                 for (code_chunks.items) |chunk| {
-                    if (combined.items.len >= cap) break;
-                    const room = cap - combined.items.len;
-                    const excerpt = chunk[0..@min(chunk.len, room)];
-                    try combined.appendSlice(allocator, excerpt);
+                    if (combined.items.len >= TOTAL_CAP) break;
+
+                    const rel_path = chunkFilePath(chunk);
+
+                    // --- Guidance member context ---
+                    if (json_base.len > 0 and rel_path.len > 0) {
+                        const hunk_ranges = parseHunkRanges(allocator, chunk) catch &.{};
+                        defer allocator.free(hunk_ranges);
+
+                        const members = loadChangedMembers(allocator, json_base, rel_path, hunk_ranges) catch &.{};
+                        defer {
+                            for (members) |m| m.deinit(allocator);
+                            allocator.free(members);
+                        }
+
+                        if (members.len > 0) {
+                            try cw.print("### Functions in {s}:\n", .{rel_path});
+                            for (members) |m| {
+                                if (m.line) |ln| {
+                                    try cw.print("- {s} (line {})", .{ m.name, ln });
+                                } else {
+                                    try cw.print("- {s}", .{m.name});
+                                }
+                                // Prefer comment; fall back to signature if comment empty.
+                                if (m.comment.len > 0) {
+                                    // Truncate comment to first sentence / 120 chars.
+                                    const end = std.mem.indexOfScalar(u8, m.comment, '.') orelse m.comment.len;
+                                    const snippet = m.comment[0..@min(end + 1, @min(m.comment.len, 120))];
+                                    try cw.print(": {s}", .{snippet});
+                                } else if (m.signature.len > 0) {
+                                    const snippet = m.signature[0..@min(m.signature.len, 80)];
+                                    try cw.print(": `{s}`", .{snippet});
+                                }
+                                try cw.writeByte('\n');
+                            }
+                            try cw.writeByte('\n');
+                        }
+                    }
+
+                    // --- Diff chunk (truncated to per-file budget) ---
+                    const budget = @min(chunk.len, per_file_cap);
+                    try combined.appendSlice(allocator, chunk[0..budget]);
                     try combined.append(allocator, '\n');
                 }
 
-                // Single synthesis prompt: identify distinct features, emit * bullets.
+                // Prompt instructs the LLM to use the function descriptions.
                 const prompt = try std.fmt.allocPrint(
                     allocator,
-                    \\Analyse this git diff and identify each distinct feature or fix that changed.
-                    \\For each one, write a single terse sentence in past tense that begins with the
-                    \\name of the primary function, struct, or namespace it concerns, followed by a
-                    \\colon, then the description.  Example format:
-                    \\  "* cmdCommit: Prompt strings were updated to enforce past-tense bullet format."
-                    \\Format your answer as a bullet list where every line starts with "* ".
-                    \\Return ONLY the bullet list, no preamble.
+                    \\You are writing a git commit message.
+                    \\Below is a set of changed files.  For each file, you are given:
+                    \\  1. A "### Functions in <file>:" block listing the functions that were
+                    \\     modified, their line numbers, and a one-sentence description of
+                    \\     what each function does (from the project's guidance index).
+                    \\  2. The raw git diff for that file.
+                    \\
+                    \\Using both the function descriptions AND the diff, write one terse bullet
+                    \\per distinct change.  Each bullet must:
+                    \\  - Start with "* "
+                    \\  - Name the function or type that changed (e.g. "* findRelatedSkills:")
+                    \\  - End with a past-tense phrase describing WHAT changed and WHY it matters
+                    \\
+                    \\Example output:
+                    \\  "* findRelatedSkills: switched from hardcoded .opencode/skills path to config.skills_dir so the correct directory is always used"
+                    \\  "* QueryEngine.init: added cfg parameter so callers can inject project-wide path config"
+                    \\
+                    \\Return ONLY the bullet list, no preamble, no headings.
                     \\
                     \\{s}
                 ,
@@ -3116,18 +3411,12 @@ fn generateCommitMessage(
                     }
 
                     if (bullets.items.len > 0) {
-                        std.mem.sort([]const u8, bullets.items, {}, struct {
-                            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-                                return std.mem.lessThan(u8, a, b);
-                            }
-                        }.lessThan);
                         var out: std.ArrayList(u8) = .{};
                         for (bullets.items) |b| {
                             try out.appendSlice(allocator, "* ");
                             try out.appendSlice(allocator, b);
                             try out.append(allocator, '\n');
                         }
-                        // Trim trailing newline.
                         if (out.items.len > 0 and out.items[out.items.len - 1] == '\n')
                             out.items.len -= 1;
                         return out.toOwnedSlice(allocator);
@@ -3136,6 +3425,9 @@ fn generateCommitMessage(
             }
         }
     } else |_| {}
+
+    // LLM was unavailable or returned no bullets — warn and fall back.
+    std.debug.print("warning: LLM unavailable or returned no output ({s}); using filename fallback\n", .{api_url});
 
     // Deterministic fallback: list changed non-guidance files as * bullets.
     var fallback_files: std.ArrayList([]const u8) = .{};
@@ -3259,10 +3551,8 @@ fn cmdLearn(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const stdout = &fw_learn.interface;
 
     for (inbox_files) |inbox| {
-        const inbox_path = try std.fs.path.join(allocator, &.{ cwd, inbox.path });
-        defer allocator.free(inbox_path);
-
-        const file = std.fs.openFileAbsolute(inbox_path, .{}) catch {
+        // inbox.path is already an absolute path (derived from guidance_dir).
+        const file = std.fs.openFileAbsolute(inbox.path, .{}) catch {
             std.debug.print("No {s} found.\n", .{inbox.path});
             continue;
         };
@@ -3316,7 +3606,7 @@ fn cmdLearn(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
         if (!dry_run and promoted_count > 0) {
             // Rewrite the inbox file with unpromoted lines.
-            const out_file = try std.fs.createFileAbsolute(inbox_path, .{ .truncate = true });
+            const out_file = try std.fs.createFileAbsolute(inbox.path, .{ .truncate = true });
             defer out_file.close();
             for (remaining.items) |ln| {
                 const ln_line = try std.fmt.allocPrint(allocator, "{s}\n", .{ln});
@@ -3397,17 +3687,6 @@ fn classifyBulletLlm(
         return primary_path;
     } else |_| {
         allocator.free(primary_path);
-    }
-
-    // Try .opencode/skills/<name>/SKILL.md next.
-    const secondary_path = try std.fs.path.join(allocator, &.{ project_root, ".opencode", "skills", skill_name, "SKILL.md" });
-    if (std.fs.accessAbsolute(secondary_path, .{})) {
-        if (std.debug.runtime_safety) {
-            std.debug.print("[learn] LLM classified to .opencode skill: {s}\n", .{secondary_path});
-        }
-        return secondary_path;
-    } else |_| {
-        allocator.free(secondary_path);
     }
 
     // Fall back to doc/skills/<name>/SKILL.md.
