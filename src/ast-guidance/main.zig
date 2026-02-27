@@ -297,7 +297,9 @@ fn cmdSync(allocator: std.mem.Allocator, args: []const []const u8) !void {
             };
             const json_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ output_path, rel });
             defer allocator.free(json_path);
-            _ = processor.infillJsonFile(json_path) catch {};
+            _ = processor.infillJsonFile(json_path) catch |err| {
+                std.debug.print("warning: infill failed for {s}: {}\n", .{ json_path, err });
+            };
         }
     } else if (sync_args.scan) |scan_dir| {
         const full_path = if (std.fs.path.isAbsolute(scan_dir))
@@ -3081,9 +3083,7 @@ fn chunkFilePath(chunk: []const u8) []const u8 {
 fn chunkIsIgnored(chunk: []const u8) bool {
     const path = chunkFilePath(chunk);
     return std.mem.startsWith(u8, path, ".ast-guidance/") or
-        std.mem.startsWith(u8, path, ".ast-guidance\\") or
-        std.mem.startsWith(u8, path, "guidance/") or
-        std.mem.startsWith(u8, path, "guidance\\");
+        std.mem.startsWith(u8, path, ".ast-guidance\\");
 }
 
 /// A member extracted from a guidance JSON file for commit context.
@@ -3103,6 +3103,21 @@ pub const CommitMemberInfo = struct {
 /// Test accessor for parseHunkRanges.
 pub fn parseHunkRangesPub(allocator: std.mem.Allocator, chunk: []const u8) ![][2]u32 {
     return parseHunkRanges(allocator, chunk);
+}
+
+/// Test accessor for chunkIsIgnored.
+pub fn chunkIsIgnoredPub(chunk: []const u8) bool {
+    return chunkIsIgnored(chunk);
+}
+
+/// Test accessor for chunkFilePath.
+pub fn chunkFilePathPub(chunk: []const u8) []const u8 {
+    return chunkFilePath(chunk);
+}
+
+/// Test accessor for splitDiffByFile.
+pub fn splitDiffByFilePub(diff: []const u8, out: *std.ArrayList([]const u8), allocator: std.mem.Allocator) !void {
+    return splitDiffByFile(diff, out, allocator);
 }
 
 /// Test accessor for loadChangedMembers.
@@ -3360,28 +3375,26 @@ fn generateCommitMessage(
                 }
 
                 // Prompt instructs the LLM to use the function descriptions.
+                // The diff content is sandwiched between two copies of the
+                // instruction so that small models don't continue the code.
                 const prompt = try std.fmt.allocPrint(
                     allocator,
-                    \\You are writing a git commit message.
-                    \\Below is a set of changed files.  For each file, you are given:
-                    \\  1. A "### Functions in <file>:" block listing the functions that were
-                    \\     modified, their line numbers, and a one-sentence description of
-                    \\     what each function does (from the project's guidance index).
-                    \\  2. The raw git diff for that file.
+                    \\TASK: Write a git commit message as a bullet list.
                     \\
-                    \\Using both the function descriptions AND the diff, write one terse bullet
-                    \\per distinct change.  Each bullet must:
-                    \\  - Start with "* "
-                    \\  - Name the function or type that changed (e.g. "* findRelatedSkills:")
-                    \\  - End with a past-tense phrase describing WHAT changed and WHY it matters
+                    \\Rules:
+                    \\  - One bullet per distinct change.
+                    \\  - Each bullet: "* <FunctionName>: <past-tense description of what changed and why>"
+                    \\  - Output ONLY the bullet list. No code. No explanations. No headings.
                     \\
-                    \\Example output:
-                    \\  "* findRelatedSkills: switched from hardcoded .opencode/skills path to config.skills_dir so the correct directory is always used"
-                    \\  "* QueryEngine.init: added cfg parameter so callers can inject project-wide path config"
+                    \\Example:
+                    \\* loadConfig: added builtin.is_test guard so warning is suppressed during unit tests
+                    \\* chunkIsIgnored: removed stale guidance/ prefix, now only filters .ast-guidance/
                     \\
-                    \\Return ONLY the bullet list, no preamble, no headings.
-                    \\
+                    \\CHANGED FILES:
                     \\{s}
+                    \\END OF DIFF.
+                    \\
+                    \\Now write the bullet list (each line starts with "* "):
                 ,
                     .{combined.items},
                 );
@@ -3395,7 +3408,8 @@ fn generateCommitMessage(
                     defer allocator.free(raw);
                     if (debug) std.debug.print("[commit] synthesis response:\n{s}\n---\n", .{raw});
 
-                    // Collect lines that start with "* " (tolerate leading whitespace).
+                    // Collect bullet lines. Accept "* " or "- " prefix
+                    // (small models often use "-" instead of "*").
                     var bullets: std.ArrayList([]const u8) = .{};
                     defer {
                         for (bullets.items) |b| allocator.free(b);
@@ -3404,7 +3418,9 @@ fn generateCommitMessage(
                     var resp_lines = std.mem.splitScalar(u8, raw, '\n');
                     while (resp_lines.next()) |line| {
                         const trimmed = std.mem.trim(u8, line, " \t\r");
-                        if (std.mem.startsWith(u8, trimmed, "* ")) {
+                        const is_bullet = std.mem.startsWith(u8, trimmed, "* ") or
+                            std.mem.startsWith(u8, trimmed, "- ");
+                        if (is_bullet) {
                             const text = std.mem.trim(u8, trimmed[2..], " \t");
                             if (text.len > 0) try bullets.append(allocator, try allocator.dupe(u8, text));
                         }
@@ -3433,7 +3449,7 @@ fn generateCommitMessage(
     var fallback_files: std.ArrayList([]const u8) = .{};
     defer fallback_files.deinit(allocator);
     for (changed_files) |f| {
-        if (std.mem.startsWith(u8, f, "guidance/") or std.mem.startsWith(u8, f, "guidance\\")) continue;
+        if (std.mem.startsWith(u8, f, ".ast-guidance/") or std.mem.startsWith(u8, f, ".ast-guidance\\")) continue;
         try fallback_files.append(allocator, f);
     }
     std.mem.sort([]const u8, fallback_files.items, {}, struct {
@@ -3524,7 +3540,9 @@ fn cmdLearn(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 try skill_names.append(allocator, try allocator.dupe(u8, entry.name));
             }
         }
-    } else |_| {}
+    } else |err| {
+        std.debug.print("warning: skills directory not found ({s}): {} — skill context will be empty\n", .{ skills_dir, err });
+    }
 
     // Build skills list string for the LLM prompt.
     const skills_list = try std.mem.join(allocator, ", ", skill_names.items);
@@ -3906,6 +3924,7 @@ const DepsArgs = struct {
 
 fn cmdDeps(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var dep_args: DepsArgs = .{};
+    var src_dir_override: ?[]const u8 = null;
     var i: usize = 0;
 
     while (i < args.len) : (i += 1) {
@@ -3916,12 +3935,27 @@ fn cmdDeps(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 std.debug.print("Missing argument for --src\n", .{});
                 return;
             }
-            dep_args.src_dir = args[i];
+            src_dir_override = args[i];
         }
     }
 
     const cwd = try std.process.getCwdAlloc(allocator);
     defer allocator.free(cwd);
+
+    // Use --src override if given; otherwise take first src_dir from config.
+    var src_dir_owned: ?[]const u8 = null;
+    defer if (src_dir_owned) |d| allocator.free(d);
+
+    if (src_dir_override) |d| {
+        dep_args.src_dir = d;
+    } else if (config_mod.loadConfig(allocator, cwd)) |cfg_val| {
+        var cfg = cfg_val;
+        defer cfg.deinit();
+        if (cfg.src_dirs.len > 0) {
+            src_dir_owned = try allocator.dupe(u8, cfg.src_dirs[0]);
+            dep_args.src_dir = src_dir_owned.?;
+        }
+    } else |_| {}
 
     var generator = deps.DepsGenerator.init(allocator, cwd);
     try generator.generateDependencies(dep_args.src_dir);

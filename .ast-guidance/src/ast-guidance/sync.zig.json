@@ -212,7 +212,7 @@
           ],
           "returns": "bool",
           "is_pub": true,
-          "line": 718
+          "line": 724
         }
     ,    {
           "type": "fn_decl",
@@ -226,7 +226,7 @@
           ],
           "returns": "usize",
           "is_pub": true,
-          "line": 731
+          "line": 737
         }
     ,    {
           "type": "fn_private",
@@ -239,7 +239,7 @@
           ],
           "returns": "[]const []const u8",
           "is_pub": false,
-          "line": 766
+          "line": 772
         }
       ],
       "line": 8

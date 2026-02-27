@@ -8,6 +8,7 @@
 /// All path fields in ProjectConfig are pre-computed absolute paths so callers
 /// do not need to allocate to derive them.
 const std = @import("std");
+const builtin = @import("builtin");
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -76,7 +77,11 @@ pub fn loadConfig(allocator: std.mem.Allocator, cwd: []const u8) !ProjectConfig 
     {
         const path = try std.fs.path.join(allocator, &.{ cwd, DEFAULT_GUIDANCE_DIR, "ast-guidance-config.json" });
         defer allocator.free(path);
-        if (tryLoadFile(allocator, cwd, path)) |cfg| return cfg else |_| {}
+        if (tryLoadFile(allocator, cwd, path)) |cfg| return cfg else |err| {
+            if (err != error.FileNotFound and !builtin.is_test) {
+                std.debug.print("warning: config file {s} is invalid ({}) — using defaults\n", .{ path, err });
+            }
+        }
     }
 
     // 2. User-global config (~/.config/ast-guidance/ast-guidance-config.json).
@@ -84,7 +89,11 @@ pub fn loadConfig(allocator: std.mem.Allocator, cwd: []const u8) !ProjectConfig 
         defer allocator.free(home);
         const path = try std.fs.path.join(allocator, &.{ home, ".config", "ast-guidance", "ast-guidance-config.json" });
         defer allocator.free(path);
-        if (tryLoadFile(allocator, cwd, path)) |cfg| return cfg else |_| {}
+        if (tryLoadFile(allocator, cwd, path)) |cfg| return cfg else |err| {
+            if (err != error.FileNotFound and !builtin.is_test) {
+                std.debug.print("warning: config file {s} is invalid ({}) — using defaults\n", .{ path, err });
+            }
+        }
     }
 
     // 3. Built-in defaults.

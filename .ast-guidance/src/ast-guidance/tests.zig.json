@@ -357,9 +357,57 @@
     },
     {
       "type": "test_decl",
+      "name": "chunkIsIgnored: .ast-guidance/ prefix is filtered",
+      "is_pub": false,
+      "line": 1416
+    },
+    {
+      "type": "test_decl",
+      "name": "chunkIsIgnored: guidance/ prefix is NOT filtered (regression guard)",
+      "is_pub": false,
+      "line": 1427
+    },
+    {
+      "type": "test_decl",
+      "name": "chunkIsIgnored: regular source files are not filtered",
+      "is_pub": false,
+      "line": 1440
+    },
+    {
+      "type": "test_decl",
+      "name": "chunkFilePath: extracts path from diff --git header",
+      "is_pub": false,
+      "line": 1460
+    },
+    {
+      "type": "test_decl",
+      "name": "chunkFilePath: returns empty string for malformed chunk",
+      "is_pub": false,
+      "line": 1469
+    },
+    {
+      "type": "test_decl",
+      "name": "splitDiffByFile: single file diff produces one chunk",
+      "is_pub": false,
+      "line": 1474
+    },
+    {
+      "type": "test_decl",
+      "name": "splitDiffByFile: multi-file diff splits into correct chunks",
+      "is_pub": false,
+      "line": 1496
+    },
+    {
+      "type": "test_decl",
+      "name": "splitDiffByFile: .ast-guidance/ chunks split correctly and are identifiable",
+      "is_pub": false,
+      "line": 1524
+    },
+    {
+      "type": "test_decl",
       "name": "QueryEngine.execute finds guidance JSON matching query",
       "is_pub": false,
-      "line": 1407
+      "line": 1554
     }
   ]
 }

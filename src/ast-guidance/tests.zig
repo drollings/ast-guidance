@@ -1404,6 +1404,153 @@ test "readInboxBullets skips heading lines" {
 // QueryEngine.execute: happy-path — guidance JSON found for a matching file
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// chunkIsIgnored / chunkFilePath / splitDiffByFile
+// ---------------------------------------------------------------------------
+//
+// These tests guard against the class of bug where filter logic uses the
+// wrong prefix (e.g. "guidance/" instead of ".ast-guidance/"), causing
+// guidance JSON diffs to leak into the commit prompt or source diffs to
+// be silently dropped.
+
+test "chunkIsIgnored: .ast-guidance/ prefix is filtered" {
+    const chunk =
+        \\diff --git a/.ast-guidance/src/foo.zig.json b/.ast-guidance/src/foo.zig.json
+        \\index 000..111 100644
+        \\--- a/.ast-guidance/src/foo.zig.json
+        \\+++ b/.ast-guidance/src/foo.zig.json
+        \\@@ -1,3 +1,3 @@
+    ;
+    try std.testing.expect(main.chunkIsIgnoredPub(chunk));
+}
+
+test "chunkIsIgnored: guidance/ prefix is NOT filtered (regression guard)" {
+    // Old code filtered "guidance/". That prefix no longer exists in the repo;
+    // filtering it would silently drop any future file with that name.
+    const chunk =
+        \\diff --git a/guidance/README.md b/guidance/README.md
+        \\index 000..111 100644
+        \\--- a/guidance/README.md
+        \\+++ b/guidance/README.md
+        \\@@ -1 +1 @@
+    ;
+    try std.testing.expect(!main.chunkIsIgnoredPub(chunk));
+}
+
+test "chunkIsIgnored: regular source files are not filtered" {
+    const src_chunk =
+        \\diff --git a/src/main.zig b/src/main.zig
+        \\index 000..111 100644
+        \\--- a/src/main.zig
+        \\+++ b/src/main.zig
+        \\@@ -10,5 +10,6 @@ fn foo() void {
+    ;
+    try std.testing.expect(!main.chunkIsIgnoredPub(src_chunk));
+
+    const bin_chunk =
+        \\diff --git a/bin/ast-guidance-py b/bin/ast-guidance-py
+        \\index 000..111 100755
+        \\--- a/bin/ast-guidance-py
+        \\+++ b/bin/ast-guidance-py
+        \\@@ -1,2 +1,3 @@
+    ;
+    try std.testing.expect(!main.chunkIsIgnoredPub(bin_chunk));
+}
+
+test "chunkFilePath: extracts path from diff --git header" {
+    const chunk =
+        \\diff --git a/src/ast-guidance/sync.zig b/src/ast-guidance/sync.zig
+        \\index abc..def 100644
+    ;
+    const path = main.chunkFilePathPub(chunk);
+    try std.testing.expectEqualStrings("src/ast-guidance/sync.zig", path);
+}
+
+test "chunkFilePath: returns empty string for malformed chunk" {
+    const path = main.chunkFilePathPub("not a diff header\n+added line\n");
+    try std.testing.expectEqualStrings("", path);
+}
+
+test "splitDiffByFile: single file diff produces one chunk" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const diff =
+        \\diff --git a/src/foo.zig b/src/foo.zig
+        \\index 000..111 100644
+        \\--- a/src/foo.zig
+        \\+++ b/src/foo.zig
+        \\@@ -1,3 +1,4 @@
+        \\ fn foo() void {}
+        \\+fn bar() void {}
+    ;
+    var chunks: std.ArrayList([]const u8) = .{};
+    defer chunks.deinit(allocator);
+    try main.splitDiffByFilePub(diff, &chunks, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), chunks.items.len);
+    try std.testing.expectEqualStrings("src/foo.zig", main.chunkFilePathPub(chunks.items[0]));
+}
+
+test "splitDiffByFile: multi-file diff splits into correct chunks" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const diff =
+        \\diff --git a/src/foo.zig b/src/foo.zig
+        \\index 000..111 100644
+        \\--- a/src/foo.zig
+        \\+++ b/src/foo.zig
+        \\@@ -1,2 +1,3 @@
+        \\+added to foo
+        \\diff --git a/src/bar.zig b/src/bar.zig
+        \\index 222..333 100644
+        \\--- a/src/bar.zig
+        \\+++ b/src/bar.zig
+        \\@@ -5,2 +5,3 @@
+        \\+added to bar
+    ;
+    var chunks: std.ArrayList([]const u8) = .{};
+    defer chunks.deinit(allocator);
+    try main.splitDiffByFilePub(diff, &chunks, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), chunks.items.len);
+    try std.testing.expectEqualStrings("src/foo.zig", main.chunkFilePathPub(chunks.items[0]));
+    try std.testing.expectEqualStrings("src/bar.zig", main.chunkFilePathPub(chunks.items[1]));
+}
+
+test "splitDiffByFile: .ast-guidance/ chunks split correctly and are identifiable" {
+    // The filter (chunkIsIgnored) runs after splitting, so we verify that
+    // guidance chunks split cleanly and are correctly tagged as ignored.
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const diff =
+        \\diff --git a/src/main.zig b/src/main.zig
+        \\index 000..111 100644
+        \\@@ -1,2 +1,3 @@
+        \\+fn new() void {}
+        \\diff --git a/.ast-guidance/src/main.zig.json b/.ast-guidance/src/main.zig.json
+        \\index 222..333 100644
+        \\@@ -1,3 +1,4 @@
+        \\+  "comment": "updated"
+    ;
+    var chunks: std.ArrayList([]const u8) = .{};
+    defer chunks.deinit(allocator);
+    try main.splitDiffByFilePub(diff, &chunks, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), chunks.items.len);
+    try std.testing.expect(!main.chunkIsIgnoredPub(chunks.items[0])); // src/main.zig — keep
+    try std.testing.expect(main.chunkIsIgnoredPub(chunks.items[1])); // .ast-guidance/ — ignore
+}
+
+// ---------------------------------------------------------------------------
+// QueryEngine.execute finds guidance JSON matching query
+// ---------------------------------------------------------------------------
+
 test "QueryEngine.execute finds guidance JSON matching query" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();

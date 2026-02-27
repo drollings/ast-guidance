@@ -1,0 +1,90 @@
+{
+  "meta": {
+    "module": "src.ast-guidance.config",
+    "source": "src/ast-guidance/config.zig",
+    "language": "zig"
+  },
+  "comment": "Defines project config with absolute paths, JSON source, skills, inbox, and model; loads via two-level fallback chain.",
+  "used_by": ["src/ast-guidance/main.zig", "src/ast-guidance/query.zig", "src/ast-guidance/tests.zig"],
+  "members": [
+    {
+      "type": "struct",
+      "name": "ProjectConfig",
+      "match_hash": "112d778ac3a1ff96e2480b8e7b3662c3cd85050e690ee0b05869375536ab52bc",
+      "signature": "keyword_struct ProjectConfig { ... }",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "fn_decl",
+          "name": "deinit",
+          "match_hash": "0d733086fc310087a87c77d4df8de8e6fdd519d0d8f23e54c30dc15813702b2d",
+          "signature": "fn deinit(self: *ProjectConfig) -> void",
+          "params": [
+            { "name": "self", "type": "*ProjectConfig" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 56
+        }
+      ],
+      "line": 27
+    },
+    {
+      "type": "fn_decl",
+      "name": "loadConfig",
+      "match_hash": "53efcfcfabf4e8ee70407bfd7cdb60f9f9aa72c1953b6f61276da13983501c4f",
+      "signature": "fn loadConfig(allocator: std.mem.Allocator, cwd: []const u8) -> ProjectConfig",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "cwd", "type": "[]const u8" }
+      ],
+      "returns": "ProjectConfig",
+      "is_pub": true,
+      "line": 74
+    },
+    {
+      "type": "fn_private",
+      "name": "tryLoadFile",
+      "match_hash": "0de89c8da404f3038eb34d0745b9fc9c90b3eea5de888d0306227d1741e37b18",
+      "signature": "fn tryLoadFile(allocator: std.mem.Allocator, cwd: []const u8, path: []const u8) -> ProjectConfig",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "cwd", "type": "[]const u8" },
+        { "name": "path", "type": "[]const u8" }
+      ],
+      "returns": "ProjectConfig",
+      "is_pub": false,
+      "line": 108
+    },
+    {
+      "type": "fn_private",
+      "name": "buildDefault",
+      "match_hash": "da1283b255a7178eac8e62031745bba0c68bfbfce83c5c5c82991441ae0ab33a",
+      "signature": "fn buildDefault(allocator: std.mem.Allocator, cwd: []const u8) -> ProjectConfig",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "cwd", "type": "[]const u8" }
+      ],
+      "returns": "ProjectConfig",
+      "is_pub": false,
+      "line": 184
+    },
+    {
+      "type": "fn_private",
+      "name": "buildFromParts",
+      "match_hash": "6c1708ec9a6cea5e0f527d87ede44965504675ab306b97290a127bbd95244e6a",
+      "signature": "fn buildFromParts(allocator: std.mem.Allocator, cwd: []const u8, guidance_dir_rel: []const u8, src_dirs: []const []const u8, model: []const u8, api_url: []const u8) -> ProjectConfig",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "cwd", "type": "[]const u8" },
+        { "name": "guidance_dir_rel", "type": "[]const u8" },
+        { "name": "src_dirs", "type": "[]const []const u8" },
+        { "name": "model", "type": "[]const u8" },
+        { "name": "api_url", "type": "[]const u8" }
+      ],
+      "returns": "ProjectConfig",
+      "is_pub": false,
+      "line": 197
+    }
+  ]
+}

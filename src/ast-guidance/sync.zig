@@ -642,7 +642,9 @@ pub const SyncProcessor = struct {
                     }
                     self.allocator.free(ai_doc);
                 }
-            } else |_| {}
+            } else |err| {
+                std.debug.print("warning: LLM file-comment failed for {s}: {}\n", .{ doc.meta.source, err });
+            }
 
             // Prepend skills prefix deterministically after LLM update.
             if (file_changed) {
@@ -676,7 +678,9 @@ pub const SyncProcessor = struct {
                                 file_changed = true;
                             }
                         }
-                    } else |_| {}
+                    } else |err| {
+                        std.debug.print("warning: LLM fn-comment failed for {s} in {s}: {}\n", .{ m.name, doc.meta.source, err });
+                    }
                 },
                 .@"struct", .@"enum", .@"union" => {
                     if (self.enhancer.?.enhanceStruct(m.name, sig, &.{}, m.comment, doc.meta.source)) |er| {
@@ -692,7 +696,9 @@ pub const SyncProcessor = struct {
                                 file_changed = true;
                             }
                         }
-                    } else |_| {}
+                    } else |err| {
+                        std.debug.print("warning: LLM type-comment failed for {s} in {s}: {}\n", .{ m.name, doc.meta.source, err });
+                    }
                 },
                 else => {},
             }
