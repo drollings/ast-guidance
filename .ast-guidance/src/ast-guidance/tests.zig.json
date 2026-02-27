@@ -1,0 +1,235 @@
+{
+  "meta": {
+    "module": "src.ast-guidance.tests",
+    "source": "src/ast-guidance/tests.zig",
+    "language": "zig"
+  },
+  "comment": "[gof-patterns] Tests JSON store merge, query engine behavior, and local time handling in Guidance.",
+  "skills": [
+    { "ref": ".ast-guidance/.skills/gof-patterns/SKILL.md", "context": "GoF patterns detected" }
+  ],
+  "used_by": ["src/ast-guidance/main.zig"],
+  "members": [
+    {
+      "type": "test_decl",
+      "name": "getLocalTime returns valid ranges",
+      "is_pub": false,
+      "line": 15
+    },
+    {
+      "type": "test_decl",
+      "name": "classifyBulletKeyword returns path under .opencode/skills",
+      "is_pub": false,
+      "line": 38
+    },
+    {
+      "type": "fn_private",
+      "name": "makeMember",
+      "match_hash": "b60c40782f5a498acdb9cda7acf9f90081c7208f806770e41ddeeaa362bce2d5",
+      "signature": "fn makeMember(name: []const u8, hash: ?[]const u8, doc: ?[]const u8) -> types.Member",
+      "params": [
+        { "name": "name", "type": "[]const u8" },
+        { "name": "hash", "type": "?[]const u8" },
+        { "name": "doc", "type": "?[]const u8" }
+      ],
+      "returns": "types.Member",
+      "patterns": [
+        { "name": "Factory (GoF)", "type": "GoF", "ref": "guidance/skills/gof-patterns/SKILL.md#factory" }
+      ],
+      "is_pub": false,
+      "line": 73
+    },
+    {
+      "type": "test_decl",
+      "name": "dupeMember produces independent copies",
+      "is_pub": false,
+      "line": 86
+    },
+    {
+      "type": "test_decl",
+      "name": "dupeMember with params",
+      "is_pub": false,
+      "line": 120
+    },
+    {
+      "type": "test_decl",
+      "name": "dupeMember with nested members",
+      "is_pub": false,
+      "line": 150
+    },
+    {
+      "type": "test_decl",
+      "name": "mergeMembers with no existing produces all new members",
+      "is_pub": false,
+      "line": 180
+    },
+    {
+      "type": "test_decl",
+      "name": "mergeMembers preserves comment when hash unchanged",
+      "is_pub": false,
+      "line": 206
+    },
+    {
+      "type": "test_decl",
+      "name": "mergeMembers counts update when hash changed",
+      "is_pub": false,
+      "line": 233
+    },
+    {
+      "type": "test_decl",
+      "name": "mergeMembers counts removed members",
+      "is_pub": false,
+      "line": 257
+    },
+    {
+      "type": "test_decl",
+      "name": "mergeMembers no changes when source matches existing exactly",
+      "is_pub": false,
+      "line": 285
+    },
+    {
+      "type": "test_decl",
+      "name": "mergeMembers clears stale comment when hash changes",
+      "is_pub": false,
+      "line": 311
+    },
+    {
+      "type": "test_decl",
+      "name": "mergeMembers preserves tags when hash unchanged",
+      "is_pub": false,
+      "line": 339
+    },
+    {
+      "type": "test_decl",
+      "name": "freeGuidanceDoc frees all fields without double-free",
+      "is_pub": false,
+      "line": 368
+    },
+    {
+      "type": "test_decl",
+      "name": "dupeSkills produces independent copies",
+      "is_pub": false,
+      "line": 395
+    },
+    {
+      "type": "test_decl",
+      "name": "mergeMembers result is independent after source freed",
+      "is_pub": false,
+      "line": 428
+    },
+    {
+      "type": "test_decl",
+      "name": "mergeMembers result is independent after existing freed",
+      "is_pub": false,
+      "line": 464
+    },
+    {
+      "type": "fn_private",
+      "name": "writeTempGuidance",
+      "match_hash": "5ac17250e2bf3840b2edec34110a8d12b1c9c3f0be5ecc14bb92d97e772a7519",
+      "signature": "fn writeTempGuidance(allocator: std.mem.Allocator, dir_path: []const u8, filename: []const u8, module: []const u8) -> []u8",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "dir_path", "type": "[]const u8" },
+        { "name": "filename", "type": "[]const u8" },
+        { "name": "module", "type": "[]const u8" }
+      ],
+      "returns": "[]u8",
+      "is_pub": false,
+      "line": 512
+    },
+    {
+      "type": "test_decl",
+      "name": "QueryEngine.execute no leaks with empty query results",
+      "is_pub": false,
+      "line": 537
+    },
+    {
+      "type": "fn_private",
+      "name": "writeGuidanceJson",
+      "match_hash": "5c11d6de5766ea3e674e135ed080b2e59fc12958e917c25fa40cb12febc09774",
+      "signature": "fn writeGuidanceJson(dir: std.fs.Dir, filename: []const u8, comment: ?[]const u8, has_member: bool) -> void",
+      "params": [
+        { "name": "dir", "type": "std.fs.Dir" },
+        { "name": "filename", "type": "[]const u8" },
+        { "name": "comment", "type": "?[]const u8" },
+        { "name": "has_member", "type": "bool" }
+      ],
+      "returns": "void",
+      "is_pub": false,
+      "line": 567
+    },
+    {
+      "type": "test_decl",
+      "name": "infillJsonFile returns false when no enhancer configured",
+      "is_pub": false,
+      "line": 587
+    },
+    {
+      "type": "test_decl",
+      "name": "infillJsonFile returns false when no infill/regen flag set",
+      "is_pub": false,
+      "line": 611
+    },
+    {
+      "type": "test_decl",
+      "name": "infillJsonFile returns false for nonexistent path",
+      "is_pub": false,
+      "line": 634
+    },
+    {
+      "type": "test_decl",
+      "name": "infillAllJson returns 0 when no enhancer configured",
+      "is_pub": false,
+      "line": 657
+    },
+    {
+      "type": "test_decl",
+      "name": "infillAllJson returns 0 when cross-language flags not set",
+      "is_pub": false,
+      "line": 681
+    },
+    {
+      "type": "test_decl",
+      "name": "infillAllJson skips files in skip_paths",
+      "is_pub": false,
+      "line": 705
+    },
+    {
+      "type": "test_decl",
+      "name": "infillAllJson ignores non-json files",
+      "is_pub": false,
+      "line": 733
+    },
+    {
+      "type": "test_decl",
+      "name": "infillAllJson processes .py.json files alongside .zig.json files",
+      "is_pub": false,
+      "line": 760
+    },
+    {
+      "type": "test_decl",
+      "name": "freeQueryResult handles all empty slices",
+      "is_pub": false,
+      "line": 787
+    },
+    {
+      "type": "test_decl",
+      "name": "freeQueryResult frees FileMatch strings",
+      "is_pub": false,
+      "line": 809
+    },
+    {
+      "type": "test_decl",
+      "name": "freeQueryResult frees GuidanceInfo strings and slices",
+      "is_pub": false,
+      "line": 846
+    },
+    {
+      "type": "test_decl",
+      "name": "QueryEngine deinit with no execute is safe",
+      "is_pub": false,
+      "line": 883
+    }
+  ]
+}

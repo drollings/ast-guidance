@@ -1,0 +1,35 @@
+{
+  "_comment": "ast-guidance model and provider configuration. All Makefile targets read from this file.",
+  "version": "1",
+  "ollama": {
+    "base_url": "http://localhost:11434",
+    "chat_endpoint": "/api/chat",
+    "tags_endpoint": "/api/tags",
+    "timeout_seconds": 30
+  },
+  "models": {
+    "default": "code:latest",
+    "fast": "fast:latest",
+    "document": "code:latest",
+    "infill": "code:latest",
+    "commit": "fast:latest",
+    "triage": "code:latest",
+    "diary": "fast:latest"
+  },
+  "providers": {
+    "zig": "ast-guidance",
+    "python": "ast-guidance-py",
+    "cpp": "ast-guidance-cpp",
+    "php": "ast-guidance-php",
+    "rust": "ast-guidance-rust",
+    "go": "ast-guidance-go"
+  },
+  "guidance_dir": ".ast-guidance",
+  "sync": {
+    "infill": true,
+    "regen": false,
+    "max_comment_chars": 200,
+    "max_module_comment_chars": 80
+  },
+  "comment": "Processes code files to extract member signatures and apply parsing algorithms."
+}

@@ -1,0 +1,251 @@
+{
+  "meta": {
+    "module": "src.registry",
+    "source": "src/registry.zig",
+    "language": "zig"
+  },
+  "comment": "Manages Zig target registry with allocator, interners, targets, bit index mapping, and provider lists.",
+  "used_by": ["src/context.zig", "src/json_parser.zig", "src/main.zig", "src/repl.zig", "src/resolver.zig"],
+  "members": [
+    {
+      "type": "fn_decl",
+      "name": "init",
+      "match_hash": "1a8e99d563e14c374835b224be0217a209edcac1a4128c85907de59bce0f4fc0",
+      "signature": "fn init(allocator: std.mem.Allocator, interner: *StringInterner) -> TargetRegistry",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "interner", "type": "*StringInterner" }
+      ],
+      "returns": "TargetRegistry",
+      "comment": "Initializes the registry with an allocator and interners, returning a target registry.",
+      "is_pub": true,
+      "line": 14
+    },
+    {
+      "type": "fn_decl",
+      "name": "deinit",
+      "match_hash": "6b6fc487674cf448b31e28373d568cf12126a59b613ac6366a8543272ace282f",
+      "signature": "fn deinit(self: *TargetRegistry) -> void",
+      "params": [
+        { "name": "self", "type": "*TargetRegistry" }
+      ],
+      "returns": "void",
+      "comment": "Releases resources by cleaning up Zig registry entries when the object is dropped.",
+      "is_pub": true,
+      "line": 24
+    },
+    {
+      "type": "fn_decl",
+      "name": "add",
+      "match_hash": "5753d8eddc799f70421fdb13b7977ad48512bbca724cf42910457ba8f69b0dfe",
+      "signature": "fn add(self: *TargetRegistry, target: *Target) -> void",
+      "params": [
+        { "name": "self", "type": "*TargetRegistry" },
+        { "name": "target", "type": "*Target" }
+      ],
+      "returns": "void",
+      "comment": "Adds a target to the registry, linking it to a given target.",
+      "is_pub": true,
+      "line": 40
+    },
+    {
+      "type": "fn_decl",
+      "name": "get",
+      "match_hash": "247b0e36352acb9a4509c1d0f09f4a28f72899cb426f0178c2467c76529ad1e7",
+      "signature": "fn get(self: *const TargetRegistry, name: []const u8) -> ?*Target",
+      "params": [
+        { "name": "self", "type": "*const TargetRegistry" },
+        { "name": "name", "type": "[]const u8" }
+      ],
+      "returns": "?*Target",
+      "comment": "Retrieves a target registry entry by name, returning a pointer to its registry if found.",
+      "is_pub": true,
+      "line": 46
+    },
+    {
+      "type": "fn_decl",
+      "name": "getByBitIndex",
+      "match_hash": "25f280dc1e53ad14518db40fd14d0d710d64fe2d8a6ab4e5b6ef866a0b87923d",
+      "signature": "fn getByBitIndex(self: *const TargetRegistry, idx: usize) -> ?*Target",
+      "params": [
+        { "name": "self", "type": "*const TargetRegistry" },
+        { "name": "idx", "type": "usize" }
+      ],
+      "returns": "?*Target",
+      "comment": "Retrieves a target registry entry by its bit index, returning a pointer to the matching target.",
+      "is_pub": true,
+      "line": 50
+    },
+    {
+      "type": "fn_decl",
+      "name": "remove",
+      "match_hash": "52bc41bb0848b6e3252cfb562c1e23b0a94ebc9e61e3d531ce90bafdabdb0139",
+      "signature": "fn remove(self: *TargetRegistry, name: []const u8) -> void",
+      "params": [
+        { "name": "self", "type": "*TargetRegistry" },
+        { "name": "name", "type": "[]const u8" }
+      ],
+      "returns": "void",
+      "comment": "Removes a target registry entry by name, returning void and no error.",
+      "is_pub": true,
+      "line": 54
+    },
+    {
+      "type": "fn_decl",
+      "name": "listNames",
+      "match_hash": "02cfa09f0513d3d2d9177efd8f1fc87acb1e0acb66569c2be5fec8e86087176a",
+      "signature": "fn listNames(self: *const TargetRegistry, allocator: std.mem.Allocator) -> [][]const u8",
+      "params": [
+        { "name": "self", "type": "*const TargetRegistry" },
+        { "name": "allocator", "type": "std.mem.Allocator" }
+      ],
+      "returns": "[][]const u8",
+      "comment": "Returns a slice of byte arrays representing names from the registry.",
+      "is_pub": true,
+      "line": 61
+    },
+    {
+      "type": "fn_private",
+      "name": "updateProviderMap",
+      "match_hash": "db3fa1460f8d56368b9863b5b2144d6526f30b9b1424e43dfe579d3ee4aca4a3",
+      "signature": "fn updateProviderMap(self: *TargetRegistry, target: *Target) -> void",
+      "params": [
+        { "name": "self", "type": "*TargetRegistry" },
+        { "name": "target", "type": "*Target" }
+      ],
+      "returns": "void",
+      "comment": "Updates the provider map with the given target, modifying internal state without errors.",
+      "is_pub": false,
+      "line": 79
+    },
+    {
+      "type": "fn_decl",
+      "name": "getProviders",
+      "match_hash": "f7e18553caf391efa58edb45f701a64d37bc34174b834db7f0b942e4d45b18ff",
+      "signature": "fn getProviders(self: *const TargetRegistry, bit_index: usize) -> ?[]*Target",
+      "params": [
+        { "name": "self", "type": "*const TargetRegistry" },
+        { "name": "bit_index", "type": "usize" }
+      ],
+      "returns": "?[]*Target",
+      "comment": "Retrieves provider lists from the registry at the specified bit index.",
+      "is_pub": true,
+      "line": 90
+    },
+    {
+      "type": "fn_decl",
+      "name": "getProvidersForName",
+      "match_hash": "a3a44712d29c572d6776a075ac13e6fe855e67e42f47fe6f18925e89fb0ca624",
+      "signature": "fn getProvidersForName(self: *const TargetRegistry, name: []const u8) -> ?[]*Target",
+      "params": [
+        { "name": "self", "type": "*const TargetRegistry" },
+        { "name": "name", "type": "[]const u8" }
+      ],
+      "returns": "?[]*Target",
+      "comment": "Retrieves registry providers matching the given name, returning their addresses.",
+      "is_pub": true,
+      "line": 97
+    },
+    {
+      "type": "fn_decl",
+      "name": "count",
+      "match_hash": "7657124174e915ce9dba8bf0fb7c0b84414b3ee5ded4b74fa994bdec3cc448df",
+      "signature": "fn count(self: *const TargetRegistry) -> usize",
+      "params": [
+        { "name": "self", "type": "*const TargetRegistry" }
+      ],
+      "returns": "usize",
+      "comment": "Counts valid registry entries in the target registry, returning the total count.",
+      "is_pub": true,
+      "line": 102
+    },
+    {
+      "type": "fn_decl",
+      "name": "essentialTargets",
+      "match_hash": "f44585422082a098ce9bd4d4a576f0c76de0031ac0eecf3211b3b879190e8930",
+      "signature": "fn essentialTargets(self: *const TargetRegistry, allocator: std.mem.Allocator) -> []*Target",
+      "params": [
+        { "name": "self", "type": "*const TargetRegistry" },
+        { "name": "allocator", "type": "std.mem.Allocator" }
+      ],
+      "returns": "[]*Target",
+      "comment": "Retrieves essential target registry entries from the registry, returning a slice of Target objects.",
+      "is_pub": true,
+      "line": 106
+    },
+    {
+      "type": "fn_decl",
+      "name": "abstractTargets",
+      "match_hash": "adcc83d9f488f5c396ea892a26798179176d0ed99c55fe749eac3c12a36d9ee4",
+      "signature": "fn abstractTargets(self: *const TargetRegistry, allocator: std.mem.Allocator) -> []*Target",
+      "params": [
+        { "name": "self", "type": "*const TargetRegistry" },
+        { "name": "allocator", "type": "std.mem.Allocator" }
+      ],
+      "returns": "[]*Target",
+      "comment": "Converts a TargetRegistry reference into a slice of Target objects using the provided allocator.",
+      "is_pub": true,
+      "line": 120
+    },
+    {
+      "type": "test_decl",
+      "name": "TargetRegistry basic operations",
+      "is_pub": false,
+      "line": 136
+    },
+    {
+      "type": "test_decl",
+      "name": "TargetRegistry GPA no leaks",
+      "is_pub": false,
+      "line": 152
+    },
+    {
+      "type": "test_decl",
+      "name": "TargetRegistry: getByBitIndex returns the correct target",
+      "is_pub": false,
+      "line": 180
+    },
+    {
+      "type": "test_decl",
+      "name": "TargetRegistry: getByBitIndex for unknown index returns null",
+      "is_pub": false,
+      "line": 196
+    },
+    {
+      "type": "test_decl",
+      "name": "TargetRegistry: remove drops the target",
+      "is_pub": false,
+      "line": 205
+    },
+    {
+      "type": "test_decl",
+      "name": "TargetRegistry: listNames returns sorted names",
+      "is_pub": false,
+      "line": 230
+    },
+    {
+      "type": "test_decl",
+      "name": "TargetRegistry: essentialTargets returns only essential ones",
+      "is_pub": false,
+      "line": 256
+    },
+    {
+      "type": "test_decl",
+      "name": "TargetRegistry: abstractTargets returns only abstract ones",
+      "is_pub": false,
+      "line": 278
+    },
+    {
+      "type": "test_decl",
+      "name": "TargetRegistry: getProviders and getProvidersForName",
+      "is_pub": false,
+      "line": 301
+    },
+    {
+      "type": "test_decl",
+      "name": "TargetRegistry: get returns null for unknown name",
+      "is_pub": false,
+      "line": 332
+    }
+  ]
+}

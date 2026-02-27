@@ -1,0 +1,292 @@
+{
+  "meta": {
+    "module": "src.target",
+    "source": "src/target.zig",
+    "language": "zig"
+  },
+  "comment": "Manages Zig target metadata, handling interns, dependencies, and allocator cleanup for target definitions.",
+  "used_by": ["src/context.zig", "src/json_parser.zig", "src/main.zig", "src/registry.zig", "src/resolver.zig"],
+  "members": [
+    {
+      "type": "enum",
+      "name": "TargetType",
+      "match_hash": "e496c382d60e78e274abae607f6a4f488f9f623a583f67668026a13cdcdfdf91",
+      "signature": "keyword_enum TargetType { ... }",
+      "comment": "Manages fixed-size buffer pools; owned by the host; ensures safe allocation/deallocation.",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "enum_field",
+          "name": "abstract",
+          "is_pub": false,
+          "line": 5
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "file",
+          "is_pub": false,
+          "line": 6
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "command",
+          "is_pub": false,
+          "line": 7
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "phony",
+          "is_pub": false,
+          "line": 8
+        }
+      ],
+      "line": 4
+    },
+    {
+      "type": "fn_decl",
+      "name": "init",
+      "match_hash": "7ba7ab82f25f1d8ef3d168e73a5680a86b0193383275cb365475b7dfa201d2e2",
+      "signature": "fn init(allocator: std.mem.Allocator, interner: *StringInterner, name: []const u8, target_type: TargetType) -> Target",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "interner", "type": "*StringInterner" },
+        { "name": "name", "type": "[]const u8" },
+        { "name": "target_type", "type": "TargetType" }
+      ],
+      "returns": "Target",
+      "comment": "Initializes a target with an allocator and interners, returning the configured target.",
+      "is_pub": true,
+      "line": 26
+    },
+    {
+      "type": "fn_decl",
+      "name": "deinit",
+      "match_hash": "5a328d2ff7b921955a02a274d43c60c31d0f03624df77d8e04813dfe3c90c8ac",
+      "signature": "fn deinit(self: *Target, allocator: std.mem.Allocator) -> void",
+      "params": [
+        { "name": "self", "type": "*Target" },
+        { "name": "allocator", "type": "std.mem.Allocator" }
+      ],
+      "returns": "void",
+      "comment": "Releases allocated memory by cleaning up Zig slices and allocator resources.",
+      "is_pub": true,
+      "line": 48
+    },
+    {
+      "type": "fn_decl",
+      "name": "setDepends",
+      "match_hash": "e72ff639b018ad2deadd3db7941d78368c2fba6625b33b0efccb0c44c7fc08f9",
+      "signature": "fn setDepends(self: *Target, allocator: std.mem.Allocator, interner: *StringInterner, depends: []const []const u8) -> void",
+      "params": [
+        { "name": "self", "type": "*Target" },
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "interner", "type": "*StringInterner" },
+        { "name": "depends", "type": "[]const []const u8" }
+      ],
+      "returns": "void",
+      "comment": "Establishes dependencies for the target, linking allocator and interners.",
+      "is_pub": true,
+      "line": 61
+    },
+    {
+      "type": "fn_decl",
+      "name": "setProvides",
+      "match_hash": "b8219d749cbfa1aba55a2dfb9c1744ead8c4fac759e40b9c71e15e07cb5ad9a2",
+      "signature": "fn setProvides(self: *Target, allocator: std.mem.Allocator, interner: *StringInterner, provides: []const []const u8) -> void",
+      "params": [
+        { "name": "self", "type": "*Target" },
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "interner", "type": "*StringInterner" },
+        { "name": "provides", "type": "[]const []const u8" }
+      ],
+      "returns": "void",
+      "comment": "Initializes a provided slice with allocator and interners, ensuring safe memory allocation.",
+      "is_pub": true,
+      "line": 71
+    },
+    {
+      "type": "fn_decl",
+      "name": "addCommand",
+      "match_hash": "94b870aac7f7422a78b7d46de122f528c33c6e21fe37c77fb818284c8cceee5f",
+      "signature": "fn addCommand(self: *Target, allocator: std.mem.Allocator, cmd: []const u8) -> void",
+      "params": [
+        { "name": "self", "type": "*Target" },
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "cmd", "type": "[]const u8" }
+      ],
+      "returns": "void",
+      "comment": "Adds a command slice to the target Zig instance using allocator and command data.",
+      "is_pub": true,
+      "line": 81
+    },
+    {
+      "type": "fn_decl",
+      "name": "isAbstract",
+      "match_hash": "6277b71442caeba6eb32e0d990fddf8a17b7ab358433dbd76bcff75e53e7ad61",
+      "signature": "fn isAbstract(self: *const Target) -> bool",
+      "params": [
+        { "name": "self", "type": "*const Target" }
+      ],
+      "returns": "bool",
+      "comment": "Checks if a target is an abstract Zig type, returning true or false.",
+      "is_pub": true,
+      "line": 85
+    },
+    {
+      "type": "fn_decl",
+      "name": "dependsSatisfiedBy",
+      "match_hash": "5eeb1692874812ee98a6e00109d0ee78e1e469e9c0fb123d1a2d7256adbb9a76",
+      "signature": "fn dependsSatisfiedBy(self: *const Target, allocator: std.mem.Allocator, available: *const std.bit_set.DynamicBitSetUnmanaged) -> bool",
+      "params": [
+        { "name": "self", "type": "*const Target" },
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "available", "type": "*const std.bit_set.DynamicBitSetUnmanaged" }
+      ],
+      "returns": "bool",
+      "comment": "Checks if a dependency condition is met using allocator and bit sets, returning true or false.",
+      "is_pub": true,
+      "line": 91
+    },
+    {
+      "type": "fn_decl",
+      "name": "missingDepends",
+      "match_hash": "bb7d38c877868d2dd5a1f802d3126b0662868b59692cf4d0cc1bf02a04821d65",
+      "signature": "fn missingDepends(self: *const Target, allocator: std.mem.Allocator, available: *const std.bit_set.DynamicBitSetUnmanaged) -> std.bit_set.DynamicBitSetUnmanaged",
+      "params": [
+        { "name": "self", "type": "*const Target" },
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "available", "type": "*const std.bit_set.DynamicBitSetUnmanaged" }
+      ],
+      "returns": "std.bit_set.DynamicBitSetUnmanaged",
+      "comment": "Validates required dependencies and returns a bit set object for missing resources.",
+      "is_pub": true,
+      "line": 102
+    },
+    {
+      "type": "fn_decl",
+      "name": "distanceFrom",
+      "match_hash": "9ba284c268ec6ee9024eb35c4193fb0e812968ec3b7e83829f9d4aa36b314454",
+      "signature": "fn distanceFrom(self: *const Target, available: *const std.bit_set.DynamicBitSetUnmanaged) -> usize",
+      "params": [
+        { "name": "self", "type": "*const Target" },
+        { "name": "available", "type": "*const std.bit_set.DynamicBitSetUnmanaged" }
+      ],
+      "returns": "usize",
+      "comment": "Calculates the distance between two targets using bit sets, returning a usize value.",
+      "is_pub": true,
+      "line": 119
+    },
+    {
+      "type": "fn_decl",
+      "name": "format",
+      "match_hash": "e628fc77ce99f6a1dabd8ca16258514b549f8570b7c831a63b7dc6cc9bc13a6b",
+      "signature": "fn format(self: *const Target, fmt: []const u8, options: std.fmt.FormatOptions, writer) -> void",
+      "params": [
+        { "name": "self", "type": "*const Target" },
+        { "name": "fmt", "type": "[]const u8" },
+        { "name": "options", "type": "std.fmt.FormatOptions" },
+        { "name": "writer" }
+      ],
+      "returns": "void",
+      "comment": "Formats a target string using specified format options and writer, returning no value on success.",
+      "is_pub": true,
+      "line": 130
+    },
+    {
+      "type": "test_decl",
+      "name": "Target creation and basic operations",
+      "is_pub": false,
+      "line": 146
+    },
+    {
+      "type": "test_decl",
+      "name": "Target depends and provides",
+      "is_pub": false,
+      "line": 158
+    },
+    {
+      "type": "test_decl",
+      "name": "Target GPA no leaks",
+      "is_pub": false,
+      "line": 173
+    },
+    {
+      "type": "test_decl",
+      "name": "Target: dependsSatisfiedBy — no deps always satisfied",
+      "is_pub": false,
+      "line": 199
+    },
+    {
+      "type": "test_decl",
+      "name": "Target: dependsSatisfiedBy — satisfied when all deps available",
+      "is_pub": false,
+      "line": 212
+    },
+    {
+      "type": "test_decl",
+      "name": "Target: dependsSatisfiedBy — not satisfied when dep missing",
+      "is_pub": false,
+      "line": 231
+    },
+    {
+      "type": "test_decl",
+      "name": "Target: missingDepends — empty when all satisfied",
+      "is_pub": false,
+      "line": 254
+    },
+    {
+      "type": "test_decl",
+      "name": "Target: missingDepends — returns unsatisfied bits",
+      "is_pub": false,
+      "line": 274
+    },
+    {
+      "type": "test_decl",
+      "name": "Target: distanceFrom — zero when no deps",
+      "is_pub": false,
+      "line": 299
+    },
+    {
+      "type": "test_decl",
+      "name": "Target: distanceFrom — counts missing deps",
+      "is_pub": false,
+      "line": 312
+    },
+    {
+      "type": "test_decl",
+      "name": "Target: distanceFrom — zero when all deps satisfied",
+      "is_pub": false,
+      "line": 332
+    },
+    {
+      "type": "test_decl",
+      "name": "Target: abstract type with commands is NOT abstract",
+      "is_pub": false,
+      "line": 355
+    },
+    {
+      "type": "test_decl",
+      "name": "Target: abstract type with exists is NOT abstract",
+      "is_pub": false,
+      "line": 366
+    },
+    {
+      "type": "test_decl",
+      "name": "Target: phony type is never abstract regardless",
+      "is_pub": false,
+      "line": 377
+    },
+    {
+      "type": "test_decl",
+      "name": "Target: format includes name and type tag",
+      "is_pub": false,
+      "line": 391
+    },
+    {
+      "type": "test_decl",
+      "name": "Target: format includes [essential] for essential targets",
+      "is_pub": false,
+      "line": 407
+    }
+  ]
+}

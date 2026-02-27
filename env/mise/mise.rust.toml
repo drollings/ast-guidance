@@ -1,0 +1,9 @@
+# mise.rust.toml
+# Rust toolchain (only installed when TARGET_LANG=rust)
+# Install with: mise -E rust install
+
+[tools]
+rust = "1.76.0"
+
+[env]
+CARGO_TARGET_DIR = "{{cwd}}/target"

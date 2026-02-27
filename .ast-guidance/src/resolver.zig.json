@@ -1,0 +1,250 @@
+{
+  "meta": {
+    "module": "src.resolver",
+    "source": "src/resolver.zig",
+    "language": "zig"
+  },
+  "comment": "[gof-patterns] Implements dependency resolution for Zig targets using topological sorting and abstract provider selection.",
+  "skills": [
+    { "ref": "guidance/skills/gof-patterns/SKILL.md", "context": "GoF patterns detected" }
+  ],
+  "used_by": ["src/context.zig", "src/main.zig"],
+  "members": [
+    {
+      "type": "fn_decl",
+      "name": "init",
+      "match_hash": "2da10f83b20efe6f434a9bde374b64a04c72195613d272846083f483cdf66be1",
+      "signature": "fn init(allocator: std.mem.Allocator, registry: *TargetRegistry, interner: *StringInterner) -> DependencyResolver",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "registry", "type": "*TargetRegistry" },
+        { "name": "interner", "type": "*StringInterner" }
+      ],
+      "returns": "DependencyResolver",
+      "comment": "Initializes the dependency resolver with allocator, registry, and interners, returning a resolved dependency structure.",
+      "is_pub": true,
+      "line": 15
+    },
+    {
+      "type": "struct",
+      "name": "ResolvedBuild",
+      "match_hash": "dfa71d3221c7ad7dec562ceb97e30683f592d08b0c879fc6786ceb9923507cd4",
+      "signature": "keyword_struct ResolvedBuild { ... }",
+      "comment": "Manages resolved build metadata, owns build instances, ensures correct lifecycle; not thread-safe.",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "fn_decl",
+          "name": "deinit",
+          "match_hash": "c98365d9e94424c1cc10bb22421245fdcc417d2c07f7107c534f59e19130c314",
+          "signature": "fn deinit(self: *ResolvedBuild) -> void",
+          "params": [
+            { "name": "self", "type": "*ResolvedBuild" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 27
+        }
+      ],
+      "line": 23
+    },
+    {
+      "type": "fn_decl",
+      "name": "resolve",
+      "match_hash": "64a2a1474fae1419d6fe2f65a3d5e6f5f3eef7be5ad7c8993d1b0dc43a3257b8",
+      "signature": "fn resolve(self: *DependencyResolver, target_names: []const []const u8) -> ResolvedBuild",
+      "params": [
+        { "name": "self", "type": "*DependencyResolver" },
+        { "name": "target_names", "type": "[]const []const u8" }
+      ],
+      "returns": "ResolvedBuild",
+      "comment": "Resolves dependencies for a target list, returning a resolved build object.",
+      "is_pub": true,
+      "line": 33
+    },
+    {
+      "type": "fn_decl",
+      "name": "resolveAbstractDependencies",
+      "match_hash": "4bed822d0c18fd14293295282d245ce9e1afb2fce84a7e474134ae17464e0640",
+      "signature": "fn resolveAbstractDependencies(self: *DependencyResolver, target_names: []const []const u8, provided: *std.bit_set.DynamicBitSetUnmanaged) -> ResolvedBuild",
+      "params": [
+        { "name": "self", "type": "*DependencyResolver" },
+        { "name": "target_names", "type": "[]const []const u8" },
+        { "name": "provided", "type": "*std.bit_set.DynamicBitSetUnmanaged" }
+      ],
+      "returns": "ResolvedBuild",
+      "comment": "Resolves abstract dependencies for a Zig build, taking target names and a bit set, returning a resolved build.",
+      "is_pub": true,
+      "line": 46
+    },
+    {
+      "type": "fn_private",
+      "name": "topoSort",
+      "match_hash": "5cd7dc9c21f317ec519363c488036810d14d0fb3346ef515b02bc16c6dd538db",
+      "signature": "fn topoSort(self: *DependencyResolver, all_needed: *std.AutoHashMap(usize, *Target)) -> ResolvedBuild",
+      "params": [
+        { "name": "self", "type": "*DependencyResolver" },
+        { "name": "all_needed", "type": "*std.AutoHashMap(usize, *Target)" }
+      ],
+      "returns": "ResolvedBuild",
+      "comment": "Converts a dependency graph into a topologically sorted build order using provided targets.",
+      "is_pub": false,
+      "line": 66
+    },
+    {
+      "type": "fn_private",
+      "name": "collectDependencies",
+      "match_hash": "f57581c9b6876d98c067f4fef58aaa062cc57ad16a3b5ef010d6face07cda6cc",
+      "signature": "fn collectDependencies(self: *DependencyResolver, target: *Target, collected: *std.AutoHashMap(usize, *Target)) -> void",
+      "params": [
+        { "name": "self", "type": "*DependencyResolver" },
+        { "name": "target", "type": "*Target" },
+        { "name": "collected", "type": "*std.AutoHashMap(usize, *Target)" }
+      ],
+      "returns": "void",
+      "comment": "Collects dependency targets and returns them in a hash map for the resolver.",
+      "is_pub": false,
+      "line": 144
+    },
+    {
+      "type": "fn_private",
+      "name": "collectDependenciesWithAbstracts",
+      "match_hash": "0c8575788c283d71b846c5bded9d2f6296ebd9dce3f9b1181ff22ded88e61096",
+      "signature": "fn collectDependenciesWithAbstracts(self: *DependencyResolver, target: *Target, collected: *std.AutoHashMap(usize, *Target), provided: *std.bit_set.DynamicBitSetUnmanaged) -> void",
+      "params": [
+        { "name": "self", "type": "*DependencyResolver" },
+        { "name": "target", "type": "*Target" },
+        { "name": "collected", "type": "*std.AutoHashMap(usize, *Target)" },
+        { "name": "provided", "type": "*std.bit_set.DynamicBitSetUnmanaged" }
+      ],
+      "returns": "void",
+      "comment": "Collects abstract dependencies for a target using a dependency resolver, returning a bit-set of collected targets.",
+      "is_pub": false,
+      "line": 166
+    },
+    {
+      "type": "fn_decl",
+      "name": "visualizeGraph",
+      "match_hash": "beb60e9e19aed6d332b8a694d7b343789010bef5b3f161bcda7068669d2f6209",
+      "signature": "fn visualizeGraph(self: *DependencyResolver, target_names: []const []const u8, allocator: std.mem.Allocator) -> []u8",
+      "params": [
+        { "name": "self", "type": "*DependencyResolver" },
+        { "name": "target_names", "type": "[]const []const u8" },
+        { "name": "allocator", "type": "std.mem.Allocator" }
+      ],
+      "returns": "[]u8",
+      "comment": "Generates a visual graph representation for dependency resolution targets.",
+      "is_pub": true,
+      "line": 222
+    },
+    {
+      "type": "fn_private",
+      "name": "printTree",
+      "match_hash": "518217695cd43030c42ae65d5c8685260737caee70ccfcaea5d21d76d8eeb27b",
+      "signature": "fn printTree(self: *DependencyResolver, target: *Target, visited: *std.AutoHashMap(usize, void), prefix: []const u8, is_last: bool, writer) -> void",
+      "params": [
+        { "name": "self", "type": "*DependencyResolver" },
+        { "name": "target", "type": "*Target" },
+        { "name": "visited", "type": "*std.AutoHashMap(usize, void)" },
+        { "name": "prefix", "type": "[]const u8" },
+        { "name": "is_last", "type": "bool" },
+        { "name": "writer" }
+      ],
+      "returns": "void",
+      "comment": "Prints a tree structure of dependencies recursively with prefix and visited tracking.",
+      "is_pub": false,
+      "line": 247
+    },
+    {
+      "type": "fn_private",
+      "name": "makeTarget",
+      "match_hash": "0f353e2d10beb08950b171658494dd3877c654d87d34a7450a2646a1b4895d25",
+      "signature": "fn makeTarget(allocator: std.mem.Allocator, interner: *StringInterner, name: []const u8, target_type: @import(\"target.zig\").TargetType) -> *Target",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "interner", "type": "*StringInterner" },
+        { "name": "name", "type": "[]const u8" },
+        { "name": "target_type", "type": "@import(\"target.zig\").TargetType" }
+      ],
+      "returns": "*Target",
+      "comment": "Creates a target slice using an allocator and string interners, returning a pointer to the constructed target.",
+      "patterns": [
+        { "name": "Factory (GoF)", "type": "GoF", "ref": "guidance/skills/gof-patterns/SKILL.md#factory" }
+      ],
+      "is_pub": false,
+      "line": 303
+    },
+    {
+      "type": "test_decl",
+      "name": "DependencyResolver basic resolution",
+      "is_pub": false,
+      "line": 318
+    },
+    {
+      "type": "test_decl",
+      "name": "DependencyResolver GPA no leaks",
+      "is_pub": false,
+      "line": 345
+    },
+    {
+      "type": "test_decl",
+      "name": "DependencyResolver: resolve unknown target returns TargetNotFound",
+      "is_pub": false,
+      "line": 386
+    },
+    {
+      "type": "test_decl",
+      "name": "DependencyResolver: single target with no deps resolves to itself",
+      "is_pub": false,
+      "line": 397
+    },
+    {
+      "type": "test_decl",
+      "name": "DependencyResolver: diamond dependency resolves all nodes once",
+      "is_pub": false,
+      "line": 414
+    },
+    {
+      "type": "test_decl",
+      "name": "DependencyResolver: multi-root resolve includes all roots",
+      "is_pub": false,
+      "line": 453
+    },
+    {
+      "type": "test_decl",
+      "name": "DependencyResolver: circular dependency returns CircularDependency",
+      "is_pub": false,
+      "line": 471
+    },
+    {
+      "type": "test_decl",
+      "name": "DependencyResolver: abstract dep resolved via provider",
+      "is_pub": false,
+      "line": 493
+    },
+    {
+      "type": "test_decl",
+      "name": "DependencyResolver: resolveAbstractDependencies unknown target returns error",
+      "is_pub": false,
+      "line": 526
+    },
+    {
+      "type": "test_decl",
+      "name": "DependencyResolver: visualizeGraph contains target names",
+      "is_pub": false,
+      "line": 544
+    },
+    {
+      "type": "test_decl",
+      "name": "DependencyResolver: visualizeGraph revisited node shows already shown",
+      "is_pub": false,
+      "line": 564
+    },
+    {
+      "type": "test_decl",
+      "name": "DependencyResolver: GPA no leaks",
+      "is_pub": false,
+      "line": 591
+    }
+  ]
+}

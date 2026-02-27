@@ -1,0 +1,110 @@
+{
+  "meta": {
+    "module": "src.ast-guidance.gitignore",
+    "source": "src/ast-guidance/gitignore.zig",
+    "language": "zig"
+  },
+  "comment": "Manages Gitignore patterns, loads from files, and cleans up allocators while supporting negations and exclusions.",
+  "used_by": ["src/ast-guidance/query.zig", "src/ast-guidance/structure.zig"],
+  "members": [
+    {
+      "type": "struct",
+      "name": "GitignoreFilter",
+      "match_hash": "3f778e8b387496fc61e8ceb7d9463c23e7fe55c7e78edeb331f9f76549eb76fe",
+      "signature": "keyword_struct GitignoreFilter { ... }",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "fn_decl",
+          "name": "init",
+          "match_hash": "7a06ba318d5cd6b58c669dc6e817f85e8105ae069eacedef2c6451ad8c52d4fb",
+          "signature": "fn init(allocator: std.mem.Allocator, project_root: []const u8) -> GitignoreFilter",
+          "params": [
+            { "name": "allocator", "type": "std.mem.Allocator" },
+            { "name": "project_root", "type": "[]const u8" }
+          ],
+          "returns": "GitignoreFilter",
+          "is_pub": true,
+          "line": 10
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "deinit",
+          "match_hash": "1dd3aad6851a3bf0c7461b9f146cb510363dabf576fa1725db1ea98ad5e7d824",
+          "signature": "fn deinit(self: *GitignoreFilter) -> void",
+          "params": [
+            { "name": "self", "type": "*GitignoreFilter" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 20
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "loadFromFile",
+          "match_hash": "d1397fa7827e7bf18191f2433f4f286f377e77464c471b6dea80eb412d01ca0d",
+          "signature": "fn loadFromFile(self: *GitignoreFilter, path: []const u8) -> void",
+          "params": [
+            { "name": "self", "type": "*GitignoreFilter" },
+            { "name": "path", "type": "[]const u8" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 27
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "shouldIgnore",
+          "match_hash": "7bd802b1e54e6695d73ccbf4c5149c660a7c9a163e824a7c2ffa53189892aa57",
+          "signature": "fn shouldIgnore(self: *const GitignoreFilter, filepath: []const u8) -> bool",
+          "params": [
+            { "name": "self", "type": "*const GitignoreFilter" },
+            { "name": "filepath", "type": "[]const u8" }
+          ],
+          "returns": "bool",
+          "is_pub": true,
+          "line": 65
+        }
+      ],
+      "line": 3
+    },
+    {
+      "type": "fn_private",
+      "name": "matchesPattern",
+      "match_hash": "a398612ec373e870eb66cb7f4e8d47fe34d93561b2446032c7bea089a1b5d760",
+      "signature": "fn matchesPattern(path: []const u8, pattern: []const u8) -> bool",
+      "params": [
+        { "name": "path", "type": "[]const u8" },
+        { "name": "pattern", "type": "[]const u8" }
+      ],
+      "returns": "bool",
+      "is_pub": false,
+      "line": 102
+    },
+    {
+      "type": "fn_private",
+      "name": "globMatch",
+      "match_hash": "9e43152a1ee2b4998f5519842f05c16e83f0712f52f66e3bf0c872d58ec717b4",
+      "signature": "fn globMatch(text: []const u8, pattern: []const u8) -> bool",
+      "params": [
+        { "name": "text", "type": "[]const u8" },
+        { "name": "pattern", "type": "[]const u8" }
+      ],
+      "returns": "bool",
+      "is_pub": false,
+      "line": 130
+    },
+    {
+      "type": "test_decl",
+      "name": "globMatch basic patterns",
+      "is_pub": false,
+      "line": 160
+    },
+    {
+      "type": "test_decl",
+      "name": "GitignoreFilter always excludes .git",
+      "is_pub": false,
+      "line": 168
+    }
+  ]
+}

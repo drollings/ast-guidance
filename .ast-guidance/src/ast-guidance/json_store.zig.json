@@ -1,0 +1,262 @@
+{
+  "meta": {
+    "module": "src.ast-guidance.json_store",
+    "source": "src/ast-guidance/json_store.zig",
+    "language": "zig"
+  },
+  "comment": "[gof-patterns] Manages Zig AST parsing, stores guidance docs, tracks leaked prompts, and supports loadGuidance for LLM updates.",
+  "skills": [
+    { "ref": ".ast-guidance/.skills/gof-patterns/SKILL.md", "context": "GoF patterns detected" }
+  ],
+  "used_by": ["src/ast-guidance/main.zig", "src/ast-guidance/query.zig", "src/ast-guidance/structure.zig", "src/ast-guidance/sync.zig", "src/ast-guidance/tests.zig"],
+  "members": [
+    {
+      "type": "struct",
+      "name": "JsonStore",
+      "match_hash": "3f34465f5f4a2dcc3dcf8c2ed5ed82d029ab59c7ef7240583dfb5e1d78378df6",
+      "signature": "keyword_struct JsonStore { ... }",
+      "patterns": [
+        { "name": "Factory (GoF)", "type": "GoF", "ref": "guidance/skills/gof-patterns/SKILL.md#factory" }
+      ],
+      "is_pub": true,
+      "members": [
+        {
+          "type": "fn_decl",
+          "name": "init",
+          "match_hash": "2df233505173c66a830c27296537efcc1a2eec8baffa0e3d3463be44a89a6844",
+          "signature": "fn init(allocator: std.mem.Allocator) -> JsonStore",
+          "params": [
+            { "name": "allocator", "type": "std.mem.Allocator" }
+          ],
+          "returns": "JsonStore",
+          "is_pub": true,
+          "line": 14
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "loadGuidance",
+          "match_hash": "b658acbae05043874a126a856eb66ddc2ae05480e7c685f57eec4642c162e80a",
+          "signature": "fn loadGuidance(self: *JsonStore, path: []const u8) -> ?types.GuidanceDoc",
+          "params": [
+            { "name": "self", "type": "*JsonStore" },
+            { "name": "path", "type": "[]const u8" }
+          ],
+          "returns": "?types.GuidanceDoc",
+          "is_pub": true,
+          "line": 18
+        }
+    ,    {
+          "type": "fn_private",
+          "name": "parseGuidance",
+          "match_hash": "1f966537edfc012df6cbba5d3dcea807b5c0deabdb80471f58fa2dd5ba2dc2dd",
+          "signature": "fn parseGuidance(self: *JsonStore, content: []const u8) -> ?types.GuidanceDoc",
+          "params": [
+            { "name": "self", "type": "*JsonStore" },
+            { "name": "content", "type": "[]const u8" }
+          ],
+          "returns": "?types.GuidanceDoc",
+          "is_pub": false,
+          "line": 29
+        }
+    ,    {
+          "type": "fn_private",
+          "name": "parseMembers",
+          "match_hash": "3807e15cc3a65d185e8462df709ff6b29deff586cc62e419e59e5214f078bfd4",
+          "signature": "fn parseMembers(self: *JsonStore, members_val: std.json.Value) -> std.mem.Allocator.Error![]types.Member",
+          "params": [
+            { "name": "self", "type": "*JsonStore" },
+            { "name": "members_val", "type": "std.json.Value" }
+          ],
+          "returns": "std.mem.Allocator.Error![]types.Member",
+          "is_pub": false,
+          "line": 114
+        }
+    ,    {
+          "type": "fn_private",
+          "name": "isLeakedPrompt",
+          "match_hash": "4c43215dda3bcbd0be1757d6e7306cd3ea5865bde52adcc5d29c33e6e3bd0698",
+          "signature": "fn isLeakedPrompt(text: []const u8) -> bool",
+          "params": [
+            { "name": "text", "type": "[]const u8" }
+          ],
+          "returns": "bool",
+          "is_pub": false,
+          "line": 131
+        }
+    ,    {
+          "type": "fn_private",
+          "name": "parseMember",
+          "match_hash": "16966830b70f71cda1891d69ff6fe1b916d709703816c851d40280319256146b",
+          "signature": "fn parseMember(self: *JsonStore, member_val: std.json.Value) -> std.mem.Allocator.Error!?types.Member",
+          "params": [
+            { "name": "self", "type": "*JsonStore" },
+            { "name": "member_val", "type": "std.json.Value" }
+          ],
+          "returns": "std.mem.Allocator.Error!?types.Member",
+          "is_pub": false,
+          "line": 151
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "saveGuidance",
+          "match_hash": "cbedb2d62890b0c22297018f94c83560d96c9e0c1531e547657a1703af124a63",
+          "signature": "fn saveGuidance(self: *JsonStore, path: []const u8, doc: types.GuidanceDoc) -> void",
+          "params": [
+            { "name": "self", "type": "*JsonStore" },
+            { "name": "path", "type": "[]const u8" },
+            { "name": "doc", "type": "types.GuidanceDoc" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 285
+        }
+    ,    {
+          "type": "fn_private",
+          "name": "makePathAbsolute",
+          "match_hash": "aaddfb3b47f0efdd1b9e1222c94403b27d22064d648165654fb5d6fe7720f203",
+          "signature": "fn makePathAbsolute(abs_path: []const u8) -> void",
+          "params": [
+            { "name": "abs_path", "type": "[]const u8" }
+          ],
+          "returns": "void",
+          "patterns": [
+            { "name": "Factory (GoF)", "type": "GoF", "ref": "guidance/skills/gof-patterns/SKILL.md#factory" }
+          ],
+          "is_pub": false,
+          "line": 298
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "dupeMember",
+          "match_hash": "0628a121f18f38476249d3595f81ae1cbbbde12f1ab552e0289b1331592664b4",
+          "signature": "fn dupeMember(self: *JsonStore, m: types.Member) -> types.Member",
+          "params": [
+            { "name": "self", "type": "*JsonStore" },
+            { "name": "m", "type": "types.Member" }
+          ],
+          "returns": "types.Member",
+          "is_pub": true,
+          "line": 328
+        }
+    ,    {
+          "type": "fn_private",
+          "name": "dupeParams",
+          "match_hash": "578a1dd22fd9d15ca7c74f55e2a22772ee508bd2cf5ee6368a0ce2a8708502aa",
+          "signature": "fn dupeParams(self: *JsonStore, params: []const types.Param) -> []types.Param",
+          "params": [
+            { "name": "self", "type": "*JsonStore" },
+            { "name": "params", "type": "[]const types.Param" }
+          ],
+          "returns": "[]types.Param",
+          "is_pub": false,
+          "line": 363
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "dupeStrings",
+          "match_hash": "79074c461f7fa1ca91eef01fe81c6a6d10164bae6d0e51baa83b38c394140418",
+          "signature": "fn dupeStrings(self: *JsonStore, strs: []const []const u8) -> [][]const u8",
+          "params": [
+            { "name": "self", "type": "*JsonStore" },
+            { "name": "strs", "type": "[]const []const u8" }
+          ],
+          "returns": "[][]const u8",
+          "is_pub": true,
+          "line": 375
+        }
+    ,    {
+          "type": "fn_private",
+          "name": "dupePatterns",
+          "match_hash": "45fdfe4be4d01c343aa0ab1aa9a34aece1dec160b6af8f1936c2a59e26b6e801",
+          "signature": "fn dupePatterns(self: *JsonStore, patterns: []const types.Pattern) -> []types.Pattern",
+          "params": [
+            { "name": "self", "type": "*JsonStore" },
+            { "name": "patterns", "type": "[]const types.Pattern" }
+          ],
+          "returns": "[]types.Pattern",
+          "is_pub": false,
+          "line": 383
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "dupeSkills",
+          "match_hash": "d2584c22fbf9d2e6053682489ad512d864b3b38e23aab86610dc8e770c687da5",
+          "signature": "fn dupeSkills(self: *JsonStore, skills: []const types.Skill) -> []types.Skill",
+          "params": [
+            { "name": "self", "type": "*JsonStore" },
+            { "name": "skills", "type": "[]const types.Skill" }
+          ],
+          "returns": "[]types.Skill",
+          "is_pub": true,
+          "line": 396
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "freeMember",
+          "match_hash": "a16c7755b4bd89c94ee11794dfb34c1dc7702ca7ee2cc4ebbabb927552513525",
+          "signature": "fn freeMember(self: *JsonStore, member: types.Member) -> void",
+          "params": [
+            { "name": "self", "type": "*JsonStore" },
+            { "name": "member", "type": "types.Member" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 407
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "freeGuidanceDoc",
+          "match_hash": "6ab0fa3d82a1cd2c13556d35106f489602333fd36cfec9b245c46ff475d6a4e4",
+          "signature": "fn freeGuidanceDoc(self: *JsonStore, doc: types.GuidanceDoc) -> void",
+          "params": [
+            { "name": "self", "type": "*JsonStore" },
+            { "name": "doc", "type": "types.GuidanceDoc" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 431
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "mergeMembers",
+          "match_hash": "81a9507eaa712cea22259a0dedcd676df517299971e8ed6a11fd50e7b00422ee",
+          "signature": "fn mergeMembers(self: *JsonStore, source: []const types.Member, existing: []const types.Member, preserve_existing_comments: bool) -> std.mem.Allocator.Error!MergeResult",
+          "params": [
+            { "name": "self", "type": "*JsonStore" },
+            { "name": "source", "type": "[]const types.Member" },
+            { "name": "existing", "type": "[]const types.Member" },
+            { "name": "preserve_existing_comments", "type": "bool" }
+          ],
+          "returns": "std.mem.Allocator.Error!MergeResult",
+          "is_pub": true,
+          "line": 448
+        }
+    ,    {
+          "type": "fn_private",
+          "name": "mergeMember",
+          "match_hash": "a64be8594a3f2965e6b0ec21d053412395729b00ddf618701950752d088dfce5",
+          "signature": "fn mergeMember(self: *JsonStore, source: types.Member, existing: types.Member, result: *MergeResult, preserve_existing_comments: bool) -> types.Member",
+          "params": [
+            { "name": "self", "type": "*JsonStore" },
+            { "name": "source", "type": "types.Member" },
+            { "name": "existing", "type": "types.Member" },
+            { "name": "result", "type": "*MergeResult" },
+            { "name": "preserve_existing_comments", "type": "bool" }
+          ],
+          "returns": "types.Member",
+          "is_pub": false,
+          "line": 491
+        }
+      ],
+      "line": 5
+    },
+    {
+      "type": "struct",
+      "name": "MergeResult",
+      "match_hash": "38f8f71ba2c1e2f8c98146d1167ea9cf28f43fe1857bc46ff5cc713273923b72",
+      "signature": "keyword_struct MergeResult { ... }",
+      "is_pub": true,
+      "line": 584
+    }
+  ]
+}

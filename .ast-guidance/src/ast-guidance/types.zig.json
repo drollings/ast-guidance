@@ -1,0 +1,241 @@
+{
+  "meta": {
+    "module": "src.ast-guidance.types",
+    "source": "src/ast-guidance/types.zig",
+    "language": "zig"
+  },
+  "comment": "Defines data structures for Zig AST analysis, storing members, patterns, signatures, and guidance metadata in a structured format.",
+  "used_by": ["src/ast-guidance/ast_parser.zig", "src/ast-guidance/hash.zig", "src/ast-guidance/json_store.zig", "src/ast-guidance/main.zig", "src/ast-guidance/pattern.zig", "src/ast-guidance/query.zig", "src/ast-guidance/sync.zig", "src/ast-guidance/tests.zig"],
+  "members": [
+    {
+      "type": "enum",
+      "name": "MemberType",
+      "match_hash": "77bb0644cedcf58c7ee95907830fc847661f03cbb56f6e4134e8b952c3eabd9a",
+      "signature": "keyword_enum MemberType { ... }",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "enum_field",
+          "name": "fn_decl",
+          "is_pub": false,
+          "line": 4
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "fn_private",
+          "is_pub": false,
+          "line": 5
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "@\"struct\"",
+          "is_pub": false,
+          "line": 6
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "@\"enum\"",
+          "is_pub": false,
+          "line": 7
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "@\"union\"",
+          "is_pub": false,
+          "line": 8
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "enum_field",
+          "is_pub": false,
+          "line": 9
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "test_decl",
+          "is_pub": false,
+          "line": 10
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "comptime_block",
+          "is_pub": false,
+          "line": 11
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "method",
+          "is_pub": false,
+          "line": 12
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "method_private",
+          "is_pub": false,
+          "line": 13
+        }
+      ],
+      "line": 3
+    },
+    {
+      "type": "struct",
+      "name": "Pattern",
+      "match_hash": "8b11a9732c235ec3b21887c577a3761044c5a36fc1ab8159f3e2f4eb18b6bf10",
+      "signature": "keyword_struct Pattern { ... }",
+      "is_pub": true,
+      "line": 21
+    },
+    {
+      "type": "struct",
+      "name": "Param",
+      "match_hash": "af50a6fe6cc9eacc97156983a19c76c443ed71068d0fb557cdae55743c108a68",
+      "signature": "keyword_struct Param { ... }",
+      "is_pub": true,
+      "line": 27
+    },
+    {
+      "type": "struct",
+      "name": "Member",
+      "match_hash": "3cd3a046821857b4b9b70fd37e1d23cb81c96026381554c53031be630e36c608",
+      "signature": "keyword_struct Member { ... }",
+      "is_pub": true,
+      "line": 33
+    },
+    {
+      "type": "struct",
+      "name": "Meta",
+      "match_hash": "5b80824a2c945733e3ae8e331b59b4c63a0b607c78bb4c0c43132ca9fc79bafc",
+      "signature": "keyword_struct Meta { ... }",
+      "is_pub": true,
+      "line": 53
+    },
+    {
+      "type": "struct",
+      "name": "GuidanceDoc",
+      "match_hash": "cfa337c3001f00ec0c367df2e1d0aca5d3800dd99bf66c9bb396e6b7ff07a728",
+      "signature": "keyword_struct GuidanceDoc { ... }",
+      "is_pub": true,
+      "line": 59
+    },
+    {
+      "type": "struct",
+      "name": "FileMatch",
+      "match_hash": "61ac8aec264632b0af58170f3b421122ceb0d7a8e8cecb3fd37ec958b909a4f5",
+      "signature": "keyword_struct FileMatch { ... }",
+      "is_pub": true,
+      "line": 68
+    },
+    {
+      "type": "struct",
+      "name": "GuidanceInfo",
+      "match_hash": "f4375b0b717de4704b40cecbc6f4ca3f2650e1c61425a155ba720f95b46353be",
+      "signature": "keyword_struct GuidanceInfo { ... }",
+      "is_pub": true,
+      "line": 75
+    },
+    {
+      "type": "struct",
+      "name": "ASTAnalysis",
+      "match_hash": "1f43542cb3c0fe29f92158ea70fe8094cac3c1b0cc2ca18956b301766931e93e",
+      "signature": "keyword_struct ASTAnalysis { ... }",
+      "is_pub": true,
+      "line": 84
+    },
+    {
+      "type": "struct",
+      "name": "QueryResult",
+      "match_hash": "5980246eb3bab94cf3948ca5138db07067d07a620289cde7701e9a18c473be89",
+      "signature": "keyword_struct QueryResult { ... }",
+      "is_pub": true,
+      "line": 94
+    },
+    {
+      "type": "struct",
+      "name": "SyncResult",
+      "match_hash": "311599e172acc49d264122c1e2903728f4389a6c683d932c25c1f4d43ccb5d6a",
+      "signature": "keyword_struct SyncResult { ... }",
+      "is_pub": true,
+      "line": 106
+    },
+    {
+      "type": "fn_decl",
+      "name": "jsonStringifyAlloc",
+      "match_hash": "8005ec25d4416da5a93e23b820e4247137dfc37ce00b4277c6b97891a39d958e",
+      "signature": "fn jsonStringifyAlloc(allocator: std.mem.Allocator, value) -> []u8",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "value" }
+      ],
+      "returns": "[]u8",
+      "is_pub": true,
+      "line": 114
+    },
+    {
+      "type": "fn_decl",
+      "name": "jsonifyMember",
+      "match_hash": "f1469b8124657f84e29d9630843f52aec23573cb892c1fa9468da5595a34cb91",
+      "signature": "fn jsonifyMember(allocator: std.mem.Allocator, member: Member) -> ?[]u8",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "member", "type": "Member" }
+      ],
+      "returns": "?[]u8",
+      "is_pub": true,
+      "line": 123
+    },
+    {
+      "type": "fn_private",
+      "name": "writeFieldOrComma",
+      "match_hash": "83ed3f3b6ba7e075c765a36b341948ac9baa86636f6a64adcbf5b503e42fc409",
+      "signature": "fn writeFieldOrComma(writer, key: []const u8, value: ?[]const u8) -> void",
+      "params": [
+        { "name": "writer" },
+        { "name": "key", "type": "[]const u8" },
+        { "name": "value", "type": "?[]const u8" }
+      ],
+      "returns": "void",
+      "is_pub": false,
+      "line": 227
+    },
+    {
+      "type": "fn_private",
+      "name": "writeEscapedValue",
+      "match_hash": "d2d72ecbe63536e0b701a6b21fa972d63b855299baedb396df1c52ef5e83ef2f",
+      "signature": "fn writeEscapedValue(writer, value: []const u8) -> void",
+      "params": [
+        { "name": "writer" },
+        { "name": "value", "type": "[]const u8" }
+      ],
+      "returns": "void",
+      "is_pub": false,
+      "line": 235
+    },
+    {
+      "type": "fn_private",
+      "name": "writeEscapedString",
+      "match_hash": "6223b0721dadb199f1e583f91d5d512c57c56fb85300b90e6ed8a739f67756ad",
+      "signature": "fn writeEscapedString(writer, key: []const u8, value: []const u8) -> void",
+      "params": [
+        { "name": "writer" },
+        { "name": "key", "type": "[]const u8" },
+        { "name": "value", "type": "[]const u8" }
+      ],
+      "returns": "void",
+      "is_pub": false,
+      "line": 248
+    },
+    {
+      "type": "fn_decl",
+      "name": "jsonifyGuidanceDoc",
+      "match_hash": "9cf9a76ff20d5b50c1c594024891ec6e4f6e6baa7781a8eeb1cba40deadce2a5",
+      "signature": "fn jsonifyGuidanceDoc(allocator: std.mem.Allocator, doc: GuidanceDoc) -> []u8",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "doc", "type": "GuidanceDoc" }
+      ],
+      "returns": "[]u8",
+      "is_pub": true,
+      "line": 254
+    }
+  ]
+}

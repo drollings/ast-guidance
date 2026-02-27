@@ -1,0 +1,74 @@
+{
+  "meta": {
+    "module": "src.ast-guidance.deps",
+    "source": "src/ast-guidance/deps.zig",
+    "language": "zig"
+  },
+  "comment": "Generates dependency graph from Zig AST files, handling paths and file content to build a map of imports.",
+  "used_by": ["src/ast-guidance/main.zig"],
+  "members": [
+    {
+      "type": "struct",
+      "name": "DepsGenerator",
+      "match_hash": "73555f33f8b73cbb3299eaa772733959adf90116f68f1ca1e56d531ea7ef4c15",
+      "signature": "keyword_struct DepsGenerator { ... }",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "fn_decl",
+          "name": "init",
+          "match_hash": "24bd056e4e9b3e61c6cc85b6a293f643597cbab6e12920d0fb614e20d3b4842c",
+          "signature": "fn init(allocator: std.mem.Allocator, cwd: []const u8) -> DepsGenerator",
+          "params": [
+            { "name": "allocator", "type": "std.mem.Allocator" },
+            { "name": "cwd", "type": "[]const u8" }
+          ],
+          "returns": "DepsGenerator",
+          "is_pub": true,
+          "line": 8
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "generateDependencies",
+          "match_hash": "8531917540982084b0da135867307ac2dca17c4ee00852929b90192fdbba6977",
+          "signature": "fn generateDependencies(self: *DepsGenerator, src_dir: []const u8) -> void",
+          "params": [
+            { "name": "self", "type": "*DepsGenerator" },
+            { "name": "src_dir", "type": "[]const u8" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 15
+        }
+    ,    {
+          "type": "fn_private",
+          "name": "resolveImport",
+          "match_hash": "f695d2a0af64352c011f05f656a57913c65468e00799bc527230d5e9116189a9",
+          "signature": "fn resolveImport(self: *DepsGenerator, from_file: []const u8, import_path: []const u8) -> ?[]const u8",
+          "params": [
+            { "name": "self", "type": "*DepsGenerator" },
+            { "name": "from_file", "type": "[]const u8" },
+            { "name": "import_path", "type": "[]const u8" }
+          ],
+          "returns": "?[]const u8",
+          "is_pub": false,
+          "line": 136
+        }
+    ,    {
+          "type": "fn_private",
+          "name": "resolveImportPath",
+          "match_hash": "72613788832cd8b49f6648e02a1c4521c5adf9bc8b912b82fb4f87968725bf57",
+          "signature": "fn resolveImportPath(self: *DepsGenerator, import_path: []const u8) -> ?[]const u8",
+          "params": [
+            { "name": "self", "type": "*DepsGenerator" },
+            { "name": "import_path", "type": "[]const u8" }
+          ],
+          "returns": "?[]const u8",
+          "is_pub": false,
+          "line": 161
+        }
+      ],
+      "line": 4
+    }
+  ]
+}

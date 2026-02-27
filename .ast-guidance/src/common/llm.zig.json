@@ -1,0 +1,345 @@
+{
+  "meta": {
+    "module": "src.common.llm",
+    "source": "src/common/llm.zig",
+    "language": "zig"
+  },
+  "comment": "Handles LLM response formatting, strips thinking blocks, and cleans preamble patterns.",
+  "members": [
+    {
+      "type": "struct",
+      "name": "LlmConfig",
+      "match_hash": "fd5af9788a3a32d4473e8226b941eaeb0932dde57a60642e4db5b448c8ef7255",
+      "signature": "keyword_struct LlmConfig { ... }",
+      "is_pub": true,
+      "line": 16
+    },
+    {
+      "type": "fn_private",
+      "name": "writeEscapedString",
+      "match_hash": "7ce3ff9363b961c8a9e373488b7bd47e3dce769cf0ffd7cf0377c927b3bdf7f8",
+      "signature": "fn writeEscapedString(writer, s: []const u8) -> void",
+      "params": [
+        { "name": "writer" },
+        { "name": "s", "type": "[]const u8" }
+      ],
+      "returns": "void",
+      "is_pub": false,
+      "line": 23
+    },
+    {
+      "type": "fn_decl",
+      "name": "stripThinkBlock",
+      "match_hash": "95c3b4915ceed297ceb2683ca261b7b201bd6e0717c5b83f76be630db83fb69c",
+      "signature": "fn stripThinkBlock(text: []const u8) -> []const u8",
+      "params": [
+        { "name": "text", "type": "[]const u8" }
+      ],
+      "returns": "[]const u8",
+      "is_pub": true,
+      "line": 40
+    },
+    {
+      "type": "fn_decl",
+      "name": "stripPreamble",
+      "match_hash": "7ecbcc31133f66a082623d0aeb90d6ae87b149b08ddccec4172c0d5a89c6c46e",
+      "signature": "fn stripPreamble(allocator: std.mem.Allocator, text: []const u8) -> []const u8",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "text", "type": "[]const u8" }
+      ],
+      "returns": "[]const u8",
+      "is_pub": true,
+      "line": 81
+    },
+    {
+      "type": "fn_decl",
+      "name": "isMalformedResponse",
+      "match_hash": "d2b67f6b51085730ec0c330ee3ea585383f76dd4f94abde904fb029e25c0415e",
+      "signature": "fn isMalformedResponse(text: []const u8) -> bool",
+      "params": [
+        { "name": "text", "type": "[]const u8" }
+      ],
+      "returns": "bool",
+      "is_pub": true,
+      "line": 124
+    },
+    {
+      "type": "fn_private",
+      "name": "llmHasDanglingEnd",
+      "match_hash": "92d37f5c26c6a53f32c388786ae72e68df648da5d2f890d4623e8b891ef2126b",
+      "signature": "fn llmHasDanglingEnd(body: []const u8) -> bool",
+      "params": [
+        { "name": "body", "type": "[]const u8" }
+      ],
+      "returns": "bool",
+      "is_pub": false,
+      "line": 154
+    },
+    {
+      "type": "fn_private",
+      "name": "llmIsGenericSelfRef",
+      "match_hash": "6dd32d83420206cc0ee18bd436409d4d01264670b0e53017c573ad5866a152db",
+      "signature": "fn llmIsGenericSelfRef(body: []const u8) -> bool",
+      "params": [
+        { "name": "body", "type": "[]const u8" }
+      ],
+      "returns": "bool",
+      "is_pub": false,
+      "line": 167
+    },
+    {
+      "type": "fn_private",
+      "name": "llmIsOverlyGeneric",
+      "match_hash": "a8f6a14a4e9d45bf6ad4af01f523b34d4891d593d9c36b681cf8495d69ecea3f",
+      "signature": "fn llmIsOverlyGeneric(body: []const u8) -> bool",
+      "params": [
+        { "name": "body", "type": "[]const u8" }
+      ],
+      "returns": "bool",
+      "is_pub": false,
+      "line": 179
+    },
+    {
+      "type": "fn_private",
+      "name": "llmContainsIgnoreCase",
+      "match_hash": "b35539148128732e27b385b580a75ac0c64a2f083a2b2eed164422271e6553bc",
+      "signature": "fn llmContainsIgnoreCase(haystack: []const u8, needle: []const u8) -> bool",
+      "params": [
+        { "name": "haystack", "type": "[]const u8" },
+        { "name": "needle", "type": "[]const u8" }
+      ],
+      "returns": "bool",
+      "is_pub": false,
+      "line": 193
+    },
+    {
+      "type": "fn_decl",
+      "name": "extractCommentTag",
+      "match_hash": "508f67edd5f7a3d015ed377c4883688cc9ec03e5c0329acc7ee0de9fb6e703ca",
+      "signature": "fn extractCommentTag(text: []const u8) -> ?[]const u8",
+      "params": [
+        { "name": "text", "type": "[]const u8" }
+      ],
+      "returns": "?[]const u8",
+      "is_pub": true,
+      "line": 207
+    },
+    {
+      "type": "struct",
+      "name": "LlmClient",
+      "match_hash": "48372c90add81bd93c5a2ab36907c51afdfdef3bac759412dd55e7f95e3e03fa",
+      "signature": "keyword_struct LlmClient { ... }",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "fn_decl",
+          "name": "init",
+          "match_hash": "86770a48dea19db1e756108f830de238c821ba3a49992b24a3bf93091a66ee58",
+          "signature": "fn init(allocator: std.mem.Allocator, config: LlmConfig) -> LlmClient",
+          "params": [
+            { "name": "allocator", "type": "std.mem.Allocator" },
+            { "name": "config", "type": "LlmConfig" }
+          ],
+          "returns": "LlmClient",
+          "is_pub": true,
+          "line": 225
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "deinit",
+          "match_hash": "3fff429679ebb90c3397aab7f9ac6b3d37f09f28334516de0df50900c164869f",
+          "signature": "fn deinit(self: *LlmClient) -> void",
+          "params": [
+            { "name": "self", "type": "*LlmClient" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 251
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "complete",
+          "match_hash": "1cf7f5e31460382df73465ae778017ca959945c0b5e1013ec38ce8d90adb4e7e",
+          "signature": "fn complete(self: *LlmClient, prompt: []const u8, max_tokens: usize, temperature: f32, system: ?[]const u8) -> LlmError!?[]const u8",
+          "params": [
+            { "name": "self", "type": "*LlmClient" },
+            { "name": "prompt", "type": "[]const u8" },
+            { "name": "max_tokens", "type": "usize" },
+            { "name": "temperature", "type": "f32" },
+            { "name": "system", "type": "?[]const u8" }
+          ],
+          "returns": "LlmError!?[]const u8",
+          "is_pub": true,
+          "line": 256
+        }
+    ,    {
+          "type": "fn_private",
+          "name": "completeViaShell",
+          "match_hash": "ca553db4b89db31f1c55ba8a1e811d883bf76fec0db66b26afc69de1e0494f67",
+          "signature": "fn completeViaShell(self: *LlmClient, url: []const u8, json_body: []const u8) -> LlmError!?[]const u8",
+          "params": [
+            { "name": "self", "type": "*LlmClient" },
+            { "name": "url", "type": "[]const u8" },
+            { "name": "json_body", "type": "[]const u8" }
+          ],
+          "returns": "LlmError!?[]const u8",
+          "is_pub": false,
+          "line": 301
+        }
+    ,    {
+          "type": "fn_private",
+          "name": "extractResponseText",
+          "match_hash": "977ffc3a0e9436f21393f6c9c0c4d36063d1ed03f3e8445772d5d48ac8dec389",
+          "signature": "fn extractResponseText(self: *LlmClient, resp: []const u8) -> ?[]const u8",
+          "params": [
+            { "name": "self", "type": "*LlmClient" },
+            { "name": "resp", "type": "[]const u8" }
+          ],
+          "returns": "?[]const u8",
+          "is_pub": false,
+          "line": 340
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "available",
+          "match_hash": "3d0c45d8023d0880c75881bce9cfc57df32f4800fce94b5de9ac0fc1744317c5",
+          "signature": "fn available(self: *LlmClient) -> bool",
+          "params": [
+            { "name": "self", "type": "*LlmClient" }
+          ],
+          "returns": "bool",
+          "is_pub": true,
+          "line": 390
+        }
+      ],
+      "line": 218
+    },
+    {
+      "type": "test_decl",
+      "name": "LlmClient init with api/chat URL uses it directly",
+      "is_pub": false,
+      "line": 429
+    },
+    {
+      "type": "test_decl",
+      "name": "LlmClient init with v1/completions URL converts to api/chat",
+      "is_pub": false,
+      "line": 444
+    },
+    {
+      "type": "test_decl",
+      "name": "LlmClient OpenAI format",
+      "is_pub": false,
+      "line": 459
+    },
+    {
+      "type": "test_decl",
+      "name": "stripThinkBlock removes think tags",
+      "is_pub": false,
+      "line": 474
+    },
+    {
+      "type": "test_decl",
+      "name": "stripThinkBlock handles unclosed think tag",
+      "is_pub": false,
+      "line": 488
+    },
+    {
+      "type": "test_decl",
+      "name": "stripThinkBlock handles [THINK] tags",
+      "is_pub": false,
+      "line": 495
+    },
+    {
+      "type": "test_decl",
+      "name": "stripPreamble removes leading preamble line",
+      "is_pub": false,
+      "line": 501
+    },
+    {
+      "type": "test_decl",
+      "name": "isMalformedResponse: empty is malformed",
+      "is_pub": false,
+      "line": 520
+    },
+    {
+      "type": "test_decl",
+      "name": "isMalformedResponse: dangling preposition",
+      "is_pub": false,
+      "line": 525
+    },
+    {
+      "type": "test_decl",
+      "name": "isMalformedResponse: ends with question mark",
+      "is_pub": false,
+      "line": 530
+    },
+    {
+      "type": "test_decl",
+      "name": "isMalformedResponse: generic self-reference",
+      "is_pub": false,
+      "line": 534
+    },
+    {
+      "type": "test_decl",
+      "name": "isMalformedResponse: overly generic single word",
+      "is_pub": false,
+      "line": 540
+    },
+    {
+      "type": "test_decl",
+      "name": "isMalformedResponse: LLM preamble phrases",
+      "is_pub": false,
+      "line": 546
+    },
+    {
+      "type": "test_decl",
+      "name": "isMalformedResponse: valid responses are NOT malformed",
+      "is_pub": false,
+      "line": 553
+    },
+    {
+      "type": "test_decl",
+      "name": "isMalformedResponse: reasoning-model chain-of-thought phrases",
+      "is_pub": false,
+      "line": 559
+    },
+    {
+      "type": "test_decl",
+      "name": "extractCommentTag: returns tag content",
+      "is_pub": false,
+      "line": 570
+    },
+    {
+      "type": "test_decl",
+      "name": "extractCommentTag: trims whitespace inside tag",
+      "is_pub": false,
+      "line": 577
+    },
+    {
+      "type": "test_decl",
+      "name": "extractCommentTag: returns null when no tag present",
+      "is_pub": false,
+      "line": 584
+    },
+    {
+      "type": "test_decl",
+      "name": "extractCommentTag: returns null for empty tag",
+      "is_pub": false,
+      "line": 590
+    },
+    {
+      "type": "test_decl",
+      "name": "extractCommentTag: chain-of-thought before tag is ignored",
+      "is_pub": false,
+      "line": 594
+    },
+    {
+      "type": "test_decl",
+      "name": "writeEscapedString escapes properly",
+      "is_pub": false,
+      "line": 606
+    }
+  ]
+}

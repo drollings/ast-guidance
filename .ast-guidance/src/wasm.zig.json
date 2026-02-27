@@ -1,0 +1,914 @@
+{
+  "meta": {
+    "module": "src.wasm",
+    "source": "src/wasm.zig",
+    "language": "zig"
+  },
+  "comment": "[gof-patterns] Defines WebAssembly sandboxing for Zig, enabling secure dynamic module loading via zero-copy IPC and DAG-based execution.",
+  "skills": [
+    { "ref": "guidance/skills/gof-patterns/SKILL.md", "context": "GoF patterns detected" }
+  ],
+  "used_by": ["src/main.zig"],
+  "members": [
+    {
+      "type": "struct",
+      "name": "BinaryHeader",
+      "match_hash": "c69cbaf8a3179739f71fa0a4578bfdb816781daa6e9f5408c3b8f1bcc56c112f",
+      "signature": "keyword_struct BinaryHeader { ... }",
+      "comment": "Defines a fixed-size binary header for Zig WASM modules, managing initialization and validation with strict ownership and invariants.",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "fn_decl",
+          "name": "init",
+          "match_hash": "a71b0544cf50f8cdf909b86d4cf1cb62aaa24bdfecc201663c2544c9c7e2ab9c",
+          "signature": "fn init(payload_type: PayloadType, size: u32) -> BinaryHeader",
+          "params": [
+            { "name": "payload_type", "type": "PayloadType" },
+            { "name": "size", "type": "u32" }
+          ],
+          "returns": "BinaryHeader",
+          "is_pub": true,
+          "line": 39
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "validate",
+          "match_hash": "1b5250fd1e4856838a40e79ac8e62f73aaf498d2a3141a71adad2bcd3f99e7ef",
+          "signature": "fn validate(self: *const BinaryHeader) -> bool",
+          "params": [
+            { "name": "self", "type": "*const BinaryHeader" }
+          ],
+          "returns": "bool",
+          "is_pub": true,
+          "line": 49
+        }
+      ],
+      "line": 32
+    },
+    {
+      "type": "enum",
+      "name": "PayloadType",
+      "match_hash": "1cabcf77e8879039e1d2d3ecad4dc64cd59b3fb071a0bc8e828b4ae3db10ffb0",
+      "signature": "keyword_enum PayloadType { ... }",
+      "comment": "Defines payload type with ownership and invariants; manages fixed buffers; not thread-safe.",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "enum_field",
+          "name": "context_node",
+          "is_pub": false,
+          "line": 57
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "execution_request",
+          "is_pub": false,
+          "line": 58
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "execution_result",
+          "is_pub": false,
+          "line": 59
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "error_response",
+          "is_pub": false,
+          "line": 60
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "host_function_call",
+          "is_pub": false,
+          "line": 61
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "host_function_result",
+          "is_pub": false,
+          "line": 62
+        }
+      ],
+      "line": 56
+    },
+    {
+      "type": "struct",
+      "name": "BinaryContextNode",
+      "match_hash": "0f74a3f86e0fe3de76c1fe14cacaf33d10108fb131ec0065c5a9e31474fad4af",
+      "signature": "keyword_struct BinaryContextNode { ... }",
+      "comment": "Manages binary context buffers with fixed-size allocations; owns node lifecycle; provides ID and lod access.",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "fn_decl",
+          "name": "init",
+          "match_hash": "7778e8b22321d2adb8ad15b6c883501b0afa7726af33d8c1ff309a41eff21195",
+          "signature": "fn init(node: *const ContextNode, buffer: []u8) -> BinaryContextNode",
+          "params": [
+            { "name": "node", "type": "*const ContextNode" },
+            { "name": "buffer", "type": "[]u8" }
+          ],
+          "returns": "BinaryContextNode",
+          "is_pub": true,
+          "line": 84
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "getId",
+          "match_hash": "61b7b32ee49db46a45a13403a0630049749cdcfc07ad28fc172a36baae813484",
+          "signature": "fn getId(self: *const BinaryContextNode) -> u128",
+          "params": [
+            { "name": "self", "type": "*const BinaryContextNode" }
+          ],
+          "returns": "u128",
+          "is_pub": true,
+          "line": 124
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "getLod0",
+          "match_hash": "a4fc062a488cfe6fc839d322940d8736d1fc17f11ff71e6d99c71aef2fa6120f",
+          "signature": "fn getLod0(self: *const BinaryContextNode, buffer: []const u8) -> []const u8",
+          "params": [
+            { "name": "self", "type": "*const BinaryContextNode" },
+            { "name": "buffer", "type": "[]const u8" }
+          ],
+          "returns": "[]const u8",
+          "is_pub": true,
+          "line": 128
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "getLod4",
+          "match_hash": "0a2d30944d034ef1317fed0b4837822252c6780c81eea31161f5bfa91b76be96",
+          "signature": "fn getLod4(self: *const BinaryContextNode, buffer: []const u8) -> []const u8",
+          "params": [
+            { "name": "self", "type": "*const BinaryContextNode" },
+            { "name": "buffer", "type": "[]const u8" }
+          ],
+          "returns": "[]const u8",
+          "is_pub": true,
+          "line": 132
+        }
+      ],
+      "line": 67
+    },
+    {
+      "type": "struct",
+      "name": "BinaryExecutionRequest",
+      "match_hash": "f3ab3a52c0c4e7e653f76815775376c8d9d1c200ac1db36d242918e1160e8122",
+      "signature": "keyword_struct BinaryExecutionRequest { ... }",
+      "comment": "Represents a binary execution request with fixed-size buffers; managed by owner; ensures data integrity during execution.",
+      "is_pub": true,
+      "line": 138
+    },
+    {
+      "type": "struct",
+      "name": "BinaryExecutionResult",
+      "match_hash": "0d90c6316e82792af2283c401f4d5264cc93305d9554bf81b237e9b5f67486e6",
+      "signature": "keyword_struct BinaryExecutionResult { ... }",
+      "comment": "Represents execution outcome with mask; owned by the struct, no external mutation.",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "fn_decl",
+          "name": "getProvidesMask",
+          "match_hash": "66ddd170dc870e586e469ef6f18b392f135e55fdf76ae320523e3be448362930",
+          "signature": "fn getProvidesMask(self: *const BinaryExecutionResult) -> u128",
+          "params": [
+            { "name": "self", "type": "*const BinaryExecutionResult" }
+          ],
+          "returns": "u128",
+          "is_pub": true,
+          "line": 163
+        }
+      ],
+      "line": 154
+    },
+    {
+      "type": "enum",
+      "name": "ExtismValType",
+      "match_hash": "53202749e587cfcd17cdecc29d93a2ce8c5e269704a1a7b516c15187c56c3871",
+      "signature": "keyword_enum ExtismValType { ... }",
+      "comment": "Represents a fixed-size buffer type with ownership and invariants; managed via init/deinit; not thread-safe.",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "enum_field",
+          "name": "void",
+          "is_pub": false,
+          "line": 180
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "i32",
+          "is_pub": false,
+          "line": 181
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "i64",
+          "is_pub": false,
+          "line": 182
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "f32",
+          "is_pub": false,
+          "line": 183
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "f64",
+          "is_pub": false,
+          "line": 184
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "v128",
+          "is_pub": false,
+          "line": 185
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "funcref",
+          "is_pub": false,
+          "line": 186
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "externref",
+          "is_pub": false,
+          "line": 187
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "ptr",
+          "is_pub": false,
+          "line": 188
+        }
+      ],
+      "line": 179
+    },
+    {
+      "type": "struct",
+      "name": "extism",
+      "match_hash": "a1472bbf5cb23b4a382779bb403e0c1880ab31da5e0b54e2901b003fef9d52db",
+      "signature": "keyword_struct extism { ... }",
+      "comment": "Tracks existence state with ownership; ensures stable lifecycle; not shared across threads.",
+      "is_pub": true,
+      "line": 208
+    },
+    {
+      "type": "struct",
+      "name": "WasmManifest",
+      "match_hash": "0a51e5e2e3d08d708a91ecbdc78c64a43adb7d975fe8895b547fb788d9cd3013",
+      "signature": "keyword_struct WasmManifest { ... }",
+      "comment": "Defines manifest metadata with init/init functions; manages WasmModule structure; ensures fixed-size buffer alignment.",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "fn_decl",
+          "name": "init",
+          "match_hash": "710754e53f9d46e05fe847eb07e492f002d0dd6e47fcc8fcceccaaad45ee28b7",
+          "signature": "fn init(wasm_bytes: []const u8) -> WasmManifest",
+          "params": [
+            { "name": "wasm_bytes", "type": "[]const u8" }
+          ],
+          "returns": "WasmManifest",
+          "is_pub": true,
+          "line": 297
+        }
+      ],
+      "line": 289
+    },
+    {
+      "type": "struct",
+      "name": "WasmPlugin",
+      "match_hash": "769c20072dcd8c9df9e5d2071448b152df12fc6be132b0f3291bcb00d899af17",
+      "signature": "keyword_struct WasmPlugin { ... }",
+      "comment": "Manages WasmPlugin lifecycle with allocator, stores/loads data; owns buffers, not shared.",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "fn_decl",
+          "name": "init",
+          "match_hash": "fc7670452284bb17285ebe7e92d1604f2c6a31b16ca39df8cdbff4f3d0735bf1",
+          "signature": "fn init(allocator: std.mem.Allocator, manifest: WasmManifest) -> Self",
+          "params": [
+            { "name": "allocator", "type": "std.mem.Allocator" },
+            { "name": "manifest", "type": "WasmManifest" }
+          ],
+          "returns": "Self",
+          "is_pub": true,
+          "line": 311
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "deinit",
+          "match_hash": "b1fed8bd8f6fbbb89fe229b3f385a27a00f8b03829d24a4600d63bc36b3926a9",
+          "signature": "fn deinit(self: *Self) -> void",
+          "params": [
+            { "name": "self", "type": "*Self" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 335
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "call",
+          "match_hash": "6d1d7603b682b4e12f497a78c3cdd18927eb61084a3e3bde3b3a8ca501bd92b5",
+          "signature": "fn call(self: *Self, func_name: [:0]const u8, input: []const u8) -> []const u8",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "func_name", "type": "[:0]const u8" },
+            { "name": "input", "type": "[]const u8" }
+          ],
+          "returns": "[]const u8",
+          "is_pub": true,
+          "line": 340
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "alloc",
+          "match_hash": "c880cd389763309d0468d233abb013ed4345b2fd1b5b4487adb50743e0a19b7e",
+          "signature": "fn alloc(self: *Self, size: u64) -> u64",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "size", "type": "u64" }
+          ],
+          "returns": "u64",
+          "is_pub": true,
+          "line": 365
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "store",
+          "match_hash": "3f6c3bcffbed3c86213457187765468e2f971ae7c0d25f6d11f6781db10d1622",
+          "signature": "fn store(self: *Self, ptr: u64, data: []const u8) -> void",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "ptr", "type": "u64" },
+            { "name": "data", "type": "[]const u8" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 369
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "load",
+          "match_hash": "2157bbacb9cdffec7dcfdcb596d89293b0d67c468f892eeed83278c2a87f1d89",
+          "signature": "fn load(self: *Self, ptr: u64, buf: []u8) -> void",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "ptr", "type": "u64" },
+            { "name": "buf", "type": "[]u8" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 373
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "freePtr",
+          "match_hash": "2816455bf852b7d73c7fcde3a5c539cdeae38a6c6ffbed7184df20e7af72edd7",
+          "signature": "fn freePtr(self: *Self, ptr: u64) -> void",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "ptr", "type": "u64" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 377
+        }
+      ],
+      "line": 303
+    },
+    {
+      "type": "fn_decl",
+      "name": "hostGetNodeLod1",
+      "match_hash": "118275dcb1589f861dd75ac4f17da86581c5613151603c90dfcdeed9b2f076d5",
+      "signature": "fn hostGetNodeLod1(plugin: ?*anyopaque, inputs: [*]const ExtismVal, n_inputs: u64, outputs: [*]ExtismVal, n_outputs: u64, user_data: ?*anyopaque) -> void",
+      "params": [
+        { "name": "plugin", "type": "?*anyopaque" },
+        { "name": "inputs", "type": "[*]const ExtismVal" },
+        { "name": "n_inputs", "type": "u64" },
+        { "name": "outputs", "type": "[*]ExtismVal" },
+        { "name": "n_outputs", "type": "u64" },
+        { "name": "user_data", "type": "?*anyopaque" }
+      ],
+      "returns": "void",
+      "comment": "Retrieves low-level node data from the plugin using specified inputs and outputs.",
+      "is_pub": true,
+      "line": 394
+    },
+    {
+      "type": "fn_decl",
+      "name": "hostGetNeighbors",
+      "match_hash": "4e0dd94c50bc4396d9319a6847c7c75348495e6b75efa6f401cac94d73fed570",
+      "signature": "fn hostGetNeighbors(plugin: ?*anyopaque, inputs: [*]const ExtismVal, n_inputs: u64, outputs: [*]ExtismVal, n_outputs: u64, user_data: ?*anyopaque) -> void",
+      "params": [
+        { "name": "plugin", "type": "?*anyopaque" },
+        { "name": "inputs", "type": "[*]const ExtismVal" },
+        { "name": "n_inputs", "type": "u64" },
+        { "name": "outputs", "type": "[*]ExtismVal" },
+        { "name": "n_outputs", "type": "u64" },
+        { "name": "user_data", "type": "?*anyopaque" }
+      ],
+      "returns": "void",
+      "comment": "Retrieves neighbor data from the plugin based on inputs, outputs, and user data.",
+      "is_pub": true,
+      "line": 430
+    },
+    {
+      "type": "struct",
+      "name": "HostFunctionRegistry",
+      "match_hash": "9c3a668e513307aacada98dbecbff8389f208c990b9c523f144ae35d72479e1e",
+      "signature": "keyword_struct HostFunctionRegistry { ... }",
+      "comment": "Manages host function registrations with ownership and invariants; not thread-safe.",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "fn_decl",
+          "name": "init",
+          "match_hash": "5ad974043807e3a1e44144bf56f3f6f75a9f86eb92081fd8a9f7e8d327a66d78",
+          "signature": "fn init(allocator: std.mem.Allocator, library: *Library) -> Self",
+          "params": [
+            { "name": "allocator", "type": "std.mem.Allocator" },
+            { "name": "library", "type": "*Library" }
+          ],
+          "returns": "Self",
+          "is_pub": true,
+          "line": 454
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "deinit",
+          "match_hash": "b1fed8bd8f6fbbb89fe229b3f385a27a00f8b03829d24a4600d63bc36b3926a9",
+          "signature": "fn deinit(self: *Self) -> void",
+          "params": [
+            { "name": "self", "type": "*Self" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 465
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "registerStandard",
+          "match_hash": "84945f7dfd505db0bba41c8bf2b58d1910832724797abe9a70c6fdc073058078",
+          "signature": "fn registerStandard(self: *Self) -> void",
+          "params": [
+            { "name": "self", "type": "*Self" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 473
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "getFunctionArray",
+          "match_hash": "c98789b1dd1581f74016a12e740a51dc5b017d844f3e718876763dd708991774",
+          "signature": "fn getFunctionArray(self: *Self) -> []ExtismFunction",
+          "params": [
+            { "name": "self", "type": "*Self" }
+          ],
+          "returns": "[]ExtismFunction",
+          "is_pub": true,
+          "line": 502
+        }
+      ],
+      "line": 447
+    },
+    {
+      "type": "struct",
+      "name": "WasmTarget",
+      "match_hash": "e2245a2786ef394bc5d7b3d05790685b333da18375ddea773e8131dd3d663ebe",
+      "signature": "keyword_struct WasmTarget { ... }",
+      "comment": "Defines a WasmTarget struct managing memory allocation and initialization; owns its state, requires allocator, and enforces strict ownership model.",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "fn_decl",
+          "name": "init",
+          "match_hash": "115dfa608c3d6b371cf9751dc3a2127aa3bda802517548b2a8a05df5b7541054",
+          "signature": "fn init(allocator: std.mem.Allocator, id: u128, name: []const u8, wasm_bytes: []const u8, total_bits: usize) -> Self",
+          "params": [
+            { "name": "allocator", "type": "std.mem.Allocator" },
+            { "name": "id", "type": "u128" },
+            { "name": "name", "type": "[]const u8" },
+            { "name": "wasm_bytes", "type": "[]const u8" },
+            { "name": "total_bits", "type": "usize" }
+          ],
+          "returns": "Self",
+          "is_pub": true,
+          "line": 532
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "deinit",
+          "match_hash": "9450bcb32205961f46e5992b23a25af0c0c456ae6706c50ef37e742cc8f2d489",
+          "signature": "fn deinit(self: *Self, allocator: std.mem.Allocator) -> void",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "allocator", "type": "std.mem.Allocator" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 548
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "run",
+          "match_hash": "0914e0fad0d1499bcb9ce9b7d1929495f76715b6415123c3b5453bf7bf9abb08",
+          "signature": "fn run(self: *Self, allocator: std.mem.Allocator, node: *const ContextNode, host_registry: ?*HostFunctionRegistry) -> ExecutionResult",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "allocator", "type": "std.mem.Allocator" },
+            { "name": "node", "type": "*const ContextNode" },
+            { "name": "host_registry", "type": "?*HostFunctionRegistry" }
+          ],
+          "returns": "ExecutionResult",
+          "is_pub": true,
+          "line": 556
+        }
+      ],
+      "line": 513
+    },
+    {
+      "type": "fn_private",
+      "name": "createPluginWithHostFunctions",
+      "match_hash": "16dba9161f14c8cbec2b423d9d2d47cfedd29f813f3990736048ed4abebb2098",
+      "signature": "fn createPluginWithHostFunctions(allocator: std.mem.Allocator, manifest: WasmManifest, registry: *HostFunctionRegistry) -> WasmPlugin",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "manifest", "type": "WasmManifest" },
+        { "name": "registry", "type": "*HostFunctionRegistry" }
+      ],
+      "returns": "WasmPlugin",
+      "comment": "Creates a Wasm plugin with host functions using provided allocator, manifest, and registry.",
+      "patterns": [
+        { "name": "Factory (GoF)", "type": "GoF", "ref": "guidance/skills/gof-patterns/SKILL.md#factory" }
+      ],
+      "is_pub": false,
+      "line": 621
+    },
+    {
+      "type": "struct",
+      "name": "ToolCompilerConfig",
+      "match_hash": "de798e6b1e3e5c50d530e3b09cd4f74c1acdc573eb13ef4d1fe0df0c099ba4ab",
+      "signature": "keyword_struct ToolCompilerConfig { ... }",
+      "comment": "Defines compiler configuration parameters, manages ownership, ensures fixed buffer pools; not thread-safe.",
+      "is_pub": true,
+      "line": 638
+    },
+    {
+      "type": "enum",
+      "name": "WasmLanguage",
+      "match_hash": "4f51b07f310ed775820f2ad804311833d43285c8cc50d4f2e80d62c1b948bf0a",
+      "signature": "keyword_enum WasmLanguage { ... }",
+      "comment": "Defines a WasmLanguage type with an enum and extension method, managing binary data ownership and invariants.",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "enum_field",
+          "name": "zig",
+          "is_pub": false,
+          "line": 648
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "rust",
+          "is_pub": false,
+          "line": 649
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "assemblyscript",
+          "is_pub": false,
+          "line": 650
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "c",
+          "is_pub": false,
+          "line": 651
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "go",
+          "is_pub": false,
+          "line": 652
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "extension",
+          "match_hash": "4977c824f177b903920bd3c8a49a7aec8fff4d797ce48f27c0f176d7f2c2d1a0",
+          "signature": "fn extension(self: WasmLanguage) -> []const u8",
+          "params": [
+            { "name": "self", "type": "WasmLanguage" }
+          ],
+          "returns": "[]const u8",
+          "is_pub": true,
+          "line": 654
+        }
+      ],
+      "line": 647
+    },
+    {
+      "type": "struct",
+      "name": "ToolGenerator",
+      "match_hash": "0347ffbc5ddd918e9309e02610a04a0b495c70c40ba90f2ea5dc03c026e43eb9",
+      "signature": "keyword_struct ToolGenerator { ... }",
+      "comment": "Manages tool generation infrastructure with allocator and config; owns compiled outputs; not thread-safe.",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "fn_decl",
+          "name": "init",
+          "match_hash": "e7635841cf3235f5f860f3d57c89b819ddee64952e9216e5e4887839cfe6015b",
+          "signature": "fn init(allocator: std.mem.Allocator, config: ToolCompilerConfig) -> Self",
+          "params": [
+            { "name": "allocator", "type": "std.mem.Allocator" },
+            { "name": "config", "type": "ToolCompilerConfig" }
+          ],
+          "returns": "Self",
+          "is_pub": true,
+          "line": 673
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "deinit",
+          "match_hash": "b1fed8bd8f6fbbb89fe229b3f385a27a00f8b03829d24a4600d63bc36b3926a9",
+          "signature": "fn deinit(self: *Self) -> void",
+          "params": [
+            { "name": "self", "type": "*Self" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 681
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "compileZig",
+          "match_hash": "badb23e2345f3c80cdd2ef1d436b21ed2d9173630a5924832c20db3c51f86c2f",
+          "signature": "fn compileZig(self: *Self, source: []const u8) -> []const u8",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "source", "type": "[]const u8" }
+          ],
+          "returns": "[]const u8",
+          "is_pub": true,
+          "line": 686
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "compileAssemblyScript",
+          "match_hash": "a80239e3063da5522201191a23ed84fd09876965f981bb247fd433f9c730c376",
+          "signature": "fn compileAssemblyScript(self: *Self, source: []const u8) -> []const u8",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "source", "type": "[]const u8" }
+          ],
+          "returns": "[]const u8",
+          "is_pub": true,
+          "line": 722
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "verifyTool",
+          "match_hash": "5484fb29ff8c602308b9c1d25df308b247ed55540631962c76f3029d568eb983",
+          "signature": "fn verifyTool(self: *Self, wasm_bytes: []const u8, test_input: []const u8) -> bool",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "wasm_bytes", "type": "[]const u8" },
+            { "name": "test_input", "type": "[]const u8" }
+          ],
+          "returns": "bool",
+          "is_pub": true,
+          "line": 754
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "generateFromLLM",
+          "match_hash": "0e30bb30896b06f5530f903c4fbf68e971d99d830d255de6b0ed951f1b3a3884",
+          "signature": "fn generateFromLLM(self: *Self, source: []const u8, language: WasmLanguage) -> []const u8",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "source", "type": "[]const u8" },
+            { "name": "language", "type": "WasmLanguage" }
+          ],
+          "returns": "[]const u8",
+          "is_pub": true,
+          "line": 766
+        }
+      ],
+      "line": 666
+    },
+    {
+      "type": "struct",
+      "name": "WasmToolCache",
+      "match_hash": "55e610634a1035a522ae3b22279a485a576a42974b66e43ff532d5364ff3db32",
+      "signature": "keyword_struct WasmToolCache { ... }",
+      "comment": "Manages fixed-size buffers for Wasm operations; owns them, requires allocator, and enforces safe access patterns.",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "fn_decl",
+          "name": "init",
+          "match_hash": "4cf7ef047edd8c359228c38b52c1f94c509665d7e1cc3508be970d1f9e73bb3f",
+          "signature": "fn init(allocator: std.mem.Allocator) -> Self",
+          "params": [
+            { "name": "allocator", "type": "std.mem.Allocator" }
+          ],
+          "returns": "Self",
+          "is_pub": true,
+          "line": 782
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "deinit",
+          "match_hash": "b1fed8bd8f6fbbb89fe229b3f385a27a00f8b03829d24a4600d63bc36b3926a9",
+          "signature": "fn deinit(self: *Self) -> void",
+          "params": [
+            { "name": "self", "type": "*Self" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 789
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "get",
+          "match_hash": "fc3acc44899ed83680e79b5fd1a6ef1012a9c92ec0dcc6a1e234823c91a90d42",
+          "signature": "fn get(self: *Self, name: []const u8) -> ?[]const u8",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "name", "type": "[]const u8" }
+          ],
+          "returns": "?[]const u8",
+          "is_pub": true,
+          "line": 798
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "put",
+          "match_hash": "b01382733cac353567617870670d2da3bf9814316f8c5e279e88dddd2e0c7ccc",
+          "signature": "fn put(self: *Self, name: []const u8, wasm_bytes: []const u8) -> void",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "name", "type": "[]const u8" },
+            { "name": "wasm_bytes", "type": "[]const u8" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 802
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "computeHash",
+          "match_hash": "0d88596a2e35033b42b4903ef83d252be005684208f26ead6f64644f8f48ad60",
+          "signature": "fn computeHash(self: *Self, wasm_bytes: []const u8) -> [32]u8",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "wasm_bytes", "type": "[]const u8" }
+          ],
+          "returns": "[32]u8",
+          "is_pub": true,
+          "line": 817
+        }
+      ],
+      "line": 776
+    },
+    {
+      "type": "test_decl",
+      "name": "BinaryHeader validation",
+      "is_pub": false,
+      "line": 833
+    },
+    {
+      "type": "test_decl",
+      "name": "BinaryContextNode serialization",
+      "is_pub": false,
+      "line": 842
+    },
+    {
+      "type": "test_decl",
+      "name": "PayloadType enum values",
+      "is_pub": false,
+      "line": 855
+    },
+    {
+      "type": "test_decl",
+      "name": "WasmManifest defaults",
+      "is_pub": false,
+      "line": 861
+    },
+    {
+      "type": "test_decl",
+      "name": "WasmLanguage extension",
+      "is_pub": false,
+      "line": 868
+    },
+    {
+      "type": "test_decl",
+      "name": "WasmToolCache put and get",
+      "is_pub": false,
+      "line": 874
+    },
+    {
+      "type": "test_decl",
+      "name": "WasmToolCache hash computation",
+      "is_pub": false,
+      "line": 886
+    },
+    {
+      "type": "test_decl",
+      "name": "ToolCompilerConfig defaults",
+      "is_pub": false,
+      "line": 899
+    },
+    {
+      "type": "test_decl",
+      "name": "BinaryExecutionRequest flag values",
+      "is_pub": false,
+      "line": 906
+    },
+    {
+      "type": "test_decl",
+      "name": "BinaryExecutionResult provides mask",
+      "is_pub": false,
+      "line": 912
+    },
+    {
+      "type": "test_decl",
+      "name": "BinaryContextNode: getLod0 and getLod4 return correct slices",
+      "is_pub": false,
+      "line": 925
+    },
+    {
+      "type": "test_decl",
+      "name": "BinaryContextNode: id round-trip via getId",
+      "is_pub": false,
+      "line": 935
+    },
+    {
+      "type": "test_decl",
+      "name": "BinaryContextNode: empty strings produce zero lengths",
+      "is_pub": false,
+      "line": 942
+    },
+    {
+      "type": "test_decl",
+      "name": "BinaryHeader: wrong magic fails validate",
+      "is_pub": false,
+      "line": 953
+    },
+    {
+      "type": "test_decl",
+      "name": "BinaryHeader: wrong version fails validate",
+      "is_pub": false,
+      "line": 959
+    },
+    {
+      "type": "test_decl",
+      "name": "WasmToolCache: put then get retrieves bytes",
+      "is_pub": false,
+      "line": 965
+    },
+    {
+      "type": "test_decl",
+      "name": "WasmToolCache: put collision replaces old bytes",
+      "is_pub": false,
+      "line": 977
+    },
+    {
+      "type": "test_decl",
+      "name": "WasmToolCache: get for unknown name returns null",
+      "is_pub": false,
+      "line": 992
+    },
+    {
+      "type": "test_decl",
+      "name": "WasmToolCache: hash is 32 bytes and deterministic",
+      "is_pub": false,
+      "line": 999
+    },
+    {
+      "type": "test_decl",
+      "name": "WasmToolCache: different inputs produce different hashes",
+      "is_pub": false,
+      "line": 1011
+    },
+    {
+      "type": "test_decl",
+      "name": "WasmToolCache: GPA no leaks across put and deinit",
+      "is_pub": false,
+      "line": 1023
+    }
+  ]
+}

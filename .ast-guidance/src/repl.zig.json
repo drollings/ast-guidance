@@ -1,0 +1,81 @@
+{
+  "meta": {
+    "module": "src.repl",
+    "source": "src/repl.zig",
+    "language": "zig"
+  },
+  "comment": "Implements a Zig REPL loop, handling commands like help, list, graph, and loading JSON targets.",
+  "used_by": ["src/main.zig"],
+  "members": [
+    {
+      "type": "fn_decl",
+      "name": "init",
+      "match_hash": "5fe11cb9d5d51fc4d4a8e0c44494c5535e25532a7998d01b070a2d1a38f7d43c",
+      "signature": "fn init(allocator: std.mem.Allocator, ctx: *BuildContext) -> Repl",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "ctx", "type": "*BuildContext" }
+      ],
+      "returns": "Repl",
+      "comment": "Initializes the repl environment with memory allocator and context, returning a configured Repl instance.",
+      "is_pub": true,
+      "line": 12
+    },
+    {
+      "type": "fn_decl",
+      "name": "deinit",
+      "match_hash": "48e322a15afd825a2f74779319d8289a984148490eda117d34b3f91ac99a95cd",
+      "signature": "fn deinit(_: *Repl) -> void",
+      "params": [
+        { "name": "_", "type": "*Repl" }
+      ],
+      "returns": "void",
+      "comment": "Releases resources by deallocating the repl instance.",
+      "is_pub": true,
+      "line": 19
+    },
+    {
+      "type": "fn_decl",
+      "name": "run",
+      "match_hash": "9ab4f9974fd768f246034d3960f63ffa568a8d635d3a54f3a0103da074be9540",
+      "signature": "fn run(self: *Repl) -> void",
+      "params": [
+        { "name": "self", "type": "*Repl" }
+      ],
+      "returns": "void",
+      "comment": "Executes the core logic of the repl, processing inputs and returning results.",
+      "is_pub": true,
+      "line": 21
+    },
+    {
+      "type": "fn_private",
+      "name": "handleDotCommand",
+      "match_hash": "7090e29e73a37982ea5a382b05648478758fecc06f231927a8037c9a7e755d31",
+      "signature": "fn handleDotCommand(self: *Repl, input: []const u8, writer: *std.Io.Writer) -> bool",
+      "params": [
+        { "name": "self", "type": "*Repl" },
+        { "name": "input", "type": "[]const u8" },
+        { "name": "writer", "type": "*std.Io.Writer" }
+      ],
+      "returns": "bool",
+      "comment": "Processes a command string and returns a boolean indicating success.",
+      "is_pub": false,
+      "line": 60
+    },
+    {
+      "type": "fn_private",
+      "name": "handleBuildCommand",
+      "match_hash": "1074af0e306cd4d63f59a66a245a71f785ecb428efdeff90bd779584b9999c5f",
+      "signature": "fn handleBuildCommand(self: *Repl, input: []const u8, writer: *std.Io.Writer) -> void",
+      "params": [
+        { "name": "self", "type": "*Repl" },
+        { "name": "input", "type": "[]const u8" },
+        { "name": "writer", "type": "*std.Io.Writer" }
+      ],
+      "returns": "void",
+      "comment": "Processes a Zig build command input, validating arguments and preparing output.",
+      "is_pub": false,
+      "line": 125
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "meta": {
+    "module": "src.common.args",
+    "source": "src/common/args.zig",
+    "language": "zig"
+  },
+  "comment": "Handles argument parsing for Zig project, interpreting flags and defaults.",
+  "used_by": ["src/common/llm.zig"],
+  "members": [
+    {
+      "type": "struct",
+      "name": "CommonArgs",
+      "match_hash": "0b2cfeed08192c014708b989745c44c41e2237ed3dd0b5e42ae23fb035a364b8",
+      "signature": "keyword_struct CommonArgs { ... }",
+      "is_pub": true,
+      "line": 3
+    },
+    {
+      "type": "fn_decl",
+      "name": "parseCommonArgs",
+      "match_hash": "7e29a104053f4aade438028405a507f2976b8ad564156672c39855d69e4ec4d6",
+      "signature": "fn parseCommonArgs(args: []const []const u8) -> CommonArgs",
+      "params": [
+        { "name": "args", "type": "[]const []const u8" }
+      ],
+      "returns": "CommonArgs",
+      "is_pub": true,
+      "line": 11
+    }
+  ]
+}

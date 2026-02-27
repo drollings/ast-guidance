@@ -1,0 +1,95 @@
+{
+  "meta": {
+    "module": "src.ast-guidance.hash",
+    "source": "src/ast-guidance/hash.zig",
+    "language": "zig"
+  },
+  "comment": "Implements SHA-256 hashing and signature generation for Zig types, ensuring consistent hashes and deterministic API outputs.",
+  "used_by": ["src/ast-guidance/ast_parser.zig", "src/ast-guidance/json_store.zig", "src/ast-guidance/sync.zig"],
+  "members": [
+    {
+      "type": "fn_decl",
+      "name": "sha256Hex",
+      "match_hash": "98b120e54d8a1f37f6ea4184403e2ba54d40978f844a3b75cf831084f6a2f941",
+      "signature": "fn sha256Hex(allocator: std.mem.Allocator, data: []const u8) -> []const u8",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "data", "type": "[]const u8" }
+      ],
+      "returns": "[]const u8",
+      "is_pub": true,
+      "line": 4
+    },
+    {
+      "type": "fn_decl",
+      "name": "apiHash",
+      "match_hash": "2aa05478b4dfb9c54404c97df32953f2334af3e8b8278b71d6e0bfdeb45f65c6",
+      "signature": "fn apiHash(allocator: std.mem.Allocator, name: []const u8, params: []const types.Param, returns: ?[]const u8) -> []const u8",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "name", "type": "[]const u8" },
+        { "name": "params", "type": "[]const types.Param" },
+        { "name": "returns", "type": "?[]const u8" }
+      ],
+      "returns": "[]const u8",
+      "is_pub": true,
+      "line": 13
+    },
+    {
+      "type": "fn_decl",
+      "name": "structHash",
+      "match_hash": "be4864c26caa58f41e7e92aacd8e6d8ab22ca0f22f5a43ab66740fe7551517f5",
+      "signature": "fn structHash(allocator: std.mem.Allocator, name: []const u8, bases: []const []const u8) -> []const u8",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "name", "type": "[]const u8" },
+        { "name": "bases", "type": "[]const []const u8" }
+      ],
+      "returns": "[]const u8",
+      "is_pub": true,
+      "line": 32
+    },
+    {
+      "type": "fn_decl",
+      "name": "normalizeType",
+      "match_hash": "d97c07e53a23308dca3de66cf277938cda4abd9f3dd65713d492afbbfb9fc3ca",
+      "signature": "fn normalizeType(type_str: []const u8) -> []const u8",
+      "params": [
+        { "name": "type_str", "type": "[]const u8" }
+      ],
+      "returns": "[]const u8",
+      "is_pub": true,
+      "line": 48
+    },
+    {
+      "type": "test_decl",
+      "name": "sha256Hex produces correct length",
+      "is_pub": false,
+      "line": 54
+    },
+    {
+      "type": "test_decl",
+      "name": "apiHash is deterministic",
+      "is_pub": false,
+      "line": 60
+    },
+    {
+      "type": "test_decl",
+      "name": "apiHash differs for different names",
+      "is_pub": false,
+      "line": 74
+    },
+    {
+      "type": "test_decl",
+      "name": "structHash differs when field names change",
+      "is_pub": false,
+      "line": 85
+    },
+    {
+      "type": "test_decl",
+      "name": "structHash same fields produce same hash",
+      "is_pub": false,
+      "line": 105
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+# mise.toml
+# Base configuration: Zig + Python + uv (always present)
+# Additional language toolchains: env/mise/mise.<lang>.toml (installed on-demand)
+
+[tools]
+python = "3.12.10"
+uv     = "0.9.28"
+zig    = "0.15.0"
+
+[env]
+PYTHONPATH             = "{{cwd}}"
+UV_PROJECT_ENVIRONMENT = "{{cwd}}/.venv"
+
+# mise tasks — thin wrappers; Makefile handles multi-language orchestration
+
+[tasks.build]
+description = "Build ast-guidance Zig binary"
+run = "zig build"
+
+[tasks.test]
+description = "Run ast-guidance Zig unit tests"
+run = "zig build test"
+
+[tasks.fmt]
+description = "Format Zig and Python source"
+run = "zig fmt src/ && uv run ruff format bin/ && uv run ruff check --fix bin/"
+
+[tasks.lint]
+description = "Lint Python code (ruff)"
+run = "uv run ruff check bin/"
+
+[tasks.py-sync]
+description = "Sync guidance JSON for Python files (ast-guidance-py)"
+run = ".venv/bin/python bin/ast-guidance-py sync --scan src/ --output .ast-guidance/"
+
+[tasks.pre-commit]
+description = "Run full RALPH loop gate (build → test → guidance → lint → STRUCTURE.md)"
+run = "make pre-commit"

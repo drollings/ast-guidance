@@ -1,0 +1,40 @@
+{
+  "meta": {
+    "module": "src.main",
+    "source": "src/main.zig",
+    "language": "zig"
+  },
+  "comment": "This Zig script initializes config, processes arguments, and sets up a Zig repl environment with JSON parsing and LLM integration.",
+  "used_by": ["src/ast-guidance/tests.zig"],
+  "members": [
+    {
+      "type": "fn_decl",
+      "name": "main",
+      "match_hash": "2a1f996d04d7b869f8b44664c3fd970c1b60631537e1cfa1d7f86d531a8b6278",
+      "signature": "fn main() -> void",
+      "returns": "void",
+      "comment": "Converts a Zig source code string into a Zig data structure, returning an owned slice.",
+      "is_pub": true,
+      "line": 11
+    },
+    {
+      "type": "fn_private",
+      "name": "printHelp",
+      "match_hash": "7d8bab1e5fad33bd27b72b476652eb393c442c974629deac5917eb9fff389c2b",
+      "signature": "fn printHelp(writer) -> void",
+      "params": [
+        { "name": "writer" }
+      ],
+      "returns": "void",
+      "comment": "Displays detailed help information for the Zig compiler when a help command is invoked.",
+      "is_pub": false,
+      "line": 213
+    },
+    {
+      "type": "test_decl",
+      "name": "simple imports",
+      "is_pub": false,
+      "line": 246
+    }
+  ]
+}

@@ -1,0 +1,651 @@
+{
+  "meta": {
+    "module": "src.db",
+    "source": "src/db.zig",
+    "language": "zig"
+  },
+  "comment": "[gof-patterns] Defines CozoDB integration for Zig, handling embeddings, graph search, and time travel with LOD context and efficient similarity matching.",
+  "skills": [
+    { "ref": "guidance/skills/gof-patterns/SKILL.md", "context": "GoF patterns detected" }
+  ],
+  "used_by": ["src/main.zig", "src/wasm.zig"],
+  "members": [
+    {
+      "type": "struct",
+      "name": "NodeId",
+      "match_hash": "9302c9c97836766ae3cac5f55ed8c9e9ddc4e01565c0ffb3f25df97cf262604d",
+      "signature": "keyword_struct NodeId { ... }",
+      "comment": "Represents a unique node identifier with fixed-size storage; owned by the struct, immutable after creation.",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "fn_decl",
+          "name": "fromU128",
+          "match_hash": "5dc26e61a348460d973283f32917bf4fb9318ab8fb78bfc9a5c3a0475924f592",
+          "signature": "fn fromU128(id: u128) -> NodeId",
+          "params": [
+            { "name": "id", "type": "u128" }
+          ],
+          "returns": "NodeId",
+          "is_pub": true,
+          "line": 40
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "toU128",
+          "match_hash": "6294e6ae06b061898c1b67076bee04d6b7bf11db6beefe9f01f87f06f8001dbb",
+          "signature": "fn toU128(self: NodeId) -> u128",
+          "params": [
+            { "name": "self", "type": "NodeId" }
+          ],
+          "returns": "u128",
+          "is_pub": true,
+          "line": 47
+        }
+      ],
+      "line": 36
+    },
+    {
+      "type": "struct",
+      "name": "ContextNode",
+      "match_hash": "2957f077966b69d624e1423b34524a13dfdcaf30ff96983e610885406282858c",
+      "signature": "keyword_struct ContextNode { ... }",
+      "comment": "Manages context nodes with fixed-size buffers; owns state; not thread-safe.",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "fn_decl",
+          "name": "init",
+          "match_hash": "02f5accf4d810dfe325125a31ca62900d32c25e740d1301c42529b8936b5403f",
+          "signature": "fn init(id: u128, name: []const u8, full_text: []const u8) -> ContextNode",
+          "params": [
+            { "name": "id", "type": "u128" },
+            { "name": "name", "type": "[]const u8" },
+            { "name": "full_text", "type": "[]const u8" }
+          ],
+          "returns": "ContextNode",
+          "is_pub": true,
+          "line": 72
+        }
+      ],
+      "line": 61
+    },
+    {
+      "type": "struct",
+      "name": "KnnHit",
+      "match_hash": "0147b6d43f225c08973fd608b5a111ce485536508c58abfeba49ec41f3d584a5",
+      "signature": "keyword_struct KnnHit { ... }",
+      "comment": "Tracks nearest neighbor hits in a fixed-size buffer; managed by owner; ensures unique key invariants.",
+      "is_pub": true,
+      "line": 89
+    },
+    {
+      "type": "enum",
+      "name": "EdgeType",
+      "match_hash": "9ba75c7914570541f9cb4d90c43e8f32f28b825390fd8a3c56d69ee22dbd085f",
+      "signature": "keyword_enum EdgeType { ... }",
+      "comment": "Represents an edge type with enum variants; provides string and reference access; owned by the model, immutable once created.",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "enum_field",
+          "name": "depends_on",
+          "is_pub": false,
+          "line": 97
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "provides_capability",
+          "is_pub": false,
+          "line": 98
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "neighbor_of",
+          "is_pub": false,
+          "line": 99
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "semantic_similarity",
+          "is_pub": false,
+          "line": 100
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "temporal_sequence",
+          "is_pub": false,
+          "line": 101
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "relName",
+          "match_hash": "c31a5811b40b0386b5be1fd50b8b82436aada77ec13a07251724e76c6e901f0b",
+          "signature": "fn relName(self: EdgeType) -> []const u8",
+          "params": [
+            { "name": "self", "type": "EdgeType" }
+          ],
+          "returns": "[]const u8",
+          "is_pub": true,
+          "line": 103
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "str",
+          "match_hash": "761b5380b8fbd9924b567b65f401243ba02fc2487a68869170ec7d55c5c20be3",
+          "signature": "fn str(self: EdgeType) -> []const u8",
+          "params": [
+            { "name": "self", "type": "EdgeType" }
+          ],
+          "returns": "[]const u8",
+          "is_pub": true,
+          "line": 111
+        }
+      ],
+      "line": 96
+    },
+    {
+      "type": "struct",
+      "name": "Library",
+      "match_hash": "20372d0b54553a139d2c54c51230f9af2c23da70143eb88413074b8df4461ecd",
+      "signature": "keyword_struct Library { ... }",
+      "comment": "Manages storage nodes with ownership; tracks schema; supports insert/fetch; not thread-safe.",
+      "patterns": [
+        { "name": "Factory (GoF)", "type": "GoF", "ref": "guidance/skills/gof-patterns/SKILL.md#factory" }
+      ],
+      "is_pub": true,
+      "members": [
+        {
+          "type": "fn_decl",
+          "name": "init",
+          "match_hash": "49b640b86fb587b149cfcc4c6737a1015a4b4fdfe4213c32ab73e3f438861ae6",
+          "signature": "fn init(allocator: std.mem.Allocator, engine: StorageEngine, path: [:0]const u8) -> *Self",
+          "params": [
+            { "name": "allocator", "type": "std.mem.Allocator" },
+            { "name": "engine", "type": "StorageEngine" },
+            { "name": "path", "type": "[:0]const u8" }
+          ],
+          "returns": "*Self",
+          "is_pub": true,
+          "line": 153
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "deinit",
+          "match_hash": "b1fed8bd8f6fbbb89fe229b3f385a27a00f8b03829d24a4600d63bc36b3926a9",
+          "signature": "fn deinit(self: *Self) -> void",
+          "params": [
+            { "name": "self", "type": "*Self" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 167
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "initSchema",
+          "match_hash": "299374d1092e4999ef42a1bf8554916404c43770f694917c7e9ce12711821690",
+          "signature": "fn initSchema(self: *Self) -> void",
+          "params": [
+            { "name": "self", "type": "*Self" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 179
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "insertNode",
+          "match_hash": "a5af120c08daf012589afaf3b15bef1cd971ef700307f367a866eabe13c918fd",
+          "signature": "fn insertNode(self: *Self, node: ContextNode) -> void",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "node", "type": "ContextNode" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 202
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "freeNode",
+          "match_hash": "2a1356f46297e59d3a49454e5ac6e6c959187daaa4d56110b98ac60e1d795ff2",
+          "signature": "fn freeNode(self: *Self, node: ContextNode) -> void",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "node", "type": "ContextNode" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 240
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "fetchNode",
+          "match_hash": "d89b49131fd6db472c46e7953d60cd6be10a3898b90d13096715d6e1c39402ca",
+          "signature": "fn fetchNode(self: *Self, id: u128) -> ?ContextNode",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "id", "type": "u128" }
+          ],
+          "returns": "?ContextNode",
+          "is_pub": true,
+          "line": 249
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "insertTarget",
+          "match_hash": "51fc6d4d9d9208de9897a862ec5501fd616cd6b03f0b7417badb45fb9d1c4625",
+          "signature": "fn insertTarget(self: *Self, id: u128, name: []const u8, depends_mask: u128, provides_mask: u128, is_essential: bool) -> void",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "id", "type": "u128" },
+            { "name": "name", "type": "[]const u8" },
+            { "name": "depends_mask", "type": "u128" },
+            { "name": "provides_mask", "type": "u128" },
+            { "name": "is_essential", "type": "bool" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 289
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "insertDependsOn",
+          "match_hash": "f81306319d9cd5841cc9dbf04821eeff1e45147848ab9815de61622bbaac47a2",
+          "signature": "fn insertDependsOn(self: *Self, from_id: u128, to_id: u128) -> void",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "from_id", "type": "u128" },
+            { "name": "to_id", "type": "u128" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 322
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "insertNeighborOf",
+          "match_hash": "4ad83946080bf31cd6080c129d2dc787d1e06ded292d6bc52a4c99098671bde3",
+          "signature": "fn insertNeighborOf(self: *Self, from_id: u128, to_id: u128, distance: f32, edge_type: EdgeType) -> void",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "from_id", "type": "u128" },
+            { "name": "to_id", "type": "u128" },
+            { "name": "distance", "type": "f32" },
+            { "name": "edge_type", "type": "EdgeType" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 336
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "createHydrationPipeline",
+          "match_hash": "c546fe4ac2c5ba373c157c5304243a6d5d9dfcb2ee84a6c9c719df2ee0f1b600",
+          "signature": "fn createHydrationPipeline(self: *Self) -> HydrationPipeline",
+          "params": [
+            { "name": "self", "type": "*Self" }
+          ],
+          "returns": "HydrationPipeline",
+          "patterns": [
+            { "name": "Factory (GoF)", "type": "GoF", "ref": "guidance/skills/gof-patterns/SKILL.md#factory" }
+          ],
+          "is_pub": true,
+          "line": 360
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "createContextPacker",
+          "match_hash": "702786a42163c934ef7930c69551333ac31aa3436f3f4a65c188e96b0816b62a",
+          "signature": "fn createContextPacker(self: *Self, max_tokens: usize) -> ContextPacker",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "max_tokens", "type": "usize" }
+          ],
+          "returns": "ContextPacker",
+          "patterns": [
+            { "name": "Factory (GoF)", "type": "GoF", "ref": "guidance/skills/gof-patterns/SKILL.md#factory" }
+          ],
+          "is_pub": true,
+          "line": 364
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "hydrate",
+          "match_hash": "baee61a9e59e9702697a9081eb2e31a20a894446f76e52fa1d0492c035120bfd",
+          "signature": "fn hydrate(self: *Self, query_vec: []const f32, k: usize) -> usize",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "query_vec", "type": "[]const f32" },
+            { "name": "k", "type": "usize" }
+          ],
+          "returns": "usize",
+          "is_pub": true,
+          "line": 368
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "packContext",
+          "match_hash": "9cf6414dc04834bcc05a9d04580d019015cef4c57d50f1d94d8c2bde664f1f2c",
+          "signature": "fn packContext(self: *Self, semantic_center_id: u128, max_tokens: usize) -> []const u8",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "semantic_center_id", "type": "u128" },
+            { "name": "max_tokens", "type": "usize" }
+          ],
+          "returns": "[]const u8",
+          "is_pub": true,
+          "line": 373
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "persistNeighborEdges",
+          "match_hash": "9c47af5143817685ef4878252b74e6e044f6973767760f81e86fe73d8f83daf8",
+          "signature": "fn persistNeighborEdges(self: *Self, knn_hits: []const KnnHit) -> void",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "knn_hits", "type": "[]const KnnHit" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 380
+        }
+      ],
+      "line": 139
+    },
+    {
+      "type": "struct",
+      "name": "HydrationPipeline",
+      "match_hash": "89c5b513b4f57814e4dff974813958fd639cefb31f738f6ec0ec42b746c62059",
+      "signature": "keyword_struct HydrationPipeline { ... }",
+      "comment": "Manages hydration data with persistent edge storage; owns query vectors and k-values; not shared across threads.",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "fn_decl",
+          "name": "init",
+          "match_hash": "5ad974043807e3a1e44144bf56f3f6f75a9f86eb92081fd8a9f7e8d327a66d78",
+          "signature": "fn init(allocator: std.mem.Allocator, library: *Library) -> Self",
+          "params": [
+            { "name": "allocator", "type": "std.mem.Allocator" },
+            { "name": "library", "type": "*Library" }
+          ],
+          "returns": "Self",
+          "is_pub": true,
+          "line": 405
+        }
+    ,    {
+          "type": "fn_private",
+          "name": "cosineDistance",
+          "match_hash": "6c2a7d2ae6b70dd90117f7dfa175edf920b3a41e2bd1c1c60435d6dd6a681ca2",
+          "signature": "fn cosineDistance(a: []const f32, b: []const f32) -> f32",
+          "params": [
+            { "name": "a", "type": "[]const f32" },
+            { "name": "b", "type": "[]const f32" }
+          ],
+          "returns": "f32",
+          "is_pub": false,
+          "line": 411
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "knnSearch",
+          "match_hash": "dc1adba4948bc81d7f9f850b777f8d0a2aca3c6ebf23d29a2d551d3cc5b8fca6",
+          "signature": "fn knnSearch(self: *Self, query_vec: []const f32, k: usize) -> []KnnHit",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "query_vec", "type": "[]const f32" },
+            { "name": "k", "type": "usize" }
+          ],
+          "returns": "[]KnnHit",
+          "is_pub": true,
+          "line": 428
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "persistEdges",
+          "match_hash": "6024a21fdc2cb44ec3075adcff1d625d9097afe8c03f2b205312fa269c9b3df0",
+          "signature": "fn persistEdges(self: *Self, knn_hits: []const KnnHit) -> void",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "knn_hits", "type": "[]const KnnHit" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 489
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "hydrate",
+          "match_hash": "baee61a9e59e9702697a9081eb2e31a20a894446f76e52fa1d0492c035120bfd",
+          "signature": "fn hydrate(self: *Self, query_vec: []const f32, k: usize) -> usize",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "query_vec", "type": "[]const f32" },
+            { "name": "k", "type": "usize" }
+          ],
+          "returns": "usize",
+          "is_pub": true,
+          "line": 495
+        }
+      ],
+      "line": 399
+    },
+    {
+      "type": "struct",
+      "name": "ContextPacker",
+      "match_hash": "64fc8294fa9795d4dfd3600dbac456ef57bf8753135c540d64fcb0577e1171d5",
+      "signature": "keyword_struct ContextPacker { ... }",
+      "comment": "Manages context-packed buffers with fixed size; owns allocator, not thread-safe; centralizes packing logic.",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "fn_decl",
+          "name": "init",
+          "match_hash": "25709b719014beb0361bb012fdb3b7edece29f00e034aa59803a133fb80f2e4f",
+          "signature": "fn init(allocator: std.mem.Allocator, library: *Library, max_tokens: usize) -> Self",
+          "params": [
+            { "name": "allocator", "type": "std.mem.Allocator" },
+            { "name": "library", "type": "*Library" },
+            { "name": "max_tokens", "type": "usize" }
+          ],
+          "returns": "Self",
+          "is_pub": true,
+          "line": 520
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "selectLod",
+          "match_hash": "8f9fb59913fce4dd721f0a728f6b2f2c5d44d7e64766f77dc2de0c0a6d755884",
+          "signature": "fn selectLod(self: *Self, node: ContextNode, graph_distance: u32) -> []const u8",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "node", "type": "ContextNode" },
+            { "name": "graph_distance", "type": "u32" }
+          ],
+          "returns": "[]const u8",
+          "is_pub": true,
+          "line": 529
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "getNodesByDistance",
+          "match_hash": "1c828a0b060086875fc24cba02d50029b1673f7d5e11798db90bc5b92b06906c",
+          "signature": "fn getNodesByDistance(self: *Self, semantic_center_id: u128) -> []GraphNode",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "semantic_center_id", "type": "u128" }
+          ],
+          "returns": "[]GraphNode",
+          "is_pub": true,
+          "line": 541
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "pack",
+          "match_hash": "58575f75b3a5d06a9cd3f8820e8a7632ab86046dfedcc64e1462b1b0bfbeb640",
+          "signature": "fn pack(self: *Self, semantic_center_id: u128) -> []const u8",
+          "params": [
+            { "name": "self", "type": "*Self" },
+            { "name": "semantic_center_id", "type": "u128" }
+          ],
+          "returns": "[]const u8",
+          "is_pub": true,
+          "line": 551
+        }
+      ],
+      "line": 512
+    },
+    {
+      "type": "test_decl",
+      "name": "NodeId: u128 round-trip",
+      "is_pub": false,
+      "line": 593
+    },
+    {
+      "type": "test_decl",
+      "name": "NodeId: zero",
+      "is_pub": false,
+      "line": 599
+    },
+    {
+      "type": "test_decl",
+      "name": "ContextNode init",
+      "is_pub": false,
+      "line": 606
+    },
+    {
+      "type": "test_decl",
+      "name": "ContextNode LOD fields",
+      "is_pub": false,
+      "line": 615
+    },
+    {
+      "type": "test_decl",
+      "name": "EdgeType relName and str",
+      "is_pub": false,
+      "line": 626
+    },
+    {
+      "type": "test_decl",
+      "name": "HydrationPipeline: cosine distance",
+      "is_pub": false,
+      "line": 633
+    },
+    {
+      "type": "test_decl",
+      "name": "HydrationPipeline: empty vectors return max distance",
+      "is_pub": false,
+      "line": 649
+    },
+    {
+      "type": "test_decl",
+      "name": "HydrationPipeline: mismatched lengths return max distance",
+      "is_pub": false,
+      "line": 656
+    },
+    {
+      "type": "test_decl",
+      "name": "ContextPacker: LOD selection",
+      "is_pub": false,
+      "line": 663
+    },
+    {
+      "type": "test_decl",
+      "name": "ContextPacker: empty LOD fallbacks",
+      "is_pub": false,
+      "line": 685
+    },
+    {
+      "type": "test_decl",
+      "name": "Library: open in-memory, init schema",
+      "is_pub": false,
+      "line": 703
+    },
+    {
+      "type": "test_decl",
+      "name": "Library: insert and fetch ContextNode",
+      "is_pub": false,
+      "line": 715
+    },
+    {
+      "type": "test_decl",
+      "name": "Library: insert target and depends_on edge",
+      "is_pub": false,
+      "line": 734
+    },
+    {
+      "type": "test_decl",
+      "name": "Library: neighbor_of edge insertion",
+      "is_pub": false,
+      "line": 748
+    },
+    {
+      "type": "test_decl",
+      "name": "Library: fetchNode returns null for unknown id",
+      "is_pub": false,
+      "line": 762
+    },
+    {
+      "type": "test_decl",
+      "name": "Library: upsert overwrites existing node",
+      "is_pub": false,
+      "line": 775
+    },
+    {
+      "type": "test_decl",
+      "name": "Library: initSchema is idempotent",
+      "is_pub": false,
+      "line": 799
+    },
+    {
+      "type": "test_decl",
+      "name": "Library: persistNeighborEdges with empty slice is a no-op",
+      "is_pub": false,
+      "line": 813
+    },
+    {
+      "type": "test_decl",
+      "name": "Library: persistNeighborEdges single-element slice is also a no-op",
+      "is_pub": false,
+      "line": 826
+    },
+    {
+      "type": "test_decl",
+      "name": "Library: all EdgeType variants can be inserted",
+      "is_pub": false,
+      "line": 841
+    },
+    {
+      "type": "test_decl",
+      "name": "NodeId: max u128 round-trip",
+      "is_pub": false,
+      "line": 863
+    },
+    {
+      "type": "test_decl",
+      "name": "NodeId: hi/lo split is correct",
+      "is_pub": false,
+      "line": 869
+    },
+    {
+      "type": "test_decl",
+      "name": "HydrationPipeline: cosine distance — anti-parallel vectors",
+      "is_pub": false,
+      "line": 879
+    },
+    {
+      "type": "test_decl",
+      "name": "HydrationPipeline: cosine distance — equal unit vectors",
+      "is_pub": false,
+      "line": 887
+    },
+    {
+      "type": "test_decl",
+      "name": "ContextPacker: selectLod distance 3 always returns name",
+      "is_pub": false,
+      "line": 894
+    }
+  ]
+}

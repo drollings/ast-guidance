@@ -1,0 +1,281 @@
+{
+  "meta": {
+    "module": "src.ast-guidance.query",
+    "source": "src/ast-guidance/query.zig",
+    "language": "zig"
+  },
+  "comment": "Manages memory for Zig AST query results, freeing allocators and storing JSON data efficiently.",
+  "used_by": ["src/ast-guidance/main.zig", "src/ast-guidance/tests.zig"],
+  "members": [
+    {
+      "type": "fn_decl",
+      "name": "freeFileMatch",
+      "match_hash": "f0ad6821f6d38cb4cb7b87b4091df1a7c95b576ee1aecf4edeb9ce484cf05659",
+      "signature": "fn freeFileMatch(allocator: std.mem.Allocator, m: types.FileMatch) -> void",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "m", "type": "types.FileMatch" }
+      ],
+      "returns": "void",
+      "is_pub": true,
+      "line": 12
+    },
+    {
+      "type": "fn_decl",
+      "name": "freeGuidanceInfo",
+      "match_hash": "ec26b1586e4c44385a60d9e003c6603ceecae1c1b1dd9fb3a720dc90cec0ed1c",
+      "signature": "fn freeGuidanceInfo(allocator: std.mem.Allocator, g: types.GuidanceInfo) -> void",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "g", "type": "types.GuidanceInfo" }
+      ],
+      "returns": "void",
+      "is_pub": true,
+      "line": 19
+    },
+    {
+      "type": "fn_decl",
+      "name": "freeASTAnalysis",
+      "match_hash": "66996e535bac78409ac310fc7d18cb13d4c215b3fe4df9896ac1ef5a0b3f3009",
+      "signature": "fn freeASTAnalysis(allocator: std.mem.Allocator, store: *json_store.JsonStore, a: types.ASTAnalysis) -> void",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "store", "type": "*json_store.JsonStore" },
+        { "name": "a", "type": "types.ASTAnalysis" }
+      ],
+      "returns": "void",
+      "is_pub": true,
+      "line": 34
+    },
+    {
+      "type": "fn_decl",
+      "name": "freeQueryResult",
+      "match_hash": "79881879a6b01327e79a4cfe618bef0664f744519114f142bfa91b694fc7880d",
+      "signature": "fn freeQueryResult(allocator: std.mem.Allocator, store: *json_store.JsonStore, r: types.QueryResult) -> void",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "store", "type": "*json_store.JsonStore" },
+        { "name": "r", "type": "types.QueryResult" }
+      ],
+      "returns": "void",
+      "is_pub": true,
+      "line": 47
+    },
+    {
+      "type": "struct",
+      "name": "QueryEngine",
+      "match_hash": "710773482829376cfcaac9cd38a24fe557af05824ccab6b96ef1b1febec2d166",
+      "signature": "keyword_struct QueryEngine { ... }",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "fn_decl",
+          "name": "init",
+          "match_hash": "bd566a62cc0787e6593352dd0de3ce27ff49a0481bef6714be1959085aa62b41",
+          "signature": "fn init(allocator: std.mem.Allocator, query_str: []const u8, project_root: []const u8, use_ast: bool, debug: bool) -> QueryEngine",
+          "params": [
+            { "name": "allocator", "type": "std.mem.Allocator" },
+            { "name": "query_str", "type": "[]const u8" },
+            { "name": "project_root", "type": "[]const u8" },
+            { "name": "use_ast", "type": "bool" },
+            { "name": "debug", "type": "bool" }
+          ],
+          "returns": "QueryEngine",
+          "is_pub": true,
+          "line": 82
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "deinit",
+          "match_hash": "365a475d5a504ffb53364e5889fdbd95c77edeea03da10df14621ff149f9d9fd",
+          "signature": "fn deinit(self: *QueryEngine) -> void",
+          "params": [
+            { "name": "self", "type": "*QueryEngine" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 98
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "execute",
+          "match_hash": "3017165168f17dc85bbe8b5bb68369e13824392f1ad781a03a585026bc3053cb",
+          "signature": "fn execute(self: *QueryEngine) -> types.QueryResult",
+          "params": [
+            { "name": "self", "type": "*QueryEngine" }
+          ],
+          "returns": "types.QueryResult",
+          "is_pub": true,
+          "line": 114
+        }
+    ,    {
+          "type": "fn_private",
+          "name": "readInboxBullets",
+          "match_hash": "19ae0a10607246bdd50735a03632ffe92442d7e08a0e9b910b186277520cea72",
+          "signature": "fn readInboxBullets(self: *QueryEngine, rel_file: []const u8) -> []const []const u8",
+          "params": [
+            { "name": "self", "type": "*QueryEngine" },
+            { "name": "rel_file", "type": "[]const u8" }
+          ],
+          "returns": "[]const []const u8",
+          "is_pub": false,
+          "line": 141
+        }
+    ,    {
+          "type": "fn_private",
+          "name": "containsIgnoreCase",
+          "match_hash": "dc0bb2f5d5b6321483058fedcab63dec1d142e08489ab9a38fc065608ffa921e",
+          "signature": "fn containsIgnoreCase(allocator: std.mem.Allocator, haystack: []const u8, needle: []const u8) -> bool",
+          "params": [
+            { "name": "allocator", "type": "std.mem.Allocator" },
+            { "name": "haystack", "type": "[]const u8" },
+            { "name": "needle", "type": "[]const u8" }
+          ],
+          "returns": "bool",
+          "is_pub": false,
+          "line": 188
+        }
+    ,    {
+          "type": "fn_private",
+          "name": "grepStructure",
+          "match_hash": "38e2dc7bc3f2c4845a408a52f7829183bd1d956ad286c9b9abdfaaff89cdf0c5",
+          "signature": "fn grepStructure(self: *QueryEngine) -> void",
+          "params": [
+            { "name": "self", "type": "*QueryEngine" }
+          ],
+          "returns": "void",
+          "is_pub": false,
+          "line": 196
+        }
+    ,    {
+          "type": "fn_private",
+          "name": "parseStructureLine",
+          "match_hash": "0da39bcc9bfe5e7ac17711d7804bf8f46e2f615a1e46e6448d28e80245f5cf7d",
+          "signature": "fn parseStructureLine(self: *QueryEngine, line: []const u8) -> ?types.FileMatch",
+          "params": [
+            { "name": "self", "type": "*QueryEngine" },
+            { "name": "line", "type": "[]const u8" }
+          ],
+          "returns": "?types.FileMatch",
+          "is_pub": false,
+          "line": 215
+        }
+    ,    {
+          "type": "fn_private",
+          "name": "resolveFilepath",
+          "match_hash": "c51fe884488da813ac0c9cc89dfdff5137bd6d94bb1266f1338e65920338101d",
+          "signature": "fn resolveFilepath(self: *QueryEngine, filename: []const u8) -> []const u8",
+          "params": [
+            { "name": "self", "type": "*QueryEngine" },
+            { "name": "filename", "type": "[]const u8" }
+          ],
+          "returns": "[]const u8",
+          "is_pub": false,
+          "line": 248
+        }
+    ,    {
+          "type": "fn_private",
+          "name": "deepFileSearch",
+          "match_hash": "d75635d19559cc4796249abded5cf67bff3822dfe9cc9ce4a62cec6dc5667a7f",
+          "signature": "fn deepFileSearch(self: *QueryEngine) -> void",
+          "params": [
+            { "name": "self", "type": "*QueryEngine" }
+          ],
+          "returns": "void",
+          "is_pub": false,
+          "line": 273
+        }
+    ,    {
+          "type": "fn_private",
+          "name": "parseGuidanceFiles",
+          "match_hash": "a32e6f73721b183b20040df4484e1a18b1c470cfa746fb7fe3c027b4756f443b",
+          "signature": "fn parseGuidanceFiles(self: *QueryEngine) -> void",
+          "params": [
+            { "name": "self", "type": "*QueryEngine" }
+          ],
+          "returns": "void",
+          "is_pub": false,
+          "line": 316
+        }
+    ,    {
+          "type": "fn_private",
+          "name": "relPath",
+          "match_hash": "12962ce591c9d166722f1797c2a0c111f5d00b6613c216ab04b8750accab6817",
+          "signature": "fn relPath(self: *QueryEngine, filepath: []const u8) -> []const u8",
+          "params": [
+            { "name": "self", "type": "*QueryEngine" },
+            { "name": "filepath", "type": "[]const u8" }
+          ],
+          "returns": "[]const u8",
+          "is_pub": false,
+          "line": 334
+        }
+    ,    {
+          "type": "fn_private",
+          "name": "loadGuidanceDoc",
+          "match_hash": "19327a935deed8864c1e9e2230c440d70bf16f4160f3173278f16282962eb984",
+          "signature": "fn loadGuidanceDoc(self: *QueryEngine, gpath: []const u8) -> void",
+          "params": [
+            { "name": "self", "type": "*QueryEngine" },
+            { "name": "gpath", "type": "[]const u8" }
+          ],
+          "returns": "void",
+          "is_pub": false,
+          "line": 343
+        }
+    ,    {
+          "type": "fn_private",
+          "name": "analyzeAst",
+          "match_hash": "f677463d39b3619059db46b6142f6c9b6506e071cc447448e6210adf0cf7163f",
+          "signature": "fn analyzeAst(self: *QueryEngine) -> void",
+          "params": [
+            { "name": "self", "type": "*QueryEngine" }
+          ],
+          "returns": "void",
+          "is_pub": false,
+          "line": 400
+        }
+    ,    {
+          "type": "fn_private",
+          "name": "findRelatedSkills",
+          "match_hash": "6f2c8cdf2dce4a5b015ee337c1f14d88ce54f03addbbe2493ba0a5343ff8b7b0",
+          "signature": "fn findRelatedSkills(self: *QueryEngine) -> void",
+          "params": [
+            { "name": "self", "type": "*QueryEngine" }
+          ],
+          "returns": "void",
+          "is_pub": false,
+          "line": 446
+        }
+      ],
+      "line": 69
+    },
+    {
+      "type": "fn_decl",
+      "name": "formatCompact",
+      "match_hash": "514ac726996120212295d7876bc2c4ebd73e56630c4501e3dc9fa9d75e89dc54",
+      "signature": "fn formatCompact(result: *const types.QueryResult, allocator: std.mem.Allocator, project_root: []const u8) -> []u8",
+      "params": [
+        { "name": "result", "type": "*const types.QueryResult" },
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "project_root", "type": "[]const u8" }
+      ],
+      "returns": "[]u8",
+      "is_pub": true,
+      "line": 477
+    },
+    {
+      "type": "fn_private",
+      "name": "relPathFrom",
+      "match_hash": "32890b4ac9c5f73f3319aca02f5131a916f4319aec34196746bc0a191a3baeda",
+      "signature": "fn relPathFrom(filepath: []const u8, project_root: []const u8) -> []const u8",
+      "params": [
+        { "name": "filepath", "type": "[]const u8" },
+        { "name": "project_root", "type": "[]const u8" }
+      ],
+      "returns": "[]const u8",
+      "is_pub": false,
+      "line": 691
+    }
+  ]
+}

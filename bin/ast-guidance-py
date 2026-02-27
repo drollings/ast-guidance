@@ -1,0 +1,1232 @@
+#!/usr/bin/env python3
+# ruff: noqa: F401, E501
+"""
+guidance_ast_py: Python AST → JSON guidance files.
+
+Handles ONLY Python source files (.py).  For Zig files use ast-guidance.
+This tool is the definitive Python language provider for the guidance system.
+
+Usage:
+  guidance_ast_py sync --scan src/ --output guidance
+  guidance_ast_py sync --file src/foo.py --output guidance [--infill] [--regen]
+  guidance_ast_py scrub --scan guidance/
+  guidance_ast_py scrub --file .guidance/src/foo.py.json
+"""
+
+import ast
+import argparse
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+try:
+    import requests
+except Exception:
+    requests = None
+
+# ============================================================================
+# Configuration & Constants
+# ============================================================================
+
+DEFAULT_OUTPUT_DIR = "guidance"
+DEFAULT_OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
+DEFAULT_MODEL = "code:latest"
+_CHAT_MIN_PREDICT = 100
+OLLAMA_TIMEOUT = 30
+
+PROJECT_ROOT = Path(__file__).parent.parent
+GUIDANCE_DIR = PROJECT_ROOT / "guidance"
+SRC_DIR = PROJECT_ROOT / "src"
+
+# ============================================================================
+# Core Utilities
+# ============================================================================
+
+
+class Colors:
+    CYAN = "\033[96m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    RESET = "\033[0m"
+
+
+def cprint(msg: str, color: str = "") -> None:
+    print(f"{color}{msg}{Colors.RESET}", file=sys.stderr)
+
+
+def count_tokens(text: str) -> int:
+    return len(text) // 4
+
+
+_LEAKED_PROMPT_PATTERNS = [
+    r"^we need (a|an|to)\b",
+    r"^i need to\b",
+    r"^let'?s\b",
+    r"^okay,?\s+(let'?s|i'?ll|so)\b",
+    r"^sure[.,]?\s",
+    r"^alright[.,]?\s",
+    r"^to (write|create|generate|craft|provide)\b",
+    r"^here'?s?\b",
+    r"^the (user|task|question|request|goal)\b",
+    r"^first[,.]? (i|let|we)\b",
+    r"^thinking:\s",
+    r"^step \d+[:.]\s",
+]
+_LEAKED_PROMPT_RE = re.compile("|".join(_LEAKED_PROMPT_PATTERNS), re.IGNORECASE)
+
+
+def _clean_llm_response(text: str) -> str:
+    if not text:
+        return text
+    lines = text.splitlines()
+    start = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _LEAKED_PROMPT_RE.match(stripped):
+            start = i + 1
+        else:
+            break
+    cleaned = "\n".join(lines[start:]).strip()
+    if len(cleaned) >= 2 and cleaned[0] in ('"', "'", "`") and cleaned[-1] == cleaned[0]:
+        cleaned = cleaned[1:-1].strip()
+    return cleaned
+
+
+def _extract_answer_from_thinking(thinking: str) -> str:
+    if not thinking:
+        return ""
+    quoted = re.findall(r'"([^"]{10,200})"', thinking)
+    plausible = [q for q in quoted if not _LEAKED_PROMPT_RE.match(q) and "count" not in q.lower() and "chars" not in q.lower()]
+    if plausible:
+        candidate = plausible[-1].strip()
+        if candidate:
+            return candidate
+    transition_re = re.compile(
+        r"(?:so[,:]?\s+(?:maybe|the answer is|we can say|it is|probably)|"
+        r"answer[:\s]+|final[:\s]+|result[:\s]+|description[:\s]+|"
+        r'something like[:\s]+|perhaps[:\s]+)\s*["\']?(.+)',
+        re.IGNORECASE,
+    )
+    for match in transition_re.finditer(thinking):
+        candidate = match.group(1).strip().strip("\"'").split("\n")[0].strip()
+        candidate = re.split(r"\.\s+Count\b|\.\s+Let", candidate)[0].strip()
+        if candidate and len(candidate) > 10 and not _LEAKED_PROMPT_RE.match(candidate):
+            return candidate
+    lines = [ln.strip() for ln in thinking.splitlines() if ln.strip()]
+    for line in reversed(lines):
+        if len(line) > 10 and not _LEAKED_PROMPT_RE.match(line):
+            if re.search(r"\(\d+\)\s*\w|\bcount\b|chars\b|= \d+", line, re.IGNORECASE):
+                continue
+            return line
+    return ""
+
+
+# ============================================================================
+# Gitignore Filter
+# ============================================================================
+
+
+class GitignoreFilter:
+    def __init__(self, project_root: Path, gitignore_path: Optional[Path] = None):
+        self.project_root = project_root
+        self.patterns: List[str] = []
+        self.negations: List[str] = []
+        self.always_exclude = {".git"}
+        path = gitignore_path or (project_root / ".gitignore")
+        if path and path.exists():
+            self._parse_gitignore(path)
+
+    def _parse_gitignore(self, path: Path) -> None:
+        with open(path, "r") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("!"):
+                    self.negations.append(line[1:])
+                else:
+                    self.patterns.append(line)
+
+    def should_ignore(self, filepath: Path) -> bool:
+        if not filepath:
+            return True
+        try:
+            rel_path = filepath.relative_to(self.project_root)
+        except ValueError:
+            return False
+        rel_path_str = str(rel_path)
+        path_parts = rel_path.parts
+        if ".git" in path_parts:
+            return True
+        for exclude in self.always_exclude:
+            if exclude in path_parts:
+                return True
+        is_file = filepath.is_file() if filepath.exists() else True
+        is_ignored = False
+        for pattern in self.patterns:
+            if self._matches_pattern(rel_path_str, path_parts, pattern, is_file):
+                is_ignored = True
+                break
+        if is_ignored:
+            for pattern in self.negations:
+                if self._matches_pattern(rel_path_str, path_parts, pattern, is_file):
+                    is_ignored = False
+                    break
+        return is_ignored
+
+    def _matches_pattern(self, rel_path_str: str, path_parts: tuple, pattern: str, is_file: bool = True) -> bool:
+        pattern = pattern.strip()
+        if not pattern:
+            return False
+        is_dir_pattern = pattern.endswith("/")
+        if is_dir_pattern:
+            pattern = pattern[:-1]
+        if "/" in pattern:
+            if pattern.startswith("/"):
+                pattern = pattern[1:]
+            if is_dir_pattern:
+                for i in range(len(path_parts)):
+                    partial = "/".join(path_parts[: i + 1])
+                    if self._glob_match(partial, pattern):
+                        return True
+            else:
+                if self._glob_match(rel_path_str, pattern):
+                    return True
+        else:
+            if is_dir_pattern:
+                dir_parts = path_parts[:-1] if is_file else path_parts
+                for part in dir_parts:
+                    if self._glob_match(part, pattern):
+                        return True
+            else:
+                for part in path_parts:
+                    if self._glob_match(part, pattern):
+                        return True
+                if self._glob_match(rel_path_str, pattern):
+                    return True
+        return False
+
+    def _glob_match(self, text: str, pattern: str) -> bool:
+        if "**" in pattern:
+            parts = pattern.split("**")
+            if len(parts) == 2:
+                prefix, suffix = parts
+                if prefix and not text.startswith(prefix):
+                    return False
+                if suffix and not text.endswith(suffix):
+                    return False
+                return True
+        try:
+            return fnmatch.fnmatch(text, pattern) or fnmatch.fnmatch(text.lower(), pattern.lower())
+        except Exception:
+            return text == pattern
+
+
+# ============================================================================
+# Canonical Signer — Hash-Based Integrity Locking
+# ============================================================================
+
+
+class CanonicalSigner:
+    @staticmethod
+    def normalize_type(type_str: str) -> str:
+        if not type_str:
+            return "Any"
+        s = type_str.strip()
+        s = s.replace("pd.Series", "Series<float>")
+        s = s.replace("pandas.Series", "Series<float>")
+        s = s.replace("np.ndarray", "Array<float>")
+        s = s.replace("List[", "Array<").replace("]", ">")
+        s = s.replace("Dict[", "Map<").replace("]", ">")
+        s = s.replace("Optional[", "Optional<").replace("]", ">")
+        return s
+
+    @staticmethod
+    def compute_hash(signature_str: str) -> str:
+        return hashlib.sha256(signature_str.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def api_hash(name: str, args: List[Dict], returns: Optional[str]) -> str:
+        sig_str = f"{name}({','.join([a['name'] + ':' + CanonicalSigner.normalize_type(a.get('type') or 'Any') for a in args])})->{CanonicalSigner.normalize_type(returns or 'Any')}"
+        return CanonicalSigner.compute_hash(sig_str)
+
+
+# ============================================================================
+# Pattern Detection (Python-specific GoF + Domain patterns)
+# ============================================================================
+
+
+class PatternDetector:
+    def detect(self, node: ast.AST) -> List[Dict]:
+        patterns = []
+        if self._detect_vectorization(node):
+            patterns.append({"name": "Vectorization", "type": "Domain", "ref": "doc/skills/domain-patterns/SKILL.md#vectorization"})
+        if self._detect_series_extraction(node):
+            patterns.append({"name": "Series Extraction", "type": "Domain", "ref": "doc/skills/domain-patterns/SKILL.md#series-extraction"})
+        if self._detect_state_persistence(node):
+            patterns.append({"name": "State Persistence", "type": "Domain", "ref": "doc/skills/domain-patterns/SKILL.md#state-persistence"})
+        if self._detect_ring_buffer(node):
+            patterns.append({"name": "Ring Buffer", "type": "Domain", "ref": "doc/skills/domain-patterns/SKILL.md#ring-buffer"})
+        if self._detect_adapter(node):
+            patterns.append({"name": "Adapter (GoF)", "type": "GoF", "ref": "doc/skills/gof-patterns/SKILL.md#adapter"})
+        if self._detect_decorator(node):
+            patterns.append({"name": "Decorator (GoF)", "type": "GoF", "ref": "doc/skills/gof-patterns/SKILL.md#decorator"})
+        if self._detect_proxy(node):
+            patterns.append({"name": "Proxy (GoF)", "type": "GoF", "ref": "doc/skills/gof-patterns/SKILL.md#proxy"})
+        if self._detect_factory(node):
+            patterns.append({"name": "Factory (GoF)", "type": "GoF", "ref": "doc/skills/gof-patterns/SKILL.md#factory"})
+        if self._detect_singleton(node):
+            patterns.append({"name": "Singleton (GoF)", "type": "GoF", "ref": "doc/skills/gof-patterns/SKILL.md#singleton"})
+        if self._detect_builder(node):
+            patterns.append({"name": "Builder (GoF)", "type": "GoF", "ref": "doc/skills/gof-patterns/SKILL.md#builder"})
+        if self._detect_strategy(node):
+            patterns.append({"name": "Strategy (GoF)", "type": "GoF", "ref": "doc/skills/gof-patterns/SKILL.md#strategy"})
+        if self._detect_observer(node):
+            patterns.append({"name": "Observer (GoF)", "type": "GoF", "ref": "doc/skills/gof-patterns/SKILL.md#observer"})
+        if self._detect_template_method(node):
+            patterns.append({"name": "Template Method (GoF)", "type": "GoF", "ref": "doc/skills/gof-patterns/SKILL.md#template-method"})
+        return patterns
+
+    def _detect_vectorization(self, node: ast.AST) -> bool:
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
+                if child.func.attr in ["rolling", "shift", "diff", "ewm", "expanding"]:
+                    return True
+                if isinstance(child.func.value, ast.Name) and child.func.value.id in ["np", "pd"]:
+                    return True
+        return False
+
+    def _detect_series_extraction(self, node: ast.AST) -> bool:
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
+                if child.func.id in ["_extract_series", "_extract_multiple_series"]:
+                    return True
+        return False
+
+    def _detect_state_persistence(self, node: ast.AST) -> bool:
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call):
+                name = ""
+                if isinstance(child.func, ast.Name):
+                    name = child.func.id
+                elif isinstance(child.func, ast.Attribute):
+                    name = child.func.attr
+                if name in ["Var", "VarIP"]:
+                    return True
+        return False
+
+    def _detect_ring_buffer(self, node: ast.AST) -> bool:
+        for child in ast.walk(node):
+            if isinstance(child, ast.ClassDef):
+                source = ast.unparse(child).lower()
+                if any(x in source for x in ["ring", "buffer", "circular", "fifo"]):
+                    return True
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
+                if child.func.id in ["deque", "RingBuffer"]:
+                    return True
+        return False
+
+    def _detect_adapter(self, node: ast.AST) -> bool:
+        for child in ast.walk(node):
+            if isinstance(child, ast.ClassDef):
+                methods = [n.name for n in child.body if isinstance(n, ast.FunctionDef)]
+                adapter_methods = ["adapt", "convert", "transform"]
+                if any(m.startswith("to_") or m.startswith("from_") or m in adapter_methods for m in methods):
+                    return True
+        return False
+
+    def _detect_decorator(self, node: ast.AST) -> bool:
+        for child in ast.walk(node):
+            if not isinstance(child, ast.ClassDef):
+                continue
+            source = ast.unparse(child).lower()
+            has_wrapped = any(kw in source for kw in ["wrapped", "component", "_inner", "wrappee"])
+            if not has_wrapped:
+                continue
+            for grandchild in ast.walk(child):
+                if isinstance(grandchild, ast.Call) and isinstance(grandchild.func, ast.Attribute):
+                    if isinstance(grandchild.func.value, ast.Attribute):
+                        inner = grandchild.func.value
+                        if isinstance(inner.value, ast.Name) and inner.value.id == "self":
+                            if inner.attr in ["wrapped", "component", "_inner", "wrappee"]:
+                                return True
+        return False
+
+    def _detect_proxy(self, node: ast.AST) -> bool:
+        for child in ast.walk(node):
+            if not isinstance(child, ast.ClassDef):
+                continue
+            source = ast.unparse(child).lower()
+            has_subject = any(kw in source for kw in ["_real", "_subject", "_target", "_delegate", "_proxied"])
+            if not has_subject:
+                continue
+            access_signals = ["cache", "lazy", "permission", "auth", "log", "throttl", "rate_limit", "check"]
+            if any(sig in source for sig in access_signals):
+                return True
+        return False
+
+    def _detect_factory(self, node: ast.AST) -> bool:
+        for child in ast.walk(node):
+            if isinstance(child, ast.ClassDef):
+                if "Factory" in child.name or "Builder" in child.name:
+                    return True
+                methods = [n.name for n in child.body if isinstance(n, ast.FunctionDef)]
+                if any(m.startswith("create_") or m.startswith("make_") for m in methods):
+                    return True
+        return False
+
+    def _detect_singleton(self, node: ast.AST) -> bool:
+        for child in ast.walk(node):
+            if not isinstance(child, ast.ClassDef):
+                continue
+            method_names = {n.name for n in child.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+            if "get_instance" in method_names or "instance" in method_names:
+                return True
+            if "__new__" in method_names:
+                source = ast.unparse(child).lower()
+                if "_instance" in source:
+                    return True
+            for stmt in child.body:
+                if isinstance(stmt, ast.Assign):
+                    for target in stmt.targets:
+                        if isinstance(target, ast.Name) and "_instance" in target.id.lower():
+                            return True
+        return False
+
+    def _detect_builder(self, node: ast.AST) -> bool:
+        for child in ast.walk(node):
+            if not isinstance(child, ast.ClassDef):
+                continue
+            methods = [n for n in child.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+            method_names = {m.name for m in methods}
+            if "Builder" in child.name and "build" in method_names:
+                return True
+            fluent_count = 0
+            has_build = "build" in method_names or "get_result" in method_names
+            for method in methods:
+                source = ast.unparse(method)
+                if "return self" in source:
+                    fluent_count += 1
+            if fluent_count >= 2 and has_build:
+                return True
+        return False
+
+    def _detect_strategy(self, node: ast.AST) -> bool:
+        for child in ast.walk(node):
+            if isinstance(child, ast.ClassDef):
+                methods = [n for n in child.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+                source = ast.unparse(child).lower()
+                has_strategy_attr = any(kw in source for kw in ["_strategy", "strategy", "_algorithm", "algorithm"])
+                execution_methods = {"execute", "run", "apply", "calculate", "compute", "perform"}
+                has_executor = any(m.name in execution_methods for m in methods)
+                if has_strategy_attr and has_executor:
+                    return True
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for arg in child.args.args:
+                    if arg.annotation and isinstance(arg.annotation, ast.Name):
+                        ann = arg.annotation.id
+                        if ann in ("Callable", "callable") or ann.endswith("Strategy"):
+                            return True
+        return False
+
+    def _detect_observer(self, node: ast.AST) -> bool:
+        for child in ast.walk(node):
+            if not isinstance(child, ast.ClassDef):
+                continue
+            method_names = {n.name for n in child.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+            subscribe_signals = {"attach", "subscribe", "add_listener", "add_observer", "register"}
+            unsubscribe_signals = {"detach", "unsubscribe", "remove_listener", "remove_observer", "unregister"}
+            notify_signals = {"notify", "emit", "dispatch", "publish", "trigger", "fire"}
+            has_subscribe = bool(method_names & subscribe_signals)
+            has_unsubscribe = bool(method_names & unsubscribe_signals)
+            has_notify = bool(method_names & notify_signals)
+            if has_notify and (has_subscribe or has_unsubscribe):
+                return True
+            source = ast.unparse(child).lower()
+            has_collection = any(kw in source for kw in ["observers", "listeners", "subscribers", "_handlers"])
+            if has_collection and has_notify:
+                return True
+        return False
+
+    def _detect_template_method(self, node: ast.AST) -> bool:
+        for child in ast.walk(node):
+            if not isinstance(child, ast.ClassDef):
+                continue
+            source = ast.unparse(child).lower()
+            has_abstract = "abstractmethod" in source or "notimplementederror" in source
+            methods = [n for n in child.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+            method_names = {m.name for m in methods}
+            for method in methods:
+                called_on_self: List[str] = []
+                for stmt_node in ast.walk(method):
+                    if isinstance(stmt_node, ast.Call) and isinstance(stmt_node.func, ast.Attribute):
+                        if isinstance(stmt_node.func.value, ast.Name) and stmt_node.func.value.id == "self":
+                            called_on_self.append(stmt_node.func.attr)
+                if len(called_on_self) < 2:
+                    continue
+                class_calls = [c for c in called_on_self if c in method_names]
+                hook_calls = [c for c in class_calls if c.startswith("_") or has_abstract]
+                if len(class_calls) >= 2 and hook_calls:
+                    return True
+        return False
+
+
+# ============================================================================
+# LLM Client (Ollama only)
+# ============================================================================
+
+
+class LLMClient:
+    def __init__(self, api_url: str = DEFAULT_OLLAMA_CHAT_URL, model: str = DEFAULT_MODEL, debug: bool = False):
+        self.api_url = api_url
+        self.model = model
+        self.debug = debug
+        self._is_openai_format = "/v1/" in api_url
+        self._is_generate = "/api/generate" in api_url
+        self._chat_url = api_url.replace("/api/generate", "/api/chat") if self._is_generate else api_url
+
+    def complete(self, prompt: str, max_tokens: int = 500, temperature: float = 0.3, system: str = "", timeout: int = OLLAMA_TIMEOUT) -> Optional[str]:
+        if requests is None:
+            return None
+        try:
+            if self._is_openai_format:
+                payload: Dict[str, Any] = {"model": self.model, "prompt": prompt, "max_tokens": max_tokens, "temperature": temperature, "stream": False}
+                url = self.api_url
+            else:
+                num_predict = max(_CHAT_MIN_PREDICT, max_tokens)
+                messages = []
+                if system:
+                    messages.append({"role": "system", "content": system})
+                messages.append({"role": "user", "content": prompt})
+                payload = {"model": self.model, "messages": messages, "stream": False, "options": {"temperature": temperature, "num_predict": num_predict}}
+                url = self._chat_url
+            resp = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            text = ""
+            thinking = ""
+            if isinstance(data, dict):
+                if isinstance(data.get("choices"), list) and data["choices"]:
+                    choice = data["choices"][0]
+                    if isinstance(choice, dict):
+                        if "text" in choice:
+                            text = choice["text"]
+                        elif "message" in choice and isinstance(choice["message"], dict):
+                            text = choice["message"].get("content", "")
+                if not text and "message" in data and isinstance(data["message"], dict):
+                    msg = data["message"]
+                    text = msg.get("content", "")
+                    thinking = msg.get("thinking", "")
+                if not text and "response" in data:
+                    text = data["response"]
+            text = text.strip() if text else ""
+            text = re.sub(r"(?i)<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+            text = re.sub(r"(?i)\[THINK\].*?\[/THINK\]", "", text, flags=re.DOTALL).strip()
+            for unclosed in (r"(?i)<think>", r"(?i)\[THINK\]"):
+                text = re.sub(unclosed + r".*", "", text, flags=re.DOTALL).strip()
+            text = _clean_llm_response(text)
+            if not text and thinking:
+                text = _extract_answer_from_thinking(thinking.strip())
+            return text if text else None
+        except Exception as e:
+            if self.debug:
+                cprint(f"LLM request failed: {e}", Colors.RED)
+            return None
+
+    def available(self) -> bool:
+        if requests is None:
+            return False
+        try:
+            check_url = self._chat_url.replace("/api/chat", "/api/tags")
+            resp = requests.get(check_url, timeout=5)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+
+# ============================================================================
+# Canonical Serializer
+# ============================================================================
+
+
+def _canonical_member(m: Dict) -> Dict:
+    result: Dict[str, Any] = {
+        "type": m.get("type", "function"),
+        "name": m.get("name", ""),
+        "is_pub": m.get("is_pub", True),
+        "line": m.get("line"),
+        "match_hash": m.get("match_hash", ""),
+        "signature": m.get("signature", ""),
+        "comment": m.get("comment", m.get("docstring", "")),
+        "params": [{"name": a.get("name", ""), "type": a.get("type", ""), "default": a.get("default")} for a in m.get("args", m.get("params", []))],
+        "returns": m.get("returns", ""),
+        "patterns": m.get("patterns", []),
+        "members": [_canonical_member(n) for n in m.get("members", [])],
+    }
+    if result["line"] is None:
+        del result["line"]
+    return result
+
+
+def _skill_tag_prefix(skills: List[Dict]) -> str:
+    names = [s.get("ref", "").split("/")[-2] for s in skills if s.get("ref", "").split("/")[-2]]
+    return f"[{', '.join(names)}] " if names else ""
+
+
+def _apply_skill_prefix(comment: str, skills: List[Dict]) -> str:
+    if not comment:
+        return comment
+    if comment.startswith("["):
+        return comment
+    prefix = _skill_tag_prefix(skills)
+    return f"{prefix}{comment}" if prefix else comment
+
+
+def build_canonical_doc(meta: Dict, comment: str, skills: List[Dict], hashtags: List[str], used_by: List[str], members: List[Dict]) -> Dict:
+    return {
+        "meta": meta,
+        "comment": comment,
+        "skills": skills,
+        "hashtags": hashtags,
+        "used_by": used_by,
+        "members": [_canonical_member(m) for m in members],
+    }
+
+
+# ============================================================================
+# Synthetic Comment Detection & Scrubbing
+# ============================================================================
+
+
+def is_synthetic_comment(comment: str) -> bool:
+    """Return True when comment is a machine-generated placeholder or mangled LLM output."""
+    if not comment or not comment.strip():
+        return True
+    body = re.sub(r"^\[[^\]]*\]\s*", "", comment).strip()
+    if not body:
+        return True
+    if re.search(r":\s*\d+\s+struct", body):
+        return True
+    if re.search(r":\s*\d+\s+class", body):
+        return True
+    if re.search(r":\s*\d+\s+function", body):
+        return True
+    if re.search(r"\b\w*\d+\s*=\s*\d+,\s*\w+\s*\d*\s*=\s*\d+", body):
+        return True
+    if re.search(r"^\(?\d+\)?\s*[+=]\s*\w", body):
+        return True
+    if re.search(r"^\d+,\s*space\s+\d+", body, re.IGNORECASE):
+        return True
+    if re.search(r"\d+\s*=>\s*\d+,\s*\w+\s*\d*\s*=>\s*\d+", body):
+        return True
+    if re.search(r"^\(max\s+\d+\s+chars?\)\s+(of|for)\b", body, re.IGNORECASE):
+        return True
+    if re.search(r"\bshould be concise\b", body, re.IGNORECASE):
+        return True
+    if re.search(r"\bmax\s+\d+\s+chars?\b.*\bfor\b", body, re.IGNORECASE):
+        return True
+    if re.search(r"\bSo\s+(it'?s?\s+a|description:)", body, re.IGNORECASE):
+        return True
+    if re.search(r"\bWe\s+need\s+to\s+(guess|produce|output|describe)\b", body, re.IGNORECASE):
+        return True
+    if re.match(r"^[.,()\s]", body) and len(body) < 60:
+        return True
+    if re.match(r"^\((?:maybe|likely|possibly|probably|perhaps|unclear)\b", body, re.IGNORECASE):
+        return True
+    if re.search(r"\b(of|in|for|from|with|to|a|an|the)\s*\.?\s*$", body):
+        return True
+    if re.search(r':\s*\(\s*"[^"]+"\s*,', body):
+        return True
+    if re.search(r"\bmaybe\s+means\b", body, re.IGNORECASE):
+        return True
+    if re.search(r"\blet'?s?\s+think\b", body, re.IGNORECASE):
+        return True
+    if re.search(r"\blet\s+me\s+think\b", body, re.IGNORECASE):
+        return True
+    if re.search(r"\bI\s+think\b", body, re.IGNORECASE):
+        return True
+    if body.rstrip().endswith("?"):
+        return True
+    return False
+
+
+def scrub_guidance_doc(doc: Dict, debug: bool = False) -> bool:
+    """Blank synthetic comments at module and member level. Returns True if changed."""
+
+    def _scrub_members(members: List[Dict]) -> bool:
+        changed = False
+        for m in members:
+            cur = m.get("comment", "")
+            name = m.get("name", "")
+            name_as_comment = bool(cur and name and cur.strip() == name.strip())
+            if cur and (is_synthetic_comment(cur) or name_as_comment):
+                if debug:
+                    reason = "name==comment" if name_as_comment else "synthetic"
+                    cprint(f"    [scrub member] {name}: {cur[:60]} ({reason})", Colors.YELLOW)
+                m["comment"] = ""
+                changed = True
+            if _scrub_members(m.get("members", [])):
+                changed = True
+        return changed
+
+    changed = False
+    cur_module = doc.get("comment", "")
+    if cur_module and is_synthetic_comment(cur_module):
+        if debug:
+            cprint(f"  [scrub module] {doc.get('meta', {}).get('source', '')}: {cur_module[:60]}", Colors.YELLOW)
+        doc["comment"] = ""
+        changed = True
+
+    if _scrub_members(doc.get("members", [])):
+        changed = True
+    return changed
+
+
+def cmd_scrub(scan: Optional[str], file: Optional[str], dry_run: bool = False, debug: bool = False) -> None:
+    """Walk guidance JSON files and blank synthetic/mangled comments."""
+    if file:
+        paths = [Path(file)]
+    elif scan:
+        paths = sorted(Path(scan).rglob("*.json"))
+    else:
+        print("Error: --scan or --file required.", file=sys.stderr)
+        return
+
+    modified = 0
+    for json_path in paths:
+        try:
+            doc = json.loads(json_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if "meta" not in doc or "members" not in doc:
+            continue
+        original = json.dumps(doc, indent=2)
+        if scrub_guidance_doc(doc, debug=debug):
+            new_text = json.dumps(doc, indent=2)
+            if new_text != original:
+                if not dry_run:
+                    json_path.write_text(new_text, encoding="utf-8")
+                    action = "Scrubbed"
+                else:
+                    action = "[DRY-RUN] Would scrub"
+                modified += 1
+                print(f"  {action}: {json_path}")
+    print(f"✓ Scrubbed {modified} file(s).")
+
+
+# ============================================================================
+# Module Processor — Python AST → Canonical JSON
+# ============================================================================
+
+
+class ModuleProcessor:
+    def __init__(
+        self,
+        project_root: Path,
+        output_dir: Path,
+        llm: Optional[LLMClient] = None,
+        infill: bool = False,
+        regen: bool = False,
+        debug: bool = False,
+    ):
+        self.project_root = project_root
+        self.output_dir = output_dir
+        self.llm = llm
+        self.infill = infill
+        self.regen = regen
+        self.debug = debug
+        self.detector = PatternDetector()
+
+    def process(self, filepath: Path) -> bool:
+        """Process a .py file → write/update .py.json. Returns True if changed."""
+        try:
+            source_code = filepath.read_text(encoding="utf-8")
+            tree = ast.parse(source_code)
+        except Exception as e:
+            cprint(f"Failed to parse {filepath}: {e}", Colors.RED)
+            return False
+
+        rel_path = filepath.relative_to(self.project_root)
+        json_path = Path(str(self.output_dir / str(rel_path)) + ".json")
+
+        existing_doc = self._load_json(json_path)
+        source_members = self._extract_members(tree, source_code)
+
+        module_comment = existing_doc.get("comment", "")
+        if not module_comment:
+            doc_str = ast.get_docstring(tree)
+            if doc_str:
+                module_comment = doc_str.split("\n")[0].strip()
+
+        skills = self._build_skills(source_members, existing_doc.get("skills", []))
+        used_by = self._find_reverse_deps(rel_path)
+        hashtags = existing_doc.get("hashtags", [])
+
+        existing_members_map = {m["name"]: m for m in existing_doc.get("members", [])}
+        merged_members = []
+        has_changes = False
+
+        for member in source_members:
+            merged, changed = self._merge_member(member, existing_members_map.get(member["name"]), source_code)
+            merged_members.append(merged)
+            if changed:
+                has_changes = True
+
+        if self.llm and (self.infill or self.regen):
+            for m in merged_members:
+                if not m.get("comment") or self.regen:
+                    new_comment = self._ai_comment(m, module_comment, source_code[:2000])
+                    if new_comment and new_comment != m.get("comment"):
+                        m["comment"] = new_comment
+                        has_changes = True
+            if not module_comment or self.regen:
+                new_mc = self._ai_module_comment(str(rel_path), source_code[:2000])
+                if new_mc and new_mc != module_comment:
+                    module_comment = new_mc
+                    has_changes = True
+
+        module_comment = _apply_skill_prefix(module_comment, skills)
+
+        meta = {"module": self._get_fqname(rel_path), "source": str(rel_path), "language": "python"}
+        doc = build_canonical_doc(meta, module_comment, skills, hashtags, used_by, merged_members)
+
+        existing_json_str = json_path.read_text(encoding="utf-8").strip() if json_path.exists() else ""
+        new_json_str = json.dumps(doc, indent=2)
+
+        if new_json_str.strip() != existing_json_str:
+            has_changes = True
+            json_path.parent.mkdir(parents=True, exist_ok=True)
+            json_path.write_text(new_json_str, encoding="utf-8")
+            print(f"Generated: {json_path}")
+
+        return has_changes
+
+    def _load_json(self, path: Path) -> Dict:
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _extract_members(self, tree: ast.Module, source_code: str = "") -> List[Dict]:
+        members = []
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if not node.name.startswith("_"):
+                    members.append(self._parse_function(node, is_method=False))
+            elif isinstance(node, ast.ClassDef):
+                if not node.name.startswith("_"):
+                    members.append(self._parse_class(node))
+        return members
+
+    def _extract_nested_members(self, body: List[ast.stmt]) -> List[Dict]:
+        members = []
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if not node.name.startswith("_"):
+                    members.append(self._parse_function(node, is_method=True))
+            elif isinstance(node, ast.ClassDef):
+                if not node.name.startswith("_"):
+                    members.append(self._parse_class(node))
+        return members
+
+    def _parse_function(self, node: "ast.FunctionDef | ast.AsyncFunctionDef", is_method: bool = False) -> Dict:
+        func_type = "method" if is_method else "function"
+        decorators = [ast.unparse(d) for d in node.decorator_list]
+        is_classmethod = "classmethod" in decorators
+        is_staticmethod = "staticmethod" in decorators
+        all_args = node.args.args
+        defaults = node.args.defaults
+        num_defaults = len(defaults)
+        num_args = len(all_args)
+        args = []
+        args_with_defaults = []
+        for i, arg in enumerate(all_args):
+            if arg.arg == "self" and is_method and not is_staticmethod:
+                args_with_defaults.append("self")
+                continue
+            if arg.arg == "cls" and is_classmethod:
+                args_with_defaults.append("cls")
+                continue
+            typename = ast.unparse(arg.annotation) if arg.annotation else None
+            arg_dict: Dict[str, Any] = {"name": arg.arg, "type": typename}
+            default_index = i - (num_args - num_defaults)
+            if default_index >= 0:
+                default_node = defaults[default_index]
+                arg_dict["default"] = ast.unparse(default_node)
+                args_with_defaults.append(f"{arg.arg}{(':' + ast.unparse(arg.annotation)) if arg.annotation else ''} = {ast.unparse(default_node)}")
+            else:
+                args_with_defaults.append(f"{arg.arg}{(':' + ast.unparse(arg.annotation)) if arg.annotation else ''}")
+            args.append(arg_dict)
+        returns = ast.unparse(node.returns) if node.returns else None
+        args_str = ", ".join(args_with_defaults)
+        return_str = f" -> {returns}" if returns else ""
+        full_signature = f"def {node.name}({args_str}){return_str}"
+        match_hash = CanonicalSigner.api_hash(node.name, args, returns)
+        doc_str = ast.get_docstring(node) or ""
+        return {
+            "type": func_type,
+            "name": node.name,
+            "is_pub": True,
+            "line": node.lineno,
+            "match_hash": match_hash,
+            "signature": full_signature,
+            "comment": doc_str.split("\n")[0].strip() if doc_str else "",
+            "args": args,
+            "returns": returns or "",
+            "patterns": self.detector.detect(node),
+            "members": [],
+            "ast_node": node,
+        }
+
+    def _parse_class(self, node: ast.ClassDef) -> Dict:
+        bases = [ast.unparse(b) for b in node.bases] or ["object"]
+        bases_str = ", ".join(bases)
+        full_signature = f"class {node.name}({bases_str})"
+        match_hash = CanonicalSigner.compute_hash(full_signature)
+        nested_members = self._extract_nested_members(node.body)
+        doc_str = ast.get_docstring(node) or ""
+        return {
+            "type": "class",
+            "name": node.name,
+            "is_pub": True,
+            "line": node.lineno,
+            "match_hash": match_hash,
+            "signature": full_signature,
+            "comment": doc_str.split("\n")[0].strip() if doc_str else "",
+            "args": [],
+            "returns": "",
+            "patterns": self.detector.detect(node),
+            "members": nested_members,
+            "ast_node": node,
+        }
+
+    def _merge_member(self, member: Dict, existing: Optional[Dict], source_code: str = "") -> Tuple[Dict, bool]:
+        merged = {k: v for k, v in member.items() if k != "ast_node"}
+        changed = False
+        if existing:
+            if existing.get("match_hash") == member["match_hash"]:
+                existing_comment = existing.get("comment", "")
+                if existing_comment and not merged.get("comment"):
+                    merged["comment"] = existing_comment
+                if member["type"] == "class" and "members" in member:
+                    existing_nested = {m["name"]: m for m in existing.get("members", [])}
+                    merged_nested = []
+                    for nm in member["members"]:
+                        nm_merged, nm_changed = self._merge_member(nm, existing_nested.get(nm["name"]), source_code)
+                        merged_nested.append(nm_merged)
+                        if nm_changed:
+                            changed = True
+                    merged["members"] = merged_nested
+            else:
+                merged["comment"] = existing.get("comment", merged.get("comment", ""))
+                changed = True
+        else:
+            changed = True
+        if "ast_node" in merged:
+            del merged["ast_node"]
+        return merged, changed
+
+    def _build_skills(self, members: List[Dict], existing_skills: List[Dict]) -> List[Dict]:
+        skills: Dict[str, Dict] = {}
+        has_domain = any(p.get("type") == "Domain" for m in members for p in m.get("patterns", []))
+        if has_domain:
+            skills["doc/skills/domain-patterns/SKILL.md"] = {"ref": "doc/skills/domain-patterns/SKILL.md", "context": "Domain patterns detected"}
+        has_gof = any(p.get("type") == "GoF" for m in members for p in m.get("patterns", []))
+        if has_gof:
+            skills["doc/skills/gof-patterns/SKILL.md"] = {"ref": "doc/skills/gof-patterns/SKILL.md", "context": "GoF patterns detected"}
+        for s in existing_skills:
+            ref = s.get("ref", "")
+            if ref not in skills:
+                skills[ref] = s
+        return list(skills.values())
+
+    def _get_fqname(self, rel_path: Path) -> str:
+        parts = list(rel_path.with_suffix("").parts)
+        if parts and parts[0] == "src":
+            parts = parts[1:]
+        return ".".join(parts)
+
+    def _find_reverse_deps(self, rel_path: Path) -> List[str]:
+        module_name = self._get_fqname(rel_path)
+        stem = rel_path.stem
+        src_dir = self.project_root / "src"
+        if not src_dir.exists():
+            return []
+        patterns_to_find = [
+            f"import {module_name}",
+            f"from {module_name} import",
+            f"from .{stem} import",
+            f"from ..{stem} import",
+            f"import src.{module_name}",
+            f"from src.{module_name} import",
+        ]
+        found: List[str] = []
+        for py_file in src_dir.rglob("*.py"):
+            try:
+                this_rel = str(py_file.relative_to(self.project_root))
+            except ValueError:
+                continue
+            if this_rel == str(rel_path):
+                continue
+            try:
+                content = py_file.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            if any(p in content for p in patterns_to_find):
+                found.append(this_rel)
+        return sorted(found)
+
+    def _ai_comment(self, member: Dict, module_context: str, source_preview: str) -> Optional[str]:
+        if not self.llm:
+            return None
+        prompt = f"""Write a one-sentence (max 200 chars) comment for this code member.
+
+Module context: {module_context}
+Signature: {member.get("signature", member.get("name", ""))}
+Existing comment: {member.get("comment", "(none)")}
+
+Return ONLY the comment text, no quotes, no markdown."""
+        return self.llm.complete(prompt, max_tokens=100, temperature=0.2)
+
+    def _ai_module_comment(self, rel_path: str, source_preview: str) -> Optional[str]:
+        if not self.llm:
+            return None
+        prompt = f"""Write a one-sentence (max 80 chars) description for this Python module.
+
+File: {rel_path}
+Source preview:
+{source_preview}
+
+Return ONLY the description text, no quotes, no markdown."""
+        return self.llm.complete(prompt, max_tokens=60, temperature=0.2)
+
+
+# ============================================================================
+# Sync Command
+# ============================================================================
+
+
+def cmd_sync(
+    scan: Optional[str],
+    file: Optional[str],
+    output: str,
+    infill: bool = False,
+    regen: bool = False,
+    dry_run: bool = False,
+    model: str = DEFAULT_MODEL,
+    debug: bool = False,
+) -> None:
+    """Phase 1: Python AST → JSON for all .py files found.
+    Phase 1.5: Scrub synthetic comments.
+    Phase 2 (if --infill/--regen): AI fill blank comments.
+    """
+    output_dir = Path(output) if Path(output).is_absolute() else PROJECT_ROOT / output
+
+    llm_client: Optional[LLMClient] = None
+    if infill or regen:
+        llm_client = LLMClient(model=model, debug=debug)
+        if not llm_client.available():
+            cprint("Warning: Ollama not available. Proceeding without AI infill.", Colors.YELLOW)
+            llm_client = None
+
+    processor = ModuleProcessor(PROJECT_ROOT, output_dir, llm=None, infill=False, regen=False, debug=debug)
+
+    py_count = 0
+    if file:
+        filepath = Path(file) if Path(file).is_absolute() else PROJECT_ROOT / file
+        if filepath.suffix == ".py":
+            processor.process(filepath)
+            py_count = 1
+        else:
+            cprint(f"Unsupported file type for guidance_ast_py: {filepath.suffix}", Colors.YELLOW)
+            return
+    elif scan:
+        scan_dir = Path(scan) if Path(scan).is_absolute() else PROJECT_ROOT / scan
+        for fp in sorted(scan_dir.rglob("*.py")):
+            if fp.is_file():
+                processor.process(fp)
+                py_count += 1
+    else:
+        print("Error: --scan or --file required.", file=sys.stderr)
+        return
+
+    print(f"✓ Phase 1 complete: {py_count} Python files synced.")
+
+    # Phase 1.5 — scrub synthetic comments
+    scrubbed_count = 0
+    for json_path in sorted(output_dir.rglob("*.json")):
+        try:
+            doc = json.loads(json_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if "meta" not in doc or "members" not in doc:
+            continue
+        # Only scrub Python guidance files
+        if doc.get("meta", {}).get("language") != "python":
+            continue
+        original = json.dumps(doc, indent=2)
+        if scrub_guidance_doc(doc, debug=debug):
+            new_text = json.dumps(doc, indent=2)
+            if new_text != original and not dry_run:
+                json_path.write_text(new_text, encoding="utf-8")
+                scrubbed_count += 1
+    if scrubbed_count:
+        print(f"  Scrubbed {scrubbed_count} JSON file(s) with synthetic comments.")
+
+    # Phase 2 — AI infill
+    if llm_client and (infill or regen):
+        print("Running AI infill over Python guidance JSON…")
+        changed = _infill_all_py_json(output_dir, llm_client, regen=regen, dry_run=dry_run, debug=debug)
+        print(f"✓ Phase 2 complete: {changed} JSON files updated by AI.")
+
+
+def _infill_all_py_json(guidance_dir: Path, llm_client: LLMClient, regen: bool, dry_run: bool, debug: bool) -> int:
+    changed_count = 0
+    for json_path in sorted(guidance_dir.rglob("*.json")):
+        try:
+            doc = json.loads(json_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if "meta" not in doc or "members" not in doc:
+            continue
+        if doc.get("meta", {}).get("language") != "python":
+            continue
+
+        original_text = json.dumps(doc, indent=2)
+        modified = False
+        source = doc.get("meta", {}).get("source", str(json_path))
+
+        cur_module_comment = doc.get("comment", "")
+        if is_synthetic_comment(cur_module_comment) or regen:
+            source_preview = ""
+            src_path = PROJECT_ROOT / source
+            if src_path.exists():
+                try:
+                    source_preview = src_path.read_text(encoding="utf-8", errors="ignore")[:1500]
+                except Exception:
+                    pass
+            member_names = [m.get("name", "") for m in doc.get("members", [])[:8]]
+            prompt = (
+                f"Write a one-sentence plain-English description (max 80 chars) of what this python file does.\n"
+                f"File: {source}\nPublic members: {', '.join(member_names)}\n"
+                f"Source preview:\n{source_preview[:1200]}\n\n"
+                "Return ONLY the description. No quotes, no markdown, no preamble."
+            )
+            new_comment = llm_client.complete(prompt, max_tokens=80, temperature=0.2)
+            if new_comment:
+                new_comment = new_comment.strip().split("\n")[0][:100]
+                new_comment = _apply_skill_prefix(new_comment, doc.get("skills", []))
+                new_comment = new_comment[:120]
+                if new_comment != cur_module_comment:
+                    doc["comment"] = new_comment
+                    modified = True
+
+        if _infill_members_json(doc.get("members", []), llm_client, source, "python", regen, debug):
+            modified = True
+
+        if modified and not dry_run:
+            new_text = json.dumps(doc, indent=2)
+            if new_text != original_text:
+                json_path.write_text(new_text, encoding="utf-8")
+                print(f"  AI-updated: {json_path.relative_to(guidance_dir.parent) if json_path.is_relative_to(guidance_dir.parent) else json_path}")
+                changed_count += 1
+        elif modified and dry_run:
+            print(f"  [DRY-RUN] Would update: {json_path}")
+            changed_count += 1
+
+    return changed_count
+
+
+def _infill_members_json(members: List[Dict], llm_client: LLMClient, source: str, language: str, regen: bool, debug: bool) -> bool:
+    changed = False
+    for m in members:
+        cur = m.get("comment", "")
+        if not cur or regen:
+            sig = m.get("signature") or m.get("name", "")
+            name = m.get("name", "")
+            prompt = (
+                f"Write a one-sentence description (max 180 chars) for this {language} function or type.\n\n"
+                f"File: {source}\nName: {name}\nSignature: {sig}\n\n"
+                "Return ONLY the description, no quotes, no markdown."
+            )
+            new_comment = llm_client.complete(prompt, max_tokens=100, temperature=0.2)
+            if new_comment:
+                new_comment = new_comment.strip().split("\n")[0][:200]
+                if new_comment != cur:
+                    m["comment"] = new_comment
+                    changed = True
+                    if debug:
+                        cprint(f"    [member] {name}: {new_comment[:60]}", Colors.CYAN)
+        if _infill_members_json(m.get("members", []), llm_client, source, language, regen, debug):
+            changed = True
+    return changed
+
+
+# ============================================================================
+# Main CLI
+# ============================================================================
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="guidance_ast_py",
+        description="Python AST → JSON guidance files (language provider for ast-guidance orchestration)",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    # sync
+    p_sync = sub.add_parser("sync", help="Sync guidance JSON for Python source files")
+    p_sync.add_argument("--scan", help="Directory to scan for .py files")
+    p_sync.add_argument("--file", help="Single .py file to process")
+    p_sync.add_argument("--output", default=DEFAULT_OUTPUT_DIR, help="Output directory (default: guidance)")
+    p_sync.add_argument("--infill", action="store_true", help="AI-fill blank comment fields")
+    p_sync.add_argument("--regen", action="store_true", help="AI-regenerate all comment fields")
+    p_sync.add_argument("--dry-run", action="store_true", help="Show what would change without writing")
+    p_sync.add_argument("-m", "--model", default=DEFAULT_MODEL, help="LLM model name")
+    p_sync.add_argument("--debug", action="store_true")
+
+    # scrub
+    p_scrub = sub.add_parser("scrub", help="Blank synthetic/mangled comments in Python guidance JSON files")
+    p_scrub.add_argument("--scan", help="Directory to scan for .json guidance files")
+    p_scrub.add_argument("--file", help="Single .json file to scrub")
+    p_scrub.add_argument("--dry-run", action="store_true")
+    p_scrub.add_argument("--debug", action="store_true")
+
+    args = parser.parse_args()
+
+    if args.command == "sync":
+        cmd_sync(
+            scan=args.scan,
+            file=args.file,
+            output=args.output,
+            infill=args.infill,
+            regen=args.regen,
+            dry_run=args.dry_run,
+            model=args.model,
+            debug=args.debug,
+        )
+    elif args.command == "scrub":
+        cmd_scrub(
+            scan=args.scan,
+            file=args.file,
+            dry_run=args.dry_run,
+            debug=args.debug,
+        )
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

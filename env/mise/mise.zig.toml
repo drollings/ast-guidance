@@ -1,0 +1,9 @@
+# mise.zig.toml
+# Zig toolchain (only installed when TARGET_LANG=zig)
+# Install with: mise -E zig install
+
+[tools]
+zig = "0.11.0"
+
+[env]
+ZIG_CACHE_DIR = "{{cwd}}/target/.zig-cache"

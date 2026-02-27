@@ -1,0 +1,11 @@
+# mise.go.toml
+# Go toolchain (only installed when TARGET_LANG=go)
+# Install with: mise -E go install
+
+[tools]
+go = "1.22.1"
+golangci-lint = "1.56"
+
+[env]
+GOPATH = "{{env.HOME}}/go"
+GO111MODULE = "on"

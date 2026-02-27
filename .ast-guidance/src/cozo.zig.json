@@ -1,0 +1,283 @@
+{
+  "meta": {
+    "module": "src.cozo",
+    "source": "src/cozo.zig",
+    "language": "zig"
+  },
+  "comment": "Zig wrapper for CozoDB, providing C API access with Datalog, SQLite/RocksDB, time travel, and graph features.",
+  "used_by": ["src/db.zig", "src/main.zig"],
+  "members": [
+    {
+      "type": "struct",
+      "name": "c",
+      "match_hash": "bafe815f182e44a841aa078eb5cc93be9a40d95b6d71e877edd528ef1c12f148",
+      "signature": "keyword_struct c { ... }",
+      "comment": "Manages fixed-size buffer allocations with ownership and lifecycle control; ensures safe initialization/deinit.",
+      "is_pub": true,
+      "line": 28
+    },
+    {
+      "type": "struct",
+      "name": "CozoResult",
+      "match_hash": "15fbb56c91df42d058a7b4323b93891d43b0d83d843f86b4bb583320f474ba32",
+      "signature": "keyword_struct CozoResult { ... }",
+      "comment": "Manages CozoResult instances with ownership, provides slicing and validation; self-manages memory.",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "fn_decl",
+          "name": "deinit",
+          "match_hash": "352070bf6c6498d06be5257fa23f430cca54ef7871813bee676c887d381d61ff",
+          "signature": "fn deinit(self: CozoResult) -> void",
+          "params": [
+            { "name": "self", "type": "CozoResult" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 83
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "slice",
+          "match_hash": "e7aa36b3dc710505dab493b14daf45ba89ad62d21e0a3efbe0097737cd775635",
+          "signature": "fn slice(self: CozoResult) -> []const u8",
+          "params": [
+            { "name": "self", "type": "CozoResult" }
+          ],
+          "returns": "[]const u8",
+          "is_pub": true,
+          "line": 88
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "check",
+          "match_hash": "85121b3dbdd747bf16d50e91d1e0fa861a53e9eeb63e3172e96000fe4306e4e9",
+          "signature": "fn check(self: CozoResult, allocator: std.mem.Allocator) -> std.json.Value",
+          "params": [
+            { "name": "self", "type": "CozoResult" },
+            { "name": "allocator", "type": "std.mem.Allocator" }
+          ],
+          "returns": "std.json.Value",
+          "is_pub": true,
+          "line": 94
+        }
+      ],
+      "line": 80
+    },
+    {
+      "type": "enum",
+      "name": "StorageEngine",
+      "match_hash": "c0fa33a77b8e4468f5321ddc9222f6e3c909557a98b671ab4abb10c716c06050",
+      "signature": "keyword_enum StorageEngine { ... }",
+      "comment": "Manages storage buffers with fixed size; owned by the instance; provides string conversion for storage operations.",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "enum_field",
+          "name": "mem",
+          "is_pub": false,
+          "line": 115
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "sqlite",
+          "is_pub": false,
+          "line": 116
+        }
+    ,    {
+          "type": "enum_field",
+          "name": "rocksdb",
+          "is_pub": false,
+          "line": 117
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "cStr",
+          "match_hash": "df2934e3871968eecbebecf49290f0527a3dcdb4545f3e9f12763d2fe746dfc1",
+          "signature": "fn cStr(self: StorageEngine) -> [*:0]const u8",
+          "params": [
+            { "name": "self", "type": "StorageEngine" }
+          ],
+          "returns": "[*:0]const u8",
+          "is_pub": true,
+          "line": 119
+        }
+      ],
+      "line": 114
+    },
+    {
+      "type": "struct",
+      "name": "CozoDB",
+      "match_hash": "0234b02628f943423a49f4c4a91a482632c6b3ad1b82572aee786fd44fc76c47",
+      "signature": "keyword_struct CozoDB { ... }",
+      "comment": "Manages CozoDB interactions via a struct; owns resources, immutable querying, no direct ownership.",
+      "is_pub": true,
+      "members": [
+        {
+          "type": "fn_decl",
+          "name": "open",
+          "match_hash": "e7fb57612b9c7c2fa7a8adba94cf3c7823d25679941134aa375f40be114e28ce",
+          "signature": "fn open(allocator: std.mem.Allocator, engine: StorageEngine, path: [:0]const u8, options: [:0]const u8) -> Self",
+          "params": [
+            { "name": "allocator", "type": "std.mem.Allocator" },
+            { "name": "engine", "type": "StorageEngine" },
+            { "name": "path", "type": "[:0]const u8" },
+            { "name": "options", "type": "[:0]const u8" }
+          ],
+          "returns": "Self",
+          "is_pub": true,
+          "line": 150
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "close",
+          "match_hash": "fa3a378d9385c023c0b93022c54a40be906bb4f6bc309bf31e2da54b08d572b2",
+          "signature": "fn close(self: Self) -> bool",
+          "params": [
+            { "name": "self", "type": "Self" }
+          ],
+          "returns": "bool",
+          "is_pub": true,
+          "line": 168
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "query",
+          "match_hash": "92fccbdeb66c4d0bf4647f5ef731ba74464b24db6a2b608a928a366ae63e1ee4",
+          "signature": "fn query(self: Self, script: [:0]const u8, params_json: [:0]const u8, immutable: bool) -> std.json.Parsed(std.json.Value)",
+          "params": [
+            { "name": "self", "type": "Self" },
+            { "name": "script", "type": "[:0]const u8" },
+            { "name": "params_json", "type": "[:0]const u8" },
+            { "name": "immutable", "type": "bool" }
+          ],
+          "returns": "std.json.Parsed(std.json.Value)",
+          "is_pub": true,
+          "line": 181
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "exec",
+          "match_hash": "7fc83b5df95b8b15d942000aea0e1aa2ec97c95aa012496afa7fd80fd37e7665",
+          "signature": "fn exec(self: Self, script: [:0]const u8) -> void",
+          "params": [
+            { "name": "self", "type": "Self" },
+            { "name": "script", "type": "[:0]const u8" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 217
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "queryRead",
+          "match_hash": "6936e0c4ccac68ed2c0f4b542f809a74708662a82e8ce3f60c77e58c428eeb4e",
+          "signature": "fn queryRead(self: Self, script: [:0]const u8) -> std.json.Parsed(std.json.Value)",
+          "params": [
+            { "name": "self", "type": "Self" },
+            { "name": "script", "type": "[:0]const u8" }
+          ],
+          "returns": "std.json.Parsed(std.json.Value)",
+          "is_pub": true,
+          "line": 223
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "queryWithParams",
+          "match_hash": "7834c8457a383c623f65f71ca80ef7f71ff8abc7a0b77bd67cd8a21e5a37952d",
+          "signature": "fn queryWithParams(self: Self, script: [:0]const u8, params_json: [:0]const u8) -> std.json.Parsed(std.json.Value)",
+          "params": [
+            { "name": "self", "type": "Self" },
+            { "name": "script", "type": "[:0]const u8" },
+            { "name": "params_json", "type": "[:0]const u8" }
+          ],
+          "returns": "std.json.Parsed(std.json.Value)",
+          "is_pub": true,
+          "line": 229
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "importRelations",
+          "match_hash": "80ccf293912e48c6e254e31d9824302602caf3c59f3e44ee013ad4a22163d8e2",
+          "signature": "fn importRelations(self: Self, json_payload: [:0]const u8) -> void",
+          "params": [
+            { "name": "self", "type": "Self" },
+            { "name": "json_payload", "type": "[:0]const u8" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 242
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "backup",
+          "match_hash": "1e61eb9caaf8f2ab1fc36ac51b310eb91fc27d5eb094664cc7ba7b44a5e88f7a",
+          "signature": "fn backup(self: Self, out_path: [:0]const u8) -> void",
+          "params": [
+            { "name": "self", "type": "Self" },
+            { "name": "out_path", "type": "[:0]const u8" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 256
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "restore",
+          "match_hash": "a7933350795d775192e361dd51c5df423596cfed942fc8d10e74609f9ca19646",
+          "signature": "fn restore(self: Self, in_path: [:0]const u8) -> void",
+          "params": [
+            { "name": "self", "type": "Self" },
+            { "name": "in_path", "type": "[:0]const u8" }
+          ],
+          "returns": "void",
+          "is_pub": true,
+          "line": 270
+        }
+    ,    {
+          "type": "fn_decl",
+          "name": "getRows",
+          "match_hash": "526ef4d7fef4799258a2a11d6e5a7e2974ad184680ca3aa2ffd544b9b8587c75",
+          "signature": "fn getRows(result: *const std.json.Parsed(std.json.Value)) -> []std.json.Value",
+          "params": [
+            { "name": "result", "type": "*const std.json.Parsed(std.json.Value)" }
+          ],
+          "returns": "[]std.json.Value",
+          "is_pub": true,
+          "line": 290
+        }
+      ],
+      "line": 135
+    },
+    {
+      "type": "test_decl",
+      "name": "CozoDB: open and close in-memory",
+      "is_pub": false,
+      "line": 304
+    },
+    {
+      "type": "test_decl",
+      "name": "CozoDB: simple scalar query",
+      "is_pub": false,
+      "line": 309
+    },
+    {
+      "type": "test_decl",
+      "name": "CozoDB: create stored relation and insert",
+      "is_pub": false,
+      "line": 321
+    },
+    {
+      "type": "test_decl",
+      "name": "CozoDB: query with no results returns empty rows",
+      "is_pub": false,
+      "line": 336
+    },
+    {
+      "type": "test_decl",
+      "name": "CozoDB: invalid query returns error",
+      "is_pub": false,
+      "line": 349
+    }
+  ]
+}

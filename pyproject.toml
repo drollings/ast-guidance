@@ -1,0 +1,52 @@
+[project]
+name = "ast-guidance-py"
+version = "0.2.0"
+description = "Python AST → JSON guidance provider for the ast-guidance codebase documentation system"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "Apache 2.0"}
+authors = [
+    {name = "ast-guidance contributors"}
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Documentation",
+]
+dependencies = [
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.14.0",
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[project.scripts]
+ast-guidance-py = "bin.ast-guidance-py:main"
+
+[project.urls]
+Homepage = "https://github.com/danielr/ast-guidance"
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 200
+target-version = "py312"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["bin*"]
+exclude = ["tests*", "tests.*"]

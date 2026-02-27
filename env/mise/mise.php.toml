@@ -1,0 +1,10 @@
+# mise.php.toml
+# PHP toolchain (only installed when TARGET_LANG=php)
+# Install with: mise -E php install
+
+[tools]
+php = "8.2"
+composer = "latest"
+
+[env]
+PHP_VERSION = "8.2"

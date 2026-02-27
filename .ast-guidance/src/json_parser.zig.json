@@ -1,0 +1,174 @@
+{
+  "meta": {
+    "module": "src.json_parser",
+    "source": "src/json_parser.zig",
+    "language": "zig"
+  },
+  "comment": "Handles Zig JSON file parsing, extracts target info, and validates AST structure.",
+  "used_by": ["src/main.zig", "src/repl.zig"],
+  "members": [
+    {
+      "type": "struct",
+      "name": "TargetJson",
+      "match_hash": "b7260e89ac8f17c802dacd9f609a319c0afa2d410d8d654df0e3cbd12b679961",
+      "signature": "keyword_struct TargetJson { ... }",
+      "comment": "Represents a JSON target structure with ownership and invariants; managed via target functions.",
+      "is_pub": true,
+      "line": 15
+    },
+    {
+      "type": "fn_decl",
+      "name": "parseFile",
+      "match_hash": "c4c27b7d46a82c578c65f1fd8247ab3d16413b0577c559446048f55c88070252",
+      "signature": "fn parseFile(allocator: std.mem.Allocator, path: []const u8, registry: *TargetRegistry, interner: *StringInterner) -> void",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "path", "type": "[]const u8" },
+        { "name": "registry", "type": "*TargetRegistry" },
+        { "name": "interner", "type": "*StringInterner" }
+      ],
+      "returns": "void",
+      "comment": "Reads a file into a Zig slice using an allocator, registry, and interners.",
+      "is_pub": true,
+      "line": 25
+    },
+    {
+      "type": "fn_decl",
+      "name": "parseJson",
+      "match_hash": "ef96f72591b032408aa1139188daf45f2acd40af4232560328f19c77499d8fd0",
+      "signature": "fn parseJson(allocator: std.mem.Allocator, json_text: []const u8, registry: *TargetRegistry, interner: *StringInterner) -> void",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "json_text", "type": "[]const u8" },
+        { "name": "registry", "type": "*TargetRegistry" },
+        { "name": "interner", "type": "*StringInterner" }
+      ],
+      "returns": "void",
+      "comment": "Converts a JSON string into a Zig-safe slice, handling allocations and registry lookups.",
+      "is_pub": true,
+      "line": 45
+    },
+    {
+      "type": "fn_private",
+      "name": "parseTarget",
+      "match_hash": "e5bd1c97717c17c4e24ffe0321962a6265e70e912b12cd9ef33180bec33d1b5a",
+      "signature": "fn parseTarget(allocator: std.mem.Allocator, name: []const u8, value: std.json.Value, registry: *TargetRegistry, interner: *StringInterner) -> void",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "name", "type": "[]const u8" },
+        { "name": "value", "type": "std.json.Value" },
+        { "name": "registry", "type": "*TargetRegistry" },
+        { "name": "interner", "type": "*StringInterner" }
+      ],
+      "returns": "void",
+      "comment": "Interprets a registry entry as a target name, parsing JSON and returning the associated value.",
+      "is_pub": false,
+      "line": 78
+    },
+    {
+      "type": "fn_private",
+      "name": "determineTargetType",
+      "match_hash": "774771ff117549f5c5413b33ccfb6ef41b95f9182dd39eeeadc81b9b7bb18bc8",
+      "signature": "fn determineTargetType(obj: std.json.ObjectMap) -> TargetType",
+      "params": [
+        { "name": "obj", "type": "std.json.ObjectMap" }
+      ],
+      "returns": "TargetType",
+      "comment": "Determines the target type from a JSON object map, returning a TargetType with key and value details.",
+      "is_pub": false,
+      "line": 161
+    },
+    {
+      "type": "fn_decl",
+      "name": "writeExample",
+      "match_hash": "38788f3fd95504e6d9d60edae1a92a15eb97619dae2e7e7438d8732357799886",
+      "signature": "fn writeExample(allocator: std.mem.Allocator, path: []const u8) -> void",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "path", "type": "[]const u8" }
+      ],
+      "returns": "void",
+      "comment": "Writes a Zig example string to an allocated memory path, returning no value on success.",
+      "is_pub": true,
+      "line": 183
+    },
+    {
+      "type": "test_decl",
+      "name": "JSON parsing",
+      "is_pub": false,
+      "line": 234
+    },
+    {
+      "type": "test_decl",
+      "name": "JSON parsing GPA no leaks",
+      "is_pub": false,
+      "line": 261
+    },
+    {
+      "type": "test_decl",
+      "name": "JSON parsing: invalid JSON returns error",
+      "is_pub": false,
+      "line": 301
+    },
+    {
+      "type": "test_decl",
+      "name": "JSON parsing: non-object root returns error",
+      "is_pub": false,
+      "line": 311
+    },
+    {
+      "type": "test_decl",
+      "name": "JSON parsing: empty object produces zero targets",
+      "is_pub": false,
+      "line": 321
+    },
+    {
+      "type": "test_decl",
+      "name": "JSON parsing: target type detection — phony",
+      "is_pub": false,
+      "line": 331
+    },
+    {
+      "type": "test_decl",
+      "name": "JSON parsing: target type detection — file (exists key)",
+      "is_pub": false,
+      "line": 347
+    },
+    {
+      "type": "test_decl",
+      "name": "JSON parsing: target type detection — command (commands key)",
+      "is_pub": false,
+      "line": 364
+    },
+    {
+      "type": "test_decl",
+      "name": "JSON parsing: target type detection — abstract (no distinguishing key)",
+      "is_pub": false,
+      "line": 382
+    },
+    {
+      "type": "test_decl",
+      "name": "JSON parsing: essential and check_mtime fields",
+      "is_pub": false,
+      "line": 398
+    },
+    {
+      "type": "test_decl",
+      "name": "JSON parsing: depends and provides are recorded",
+      "is_pub": false,
+      "line": 421
+    },
+    {
+      "type": "test_decl",
+      "name": "JSON parsing: multiple commands are all stored",
+      "is_pub": false,
+      "line": 446
+    },
+    {
+      "type": "test_decl",
+      "name": "JSON parsing: parseFile returns IoError for missing file",
+      "is_pub": false,
+      "line": 464
+    }
+  ]
+}

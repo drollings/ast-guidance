@@ -1,0 +1,47 @@
+{
+  "meta": {
+    "module": "src.schema",
+    "source": "src/schema.zig",
+    "language": "zig"
+  },
+  "comment": "Defines CozoDB schema for Coral Context, replacing legacy engines with CozoDB's unified payloads, embeddings, Datalog traversal, and time-travel features.",
+  "used_by": ["src/db.zig", "src/main.zig"],
+  "members": [
+    {
+      "type": "test_decl",
+      "name": "schema DDL constants are non-empty",
+      "is_pub": false,
+      "line": 202
+    },
+    {
+      "type": "test_decl",
+      "name": "schema DDL contains expected keywords",
+      "is_pub": false,
+      "line": 211
+    },
+    {
+      "type": "test_decl",
+      "name": "schema uses CozoDB syntax not PostgreSQL",
+      "is_pub": false,
+      "line": 234
+    },
+    {
+      "type": "test_decl",
+      "name": "schema uses CozoDB syntax not Cypher",
+      "is_pub": false,
+      "line": 246
+    },
+    {
+      "type": "test_decl",
+      "name": "SCHEMA_DDL has 7 statements",
+      "is_pub": false,
+      "line": 254
+    },
+    {
+      "type": "test_decl",
+      "name": "query templates contain Datalog syntax",
+      "is_pub": false,
+      "line": 260
+    }
+  ]
+}

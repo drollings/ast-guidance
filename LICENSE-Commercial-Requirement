@@ -1,0 +1,12 @@
+If you are developing proprietary, closed-source software, you cannot legally
+use the GPLv3 license without open-sourcing your own codebase.  You must
+purchase a Commercial License if you meet any of the following criteria:
+
+You wish to embed this software in a proprietary, closed-source product.
+
+Your Legal Entity (including parent companies and affiliates) generates gross
+annual revenue exceeding $1,000,000 USD.
+
+You require usage for more than one (1) developer seat.
+
+You require technical support, indemnification, or liability waivers.

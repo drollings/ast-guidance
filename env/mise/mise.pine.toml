@@ -1,0 +1,10 @@
+# mise.pine.toml
+# Pine Script v6 toolchain (only installed when TARGET_LANG=pine)
+# Pine Script is text-based, no compilation toolchain needed
+# Node installed here only for potential Pine Script linters if available
+
+[tools]
+node = "20.11.0"
+
+[env]
+PINE_VERSION = "6"

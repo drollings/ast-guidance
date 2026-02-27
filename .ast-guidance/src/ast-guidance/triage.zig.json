@@ -1,0 +1,133 @@
+{
+  "meta": {
+    "module": "src.ast-guidance.triage",
+    "source": "src/ast-guidance/triage.zig",
+    "language": "zig"
+  },
+  "comment": "Generates TRIAGE.md from TODO.md using lifecycle detection, risk assessment, and recommended actions.",
+  "used_by": ["src/ast-guidance/main.zig"],
+  "members": [
+    {
+      "type": "fn_decl",
+      "name": "getLifecycleState",
+      "match_hash": "18c27e008aec0dd55a287ddefc19aeb80b8123904651d7b2e325065f745abc29",
+      "signature": "fn getLifecycleState(allocator: std.mem.Allocator, work_dir: []const u8) -> []const u8",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "work_dir", "type": "[]const u8" }
+      ],
+      "returns": "[]const u8",
+      "is_pub": true,
+      "line": 21
+    },
+    {
+      "type": "fn_decl",
+      "name": "assessRisk",
+      "match_hash": "c1bff9914e2c687f3ed135a6268efa1e378bfa949f74fbe05885cdd78b032833",
+      "signature": "fn assessRisk(content: []const u8, affected_count: usize) -> []const u8",
+      "params": [
+        { "name": "content", "type": "[]const u8" },
+        { "name": "affected_count", "type": "usize" }
+      ],
+      "returns": "[]const u8",
+      "is_pub": true,
+      "line": 36
+    },
+    {
+      "type": "fn_private",
+      "name": "containsIgnoreCase",
+      "match_hash": "2f8da225c4258338c0751d613bfff67297f7d117e2e155ac2f04a084d52290de",
+      "signature": "fn containsIgnoreCase(haystack: []const u8, needle: []const u8) -> bool",
+      "params": [
+        { "name": "haystack", "type": "[]const u8" },
+        { "name": "needle", "type": "[]const u8" }
+      ],
+      "returns": "bool",
+      "is_pub": false,
+      "line": 54
+    },
+    {
+      "type": "fn_decl",
+      "name": "findAffectedFiles",
+      "match_hash": "edbe3cd244be75394e68fa64d5d4f2c54af5f0781bf338934ecb37f19ebd6e52",
+      "signature": "fn findAffectedFiles(allocator: std.mem.Allocator, content: []const u8, project_root: []const u8) -> [][]const u8",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "content", "type": "[]const u8" },
+        { "name": "project_root", "type": "[]const u8" }
+      ],
+      "returns": "[][]const u8",
+      "is_pub": true,
+      "line": 76
+    },
+    {
+      "type": "fn_private",
+      "name": "isPathToken",
+      "match_hash": "32a590384288ccdc79281aa0d3b076495b458da3595d36d03717e9d96fc341cf",
+      "signature": "fn isPathToken(s: []const u8) -> bool",
+      "params": [
+        { "name": "s", "type": "[]const u8" }
+      ],
+      "returns": "bool",
+      "is_pub": false,
+      "line": 143
+    },
+    {
+      "type": "fn_private",
+      "name": "hasExtension",
+      "match_hash": "5acac65718482b22248565778bf0707fd61f280ae3830d0a2a4204176fcd07be",
+      "signature": "fn hasExtension(s: []const u8) -> bool",
+      "params": [
+        { "name": "s", "type": "[]const u8" }
+      ],
+      "returns": "bool",
+      "is_pub": false,
+      "line": 148
+    },
+    {
+      "type": "fn_private",
+      "name": "addUnique",
+      "match_hash": "99aa58a4560b1591f3794ef23bb8690eba437c50375f0f4e67a4f40ab08d7edd",
+      "signature": "fn addUnique(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8), path: []const u8, project_root: []const u8) -> bool",
+      "params": [
+        { "name": "allocator", "type": "std.mem.Allocator" },
+        { "name": "list", "type": "*std.ArrayList([]const u8)" },
+        { "name": "path", "type": "[]const u8" },
+        { "name": "project_root", "type": "[]const u8" }
+      ],
+      "returns": "bool",
+      "is_pub": false,
+      "line": 161
+    },
+    {
+      "type": "test_decl",
+      "name": "assessRisk high for delete",
+      "is_pub": false,
+      "line": 185
+    },
+    {
+      "type": "test_decl",
+      "name": "assessRisk medium for refactor",
+      "is_pub": false,
+      "line": 190
+    },
+    {
+      "type": "test_decl",
+      "name": "assessRisk medium for wide scope",
+      "is_pub": false,
+      "line": 195
+    },
+    {
+      "type": "test_decl",
+      "name": "assessRisk low for simple change",
+      "is_pub": false,
+      "line": 200
+    },
+    {
+      "type": "test_decl",
+      "name": "findAffectedFiles detects backtick paths",
+      "is_pub": false,
+      "line": 205
+    }
+  ]
+}

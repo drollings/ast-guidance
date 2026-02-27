@@ -1,0 +1,23 @@
+# mise.wasm.toml
+# WebAssembly toolchain for AgenticSandbox
+# Builds Rust → WebAssembly targeting wasm32-unknown-unknown
+# Only installed when TARGET_LANG=wasm
+
+[tools]
+rust = "1.76.0"
+node = "20.11.0"  # For wasm-pack CLI and testing tools
+
+[tasks]
+fmt = { run = "cd target && cargo fmt", description = "Format WASM code" }
+lint = { run = "cd target && cargo clippy --target wasm32-unknown-unknown -- -D warnings", description = "Lint WASM code" }
+test = { run = "cd target && wasm-pack test --headless --firefox", description = "Test WASM builds" }
+build = { run = "cd target && wasm-pack build --release --target web", description = "Build WASM for web" }
+
+[env]
+CARGO_TARGET_DIR = "{{cwd}}/target/.cargo"
+RUSTFLAGS = "--cfg target_arch=\"wasm32\""
+WASM_BINDGEN_TEST_TIMEOUT = "30"
+
+[env.development]
+# Development-specific WASM settings (if needed)
+WASM_DEBUG = "true"
