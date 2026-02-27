@@ -574,7 +574,7 @@
       ],
       "returns": "[]u8",
       "is_pub": false,
-      "line": 3476
+      "line": 3477
     },
     {
       "type": "fn_private",
@@ -587,7 +587,7 @@
       ],
       "returns": "void",
       "is_pub": false,
-      "line": 3492
+      "line": 3493
     },
     {
       "type": "fn_private",
@@ -603,7 +603,7 @@
       ],
       "returns": "?[]const u8",
       "is_pub": false,
-      "line": 3645
+      "line": 3646
     },
     {
       "type": "fn_private",
@@ -618,7 +618,7 @@
       ],
       "returns": "?[]const u8",
       "is_pub": false,
-      "line": 3725
+      "line": 3726
     },
     {
       "type": "fn_private",
@@ -631,7 +631,7 @@
       ],
       "returns": "void",
       "is_pub": false,
-      "line": 3767
+      "line": 3768
     },
     {
       "type": "fn_private",
@@ -644,13 +644,13 @@
       ],
       "returns": "void",
       "is_pub": false,
-      "line": 3924
+      "line": 3925
     },
     {
       "type": "test_decl",
       "name": "main compiles",
       "is_pub": false,
-      "line": 3967
+      "line": 3968
     }
   ]
 }

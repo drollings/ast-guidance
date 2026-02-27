@@ -24,10 +24,10 @@
           ],
           "returns": "void",
           "is_pub": true,
-          "line": 56
+          "line": 57
         }
       ],
-      "line": 27
+      "line": 28
     },
     {
       "type": "fn_decl",
@@ -40,7 +40,7 @@
       ],
       "returns": "ProjectConfig",
       "is_pub": true,
-      "line": 74
+      "line": 75
     },
     {
       "type": "fn_private",
@@ -54,7 +54,7 @@
       ],
       "returns": "ProjectConfig",
       "is_pub": false,
-      "line": 108
+      "line": 109
     },
     {
       "type": "fn_private",
@@ -67,7 +67,7 @@
       ],
       "returns": "ProjectConfig",
       "is_pub": false,
-      "line": 184
+      "line": 185
     },
     {
       "type": "fn_private",
@@ -84,7 +84,7 @@
       ],
       "returns": "ProjectConfig",
       "is_pub": false,
-      "line": 197
+      "line": 198
     }
   ]
 }

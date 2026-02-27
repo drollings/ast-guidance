@@ -20,7 +20,8 @@ BIN         := $(VENV)/bin
 PYTHON_VENV := $(BIN)/python
 UV          := uv
 
-DOCUMENTOR  := zig-out/bin/ast-guidance
+DOCUMENTOR  := $(shell which ast-guidance)
+TARGET_BIN  := zig-out/bin/ast-guidance
 AST_PY      := bin/ast-guidance-py
 CONFIG      := .ast-guidance/ast-guidance-config.json
 
@@ -136,7 +137,7 @@ env-init: check-prereqs venv ## Initialize development environment (uv venv + zi
 
 .PHONY: clean
 clean: ## Remove build artifacts and markers (keeps venv)
-	$(Q)rm -rf zig-out/.zig-cache $(HASH_DIR)
+	$(Q)rm -rf zig-out/.zig-cache $(HASH_DIR) $(TARGET_BIN)
 	$(Q)rm -rf $(BUILD_MARKER_DIR) $(TEST_MARKER_DIR) $(GUIDANCE_MARKER_DIR) $(LINT_MARKER_DIR)
 	$(Q)find . -type d -name ".zig-cache" -exec rm -rf {} + 2>/dev/null || true
 
@@ -146,9 +147,13 @@ clean-all: clean ## Nuclear cleanup (includes venv)
 
 ##@ Zig Build & RALPH Loop (incremental per-file)
 
-$(DOCUMENTOR):
+$(TARGET_BIN): STRUCTURE.md
 	$(Q)mkdir -p $(BUILD_MARKER_DIR) $(TEST_MARKER_DIR) $(GUIDANCE_MARKER_DIR) $(LINT_MARKER_DIR)
-	zig build
+	$(Q)zig build
+
+.PHONY: install
+install: $(DOCUMENTOR)
+	cp $(TARGET_BIN) $(DOCUMENTOR)
 
 # Find all Zig source files
 ZIG_SRC_FILES := $(shell find $(SRC_DIR) -name '*.zig' 2>/dev/null)
@@ -237,7 +242,7 @@ STRUCTURE.md: $(LINT_MARKERS)
 
 # Full RALPH loop gate: build → test → guidance → lint → STRUCTURE.md
 .PHONY: pre-commit
-pre-commit: STRUCTURE.md ## Run all checks (RALPH loop gate)
+pre-commit: $(TARGET_BIN) ## Run all checks (RALPH loop gate)
 	$(Q)echo "All checks passed."
 
 .PHONY: fmt
