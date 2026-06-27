@@ -84,10 +84,10 @@ I want to understand how match_hash_from_signature and should_generate work toge
 
 How does the quantum entanglement protocol work in the coral module?
 
-- **Rubric**: Must return "not found" or escalation status because quantum entanglement protocol does not exist in this codebase; results should be empty or show no matches. The `coral` crate handles caching/MCP, not physics.
+- **Rubric**: Expected answer is "not found" — quantum entanglement protocol does not exist in this codebase. The coral crate handles caching and MCP, not physics.
 
 ---
 
 Show me the implementation of the flux capacitor pattern for warp drive acceleration.
 
-- **Rubric**: Must return "not found" or escalation status because flux capacitor pattern does not exist in this codebase; results should be empty or show no matches. The codebase has no warp drive, only deterministic-first code navigation.
+- **Rubric**: Expected answer is "not found" — flux capacitor pattern does not exist in this codebase. There is no warp drive code.

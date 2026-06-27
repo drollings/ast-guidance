@@ -41,24 +41,33 @@ pub struct GenConfig {
 pub struct SyncEngine {
     pub ast_parser: AstParser,
     pub guidance_dir: PathBuf,
+    pub workspace_root: PathBuf,
     pub source_dir: PathBuf,
     pub enhancer: Option<Enhancer>,
 }
 
 impl SyncEngine {
     pub fn new(guidance_dir: PathBuf, source_dir: PathBuf) -> Self {
+        let workspace_root = guidance_dir
+            .parent()
+            .map_or_else(|| source_dir.clone(), Path::to_path_buf);
         Self {
             ast_parser: AstParser::new(),
             guidance_dir,
+            workspace_root,
             source_dir,
             enhancer: None,
         }
     }
 
     pub fn with_parser(guidance_dir: PathBuf, source_dir: PathBuf, ast_parser: AstParser) -> Self {
+        let workspace_root = guidance_dir
+            .parent()
+            .map_or_else(|| source_dir.clone(), Path::to_path_buf);
         Self {
             ast_parser,
             guidance_dir,
+            workspace_root,
             source_dir,
             enhancer: None,
         }
@@ -81,17 +90,24 @@ impl SyncEngine {
     ) -> Result<GuidanceDoc, SyncEngineError> {
         let source = common_core::io::read_to_string_err(source_path)?;
 
-        let rel_path = source_path
+        // Module name is relative to source_dir (for logical module path).
+        let module_rel = source_path
             .strip_prefix(&self.source_dir)
             .unwrap_or(source_path);
-        let module_name = rel_path
+        let module_name = module_rel
             .to_string_lossy()
             .strip_suffix(&format!(
                 ".{}",
-                rel_path.extension().and_then(|e| e.to_str()).unwrap_or("")
+                module_rel.extension().and_then(|e| e.to_str()).unwrap_or("")
             ))
-            .unwrap_or(&rel_path.to_string_lossy())
+            .unwrap_or(&module_rel.to_string_lossy())
             .replace(['/', '\\'], ".");
+
+        // Source path is relative to workspace root (canonical display path).
+        let source_path_str = source_path
+            .strip_prefix(&self.workspace_root)
+            .unwrap_or(source_path)
+            .to_string_lossy();
 
         let mut doc = self
             .ast_parser
@@ -99,7 +115,7 @@ impl SyncEngine {
             .map_err(|e| SyncEngineError::Parse(e.to_string()))?;
 
         doc.meta.module = module_name.as_str().into();
-        doc.meta.source = rel_path.to_string_lossy().as_ref().into();
+        doc.meta.source = source_path_str.as_ref().into();
 
         // G5: LLM enhancement — generate missing comments before JSON save
         if let Some(ref enhancer) = self.enhancer {

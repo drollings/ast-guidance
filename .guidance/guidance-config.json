@@ -18,6 +18,7 @@
     "batch": "llama:code",
     "embed": "llama:embed"
   },
+  "model_thinking": "llama:code",
   "embed": {
     "dims": 768,
     "cache_limit": 400

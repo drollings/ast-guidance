@@ -313,15 +313,15 @@ impl GuidanceDb {
 
     pub fn keyword_search(&self, query: &str) -> Result<Vec<SearchResult>, VectorDbError> {
         let conn = self.conn.lock().unwrap();
-        let pattern = format!("%{query}%");
 
+        // 1. Try exact full-query substring match first (fast, precise).
+        let pattern = format!("%{query}%");
         let mut stmt = conn.prepare(
             "SELECT id, name, source, signature FROM guidance_nodes
              WHERE name LIKE ?1 OR signature LIKE ?1 OR comment LIKE ?1
              LIMIT 50",
         )?;
-
-        let results = stmt
+        let exact: Vec<SearchResult> = stmt
             .query_map(params![pattern], |row| {
                 Ok(SearchResult {
                     id: row.get(0)?,
@@ -329,6 +329,80 @@ impl GuidanceDb {
                     source: row.get(2)?,
                     signature: row.get(3)?,
                     similarity: 1.0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !exact.is_empty() {
+            return Ok(exact);
+        }
+
+        // 2. Token-based fallback for natural-language queries. Split
+        //    into tokens, require at least `min_matches` tokens to match
+        //    name/signature/comment. Short queries (1-2 tokens) need 1
+        //    match; longer queries need 2+ to filter noise.
+        let tokens: Vec<&str> = query
+            .split_whitespace()
+            .filter(|t| t.len() >= 3)
+            .collect();
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Require a proportional number of token matches to filter noise.
+        // Short queries (1-2 tokens) need 1 match; longer queries need
+        // ~30% of significant tokens to match, preventing false positives
+        // from incidental keyword overlap (e.g. "coral" + "module" matching
+        // unrelated code when the query is about quantum entanglement).
+        let min_matches: i32 = if tokens.len() <= 2 {
+            1
+        } else {
+            ((tokens.len() as f32 * 0.3).ceil() as i32).max(2)
+        };
+
+        // Build positional LIKE conditions for each token.
+        let mut wheres = Vec::new();
+        let mut param_idx = 1;
+        let mut token_patterns: Vec<String> = Vec::new();
+        for &tok in &tokens {
+            let pattern = format!("%{tok}%");
+            token_patterns.push(pattern);
+            let t = param_idx;
+            wheres.push(format!(
+                "(name LIKE ?{t} OR signature LIKE ?{t} OR comment LIKE ?{t})"
+            ));
+            param_idx += 1;
+        }
+        let hits_expr = wheres
+            .iter()
+            .map(|w| format!("CASE WHEN {w} THEN 1 ELSE 0 END"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let min_hits_param = param_idx;
+
+        let sql = format!(
+            "SELECT id, name, source, signature, ({hits_expr}) AS hits
+             FROM guidance_nodes
+             WHERE hits >= ?{min_hits_param}
+             ORDER BY hits DESC
+             LIMIT 50"
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = token_patterns
+            .iter()
+            .map(|p| Box::new(p.clone()) as Box<dyn rusqlite::types::ToSql>)
+            .collect();
+        params.push(Box::new(min_matches));
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(Box::as_ref).collect();
+        let results = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                Ok(SearchResult {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    source: row.get(2)?,
+                    signature: row.get(3)?,
+                    similarity: row.get::<_, i32>(4)? as f32,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -385,6 +459,9 @@ impl GuidanceDb {
             let mut synced = 0;
             let conn = self.conn.lock().unwrap();
 
+            // Clear existing nodes before re-sync to avoid stale duplicates.
+            conn.execute("DELETE FROM guidance_nodes", [])?;
+
             let mut json_files = Vec::new();
             common_core::walk::walk_files(json_dir, &["json"], |path| {
                 json_files.push(path.to_path_buf());
@@ -411,7 +488,9 @@ impl GuidanceDb {
                 let language = doc["meta"]["language"].as_str().unwrap_or("zig");
                 let comment = doc["comment"].as_str();
 
-                // Upsert node
+                // Upsert node — skip duplicates where (name, signature)
+                // already exists.  This handles multiple JSON files for
+                // the same source (e.g. `guidance/src/...` vs `src/guidance/src/...`).
                 if let Some(members) = doc["members"].as_array() {
                     for member in members {
                         let name = member["name"].as_str().unwrap_or("");
@@ -419,8 +498,20 @@ impl GuidanceDb {
                         let member_comment = member["comment"].as_str();
                         let _is_anchor = member["is_anchor"].as_bool().unwrap_or(false);
 
+                        // Check for existing row with same (name, signature).
+                        let exists: bool = conn
+                            .query_row(
+                                "SELECT 1 FROM guidance_nodes WHERE name = ?1 AND signature IS ?2 LIMIT 1",
+                                rusqlite::params![name, signature],
+                                |_| Ok(true),
+                            )
+                            .unwrap_or(false);
+                        if exists {
+                            continue;
+                        }
+
                         let _ = conn.execute(
-                            "INSERT OR REPLACE INTO guidance_nodes (name, source, signature, comment, module, language)
+                            "INSERT INTO guidance_nodes (name, source, signature, comment, module, language)
                              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                             rusqlite::params![
                                 name,

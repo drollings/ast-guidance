@@ -153,8 +153,19 @@ pub fn resolve_model_ref(config: &ProjectConfig, role: &str) -> String {
 }
 
 /// Resolve a model reference into (api_url, model_name, is_thinking).
+///
+/// A model is considered a "thinking" model when:
+/// 1. Its reference matches `config.model_thinking` (flat field), OR
+/// 2. Its reference matches the model in `models.thinking`, OR
+/// 3. It IS the model referenced by `models.thinking` (same provider:model).
 pub fn resolve_model_url(config: &ProjectConfig, model_ref: &str) -> (String, String, bool) {
-    let is_thinking = config.model_thinking.as_deref() == Some(model_ref);
+    // Determine the thinking model reference from both sources.
+    let thinking_ref = config
+        .model_thinking
+        .as_deref()
+        .or_else(|| config.models.get("thinking").map(|s| s.as_str()));
+
+    let is_thinking = thinking_ref.is_some_and(|tr| tr == model_ref);
 
     let (provider_name, model) = model_ref.split_once(':').unwrap_or(("default", model_ref));
 

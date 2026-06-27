@@ -130,6 +130,7 @@ Then you you must read
     │   └── guidance/
     │       ├── Cargo.toml
     │       └── src/
+    │           ├── benchmark.rs  # //! `guidance benchmark` — query ac...
     │           ├── commit.rs  # //! Commit message generation — LLM...
     │           ├── editor.rs  # //! Editor interaction utilities for hum
     │           ├── main.rs  # use std::path::{Path, PathBuf};

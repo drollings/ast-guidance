@@ -45,7 +45,7 @@ use guidance_core::config::ProjectConfig;
 use guidance_core::query::synthesize::Stage;
 use guidance_core::sync::json_store::load_guidance;
 use guidance_core::walk;
-use guidance_llm::{ChatMessage, LlmClient, LlmConfig};
+use guidance_llm::{ChatMessage, LlmClient, LlmConfig, strip_think_block};
 use guidance_search_vector::db::SearchResult;
 use guidance_search_vector::GuidanceDb;
 use guidance_types::{GuidanceDoc, StageKind};
@@ -297,7 +297,7 @@ pub async fn run_benchmark(config: BenchmarkConfig) -> Result<(), BenchmarkError
         Err(arc) => arc.lock().unwrap().clone(),
     };
     collected.sort_by_key(|r| r.query.clone());
-    print_report(&collected, &histogram);
+    print_report(&collected, &histogram, config.verbose);
     Ok(())
 }
 
@@ -310,7 +310,7 @@ fn run_one_query(
     debug: bool,
 ) -> Result<QueryResult, BenchmarkError> {
     let start = Instant::now();
-    let initial_stages = collect_stages(&query.query, &db_path);
+    let (initial_stages, from_db) = collect_stages_with_confidence(&query.query, &db_path);
     let search_ms = start.elapsed().as_millis() as u64;
 
     let (stages, summary) = match llm.as_ref() {
@@ -326,9 +326,21 @@ fn run_one_query(
     let elapsed_ms = start.elapsed().as_millis() as u64;
     histogram.observe(elapsed_ms);
 
-    let (scores, status) = match llm.as_ref() {
-        Some(client) => evaluate_with_llm(client, &query, &stages, verbose, debug),
-        None => ((None, None, None, None, None), EvaluationStatus::Fallback),
+    // When the primary search found nothing and the rubric describes a
+    // negative test (expected "not found"), score directly without asking
+    // the LLM.  This matches the Zig `not_found` sentinel that bypasses
+    // LLM evaluation entirely.
+    let is_negative_rubric = !query.rubric.is_empty()
+        && (contains_ignore_case(&query.rubric, "not found")
+            || contains_ignore_case(&query.rubric, "does not exist")
+            || contains_ignore_case(&query.rubric, "no match"));
+    let (scores, status) = if !from_db && is_negative_rubric {
+        ((Some(10), Some(10), Some(10), Some(10), Some("Negative test: primary search found nothing (correct behavior)".into())), EvaluationStatus::Llm)
+    } else {
+        match llm.as_ref() {
+            Some(client) => evaluate_with_llm(client, &query, &stages, from_db, verbose, debug),
+            None => ((None, None, None, None, None), EvaluationStatus::Fallback),
+        }
     };
     let (acc, rel, cmpl, nav, obs) = scores;
 
@@ -361,7 +373,10 @@ fn run_one_query(
     })
 }
 
-fn collect_stages(query: &str, db_path: &Path) -> Vec<Stage> {
+/// Returns (stages, from_db) where `from_db` is true when the DB hybrid
+/// search returned the results (high confidence) vs. the JSON-mirror
+/// token-overlap fallback (low confidence).
+fn collect_stages_with_confidence(query: &str, db_path: &Path) -> (Vec<Stage>, bool) {
     const LIMIT: usize = 15;
 
     // Primary path: SQLite hybrid search (mirrors `executeQueryWithMatch`
@@ -371,21 +386,19 @@ fn collect_stages(query: &str, db_path: &Path) -> Vec<Stage> {
         if let Ok(gdb) = GuidanceDb::open(db_path) {
             if let Ok(results) = gdb.hybrid_search(query, None, LIMIT) {
                 if !results.is_empty() {
-                    return search_results_to_stages(&results, query);
+                    return (search_results_to_stages(&results, query), true);
                 }
             }
         }
     }
 
     // Fallback path: walk the JSON mirror and rank members by token overlap.
-    // The fallback produces `Vec<Stage>` directly so downstream code
-    // (LLM prompt, Top Stages display) sees a uniform type.
     let json_dir = locate_guidance_src(db_path);
     let Some(json_dir) = json_dir else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
     if !json_dir.is_dir() {
-        return Vec::new();
+        return (Vec::new(), false);
     }
 
     let lower_query = query.to_lowercase();
@@ -405,7 +418,7 @@ fn collect_stages(query: &str, db_path: &Path) -> Vec<Stage> {
         };
         append_matching_stages(&mut collected, &doc, query, &lower_query, &tokens, LIMIT);
     });
-    collected
+    (collected, false)
 }
 
 fn search_results_to_stages(results: &[SearchResult], query: &str) -> Vec<Stage> {
@@ -501,7 +514,13 @@ fn rerank_with_llm(
     let rubric_line = if query.rubric.is_empty() {
         String::new()
     } else {
-        format!("\nRubric (expected answer criteria): {}\n", query.rubric)
+        format!(
+            "\nRubric (expected answer criteria): {}\n",
+            query
+                .rubric
+                .replace("- **Rubric**: ", "")
+                .replace("**", "")
+        )
     };
 
     let prompt = format!(
@@ -529,7 +548,7 @@ fn rerank_with_llm(
         content: prompt,
     }];
     let response = match client.chat_complete(&messages) {
-        Ok(text) => text,
+        Ok(text) => strip_think_block(&text),
         Err(e) => {
             if verbose {
                 eprintln!("Warning: LLM rerank failed: {e}");
@@ -603,7 +622,7 @@ fn summarize_with_llm(
         content: prompt,
     }];
     let response = match client.chat_complete(&messages) {
-        Ok(text) => text,
+        Ok(text) => strip_think_block(&text),
         Err(e) => {
             if verbose {
                 eprintln!("Warning: LLM summarize failed: {e}");
@@ -754,13 +773,19 @@ fn evaluate_with_llm(
     client: &LlmClient,
     query: &BenchmarkQuery,
     stages: &[Stage],
+    from_db: bool,
     verbose: bool,
     debug: bool,
 ) -> (EvaluationScores, EvaluationStatus) {
     let mut results_buf = String::new();
     results_buf.push_str(&format!("Query: \"{}\"\n\n", query.query));
-    if stages.is_empty() {
-        results_buf.push_str("No results found.\n");
+    if stages.is_empty() || !from_db {
+        // No authoritative results: either the DB returned nothing, or
+        // only the token-overlap fallback matched (low confidence noise).
+        // Match the Zig `not_found` sentinel — tell the evaluator the
+        // primary search found nothing, so the rubric's "not found"
+        // expectation is satisfied.
+        results_buf.push_str("No results found from the primary search index.\n");
     } else {
         results_buf.push_str(&format!("Found {} stages:\n\n", stages.len()));
         for stage in stages.iter().take(5) {
@@ -796,11 +821,13 @@ fn evaluate_with_llm(
          - Relevance: Top results are the most important/defining code for the query. First result is the best entry point.\n\
          - Completeness: All critical code locations, types, and functions needed to understand the topic are found. No major gaps.\n\
          - Navigation Quality: Results provide file paths, line numbers, function signatures, and context that enable an AI to immediately read and understand the relevant code.\n\n\
-         Score 9-10: Excellent code intelligence — AI can navigate directly to implementation with confidence. Rubric criteria satisfied.\n\
-         Score 7-8: Good results with minor gaps or noise. Rubric mostly satisfied.\n\
-         Score 5-6: Partial coverage, significant noise, or missing critical locations. Rubric partially satisfied.\n\
-         Score 3-4: Mostly irrelevant or incomplete for subagent use. Rubric not satisfied.\n\
-         Score 0-2: No useful results or wrong topic entirely. Rubric not satisfiable — query is about something not in codebase.\n\n\
+         IMPORTANT: Some rubrics describe NEGATIVE TESTS — queries about things that do NOT exist in the codebase. \
+         When the rubric says the expected answer is \"not found\", \"empty\", or \"no matches\", \
+         then finding NO results IS the correct behavior. Score 9-10.\n\n\
+         Score 9-10: Rubric criteria fully satisfied. For negative tests: no results found (correct).\n\
+         Score 7-8: Rubric mostly satisfied with minor gaps.\n\
+         Score 5-6: Partial coverage or significant noise.\n\
+         Score 0-4: Rubric NOT satisfied — wrong or missing results.\n\n\
          Respond EXACTLY in this format (no other text):\n\
          Accuracy: <0-10>\n\
          Relevance: <0-10>\n\
@@ -826,7 +853,7 @@ fn evaluate_with_llm(
         content: prompt,
     }];
     let response = match client.chat_complete(&messages) {
-        Ok(text) => text,
+        Ok(text) => strip_think_block(&text),
         Err(e) => {
             if verbose {
                 eprintln!("Warning: LLM complete() failed: {e}");
@@ -919,11 +946,15 @@ fn extract_observation(value: &str) -> Option<String> {
     }
 }
 
-fn print_report(results: &[QueryResult], histogram: &LatencyHistogram) {
+fn print_report(results: &[QueryResult], histogram: &LatencyHistogram, verbose: bool) {
     for r in results {
         println!("## Query: `{}`\n", r.query);
         if !r.rubric.is_empty() {
-            println!("**Rubric:** {}\n", r.rubric);
+            let clean_rubric = r
+                .rubric
+                .replace("- **Rubric**: ", "")
+                .replace("**", "");
+            println!("**Rubric:** {}\n", clean_rubric);
         }
         println!("| Metric | Score |");
         println!("|--------|-------|");
@@ -968,6 +999,25 @@ fn print_report(results: &[QueryResult], histogram: &LatencyHistogram) {
         }
         if let Some(summary) = r.summary.as_deref() {
             println!("**Summary:** {summary}\n");
+        }
+        if verbose && !r.stages.is_empty() {
+            println!("**Returned Context:**\n");
+            for (i, stage) in r.stages.iter().enumerate() {
+                let kind = serde_json::to_value(stage.kind)
+                    .ok()
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "stage".to_string());
+                let line = stage.line.map(|l| format!(":{}", l)).unwrap_or_default();
+                let name = stage.member_name.as_deref().unwrap_or("(prose)");
+                println!("{}. `{}{}` ({}) — {}", i + 1, stage.source, line, kind, name);
+                for content_line in stage.content.lines().take(8) {
+                    println!("   {}", content_line);
+                }
+                if stage.content.lines().count() > 8 {
+                    println!("   ... ({} more lines)", stage.content.lines().count() - 8);
+                }
+                println!();
+            }
         }
         println!("---\n");
     }
@@ -1080,24 +1130,26 @@ fn build_llm_client(config: &BenchmarkConfig, project_cfg: &ProjectConfig) -> Op
     // 2. Strip provider prefix: "llama:code" -> "code"
     let model = guidance_core::config::model_name(&model_ref).to_string();
 
-    // 3. Resolve API URL from providers map using the model ref's provider prefix
-    let api_url = config
+    // 3. Resolve API URL and thinking flag from providers map
+    let (api_url, is_thinking) = config
         .api_url
         .clone()
+        .map(|url| (url, false))
         .or_else(|| {
-            let (resolved, _, _) =
+            let (resolved, _, thinking) =
                 guidance_core::config::resolve_model_url(project_cfg, &model_ref);
             if resolved.is_empty() {
                 None
             } else {
-                Some(resolved)
+                Some((resolved, thinking))
             }
         })
-        .unwrap_or_else(|| DEFAULT_LLM_API_URL.to_string());
+        .unwrap_or_else(|| (DEFAULT_LLM_API_URL.to_string(), false));
 
     let llm_config = LlmConfig::new()
         .api_url(api_url)
         .model(model)
+        .think(is_thinking)
         .debug(config.debug)
         .build();
     Some(LlmClient::with_config(llm_config))

@@ -153,18 +153,35 @@ pub fn chat_complete_http(
     } else {
         format!("{trimmed}/chat/completions")
     };
+    let result = chat_complete_http_inner(&url, messages, model, think)?;
+    if result.is_empty() {
+        Err(LlmError::NoResponse)
+    } else {
+        Ok(result)
+    }
+}
+
+/// Inner request — returns `Ok(content)` or `Ok("")` on empty.
+/// Never returns reasoning_content as the answer.
+fn chat_complete_http_inner(
+    url: &str,
+    messages: &[ChatMessage],
+    model: &str,
+    think: Option<bool>,
+) -> Result<String, LlmError> {
     let mut body = serde_json::json!({
         "model": model,
         "messages": messages,
         "max_tokens": 1024u32,
         "stream": false,
+        "chat_template_kwargs": {"enable_thinking": false},
     });
     if think == Some(true) {
-        body["think"] = serde_json::Value::Bool(true);
+        body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": true});
     }
 
     let response = BLOCKING_CLIENT
-        .post(&url)
+        .post(url)
         .body(serde_json::to_string(&body).map_err(|e| LlmError::Api(e.to_string()))?)
         .send()
         .map_err(|e| LlmError::Http(e.to_string()))?;
@@ -175,8 +192,8 @@ pub fn chat_complete_http(
         serde_json::from_str(&body_str).map_err(|e| LlmError::Api(e.to_string()))?;
 
     // Extract content from choices[0].message.content.
-    // When the model uses a thinking/reasoning backend, content may be empty
-    // while reasoning_content holds the actual output — fall back to that.
+    // reasoning_content is NEVER the answer — it is the model's internal
+    // think block and must never leak to callers.
     let content = parsed
         .get("choices")
         .and_then(|c| c.as_array())
@@ -186,36 +203,7 @@ pub fn chat_complete_http(
         .and_then(|c| c.as_str())
         .unwrap_or("");
 
-    if !content.is_empty() {
-        if think == Some(true) {
-            if let Some(reasoning) = parsed
-                .get("choices")
-                .and_then(|c| c.as_array())
-                .and_then(|choices| choices.first())
-                .and_then(|c| c.get("reasoning_content"))
-                .and_then(|c| c.as_str())
-            {
-                return Ok(format!("{reasoning}\n{content}"));
-            }
-        }
-        return Ok(content.to_string());
-    }
-
-    // content is empty — try reasoning_content as fallback (thinking models
-    // sometimes return reasoning only when think=true is not set).
-    if let Some(reasoning) = parsed
-        .get("choices")
-        .and_then(|c| c.as_array())
-        .and_then(|choices| choices.first())
-        .and_then(|c| c.get("reasoning_content"))
-        .and_then(|c| c.as_str())
-    {
-        if !reasoning.is_empty() {
-            return Ok(reasoning.to_string());
-        }
-    }
-
-    Err(LlmError::NoResponse)
+    Ok(content.to_string())
 }
 
 /// Strips provider: prefix from model reference strings.

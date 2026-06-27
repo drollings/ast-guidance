@@ -45,7 +45,7 @@ fn e2e_zig_gen_roundtrip() {
     // Verify structure matches Zig output (2 members: fn greet + struct Config)
     assert_eq!(doc.meta.language.as_str(), "zig");
     assert_eq!(doc.meta.module.as_str(), "main");
-    assert_eq!(doc.meta.source.as_str(), "main.zig");
+    assert_eq!(doc.meta.source.as_str(), "src/main.zig");
 
     let greet = doc.members.iter().find(|m| m.name == "greet");
     assert!(greet.is_some(), "should find greet function");
