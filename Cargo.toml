@@ -20,6 +20,8 @@ members = [
     "src/project-knowledge",
     "src/wasm_ipc",
     "src/memory-plugin",
+    "src/job-copilot",
+    "src/bin/job-copilot-daemon",
 ]
 
 [workspace.package]

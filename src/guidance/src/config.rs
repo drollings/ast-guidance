@@ -258,9 +258,7 @@ mod tests {
                 chat_endpoint: "api/chat".into(),
             },
         );
-        let config = ProjectConfig::builder()
-            .providers(providers)
-            .build();
+        let config = ProjectConfig::builder().providers(providers).build();
         let (url, model, is_thinking) = resolve_model_url(&config, "ollama:llama3");
         assert_eq!(model, "llama3");
         assert_eq!(url, "http://localhost:11434/api/chat");
@@ -343,9 +341,7 @@ mod tests {
         let mut models = std::collections::HashMap::new();
         models.insert("fast".to_string(), "llama:code".to_string());
         models.insert("default".to_string(), "llama:code".to_string());
-        let config = ProjectConfig::builder()
-            .models(models)
-            .build();
+        let config = ProjectConfig::builder().models(models).build();
         assert_eq!(resolve_model_ref(&config, "fast"), "llama:code");
         assert_eq!(resolve_model_ref(&config, "default"), "llama:code");
     }

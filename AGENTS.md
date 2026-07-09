@@ -33,6 +33,8 @@ follow instructions for any queries of interest
 5. VERIFY (cargo):       cargo build --workspace && cargo test --workspace
                          && cargo clippy --workspace -- -D warnings
                          && cargo run --bin guidance -- structure .guidance
+
+6. HEALTH (optional):    job-copilot-daemon doctor  (check daemon health)
 ```
 
 ---
@@ -64,6 +66,10 @@ src/
   rdf/                 guidance-rdf (Turtle/N-Quads parser, normalization)
   wasm_ipc/            guidance-wasm-ipc (WASM IPC binary types)
   memory-plugin/       Pluggable memory tier (holographic, hindsight, honcho backends)
+  bin/
+    job-copilot-daemon/ job-copilot binary (serve, validate-profile, install-native-messaging, doctor)
+  job-copilot/          job-copilot-core: config, schema, sanitize, profile, dispatcher, server, components
+extension/             Chromium MV3 extension (JS/HTML/CSS — not a Cargo crate)
 .guidance/
   guidance-config.json   Model / provider configuration
   .skills/          Structured skill documents (GoF, zig-current, domain-patterns)
@@ -76,6 +82,26 @@ env/
 doc/
   DESIGN.md         System design reference
 ```
+
+---
+
+## Job Copilot — import boundary
+
+`src/job-copilot` and `src/bin/job-copilot-daemon` may import from
+`common-core`, `fluent-wvr`, `fluent-concurrency`, `guidance-llm`,
+`guidance-types`, `dag`, `search-vector`, `memory-plugin`, `content-node`,
+and the standard library / `tokio` / `reqwest` (the latter two via the
+workspace deps). They **must not** import from
+`guidance`, `coral`, `wasm_ipc`,
+`project-knowledge`, `ontology`, or `rdf`. Domain logic for the copilot
+lives in `src/job-copilot`; do not add it to any shared crate.
+
+Shared crates **may** be improved when doing so produces more generic,
+reusable, composable code. For example: adding a `with_histogram`
+constructor to `TimingMiddleware`, extending `WorkContext` to accept
+typed metadata, or adding a `FieldAccess` derive helper for complex
+field types. These improvements benefit all consumers, not just the
+copilot.
 
 ---
 

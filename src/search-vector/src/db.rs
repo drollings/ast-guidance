@@ -340,10 +340,7 @@ impl GuidanceDb {
         //    into tokens, require at least `min_matches` tokens to match
         //    name/signature/comment. Short queries (1-2 tokens) need 1
         //    match; longer queries need 2+ to filter noise.
-        let tokens: Vec<&str> = query
-            .split_whitespace()
-            .filter(|t| t.len() >= 3)
-            .collect();
+        let tokens: Vec<&str> = query.split_whitespace().filter(|t| t.len() >= 3).collect();
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
@@ -393,8 +390,7 @@ impl GuidanceDb {
             .collect();
         params.push(Box::new(min_matches));
 
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(Box::as_ref).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(Box::as_ref).collect();
         let results = stmt
             .query_map(param_refs.as_slice(), |row| {
                 Ok(SearchResult {

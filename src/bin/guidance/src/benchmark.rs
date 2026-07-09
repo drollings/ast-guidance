@@ -41,12 +41,12 @@ use common_core::string::contains_ignore_case;
 use common_core::LatencyHistogram;
 use fluent_concurrency::pool::Limiter;
 use fluent_concurrency::scope::Scope;
-use guidance_core::config::ProjectConfig;
 use guidance_core::ast_parser;
+use guidance_core::config::ProjectConfig;
 use guidance_core::query::synthesize::Stage;
 use guidance_core::sync::json_store::load_guidance;
 use guidance_core::walk;
-use guidance_llm::{ChatMessage, LlmClient, LlmConfig, strip_think_block};
+use guidance_llm::{strip_think_block, ChatMessage, LlmClient, LlmConfig};
 use guidance_search_vector::db::SearchResult;
 use guidance_search_vector::GuidanceDb;
 use guidance_types::{GuidanceDoc, MemberType, StageKind};
@@ -343,7 +343,16 @@ fn run_one_query(
             || contains_ignore_case(&query.rubric, "does not exist")
             || contains_ignore_case(&query.rubric, "no match"));
     let (scores, status) = if !from_db && is_negative_rubric {
-        ((Some(10), Some(10), Some(10), Some(10), Some("Negative test: primary search found nothing (correct behavior)".into())), EvaluationStatus::Llm)
+        (
+            (
+                Some(10),
+                Some(10),
+                Some(10),
+                Some(10),
+                Some("Negative test: primary search found nothing (correct behavior)".into()),
+            ),
+            EvaluationStatus::Llm,
+        )
     } else {
         match llm.as_ref() {
             Some(client) => evaluate_with_llm(client, &query, &stages, from_db, verbose, debug),
@@ -577,10 +586,7 @@ fn rerank_with_llm(
     } else {
         format!(
             "\nRubric (expected answer criteria): {}\n",
-            query
-                .rubric
-                .replace("- **Rubric**: ", "")
-                .replace("**", "")
+            query.rubric.replace("- **Rubric**: ", "").replace("**", "")
         )
     };
 
@@ -701,10 +707,7 @@ fn parse_rerank_response(response: &str, max: usize) -> Vec<usize> {
     let mut seen = vec![false; max];
     let mut out = Vec::with_capacity(max);
     for token in response.split([',', '\n', ' ', ';']) {
-        let cleaned: String = token
-            .chars()
-            .filter(|c| c.is_ascii_digit())
-            .collect();
+        let cleaned: String = token.chars().filter(|c| c.is_ascii_digit()).collect();
         if cleaned.is_empty() {
             continue;
         }
@@ -1019,10 +1022,7 @@ fn print_report(results: &[QueryResult], histogram: &LatencyHistogram, verbose: 
     for r in results {
         println!("## Query: `{}`\n", r.query);
         if !r.rubric.is_empty() {
-            let clean_rubric = r
-                .rubric
-                .replace("- **Rubric**: ", "")
-                .replace("**", "");
+            let clean_rubric = r.rubric.replace("- **Rubric**: ", "").replace("**", "");
             println!("**Rubric:** {}\n", clean_rubric);
         }
         println!("| Metric | Score |");

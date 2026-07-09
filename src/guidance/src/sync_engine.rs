@@ -98,7 +98,10 @@ impl SyncEngine {
             .to_string_lossy()
             .strip_suffix(&format!(
                 ".{}",
-                module_rel.extension().and_then(|e| e.to_str()).unwrap_or("")
+                module_rel
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
             ))
             .unwrap_or(&module_rel.to_string_lossy())
             .replace(['/', '\\'], ".");

@@ -7,6 +7,7 @@ struct FieldMeta {
     desc: Option<String>,
     min: Option<f64>,
     max: Option<f64>,
+    skip: bool,
 }
 
 fn parse_field_attrs(field: &syn::Field) -> FieldMeta {
@@ -14,6 +15,7 @@ fn parse_field_attrs(field: &syn::Field) -> FieldMeta {
         desc: None,
         min: None,
         max: None,
+        skip: false,
     };
 
     for attr in &field.attrs {
@@ -22,6 +24,10 @@ fn parse_field_attrs(field: &syn::Field) -> FieldMeta {
         }
 
         let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("skip") {
+                result.skip = true;
+                return Ok(());
+            }
             if meta.path.is_ident("desc") {
                 let value = meta.value()?;
                 let lit: Lit = value.parse()?;
@@ -35,7 +41,7 @@ fn parse_field_attrs(field: &syn::Field) -> FieldMeta {
                 let lit: Lit = value.parse()?;
                 match lit {
                     Lit::Int(i) => result.min = Some(i.base10_parse::<f64>().unwrap()),
-                    Lit::Float(f) => result.min = Some(f.base10_parse::<f64>().unwrap()),
+                    Lit::Float(f) => result.max = Some(f.base10_parse::<f64>().unwrap()),
                     _ => {}
                 }
                 return Ok(());
@@ -50,7 +56,7 @@ fn parse_field_attrs(field: &syn::Field) -> FieldMeta {
                 }
                 return Ok(());
             }
-            Err(meta.error("unknown field attribute, expected `desc`, `min`, or `max`"))
+            Err(meta.error("unknown field attribute, expected `skip`, `desc`, `min`, or `max`"))
         });
     }
 
@@ -108,6 +114,7 @@ fn quote_type_string(ty_str: &str) -> TokenStream2 {
 /// key matching in routing boundaries.
 ///
 /// Supports optional field attributes:
+/// - `#[field(skip)]` — exclude this field from runtime access and schema
 /// - `#[field(desc = "...")]` — field description (used by `Describable`)
 /// - `#[field(min = N)]` — minimum value constraint (numeric fields only)
 /// - `#[field(max = N)]` — maximum value constraint (numeric fields only)
@@ -134,18 +141,24 @@ pub fn derive_field_access(input: TokenStream) -> TokenStream {
 
     let field_name_strs: Vec<String> = fields
         .iter()
+        .filter(|f| !parse_field_attrs(f).skip)
         .map(|f| f.ident.as_ref().unwrap().to_string())
         .collect();
 
     let mut set_body = TokenStream2::new();
     let mut get_body = TokenStream2::new();
 
-    for (idx, f) in fields.iter().enumerate() {
+    let mut non_skip_idx = 0usize;
+    for f in fields.iter() {
         let field_ident = f.ident.as_ref().unwrap();
         let field_name_str = field_ident.to_string();
         let ty = &f.ty;
         let ty_str = quote!(#ty).to_string();
         let meta = parse_field_attrs(f);
+
+        if meta.skip {
+            continue;
+        }
 
         let has_constraints = meta.min.is_some() || meta.max.is_some();
 
@@ -218,7 +231,7 @@ pub fn derive_field_access(input: TokenStream) -> TokenStream {
             Ok(())
         };
 
-        if idx == 0 {
+        if non_skip_idx == 0 {
             set_body.extend(quote! {
                 if name == #field_name_str {
                     #set_expr
@@ -241,7 +254,7 @@ pub fn derive_field_access(input: TokenStream) -> TokenStream {
             quote! { self.#field_ident.to_string() }
         };
 
-        if idx == 0 {
+        if non_skip_idx == 0 {
             get_body.extend(quote! {
                 if name == #field_name_str {
                     Ok(#to_string_expr)
@@ -254,6 +267,8 @@ pub fn derive_field_access(input: TokenStream) -> TokenStream {
                 }
             });
         }
+
+        non_skip_idx += 1;
     }
 
     let expanded = if fields.is_empty() {
@@ -334,6 +349,10 @@ pub fn derive_describable(input: TokenStream) -> TokenStream {
         let ty = &f.ty;
         let ty_str = quote!(#ty).to_string();
         let meta = parse_field_attrs(f);
+
+        if meta.skip {
+            continue;
+        }
 
         let mut schema = Vec::new();
 

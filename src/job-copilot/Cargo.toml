@@ -1,0 +1,36 @@
+[package]
+name = "job-copilot"
+version.workspace = true
+edition.workspace = true
+description = "Local-only human-in-the-loop job application copilot (daemon + JSON-RPC schema)"
+
+[dependencies]
+common-core        = { path = "../common-core", features = ["sqlite"] }
+fluent-wvr         = { path = "../fluent-wvr" }
+fluent-concurrency = { path = "../fluent-concurrency" }
+guidance-llm       = { path = "../llm" }
+guidance-types     = { path = "../types" }
+dag                = { path = "../dag", package = "fluent-dag" }
+search-vector      = { path = "../search-vector", package = "guidance-search-vector" }
+memory-plugin      = { path = "../memory-plugin" }
+content-node       = { path = "../content-node", package = "guidance-content-node" }
+bon                = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+thiserror          = { workspace = true }
+tokio              = { workspace = true, features = ["rt-multi-thread", "net", "sync", "macros", "io-util"] }
+tracing            = { workspace = true }
+toml               = "0.8"
+blake3             = { workspace = true }
+regex              = { workspace = true }
+rusqlite            = { workspace = true, features = ["bundled"] }
+time               = { workspace = true, features = ["formatting", "parsing"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = "1"
+httpmock = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+
+[lints]
+workspace = true
