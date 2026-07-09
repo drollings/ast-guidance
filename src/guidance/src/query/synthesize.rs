@@ -7,6 +7,8 @@ pub struct Stage {
     pub source: String,
     pub line: Option<u32>,
     #[serde(skip)]
+    pub end_line: Option<u32>,
+    #[serde(skip)]
     pub member_name: Option<String>,
     #[serde(skip)]
     pub member_type: Option<MemberType>,
@@ -21,6 +23,7 @@ impl Stage {
             content: content.to_string(),
             source: source.to_string(),
             line: None,
+            end_line: None,
             member_name: None,
             member_type: None,
         }
@@ -36,6 +39,7 @@ impl Stage {
             content,
             source: source.to_string(),
             line: member.line,
+            end_line: None,
             member_name: Some(member.name.as_str().to_string()),
             member_type: Some(member.type_name),
         }
@@ -52,6 +56,7 @@ impl Stage {
             content,
             source: source.to_string(),
             line: member.line,
+            end_line: None,
             member_name: Some(member.name.as_str().to_string()),
             member_type: Some(member.type_name),
         }
@@ -63,6 +68,7 @@ impl Stage {
             content: format!("No results found for query: {query}"),
             source: doc.meta.source.as_str().to_string(),
             line: None,
+            end_line: None,
             member_name: None,
             member_type: None,
         }
@@ -93,6 +99,7 @@ impl Synthesizer {
                 content: format!("No results found for query: {query}"),
                 source: String::new(),
                 line: None,
+                end_line: None,
                 member_name: None,
                 member_type: None,
             });

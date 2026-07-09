@@ -42,13 +42,14 @@ use common_core::LatencyHistogram;
 use fluent_concurrency::pool::Limiter;
 use fluent_concurrency::scope::Scope;
 use guidance_core::config::ProjectConfig;
+use guidance_core::ast_parser;
 use guidance_core::query::synthesize::Stage;
 use guidance_core::sync::json_store::load_guidance;
 use guidance_core::walk;
 use guidance_llm::{ChatMessage, LlmClient, LlmConfig, strip_think_block};
 use guidance_search_vector::db::SearchResult;
 use guidance_search_vector::GuidanceDb;
-use guidance_types::{GuidanceDoc, StageKind};
+use guidance_types::{GuidanceDoc, MemberType, StageKind};
 use thiserror::Error;
 
 const BENCHMARK_FILE: &str = "benchmarks.md";
@@ -87,6 +88,7 @@ pub struct BenchmarkConfig {
     pub no_llm: bool,
     pub verbose: bool,
     pub debug: bool,
+    pub show_prompts: bool,
     pub api_url: Option<String>,
     pub model: Option<String>,
     pub timeout: Duration,
@@ -104,6 +106,7 @@ impl Default for BenchmarkConfig {
             no_llm: false,
             verbose: false,
             debug: false,
+            show_prompts: false,
             api_url: None,
             model: None,
             timeout: DEFAULT_BENCHMARK_TIMEOUT,
@@ -123,6 +126,7 @@ impl BenchmarkConfig {
         no_llm: bool,
         verbose: bool,
         debug: bool,
+        show_prompts: bool,
         api_url: Option<String>,
         model: Option<String>,
         timeout_secs: u64,
@@ -137,6 +141,7 @@ impl BenchmarkConfig {
             no_llm,
             verbose,
             debug,
+            show_prompts,
             api_url,
             model,
             timeout: Duration::from_secs(timeout_secs.max(1)),
@@ -254,6 +259,7 @@ pub async fn run_benchmark(config: BenchmarkConfig) -> Result<(), BenchmarkError
         let lim = limiter.clone();
         let llm = llm_client.clone();
         let db = db_path.clone();
+        let ws = workspace.clone();
         let hist = histogram.clone();
         let results = results.clone();
         let verbose = config.verbose;
@@ -263,7 +269,7 @@ pub async fn run_benchmark(config: BenchmarkConfig) -> Result<(), BenchmarkError
             lim.run(|| async move {
                 let q = query;
                 let outcome = tokio::task::spawn_blocking(move || {
-                    run_one_query(q, llm, db, hist, verbose, debug)
+                    run_one_query(q, llm, db, ws, hist, verbose, debug)
                 })
                 .await;
 
@@ -305,12 +311,14 @@ fn run_one_query(
     query: BenchmarkQuery,
     llm: Option<Arc<LlmClient>>,
     db_path: PathBuf,
+    workspace: PathBuf,
     histogram: Arc<LatencyHistogram>,
     verbose: bool,
     debug: bool,
 ) -> Result<QueryResult, BenchmarkError> {
     let start = Instant::now();
-    let (initial_stages, from_db) = collect_stages_with_confidence(&query.query, &db_path);
+    let (initial_stages, from_db) =
+        collect_stages_with_confidence(&query.query, &db_path, &workspace);
     let search_ms = start.elapsed().as_millis() as u64;
 
     let (stages, summary) = match llm.as_ref() {
@@ -376,7 +384,11 @@ fn run_one_query(
 /// Returns (stages, from_db) where `from_db` is true when the DB hybrid
 /// search returned the results (high confidence) vs. the JSON-mirror
 /// token-overlap fallback (low confidence).
-fn collect_stages_with_confidence(query: &str, db_path: &Path) -> (Vec<Stage>, bool) {
+fn collect_stages_with_confidence(
+    query: &str,
+    db_path: &Path,
+    workspace: &Path,
+) -> (Vec<Stage>, bool) {
     const LIMIT: usize = 15;
 
     // Primary path: SQLite hybrid search (mirrors `executeQueryWithMatch`
@@ -386,7 +398,7 @@ fn collect_stages_with_confidence(query: &str, db_path: &Path) -> (Vec<Stage>, b
         if let Ok(gdb) = GuidanceDb::open(db_path) {
             if let Ok(results) = gdb.hybrid_search(query, None, LIMIT) {
                 if !results.is_empty() {
-                    return (search_results_to_stages(&results, query), true);
+                    return (search_results_to_stages(&results, query, workspace), true);
                 }
             }
         }
@@ -421,7 +433,11 @@ fn collect_stages_with_confidence(query: &str, db_path: &Path) -> (Vec<Stage>, b
     (collected, false)
 }
 
-fn search_results_to_stages(results: &[SearchResult], query: &str) -> Vec<Stage> {
+fn search_results_to_stages(
+    results: &[SearchResult],
+    query: &str,
+    workspace: &std::path::Path,
+) -> Vec<Stage> {
     results
         .iter()
         .map(|r| {
@@ -430,14 +446,43 @@ fn search_results_to_stages(results: &[SearchResult], query: &str) -> Vec<Stage>
             } else {
                 StageKind::Metadata
             };
+
+            // Try to extract actual code snippet using tree-sitter AST
+            let (content, start_line, end_line) = if let Some(ref sig) = r.signature {
+                // Determine member type from signature pattern
+                let member_type = if sig.starts_with("fn ") || sig.starts_with("pub fn ") {
+                    MemberType::FnDecl
+                } else if sig.starts_with("struct ") || sig.starts_with("pub struct ") {
+                    MemberType::Struct
+                } else if sig.starts_with("enum ") || sig.starts_with("pub enum ") {
+                    MemberType::Enum
+                } else if sig.starts_with("impl ") {
+                    MemberType::Struct
+                } else {
+                    MemberType::FnDecl
+                };
+
+                if let Some((snippet, sl, el)) = ast_parser::extract_code_snippet(
+                    &r.source,
+                    &r.name,
+                    member_type,
+                    workspace,
+                    200,
+                ) {
+                    (snippet, Some(sl), Some(el))
+                } else {
+                    (sig.clone(), None, None)
+                }
+            } else {
+                (format!("(match) {}", r.name), None, None)
+            };
+
             Stage {
                 kind,
-                content: r
-                    .signature
-                    .clone()
-                    .unwrap_or_else(|| format!("(match) {}", r.name)),
+                content,
                 source: r.source.clone(),
-                line: None,
+                line: start_line.or(Some(r.similarity as u32)),
+                end_line,
                 member_name: Some(r.name.clone()),
                 member_type: None,
             }
@@ -447,42 +492,63 @@ fn search_results_to_stages(results: &[SearchResult], query: &str) -> Vec<Stage>
             content: format!("Query: {query} ({} results)", results.len()),
             source: String::new(),
             line: None,
+            end_line: None,
             member_name: None,
             member_type: None,
         }))
         .collect()
 }
 
-/// Renders stages into the compact `index. source:line — name: excerpt` form
-/// used by the LLM re-rank and summary prompts. Excludes the synthetic
-/// `Prose` "Query: …" trailer that `search_results_to_stages` appends.
+/// Formats a stage's source location with line range.
+/// Returns `source:start-end` when both bounds exist, `source:line` when only
+/// start exists, or just `source` when no line info is available.
+fn stage_loc(stage: &Stage) -> String {
+    match (stage.line, stage.end_line) {
+        (Some(start), Some(end)) => format!("{}:{}-{}", stage.source, start, end),
+        (Some(line), None) => format!("{}:{}", stage.source, line),
+        _ => stage.source.clone(),
+    }
+}
+
+/// Renders stages into the compact `index. source:start-end (kind) — name: excerpt` form
+/// used by the LLM re-rank and summary prompts. Includes code snippets when
+/// available (multi-line content). Excludes the synthetic `Prose` "Query: …"
+/// trailer that `search_results_to_stages` appends.
 fn stages_for_llm_prompt(stages: &[Stage]) -> Vec<String> {
     stages
         .iter()
         .filter(|s| !matches!(s.kind, StageKind::Prose) || !s.content.starts_with("Query: "))
-        .map(|stage| {
+        .enumerate()
+        .map(|(i, stage)| {
             let kind = serde_json::to_value(stage.kind)
                 .ok()
                 .and_then(|v| v.as_str().map(|s| s.to_string()))
                 .unwrap_or_else(|| "stage".to_string());
-            let line = stage.line.map(|l| format!(":{}", l)).unwrap_or_default();
+            let loc = stage_loc(stage);
             let name = stage.member_name.as_deref().unwrap_or("(prose)");
-            let content_first = stage.content.lines().next().unwrap_or("").trim();
-            let truncated = if content_first.chars().count() > 120 {
-                let mut s: String = content_first.chars().take(120).collect();
-                s.push('…');
-                s
+
+            // Include full code snippet when content has multiple lines
+            let content_display = if stage.content.lines().count() > 1 {
+                format!("\n```\n{}\n```", stage.content.trim())
             } else {
-                content_first.to_string()
+                let first = stage.content.lines().next().unwrap_or("").trim();
+                let truncated = if first.chars().count() > 120 {
+                    let mut s: String = first.chars().take(120).collect();
+                    s.push('…');
+                    s
+                } else {
+                    first.to_string()
+                };
+                truncated
             };
+
             format!(
-                "{idx}. `{source}{line}` ({kind}) — {name}: {truncated}",
-                idx = 0, // placeholder, replaced by caller
-                source = stage.source,
-                line = line,
+                "{idx}. `{loc}` ({kind}) — {name}:{content}",
+                idx = i + 1,
+                loc = loc,
                 kind = kind,
                 name = name,
-                truncated = truncated
+                content = content_display,
             )
         })
         .collect()
@@ -504,12 +570,7 @@ fn rerank_with_llm(
         return None;
     }
     let cap = RERANK_TOP_N.min(stages.len());
-    let lines = stages_for_llm_prompt(&stages[..cap]);
-    let indexed: Vec<String> = lines
-        .into_iter()
-        .enumerate()
-        .map(|(i, l)| l.replacen("0. ", &format!("{i}. "), 1))
-        .collect();
+    let indexed = stages_for_llm_prompt(&stages[..cap]);
 
     let rubric_line = if query.rubric.is_empty() {
         String::new()
@@ -592,12 +653,7 @@ fn summarize_with_llm(
         return None;
     }
     let cap = SUMMARY_TOP_N.min(stages.len());
-    let lines = stages_for_llm_prompt(&stages[..cap]);
-    let indexed: Vec<String> = lines
-        .into_iter()
-        .enumerate()
-        .map(|(i, l)| l.replacen("0. ", &format!("{i}. "), 1))
-        .collect();
+    let indexed = stages_for_llm_prompt(&stages[..cap]);
 
     let prompt = format!(
         "{header}\n\nQuery: \"{q}\"\n\nTop code navigation results:\n{results}\n\n\
@@ -683,6 +739,7 @@ fn append_matching_stages(
                 content: comment.as_str().to_string(),
                 source: source.to_string(),
                 line: None,
+                end_line: None,
                 member_name: None,
                 member_type: None,
             });
@@ -723,6 +780,7 @@ fn append_matching_stages(
             content,
             source: source.to_string(),
             line: member.line,
+            end_line: None,
             member_name: Some(member.name.as_str().to_string()),
             member_type: Some(member.type_name),
         });
@@ -736,6 +794,7 @@ fn append_matching_stages(
                     .unwrap_or_default(),
                 source: source.to_string(),
                 line: member.line,
+                end_line: None,
                 member_name: Some(member.name.as_str().to_string()),
                 member_type: Some(member.type_name),
             });
@@ -788,29 +847,39 @@ fn evaluate_with_llm(
         results_buf.push_str("No results found from the primary search index.\n");
     } else {
         results_buf.push_str(&format!("Found {} stages:\n\n", stages.len()));
-        for stage in stages.iter().take(5) {
+        for (_i, stage) in stages.iter().enumerate().take(5) {
             let kind = serde_json::to_value(stage.kind)
                 .ok()
                 .and_then(|v| v.as_str().map(|s| s.to_string()))
                 .unwrap_or_else(|| "stage".to_string());
-            let line = stage.line.map(|l| format!(":{}", l)).unwrap_or_default();
+            let loc = stage_loc(stage);
             let name = stage.member_name.as_deref().unwrap_or("(prose)");
-            let content_first = stage.content.lines().next().unwrap_or("").trim();
-            let truncated = if content_first.chars().count() > 100 {
-                let mut s: String = content_first.chars().take(100).collect();
-                s.push('…');
-                s
+            // Include full code snippet for multi-line content
+            if stage.content.lines().count() > 1 {
+                results_buf.push_str(&format!(
+                    "- {loc} ({kind}) — {name}:\n```\n{code}\n```\n",
+                    loc = loc,
+                    kind = kind,
+                    name = name,
+                    code = stage.content.trim(),
+                ));
             } else {
-                content_first.to_string()
-            };
-            results_buf.push_str(&format!(
-                "- {source}{line} ({kind}) — {name}: {truncated}\n",
-                source = stage.source,
-                line = line,
-                kind = kind,
-                name = name,
-                truncated = truncated
-            ));
+                let content_first = stage.content.lines().next().unwrap_or("").trim();
+                let truncated = if content_first.chars().count() > 100 {
+                    let mut s: String = content_first.chars().take(100).collect();
+                    s.push('…');
+                    s
+                } else {
+                    content_first.to_string()
+                };
+                results_buf.push_str(&format!(
+                    "- {loc} ({kind}) — {name}: {truncated}\n",
+                    loc = loc,
+                    kind = kind,
+                    name = name,
+                    truncated = truncated
+                ));
+            }
         }
     }
 
@@ -989,8 +1058,8 @@ fn print_report(results: &[QueryResult], histogram: &LatencyHistogram, verbose: 
                     .ok()
                     .and_then(|v| v.as_str().map(|s| s.to_string()))
                     .unwrap_or_else(|| "stage".to_string());
-                let line = stage.line.map(|l| format!(":{}", l)).unwrap_or_default();
-                println!("- `{}{}` ({})", stage.source, line, kind);
+                let loc = stage_loc(stage);
+                println!("- `{loc}` ({kind})");
             }
             println!();
         }
@@ -1007,14 +1076,12 @@ fn print_report(results: &[QueryResult], histogram: &LatencyHistogram, verbose: 
                     .ok()
                     .and_then(|v| v.as_str().map(|s| s.to_string()))
                     .unwrap_or_else(|| "stage".to_string());
-                let line = stage.line.map(|l| format!(":{}", l)).unwrap_or_default();
+                let loc = stage_loc(stage);
                 let name = stage.member_name.as_deref().unwrap_or("(prose)");
-                println!("{}. `{}{}` ({}) — {}", i + 1, stage.source, line, kind, name);
-                for content_line in stage.content.lines().take(8) {
+                println!("{}. `{loc}` ({}) — {}", i + 1, kind, name);
+                // Show full code snippet — no truncation in verbose mode
+                for content_line in stage.content.lines() {
                     println!("   {}", content_line);
-                }
-                if stage.content.lines().count() > 8 {
-                    println!("   ... ({} more lines)", stage.content.lines().count() - 8);
                 }
                 println!();
             }
@@ -1151,6 +1218,7 @@ fn build_llm_client(config: &BenchmarkConfig, project_cfg: &ProjectConfig) -> Op
         .model(model)
         .think(is_thinking)
         .debug(config.debug)
+        .show_prompts(config.show_prompts)
         .build();
     Some(LlmClient::with_config(llm_config))
 }
@@ -1358,6 +1426,7 @@ src/dag/target.zig
                 content: "fn cmd_benchmark()".into(),
                 source: "src/bin/guidance/src/main.rs".into(),
                 line: Some(1200),
+                end_line: Some(1250),
                 member_name: Some("cmd_benchmark".into()),
                 member_type: None,
             },
@@ -1366,6 +1435,7 @@ src/dag/target.zig
                 content: "Query: cmd_benchmark (3 results)".into(),
                 source: String::new(),
                 line: None,
+                end_line: None,
                 member_name: None,
                 member_type: None,
             },
@@ -1374,6 +1444,8 @@ src/dag/target.zig
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("cmd_benchmark"));
         assert!(!lines[0].contains("Query: "));
+        // Verify indexed format
+        assert!(lines[0].starts_with("1. "));
     }
 
     #[test]
@@ -1388,6 +1460,7 @@ src/dag/target.zig
                 content: "fn alpha()".into(),
                 source: "a.rs".into(),
                 line: Some(1),
+                end_line: Some(3),
                 member_name: Some("alpha".into()),
                 member_type: None,
             },
@@ -1396,6 +1469,7 @@ src/dag/target.zig
                 content: "fn beta()".into(),
                 source: "b.rs".into(),
                 line: Some(2),
+                end_line: Some(4),
                 member_name: Some("beta".into()),
                 member_type: None,
             },
@@ -1404,6 +1478,7 @@ src/dag/target.zig
                 content: "fn gamma()".into(),
                 source: "c.rs".into(),
                 line: Some(3),
+                end_line: Some(5),
                 member_name: Some("gamma".into()),
                 member_type: None,
             },

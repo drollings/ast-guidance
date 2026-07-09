@@ -149,6 +149,7 @@ mod tests {
             content: "fn test() {}".to_string(),
             source: source.to_string(),
             line: Some(line),
+            end_line: None,
             member_name: Some("test".to_string()),
             member_type: None,
         }
@@ -160,6 +161,7 @@ mod tests {
             content: content.to_string(),
             source: String::new(),
             line: None,
+            end_line: None,
             member_name: None,
             member_type: None,
         }
@@ -187,6 +189,7 @@ mod tests {
             content: "fn test() {}".to_string(),
             source: "src/main.rs".to_string(),
             line: None,
+            end_line: None,
             member_name: None,
             member_type: None,
         }];

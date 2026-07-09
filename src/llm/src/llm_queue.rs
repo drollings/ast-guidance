@@ -93,7 +93,14 @@ impl LlmRequestQueue {
 }
 
 fn make_llm_request(messages: &[ChatMessage], config: &LlmConfig) -> Result<String, LlmError> {
-    crate::client::chat_complete_http(&config.api_url, messages, &config.model, config.think)
+    crate::client::chat_complete_http(
+        &config.api_url,
+        messages,
+        &config.model,
+        config.think,
+        config.debug,
+        config.show_prompts,
+    )
 }
 
 #[cfg(test)]

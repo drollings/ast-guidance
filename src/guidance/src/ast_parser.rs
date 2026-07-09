@@ -879,6 +879,45 @@ fn find_doc_comment_start(node: &tree_sitter::Node, source: &str) -> u32 {
     candidate_start
 }
 
+/// Extracts a code snippet for a member from its source file using tree-sitter AST.
+///
+/// Given a source path (relative to workspace), member name, member type, and
+/// workspace root, reads the source file, parses it with tree-sitter to find
+/// the exact span, and returns the code lines along with 1-based line bounds.
+///
+/// Follows the Zig `cmdExplain` pattern: AST-driven line extraction, not
+/// heuristic brace counting. Uses the tree-sitter span end line for exact
+/// boundaries (no arbitrary truncation).
+///
+/// Returns `(snippet, start_line, end_line)` where lines are 1-based.
+pub fn extract_code_snippet(
+    source_path: &str,
+    member_name: &str,
+    member_type: MemberType,
+    workspace: &std::path::Path,
+    max_lines: usize,
+) -> Option<(String, u32, u32)> {
+    let abs_path = workspace.join(source_path);
+    let source = common_core::io::read_to_string_err(&abs_path).ok()?;
+    let span = resolve_span(&abs_path, member_name, member_type)?;
+
+    let start = (span.start_line as usize).saturating_sub(1);
+    let span_end = span.end_line as usize;
+    let limited_end = start + max_lines;
+    let end = span_end.min(limited_end);
+    let lines: Vec<&str> = source.lines().collect();
+    if start >= lines.len() {
+        return None;
+    }
+    let end = end.min(lines.len());
+    let snippet: String = lines[start..end].join("\n");
+    if snippet.trim().is_empty() {
+        None
+    } else {
+        Some((snippet, span.start_line, span.end_line))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

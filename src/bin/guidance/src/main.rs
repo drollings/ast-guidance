@@ -309,6 +309,7 @@ async fn main() {
                 *no_llm,
                 *verbose,
                 cli.debug,
+                cli.show_prompts,
                 api_url.clone(),
                 model.clone(),
                 *timeout,

@@ -163,7 +163,7 @@ pub fn resolve_model_url(config: &ProjectConfig, model_ref: &str) -> (String, St
     let thinking_ref = config
         .model_thinking
         .as_deref()
-        .or_else(|| config.models.get("thinking").map(|s| s.as_str()));
+        .or_else(|| config.models.get("thinking").map(String::as_str));
 
     let is_thinking = thinking_ref.is_some_and(|tr| tr == model_ref);
 

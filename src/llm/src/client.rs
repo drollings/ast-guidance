@@ -146,6 +146,8 @@ pub fn chat_complete_http(
     messages: &[ChatMessage],
     model: &str,
     think: Option<bool>,
+    debug: bool,
+    show_prompts: bool,
 ) -> Result<String, LlmError> {
     let trimmed = api_base.trim_end_matches('/');
     let url = if trimmed.ends_with("/chat/completions") {
@@ -153,7 +155,7 @@ pub fn chat_complete_http(
     } else {
         format!("{trimmed}/chat/completions")
     };
-    let result = chat_complete_http_inner(&url, messages, model, think)?;
+    let result = chat_complete_http_inner(&url, messages, model, think, debug, show_prompts)?;
     if result.is_empty() {
         Err(LlmError::NoResponse)
     } else {
@@ -168,6 +170,8 @@ fn chat_complete_http_inner(
     messages: &[ChatMessage],
     model: &str,
     think: Option<bool>,
+    debug: bool,
+    show_prompts: bool,
 ) -> Result<String, LlmError> {
     let mut body = serde_json::json!({
         "model": model,
@@ -178,6 +182,19 @@ fn chat_complete_http_inner(
     });
     if think == Some(true) {
         body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": true});
+    }
+
+    if show_prompts {
+        eprintln!("=== LLM PROMPT ===");
+        eprintln!("URL: {url}");
+        eprintln!("Model: {model}");
+        for msg in messages {
+            eprintln!("--- {} ---", msg.role);
+            eprintln!("{}", msg.content);
+        }
+        eprintln!("=== END PROMPT ===");
+    } else if debug {
+        eprintln!("[llm] model={model} url={url} messages={}", messages.len());
     }
 
     let response = BLOCKING_CLIENT
@@ -202,6 +219,12 @@ fn chat_complete_http_inner(
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
         .unwrap_or("");
+
+    if show_prompts {
+        eprintln!("=== LLM RESPONSE ===");
+        eprintln!("{content}");
+        eprintln!("=== END RESPONSE ===");
+    }
 
     Ok(content.to_string())
 }
