@@ -132,6 +132,7 @@ mod tests {
         assert!((cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]) - 0.0).abs() < 1e-6);
     }
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_cosine_similarity_empty() {
         assert_eq!(cosine_similarity(&[], &[]), 0.0);
     }
@@ -170,6 +171,7 @@ mod tests {
         assert!((cosine_similarity_q8(&a, &b) - 1.0).abs() < 0.02);
     }
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_q8_cosine_empty() {
         assert_eq!(
             cosine_similarity_q8(

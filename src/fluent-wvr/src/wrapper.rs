@@ -779,7 +779,7 @@ mod tests {
             if name == "port" {
                 let v: u16 = value
                     .parse()
-                    .map_err(|_| FieldError::Parse(format!("invalid u16 for 'port': {}", value)))?;
+                    .map_err(|_| FieldError::Parse(format!("invalid u16 for 'port': {value}")))?;
                 if v > 1024 {
                     return Err(FieldError::Constraint(
                         "port: value above maximum 1024".into(),
@@ -832,9 +832,9 @@ mod tests {
         let err = adapter.set_field("port", "9999").unwrap_err();
         match err {
             FieldError::Constraint(msg) => {
-                assert!(msg.contains("above maximum"), "unexpected: {}", msg);
+                assert!(msg.contains("above maximum"), "unexpected: {msg}");
             }
-            other => panic!("expected Constraint error, got: {:?}", other),
+            other => panic!("expected Constraint error, got: {other:?}"),
         }
         // The override should NOT have been stored for the invalid value.
         assert_eq!(adapter.get_field("port").unwrap(), "512");
@@ -847,9 +847,9 @@ mod tests {
         let err = adapter.set_field("port", "not_a_number").unwrap_err();
         match err {
             FieldError::Parse(msg) => {
-                assert!(msg.contains("invalid u16"), "unexpected: {}", msg);
+                assert!(msg.contains("invalid u16"), "unexpected: {msg}");
             }
-            other => panic!("expected Parse error, got: {:?}", other),
+            other => panic!("expected Parse error, got: {other:?}"),
         }
     }
 }

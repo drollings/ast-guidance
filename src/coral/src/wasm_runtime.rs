@@ -370,7 +370,7 @@ mod tests {
     fn test_plugin_pool_lru_eviction() {
         let runtime: Arc<dyn WasmRuntime> = Arc::new(MockRuntime);
         let pool = PluginPool::new(runtime, 2);
-        let _p1 = pool.get_or_load("/a.wasm").unwrap();
+        let p1 = pool.get_or_load("/a.wasm").unwrap();
         let _p2 = pool.get_or_load("/b.wasm").unwrap();
         assert_eq!(pool.cache_size(), 2);
         // Adding a third entry evicts the least-recently-used (/a.wasm)
@@ -378,7 +378,7 @@ mod tests {
         assert_eq!(pool.cache_size(), 2);
         // /a.wasm was evicted — get_or_load loads a fresh instance
         let p1_new = pool.get_or_load("/a.wasm").unwrap();
-        let p1_old = _p1;
+        let p1_old = p1;
         assert!(
             !Arc::ptr_eq(&p1_new, &p1_old),
             "evicted plugin should be reloaded as a new instance"

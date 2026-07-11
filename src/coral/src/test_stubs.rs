@@ -52,7 +52,7 @@ impl EmbeddingProvider for StubEmbedder {
         let bytes = text.as_bytes();
         for i in 0..self.dims as usize {
             let byte = bytes.get(i % bytes.len()).copied().unwrap_or(0);
-            vec.push(byte as f32 / 255.0);
+            vec.push(f32::from(byte) / 255.0);
         }
         Ok(vec)
     }

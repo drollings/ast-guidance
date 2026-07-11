@@ -25,8 +25,8 @@ impl ExecutionPlan {
 /// # Examples
 ///
 /// ```no_run
-/// use dag::resolver::DependencyResolver;
-/// use dag::target::TargetRegistry;
+/// use fluent_dag::resolver::DependencyResolver;
+/// use fluent_dag::target::TargetRegistry;
 ///
 /// let registry = TargetRegistry::new();
 /// // ... register targets ...

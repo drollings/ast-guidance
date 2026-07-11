@@ -125,7 +125,7 @@ mod tests {
 
     #[test]
     fn strip_html_removes_script_and_style() {
-        let input = r#"<div>Hello <script>alert('x')</script> world <style>.x{}</style>!</div>"#;
+        let input = r"<div>Hello <script>alert('x')</script> world <style>.x{}</style>!</div>";
         let result = strip_html(input);
         assert_eq!(result, "Hello world !");
     }

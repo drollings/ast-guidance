@@ -225,6 +225,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn prefilled_value_clamp() {
         let pf = PreFilledValue {
             field_id: "f1".into(),
@@ -301,6 +302,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn histogram_summary_default() {
         let h = HistogramSummary::default();
         assert_eq!(h.count, 0);

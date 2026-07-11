@@ -1454,7 +1454,7 @@ src/dag/target.zig
         // index list the prompt would receive, validating that any prefix
         // permutation of the indices is accepted and that stages missing
         // from the LLM output are appended at the tail.
-        let stages = vec![
+        let stages = [
             Stage {
                 kind: StageKind::Code,
                 content: "fn alpha()".into(),

@@ -138,25 +138,25 @@ mod tests {
 
     #[test]
     fn test_normalize_integer() {
-        let tv = normalize_literal("42", None, Some(&format!("{}integer", XSD_NS)));
+        let tv = normalize_literal("42", None, Some(&format!("{XSD_NS}integer")));
         assert_eq!(tv, TypedValue::Integer(42));
     }
 
     #[test]
     fn test_normalize_decimal() {
-        let tv = normalize_literal("3.14", None, Some(&format!("{}decimal", XSD_NS)));
+        let tv = normalize_literal("3.14", None, Some(&format!("{XSD_NS}decimal")));
         assert!(matches!(tv, TypedValue::Double(_)));
     }
 
     #[test]
     fn test_normalize_boolean_true() {
-        let tv = normalize_literal("true", None, Some(&format!("{}boolean", XSD_NS)));
+        let tv = normalize_literal("true", None, Some(&format!("{XSD_NS}boolean")));
         assert_eq!(tv, TypedValue::Boolean(true));
     }
 
     #[test]
     fn test_normalize_boolean_false() {
-        let tv = normalize_literal("false", None, Some(&format!("{}boolean", XSD_NS)));
+        let tv = normalize_literal("false", None, Some(&format!("{XSD_NS}boolean")));
         assert_eq!(tv, TypedValue::Boolean(false));
     }
 

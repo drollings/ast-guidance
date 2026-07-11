@@ -718,8 +718,8 @@ mod tests {
 
     #[test]
     fn test_parallel_router_is_send_sync() {
-        fn _assert_send_sync<T: Send + Sync>() {}
-        _assert_send_sync::<ParallelRouter>();
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ParallelRouter>();
     }
 
     #[test]

@@ -63,7 +63,7 @@ mod tests {
     fn test_batch_filter_multiple_batches() {
         let batch = BatchLlmFilter::new(Box::new(NoopLlmFilter), 2);
         let candidates: Vec<String> = (0..5).map(|i| format!("fn func_{i}()")).collect();
-        let candidate_refs: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
+        let candidate_refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
         let results = batch.score_batch("func", &candidate_refs).expect("score");
         assert_eq!(results.len(), 5);
     }

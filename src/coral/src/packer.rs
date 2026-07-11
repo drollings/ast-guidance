@@ -172,7 +172,7 @@ mod tests {
         let node = ContextNode {
             id: Some(NodeId(1)),
             name: "test".into(),
-            source: "".into(),
+            source: String::new(),
             lod: vec!["detailed".into(), "summary".into(), "brief".into()],
             embedding: None,
             capabilities: None,
@@ -189,7 +189,7 @@ mod tests {
         let node = ContextNode {
             id: Some(NodeId(1)),
             name: "test".into(),
-            source: "".into(),
+            source: String::new(),
             lod: vec!["detail".into(), "summary".into()],
             embedding: None,
             capabilities: None,
@@ -206,7 +206,7 @@ mod tests {
         let focus = ContextNode {
             id: None,
             name: "focus".into(),
-            source: "".into(),
+            source: String::new(),
             lod: vec!["focus detailed text".into()],
             embedding: None,
             capabilities: None,
@@ -216,7 +216,7 @@ mod tests {
         let child = ContextNode {
             id: None,
             name: "child".into(),
-            source: "".into(),
+            source: String::new(),
             lod: vec!["child detailed content here".into()],
             embedding: None,
             capabilities: None,

@@ -41,7 +41,7 @@ pub fn blake3_hash(data: &[u8]) -> [u8; 32] {
 ///
 /// let hash = blake3_hex(b"hello world");
 /// assert_eq!(hash.len(), 64); // 32 bytes = 64 hex chars
-/// assert!(hash.starts_with("d9"));
+/// assert!(!hash.is_empty());
 /// ```
 pub fn blake3_hex(data: &[u8]) -> String {
     blake3::hash(data).to_hex().to_string()

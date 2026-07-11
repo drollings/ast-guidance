@@ -237,6 +237,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn bytes_roundtrip() {
         let phases = vec![0.0, 1.0, 2.0, 3.14];
         let bytes = phases_to_bytes(&phases);

@@ -65,7 +65,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     fn loopback_addr() -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345)
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345)
     }
 
     fn public_addr() -> SocketAddr {

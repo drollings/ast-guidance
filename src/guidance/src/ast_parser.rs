@@ -986,7 +986,7 @@ class MyClass:
         );
         let func = doc.members.first().expect("should have a function");
         assert_eq!(
-            func.comment.as_ref().map(|c| c.as_str()),
+            func.comment.as_ref().map(smol_str::SmolStr::as_str),
             Some("This is a test function")
         );
     }

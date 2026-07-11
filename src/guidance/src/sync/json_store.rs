@@ -471,7 +471,7 @@ mod tests {
         let doc = load_guidance_from_value(&v).expect("should load");
         assert_eq!(doc.meta.module.as_str(), "test");
         assert_eq!(
-            doc.comment.as_ref().map(|c| c.as_str()),
+            doc.comment.as_ref().map(smol_str::SmolStr::as_str),
             Some("A test module")
         );
     }

@@ -97,7 +97,7 @@ mod tests {
     fn test_command_unit_noop() {
         let result = CommandUnit::new()
             .name("noop".into())
-            .command("".into())
+            .command(String::new())
             .build()
             .execute(&WorkContext::default())
             .unwrap();

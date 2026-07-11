@@ -572,7 +572,7 @@ mod tests {
             assert_eq!(summary.cancelled.len(), 0);
             match &summary.panicked[0] {
                 crate::zone::ZoneEvent::Panicked { info, .. } => {
-                    assert!(info.contains("timed out"))
+                    assert!(info.contains("timed out"));
                 }
                 _ => panic!("expected Panicked event"),
             }
@@ -926,7 +926,7 @@ mod tests {
             let a = ZoneConfig { poll_budget: 64 };
             let b = a;
             assert_eq!(a, b);
-            let c = a.clone();
+            let c = a;
             assert_eq!(a, c);
             let _ = format!("{a:?}");
         }

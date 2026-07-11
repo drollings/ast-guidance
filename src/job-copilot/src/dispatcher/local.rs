@@ -181,6 +181,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn matches_first_name() {
         let d = make_dispatcher();
         let field = make_field("firstName", "First Name");
@@ -189,7 +190,6 @@ mod tests {
         assert_eq!(result.source, ValueSource::Resume);
         assert_eq!(result.confidence, 1.0);
     }
-
     #[test]
     fn matches_last_name() {
         let d = make_dispatcher();

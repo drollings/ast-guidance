@@ -189,10 +189,9 @@ impl Drop for Reserve {
 ///
 /// ```no_run
 /// use std::sync::Arc;
-/// use fluent_wvr::Runtime;
-/// use fluent_concurrency::runtime::tokio::TokioRuntime;
+/// use fluent_wvr::{Runtime, NoopRuntime};
 ///
-/// let rt: Arc<dyn Runtime> = Arc::new(TokioRuntime);
+/// let rt: Arc<dyn Runtime> = Arc::new(NoopRuntime);
 /// rt.spawn(Box::pin(async { /* background work */ }));
 /// ```
 pub trait Runtime: Send + Sync + 'static {
@@ -258,7 +257,7 @@ pub enum WorkError {
 /// # Examples
 ///
 /// ```no_run
-/// use fluent_wvr::{WorkContext, CapabilitySet};
+/// use fluent_wvr::{WorkContext, CapabilitySet, NoopRuntime};
 /// use std::sync::Arc;
 ///
 /// let ctx = WorkContext {
@@ -266,7 +265,7 @@ pub enum WorkError {
 ///     max_retries: 3,
 ///     timeout_ms: 10_000,
 ///     metadata: Default::default(),
-///     rt: Arc::new(fluent_concurrency::runtime::tokio::TokioRuntime),
+///     rt: Arc::new(NoopRuntime),
 ///     caps: CapabilitySet::new(),
 /// };
 /// assert!(ctx.dry_run);
@@ -394,7 +393,7 @@ pub trait SchemaProvider {
 ///     fn depends(&self) -> &[ArcIntern<str>] { &[] }
 ///     fn provides(&self) -> &[ArcIntern<str>] { &[] }
 ///     fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-///         WorkOutput::ok("pong")
+///         Ok(WorkOutput::ok("pong"))
 ///     }
 /// }
 ///
@@ -434,7 +433,7 @@ pub trait WorkUnit: Send + Sync {
 ///     fn depends(&self) -> &[ArcIntern<str>] { &[] }
 ///     fn provides(&self) -> &[ArcIntern<str>] { &[] }
 ///     fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-///         WorkOutput::ok("done")
+///         Ok(WorkOutput::ok("done"))
 ///     }
 /// }
 /// impl FieldAccess for MyUnit {
@@ -635,7 +634,7 @@ mod tests {
     #[test]
     fn test_derive_field_names() {
         let cfg = BasicConfig {
-            name: "".into(),
+            name: String::new(),
             count: 0,
             enabled: false,
         };
@@ -710,9 +709,9 @@ mod tests {
         let err = cfg.set_field("port", "0").unwrap_err();
         match err {
             FieldError::Constraint(msg) => {
-                assert!(msg.contains("below minimum"), "unexpected: {}", msg);
+                assert!(msg.contains("below minimum"), "unexpected: {msg}");
             }
-            other => panic!("expected Constraint, got {:?}", other),
+            other => panic!("expected Constraint, got {other:?}"),
         }
     }
 
@@ -726,9 +725,9 @@ mod tests {
         let err = cfg.set_field("port", "70000").unwrap_err();
         match err {
             FieldError::Constraint(msg) => {
-                assert!(msg.contains("above maximum"), "unexpected: {}", msg);
+                assert!(msg.contains("above maximum"), "unexpected: {msg}");
             }
-            other => panic!("expected Constraint, got {:?}", other),
+            other => panic!("expected Constraint, got {other:?}"),
         }
     }
 
@@ -924,6 +923,7 @@ mod tests {
     fn noop_runtime_spawn_panics_outside_tokio_with_clear_message() {
         let rt = NoopRuntime;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[allow(clippy::let_underscore_future)]
             let _ = rt.spawn(Box::pin(async {}));
         }));
         assert!(result.is_err(), "should panic outside tokio runtime");

@@ -336,6 +336,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn confidence_is_clamped() {
         let server = httpmock::MockServer::start();
         let mock = server.mock(|when, then| {
@@ -356,6 +357,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn negative_confidence_is_clamped() {
         let server = httpmock::MockServer::start();
         let mock = server.mock(|when, then| {
@@ -410,6 +412,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn store_exact_match_short_circuits_llm() {
         let store = Arc::new(RwLock::new({
             let mut s = crate::similarity::FieldSimilarityStore::new();
@@ -434,6 +437,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn store_alias_match_short_circuits_llm() {
         let store = Arc::new(RwLock::new({
             let mut s = crate::similarity::FieldSimilarityStore::new();

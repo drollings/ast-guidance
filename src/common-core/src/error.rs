@@ -71,7 +71,7 @@ mod tests {
 
     #[test]
     fn io_error_from_via_into() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "boom");
+        let io_err = std::io::Error::other("boom");
         let err: IoError = io_err.into();
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
     }
