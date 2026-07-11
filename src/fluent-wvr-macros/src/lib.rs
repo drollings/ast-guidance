@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
@@ -8,6 +10,8 @@ struct FieldMeta {
     min: Option<f64>,
     max: Option<f64>,
     skip: bool,
+    required: bool,
+    format: Option<String>,
 }
 
 fn parse_field_attrs(field: &syn::Field) -> FieldMeta {
@@ -16,6 +20,8 @@ fn parse_field_attrs(field: &syn::Field) -> FieldMeta {
         min: None,
         max: None,
         skip: false,
+        required: true,
+        format: None,
     };
 
     for attr in &field.attrs {
@@ -41,7 +47,7 @@ fn parse_field_attrs(field: &syn::Field) -> FieldMeta {
                 let lit: Lit = value.parse()?;
                 match lit {
                     Lit::Int(i) => result.min = Some(i.base10_parse::<f64>().unwrap()),
-                    Lit::Float(f) => result.max = Some(f.base10_parse::<f64>().unwrap()),
+                    Lit::Float(f) => result.min = Some(f.base10_parse::<f64>().unwrap()),
                     _ => {}
                 }
                 return Ok(());
@@ -56,7 +62,25 @@ fn parse_field_attrs(field: &syn::Field) -> FieldMeta {
                 }
                 return Ok(());
             }
-            Err(meta.error("unknown field attribute, expected `skip`, `desc`, `min`, or `max`"))
+            if meta.path.is_ident("required") {
+                let value = meta.value()?;
+                let lit: Lit = value.parse()?;
+                if let Lit::Bool(b) = lit {
+                    result.required = b.value();
+                }
+                return Ok(());
+            }
+            if meta.path.is_ident("format") {
+                let value = meta.value()?;
+                let lit: Lit = value.parse()?;
+                if let Lit::Str(s) = lit {
+                    result.format = Some(s.value());
+                }
+                return Ok(());
+            }
+            Err(meta.error(
+                "unknown field attribute, expected `skip`, `desc`, `min`, `max`, `required`, or `format`",
+            ))
         });
     }
 
@@ -374,6 +398,10 @@ pub fn derive_describable(input: TokenStream) -> TokenStream {
             }
         }
 
+        if let Some(ref fmt) = meta.format {
+            schema.push(quote! { "format": #fmt });
+        }
+
         let field_name_lit = field_name_str.clone();
         properties.push(quote! {
             #field_name_lit: {
@@ -395,6 +423,17 @@ pub fn derive_describable(input: TokenStream) -> TokenStream {
         };
         let type_name_str = ty_str.clone();
 
+        let required_expr = if meta.required {
+            quote! { true }
+        } else {
+            quote! { false }
+        };
+
+        let format_expr = match &meta.format {
+            Some(f) => quote! { Some(#f.into()) },
+            None => quote! { None },
+        };
+
         schema_fields.push(quote! {
             fluent_wvr::FieldSchema {
                 name: #field_name_str.into(),
@@ -402,11 +441,14 @@ pub fn derive_describable(input: TokenStream) -> TokenStream {
                 description: #desc_expr,
                 min: #min_expr,
                 max: #max_expr,
-                required: true,
+                required: #required_expr,
+                format: #format_expr,
             }
         });
 
-        required.push(field_name_str);
+        if meta.required {
+            required.push(field_name_str);
+        }
     }
 
     let expanded = quote! {

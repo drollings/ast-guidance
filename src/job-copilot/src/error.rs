@@ -1,3 +1,4 @@
+use common_core::error_context::ErrorContext;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -32,6 +33,8 @@ pub enum CopilotError {
     Internal(String),
     #[error("database error: {0}")]
     Sqlite(#[from] common_core::error::SqliteError),
+    #[error(transparent)]
+    Context(#[from] Box<ErrorContext>),
 }
 
 pub type Result<T> = std::result::Result<T, CopilotError>;
@@ -39,5 +42,45 @@ pub type Result<T> = std::result::Result<T, CopilotError>;
 impl From<rusqlite::Error> for CopilotError {
     fn from(e: rusqlite::Error) -> Self {
         CopilotError::Sqlite(common_core::error::SqliteError(e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_context_display_includes_operation_field_value_cause() {
+        let ctx = ErrorContext::new(
+            "load_profile",
+            Some("path"),
+            Some("/home/user/profile.toml"),
+            std::io::Error::new(std::io::ErrorKind::NotFound, "file not found"),
+        );
+        let err = CopilotError::Context(Box::new(ctx));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("load_profile"),
+            "should contain operation: {msg}"
+        );
+        assert!(msg.contains("path"), "should contain field: {msg}");
+        assert!(
+            msg.contains("/home/user/profile.toml"),
+            "should contain value: {msg}"
+        );
+        assert!(
+            msg.contains("file not found"),
+            "should contain cause: {msg}"
+        );
+    }
+
+    #[test]
+    fn error_context_from_conversion() {
+        let ctx =
+            ErrorContext::simple("open_audit_log", std::io::Error::other("permission denied"));
+        let err: CopilotError = Box::new(ctx).into();
+        let msg = err.to_string();
+        assert!(msg.contains("open_audit_log"));
+        assert!(msg.contains("permission denied"));
     }
 }

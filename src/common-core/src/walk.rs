@@ -1,3 +1,5 @@
+//! Directory walker: `walk_files` (callback), `should_skip_dir`, `SOURCE_EXTENSIONS`.
+
 use std::collections::HashSet;
 use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};

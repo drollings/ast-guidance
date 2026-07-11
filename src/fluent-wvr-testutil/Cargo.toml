@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+common-core = { path = "../common-core" }
 fluent-wvr = { path = "../fluent-wvr" }
 serde_json = { workspace = true }
 internment = { workspace = true }

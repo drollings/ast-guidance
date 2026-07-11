@@ -1,9 +1,30 @@
+//! Lock-free latency histogram with 12 fixed buckets.
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 pub const BUCKET_MS: [u64; 11] = [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000];
 pub const BUCKET_COUNT: usize = 12;
 
+/// Lock-free latency histogram with 12 fixed buckets.
+///
+/// Buckets are: `[1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, +∞]` ms.
+/// Thread-safe via `AtomicU64` — safe to share across tasks.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Instant;
+/// use common_core::metrics::LatencyHistogram;
+///
+/// let hist = LatencyHistogram::new();
+/// let start = Instant::now();
+/// // ... do work ...
+/// hist.observe_duration(start);
+///
+/// assert_eq!(hist.count(), 1);
+/// assert!(hist.sum_ms() < 1000);
+/// ```
 pub struct LatencyHistogram {
     buckets: [AtomicU64; BUCKET_COUNT],
     count: AtomicU64,

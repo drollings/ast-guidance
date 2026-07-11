@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! ## Fluent WVR — Framework Trait Crate
 //!
 //! This is a **framework trait** crate — the Rust equivalent of a header-only
@@ -29,10 +31,85 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::task::JoinHandle;
 
+/// Typed metadata value for `WorkContext`.
+///
+/// Replaces the old `Vec<(String, String)>` with a type-safe, structured
+/// representation. Supports string, integer, float, boolean, and null values.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MetadataValue {
+    String(String),
+    Number(i64),
+    Float(f64),
+    Bool(bool),
+    Null,
+}
+
+impl From<&str> for MetadataValue {
+    fn from(s: &str) -> Self {
+        MetadataValue::String(s.to_string())
+    }
+}
+
+impl From<String> for MetadataValue {
+    fn from(s: String) -> Self {
+        MetadataValue::String(s)
+    }
+}
+
+impl From<i64> for MetadataValue {
+    fn from(n: i64) -> Self {
+        MetadataValue::Number(n)
+    }
+}
+
+impl From<f64> for MetadataValue {
+    fn from(f: f64) -> Self {
+        MetadataValue::Float(f)
+    }
+}
+
+impl From<bool> for MetadataValue {
+    fn from(b: bool) -> Self {
+        MetadataValue::Bool(b)
+    }
+}
+
+/// Legacy type alias for backward compatibility. Prefer `MetadataValue`.
+pub type MetadataEntry = (String, String);
+
+/// A capability token that can be placed in a `CapabilitySet` to gate access
+/// to resources (network, filesystem, database).
+///
+/// # Examples
+///
+/// ```
+/// use fluent_wvr::Capability;
+///
+/// struct NetCapability;
+/// impl Capability for NetCapability {
+///     fn name(&self) -> &'static str { "net" }
+/// }
+/// ```
 pub trait Capability: Send + Sync + 'static {
     fn name(&self) -> &'static str;
 }
 
+/// A type-map of capability tokens, used to gate access to resources.
+///
+/// # Examples
+///
+/// ```
+/// use fluent_wvr::{Capability, CapabilitySet};
+///
+/// struct FsCapability;
+/// impl Capability for FsCapability {
+///     fn name(&self) -> &'static str { "fs" }
+/// }
+///
+/// let caps = CapabilitySet::new().with(FsCapability);
+/// assert!(caps.get::<FsCapability>().is_some());
+/// ```
 #[derive(Default, Debug)]
 pub struct CapabilitySet {
     caps: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
@@ -104,6 +181,20 @@ impl Drop for Reserve {
     }
 }
 
+/// Async runtime abstraction. All async primitives in the workspace accept
+/// this trait so that production code uses `tokio` and tests can substitute
+/// a deterministic runtime.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use fluent_wvr::Runtime;
+/// use fluent_concurrency::runtime::tokio::TokioRuntime;
+///
+/// let rt: Arc<dyn Runtime> = Arc::new(TokioRuntime);
+/// rt.spawn(Box::pin(async { /* background work */ }));
+/// ```
 pub trait Runtime: Send + Sync + 'static {
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) -> JoinHandle<()>;
     fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -112,14 +203,23 @@ pub trait Runtime: Send + Sync + 'static {
 
 /// A no-op runtime for contexts where `spawn` and `sleep` are never called.
 ///
-/// `spawn` logs a warning and returns a dummy `JoinHandle`. `sleep` returns
-/// immediately. This runtime is intended for testing or initialization code
-/// that doesn't actually need async execution.
+/// `spawn` logs a warning and returns a dummy `JoinHandle`. If called outside
+/// a tokio runtime, it panics with a clear message directing the caller to
+/// provide a real `Runtime`. `sleep` returns immediately. This runtime is
+/// intended for testing or initialization code that doesn't actually need
+/// async execution.
 pub struct NoopRuntime;
 
 impl Runtime for NoopRuntime {
     fn spawn(&self, _future: Pin<Box<dyn Future<Output = ()> + Send>>) -> JoinHandle<()> {
         tracing::warn!("NoopRuntime::spawn called — no runtime configured; task will not execute");
+        let has_runtime = tokio::runtime::Handle::try_current().is_ok();
+        assert!(
+            has_runtime,
+            "NoopRuntime::spawn called outside a tokio runtime. \
+             Either supply a real Runtime (e.g. via WorkContext with rt: tokio_runtime()) \
+             or use NoopRuntime only for dry-run / init code paths."
+        );
         tokio::spawn(async {})
     }
 
@@ -152,12 +252,31 @@ pub enum WorkError {
     Timeout { duration_ms: u64, unit: String },
 }
 
+/// Execution context passed to `WorkUnit::execute`. Carries configuration
+/// (dry-run, retries, timeout), typed metadata, a runtime, and a capability set.
+///
+/// # Examples
+///
+/// ```no_run
+/// use fluent_wvr::{WorkContext, CapabilitySet};
+/// use std::sync::Arc;
+///
+/// let ctx = WorkContext {
+///     dry_run: true,
+///     max_retries: 3,
+///     timeout_ms: 10_000,
+///     metadata: Default::default(),
+///     rt: Arc::new(fluent_concurrency::runtime::tokio::TokioRuntime),
+///     caps: CapabilitySet::new(),
+/// };
+/// assert!(ctx.dry_run);
+/// ```
 #[derive(Clone)]
 pub struct WorkContext {
     pub dry_run: bool,
     pub max_retries: u32,
     pub timeout_ms: u64,
-    pub metadata: Vec<(String, String)>,
+    pub metadata: HashMap<String, MetadataValue>,
     pub rt: Arc<dyn Runtime>,
     pub caps: CapabilitySet,
 }
@@ -180,10 +299,25 @@ impl Default for WorkContext {
         Self {
             dry_run: false,
             max_retries: 0,
-            timeout_ms: 30000,
-            metadata: Vec::new(),
+            timeout_ms: 30_000,
+            metadata: HashMap::new(),
             rt: Arc::new(NoopRuntime),
             caps: CapabilitySet::new(),
+        }
+    }
+}
+
+impl WorkContext {
+    /// Construct a `WorkContext` for a specific unit with a given capability set.
+    /// Uses the unit's `default_timeout_ms()` and a default runtime.
+    pub fn for_unit(unit: &dyn WorkUnit, caps: CapabilitySet) -> Self {
+        Self {
+            dry_run: false,
+            max_retries: 0,
+            timeout_ms: unit.default_timeout_ms(),
+            metadata: HashMap::new(),
+            rt: Arc::new(NoopRuntime),
+            caps,
         }
     }
 }
@@ -237,19 +371,84 @@ pub struct FieldSchema {
     pub min: Option<f64>,
     pub max: Option<f64>,
     pub required: bool,
+    pub format: Option<String>,
 }
 
 pub trait SchemaProvider {
     fn schema(&self) -> Vec<FieldSchema>;
 }
 
+/// The core execution unit in the component system. Every `Component` implements
+/// this trait. The `Zone` supervisor and `MiddlewareChain` operate on `WorkUnit`s.
+///
+/// # Examples
+///
+/// ```
+/// use fluent_wvr::{WorkUnit, WorkContext, WorkOutput, WorkError};
+/// use internment::ArcIntern;
+///
+/// struct PingUnit;
+///
+/// impl WorkUnit for PingUnit {
+///     fn name(&self) -> &str { "ping" }
+///     fn depends(&self) -> &[ArcIntern<str>] { &[] }
+///     fn provides(&self) -> &[ArcIntern<str>] { &[] }
+///     fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+///         WorkOutput::ok("pong")
+///     }
+/// }
+///
+/// let unit = PingUnit;
+/// assert_eq!(unit.name(), "ping");
+/// ```
 pub trait WorkUnit: Send + Sync {
     fn name(&self) -> &str;
     fn depends(&self) -> &[ArcIntern<str>];
     fn provides(&self) -> &[ArcIntern<str>];
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError>;
+
+    /// Returns the default timeout in milliseconds for this unit.
+    /// Override this to set a unit-specific timeout. Default: 30,000ms.
+    fn default_timeout_ms(&self) -> u64 {
+        30_000
+    }
 }
 
+/// A fully-featured component: `FieldAccess` + `Describable` + `WorkUnit` + `Send + Sync`.
+///
+/// Any type that implements all four traits automatically implements `Component`
+/// via a blanket impl. The derive macros (`#[derive(FieldAccess, Describable)]`)
+/// plus a manual `WorkUnit` impl is the 80% path.
+///
+/// # Examples
+///
+/// ```no_run
+/// use fluent_wvr::{Component, WorkUnit, WorkContext, WorkOutput, WorkError,
+///     FieldAccess, Describable, FieldError};
+/// use internment::ArcIntern;
+///
+/// struct MyUnit { port: u16 }
+///
+/// impl WorkUnit for MyUnit {
+///     fn name(&self) -> &str { "my_unit" }
+///     fn depends(&self) -> &[ArcIntern<str>] { &[] }
+///     fn provides(&self) -> &[ArcIntern<str>] { &[] }
+///     fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+///         WorkOutput::ok("done")
+///     }
+/// }
+/// impl FieldAccess for MyUnit {
+///     fn set_field(&mut self, _: &str, _: &str) -> Result<(), FieldError> { Ok(()) }
+///     fn get_field(&self, _: &str) -> Result<String, FieldError> { Err(FieldError::NotFound("none".into())) }
+///     fn field_names(&self) -> &'static [&'static str] { &[] }
+/// }
+/// impl Describable for MyUnit {
+///     fn describe(&self) -> serde_json::Value { serde_json::json!({}) }
+/// }
+///
+/// // MyUnit is now a Component — can be wrapped in Arc<dyn Component>.
+/// let _comp: std::sync::Arc<dyn Component> = std::sync::Arc::new(MyUnit { port: 8080 });
+/// ```
 pub trait Component: FieldAccess + Describable + WorkUnit + Send + Sync {}
 impl<T: FieldAccess + Describable + WorkUnit + Send + Sync> Component for T {}
 
@@ -266,6 +465,9 @@ impl WorkUnit for Arc<dyn WorkUnit> {
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
         (**self).execute(ctx)
     }
+    fn default_timeout_ms(&self) -> u64 {
+        (**self).default_timeout_ms()
+    }
 }
 
 impl WorkUnit for Arc<dyn Component> {
@@ -280,6 +482,9 @@ impl WorkUnit for Arc<dyn Component> {
     }
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
         (**self).execute(ctx)
+    }
+    fn default_timeout_ms(&self) -> u64 {
+        (**self).default_timeout_ms()
     }
 }
 
@@ -585,5 +790,158 @@ mod tests {
         };
         let boxed: Box<dyn Component> = Box::new(cfg);
         assert_eq!(boxed.field_names().len(), 3);
+    }
+
+    #[derive(FieldAccess)]
+    struct FloatMinConfig {
+        #[field(min = 1.5)]
+        scale: f64,
+    }
+
+    #[test]
+    fn field_min_float_sets_min_not_max() {
+        let mut c = FloatMinConfig { scale: 2.0 };
+        // 0.5 is below min=1.5, should fail
+        assert!(c.set_field("scale", "0.5").is_err());
+        // 2.0 is above min=1.5, should succeed
+        assert!(c.set_field("scale", "2.0").is_ok());
+        // 1.5 is exactly min, should succeed
+        assert!(c.set_field("scale", "1.5").is_ok());
+    }
+
+    #[derive(Describable)]
+    #[allow(dead_code)]
+    struct OptionalConfig {
+        name: String,
+        #[field(required = false)]
+        nickname: Option<String>,
+    }
+
+    impl WorkUnit for OptionalConfig {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn depends(&self) -> &[ArcIntern<str>] {
+            &[]
+        }
+        fn provides(&self) -> &[ArcIntern<str>] {
+            &[]
+        }
+        fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+            Ok(WorkOutput::ok("done"))
+        }
+    }
+
+    #[test]
+    fn describable_required_false_excludes_from_required_array() {
+        let c = OptionalConfig {
+            name: "x".into(),
+            nickname: None,
+        };
+        let desc = c.describe();
+        let required = desc["required"].as_array().unwrap();
+        assert!(
+            required.iter().any(|v| v == "name"),
+            "name should be required"
+        );
+        assert!(
+            !required.iter().any(|v| v == "nickname"),
+            "nickname should not be required"
+        );
+    }
+
+    #[test]
+    fn schema_provider_required_false() {
+        let c = OptionalConfig {
+            name: "x".into(),
+            nickname: None,
+        };
+        let fields = c.schema();
+        let name_field = fields.iter().find(|f| f.name == "name").unwrap();
+        assert!(name_field.required);
+        let nick_field = fields.iter().find(|f| f.name == "nickname").unwrap();
+        assert!(!nick_field.required);
+    }
+
+    #[derive(Describable)]
+    #[allow(dead_code)]
+    struct FormatConfig {
+        #[field(desc = "Endpoint URL", format = "url")]
+        endpoint: String,
+        #[field(desc = "Timeout", format = "duration")]
+        timeout_ms: u64,
+        name: String,
+    }
+
+    impl WorkUnit for FormatConfig {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn depends(&self) -> &[ArcIntern<str>] {
+            &[]
+        }
+        fn provides(&self) -> &[ArcIntern<str>] {
+            &[]
+        }
+        fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+            Ok(WorkOutput::ok("done"))
+        }
+    }
+
+    #[test]
+    fn format_attribute_reaches_describable_json() {
+        let c = FormatConfig {
+            endpoint: "https://example.com".into(),
+            timeout_ms: 5000,
+            name: "test".into(),
+        };
+        let desc = c.describe();
+        let endpoint_schema = &desc["properties"]["endpoint"];
+        assert_eq!(endpoint_schema["description"], "Endpoint URL");
+        assert_eq!(endpoint_schema["format"], "url");
+        let timeout_schema = &desc["properties"]["timeout_ms"];
+        assert_eq!(timeout_schema["format"], "duration");
+    }
+
+    #[test]
+    fn format_attribute_reaches_field_schema() {
+        use super::SchemaProvider;
+        let c = FormatConfig {
+            endpoint: "https://example.com".into(),
+            timeout_ms: 5000,
+            name: "test".into(),
+        };
+        let fields = c.schema();
+        let endpoint_field = fields.iter().find(|f| f.name == "endpoint").unwrap();
+        assert_eq!(endpoint_field.format.as_deref(), Some("url"));
+        let timeout_field = fields.iter().find(|f| f.name == "timeout_ms").unwrap();
+        assert_eq!(timeout_field.format.as_deref(), Some("duration"));
+        let name_field = fields.iter().find(|f| f.name == "name").unwrap();
+        assert!(name_field.format.is_none());
+    }
+
+    #[test]
+    fn noop_runtime_spawn_panics_outside_tokio_with_clear_message() {
+        let rt = NoopRuntime;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = rt.spawn(Box::pin(async {}));
+        }));
+        assert!(result.is_err(), "should panic outside tokio runtime");
+        let payload = result.unwrap_err();
+        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            panic!("unexpected panic payload type");
+        };
+        assert!(
+            msg.contains("NoopRuntime::spawn called outside a tokio runtime"),
+            "panic message should be clear, got: {msg}"
+        );
+        assert!(
+            msg.contains("supply a real Runtime"),
+            "panic message should suggest fix, got: {msg}"
+        );
     }
 }

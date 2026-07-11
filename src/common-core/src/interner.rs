@@ -1,3 +1,5 @@
+//! Capability registry: thread-safe string ↔ BitVec index for capability bitsets.
+
 use bitvec::vec::BitVec;
 use internment::ArcIntern;
 use std::collections::HashMap;

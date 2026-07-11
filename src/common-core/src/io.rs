@@ -9,6 +9,19 @@ pub fn mtime(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
+/// Atomically write data to a file by writing to a temp file and renaming.
+///
+/// This prevents partial writes if the process is interrupted mid-write.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::path::Path;
+/// use common_core::io::write_atomic;
+///
+/// write_atomic(Path::new("config.json"), b"{\"key\": \"value\"}")?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
 pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, data)?;
@@ -16,6 +29,19 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Read a file to a string, returning `IoError` for I/O failures and files
+/// exceeding the 100 MiB size cap.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::path::Path;
+/// use common_core::io::read_to_string_err;
+///
+/// let content = read_to_string_err(Path::new("Cargo.toml"))?;
+/// assert!(content.contains("[package]"));
+/// # Ok::<(), common_core::error::IoError>(())
+/// ```
 pub fn read_to_string_err(path: &Path) -> Result<String, IoError> {
     let meta = fs::metadata(path).map_err(IoError)?;
     let size = meta.len() as usize;
@@ -76,6 +102,17 @@ pub fn strip_path_prefix<'a>(path: &'a str, prefix: &str) -> &'a str {
     } else {
         path
     }
+}
+
+/// Idempotent directory creation with canonical error wrapping.
+/// Replaces the 10+ ad-hoc `std::fs::create_dir_all(...)` calls across the workspace.
+pub fn ensure_dir(path: impl AsRef<Path>) -> Result<(), IoError> {
+    std::fs::create_dir_all(path.as_ref()).map_err(IoError)
+}
+
+/// Same as `ensure_dir` but `.expect`s on failure (for test setup and config init).
+pub fn ensure_dir_or_panic(path: impl AsRef<Path>) {
+    std::fs::create_dir_all(path.as_ref()).expect("ensure_dir");
 }
 
 #[cfg(test)]
@@ -193,5 +230,20 @@ mod tests {
     #[test]
     fn read_to_string_err_missing_file() {
         assert!(read_to_string_err(Path::new("/nonexistent/file.txt")).is_err());
+    }
+
+    #[test]
+    fn ensure_dir_creates_nested() {
+        let dir = TempDir::new().unwrap();
+        let nested = dir.path().join("a/b/c");
+        ensure_dir(&nested).unwrap();
+        assert!(nested.is_dir());
+    }
+
+    #[test]
+    fn ensure_dir_idempotent() {
+        let dir = TempDir::new().unwrap();
+        ensure_dir(dir.path()).unwrap();
+        ensure_dir(dir.path()).unwrap();
     }
 }

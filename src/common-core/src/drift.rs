@@ -1,3 +1,5 @@
+//! Bit-set drift analysis: compute "missing capability" follow-ups from `BitVec` masks.
+
 use bitvec::prelude::*;
 use internment::ArcIntern;
 use std::collections::HashMap;

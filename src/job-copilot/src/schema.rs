@@ -25,7 +25,7 @@ pub struct FieldDescription {
 impl FieldDescription {
     /// Lowercase version of `field_id`, used for regex matching in dispatchers.
     #[must_use]
-    pub fn name_or_id_lower(&self) -> String {
+    pub fn field_id_lower(&self) -> String {
         self.field_id.to_lowercase()
     }
 }
@@ -309,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn name_or_id_lower() {
+    fn field_id_lower() {
         let fd = FieldDescription {
             field_id: "FirstName".into(),
             label: "First Name".into(),
@@ -321,6 +321,6 @@ mod tests {
             autocomplete: None,
             options: vec![],
         };
-        assert_eq!(fd.name_or_id_lower(), "firstname");
+        assert_eq!(fd.field_id_lower(), "firstname");
     }
 }

@@ -9,7 +9,11 @@ use crate::server::audit::AuditLog;
 use common_core::hash::blake3_hex;
 use common_core::jsonrpc::{JsonRpcError, JsonRpcHandler, JsonRpcRequest, JsonRpcResponse};
 use common_core::metrics::LatencyHistogram;
-use fluent_wvr::{CapabilitySet, Component, WorkContext, WorkUnit};
+use fluent_concurrency::zone::ZoneSummary;
+use fluent_wvr::{
+    CapabilitySet, Component, Describable, FieldAccess, FieldError, WorkContext, WorkError,
+    WorkOutput, WorkUnit,
+};
 use std::sync::RwLock;
 
 /// Central handler for all JSON-RPC methods.
@@ -109,10 +113,10 @@ impl DaemonHandler {
             };
         };
 
-        let ctx = WorkContext {
-            caps: CapabilitySet::new().with(AnalyzeFormParamsCap(params)),
-            ..WorkContext::default()
-        };
+        let ctx = WorkContext::for_unit(
+            self.unit.as_ref(),
+            CapabilitySet::new().with(AnalyzeFormParamsCap(params)),
+        );
 
         match WorkUnit::execute(self.unit.as_ref(), &ctx) {
             Ok(output) => JsonRpcResponse {
@@ -199,7 +203,10 @@ impl DaemonHandler {
         let h = &self.histogram;
         let health = DaemonHealth {
             version: env!("CARGO_PKG_VERSION").to_string(),
-            profile_loaded: self.profile.read().is_ok(),
+            profile_loaded: self
+                .profile
+                .read()
+                .is_ok_and(|p| !p.personal.first_name.is_empty() || !p.personal.email.is_empty()),
             llm_reachable: false,
             uptime_s: self.started_at.elapsed().as_secs(),
             analyze_count: h.count(),
@@ -228,6 +235,130 @@ impl DaemonHandler {
             let _ = audit.record_error(&blake3_hex(rid.as_bytes()), kind, message);
         }
     }
+
+    /// Dispatch multiple form analysis requests concurrently using a `Zone`.
+    ///
+    /// Each request is registered as a separate task in the zone. The zone
+    /// supervises all tasks and returns a `ZoneSummary` with completed,
+    /// panicked, and cancelled events.
+    ///
+    /// The returned `Vec` preserves input order. Successful results contain
+    /// the `AnalyzeFormResponse` JSON. Failed results contain an error message.
+    pub async fn dispatch_concurrent(
+        &self,
+        requests: Vec<PageAnalyzeFormParams>,
+    ) -> (Vec<Result<serde_json::Value, String>>, ZoneSummary) {
+        use fluent_concurrency::zone::Zone;
+
+        let runtime = fluent_concurrency::tokio_runtime();
+        let mut zone = Zone::new(runtime, CapabilitySet::new());
+
+        // Wrap each unit with a unique name so Zone can distinguish tasks.
+        let units: Vec<Arc<dyn Component>> = requests
+            .iter()
+            .enumerate()
+            .map(|(i, params)| {
+                let ctx = WorkContext::for_unit(
+                    self.unit.as_ref(),
+                    CapabilitySet::new().with(AnalyzeFormParamsCap(params.clone())),
+                );
+                let named = NamedComponent::new(Arc::clone(&self.unit), i, ctx);
+                Arc::new(named) as Arc<dyn Component>
+            })
+            .collect();
+
+        for unit in &units {
+            let ctx = WorkContext::for_unit(unit.as_ref(), CapabilitySet::new());
+            zone.register_with_context(Arc::clone(unit), ctx);
+        }
+
+        let summary: ZoneSummary = (&mut zone).await;
+
+        // Reconstruct results in input order using the index encoded in task names.
+        let mut results: Vec<Result<serde_json::Value, String>> =
+            vec![Err("task did not complete".into()); requests.len()];
+
+        for event in &summary.completed {
+            if let fluent_concurrency::zone::ZoneEvent::Completed { name, output } = event {
+                if let Some(idx) = parse_index(name) {
+                    results[idx] = Ok(output.data.clone());
+                }
+            }
+        }
+        for event in &summary.panicked {
+            if let fluent_concurrency::zone::ZoneEvent::Panicked { name, info } = event {
+                if let Some(idx) = parse_index(name) {
+                    results[idx] = Err(info.clone());
+                }
+            }
+        }
+
+        (results, summary)
+    }
+}
+
+/// A `Component` wrapper that gives the inner unit a unique name by appending
+/// an index suffix. Used by `dispatch_concurrent` so the `Zone` can
+/// distinguish between tasks that share the same base name.
+struct NamedComponent {
+    inner: Arc<dyn Component>,
+    name: String,
+    ctx: WorkContext,
+}
+
+impl NamedComponent {
+    fn new(inner: Arc<dyn Component>, index: usize, ctx: WorkContext) -> Self {
+        let name = format!("{}:{index}", inner.name());
+        Self { inner, name, ctx }
+    }
+}
+
+impl WorkUnit for NamedComponent {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn depends(&self) -> &[fluent_wvr::ArcIntern<str>] {
+        self.inner.depends()
+    }
+    fn provides(&self) -> &[fluent_wvr::ArcIntern<str>] {
+        self.inner.provides()
+    }
+    fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+        // Use the Zone-supplied runtime (real tokio) and per-unit capabilities
+        // from self.ctx. Self.ctx carries `AnalyzeFormParamsCap`; the Zone's
+        // ctx carries the live runtime and any other zone-wide capabilities.
+        let merged = WorkContext {
+            rt: Arc::clone(&ctx.rt),
+            ..self.ctx.clone()
+        };
+        self.inner.execute(&merged)
+    }
+    fn default_timeout_ms(&self) -> u64 {
+        self.inner.default_timeout_ms()
+    }
+}
+
+impl FieldAccess for NamedComponent {
+    fn set_field(&mut self, name: &str, value: &str) -> Result<(), FieldError> {
+        self.inner.set_field(name, value)
+    }
+    fn get_field(&self, name: &str) -> Result<String, FieldError> {
+        self.inner.get_field(name)
+    }
+    fn field_names(&self) -> &'static [&'static str] {
+        self.inner.field_names()
+    }
+}
+
+impl Describable for NamedComponent {
+    fn describe(&self) -> serde_json::Value {
+        self.inner.describe()
+    }
+}
+
+/// Parse the index suffix from a `NamedComponent` name (e.g., "analyze_form:3" → Some(3)).
+fn parse_index(name: &str) -> Option<usize> {
+    name.rsplit(':').next()?.parse().ok()
 }
 
 impl JsonRpcHandler for DaemonHandler {
@@ -266,7 +397,7 @@ mod tests {
                 .build(),
         );
         let chain = MiddlewareChain::new()
-            .push(Box::new(TimingMiddleware))
+            .push(Box::new(TimingMiddleware::new()))
             .push(Box::new(RetryMiddleware::new(2, 50)));
         chain.apply(base)
     }
@@ -306,7 +437,7 @@ mod tests {
                 .build(),
         );
         let chain = MiddlewareChain::new()
-            .push(Box::new(TimingMiddleware))
+            .push(Box::new(TimingMiddleware::new()))
             .push(Box::new(RetryMiddleware::new(2, 50)));
         let unit = chain.apply(base);
 
@@ -554,7 +685,7 @@ mod tests {
                     .build(),
             );
             let chain = MiddlewareChain::new()
-                .push(Box::new(TimingMiddleware))
+                .push(Box::new(TimingMiddleware::new()))
                 .push(Box::new(RetryMiddleware::new(2, 50)));
             let unit = chain.apply(base);
 
@@ -635,5 +766,118 @@ mod tests {
                     .expect("audit line is not valid JSON");
             }
         }
+    }
+
+    /// Zone-based concurrent form analysis: 10 requests dispatched via Zone.
+    #[tokio::test]
+    async fn concurrent_form_analysis_via_zone() {
+        let handler = test_handler();
+        let requests: Vec<PageAnalyzeFormParams> = (0..10)
+            .map(|i| PageAnalyzeFormParams {
+                url: format!("https://example.com/form/{i}"),
+                company_hint: None,
+                page_context: None,
+                fields: vec![FieldDescription {
+                    field_id: "firstName".into(),
+                    label: "First Name".into(),
+                    input_type: "text".into(),
+                    selector: "#fn".into(),
+                    context_text: String::new(),
+                    required: false,
+                    current_value_hash: None,
+                    autocomplete: None,
+                    options: vec![],
+                }],
+                request_id: format!("req-zone-{i}"),
+            })
+            .collect();
+
+        let (results, summary) = handler.dispatch_concurrent(requests).await;
+
+        // All 10 should complete successfully.
+        assert_eq!(results.len(), 10);
+        let success_count = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(success_count, 10, "all 10 zone tasks must succeed");
+        assert_eq!(summary.completed.len(), 10);
+        assert_eq!(summary.panicked.len(), 0);
+        assert_eq!(summary.cancelled.len(), 0);
+
+        // Each result should contain valid AnalyzeFormResponse data.
+        for result in &results {
+            let data = result.as_ref().unwrap();
+            let response: crate::schema::AnalyzeFormResponse =
+                serde_json::from_value(data.clone()).unwrap();
+            assert_eq!(response.prefilled.len(), 1);
+            assert_eq!(response.prefilled[0].value, "Ada");
+        }
+    }
+
+    #[test]
+    fn histogram_records_sample_after_analyze_form() {
+        let hist = Arc::new(LatencyHistogram::new());
+        let unit = {
+            let mut profile = Profile::default();
+            profile.personal.first_name = "Ada".into();
+            profile.personal.last_name = "Lovelace".into();
+            profile.personal.email = "ada@example.com".into();
+            let shared = Arc::new(RwLock::new(profile));
+            let local = Arc::new(LocalDispatcher::new(shared.clone()));
+            let dispatcher: Arc<dyn FieldValueDispatcher> =
+                Arc::new(TieredDispatcher::new().with(local));
+
+            let base: Arc<dyn Component> = Arc::new(
+                AnalyzeFormComponent::builder()
+                    .dispatcher(dispatcher)
+                    .profile(shared)
+                    .build(),
+            );
+            let chain = MiddlewareChain::new()
+                .push(Box::new(TimingMiddleware::with_histogram(Arc::clone(
+                    &hist,
+                ))))
+                .push(Box::new(RetryMiddleware::new(2, 50)));
+            chain.apply(base)
+        };
+
+        let handler = DaemonHandler::new(
+            Arc::new(RwLock::new({
+                let mut p = Profile::default();
+                p.personal.first_name = "Ada".into();
+                p.personal.last_name = "Lovelace".into();
+                p.personal.email = "ada@example.com".into();
+                p
+            })),
+            unit,
+        );
+
+        let params = serde_json::to_value(PageAnalyzeFormParams {
+            url: "https://example.com".into(),
+            company_hint: None,
+            page_context: None,
+            fields: vec![FieldDescription {
+                field_id: "firstName".into(),
+                label: "First Name".into(),
+                input_type: "text".into(),
+                selector: "#fn".into(),
+                context_text: String::new(),
+                required: false,
+                current_value_hash: None,
+                autocomplete: None,
+                options: vec![],
+            }],
+            request_id: "req-hist".into(),
+        })
+        .unwrap();
+
+        let request = make_request("page.analyzeForm", params);
+        let resp = handler.dispatch(&request);
+        assert!(resp.error.is_none());
+
+        // The Instrumented::with_metrics wrapper records to the histogram.
+        assert!(
+            hist.count() >= 1,
+            "histogram must have at least 1 sample after execute, got {}",
+            hist.count()
+        );
     }
 }

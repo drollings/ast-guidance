@@ -1,3 +1,5 @@
+//! Cross-crate magic numbers (size caps, dimension limits, HNSW defaults).
+
 pub const MAX_VALUE_LEN: usize = 128;
 pub const MAX_FILE_SIZE: usize = 100 * 1024 * 1024;
 pub const MAX_JSON_DEPTH: usize = 100;

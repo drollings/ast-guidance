@@ -182,7 +182,7 @@ impl MemoryOps for HindsightMemory {
         Box::pin(async move {
             if let Some(path) = path {
                 if let Some(parent) = path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+                    let _ = common_core::io::ensure_dir(parent);
                 }
                 let g = graph.read().await;
                 if let Ok(data) = serde_json::to_string_pretty(&*g) {

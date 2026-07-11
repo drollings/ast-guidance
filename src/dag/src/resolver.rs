@@ -20,6 +20,20 @@ impl ExecutionPlan {
     }
 }
 
+/// Resolves target dependencies into an execution order using Kahn's algorithm.
+///
+/// # Examples
+///
+/// ```no_run
+/// use dag::resolver::DependencyResolver;
+/// use dag::target::TargetRegistry;
+///
+/// let registry = TargetRegistry::new();
+/// // ... register targets ...
+/// let resolver = DependencyResolver::new(&registry);
+/// let plan = resolver.resolve(&["build".into()]).unwrap();
+/// assert!(!plan.is_empty());
+/// ```
 pub struct DependencyResolver<'a> {
     registry: &'a TargetRegistry,
     strict: bool,

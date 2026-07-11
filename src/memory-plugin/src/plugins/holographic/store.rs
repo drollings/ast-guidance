@@ -137,7 +137,7 @@ impl HolographicStore {
     pub fn open(config: StoreConfig) -> Result<Self, MemoryError> {
         // Ensure parent directory exists
         if let Some(parent) = config.db_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
+            common_core::io::ensure_dir(parent).map_err(|e| {
                 MemoryError::InitFailed(format!(
                     "failed to create db directory {}: {e}",
                     parent.display()

@@ -29,6 +29,7 @@ follow instructions for any queries of interest
 
 4. IMPLEMENT:            Write to src/guidance/ or src/bin/ (for binary targets)
                          Follow source patterns and applicable skills only
+                         Use: use common_core::prelude::*; for the 80% case
 
 5. VERIFY (cargo):       cargo build --workspace && cargo test --workspace
                          && cargo clippy --workspace -- -D warnings
@@ -82,6 +83,34 @@ env/
 doc/
   DESIGN.md         System design reference
 ```
+
+---
+
+## Composability guide
+
+For day-to-day patterns (Component, Zone, Scope, Limiter, JSON-RPC, prelude)
+see `doc/COMPOSABILITY.md`. The full API inventory and roadmap lives in
+`ROADMAP_20260709_COMPOSABILITY.md` (checklist:
+`ROADMAP_20260709_COMPOSABILITY_CHECKLIST.md`).
+
+---
+
+## Production adoption sites
+
+Which consumers use which `fluent-concurrency` primitives:
+
+| Primitive | Production consumer | Location |
+|---|---|---|
+| `Zone` | `job-copilot` handler | `src/job-copilot/src/server/handler.rs` |
+| `Scope::defer` | `job-copilot` handler | `src/job-copilot/src/server/handler.rs` |
+| `Limiter::run_sync` | `guidance-llm` client | `src/llm/src/client.rs` |
+| `ResultPool` | `guidance-llm` request queue | `src/llm/src/client.rs` |
+| `PriorityResultPool` | `fluent-concurrency` tests only | `src/fluent-concurrency/src/pool.rs` |
+| `WorkerPool` | `fluent-concurrency` tests only | `src/fluent-concurrency/src/pool.rs` |
+| `Queue` | `fluent-concurrency` tests only | `src/fluent-concurrency/src/pool.rs` |
+| `Instrumented::with_metrics` | `bin/guidance` histogram | `src/bin/guidance/src/main.rs` |
+| `ComponentAdapter` | `coral` cache reactor | `src/coral/src/cache_reactor.rs` |
+| `PartitionedRouter` | `job-copilot` dispatcher | `src/job-copilot/src/dispatcher/llm.rs` |
 
 ---
 
@@ -180,12 +209,9 @@ ef_construction, DistCosine)` ordering is decided exactly once per crate
 and `fluent_wvr::wrapper::Instrumented::with_metrics(inner, label, histogram)`
 is the future-ready API for recording per-unit execution durations. The
 in-tree consumer today is the CLI-level `cmd_histogram` in
-`src/bin/guidance/src/main.rs` (total command timing). The `with_metrics`
-constructor itself has **no production consumer** yet — its only in-tree
-exercise is the `instrumented_with_metrics_records_duration` unit test in
-`src/fluent-wvr/src/wrapper.rs`. Candidate adoption sites are documented in
-the `with_metrics` doc comment (the L4 Semantic KNN dispatch in
-`coral::cache_reactor`, and the top-level dispatch in `dag::executor`).
+`src/bin/guidance/src/main.rs` (total command timing). Candidate adoption sites
+are documented in the `with_metrics` doc comment (the L4 Semantic KNN dispatch
+in `coral::cache_reactor`, and the top-level dispatch in `dag::executor`).
 Adoption at any of those moves M12 from "test-only" to a real consumer
 wiring; see `ROADMAP_20260625_CONSOLIDATE_CHECKLIST.md` M12 notes.
 

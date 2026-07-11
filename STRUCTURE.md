@@ -127,15 +127,19 @@ Then you you must read
     │   │   ├── Cargo.toml
     │   │   └── src/
     │   │       └── main.rs  # use clap::{Parser, Subcommand};
-    │   └── guidance/
+    │   ├── guidance/
+    │   │   ├── Cargo.toml
+    │   │   └── src/
+    │   │       ├── benchmark.rs  # //! `guidance benchmark` — query ac...
+    │   │       ├── commit.rs  # //! Commit message generation — LLM...
+    │   │       ├── editor.rs  # //! Editor interaction utilities for hum
+    │   │       ├── main.rs  # use std::path::{Path, PathBuf};
+    │   │       ├── mcp.rs  # //! MCP (Model Context Protocol) server 
+    │   │       └── structure.rs  # use std::collections::BTreeMap;
+    │   └── job-copilot-daemon/
     │       ├── Cargo.toml
     │       └── src/
-    │           ├── benchmark.rs  # //! `guidance benchmark` — query ac...
-    │           ├── commit.rs  # //! Commit message generation — LLM...
-    │           ├── editor.rs  # //! Editor interaction utilities for hum
-    │           ├── main.rs  # use std::path::{Path, PathBuf};
-    │           ├── mcp.rs  # //! MCP (Model Context Protocol) server 
-    │           └── structure.rs  # use std::collections::BTreeMap;
+    │           └── main.rs  # use std::io::{BufRead, BufReader};
     ├── common-core/
     │   ├── Cargo.toml
     │   └── src/
@@ -262,6 +266,35 @@ Then you you must read
     │   │   └── sync_engine.rs  # use std::path::{Path, PathBuf};
     │   └── tests/
     │       └── e2e_gen_roundtrip.rs  # use fluent_wvr_testutil::tempdir;
+    ├── job-copilot/
+    │   ├── Cargo.toml
+    │   ├── proptest-regressions/
+    │   │   └── server/
+    │   │       └── handler.txt
+    │   └── src/
+    │       ├── components.rs  # use std::sync::Arc;
+    │       ├── config.rs  # use std::path::PathBuf;
+    │       ├── dispatcher/
+    │       │   ├── llm.rs  # use std::sync::{Arc, RwLock};
+    │       │   ├── local.rs  # use std::sync::{Arc, RwLock};
+    │       │   └── mod.rs  # pub mod llm;
+    │       ├── error.rs  # use thiserror::Error;
+    │       ├── lib.rs  # //! Job Copilot — local-only human-...
+    │       ├── memory.rs  # use std::path::PathBuf;
+    │       ├── profile.rs  # use std::path::Path;
+    │       ├── prompt/
+    │       │   ├── context.rs  # use common_core::tokens::estimate_tokens
+    │       │   └── mod.rs  # pub mod context;
+    │       ├── sanitize.rs  # use regex::Regex;
+    │       ├── schema.rs  # use serde::{Deserialize, Serialize};
+    │       ├── server/
+    │       │   ├── audit.rs  # use std::fs::{File, OpenOptions};
+    │       │   ├── auth.rs  # use std::collections::HashMap;
+    │       │   ├── handler.rs  # use std::sync::Arc;
+    │       │   ├── http.rs  # use std::collections::HashMap;
+    │       │   ├── mod.rs  # pub mod audit;
+    │       │   └── stdio.rs  # use std::io::{self, Read, Write};
+    │       └── similarity.rs  # use std::path::{Path, PathBuf};
     ├── llm/
     │   ├── Cargo.toml
     │   └── src/

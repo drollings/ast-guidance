@@ -5,7 +5,7 @@ edition.workspace = true
 description = "Local-only human-in-the-loop job application copilot (daemon + JSON-RPC schema)"
 
 [dependencies]
-common-core        = { path = "../common-core", features = ["sqlite"] }
+common-core        = { path = "../common-core", features = ["http", "sqlite", "test-util"] }
 fluent-wvr         = { path = "../fluent-wvr" }
 fluent-concurrency = { path = "../fluent-concurrency" }
 guidance-llm       = { path = "../llm" }

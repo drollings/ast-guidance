@@ -1,3 +1,5 @@
+//! Contextual error wrappers: `ErrorContext` (stack-allocated) and `HeapErrorContext`.
+
 use std::fmt;
 
 use crate::constants::MAX_VALUE_LEN;

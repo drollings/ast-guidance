@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! common-core: Zero-domain generic utility crate (hashing, formatting, I/O,
 //! shell, metrics, string utilities).
 //!
@@ -21,10 +23,13 @@ pub mod error_context;
 pub mod format;
 pub mod git;
 pub mod hash;
+#[cfg(feature = "http")]
+pub mod http;
 pub mod interner;
 pub mod io;
 pub mod jsonrpc;
 pub mod metrics;
+pub mod prelude;
 pub mod shell;
 pub mod shell_parser;
 #[cfg(feature = "sqlite")]
@@ -49,8 +54,8 @@ pub use hash::{
 };
 pub use interner::CapabilityRegistry;
 pub use io::{
-    make_path_absolute, mtime, read_file_alloc, read_file_alloc_err, read_to_string_err,
-    resolve_path, strip_path_prefix, write_atomic,
+    ensure_dir, ensure_dir_or_panic, make_path_absolute, mtime, read_file_alloc,
+    read_file_alloc_err, read_to_string_err, resolve_path, strip_path_prefix, write_atomic,
 };
 pub use jsonrpc::{
     method_not_found, serve_stdio, JsonRpcError, JsonRpcHandler, JsonRpcRequest, JsonRpcResponse,
@@ -70,3 +75,19 @@ pub use string::{
 };
 pub use tokens::{estimate_tokens, estimate_tokens_with, TokenBudget, DEFAULT_CHARS_PER_TOKEN};
 pub use walk::{collect_extensions, should_skip_dir, walk_files, SOURCE_EXTENSIONS};
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn prelude_smoke() {
+        use crate::prelude::*;
+        let _ = blake3_hex(b"test");
+        let _ = fnv1a64(b"test");
+        let _ = sha256_hex(b"test");
+        let _ = hex_encode(&[1u8, 2, 3]);
+        let _ = LatencyHistogram::new();
+        let _ = estimate_tokens("test");
+        let _ = ensure_dir(std::path::Path::new("/tmp/common-core-prelude-smoke"));
+        let _ = TokenBudget(100);
+    }
+}

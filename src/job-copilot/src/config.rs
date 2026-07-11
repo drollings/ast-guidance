@@ -150,9 +150,16 @@ impl DaemonConfig {
         }
 
         if !self.profile_path.exists() {
-            return Err(CopilotError::Config(format!(
-                "profile_path does not exist: {}",
-                self.profile_path.display()
+            return Err(CopilotError::Context(Box::new(
+                common_core::error_context::ErrorContext::new(
+                    "validate_config",
+                    Some("profile_path"),
+                    Some(&self.profile_path.display().to_string()),
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "profile_path does not exist",
+                    ),
+                ),
             )));
         }
 

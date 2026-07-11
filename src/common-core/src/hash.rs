@@ -1,3 +1,5 @@
+//! Hashing utilities: `blake3_*`, `sha256_*`, `fnv1a64`, `HashState`, `hash_file`/`hash_batch`.
+
 use blake3::Hasher;
 use sha2::{Digest, Sha256, Sha512};
 use std::io::Read;
@@ -30,6 +32,17 @@ pub fn blake3_hash(data: &[u8]) -> [u8; 32] {
     blake3::hash(data).into()
 }
 
+/// Compute a BLAKE3 content hash and return it as a lowercase hex string.
+///
+/// # Examples
+///
+/// ```
+/// use common_core::hash::blake3_hex;
+///
+/// let hash = blake3_hex(b"hello world");
+/// assert_eq!(hash.len(), 64); // 32 bytes = 64 hex chars
+/// assert!(hash.starts_with("d9"));
+/// ```
 pub fn blake3_hex(data: &[u8]) -> String {
     blake3::hash(data).to_hex().to_string()
 }

@@ -1,10 +1,11 @@
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, OnceLock};
 
 use bon::Builder;
+use common_core::http::shared_http_client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::llm_queue::{LlmQueueConfig, LlmRequestQueue};
+use crate::llm_queue::LlmRequestQueue;
 
 /// Trait for chat backends — sends messages and returns a response string.
 ///
@@ -45,34 +46,19 @@ pub struct LlmConfig {
     pub show_prompts: bool,
 }
 
-struct DefaultQueue {
-    #[allow(dead_code)]
-    runtime: tokio::runtime::Runtime,
-    queue: Arc<LlmRequestQueue>,
+/// Fallback runtime used only when the sync adapter is called from a context
+/// that has no tokio runtime (e.g. a plain `fn main()`). Production callers
+/// inside an async runtime use `Handle::current().block_on` instead.
+fn fallback_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("failed to build fallback tokio runtime for LlmClient")
+    })
 }
-
-impl DefaultQueue {
-    fn get() -> &'static Self {
-        static INSTANCE: LazyLock<DefaultQueue> = LazyLock::new(|| {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .unwrap();
-            let queue = runtime.block_on(async {
-                Arc::new(LlmRequestQueue::new(
-                    Arc::new(fluent_concurrency::runtime::tokio::TokioRuntime),
-                    &LlmQueueConfig::default(),
-                ))
-            });
-            DefaultQueue { runtime, queue }
-        });
-        &INSTANCE
-    }
-}
-
-static BLOCKING_CLIENT: std::sync::LazyLock<reqwest::blocking::Client> =
-    std::sync::LazyLock::new(reqwest::blocking::Client::new);
 
 pub struct LlmClient {
     pub api_base: String,
@@ -127,11 +113,36 @@ impl LlmClient {
         &self.config
     }
 
+    /// Native async chat completion. Uses the caller's tokio runtime and a
+    /// shared `reqwest::Client`. If a custom `LlmRequestQueue` is configured,
+    /// the request is submitted through that queue's worker pool; otherwise
+    /// the HTTP call is made directly.
+    pub async fn chat_complete_async(&self, messages: &[ChatMessage]) -> Result<String, LlmError> {
+        match &self.queue {
+            Some(q) => q.submit_async(messages.to_vec(), self.config.clone()).await,
+            None => {
+                chat_complete_http_async(
+                    &self.api_base,
+                    messages,
+                    &self.model,
+                    self.config.think,
+                    self.config.timeout_ms,
+                    self.config.debug,
+                    self.config.show_prompts,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Sync adapter for `chat_complete_async`. Bridges to the caller's
+    /// tokio runtime via `Handle::block_on` if one is active, otherwise
+    /// uses a process-wide fallback runtime.
     pub fn chat_complete(&self, messages: &[ChatMessage]) -> Result<String, LlmError> {
-        let dq = DefaultQueue::get();
-        let queue = self.queue.clone().unwrap_or_else(|| dq.queue.clone());
-        dq.runtime
-            .block_on(queue.submit_async(messages.to_vec(), self.config.clone()))
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => handle.block_on(self.chat_complete_async(messages)),
+            Err(_) => fallback_runtime().block_on(self.chat_complete_async(messages)),
+        }
     }
 }
 
@@ -141,11 +152,14 @@ impl ChatBackend for LlmClient {
     }
 }
 
-pub fn chat_complete_http(
+/// Async chat completion HTTP call. Honors `LlmConfig::timeout_ms` via
+/// `tokio::time::timeout` on the whole request/response.
+pub async fn chat_complete_http_async(
     api_base: &str,
     messages: &[ChatMessage],
     model: &str,
     think: Option<bool>,
+    timeout_ms: u64,
     debug: bool,
     show_prompts: bool,
 ) -> Result<String, LlmError> {
@@ -155,7 +169,16 @@ pub fn chat_complete_http(
     } else {
         format!("{trimmed}/chat/completions")
     };
-    let result = chat_complete_http_inner(&url, messages, model, think, debug, show_prompts)?;
+    let result = chat_complete_http_inner_async(
+        &url,
+        messages,
+        model,
+        think,
+        timeout_ms,
+        debug,
+        show_prompts,
+    )
+    .await?;
     if result.is_empty() {
         Err(LlmError::NoResponse)
     } else {
@@ -163,13 +186,33 @@ pub fn chat_complete_http(
     }
 }
 
-/// Inner request — returns `Ok(content)` or `Ok("")` on empty.
+/// Sync adapter for `chat_complete_http_async`. Forwards to the caller's
+/// tokio runtime when one is active, otherwise the fallback runtime.
+pub fn chat_complete_http(
+    api_base: &str,
+    messages: &[ChatMessage],
+    model: &str,
+    think: Option<bool>,
+    debug: bool,
+    show_prompts: bool,
+) -> Result<String, LlmError> {
+    // timeout_ms=0 disables the timeout to preserve the original behavior
+    // of the sync `chat_complete_http` (which had no timeout).
+    let fut = chat_complete_http_async(api_base, messages, model, think, 0, debug, show_prompts);
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(fut),
+        Err(_) => fallback_runtime().block_on(fut),
+    }
+}
+
+/// Inner async request — returns `Ok(content)` or `Ok("")` on empty.
 /// Never returns reasoning_content as the answer.
-fn chat_complete_http_inner(
+async fn chat_complete_http_inner_async(
     url: &str,
     messages: &[ChatMessage],
     model: &str,
     think: Option<bool>,
+    timeout_ms: u64,
     debug: bool,
     show_prompts: bool,
 ) -> Result<String, LlmError> {
@@ -197,13 +240,36 @@ fn chat_complete_http_inner(
         eprintln!("[llm] model={model} url={url} messages={}", messages.len());
     }
 
-    let response = BLOCKING_CLIENT
-        .post(url)
-        .body(serde_json::to_string(&body).map_err(|e| LlmError::Api(e.to_string()))?)
-        .send()
-        .map_err(|e| LlmError::Http(e.to_string()))?;
+    let client = shared_http_client();
+    let body_str = serde_json::to_string(&body).map_err(|e| LlmError::Api(e.to_string()))?;
 
-    let body_str = response.text().map_err(|e| LlmError::Api(e.to_string()))?;
+    let send_fut = async {
+        let response = client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .body(body_str)
+            .send()
+            .await
+            .map_err(|e| LlmError::Http(e.to_string()))?;
+        response
+            .text()
+            .await
+            .map_err(|e| LlmError::Api(e.to_string()))
+    };
+
+    let body_str = if timeout_ms == 0 {
+        send_fut.await?
+    } else {
+        match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), send_fut).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(LlmError::Http(format!(
+                    "request timed out after {timeout_ms}ms"
+                )));
+            }
+        }
+    };
 
     let parsed: serde_json::Value =
         serde_json::from_str(&body_str).map_err(|e| LlmError::Api(e.to_string()))?;

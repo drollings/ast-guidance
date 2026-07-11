@@ -57,7 +57,7 @@ pub fn file_mtime(path: &Path) -> Option<SystemTime> {
 /// whitespace.
 pub fn read_cleaned(path: &Path) -> std::io::Result<String> {
     // kept: see editor.rs:36-39 rationale for stdin/utf8 handling
-    let raw = std::fs::read_to_string(path)?;
+    let raw = common_core::io::read_to_string_err(path).map_err(|e| e.0)?;
     let cleaned: String = raw
         .lines()
         .filter(|line| !line.starts_with('#'))

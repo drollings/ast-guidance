@@ -153,10 +153,10 @@ impl AnalyzeFormComponent {
         &self,
         params: &PageAnalyzeFormParams,
     ) -> Result<AnalyzeFormResponse, String> {
-        let ctx = WorkContext {
-            caps: fluent_wvr::CapabilitySet::new().with(AnalyzeFormParamsCap(params.clone())),
-            ..WorkContext::default()
-        };
+        let ctx = WorkContext::for_unit(
+            self,
+            fluent_wvr::CapabilitySet::new().with(AnalyzeFormParamsCap(params.clone())),
+        );
         let output = self.execute(&ctx).map_err(|e| e.to_string())?;
         serde_json::from_value(output.data).map_err(|e| format!("deserialize response: {e}"))
     }
@@ -305,10 +305,10 @@ mod tests {
             }],
             request_id: "req-3".into(),
         };
-        let ctx = WorkContext {
-            caps: fluent_wvr::CapabilitySet::new().with(AnalyzeFormParamsCap(params)),
-            ..WorkContext::default()
-        };
+        let ctx = WorkContext::for_unit(
+            &c,
+            fluent_wvr::CapabilitySet::new().with(AnalyzeFormParamsCap(params)),
+        );
         let output = WorkUnit::execute(&c, &ctx).unwrap();
         assert!(output.success);
         assert_eq!(output.message, "form analyzed");

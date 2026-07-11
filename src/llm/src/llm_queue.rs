@@ -1,15 +1,13 @@
 use std::sync::Arc;
 
-use fluent_concurrency::pool::{PoolError, WorkerPool};
+use fluent_concurrency::pool::{ResultPool, ResultPoolError};
 use fluent_wvr::Runtime;
-use tokio::sync::oneshot;
 
-use crate::client::{ChatMessage, LlmConfig, LlmError};
+use crate::client::{chat_complete_http_async, ChatMessage, LlmConfig, LlmError};
 
 pub struct LlmTask {
     pub messages: Vec<ChatMessage>,
     pub config: LlmConfig,
-    pub response_tx: oneshot::Sender<Result<String, LlmError>>,
 }
 
 pub struct LlmQueueConfig {
@@ -26,23 +24,31 @@ impl Default for LlmQueueConfig {
     }
 }
 
+/// Async request queue backed by a `fluent_concurrency::ResultPool`.
+///
+/// The worker handler calls `chat_complete_http_async` and returns the
+/// result directly — no `oneshot::channel` boilerplate needed.
 pub struct LlmRequestQueue {
-    pool: Arc<WorkerPool<LlmTask>>,
+    pool: Arc<ResultPool<LlmTask, String, LlmError>>,
 }
 
 impl LlmRequestQueue {
     pub fn new(runtime: Arc<dyn Runtime>, config: &LlmQueueConfig) -> Self {
-        let pool = WorkerPool::new(
+        let pool = ResultPool::new(
             runtime,
             config.worker_count,
             config.queue_capacity,
             |task: LlmTask| async move {
-                let result = tokio::task::spawn_blocking(move || {
-                    make_llm_request(&task.messages, &task.config)
-                })
+                chat_complete_http_async(
+                    &task.config.api_url,
+                    &task.messages,
+                    &task.config.model,
+                    task.config.think,
+                    task.config.timeout_ms,
+                    task.config.debug,
+                    task.config.show_prompts,
+                )
                 .await
-                .unwrap_or_else(|e| Err(LlmError::Http(e.to_string())));
-                let _ = task.response_tx.send(result);
             },
         );
         Self {
@@ -50,69 +56,36 @@ impl LlmRequestQueue {
         }
     }
 
-    pub fn submit(
-        &self,
-        messages: Vec<ChatMessage>,
-        config: LlmConfig,
-    ) -> Result<String, LlmError> {
-        let (tx, rx) = oneshot::channel();
-        let task = LlmTask {
-            messages,
-            config,
-            response_tx: tx,
-        };
-        let handle = tokio::runtime::Handle::current();
-        handle
-            .block_on(self.pool.try_submit(task))
-            .map_err(|e| match e {
-                PoolError::Full => LlmError::Http("queue full".into()),
-                PoolError::Closed => LlmError::Http("queue closed".into()),
-            })?;
-        rx.blocking_recv()
-            .map_err(|_| LlmError::Http("queue response canceled".into()))?
-    }
-
+    /// Submit a request and await the result. Returns `Err` if the queue is
+    /// full or closed, or if the handler fails.
     pub async fn submit_async(
         &self,
         messages: Vec<ChatMessage>,
         config: LlmConfig,
     ) -> Result<String, LlmError> {
-        let (tx, rx) = oneshot::channel();
-        let task = LlmTask {
-            messages,
-            config,
-            response_tx: tx,
-        };
-        self.pool.try_submit(task).await.map_err(|e| match e {
-            PoolError::Full => LlmError::Http("queue full".into()),
-            PoolError::Closed => LlmError::Http("queue closed".into()),
-        })?;
-        rx.await
-            .map_err(|_| LlmError::Http("queue response canceled".into()))?
+        let task = LlmTask { messages, config };
+        self.pool.submit(task).await.map_err(|e| match e {
+            ResultPoolError::Pool(fluent_concurrency::pool::PoolError::Full) => {
+                LlmError::Http("queue full".into())
+            }
+            ResultPoolError::Pool(fluent_concurrency::pool::PoolError::Closed) => {
+                LlmError::Http("queue closed".into())
+            }
+            ResultPoolError::Inner(e) => e,
+            ResultPoolError::Canceled => LlmError::Http("queue response canceled".into()),
+        })
     }
-}
-
-fn make_llm_request(messages: &[ChatMessage], config: &LlmConfig) -> Result<String, LlmError> {
-    crate::client::chat_complete_http(
-        &config.api_url,
-        messages,
-        &config.model,
-        config.think,
-        config.debug,
-        config.show_prompts,
-    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluent_concurrency::runtime::tokio::TokioRuntime;
+    use fluent_concurrency::tokio_runtime;
 
-    #[test]
-    fn test_llm_request_queue_creation() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let _guard = rt.enter();
-        let queue = LlmRequestQueue::new(Arc::new(TokioRuntime), &LlmQueueConfig::default());
+    #[tokio::test]
+    async fn test_queue_submit_async_returns_err_when_no_server() {
+        let runtime = tokio_runtime();
+        let queue = LlmRequestQueue::new(runtime, &LlmQueueConfig::default());
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "hello".into(),
@@ -120,9 +93,29 @@ mod tests {
         let config = LlmConfig::new()
             .api_url("http://localhost:11434/v1".into())
             .model("test".into())
+            // Short timeout so the test fails fast (default is 2s, which is
+            // already short, but make it explicit).
+            .timeout_ms(500)
             .build();
 
-        let result = queue.submit(messages, config);
+        let result = queue.submit_async(messages, config).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_queue_creation_with_default_config() {
+        let runtime = tokio_runtime();
+        let _queue = LlmRequestQueue::new(runtime, &LlmQueueConfig::default());
+        // Just verify construction succeeds without panicking.
+    }
+
+    #[tokio::test]
+    async fn test_queue_creation_with_custom_config() {
+        let runtime = tokio_runtime();
+        let config = LlmQueueConfig {
+            worker_count: 4,
+            queue_capacity: 50,
+        };
+        let _queue = LlmRequestQueue::new(runtime, &config);
     }
 }

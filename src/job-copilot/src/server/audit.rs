@@ -22,7 +22,14 @@ impl AuditLog {
             .create(true)
             .append(true)
             .open(path)
-            .map_err(|e| CopilotError::Audit(format!("failed to open {}: {e}", path.display())))?;
+            .map_err(|e| {
+                CopilotError::Context(Box::new(common_core::error_context::ErrorContext::new(
+                    "open_audit_log",
+                    Some("path"),
+                    Some(&path.display().to_string()),
+                    e,
+                )))
+            })?;
         Ok(Self {
             path: path.to_path_buf(),
             file: Mutex::new(file),

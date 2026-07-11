@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Job Copilot",
+  "version": "0.1.0",
+  "description": "Local-only human-in-the-loop job application copilot. NEVER auto-fills.",
+  "permissions": ["nativeMessaging", "activeTab", "scripting", "sidePanel", "storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "side_panel": { "default_path": "side-panel.html" },
+  "content_scripts": [{
+    "matches": ["<all_urls>"],
+    "js": ["content-script.js"],
+    "run_at": "document_idle",
+    "all_frames": false
+  }],
+  "commands": {
+    "paste-and-next":   { "suggested_key": { "default": "Alt+V" },     "description": "Paste active field value and advance" },
+    "paste-and-prev":   { "suggested_key": { "default": "Alt+Shift+V" }, "description": "Paste active field value and step back" },
+    "skip-field":       { "suggested_key": { "default": "Alt+N" },     "description": "Skip current field without pasting" }
+  },
+  "action": { "default_title": "Open Job Copilot side panel" }
+}

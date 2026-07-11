@@ -98,6 +98,7 @@ impl FieldValueDispatcher for llm::LlmDispatcher {
 }
 
 pub use llm::LlmDispatcher;
+pub use llm::ShardedLlmDispatcher;
 pub use local::LocalDispatcher;
 
 #[cfg(test)]

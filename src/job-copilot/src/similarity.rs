@@ -181,7 +181,7 @@ impl FieldSimilarityStore {
         }
         let content = lines.join("\n");
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("create dir: {e}"))?;
+            common_core::io::ensure_dir(parent).map_err(|e| format!("create dir: {e}"))?;
         }
         common_core::io::write_atomic(path, content.as_bytes())
             .map_err(|e| format!("write store: {e}"))?;

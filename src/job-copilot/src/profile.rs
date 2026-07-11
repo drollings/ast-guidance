@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -120,8 +120,22 @@ pub struct CoverLetterTemplate {
 impl Profile {
     /// Load a profile from a TOML file path.
     pub fn load_from_path(p: &Path) -> Result<Self, CopilotError> {
-        let raw = common_core::io::read_to_string_err(p)?;
-        let profile: Self = toml::from_str(&raw)?;
+        let raw = common_core::io::read_to_string_err(p).map_err(|e| {
+            CopilotError::Context(Box::new(common_core::error_context::ErrorContext::new(
+                "load_profile",
+                Some("path"),
+                Some(&p.display().to_string()),
+                std::io::Error::other(e),
+            )))
+        })?;
+        let profile: Self = toml::from_str(&raw).map_err(|e| {
+            CopilotError::Context(Box::new(common_core::error_context::ErrorContext::new(
+                "parse_profile",
+                Some("path"),
+                Some(&p.display().to_string()),
+                e,
+            )))
+        })?;
         Ok(profile)
     }
 
@@ -133,8 +147,11 @@ impl Profile {
             ));
         }
         if !self.personal.email.is_empty() {
-            let email_re = regex::Regex::new(r"^[^@\s]+@[^@\s]+\.[^@\s]+$").unwrap();
-            if !email_re.is_match(&self.personal.email) {
+            fn email_re() -> &'static regex::Regex {
+                static RE: OnceLock<regex::Regex> = OnceLock::new();
+                RE.get_or_init(|| regex::Regex::new(r"^[^@\s]+@[^@\s]+\.[^@\s]+$").unwrap())
+            }
+            if !email_re().is_match(&self.personal.email) {
                 return Err(CopilotError::ProfileNotLoaded(format!(
                     "personal.email is not a valid email: {}",
                     self.personal.email

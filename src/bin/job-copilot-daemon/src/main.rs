@@ -1,7 +1,9 @@
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use clap::{Parser, Subcommand};
+use common_core::ensure_dir;
 use job_copilot::config::DaemonConfig;
 
 #[derive(Parser)]
@@ -260,7 +262,7 @@ fn run_install_native_messaging(
         })
     };
 
-    if let Err(e) = std::fs::create_dir_all(manifest_dir) {
+    if let Err(e) = ensure_dir(manifest_dir) {
         eprintln!(
             "Error: cannot create manifest directory {}: {e}",
             manifest_dir.display()
@@ -271,7 +273,7 @@ fn run_install_native_messaging(
     let manifest_path = manifest_dir.join("io.github.anomalyco.job_copilot.json");
     let json = serde_json::to_string_pretty(&manifest).expect("valid JSON");
 
-    if let Err(e) = std::fs::write(&manifest_path, json) {
+    if let Err(e) = common_core::io::write_atomic(&manifest_path, json.as_bytes()) {
         eprintln!(
             "Error: cannot write manifest to {}: {e}",
             manifest_path.display()
@@ -288,7 +290,8 @@ fn run_install_native_messaging(
 }
 
 fn run_doctor(profile_path: Option<&std::path::PathBuf>) {
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
 
     // Load config: from the given path, or from CWD default, or use built-in defaults.
     let config = if let Some(p) = profile_path {
@@ -357,16 +360,17 @@ fn run_doctor(profile_path: Option<&std::path::PathBuf>) {
             .nth(1)
             .and_then(|rest| rest.split('/').next())
             .unwrap_or("127.0.0.1:11434");
-        match TcpListener::bind(host_port) {
-            Ok(l) => {
-                drop(l);
-                println!("  ✓ LLM reachability");
-                passed += 1;
-            }
-            Err(e) => {
-                println!("  ✗ LLM reachability: cannot connect to {host_port}: {e}");
-                failed += 1;
-            }
+        if let Some(Ok(stream)) = std::net::SocketAddr::from_str(host_port)
+            .ok()
+            .map(|addr| TcpStream::connect_timeout(&addr, Duration::from_secs(2)))
+        {
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+            drop(stream);
+            println!("  ✓ LLM reachability");
+            passed += 1;
+        } else {
+            println!("  ✗ LLM reachability: cannot connect to {host_port}");
+            failed += 1;
         }
     }
 
@@ -388,33 +392,44 @@ fn run_doctor(profile_path: Option<&std::path::PathBuf>) {
 
     // 5. Audit log path writability
     if let Some(path) = &config.audit_log_path {
-        if let Some(parent) = path.parent() {
-            if parent.exists() {
-                let probe = parent.join(".doctor-probe");
-                match std::fs::write(&probe, "") {
-                    Ok(()) => {
-                        let _ = std::fs::remove_file(probe);
-                        println!("  ✓ Audit log writability");
-                        passed += 1;
-                    }
-                    Err(e) => {
-                        println!("  ✗ Audit log writability: directory not writable: {e}");
-                        failed += 1;
+        if path.as_os_str().is_empty() {
+            println!("  ✗ Audit log writability: empty path");
+            failed += 1;
+        } else {
+            let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+            match parent {
+                Some(p) if p.exists() => {
+                    let probe = p.join(".doctor-probe");
+                    match common_core::io::write_atomic(&probe, b"") {
+                        Ok(()) => {
+                            let _ = std::fs::remove_file(probe);
+                            println!("  ✓ Audit log writability");
+                            passed += 1;
+                        }
+                        Err(e) => {
+                            println!("  ✗ Audit log writability: directory not writable: {e}");
+                            failed += 1;
+                        }
                     }
                 }
-            } else {
-                println!(
-                    "  ✗ Audit log writability: parent directory does not exist: {}",
-                    parent.display()
-                );
-                failed += 1;
+                Some(p) => {
+                    println!(
+                        "  ✗ Audit log writability: parent directory does not exist: {}",
+                        p.display()
+                    );
+                    failed += 1;
+                }
+                None => {
+                    println!(
+                        "  ✗ Audit log writability: cannot determine parent directory for {}",
+                        path.display()
+                    );
+                    failed += 1;
+                }
             }
-        } else {
-            println!("  ✓ Audit log writability");
-            passed += 1;
         }
     } else {
-        println!("  ✓ Audit log writability");
+        println!("  ✓ Audit log writability (not configured)");
         passed += 1;
     }
 

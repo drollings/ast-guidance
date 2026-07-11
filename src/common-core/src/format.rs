@@ -1,3 +1,5 @@
+//! Human-readable output: `format_json`, `format_csv`, `format_size`/`parse_size`, `Column`/`Table`.
+
 use std::fmt::Write as _;
 
 /// Formats a JSON value as a pretty-printed string with 2-space indent.
@@ -54,6 +56,20 @@ pub fn format_csv(rows: &[serde_json::Value], fieldnames: Option<&[&str]>) -> St
     out
 }
 
+/// Format a byte count as a human-readable string (e.g. "1.5 MB").
+///
+/// # Examples
+///
+/// ```
+/// use common_core::format::format_size;
+///
+/// assert_eq!(format_size(0), "0 B");
+/// assert_eq!(format_size(1023), "1023 B");
+/// assert_eq!(format_size(1024), "1.0 KB");
+/// assert_eq!(format_size(1_536), "1.5 KB");
+/// assert_eq!(format_size(1_048_576), "1.0 MB");
+/// assert_eq!(format_size(1_073_741_824), "1.0 GB");
+/// ```
 pub fn format_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -130,6 +146,26 @@ impl Table {
         self.rows = rows;
     }
 
+    /// Render the table as an ASCII-formatted string.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use common_core::format::{Column, Table};
+    ///
+    /// let cols = vec![
+    ///     Column { header: "Name".into(), key: "name".into(), width: 10, align_left: true },
+    ///     Column { header: "Count".into(), key: "count".into(), width: 8, align_left: false },
+    /// ];
+    /// let mut table = Table::new(cols, "Items");
+    /// table.with_rows(vec![
+    ///     serde_json::json!({"name": "alpha", "count": 3}),
+    ///     serde_json::json!({"name": "beta", "count": 7}),
+    /// ]);
+    /// let rendered = table.render();
+    /// assert!(rendered.contains("Items"));
+    /// assert!(rendered.contains("alpha"));
+    /// ```
     pub fn render(&self) -> String {
         if self.columns.is_empty() {
             return String::new();
@@ -333,5 +369,20 @@ mod tests {
         assert!(rendered.contains("Name"));
         assert!(rendered.contains("Alice"));
         assert!(rendered.contains("Bob"));
+    }
+
+    #[test]
+    fn format_size_roundtrip() {
+        let sizes: &[(u64, &str)] = &[
+            (0, "0 B"),
+            (512, "512 B"),
+            (1024, "1.0 KB"),
+            (1_048_576, "1.0 MB"),
+            (1_073_741_824, "1.0 GB"),
+            (1_099_511_627_776, "1.0 TB"),
+        ];
+        for &(bytes, expected) in sizes {
+            assert_eq!(format_size(bytes), expected, "format_size({bytes})");
+        }
     }
 }

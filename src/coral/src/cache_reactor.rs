@@ -14,7 +14,7 @@ use crate::cache_router::ParallelRouter;
 use crate::db::Library;
 use crate::tier_units::{L2WasmUnit, L3GraphUnit, L4SemanticUnit, L5FrontierUnit, TierRegistry};
 use crate::wasm_runtime::PluginPool;
-use fluent_wvr::wrapper::Instrumented;
+use fluent_wvr::wrapper::{ComponentAdapter, Instrumented};
 use fluent_wvr::Component;
 
 #[derive(Builder)]
@@ -95,8 +95,10 @@ impl QueueReactor {
                         Arc::clone(pool),
                     );
                     let hist = Arc::new(LatencyHistogram::new());
+                    let adapted =
+                        ComponentAdapter::new(Arc::new(unit)).with_name_override("coral.l2.wasm");
                     let wrapped =
-                        Instrumented::with_metrics(unit, "coral.l2.wasm", Arc::clone(&hist));
+                        Instrumented::with_metrics(adapted, "coral.l2.wasm", Arc::clone(&hist));
                     tiers.push(Arc::new(wrapped));
                     histograms.push(hist);
                 }
@@ -107,7 +109,9 @@ impl QueueReactor {
         {
             let hist = Arc::new(LatencyHistogram::new());
             let unit = L3GraphUnit::new(Arc::clone(&router));
-            let wrapped = Instrumented::with_metrics(unit, "coral.l3.graph", Arc::clone(&hist));
+            let adapted =
+                ComponentAdapter::new(Arc::new(unit)).with_name_override("coral.l3.graph");
+            let wrapped = Instrumented::with_metrics(adapted, "coral.l3.graph", Arc::clone(&hist));
             tiers.push(Arc::new(wrapped));
             histograms.push(hist);
         }
@@ -116,7 +120,10 @@ impl QueueReactor {
         if let Some(ref embedder) = args.embedder {
             let hist = Arc::new(LatencyHistogram::new());
             let unit = L4SemanticUnit::new(Arc::clone(&router), Arc::clone(embedder));
-            let wrapped = Instrumented::with_metrics(unit, "coral.l4.semantic", Arc::clone(&hist));
+            let adapted =
+                ComponentAdapter::new(Arc::new(unit)).with_name_override("coral.l4.semantic");
+            let wrapped =
+                Instrumented::with_metrics(adapted, "coral.l4.semantic", Arc::clone(&hist));
             tiers.push(Arc::new(wrapped));
             histograms.push(hist);
         }
@@ -130,7 +137,10 @@ impl QueueReactor {
         if let Some(ref frontier) = args.frontier_config {
             let hist = Arc::new(LatencyHistogram::new());
             let unit = L5FrontierUnit::new(frontier.clone());
-            let wrapped = Instrumented::with_metrics(unit, "coral.l5.frontier", Arc::clone(&hist));
+            let adapted =
+                ComponentAdapter::new(Arc::new(unit)).with_name_override("coral.l5.frontier");
+            let wrapped =
+                Instrumented::with_metrics(adapted, "coral.l5.frontier", Arc::clone(&hist));
             tiers.push(Arc::new(wrapped));
             histograms.push(hist);
         }
@@ -399,7 +409,7 @@ mod tests {
         let unit = crate::tier_units::L4SemanticUnit::new(router, embedder);
 
         let mut ctx = fluent_wvr::WorkContext::default();
-        ctx.metadata.push(("query".into(), "aaaa".into()));
+        ctx.metadata.insert("query".into(), "aaaa".into());
         let output = unit.execute(&ctx).expect("L4 should succeed");
         assert_eq!(output.message, "L4");
     }
@@ -485,7 +495,7 @@ mod tests {
 
         let mut ctx = fluent_wvr::WorkContext::default();
         ctx.metadata
-            .push(("query".into(), "complex_parent_query".into()));
+            .insert("query".into(), "complex_parent_query".into());
         let output = unit.execute(&ctx).expect("L4.5 should succeed");
         assert_eq!(output.message, "L4.5");
         // Verify subtask results are merged
@@ -717,5 +727,59 @@ mod tests {
         let lib = Arc::new(Library::open_in_memory().expect("db"));
         let reactor = make_reactor(lib);
         assert!(!reactor.tier_registry.is_empty());
+    }
+
+    #[test]
+    fn component_adapter_name_override_reports_new_name() {
+        use fluent_wvr::wrapper::ComponentAdapter;
+        use fluent_wvr::{ArcIntern, FieldAccess, FieldError, WorkUnit};
+
+        struct StubUnit {
+            name: ArcIntern<str>,
+        }
+        impl WorkUnit for StubUnit {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn depends(&self) -> &[ArcIntern<str>] {
+                &[]
+            }
+            fn provides(&self) -> &[ArcIntern<str>] {
+                &[]
+            }
+            fn execute(
+                &self,
+                _ctx: &fluent_wvr::WorkContext,
+            ) -> Result<fluent_wvr::WorkOutput, fluent_wvr::WorkError> {
+                Ok(fluent_wvr::WorkOutput::ok("from_stub"))
+            }
+        }
+        impl FieldAccess for StubUnit {
+            fn set_field(&mut self, _: &str, _: &str) -> Result<(), FieldError> {
+                Ok(())
+            }
+            fn get_field(&self, _: &str) -> Result<String, FieldError> {
+                Err(FieldError::NotFound("none".into()))
+            }
+            fn field_names(&self) -> &'static [&'static str] {
+                &[]
+            }
+        }
+        impl fluent_wvr::Describable for StubUnit {
+            fn describe(&self) -> serde_json::Value {
+                serde_json::json!({"name": &*self.name})
+            }
+        }
+
+        let stub = StubUnit {
+            name: ArcIntern::from("inner_unit"),
+        };
+        let adapted = ComponentAdapter::new(Arc::new(stub)).with_name_override("coral.l3.graph");
+        assert_eq!(adapted.name(), "coral.l3.graph");
+
+        let result = adapted
+            .execute(&fluent_wvr::WorkContext::default())
+            .unwrap();
+        assert_eq!(result.message, "from_stub");
     }
 }

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
+use common_core::ensure_dir_or_panic;
 use common_core::shell::run_command;
 use guidance_core::config;
 use guidance_core::memory::MemoryBridge;
@@ -212,9 +213,9 @@ async fn main() {
             .init();
     }
 
-    // Currently observes total command time; per-unit observation pending
-    // `Instrumented::with_metrics` consumer wiring (M12). See
-    // `ROADMAP_20260625_CONSOLIDATE_CHECKLIST.md` M12 notes.
+    // Observes total command time. Per-unit observation is wired via
+    // `Instrumented::with_metrics` in the job-copilot handler (M5.1). The
+    // histogram here captures the outer command dispatch duration.
     let cmd_histogram = std::sync::Arc::new(common_core::LatencyHistogram::new());
     let cmd_start = std::time::Instant::now();
 
@@ -510,7 +511,7 @@ fn cmd_db_stats(db_path: &str, label: &str) {
 
 fn cmd_init(dir: &str) {
     let d = Path::new(dir).join(".guidance");
-    std::fs::create_dir_all(&d).expect("create .guidance dir");
+    ensure_dir_or_panic(&d);
     let config_path = d.join("guidance-config.json");
     if !config_path.exists() {
         let default_config = serde_json::json!({
@@ -533,9 +534,11 @@ fn cmd_init(dir: &str) {
             },
             "embed": { "dims": 768, "cache_limit": 400 }
         });
-        std::fs::write(
+        common_core::io::write_atomic(
             &config_path,
-            serde_json::to_string_pretty(&default_config).unwrap(),
+            serde_json::to_string_pretty(&default_config)
+                .unwrap()
+                .as_bytes(),
         )
         .expect("write config");
     }
@@ -576,7 +579,7 @@ async fn cmd_sync(
         } else {
             source_path.parent().unwrap_or(Path::new(".")).to_path_buf()
         };
-        std::fs::create_dir_all(&guidance_dir).expect("create guidance dir");
+        ensure_dir_or_panic(&guidance_dir);
 
         if source_path.is_dir() {
             let engine = SyncEngine::new(guidance_dir.clone(), source_dir.clone());
@@ -628,7 +631,7 @@ async fn cmd_sync(
         }
     } else if let Some(scan_dir) = scan {
         let scan_path = PathBuf::from(scan_dir);
-        std::fs::create_dir_all(&guidance_dir).expect("create guidance dir");
+        ensure_dir_or_panic(&guidance_dir);
         let generated =
             walk_and_gen_async(guidance_dir.clone(), scan_path, force, verbose, &[]).await;
         println!("Scanned {scan_dir}: generated {generated} files");
@@ -643,7 +646,7 @@ async fn cmd_sync(
             if !src_dir.is_dir() {
                 continue;
             }
-            std::fs::create_dir_all(&guidance_dir).expect("create guidance dir");
+            ensure_dir_or_panic(&guidance_dir);
             let engine = SyncEngine::new(guidance_dir.clone(), src_dir.clone());
             let status = engine.status().expect("status");
             total_files += status.total_files;
@@ -1184,7 +1187,7 @@ fn cmd_todo() {
 
 fn cmd_diary(text_or_path: &str) {
     let diary_dir = Path::new(".guidance/doc");
-    std::fs::create_dir_all(diary_dir).expect("create .guidance/doc dir");
+    ensure_dir_or_panic(diary_dir);
     let diary_path = diary_dir.join("DIARY.md");
     let timestamp = OffsetDateTime::now_utc()
         .format(
@@ -1230,7 +1233,8 @@ fn cmd_structure(json_dir: &str) {
     let gdir = PathBuf::from(json_dir);
     match structure::generate(&gdir) {
         Ok(output) => {
-            std::fs::write("STRUCTURE.md", &output).expect("write STRUCTURE.md");
+            common_core::io::write_atomic(std::path::Path::new("STRUCTURE.md"), output.as_bytes())
+                .expect("write STRUCTURE.md");
             let line_count = output.lines().count();
             println!("STRUCTURE.md generated ({} lines)", line_count);
         }

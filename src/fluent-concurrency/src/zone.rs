@@ -63,6 +63,24 @@ pub struct ZoneSummary {
 
 /// A supervision zone that manages a group of `WorkUnit` tasks with retry, timeout,
 /// and dependency-based cancellation. Implements `Future` to drive task completion.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use fluent_concurrency::zone::Zone;
+/// use fluent_wvr::{CapabilitySet, WorkContext};
+/// use fluent_wvr::wrapper::ComponentAdapter;
+///
+/// # async fn example() {
+/// let rt: Arc<dyn fluent_wvr::Runtime> = Arc::new(fluent_concurrency::runtime::tokio::TokioRuntime);
+/// let mut zone = Zone::new(rt, CapabilitySet::new());
+/// // zone.register(component_a);
+/// // zone.register(component_b);
+/// let summary = zone.await;
+/// assert!(summary.panicked.is_empty());
+/// # }
+/// ```
 #[must_use = "Zone must be awaited to completion to get a ZoneSummary"]
 pub struct Zone {
     runtime: Arc<dyn Runtime>,

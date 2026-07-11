@@ -5,12 +5,15 @@ edition.workspace = true
 
 [features]
 default = []
+test-util = []
+http = ["dep:reqwest"]
 sqlite = ["dep:rusqlite"]
 
 [dependencies]
 bitvec = { workspace = true }
 blake3 = { workspace = true }
 internment = { workspace = true, features = ["arc"] }
+reqwest = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

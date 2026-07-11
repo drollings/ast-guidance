@@ -1,3 +1,5 @@
+//! Token budget helpers: `estimate_tokens` and `TokenBudget`.
+
 pub const DEFAULT_CHARS_PER_TOKEN: usize = 4;
 
 pub fn estimate_tokens(text: &str) -> usize {
@@ -11,6 +13,23 @@ pub fn estimate_tokens_with(text: &str, chars_per_token: usize) -> usize {
     text.len().div_ceil(chars_per_token)
 }
 
+/// A remaining token budget that can be checked and consumed.
+///
+/// Useful for truncating prompts or responses to fit within LLM context windows.
+///
+/// # Examples
+///
+/// ```
+/// use common_core::tokens::{TokenBudget, estimate_tokens};
+///
+/// let mut budget = TokenBudget(1000);
+/// let text = "This is a test prompt.";
+/// let tokens = estimate_tokens(text);
+///
+/// assert!(budget.fits(tokens));
+/// assert!(budget.consume(tokens));
+/// assert_eq!(budget.remaining(0), 1000 - tokens);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TokenBudget(pub usize);
 

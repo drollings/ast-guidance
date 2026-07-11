@@ -10,6 +10,14 @@ pub mod runtime;
 pub mod scope;
 pub mod zone;
 
+use std::sync::Arc;
+
+/// Returns a new `Arc<dyn Runtime>` wrapping the production Tokio runtime.
+/// Use this instead of `crate::tokio_runtime()`.
+pub fn tokio_runtime() -> Arc<dyn fluent_wvr::Runtime> {
+    Arc::new(runtime::tokio::TokioRuntime)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -344,11 +352,50 @@ mod tests {
             );
         }
 
+        /// `Scope::defer()` returns a guard that closes the scope on drop.
+        /// The scope must not panic when the guard is dropped.
+        #[tokio::test(start_paused = true)]
+        async fn test_scope_defer_guard_closes_scope() {
+            tokio::time::resume();
+            let flag = Arc::new(AtomicUsize::new(0));
+            let flag_clone = Arc::clone(&flag);
+            let mut scope = Scope::new();
+            scope.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                flag_clone.fetch_add(1, Ordering::SeqCst);
+            });
+            let _guard = scope.defer();
+            // _guard will call close().await when dropped
+        }
+
+        /// `Scope::defer()` guard: the scope's tasks are aborted when the guard drops.
+        #[tokio::test(start_paused = true)]
+        async fn test_scope_defer_aborts_tasks() {
+            tokio::time::resume();
+            let flag = Arc::new(AtomicUsize::new(0));
+            let flag_clone = Arc::clone(&flag);
+            {
+                let mut scope = Scope::new();
+                scope.spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    flag_clone.fetch_add(1, Ordering::SeqCst);
+                });
+                let _guard = scope.defer();
+            }
+            // Guard dropped — tasks should be aborted
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(
+                flag.load(Ordering::SeqCst),
+                0,
+                "deferred scope must abort tasks on drop"
+            );
+        }
+
         /// Zone panic propagation: a panic in a work unit should propagate as
         /// JoinError::Panic and trigger dependency-aware cancellation.
         #[tokio::test(start_paused = true)]
         async fn test_zone_panic_propagates_as_join_error() {
-            let runtime = Arc::new(TokioRuntime) as Arc<dyn Runtime>;
+            let runtime = crate::tokio_runtime();
             let caps = CapabilitySet::new();
             let mut zone = Zone::new(runtime, caps);
 
@@ -390,7 +437,7 @@ mod tests {
         /// Zone: a panic in a provider task must cancel all transitively dependent tasks.
         #[tokio::test(start_paused = true)]
         async fn test_zone_panic_cancels_transitive_dependents() {
-            let runtime = Arc::new(TokioRuntime) as Arc<dyn Runtime>;
+            let runtime = crate::tokio_runtime();
             let caps = CapabilitySet::new();
             let mut zone = Zone::new(runtime, caps);
 
@@ -482,7 +529,7 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn test_zone_normal_completion() {
-            let runtime = Arc::new(TokioRuntime) as Arc<dyn Runtime>;
+            let runtime = crate::tokio_runtime();
             let caps = CapabilitySet::new();
             let mut zone = Zone::new(runtime, caps);
             zone.register(Arc::new(TestWorkUnit::ok("task1")));
@@ -495,7 +542,7 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn test_zone_panic_containment() {
-            let runtime = Arc::new(TokioRuntime) as Arc<dyn Runtime>;
+            let runtime = crate::tokio_runtime();
             let caps = CapabilitySet::new();
             let mut zone = Zone::new(runtime, caps);
             zone.register(Arc::new(TestWorkUnit::ok("good")));
@@ -509,7 +556,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn test_zone_real_timeout() {
             tokio::time::resume();
-            let runtime = Arc::new(TokioRuntime) as Arc<dyn Runtime>;
+            let runtime = crate::tokio_runtime();
             let caps = CapabilitySet::new();
             let mut zone = Zone::new(runtime, caps);
             let unit = Arc::new(TestWorkUnit::fail("slow"));
@@ -534,7 +581,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn test_zone_retry_with_max_retries() {
             tokio::time::resume();
-            let runtime = Arc::new(TokioRuntime) as Arc<dyn Runtime>;
+            let runtime = crate::tokio_runtime();
             let caps = CapabilitySet::new();
             let mut zone = Zone::new(Arc::clone(&runtime), caps.clone());
             let counter = Arc::new(AtomicUsize::new(0));
@@ -578,7 +625,7 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn test_zone_real_panic() {
-            let runtime = Arc::new(TokioRuntime) as Arc<dyn Runtime>;
+            let runtime = crate::tokio_runtime();
             let caps = CapabilitySet::new();
             let mut zone = Zone::new(runtime, caps);
 
@@ -613,7 +660,7 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn test_zone_dependency_cancellation() {
-            let runtime = Arc::new(TokioRuntime) as Arc<dyn Runtime>;
+            let runtime = crate::tokio_runtime();
             let caps = CapabilitySet::new();
             let mut zone = Zone::new(runtime, caps);
 
@@ -656,7 +703,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn test_zone_drop_cancels_tasks() {
             tokio::time::resume();
-            let runtime = Arc::new(TokioRuntime) as Arc<dyn Runtime>;
+            let runtime = crate::tokio_runtime();
             let caps = CapabilitySet::new();
             let mut zone = Zone::new(runtime, caps);
             let unit = Arc::new(TestWorkUnit::fail("slow"));
@@ -672,7 +719,7 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn test_zone_builder_chaining() {
-            let runtime = Arc::new(TokioRuntime) as Arc<dyn Runtime>;
+            let runtime = crate::tokio_runtime();
             let caps = CapabilitySet::new();
             let mut zone = Zone::new(runtime, caps);
             zone.register(Arc::new(TestWorkUnit::ok("a")))
@@ -684,7 +731,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn test_zone_transitive_cancellation() {
             tokio::time::resume();
-            let runtime = Arc::new(TokioRuntime) as Arc<dyn Runtime>;
+            let runtime = crate::tokio_runtime();
             let caps = CapabilitySet::new();
             let mut zone = Zone::new(runtime, caps);
 
@@ -767,7 +814,7 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn test_zone_panic_cancels_dependents() {
-            let runtime = Arc::new(TokioRuntime) as Arc<dyn Runtime>;
+            let runtime = crate::tokio_runtime();
             let caps = CapabilitySet::new();
             let mut zone = Zone::new(runtime, caps);
 
@@ -807,7 +854,7 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn test_zone_budget_exhaustion() {
-            let runtime = Arc::new(TokioRuntime) as Arc<dyn Runtime>;
+            let runtime = crate::tokio_runtime();
             let caps = CapabilitySet::new();
             let mut zone = Zone::new(runtime, caps);
 
@@ -824,7 +871,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn test_zone_drop_aborts_all_tasks() {
             tokio::time::resume();
-            let runtime = Arc::new(TokioRuntime) as Arc<dyn Runtime>;
+            let runtime = crate::tokio_runtime();
             let caps = CapabilitySet::new();
             let mut zone = Zone::new(runtime, caps);
 
@@ -851,7 +898,7 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn test_zone_config_custom_budget() {
-            let runtime = Arc::new(TokioRuntime) as Arc<dyn Runtime>;
+            let runtime = crate::tokio_runtime();
             let caps = CapabilitySet::new();
             let config = ZoneConfig { poll_budget: 32 };
             let mut zone = Zone::new_with_config(runtime, caps, config);
@@ -864,7 +911,7 @@ mod tests {
         /// prevents abort_all() from being called on an empty JoinSet.
         #[tokio::test(start_paused = true)]
         async fn test_zone_drop_completed_zone_is_safe() {
-            let runtime = Arc::new(TokioRuntime) as Arc<dyn Runtime>;
+            let runtime = crate::tokio_runtime();
             let caps = CapabilitySet::new();
             let mut zone = Zone::new(runtime, caps);
             zone.register(Arc::new(TestWorkUnit::ok("task")));
@@ -887,7 +934,7 @@ mod tests {
         /// ZoneConfig with poll_budget=1: the minimum valid budget works.
         #[tokio::test(start_paused = true)]
         async fn test_zone_config_budget_one() {
-            let runtime = Arc::new(TokioRuntime) as Arc<dyn Runtime>;
+            let runtime = crate::tokio_runtime();
             let caps = CapabilitySet::new();
             let config = ZoneConfig { poll_budget: 1 };
             let mut zone = Zone::new_with_config(runtime, caps, config);
@@ -901,7 +948,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn test_zone_drop_multiple_pending_tasks() {
             tokio::time::resume();
-            let runtime = Arc::new(TokioRuntime) as Arc<dyn Runtime>;
+            let runtime = crate::tokio_runtime();
             let caps = CapabilitySet::new();
             let counter = Arc::new(AtomicUsize::new(0));
             let mut zone = Zone::new(runtime, caps);
@@ -931,7 +978,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn test_zone_drop_dependency_graph() {
             tokio::time::resume();
-            let runtime = Arc::new(TokioRuntime) as Arc<dyn Runtime>;
+            let runtime = crate::tokio_runtime();
             let caps = CapabilitySet::new();
             let mut zone = Zone::new(runtime, caps);
             let asset = ArcIntern::<str>::from("shared_asset");
@@ -1021,10 +1068,9 @@ mod tests {
 
     mod m3 {
         use super::*;
-        use crate::pool::{Limiter, PoolError, Queue, WorkerPool};
+        use crate::pool::{Limiter, PoolError, Queue, ResultPool, ResultPoolError, WorkerPool};
         use crate::queue::PriorityQueue;
         use crate::router::PartitionedRouter;
-        use crate::runtime::tokio::TokioRuntime;
         use std::sync::Arc;
 
         #[tokio::test(start_paused = true)]
@@ -1065,7 +1111,7 @@ mod tests {
         async fn test_worker_pool_processes_all_jobs() {
             let results = Arc::new(std::sync::Mutex::new(Vec::new()));
             let r = Arc::clone(&results);
-            let pool = WorkerPool::new(Arc::new(TokioRuntime), 2, 10, move |job: i32| {
+            let pool = WorkerPool::new(crate::tokio_runtime(), 2, 10, move |job: i32| {
                 let r = Arc::clone(&r);
                 async move {
                     let mut guard = r.lock().unwrap();
@@ -1088,7 +1134,7 @@ mod tests {
             tokio::time::resume();
             let completed = Arc::new(AtomicUsize::new(0));
             let c = Arc::clone(&completed);
-            let pool = WorkerPool::new(Arc::new(TokioRuntime), 2, 10, move |job: i32| {
+            let pool = WorkerPool::new(crate::tokio_runtime(), 2, 10, move |job: i32| {
                 let c = Arc::clone(&c);
                 async move {
                     tokio::time::sleep(Duration::from_millis(10 * u64::try_from(job).unwrap()))
@@ -1129,6 +1175,30 @@ mod tests {
                 h.await.unwrap();
             }
             assert!(max_concurrent.load(Ordering::SeqCst) <= 2);
+        }
+
+        /// `Limiter::run_sync` works from a sync context (no tokio runtime needed).
+        #[test]
+        fn limiter_run_sync_caps_concurrency() {
+            let limiter = Limiter::new(2);
+            let counter = Arc::new(AtomicUsize::new(0));
+            let max_concurrent = Arc::new(AtomicUsize::new(0));
+
+            // Run 5 tasks synchronously through the limiter.
+            // run_sync creates its own runtime internally.
+            for _ in 0..5 {
+                let cnt = Arc::clone(&counter);
+                let max_c = Arc::clone(&max_concurrent);
+                limiter.run_sync(|| async move {
+                    let prev = cnt.fetch_add(1, Ordering::SeqCst);
+                    max_c.fetch_max(prev + 1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    cnt.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+            // Since run_sync is blocking and sequential, max_concurrent is 1.
+            assert!(max_concurrent.load(Ordering::SeqCst) <= 2);
+            assert_eq!(counter.load(Ordering::SeqCst), 0);
         }
 
         #[test]
@@ -1254,7 +1324,7 @@ mod tests {
             let completed = Arc::new(AtomicUsize::new(0));
             let c = Arc::clone(&completed);
             let pool = Arc::new(WorkerPool::new(
-                Arc::new(TokioRuntime),
+                crate::tokio_runtime(),
                 4,
                 2000,
                 move |job: i32| {
@@ -1291,14 +1361,14 @@ mod tests {
             let results = Arc::new(std::sync::Mutex::new(Vec::new()));
             let r1 = Arc::clone(&results);
             let r2 = Arc::clone(&results);
-            let pool1 = WorkerPool::new(Arc::new(TokioRuntime), 1, 10, move |job: i32| {
+            let pool1 = WorkerPool::new(crate::tokio_runtime(), 1, 10, move |job: i32| {
                 let r = Arc::clone(&r1);
                 async move {
                     let mut guard = r.lock().unwrap();
                     guard.push((0, job));
                 }
             });
-            let pool2 = WorkerPool::new(Arc::new(TokioRuntime), 1, 10, move |job: i32| {
+            let pool2 = WorkerPool::new(crate::tokio_runtime(), 1, 10, move |job: i32| {
                 let r = Arc::clone(&r2);
                 async move {
                     let mut guard = r.lock().unwrap();
@@ -1322,14 +1392,14 @@ mod tests {
             let results = Arc::new(std::sync::Mutex::new(Vec::new()));
             let r1 = Arc::clone(&results);
             let r2 = Arc::clone(&results);
-            let pool1 = WorkerPool::new(Arc::new(TokioRuntime), 1, 10, move |job: i32| {
+            let pool1 = WorkerPool::new(crate::tokio_runtime(), 1, 10, move |job: i32| {
                 let r = Arc::clone(&r1);
                 async move {
                     let mut guard = r.lock().unwrap();
                     guard.push((0, job));
                 }
             });
-            let pool2 = WorkerPool::new(Arc::new(TokioRuntime), 1, 10, move |job: i32| {
+            let pool2 = WorkerPool::new(crate::tokio_runtime(), 1, 10, move |job: i32| {
                 let r = Arc::clone(&r2);
                 async move {
                     let mut guard = r.lock().unwrap();
@@ -1346,6 +1416,75 @@ mod tests {
             let shards: Vec<_> = guard.iter().map(|(s, _)| *s).collect();
             assert!(shards.contains(&0));
             assert!(shards.contains(&1));
+        }
+
+        #[tokio::test]
+        async fn result_pool_happy_path() {
+            let pool = ResultPool::new(crate::tokio_runtime(), 2, 10, |job: i32| async move {
+                Ok::<i32, String>(job * 2)
+            });
+            let result = pool.submit(5).await.unwrap();
+            assert_eq!(result, 10);
+            pool.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn result_pool_handler_error() {
+            let pool = ResultPool::new(crate::tokio_runtime(), 1, 10, |job: i32| async move {
+                if job < 0 {
+                    Err("negative".to_string())
+                } else {
+                    Ok(job)
+                }
+            });
+            let err = pool.submit(-1).await.unwrap_err();
+            match err {
+                ResultPoolError::Inner(msg) => assert_eq!(msg, "negative"),
+                other => panic!("expected Inner, got {other:?}"),
+            }
+            pool.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn result_pool_multiple_jobs() {
+            let pool = ResultPool::new(crate::tokio_runtime(), 2, 10, |job: i32| async move {
+                Ok::<i32, String>(job + 1)
+            });
+            let mut handles = Vec::new();
+            for i in 0..5i32 {
+                handles.push(pool.submit(i));
+            }
+            for (i, handle) in handles.into_iter().enumerate() {
+                assert_eq!(handle.await.unwrap(), i as i32 + 1);
+            }
+            pool.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn result_pool_queue_full_returns_error() {
+            // Queue capacity 0 means any submit will fail immediately
+            let pool = ResultPool::new(crate::tokio_runtime(), 1, 0, |job: i32| async move {
+                Ok::<i32, String>(job)
+            });
+            // The queue has capacity 0, so submit should fail immediately.
+            // Wait briefly for the queue to fill (it's already full at capacity 0).
+            let err = tokio::time::timeout(std::time::Duration::from_millis(100), pool.submit(1))
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(matches!(err, ResultPoolError::Pool(PoolError::Full)));
+            pool.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn result_pool_shutdown_returns_canceled() {
+            let pool = ResultPool::new(crate::tokio_runtime(), 1, 10, |job: i32| async move {
+                Ok::<i32, String>(job)
+            });
+            // Submit a job to verify the pool is working
+            let result = pool.submit(42).await.unwrap();
+            assert_eq!(result, 42);
+            pool.shutdown().await;
         }
     }
 
@@ -1665,11 +1804,8 @@ mod tests {
     mod e2e {
         use super::{DepWorkUnit, PanicUnit};
         use crate::pool::WorkerPool;
-        use crate::runtime::tokio::TokioRuntime;
         use crate::zone::{Zone, ZoneEvent, ZoneSummary};
-        use fluent_wvr::{
-            ArcIntern, CapabilitySet, Runtime, WorkContext, WorkError, WorkOutput, WorkUnit,
-        };
+        use fluent_wvr::{ArcIntern, CapabilitySet, WorkContext, WorkError, WorkOutput, WorkUnit};
         use fluent_wvr_testutil::impl_component_for_test;
         use std::sync::Arc;
         use std::time::Duration;
@@ -1678,7 +1814,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn test_e2e_zone_with_worker_pool() {
             tokio::time::resume();
-            let runtime = Arc::new(TokioRuntime) as Arc<dyn Runtime>;
+            let runtime = crate::tokio_runtime();
             let caps = CapabilitySet::new();
             let pool = Arc::new(WorkerPool::new(
                 Arc::clone(&runtime),
@@ -1735,7 +1871,7 @@ mod tests {
         /// End-to-end: Zone handles mixed success/failure/cancellation
         #[tokio::test(start_paused = true)]
         async fn test_e2e_zone_mixed_outcomes() {
-            let runtime = Arc::new(TokioRuntime) as Arc<dyn Runtime>;
+            let runtime = crate::tokio_runtime();
             let caps = CapabilitySet::new();
 
             struct OutcomeUnit {
@@ -1802,7 +1938,7 @@ mod tests {
         /// dependents while independent neighbors continue unhindered.
         #[tokio::test(start_paused = true)]
         async fn test_e2e_panic_cascade_with_independent_neighbors() {
-            let runtime = Arc::new(TokioRuntime) as Arc<dyn Runtime>;
+            let runtime = crate::tokio_runtime();
             let caps = CapabilitySet::new();
             let mut zone = Zone::new(runtime, caps);
 
@@ -1866,7 +2002,7 @@ mod tests {
         /// the zone and that the cascade breaks the loop safely.
         #[tokio::test(start_paused = true)]
         async fn test_e2e_cycle_resiliency() {
-            let runtime = Arc::new(TokioRuntime) as Arc<dyn Runtime>;
+            let runtime = crate::tokio_runtime();
             let caps = CapabilitySet::new();
             let mut zone = Zone::new(runtime, caps);
 

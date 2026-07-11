@@ -80,12 +80,12 @@ pub fn tempdir() -> tempfile::TempDir {
 /// Files are created as empty. Parent directories are created automatically.
 pub fn make_tree(root: &std::path::Path, files: &[&str], dirs: &[&str]) {
     for d in dirs {
-        std::fs::create_dir_all(root.join(d)).unwrap();
+        common_core::ensure_dir(root.join(d)).unwrap();
     }
     for f in files {
         let p = root.join(f);
         if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent).unwrap();
+            common_core::ensure_dir(parent).unwrap();
         }
         std::fs::write(&p, "").unwrap();
     }

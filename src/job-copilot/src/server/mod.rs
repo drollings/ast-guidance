@@ -18,6 +18,7 @@ use crate::server::audit::AuditLog;
 use crate::similarity::FieldSimilarityStore;
 use common_core::metrics::LatencyHistogram;
 use dag::middleware::{MiddlewareChain, RetryMiddleware, TimingMiddleware};
+use fluent_concurrency::io::net::NetCapability;
 use fluent_wvr::Component;
 
 /// Start the Native Messaging STDIO transport.
@@ -45,11 +46,10 @@ pub async fn serve_native_messaging(config: DaemonConfig) -> Result<(), CopilotE
         FieldSimilarityStore::load(&store_path).unwrap_or_default(),
     ));
 
-    let llm = Arc::new(LlmDispatcher::with_store(
-        client,
-        profile.clone(),
-        store.clone(),
-    ));
+    let llm = Arc::new(
+        LlmDispatcher::with_store(client, profile.clone(), store.clone())
+            .with_net_capability(NetCapability::new()),
+    );
 
     let dispatcher: Arc<dyn FieldValueDispatcher> =
         Arc::new(TieredDispatcher::new().with(local).with(llm));
@@ -82,7 +82,9 @@ pub async fn serve_native_messaging(config: DaemonConfig) -> Result<(), CopilotE
             .build(),
     );
     let chain = MiddlewareChain::new()
-        .push(Box::new(TimingMiddleware))
+        .push(Box::new(TimingMiddleware::with_histogram(
+            histogram.clone(),
+        )))
         .push(Box::new(RetryMiddleware::new(2, 50)));
     let unit = chain.apply(base);
 
@@ -91,9 +93,11 @@ pub async fn serve_native_messaging(config: DaemonConfig) -> Result<(), CopilotE
         .with_memory(memory_store);
 
     // Attach audit log if configured.
-    if let Some(ref path) = config.audit_log_path {
-        let audit = Arc::new(AuditLog::open(path)?);
-        handler = handler.with_audit(audit);
+    if let Some(path) = config.audit_log_path.as_ref() {
+        if !path.as_os_str().is_empty() {
+            let audit = Arc::new(AuditLog::open(path)?);
+            handler = handler.with_audit(audit);
+        }
     }
 
     let handler = Arc::new(handler);

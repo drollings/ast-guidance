@@ -1,3 +1,5 @@
+//! Shared leaf error types: `IoError`, `ResolverError`, `SqliteError` (feature-gated).
+
 use thiserror::Error;
 
 /// I/O error wrapper.

@@ -48,6 +48,29 @@ where
     }
 }
 
+/// A `WorkUnit` wrapper that logs execution timing and optionally records
+/// durations into a shared `LatencyHistogram`.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use fluent_wvr::wrapper::Instrumented;
+/// use common_core::metrics::LatencyHistogram;
+/// # use fluent_wvr::{WorkUnit, WorkContext, WorkOutput, WorkError};
+/// # use internment::ArcIntern;
+/// # struct MyUnit;
+/// # impl WorkUnit for MyUnit {
+/// #     fn name(&self) -> &str { "my_unit" }
+/// #     fn depends(&self) -> &[ArcIntern<str>] { &[] }
+/// #     fn provides(&self) -> &[ArcIntern<str>] { &[] }
+/// #     fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> { Ok(WorkOutput::ok("ok")) }
+/// # }
+///
+/// let hist = Arc::new(LatencyHistogram::new());
+/// let unit = Instrumented::with_metrics(MyUnit, "my.unit", hist.clone());
+/// // unit.execute(ctx) will log timing and record to hist
+/// ```
 pub struct Instrumented<U> {
     inner: U,
     label: String,
@@ -326,6 +349,9 @@ impl WorkUnit for ComponentAdapter {
 
 impl FieldAccess for ComponentAdapter {
     fn set_field(&mut self, name: &str, value: &str) -> Result<(), FieldError> {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.set_field(name, value)?;
+        }
         self.field_overrides.push((name.into(), value.into()));
         Ok(())
     }
@@ -742,5 +768,88 @@ mod tests {
         assert_eq!(names[0], "host_a");
         assert_eq!(names[1], "host_b");
         assert_eq!(names[2], "host_c");
+    }
+
+    /// A `Component` with a max constraint on `port` (max=1024).
+    struct ConstrainedHost {
+        port: u16,
+    }
+    impl FieldAccess for ConstrainedHost {
+        fn set_field(&mut self, name: &str, value: &str) -> Result<(), FieldError> {
+            if name == "port" {
+                let v: u16 = value
+                    .parse()
+                    .map_err(|_| FieldError::Parse(format!("invalid u16 for 'port': {}", value)))?;
+                if v > 1024 {
+                    return Err(FieldError::Constraint(
+                        "port: value above maximum 1024".into(),
+                    ));
+                }
+                self.port = v;
+                Ok(())
+            } else {
+                Err(FieldError::NotFound(name.into()))
+            }
+        }
+        fn get_field(&self, name: &str) -> Result<String, FieldError> {
+            match name {
+                "port" => Ok(self.port.to_string()),
+                _ => Err(FieldError::NotFound(name.into())),
+            }
+        }
+        fn field_names(&self) -> &'static [&'static str] {
+            &["port"]
+        }
+    }
+    impl Describable for ConstrainedHost {
+        fn describe(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+    }
+    impl WorkUnit for ConstrainedHost {
+        fn name(&self) -> &str {
+            "constrained_host"
+        }
+        fn depends(&self) -> &[ArcIntern<str>] {
+            &[]
+        }
+        fn provides(&self) -> &[ArcIntern<str>] {
+            &[]
+        }
+        fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+            Ok(WorkOutput::ok("done"))
+        }
+    }
+
+    #[test]
+    fn adapter_set_field_propagates_constraint_error() {
+        let host = ConstrainedHost { port: 8080 };
+        let mut adapter = ComponentAdapter::new(Arc::new(host));
+        // Valid value — should succeed and store override.
+        adapter.set_field("port", "512").unwrap();
+        assert_eq!(adapter.get_field("port").unwrap(), "512");
+        // Value above max — should propagate the constraint error.
+        let err = adapter.set_field("port", "9999").unwrap_err();
+        match err {
+            FieldError::Constraint(msg) => {
+                assert!(msg.contains("above maximum"), "unexpected: {}", msg);
+            }
+            other => panic!("expected Constraint error, got: {:?}", other),
+        }
+        // The override should NOT have been stored for the invalid value.
+        assert_eq!(adapter.get_field("port").unwrap(), "512");
+    }
+
+    #[test]
+    fn adapter_set_field_propagates_parse_error() {
+        let host = ConstrainedHost { port: 8080 };
+        let mut adapter = ComponentAdapter::new(Arc::new(host));
+        let err = adapter.set_field("port", "not_a_number").unwrap_err();
+        match err {
+            FieldError::Parse(msg) => {
+                assert!(msg.contains("invalid u16"), "unexpected: {}", msg);
+            }
+            other => panic!("expected Parse error, got: {:?}", other),
+        }
     }
 }

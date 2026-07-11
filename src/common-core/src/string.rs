@@ -1,3 +1,5 @@
+//! 20+ string utilities: case-insensitive search, slug, truncation, identifier detection.
+
 use std::collections::HashSet;
 use std::sync::LazyLock;
 

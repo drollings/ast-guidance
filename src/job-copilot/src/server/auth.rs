@@ -15,7 +15,14 @@ pub fn check_loopback_peer(peer: &SocketAddr) -> Result<(), CopilotError> {
 
 /// Check the `Authorization: Bearer <token>` header against an expected token.
 ///
-/// If `expected` is `None`, any/no token is accepted (auth disabled).
+/// Auth behavior:
+/// - `expected = None` → auth disabled, any request is accepted.
+/// - `expected = Some("")` → empty-string token; any/no token is accepted.
+///   This is a degenerate configuration; in practice, the daemon's
+///   `validate()` should reject an empty `auth_token`. Treat this branch
+///   as a safety net for misconfiguration.
+/// - `expected = Some(non-empty)` → the header must contain
+///   `Authorization: Bearer <expected>`. The comparison is constant-time.
 pub fn check_bearer_token(
     headers: &HashMap<String, String, std::collections::hash_map::RandomState>,
     expected: Option<&str>,
@@ -32,11 +39,24 @@ pub fn check_bearer_token(
 
     let token = auth.strip_prefix("Bearer ").unwrap_or("");
 
-    if token != expected {
+    if !constant_time_eq(token.as_bytes(), expected.as_bytes()) {
         return Err(CopilotError::Auth("invalid bearer token".into()));
     }
 
     Ok(())
+}
+
+/// Constant-time byte comparison to prevent timing side-channels.
+/// Returns `true` iff `a` and `b` have the same length and content.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[cfg(test)]

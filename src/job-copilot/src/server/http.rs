@@ -286,7 +286,7 @@ mod tests {
                 .build(),
         );
         let chain = MiddlewareChain::new()
-            .push(Box::new(TimingMiddleware))
+            .push(Box::new(TimingMiddleware::new()))
             .push(Box::new(RetryMiddleware::new(2, 50)));
         let unit = chain.apply(base);
 
@@ -323,7 +323,7 @@ mod tests {
             .build();
         let addr = run_http_once(&config, handler).await.unwrap();
 
-        let client = reqwest::Client::new();
+        let client = common_core::http::test_http_client();
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -351,7 +351,7 @@ mod tests {
             .build();
         let addr = run_http_once(&config, handler).await.unwrap();
 
-        let client = reqwest::Client::new();
+        let client = common_core::http::test_http_client();
         let resp = client
             .request(reqwest::Method::OPTIONS, format!("http://{addr}/rpc"))
             .send()
@@ -373,7 +373,7 @@ mod tests {
             .build();
         let addr = run_http_once(&config, handler).await.unwrap();
 
-        let client = reqwest::Client::new();
+        let client = common_core::http::test_http_client();
         let resp = client
             .get(format!("http://{addr}/rpc"))
             .send()
@@ -391,7 +391,7 @@ mod tests {
             .build();
         let addr = run_http_once(&config, handler).await.unwrap();
 
-        let client = reqwest::Client::new();
+        let client = common_core::http::test_http_client();
         let resp = client
             .post(format!("http://{addr}/other"))
             .body("test")
@@ -411,7 +411,7 @@ mod tests {
             .build();
         let addr = run_http_once(&config, handler).await.unwrap();
 
-        let client = reqwest::Client::new();
+        let client = common_core::http::test_http_client();
         let resp = client
             .post(format!("http://{addr}/rpc"))
             .bearer_auth("wrong")
@@ -432,7 +432,7 @@ mod tests {
             .build();
         let addr = run_http_once(&config, handler).await.unwrap();
 
-        let client = reqwest::Client::new();
+        let client = common_core::http::test_http_client();
         let resp = client
             .post(format!("http://{addr}/rpc"))
             .bearer_auth("secret")

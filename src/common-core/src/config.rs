@@ -1,3 +1,5 @@
+//! JSON config loaders: `load_json_or_default` (fallback to `T::default()`) and `load_json` (strict).
+
 use std::path::Path;
 
 use serde::de::DeserializeOwned;

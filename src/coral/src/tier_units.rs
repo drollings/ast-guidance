@@ -25,9 +25,11 @@ fn query_deps() -> Vec<ArcIntern<str>> {
 
 fn extract_query(ctx: &WorkContext) -> Result<String, WorkError> {
     ctx.metadata
-        .iter()
-        .find(|(k, _)| k == QUERY_KEY)
-        .map(|(_, v)| v.clone())
+        .get(QUERY_KEY)
+        .and_then(|v| match v {
+            fluent_wvr::MetadataValue::String(s) => Some(s.clone()),
+            _ => None,
+        })
         .ok_or_else(|| WorkError::Dependency("missing 'query' in WorkContext.metadata".into()))
 }
 
@@ -345,9 +347,12 @@ impl WorkUnit for L4_5DecomposeUnit {
         let query = extract_query(ctx)?;
         let depth: u8 = ctx
             .metadata
-            .iter()
-            .find(|(k, _)| k == "depth")
-            .and_then(|(_, v)| v.parse().ok())
+            .get("depth")
+            .and_then(|v| match v {
+                fluent_wvr::MetadataValue::String(s) => s.parse().ok(),
+                fluent_wvr::MetadataValue::Number(n) => Some(*n as u8),
+                _ => None,
+            })
             .unwrap_or(0);
 
         if depth >= self.max_depth {
@@ -533,9 +538,10 @@ impl TierRegistry {
 
     pub fn execute(&self, query: &str, depth: u8) -> Result<RoutingResult, WorkError> {
         let mut ctx = WorkContext::default();
-        ctx.metadata.push((QUERY_KEY.into(), query.to_string()));
+        ctx.metadata
+            .insert(QUERY_KEY.into(), query.to_string().into());
         if depth > 0 {
-            ctx.metadata.push(("depth".into(), depth.to_string()));
+            ctx.metadata.insert("depth".into(), i64::from(depth).into());
         }
 
         let mut last_err = None;
@@ -595,7 +601,7 @@ mod tests {
     #[test]
     fn test_extract_query_present() {
         let mut ctx = WorkContext::default();
-        ctx.metadata.push(("query".into(), "hello".into()));
+        ctx.metadata.insert("query".into(), "hello".into());
         assert_eq!(extract_query(&ctx).unwrap(), "hello");
     }
 }

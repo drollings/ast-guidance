@@ -302,7 +302,7 @@ pub fn merge_doc(existing: &GuidanceDoc, new: &mut GuidanceDoc) {
 /// Save guidance doc, preserving existing metadata when hashes are unchanged.
 pub fn save_guidance(path: &Path, doc: &GuidanceDoc) -> Result<(), JsonError> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        common_core::io::ensure_dir(parent)?;
     }
     // Load existing to preserve user annotations on hash-match
     let mut doc_to_save = doc.clone();

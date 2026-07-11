@@ -1,3 +1,5 @@
+//! Safe shell parser: whitespace+quote tokenizer that refuses metacharacters.
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]

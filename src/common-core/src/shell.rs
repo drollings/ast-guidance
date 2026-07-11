@@ -1,3 +1,5 @@
+//! Subprocess helpers: `run_capture`, `run_shell_capture`, `run_command`, `CommandOutput`.
+
 use std::process::{Command, Output};
 
 /// Returns the platform-specific shell program and argument.
