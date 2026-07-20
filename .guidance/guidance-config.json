@@ -12,8 +12,8 @@
     }
   },
   "models": {
-    "default": "llama:fast",
-    "fast": "llama:fast",
+    "default": "llama:code",
+    "fast": "llama:code",
     "thinking": "llama:code",
     "batch": "llama:code",
     "embed": "llama:embed"

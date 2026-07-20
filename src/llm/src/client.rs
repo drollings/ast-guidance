@@ -1,49 +1,14 @@
 use std::sync::{Arc, OnceLock};
 
-use bon::Builder;
 use common_core::http::shared_http_client;
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
-use crate::llm_queue::LlmRequestQueue;
+use fluent_concurrency::llm_queue::{ChatMessage, LlmConfig, LlmError, LlmRequestQueue};
 
 /// Trait for chat backends — sends messages and returns a response string.
 ///
 /// Implemented by `LlmClient` (production) and test stubs.
 pub trait ChatBackend: Send + Sync {
     fn chat_complete(&self, messages: &[ChatMessage]) -> Result<String, LlmError>;
-}
-
-#[derive(Error, Debug)]
-pub enum LlmError {
-    #[error("API error: {0}")]
-    Api(String),
-    #[error("HTTP error: {0}")]
-    Http(String),
-    #[error("no response from model")]
-    NoResponse,
-    #[error("rate limited")]
-    RateLimited,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
-#[builder(start_fn = new)]
-pub struct LlmConfig {
-    pub api_url: String,
-    pub model: String,
-    pub think: Option<bool>,
-    #[builder(default = 2000)]
-    pub timeout_ms: u64,
-    #[builder(default)]
-    pub debug: bool,
-    #[builder(default)]
-    pub show_prompts: bool,
 }
 
 /// Fallback runtime used only when the sync adapter is called from a context
@@ -94,6 +59,22 @@ impl LlmClient {
         }
     }
 
+    /// Attaches a pre-built `LlmRequestQueue` (worker pool) and a fully
+    /// resolved `LlmConfig` (think flag, debug, show_prompts, timeout).
+    /// Prefer this over [`with_queue`](Self::with_queue) when the config
+    /// carries non-default fields, since `with_queue` rebuilds a default
+    /// `LlmConfig` and silently drops `think`, `debug`, etc.
+    pub fn with_queue_and_config(queue: Arc<LlmRequestQueue>, config: LlmConfig) -> Self {
+        let api_base = config.api_url.trim_end_matches('/').to_string();
+        let model = config.model.clone();
+        Self {
+            api_base,
+            model,
+            config,
+            queue: Some(queue),
+        }
+    }
+
     pub fn with_config(config: LlmConfig) -> Self {
         let api_base = config.api_url.trim_end_matches('/').to_string();
         let model = config.model.clone();
@@ -117,9 +98,19 @@ impl LlmClient {
     /// shared `reqwest::Client`. If a custom `LlmRequestQueue` is configured,
     /// the request is submitted through that queue's worker pool; otherwise
     /// the HTTP call is made directly.
+    ///
+    /// When a queue is attached, the call awaits the queue's worker future
+    /// — this is fully async, so it composes correctly with `tokio::spawn`,
+    /// `Scope::spawn`, and `Limiter::run` without requiring `Handle::block_on`.
     pub async fn chat_complete_async(&self, messages: &[ChatMessage]) -> Result<String, LlmError> {
         match &self.queue {
-            Some(q) => q.submit_async(messages.to_vec(), self.config.clone()).await,
+            Some(q) => {
+                let task = fluent_concurrency::llm_queue::LlmTask {
+                    messages: messages.to_vec(),
+                    config: self.config.clone(),
+                };
+                q.submit(task).await
+            }
             None => {
                 chat_complete_http_async(
                     &self.api_base,

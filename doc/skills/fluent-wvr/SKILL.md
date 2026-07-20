@@ -2,8 +2,6 @@
 
 **A design pattern guide for human coders and AI agents working in the Rust codebase.**
 
-**Supersedes:** `FLUENT_WVR_RUST.md` (raw-pointer variant, deprecated) and the previous `FLUENT_WVR.md`.
-
 ---
 
 ## Who This Document Is For

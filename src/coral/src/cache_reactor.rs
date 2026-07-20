@@ -5,7 +5,7 @@ use crate::wasm_runtime::WasmRuntime;
 use bon::Builder;
 use common_core::hash::content_hash_with_model;
 use common_core::metrics::LatencyHistogram;
-use guidance_llm::client::LlmConfig;
+use guidance_llm::LlmConfig;
 use guidance_llm::decomposer::Decomposer;
 use guidance_types::{ContextNode, NodeId, WasmTool};
 

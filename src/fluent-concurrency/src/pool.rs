@@ -250,6 +250,7 @@ where
 {
     queue: Arc<Queue<WrappedJob<T, R, E>>>,
     workers: Vec<JoinHandle<()>>,
+    worker_count: usize,
     shutdown: Arc<Notify>,
 }
 
@@ -302,8 +303,14 @@ where
         Self {
             queue,
             workers,
+            worker_count: cap,
             shutdown,
         }
+    }
+
+    /// Returns the configured number of workers.
+    pub fn worker_count(&self) -> usize {
+        self.worker_count
     }
 
     /// Submits a job and awaits the handler's result.

@@ -120,6 +120,14 @@ Then you you must read
 │           ├── py.mk
 │           ├── rust.mk
 │           └── zig.mk
+├── extension/
+│   ├── README.md  # # Job Copilot — Chromium Extension
+│   ├── background.js  # // Job Copilot — background service...
+│   ├── content-script.js  # // Job Copilot — content script (DO...
+│   ├── manifest.json
+│   ├── side-panel.css
+│   ├── side-panel.html
+│   └── side-panel.js  # // Job Copilot — side panel
 └── src/
     ├── Cargo.lock
     ├── bin/
@@ -143,25 +151,27 @@ Then you you must read
     ├── common-core/
     │   ├── Cargo.toml
     │   └── src/
-    │       ├── config.rs  # use std::path::Path;
-    │       ├── constants.rs  # pub const MAX_VALUE_LEN: usize = 128;
-    │       ├── drift.rs  # use bitvec::prelude::*;
-    │       ├── error.rs  # use thiserror::Error;
-    │       ├── error_context.rs  # use std::fmt;
-    │       ├── format.rs  # use std::fmt::Write as _;
+    │       ├── config.rs  # //! JSON config loaders: `load_json_or_d
+    │       ├── constants.rs  # //! Cross-crate magic numbers (size caps
+    │       ├── drift.rs  # //! Bit-set drift analysis: compute "mis
+    │       ├── error.rs  # //! Shared leaf error types: `IoError`, 
+    │       ├── error_context.rs  # //! Contextual error wrappers: `ErrorCon
+    │       ├── format.rs  # //! Human-readable output: `format_json`
     │       ├── git.rs  # //! Git operations — thin wrappers ...
-    │       ├── hash.rs  # use blake3::Hasher;
-    │       ├── interner.rs  # use bitvec::vec::BitVec;
+    │       ├── hash.rs  # //! Hashing utilities: `blake3_*`, `sha2
+    │       ├── http.rs  # //! Process-wide shared HTTP client (and
+    │       ├── interner.rs  # //! Capability registry: thread-safe str
     │       ├── io.rs  # use std::fs;
     │       ├── jsonrpc.rs  # //! Shared JSON-RPC 2.
-    │       ├── lib.rs  # //! common-core: Zero-domain generic uti
-    │       ├── metrics.rs  # use std::sync::atomic::{AtomicU64, Order
-    │       ├── shell.rs  # use std::process::{Command, Output};
-    │       ├── shell_parser.rs  # use thiserror::Error;
+    │       ├── lib.rs  # #![forbid(unsafe_code)]
+    │       ├── metrics.rs  # //! Lock-free latency histogram with 12 
+    │       ├── prelude.rs  # //! The common-core prelude — impor...
+    │       ├── shell.rs  # //! Subprocess helpers: `run_capture`, `
+    │       ├── shell_parser.rs  # //! Safe shell parser: whitespace+quote 
     │       ├── sqlite.rs  # //! Shared SQLite helpers — connect...
-    │       ├── string.rs  # use std::collections::HashSet;
-    │       ├── tokens.rs  # pub const DEFAULT_CHARS_PER_TOKEN: usize
-    │       └── walk.rs  # use std::collections::HashSet;
+    │       ├── string.rs  # //! 20+ string utilities: case-insensiti
+    │       ├── tokens.rs  # //! Token budget helpers: `estimate_toke
+    │       └── walk.rs  # //! Directory walker: `walk_files` (call
     ├── content-node/
     │   ├── Cargo.toml
     │   └── src/
@@ -224,12 +234,12 @@ Then you you must read
     ├── fluent-wvr/
     │   ├── Cargo.toml
     │   └── src/
-    │       ├── lib.rs  # //! ## Fluent WVR — Framework Trait...
+    │       ├── lib.rs  # #![forbid(unsafe_code)]
     │       └── wrapper.rs  # use std::sync::Arc;
     ├── fluent-wvr-macros/
     │   ├── Cargo.toml
     │   └── src/
-    │       └── lib.rs  # use proc_macro::TokenStream;
+    │       └── lib.rs  # #![forbid(unsafe_code)]
     ├── fluent-wvr-testutil/
     │   ├── Cargo.toml
     │   └── src/
@@ -239,7 +249,7 @@ Then you you must read
     │   ├── src/
     │   │   ├── ast_parser.rs  # use std::path::Path;
     │   │   ├── config.rs  # use std::collections::HashMap;
-    │   │   ├── enhancer.rs  # use guidance_llm::client::{ChatMessage, 
+    │   │   ├── enhancer.rs  # use guidance_llm::client::LlmClient;
     │   │   ├── grounding.rs  # //! Grounding enforcement — ensures...
     │   │   ├── lib.rs  # //! Guidance: AST-guided vector search &
     │   │   ├── memory.rs  # //! Memory integration for the guidance 
@@ -276,16 +286,16 @@ Then you you must read
     │       ├── config.rs  # use std::path::PathBuf;
     │       ├── dispatcher/
     │       │   ├── llm.rs  # use std::sync::{Arc, RwLock};
-    │       │   ├── local.rs  # use std::sync::{Arc, RwLock};
+    │       │   ├── local.rs  # use std::sync::{Arc, OnceLock, RwLock};
     │       │   └── mod.rs  # pub mod llm;
-    │       ├── error.rs  # use thiserror::Error;
+    │       ├── error.rs  # use common_core::error_context::ErrorCon
     │       ├── lib.rs  # //! Job Copilot — local-only human-...
     │       ├── memory.rs  # use std::path::PathBuf;
     │       ├── profile.rs  # use std::path::Path;
     │       ├── prompt/
     │       │   ├── context.rs  # use common_core::tokens::estimate_tokens
     │       │   └── mod.rs  # pub mod context;
-    │       ├── sanitize.rs  # use regex::Regex;
+    │       ├── sanitize.rs  # use std::sync::OnceLock;
     │       ├── schema.rs  # use serde::{Deserialize, Serialize};
     │       ├── server/
     │       │   ├── audit.rs  # use std::fs::{File, OpenOptions};
@@ -299,14 +309,14 @@ Then you you must read
     │   ├── Cargo.toml
     │   └── src/
     │       ├── anonymize.rs  # use std::sync::LazyLock;
-    │       ├── client.rs  # use std::sync::{Arc, LazyLock};
+    │       ├── client.rs  # use std::sync::{Arc, OnceLock};
     │       ├── constants.rs  # //! Cross-crate limit moved to `common-c
-    │       ├── context_packer.rs  # use crate::client::ChatMessage;
+    │       ├── context_packer.rs  # use crate::ChatMessage;
     │       ├── decomposer.rs  # use bon::Builder;
     │       ├── embeddings.rs  # use std::num::NonZeroUsize;
     │       ├── error.rs  # use crate::embeddings::EmbeddingError;
     │       ├── lib.rs  # //! guidance-llm: LLM HTTP client provid
-    │       ├── llm_queue.rs  # use std::sync::Arc;
+    │       ├── llm_queue.rs  # //! Default LLM request handler — w...
     │       └── url.rs  # use thiserror::Error;
     ├── memory-plugin/
     │   ├── Cargo.toml

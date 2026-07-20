@@ -3,6 +3,7 @@
 pub mod capability;
 pub mod flow;
 pub mod io;
+pub mod llm_queue;
 pub mod pool;
 pub mod queue;
 pub mod router;

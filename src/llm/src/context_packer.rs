@@ -1,4 +1,4 @@
-use crate::client::ChatMessage;
+use crate::ChatMessage;
 use common_core::tokens::estimate_tokens;
 
 pub struct ContextPacker {

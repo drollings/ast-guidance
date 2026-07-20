@@ -1,6 +1,7 @@
 use bon::Builder;
 
-use crate::client::{strip_think_block, LlmClient, LlmConfig};
+use crate::client::{strip_think_block, LlmClient};
+use crate::LlmConfig;
 
 /// Trait for task decomposition — splits a query into subtasks.
 ///
@@ -41,11 +42,11 @@ impl LocalDecomposer {
     pub fn decompose(&self, task: &str) -> Vec<String> {
         let client = LlmClient::with_config(self.config.llm.clone());
         let messages = vec![
-            crate::client::ChatMessage {
+            crate::ChatMessage {
                 role: "system".into(),
                 content: SYSTEM_PROMPT.to_string(),
             },
-            crate::client::ChatMessage {
+            crate::ChatMessage {
                 role: "user".into(),
                 content: task.to_string(),
             },

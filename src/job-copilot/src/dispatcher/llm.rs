@@ -1,7 +1,8 @@
 use std::sync::{Arc, RwLock};
 
 use fluent_concurrency::io::net::NetCapability;
-use guidance_llm::client::{ChatMessage, LlmClient};
+use guidance_llm::client::LlmClient;
+use guidance_llm::ChatMessage;
 
 use crate::profile::Profile;
 use crate::prompt;

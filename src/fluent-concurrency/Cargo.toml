@@ -6,14 +6,16 @@ edition.workspace = true
 [dependencies]
 tokio = { workspace = true }
 fluent-wvr = { path = "../fluent-wvr" }
+serde = { workspace = true }
 serde_json = { workspace = true }
-internment = { workspace = true, features = ["arc", "serde"] }
+bon = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
 common-core = { path = "../common-core", features = ["sqlite"] }
 rusqlite = { workspace = true }
 fastrand = { workspace = true }
+internment = { workspace = true, features = ["arc", "serde"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

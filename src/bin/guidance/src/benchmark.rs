@@ -39,14 +39,17 @@ use std::time::{Duration, Instant};
 
 use common_core::string::contains_ignore_case;
 use common_core::LatencyHistogram;
+use fluent_concurrency::llm_queue::LlmQueueConfig;
 use fluent_concurrency::pool::Limiter;
 use fluent_concurrency::scope::Scope;
+use fluent_concurrency::tokio_runtime;
 use guidance_core::ast_parser;
 use guidance_core::config::ProjectConfig;
 use guidance_core::query::synthesize::Stage;
 use guidance_core::sync::json_store::load_guidance;
 use guidance_core::walk;
-use guidance_llm::{strip_think_block, ChatMessage, LlmClient, LlmConfig};
+use guidance_llm::llm_queue::build_default_queue;
+use guidance_llm::{strip_think_block, ChatMessage, LlmClient, LlmConfig, LlmRequestQueue};
 use guidance_search_vector::db::SearchResult;
 use guidance_search_vector::GuidanceDb;
 use guidance_types::{GuidanceDoc, MemberType, StageKind};
@@ -212,7 +215,15 @@ pub async fn run_benchmark(config: BenchmarkConfig) -> Result<(), BenchmarkError
     };
 
     let llm_client: Option<Arc<LlmClient>> = if !config.no_llm {
-        build_llm_client(&config, &project_cfg).map(Arc::new)
+        let worker_count = config.concurrency.max(1);
+        let queue = build_default_queue(
+            tokio_runtime(),
+            &LlmQueueConfig {
+                worker_count,
+                queue_capacity: 256,
+            },
+        );
+        build_llm_client(&config, &project_cfg, queue).map(Arc::new)
     } else {
         None
     };
@@ -268,19 +279,11 @@ pub async fn run_benchmark(config: BenchmarkConfig) -> Result<(), BenchmarkError
         scope.spawn(async move {
             lim.run(|| async move {
                 let q = query;
-                let outcome = tokio::task::spawn_blocking(move || {
-                    run_one_query(q, llm, db, ws, hist, verbose, debug)
-                })
-                .await;
-
-                let result = match outcome {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(e)) => {
-                        eprintln!("Query {} failed: {e}", idx + 1);
-                        return;
-                    }
+                let result = run_one_query(q, llm, db, ws, hist, verbose, debug).await;
+                let result = match result {
+                    Ok(r) => r,
                     Err(e) => {
-                        eprintln!("Query {} join error: {e}", idx + 1);
+                        eprintln!("Query {} failed: {e}", idx + 1);
                         return;
                     }
                 };
@@ -307,7 +310,7 @@ pub async fn run_benchmark(config: BenchmarkConfig) -> Result<(), BenchmarkError
     Ok(())
 }
 
-fn run_one_query(
+async fn run_one_query(
     query: BenchmarkQuery,
     llm: Option<Arc<LlmClient>>,
     db_path: PathBuf,
@@ -324,8 +327,9 @@ fn run_one_query(
     let (stages, summary) = match llm.as_ref() {
         Some(client) => {
             let reranked = rerank_with_llm(client, &query, &initial_stages, verbose, debug)
+                .await
                 .unwrap_or_else(|| initial_stages.clone());
-            let summary = summarize_with_llm(client, &query, &reranked, verbose, debug);
+            let summary = summarize_with_llm(client, &query, &reranked, verbose, debug).await;
             (reranked, summary)
         }
         None => (initial_stages.clone(), None),
@@ -355,7 +359,9 @@ fn run_one_query(
         )
     } else {
         match llm.as_ref() {
-            Some(client) => evaluate_with_llm(client, &query, &stages, from_db, verbose, debug),
+            Some(client) => {
+                evaluate_with_llm(client, &query, &stages, from_db, verbose, debug).await
+            }
             None => ((None, None, None, None, None), EvaluationStatus::Fallback),
         }
     };
@@ -568,7 +574,7 @@ fn stages_for_llm_prompt(stages: &[Stage]) -> Vec<String> {
 /// indices in the order of decreasing relevance. Falls back to the original
 /// order whenever the LLM is unavailable, fails, or returns an
 /// unparseable response.
-fn rerank_with_llm(
+async fn rerank_with_llm(
     client: &LlmClient,
     query: &BenchmarkQuery,
     stages: &[Stage],
@@ -614,7 +620,7 @@ fn rerank_with_llm(
         role: "user".into(),
         content: prompt,
     }];
-    let response = match client.chat_complete(&messages) {
+    let response = match client.chat_complete_async(&messages).await {
         Ok(text) => strip_think_block(&text),
         Err(e) => {
             if verbose {
@@ -648,7 +654,7 @@ fn rerank_with_llm(
 /// Asks the LLM to summarize the top-N re-ranked stages. The summary is
 /// displayed under each query in the per-query report. Returns `None` when
 /// the LLM is unavailable, returns empty output, or refuses to answer.
-fn summarize_with_llm(
+async fn summarize_with_llm(
     client: &LlmClient,
     query: &BenchmarkQuery,
     stages: &[Stage],
@@ -683,7 +689,7 @@ fn summarize_with_llm(
         role: "user".into(),
         content: prompt,
     }];
-    let response = match client.chat_complete(&messages) {
+    let response = match client.chat_complete_async(&messages).await {
         Ok(text) => strip_think_block(&text),
         Err(e) => {
             if verbose {
@@ -831,7 +837,7 @@ fn locate_guidance_src(db_path: &Path) -> Option<PathBuf> {
     None
 }
 
-fn evaluate_with_llm(
+async fn evaluate_with_llm(
     client: &LlmClient,
     query: &BenchmarkQuery,
     stages: &[Stage],
@@ -924,7 +930,7 @@ fn evaluate_with_llm(
         role: "user".into(),
         content: prompt,
     }];
-    let response = match client.chat_complete(&messages) {
+    let response = match client.chat_complete_async(&messages).await {
         Ok(text) => strip_think_block(&text),
         Err(e) => {
             if verbose {
@@ -1187,7 +1193,11 @@ fn load_project_config(workspace: &Path) -> ProjectConfig {
     guidance_core::config::load_config(workspace).unwrap_or_default()
 }
 
-fn build_llm_client(config: &BenchmarkConfig, project_cfg: &ProjectConfig) -> Option<LlmClient> {
+fn build_llm_client(
+    config: &BenchmarkConfig,
+    project_cfg: &ProjectConfig,
+    queue: Arc<LlmRequestQueue>,
+) -> Option<LlmClient> {
     // 1. Resolve model reference: CLI flag > models.fast > models.default > hardcoded
     let model_ref = config
         .model
@@ -1213,14 +1223,23 @@ fn build_llm_client(config: &BenchmarkConfig, project_cfg: &ProjectConfig) -> Op
         })
         .unwrap_or_else(|| (DEFAULT_LLM_API_URL.to_string(), false));
 
+    // Per-LLM-call timeout. The default of 2000ms in LlmConfig::new() is too
+    // short for a thinking model (e.g. `llama:code`); each rerank/summarize/
+    // evaluate call needs 5-30s of wall time depending on prompt length. We
+    // cap at the benchmark's overall timeout divided by the per-query LLM
+    // call count (3) — anything longer is unlikely to finish inside the
+    // benchmark's `close_graceful` window anyway.
+    let per_call_timeout_ms = (config.timeout.as_millis() as u64 / 3).max(30_000);
+
     let llm_config = LlmConfig::new()
         .api_url(api_url)
         .model(model)
         .think(is_thinking)
+        .timeout_ms(per_call_timeout_ms)
         .debug(config.debug)
         .show_prompts(config.show_prompts)
         .build();
-    Some(LlmClient::with_config(llm_config))
+    Some(LlmClient::with_queue_and_config(queue, llm_config))
 }
 
 fn load_benchmark_queries(guidance_dir: &Path) -> std::io::Result<Vec<BenchmarkQuery>> {

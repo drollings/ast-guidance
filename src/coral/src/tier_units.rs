@@ -3,7 +3,8 @@ use std::sync::{Arc, Weak};
 use fluent_wvr::{
     Component, Describable, FieldAccess, FieldError, WorkContext, WorkError, WorkOutput, WorkUnit,
 };
-use guidance_llm::client::{is_malformed_response, ChatBackend, LlmClient, LlmConfig};
+use guidance_llm::client::{is_malformed_response, ChatBackend, LlmClient};
+use guidance_llm::LlmConfig;
 use guidance_llm::decomposer::Decomposer;
 use internment::ArcIntern;
 
@@ -459,11 +460,11 @@ impl WorkUnit for L5FrontierUnit {
         let query = extract_query(ctx)?;
         let anonymized = guidance_llm::anonymize::anonymize(&query);
         let messages = vec![
-            guidance_llm::client::ChatMessage {
+            guidance_llm::ChatMessage {
                 role: "system".into(),
                 content: "You are a helpful assistant. Answer concisely.".into(),
             },
-            guidance_llm::client::ChatMessage {
+            guidance_llm::ChatMessage {
                 role: "user".into(),
                 content: anonymized,
             },
