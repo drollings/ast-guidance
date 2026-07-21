@@ -12,11 +12,11 @@
 //! // Option 1: explicit close
 //! scope.close().await;
 //!
-//! // Option 2: defer guard — closes on drop (best-effort via spawn)
+//! // Option 2: defer guard — calls close_sync() on drop
 //! let mut scope = Scope::new();
 //! scope.spawn(async { /* work */ });
 //! let _guard = scope.defer();
-//! // _guard calls close().await on drop
+//! // _guard calls close_sync() on drop
 //! # }
 //! ```
 
@@ -129,11 +129,12 @@ impl Scope {
         self.tasks.is_empty()
     }
 
-    /// Returns a `ScopeGuard` that will call `close().await` on drop.
+    /// Returns a `ScopeGuard` that will call `close_sync()` on drop.
     ///
     /// This is the ergonomic alternative to manually calling `close().await`.
-    /// The guard uses `tokio::spawn` to close asynchronously when a runtime
-    /// is available, and falls back to `abort_all()` otherwise.
+    /// The guard calls `close_sync()` synchronously because spawning an async
+    /// close task would create a fire-and-forget task that could itself be
+    /// aborted if the runtime drops.
     pub fn defer(&mut self) -> ScopeGuard<'_> {
         ScopeGuard { scope: self }
     }
@@ -167,9 +168,9 @@ impl Drop for Scope {
     }
 }
 
-/// RAII guard returned by `Scope::defer()`. Calls `close().await` (via
-/// `tokio::spawn`) on drop. If the guard is dropped during a panic unwind
-/// or outside a tokio runtime, it falls back to `abort_all()` (best-effort).
+/// RAII guard returned by `Scope::defer()`. Calls `close_sync()` on drop.
+/// If the guard is dropped during a panic unwind, it falls back to
+/// `abort_all()` (best-effort).
 ///
 /// # Example
 ///

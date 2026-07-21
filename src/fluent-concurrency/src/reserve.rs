@@ -1,3 +1,9 @@
+//! Available primitive: RAII permit on a shared `AtomicUsize`.
+//!
+//! Currently not on the critical path — no in-tree consumer outside its own
+//! tests. Use `Limiter` for "run this with a permit" patterns and `Reserve`
+//! for "acquire now, release later" patterns.
+
 use std::sync::Arc;
 
 /// A RAII permit acquired from a shared `AtomicUsize` counter.

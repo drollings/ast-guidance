@@ -19,11 +19,20 @@ Every unit of work in this system — a DAG target, a WASM plugin, a query strat
 The `Component` supertrait is the concrete expression of this principle:
 
 ```rust
-pub trait Component: FieldAccess + Describable + WorkUnit + Send + Sync {}
+pub trait Component: FieldAccess + Describable + WorkUnit + Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
 
-// Blanket implementation: any type satisfying all bounds is automatically a Component
-impl<T: FieldAccess + Describable + WorkUnit + Send + Sync> Component for T {}
+// `impl_component!` writes the `as_any`/`as_any_mut` body — never hand-roll it.
+impl_component!(MyConfig);
 ```
+
+The `as_any`/`as_any_mut` methods are required for safe downcasting after
+`Arc<dyn Component>` erasure. The `impl_component!` macro eliminates the
+7-line boilerplate (it has a concrete-type arm and a `generic (bounds)`
+arm for wrapper types). See §2 for the full definition and §5 for
+wrapper usage.
 
 This interface is valid for **both compile-time and runtime assembly**:
 
@@ -101,12 +110,59 @@ pub trait Describable {
     fn describe(&self) -> serde_json::Value;
 }
 
+/// Errors produced by `FieldAccess` implementations.
+#[derive(Error, Debug, PartialEq, Eq)]
+pub enum FieldError {
+    #[error("field not found: {0}")]
+    NotFound(String),
+    #[error("field parse error: {0}")]
+    Parse(String),
+    #[error("constraint violation: {0}")]
+    Constraint(String),
+    /// Returned by the `Arc<dyn Component>` blanket `set_field` impl when
+    /// the Arc has multiple owners. Callers who need shared mutation
+    /// should either (a) use `ComponentArcExt::try_as_any_mut` and
+    /// handle `None`, or (b) use a wrapper with interior mutability.
+    #[error("field {0:?} is read-only on a shared Arc: {1}")]
+    ReadOnly(String, String),
+}
+
+/// Optional JSON-Schema-style description of a single field. Returned
+/// by `SchemaProvider::schema`. The derive macro on `FieldAccess` does
+/// **not** auto-generate `SchemaProvider`; implement it explicitly when
+/// MCP tool validation or TUI editors need typed schema metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FieldSchema {
+    pub name: String,
+    pub type_name: String,
+    pub description: Option<String>,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub required: bool,
+    pub format: Option<String>,
+    pub max_len: Option<usize>,
+    pub sanitize: Option<String>,
+    pub pattern: Option<String>,
+}
+pub trait SchemaProvider {
+    fn schema(&self) -> Vec<FieldSchema>;
+}
+
 /// Uniform orchestration interface. Every task the orchestrator executes implements this.
 pub trait WorkUnit: Send + Sync {
     fn name(&self) -> &str;
     fn depends(&self) -> &[ArcIntern<str>];
     fn provides(&self) -> &[ArcIntern<str>];
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError>;
+
+    /// Default per-unit timeout. Override to specialise.
+    /// The `Zone` supervisor reads this via `WorkContext::for_unit` and
+    /// enforces it through `execute_with_timeout_and_retry`.
+    fn default_timeout_ms(&self) -> u64 { 30_000 }
+
+    /// Concrete type name. Default uses `std::any::type_name::<Self>()`
+    /// — useful for logging and metrics aggregation.
+    fn type_name(&self) -> &'static str { std::any::type_name::<Self>() }
 }
 
 /// The unified process boundary. Requires as_any/as_any_mut for runtime
@@ -117,14 +173,149 @@ pub trait Component: FieldAccess + Describable + WorkUnit + Send + Sync {
 }
 
 /// Use the `impl_component!` macro instead of hand-writing `as_any`/`as_any_mut`:
+///
 /// ```ignore
-/// impl_component!(MyConfig);
+/// impl_component!(MyConfig);                       // concrete type
+/// impl_component!(generic (U: Component + 'static) for Instrumented<U>);  // generic
 /// ```
+///
+/// Two arms: the concrete-type form writes `impl Component for $type`
+/// directly; the `generic (bounds) for Type<…>` form writes
+/// `impl <$($generics)*> Component for $type` so wrapper types like
+/// `Instrumented<U>` and `WithRetry<U>` can satisfy the supertrait
+/// without copy-pasting the same body.
 
 /// Free functions for downcasting (no blanket impl — Rust dyn-compatibility).
 pub fn component_downcast_ref<T: 'static>(comp: &dyn Component) -> Option<&T>;
 pub fn component_downcast_mut<T: 'static>(comp: &mut dyn Component) -> Option<&mut T>;
+
+/// Extension trait for safe mutable downcasting through an `Arc<dyn Component>`.
+pub trait ComponentArcExt {
+    fn try_as_any_mut(&mut self) -> Option<&mut dyn Any>;
+}
+impl ComponentArcExt for Arc<dyn Component> {
+    fn try_as_any_mut(&mut self) -> Option<&mut dyn Any> {
+        Arc::get_mut(self).map(Component::as_any_mut)
+    }
+}
+
+/// `Arc<dyn Component>` and `Arc<dyn WorkUnit>` themselves satisfy the
+/// full supertrait surface. The blanket impls in `lib.rs:50-129` make
+/// every `Arc<dyn Component>` callable as a `Component`/`WorkUnit`/
+/// `FieldAccess`/`Describable`. The `set_field` impl returns
+/// `FieldError::ReadOnly(name, reason)` when the `Arc` is shared
+/// (i.e. `Arc::get_mut` returns `None`).
 ```
+
+### Error and output types
+
+`WorkError` and `WorkOutput` are the data flow types for `WorkUnit::execute`.
+
+```rust
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum WorkError {
+    /// Synchronous failure inside `execute`. The `Zone` supervisor
+    /// routes this to `summary.failed` — NOT to `summary.panicked`.
+    #[error("execution failed: {0}")]
+    Execution(String),
+
+    /// Dependency prerequisite could not be satisfied. Used by the
+    /// orchestrator when a `depends()` asset is not yet `provides()`'d.
+    #[error("dependency not satisfied: {0}")]
+    Dependency(String),
+
+    /// Returned by `Zone::execute_with_timeout_and_retry` when the
+    /// wall-clock budget is exhausted. `Zone` routes this to
+    /// `summary.cancelled`, NOT to `summary.failed`.
+    #[error("timeout after {duration_ms}ms ({unit})")]
+    Timeout { duration_ms: u64, unit: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkOutput {
+    pub success: bool,
+    pub message: String,
+    pub data: serde_json::Value,
+}
+
+impl WorkOutput {
+    pub fn ok(message: impl Into<String>) -> Self;
+    pub fn ok_with_data(message: impl Into<String>, data: serde_json::Value) -> Self;
+    pub fn fail(message: impl Into<String>) -> Self;
+
+    /// Serialise a typed value into `data` and return `Ok(Self)`.
+    /// Returns `Err(WorkError::Execution)` on serialisation failure —
+    /// use this for untrusted input.
+    pub fn typed<T: Serialize>(message: impl Into<String>, data: &T)
+        -> Result<Self, WorkError>;
+
+    /// Same as `typed` but panics on serialisation failure. For
+    /// trusted input only.
+    pub fn typed_infallible<T: Serialize>(message: impl Into<String>, data: &T) -> Self;
+
+    /// Deserialise `data` to a typed value (borrows `self`).
+    pub fn data_as<T: for<'de> Deserialize<'de>>(&self) -> Result<T, WorkError>;
+
+    /// Deserialise `data`, consuming `self` — avoids the clone that
+    /// `data_as` requires.
+    pub fn data_take<T: for<'de> Deserialize<'de>>(self) -> Result<T, WorkError>;
+}
+
+impl std::fmt::Display for WorkOutput {
+    // "OK: msg" or "FAIL: msg"
+}
+```
+
+### Execution context
+
+`WorkContext` carries the per-call configuration plus a `Runtime` and
+a `CapabilitySet`. The default uses `NoopRuntime` and an empty
+capability set; `Zone` overrides both at registration time.
+
+```rust
+#[derive(Clone)]
+pub struct WorkContext {
+    pub dry_run: bool,                   // short-circuit mutating handlers
+    pub max_retries: u32,                // 0 = no retry; >0 = Zone retries this many times
+    pub timeout_ms: u64,                 // per-attempt wall-clock budget
+    pub metadata: HashMap<String, MetadataValue>,
+    pub rt: Arc<dyn Runtime>,            // pluggable: TokioRuntime, TestRuntime, NoopRuntime
+    pub caps: CapabilitySet,             // type-erased capability tokens
+}
+
+impl Default for WorkContext { /* dry_run=false, max_retries=0, timeout_ms=30_000, NoopRuntime */ }
+
+impl WorkContext {
+    /// Build a context for a single unit, using its `default_timeout_ms()`.
+    pub fn for_unit(unit: &dyn WorkUnit, caps: CapabilitySet) -> Self;
+
+    /// Build a context that inherits the zone's `rt` and `caps`, with
+    /// optional per-unit overrides via a closure. The intended
+    /// registration-site helper — `Zone::register` uses it internally.
+    pub fn for_unit_in_zone(
+        zone_rt: &Arc<dyn Runtime>,
+        zone_caps: &CapabilitySet,
+        mutate: impl FnOnce(&mut WorkContext),
+    ) -> Self;
+}
+```
+
+### The canonical prelude
+
+```rust
+use fluent_wvr::prelude::*;
+// Brings in: Component, WorkUnit, FieldAccess, Describable, FieldError,
+// WorkContext, WorkError, WorkOutput, Capability, CapabilitySet,
+// impl_component, retry_call, ComponentAdapter, ExecuteFn,
+// Instrumented, WithRetry, MetadataValue, ArcIntern.
+```
+
+> `ComponentArcExt`, `FieldSchema`, `SchemaProvider`, and
+> `PersistableComponent` are **not** in the prelude — they are niche
+> types that should be imported from `fluent_wvr::traits` or
+> `fluent_wvr::capability` when actually needed. The M2 milestone
+> removed them from the prelude because no consumer in the in-tree
+> call graph imported them through the prelude.
 
 > **Critical design note on `field_names` and `describe`:** Both are defined as `&self` instance methods, not static associated functions. This is deliberate: it makes them callable through `dyn Component`. A `fn field_names() -> &'static [&'static str]` associated function is not object-safe and cannot be dispatched through a trait object. Always use the instance method form.
 
@@ -189,7 +380,7 @@ target = Target(name="build", depends=["compile"], provides=["artifact"], essent
 
 `#[derive(bon::Builder)]` generates zero-boilerplate fluent builders. Validation moves to `build()` or a separate `register()` step. The `?` operator replaces error accumulation.
 
-### Canonical implementation: `Target` in `common/src/registry.rs`
+### Canonical implementation: `Target` in `dag/src/target.rs`
 
 ```rust
 use bon::Builder;
@@ -461,29 +652,53 @@ Newtype wrappers around trait implementations. Each wrapper implements the same 
 ```rust
 pub struct Instrumented<U> {
     inner: U,
-    name: &'static str,
+    label: String,                                     // owned, not &'static str
+    histogram: Option<Arc<LatencyHistogram>>,          // optional metrics sink
+}
+
+impl<U: WorkUnit> Instrumented<U> {
+    pub fn new(inner: U, label: impl Into<String>) -> Self { /* … */ }
+    pub fn with_metrics(
+        inner: U, label: impl Into<String>, histogram: Arc<LatencyHistogram>,
+    ) -> Self { /* … */ }
 }
 
 impl<U: WorkUnit> WorkUnit for Instrumented<U> {
-    fn name(&self) -> &str { self.name }
+    fn name(&self) -> &str { self.inner.name() }   // delegates, does NOT shadow
     fn depends(&self) -> &[ArcIntern<str>] { self.inner.depends() }
     fn provides(&self) -> &[ArcIntern<str>] { self.inner.provides() }
 
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
         let start = Instant::now();
         let result = self.inner.execute(ctx);
-        info!(unit = self.name, elapsed_us = start.elapsed().as_micros() as u64);
+        if let Some(ref hist) = self.histogram {
+            hist.observe_duration(start);
+        }
+        info!(target: "instrumented", label = %self.label,
+              elapsed = ?start.elapsed(), name = %self.inner.name(), "executed");
         result
     }
 }
+impl_component!(generic (U: Component + 'static) for Instrumented<U>);
 ```
+
+The wrapper also implements `FieldAccess` (delegates `get_field`/`field_names` to the inner; `set_field` returns `FieldError::NotFound` so callers configure the inner before wrapping) and `Describable` (delegates to inner). The `name()` call passes through to the inner type — `Instrumented` does not rename the unit; it only adds observability.
 
 ### Retry wrapper
 
 ```rust
 pub struct WithRetry<U> {
     inner: U,
-    max_attempts: usize,
+    max_attempts: u32,
+    base_ms: u64,
+    jitter_pct: u32,
+}
+
+impl<U: WorkUnit> WithRetry<U> {
+    pub fn new(inner: U, max_attempts: u32, backoff_ms: u64) -> Self { /* … */ }
+    pub fn new_jittered(
+        inner: U, max_attempts: u32, base_ms: u64, jitter_pct: u32,
+    ) -> Self { /* … */ }
 }
 
 impl<U: WorkUnit> WorkUnit for WithRetry<U> {
@@ -492,19 +707,35 @@ impl<U: WorkUnit> WorkUnit for WithRetry<U> {
     fn provides(&self) -> &[ArcIntern<str>] { self.inner.provides() }
 
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-        for attempt in 0..self.max_attempts {
+        // Linear backoff with configurable jitter; uses std::thread::sleep,
+        // NOT tokio::time::sleep — sync work-unit contract.
+        let mut attempts = 0u32;
+        loop {
+            attempts += 1;
             match self.inner.execute(ctx) {
                 Ok(output) => return Ok(output),
-                Err(e) if attempt + 1 < self.max_attempts => {
-                    std::thread::sleep(Duration::from_millis(10 * (attempt + 1) as u64));
+                Err(e) if attempts < self.max_attempts => {
+                    let jitter = if self.jitter_pct > 0 {
+                        fastrand::u64(0..self.base_ms * self.jitter_pct as u64 / 100)
+                    } else { 0 };
+                    std::thread::sleep(Duration::from_millis(
+                        self.base_ms * attempts as u64 + jitter,
+                    ));
                 }
                 Err(e) => return Err(e),
             }
         }
-        unreachable!()
     }
 }
+impl_component!(generic (U: Component + 'static) for WithRetry<U>);
 ```
+
+`WithRetry` is a **synchronous** retry — it sleeps with `std::thread::sleep`
+inside the executor, which is allowed because `WorkUnit::execute` is
+documented as a sync boundary. For async retry semantics, use the
+`Zone` supervisor (M6) instead, which routes the underlying error to
+`ZoneSummary::failed` and runs `execute` on a fresh task budget per
+attempt.
 
 ### Application at the registration site
 
@@ -512,11 +743,11 @@ Apply wrappers **before** type erasure — this is the only point where the comp
 
 ```rust
 // Compose before type erasure: wraps are inlined
-let unit = Instrumented {
-    inner: WithRetry { inner: MyWorkUnit::new(), max_attempts: 3 },
-    name: "ingest_yago",
-};
-registry.register(Arc::new(unit));  // one vtable boundary total
+let unit = Instrumented::new(
+    WithRetry::new(MyWorkUnit::new(), /* max_attempts: */ 3, /* backoff_ms: */ 50),
+    "ingest_yago",
+);
+registry.push(Arc::new(unit));   // one vtable boundary total
 ```
 
 ### Composition order (outer to inner)
@@ -824,40 +1055,31 @@ process_node(sess);  // Compile error: expected NodeId, found SessionId
 
 An orchestrator (DAG executor, MCP server, WASM plugin host) must execute heterogeneous tasks uniformly. Without a common interface, the orchestrator branches on implementation type.
 
-### Definition in `dag/src/work_unit.rs`
+### Definition
+
+`WorkUnit`, `WorkContext`, `WorkOutput`, and `WorkError` live in
+`fluent-wvr/src/work.rs` and `fluent-wvr/src/traits.rs`. The full
+shapes are listed in §2. The unit-of-work pattern itself is short:
 
 ```rust
-pub struct WorkContext {
-    pub library: Arc<Library>,
-    pub embedder: Arc<dyn EmbeddingProvider>,
-    pub config: WorkConfig,
-    pub input: Vec<u8>,
-}
-
-pub struct WorkOutput {
-    pub success: bool,
-    pub message: String,
-    pub data: serde_json::Value,
-}
-
-impl WorkOutput {
-    pub fn ok(message: impl Into<String>) -> Self;
-    pub fn fail(message: impl Into<String>) -> Self;
-    pub fn typed<T: Serialize>(message: impl Into<String>, data: &T) -> Self;
-    pub fn data_as<T: Deserialize>(&self) -> Result<T, WorkError>;
-}
-
-impl std::fmt::Display for WorkOutput { /* "OK: msg" or "FAIL: msg" */ }
-
 pub trait WorkUnit: Send + Sync {
     fn name(&self) -> &str;
     fn depends(&self) -> &[ArcIntern<str>];
     fn provides(&self) -> &[ArcIntern<str>];
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError>;
+    fn default_timeout_ms(&self) -> u64 { 30_000 }
+    fn type_name(&self) -> &'static str { std::any::type_name::<Self>() }
 }
 ```
 
 ### Implementation: native command
+
+`CommandUnit` in `dag/src/work_unit.rs`. Note that `WorkContext` does
+**not** carry a `library` or `input` field — those belong in
+component-specific configuration or in the `data` payload of
+`WorkOutput`. `WorkError` does not have `ExecutionFailed` or
+`WasmFailed` variants; the only variants are `Execution(String)`,
+`Dependency(String)`, and `Timeout { duration_ms, unit }`.
 
 ```rust
 pub struct CommandUnit {
@@ -873,31 +1095,38 @@ impl WorkUnit for CommandUnit {
     fn provides(&self) -> &[ArcIntern<str>] { &self.provides }
 
     fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+        // Run in a worker thread — never block the executor directly.
         let output = std::process::Command::new("sh")
             .arg("-c")
             .arg(&self.command)
             .output()
-            .map_err(|e| WorkError::ExecutionFailed(e.to_string()))?;
-
-        Ok(WorkOutput {
-            provides: BitVec::new(),
-            output: if output.status.success() { output.stdout } else { output.stderr },
-            success: output.status.success(),
+            .map_err(|e| WorkError::Execution(e.to_string()))?;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        Ok(if output.status.success() {
+            WorkOutput::ok(stdout)
+        } else {
+            WorkOutput::fail(stdout)
         })
     }
 }
+impl FieldAccess for CommandUnit { /* …see derive in §4… */ }
+impl Describable for CommandUnit { /* … */ }
+impl_component!(CommandUnit);
 ```
 
 ### Implementation: WASM plugin bridge
 
-WASM plugins also implement `Component` — including `FieldAccess` and `Describable` — so they are indistinguishable from native Rust implementations at the orchestrator level.
+The real `WasmComponent` (in `coral/src/wasm_runtime.rs`) uses field
+construction, not a `new(plugin, schema)` constructor. `WasmComponent`
+also implements `Component` via `impl_component!` (not via a blanket
+impl — there is no blanket impl).
 
 ```rust
 pub struct WasmComponent {
     name: ArcIntern<str>,
     plugin: Mutex<extism::Plugin>,
     config: Mutex<HashMap<String, String>>,
-    schema: serde_json::Value,  // loaded from plugin at init time
+    schema: serde_json::Value,            // loaded from plugin at init time
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
@@ -908,55 +1137,61 @@ impl WorkUnit for WasmComponent {
     fn provides(&self) -> &[ArcIntern<str>] { &self.provides }
 
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+        // Inputs flow through the `data` payload of `WorkOutput` or
+        // through a side-channel like `ctx.metadata`, not `ctx.input`.
         let mut plugin = self.plugin.lock().unwrap();
-        let result = plugin.call("execute", &ctx.input)
-            .map_err(|e| WorkError::WasmFailed(e.to_string()))?;
+        let payload = ctx.metadata.get("input")
+            .and_then(|v| v.as_str().map(String::as_bytes))
+            .unwrap_or(&[]);
+        let result = plugin.call("execute", payload)
+            .map_err(|e| WorkError::Execution(e.to_string()))?;
         Ok(decode_output(&result)?)
     }
 }
 
 impl FieldAccess for WasmComponent {
     fn set_field(&mut self, name: &str, value: &str) -> Result<(), FieldError> {
-        // Delegate configuration into the WASM plugin's config namespace
         let mut plugin = self.plugin.lock().unwrap();
         plugin.call("set_config", format!("{}={}", name, value).as_bytes())
-            .map_err(|e| FieldError::Parse(format!("wasm set_config failed for '{}': {}", name, e)))?;
+            .map_err(|e| FieldError::Parse(
+                format!("wasm set_config failed for '{}': {}", name, e)
+            ))?;
         self.config.lock().unwrap().insert(name.to_string(), value.to_string());
         Ok(())
     }
-
     fn get_field(&self, name: &str) -> Result<String, FieldError> {
-        self.config.lock().unwrap()
-            .get(name)
-            .cloned()
+        self.config.lock().unwrap().get(name).cloned()
             .ok_or_else(|| FieldError::NotFound(name.into()))
     }
-
-    fn field_names(&self) -> &'static [&'static str] {
-        &[]  // WASM fields are dynamic; inspect describe() for schema
-    }
+    fn field_names(&self) -> &'static [&'static str] { &[] }   // schema is dynamic
 }
 
 impl Describable for WasmComponent {
-    fn describe(&self) -> serde_json::Value {
-        self.schema.clone()  // schema loaded from the WASM plugin at init
-    }
+    fn describe(&self) -> serde_json::Value { self.schema.clone() }
 }
+impl_component!(WasmComponent);
 ```
 
 ### Orchestration — uniform loop
 
+The orchestrator sees a single `Arc<dyn Component>` handle regardless
+of origin. The two key traits at the registration site are `impl_component!`
+(to satisfy the supertrait) and the prelude import.
+
 ```rust
-let mut registry = WorkRegistry::new();
-registry.register(Arc::new(Instrumented {
-    inner: CommandUnit { ... },
-    name: "build",
-}));
-registry.register(Arc::new(WasmComponent { ... }));
+use fluent_wvr::prelude::*;
+
+let mut registry: Vec<Arc<dyn Component>> = Vec::new();
+registry.push(Arc::new(Instrumented::new(
+    CommandUnit { /* … */ },
+    "build",
+)));
+registry.push(Arc::new(WasmComponent { /* … */ }));
 
 // The orchestrator sees one interface regardless of origin:
-for unit in registry.resolve(&["build"])? {
+for unit in &registry {
     let output = unit.execute(&ctx)?;
+    if !output.success { /* … */ }
 }
 ```
 
@@ -964,8 +1199,9 @@ for unit in registry.resolve(&["build"])? {
 
 - **Every orchestratable task implements `WorkUnit`.** No exceptions.
 - **Store as `Arc<dyn WorkUnit>` or `Arc<dyn Component>`** in registries.
-- **Do NOT add methods to `WorkUnit` speculatively.** Start with `name`, `depends`, `provides`, `execute`. Add more only when a second implementation requires it.
-- **For full runtime configurability**, implement all three sub-traits to satisfy `Component`.
+- **Do NOT add methods to `WorkUnit` speculatively.** Start with `name`, `depends`, `provides`, `execute`. Add `default_timeout_ms`/`type_name` overrides only when the second implementation requires it (both have sensible defaults).
+- **For full runtime configurability**, implement all three sub-traits and call `impl_component!` to satisfy the `Component` supertrait.
+- **`execute` MUST be synchronous and non-blocking.** See the purity contract in the `WorkUnit` doc comment — violations defeat the `Zone` timeout/retry invariants.
 
 ---
 
@@ -979,54 +1215,56 @@ When you already have `Arc<dyn WorkUnit>` and need to add logging, retry, or rat
 
 ```rust
 pub trait Middleware: Send + Sync {
-    fn wrap(&self, inner: Arc<dyn WorkUnit>) -> Arc<dyn WorkUnit>;
+    fn wrap(&self, inner: Arc<dyn Component>) -> Arc<dyn Component>;
 }
 
-pub struct TimingMiddleware;
+pub struct TimingMiddleware {
+    histogram: Option<Arc<LatencyHistogram>>,
+}
 
 impl Middleware for TimingMiddleware {
-    fn wrap(&self, inner: Arc<dyn WorkUnit>) -> Arc<dyn WorkUnit> {
-        Arc::new(InstrumentedWorkUnit { inner })
-    }
-}
-
-struct InstrumentedWorkUnit {
-    inner: Arc<dyn WorkUnit>,
-}
-
-impl WorkUnit for InstrumentedWorkUnit {
-    fn name(&self) -> &str { self.inner.name() }
-    fn depends(&self) -> &[ArcIntern<str>] { self.inner.depends() }
-    fn provides(&self) -> &[ArcIntern<str>] { self.inner.provides() }
-
-    fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-        let start = Instant::now();
-        let result = self.inner.execute(ctx);
-        info!(unit = self.inner.name(), elapsed_us = start.elapsed().as_micros() as u64);
-        result
+    fn wrap(&self, inner: Arc<dyn Component>) -> Arc<dyn Component> {
+        match &self.histogram {
+            // The actual implementation reuses `Instrumented::with_metrics`
+            // from fluent-wvr — no parallel `InstrumentedWorkUnit` struct.
+            Some(hist) => Arc::new(Instrumented::with_metrics(
+                inner, "middleware", Arc::clone(hist),
+            )),
+            None => Arc::new(Instrumented::new(inner, "middleware")),
+        }
     }
 }
 ```
+
+`RetryMiddleware` (in the same file) wraps with `WithRetry::new`
+from `fluent-wvr`. The middleware crate does **not** redefine its own
+wrapper types — it composes the canonical ones. The actual
+`TimingMiddleware::with_histogram(histogram)` constructor takes an
+`Arc<LatencyHistogram>`; without one, it produces an `Instrumented`
+that logs via `tracing::info!` only.
 
 ### Stacking middleware
 
 ```rust
-let unit: Arc<dyn WorkUnit> = Arc::new(CommandUnit { ... });
+let unit: Arc<dyn Component> = Arc::new(CommandUnit { ... });
 
-let middleware: Vec<Arc<dyn Middleware>> = vec![
-    Arc::new(TimingMiddleware),
-    Arc::new(RetryMiddleware { max_attempts: 3 }),
-];
+let chain: MiddlewareChain = MiddlewareChain::new()
+    .push(Box::new(TimingMiddleware::new()))
+    .push(Box::new(RetryMiddleware::new(3, 50)));
 
-let wrapped = middleware.into_iter().fold(unit, |u, m| m.wrap(u));
+let wrapped = chain.apply(unit);
 ```
+
+`MiddlewareChain::apply` folds the unit through each layer:
+`result = unit; for mw in &middlewares { result = mw.wrap(result); }`.
 
 ### Rules
 
 - **Prefer newtype wrappers (Pattern 3) when the type is not yet erased.** Middleware adds a vtable call layer; wrappers can be inlined.
-- **Use `Arc<dyn WorkUnit>`**, not `Box`, because middleware may be shared across threads.
+- **Use `Arc<dyn Component>`**, not `Box`, because middleware may be shared across threads.
 - **Apply middleware at registration time**, not at execution time.
 - **Each middleware layer adds one vtable dispatch.** Minimize layers on hot paths.
+- **Reuse `Instrumented` and `WithRetry` from fluent-wvr.** Do not define parallel wrapper types inside `dag` — the whole point of fluent-wvr is the single source of truth.
 
 ---
 
@@ -1036,105 +1274,147 @@ let wrapped = middleware.into_iter().fold(unit, |u, m| m.wrap(u));
 
 When adaptation decisions are made at runtime — renaming a component, overriding its execution behavior, or bridging between interfaces — you cannot use compile-time generics.
 
-### Definition in `dag/src/adapter.rs`
+### Definition in `fluent-wvr/src/wrapper.rs`
+
+`ComponentAdapter` wraps any `Arc<dyn Component>` and lets callers
+override `name`, `execute`, and field values at runtime. The
+overrides stack — calling `with_field_override` twice with the same
+key keeps the most recently set value.
 
 ```rust
+/// Type alias used by `with_execute_override`. The closure must be
+/// `Send + Sync + 'static` because the adapter is shared across threads.
+pub type ExecuteFn =
+    Arc<dyn Fn(&WorkContext) -> Result<WorkOutput, WorkError> + Send + Sync>;
+
 pub struct ComponentAdapter {
     inner: Arc<dyn Component>,
-    execute_fn: Option<Arc<dyn Fn(&WorkContext) -> Result<WorkOutput, WorkError> + Send + Sync>>,
-    name_override: Option<ArcIntern<str>>,
-    schema_override: Option<serde_json::Value>,
+    name_override: Option<String>,
+    execute_override: Option<ExecuteFn>,
+    field_overrides: HashMap<String, String>,
 }
 
 impl ComponentAdapter {
-    pub fn new(inner: Arc<dyn Component>) -> Self {
-        Self { inner, execute_fn: None, name_override: None, schema_override: None }
-    }
+    pub fn new(inner: Arc<dyn Component>) -> Self { /* all None */ }
 
-    pub fn with_execute<F>(mut self, f: F) -> Self
-    where F: Fn(&WorkContext) -> Result<WorkOutput, WorkError> + Send + Sync + 'static {
-        self.execute_fn = Some(Arc::new(f));
-        self
-    }
+    /// Rename the component. `WorkUnit::name()` returns this when set.
+    #[must_use]
+    pub fn with_name_override(mut self, name: impl Into<String>) -> Self;
 
-    pub fn with_name(mut self, name: ArcIntern<str>) -> Self {
-        self.name_override = Some(name);
-        self
-    }
+    /// Replace `execute` with a custom handler — useful for test
+    /// doubles, memoised fast paths, or policy enforcement layers.
+    /// Pass an `Arc::new(|ctx| ...)` (not a bare closure).
+    #[must_use]
+    pub fn with_execute_override(mut self, f: ExecuteFn) -> Self;
 
-    pub fn with_schema(mut self, schema: serde_json::Value) -> Self {
-        self.schema_override = Some(schema);
-        self
-    }
+    /// Add one field override. Re-setting the same key keeps the new value.
+    #[must_use]
+    pub fn with_field_override(self, name: impl Into<String>, value: impl Into<String>) -> Self;
+
+    /// Bulk-set from a `HashMap`. Existing keys are replaced.
+    #[must_use]
+    pub fn with_field_overrides(mut self, overrides: HashMap<String, String>) -> Self;
+
+    /// Drop all field overrides. After this call, `get_field` falls
+    /// through to `self.inner`.
+    pub fn clear_field_overrides(&mut self);
+
+    /// Borrow the wrapped component.
+    pub fn inner(&self) -> &Arc<dyn Component>;
 }
 ```
 
-`ComponentAdapter` must implement all three sub-traits to remain a `Component`:
+`ComponentAdapter` must implement all three sub-traits to remain a
+`Component`. Note the `set_field` semantics: it propagates the inner
+error when the inner has the field but rejects it, and it stores the
+override only after the inner accepts the value.
 
 ```rust
 impl FieldAccess for ComponentAdapter {
     fn set_field(&mut self, name: &str, value: &str) -> Result<(), FieldError> {
-        // Adapters typically delegate field access to the inner component.
-        // To delegate to an Arc<dyn Component>, the inner must expose
-        // interior mutability (e.g. WasmComponent uses Mutex internally).
-        // If the inner type requires &mut self, configure it before wrapping.
-        self.inner.get_field(name).and_then(|_| {
-            Err(FieldError::NotFound(format!("{}: read-only adapter", name)))
-        })
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.set_field(name, value)?;   // inner validates; on Err, the
+                                              // override below is NOT stored
+        }
+        self.field_overrides.insert(name.into(), value.into());
+        Ok(())
     }
-
     fn get_field(&self, name: &str) -> Result<String, FieldError> {
+        if let Some(v) = self.field_overrides.get(name) {
+            return Ok(v.clone());
+        }
         self.inner.get_field(name)
     }
-
     fn field_names(&self) -> &'static [&'static str] {
-        self.inner.field_names()
+        self.inner.field_names()      // never returns the override set
     }
 }
 
 impl Describable for ComponentAdapter {
     fn describe(&self) -> serde_json::Value {
-        self.schema_override.clone().unwrap_or_else(|| self.inner.describe())
+        let mut schema = self.inner.describe();
+        if let Some(name) = &self.name_override {
+            schema["name"] = serde_json::Value::String(name.clone());
+        }
+        if !self.field_overrides.is_empty() {
+            let mut pairs: Vec<(&String, &String)> =
+                self.field_overrides.iter().collect();
+            pairs.sort_by(|a, b| a.0.cmp(b.0));
+            schema["field_overrides"] = serde_json::json!(
+                pairs.into_iter()
+                     .map(|(k, v)| vec![k.clone(), v.clone()])
+                     .collect::<Vec<_>>()
+            );
+        }
+        schema["adapted"] = serde_json::Value::Bool(true);
+        schema
     }
 }
 
 impl WorkUnit for ComponentAdapter {
     fn name(&self) -> &str {
-        self.name_override.as_deref().unwrap_or_else(|| self.inner.name())
+        self.name_override.as_deref()
+            .unwrap_or_else(|| self.inner.name())
     }
     fn depends(&self) -> &[ArcIntern<str>] { self.inner.depends() }
     fn provides(&self) -> &[ArcIntern<str>] { self.inner.provides() }
 
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-        match &self.execute_fn {
+        match &self.execute_override {
             Some(f) => f(ctx),
             None    => self.inner.execute(ctx),
         }
     }
 }
+impl_component!(ComponentAdapter);   // <-- required, not a blanket impl
 ```
 
 ### Usage: adapting a WASM plugin
 
 ```rust
-let wasm_unit: Arc<dyn Component> = Arc::new(WasmComponent { ... });
+use std::sync::Arc;
+use fluent_wvr::prelude::*;
+
+let wasm_unit: Arc<dyn Component> = Arc::new(WasmComponent { /* … */ });
 
 let adapted = Arc::new(
     ComponentAdapter::new(wasm_unit)
-        .with_name("custom_name".into())
-        .with_execute(|ctx| Ok(WorkOutput { ... }))
-        .with_schema(serde_json::json!({ "type": "object", "properties": {} }))
+        .with_name_override("custom_name")
+        .with_execute_override(Arc::new(|_ctx| {
+            Ok(WorkOutput::ok("overridden by adapter"))
+        }))
+        .with_field_override("port", "8080"),
 );
 
-registry.register(adapted);
+registry.push(adapted);
 ```
 
 ### Rules
 
 - **Use when adaptation decisions are made at runtime.** For compile-time adaptation, use newtype wrappers.
-- **Adapters implement `Component`**, so they store in the same registry as any other component.
-- **Delegate to the inner component** for all methods you don't override.
-- **`set_field` on an adapter is intentionally limited.** Configure the inner component before wrapping if mutation is needed.
+- **Adapters implement `Component`** via `impl_component!(ComponentAdapter)`, so they store in the same registry as any other component.
+- **Delegate to the inner component** for all methods you don't override — `depends`, `provides`, `field_names`, and `get_field` (when no override is set) all fall through.
+- **`set_field` validates against the inner first, then stores.** If `Arc::get_mut(&mut self.inner)` returns `None`, the override is stored silently — the inner sees the value on the next call only if the inner has interior mutability. If the inner rejects the value, the override is *not* stored.
 - **`get_field` falls back to the inner component** when no override exists for the requested field.
 
 ---
@@ -1158,14 +1438,14 @@ component.set_field("port", "9000")?;
 component.set_field("verbose", "true")?;
 
 // 3. Wrap: add cross-cutting concerns before type erasure (inlineable)
-let wrapped = Instrumented {
-    inner: WithRetry { inner: component, max_attempts: 3 },
-    name: "my_tool",
-};
+let wrapped = Instrumented::new(
+    WithRetry::new(component, /* max_attempts: */ 3, /* backoff_ms: */ 50),
+    "my_tool",
+);
 
 // 4. Erase to Arc<dyn Component>: uniform handle from this point on
 let handle: Arc<dyn Component> = Arc::new(wrapped);
-registry.register(handle.clone());
+registry.push(handle.clone());
 
 // 5. Execute uniformly
 let output = handle.execute(&ctx)?;
@@ -1185,12 +1465,18 @@ let plugin = extism::Plugin::new(wasm_bytes)?;
 let schema_bytes = plugin.call("get_schema", &[])?;
 let schema: serde_json::Value = serde_json::from_slice(&schema_bytes)?;
 
-// 2. Bridge into Component interface
-let wasm_comp = WasmComponent::new(plugin, schema);
+// 2. Bridge into Component interface (field construction — no `new` constructor)
+let mut wasm_comp = WasmComponent {
+    name: ArcIntern::from("my_tool"),
+    plugin: Mutex::new(plugin),
+    config: Mutex::new(HashMap::new()),
+    schema,
+    depends: vec![],
+    provides: vec![],
+};
 
 // 3. Configure by name (delegates into the WASM plugin)
 // Note: WasmComponent uses interior mutability, so this works on &mut self
-let mut wasm_comp = wasm_comp;
 wasm_comp.set_field("timeout_ms", "5000")?;
 
 // 4. Erase to Arc<dyn Component>: same uniform handle as the Rust struct case
@@ -1221,7 +1507,7 @@ let output = handle.execute(&ctx)?;
 
 ### Key guarantee
 
-In all three cases — Rust struct, WASM plugin, database config — the orchestrator sees the same five operations through the same `Arc<dyn Component>` handle: `execute`, `get_field`, `set_field`, `field_names`, `describe`. No branching on origin.
+In all three cases — Rust struct, WASM plugin, database config — the orchestrator sees the same six operations through the same `Arc<dyn Component>` handle: `execute`, `get_field`, `set_field`, `field_names`, `describe`, and `as_any` (for runtime downcasting). No branching on origin.
 
 ---
 
@@ -1264,11 +1550,25 @@ let p99 = histogram.estimate_percentile(99.0);
 println!("p50={p50}ms p99={p99}ms total={}ms", histogram.sum_ms());
 ```
 
-**Production consumer:** Coral's `QueueReactor` wraps each tier
-(`L3GraphUnit`, `L4SemanticUnit`, `L5FrontierUnit`) in
-`Instrumented::with_metrics` before type erasure into `Arc<dyn
-Component>`. The histograms are exposed via the `coral_stats` MCP
-method, returning aggregated p50/p99/count/sum across all tiers.
+**Production consumer:** The `with_metrics` wrapper is wired into
+three sites in the workspace:
+
+1. `coral/src/cache_reactor.rs:100,113,125,142` — Coral's `QueueReactor`
+   wraps each cache tier (`L2WasmUnit`, `L3GraphUnit`, `L4SemanticUnit`,
+   `L5FrontierUnit`) in `Instrumented::with_metrics(adapted, label, hist)`
+   before erasing to `Arc<dyn Component>`. The histograms are exposed
+   via the `coral_stats` MCP method, returning aggregated p50/p99/count/sum
+   per tier.
+
+2. `dag/src/middleware.rs:37,42` — `TimingMiddleware` wraps an
+   `Arc<dyn Component>` in `Instrumented::with_metrics` when a histogram
+   is provided, falling back to `Instrumented::new` otherwise.
+
+3. `job-copilot/src/server/handler.rs:882` — per-component instrumentation
+   for form analysis.
+
+A consumer test that exercises the histogram path end-to-end lives in
+`wrapper.rs:619-637` (`instrumented_with_metrics_records_duration`).
 
 ### Key properties
 
@@ -1291,12 +1591,12 @@ The patterns are not independently beneficial — their value multiplies when co
 | Pattern | Produces | Consumed by |
 |---------|----------|-------------|
 | Fluent Builder | Fully-configured owned object | Trait Composition (wrap before erasure) |
-| Trait-Based Reflection | `FieldAccess` + `Describable` | Component supertrait blanket impl |
+| Trait-Based Reflection | `FieldAccess` + `Describable` | `Component` supertrait (via `impl_component!`) |
 | Trait Composition | Instrumented concrete type | Trait Object (erase after wrapping) |
 | Trait Objects | `Arc<dyn Component>` uniform handle | Middleware Chain, Component Adapter, registry |
 | Scoped Ownership | RAII-managed intermediates | Binary IPC payload lifetime |
 | Newtype Handles | Distinct integer types | Trait Object registries (prevent ID confusion) |
-| Unit of Work | `WorkUnit` impl | Component blanket impl, registry |
+| Unit of Work | `WorkUnit` impl | `Component` supertrait (via `impl_component!`), registry |
 | Middleware Chain | Wrapped `Arc<dyn WorkUnit>` | Registry, orchestrator |
 | Component Adapter | Runtime-adapted `Arc<dyn Component>` | Registry, orchestrator |
 | Structured Logging Context | Request-scoped observability | All handler entry points |
@@ -1353,8 +1653,44 @@ pub struct WasmComponent { plugin: Mutex<extism::Plugin>, schema: serde_json::Va
 impl WorkUnit for WasmComponent { ... }
 impl FieldAccess for WasmComponent { ... }
 impl Describable for WasmComponent { ... }
-// WasmComponent is automatically a Component via the blanket impl
+impl_component!(WasmComponent);   // <-- required; there is no blanket impl
 ```
+
+### ❌ Hand-rolling `as_any`/`as_any_mut`
+
+The `Component` supertrait requires the two `Any` methods. The
+7-line body is identical for every type:
+
+```rust
+// Wrong: boilerplate at every implementation site
+impl Component for MyType {
+    fn as_any(&self) -> &dyn Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+}
+
+// Right: one line restores the "blanket-impl feel"
+impl_component!(MyType);
+
+// And for wrapper types:
+impl_component!(generic (U: Component + 'static) for Instrumented<U>);
+```
+
+There is **no blanket `impl<T: FieldAccess + Describable + WorkUnit +
+Send + Sync> Component for T`**. The blanket impl is unsound because it
+collides with `impl Component for Arc<dyn Component>` (every trait
+object would then be a `Component` twice). The `impl_component!` macro
+is the canonical mechanism; if a second consumer materializes that
+needs a different style, the macro is the extension point.
+
+### ❌ Parallel trait hierarchies
+
+Do not invent a second `as_any`/`as_any_mut` pair (or any second
+`Component`-shaped trait) inside a sub-crate. This is what
+`guidance-content-node` does today — its `ContentNode` trait
+(`node.rs:28-39`) duplicates the `Component` supertrait surface. New
+code should either (a) depend on `fluent-wvr` and implement
+`Component` directly, or (b) extend `ContentNode` only when the
+content-specific methods cannot be expressed on `Component`.
 
 ### ❌ `dyn Trait` with only one implementation
 
@@ -1527,12 +1863,16 @@ Do you need to adapt component behavior at runtime?
 | `serde` | Stateless serialization — zero contention |
 | `FieldAccess` on Rust structs | Requires `&mut self` — configure before sharing |
 | `FieldAccess` on WASM/dynamic | Interior mutability (`Mutex`) inside the impl |
+| `FieldAccess` on shared `Arc<dyn Component>` | `Arc::get_mut` succeeds only with exclusive ownership; the blanket impl returns `FieldError::ReadOnly` otherwise. Use `ComponentArcExt::try_as_any_mut` for safe fallback. |
 | Newtype wrappers | No state — no contention |
 | `bon::Builder` | Per-request, lock-free until `build()` |
 | Scoped ownership | Stack-local — no sharing |
 | `WorkUnit` | `Send + Sync` required; implementors must be thread-safe |
 | `Middleware` | `Send + Sync` required; stateless middleware is zero-contention |
 | `ComponentAdapter` | `Send + Sync` required; closures must be `Send + Sync` |
+| `Scope` (`fluent-concurrency`) | Holds a `JoinSet` internally; not `Sync`. Use `Scope::defer()` to guarantee cleanup on drop. Dropping without `close().await` panics (a structured-concurrency violation). |
+| `Zone` (`fluent-concurrency`) | Holds a `JoinSet` and a per-zone `Runtime` reference. `Zone::register` returns `Result<&mut Self, ZoneError>` — duplicate names are rejected with `Err(ZoneError::DuplicateName(_))`. |
+| `Reserve` (`fluent-concurrency`) | RAII permit from a shared `AtomicUsize` counter. `Send + Sync` because the counter is `Arc`-shared. Drop without `commit()` returns the permit; `commit()` consumes it permanently. |
 | `LogContext` | Thread-local — no synchronization needed |
 
 ### Detailed rules
@@ -1648,25 +1988,29 @@ if version != BINARY_SCHEMA_VERSION {
 
 When writing new code in `rust-src/`:
 
-1. **Check the source first.** Run `guidance explain "<topic>"` before writing. Check `common/src/registry.rs` for builders, `common/src/embeddings.rs` for trait objects, `wasm_ipc/src/lib.rs` for binary IPC.
+1. **Check the source first.** Run `guidance explain "<topic>"` before writing. Check `dag/src/target.rs` for builders, `coral/src/tier_units.rs` for trait objects, `wasm_ipc/src/lib.rs` for binary IPC, `fluent-wvr/src/wrapper.rs` for adapters and wrappers.
 
 2. **New multi-parameter construction** → `#[derive(bon::Builder)]`. Use `#[builder(default)]` for optional fields. Never write manual builders.
 
 3. **New boundary serialization** → `#[derive(Serialize, Deserialize)]` with `#[serde(default)]` and `#[serde(skip_serializing_if = "Option::is_none")]`.
 
-4. **New runtime-configurable component** → Implement `FieldAccess` (instance method `field_names(&self)`), `Describable` (instance method `describe(&self)`), and `WorkUnit`. The blanket impl makes it a `Component` automatically. Both `field_names` and `describe` **must be instance methods** for trait-object dispatch to work.
+4. **New runtime-configurable component** → Implement `FieldAccess` (instance method `field_names(&self)`), `Describable` (instance method `describe(&self)`), and `WorkUnit`. Then add `impl_component!(MyType);` after the three impls. There is **no blanket impl** — `impl_component!` is the canonical way to satisfy the supertrait. Both `field_names` and `describe` **must be instance methods** for trait-object dispatch to work.
 
-5. **New cross-cutting logic** → Newtype wrapper **before type erasure** (Pattern 3). If the type is already erased, use Middleware (Pattern 9). Never wrap after type erasure.
+5. **New cross-cutting logic** → Newtype wrapper **before type erasure** (Pattern 3). If the type is already erased, use Middleware (Pattern 9). Never wrap after type erasure. The canonical wrappers are `Instrumented::new(inner, label)` (timing/observability) and `WithRetry::new(inner, max_attempts, backoff_ms)` (sync retry with jittered backoff).
 
 6. **New subsystem with multiple implementations** → Define a trait with `Send + Sync`. Store as `Arc<dyn Trait>`. Never use `dyn Trait` with only one implementation.
 
 7. **New WASM/binary IPC type** → `#[repr(C, packed)]` + explicit `to_le_bytes()` / `from_le_bytes()`. Validate magic + version first. Never `transmute`.
 
-8. **New batch-processing loop** → Scoped function with local `Vec`s. RAII drops everything at scope exit.
+8. **New batch-processing loop** → Scoped function with local `Vec`s. RAII drops everything at scope exit. For long-lived async groups, use `Scope::defer()` instead of manually calling `close().await`; dropping a `Scope` without closing panics.
 
-9. **New orchestratable task** → Implement `WorkUnit`. For runtime configurability, add `FieldAccess` + `Describable` to become a `Component`. Store as `Arc<dyn Component>`.
+9. **New orchestratable task** → Implement `WorkUnit`. For runtime configurability, add `FieldAccess` + `Describable` and call `impl_component!` to become a `Component`. Store as `Arc<dyn Component>`. Use `Zone::register` (returns `Result<&mut Self, ZoneError>`) to participate in a `Zone` — the supervisor handles timeout, retry, and panic/fail distinct tracking.
 
-10. **New request-scoped observability** → `LogContext::set()` at request entry. `Scope::begin()` / `Scope::end()` for timing. `call_logged()` for single-expression calls. Always clear context on exit.
+10. **New request-scoped observability** → Wrap the unit in `Instrumented::with_metrics(inner, label, histogram)`. The histogram is `Arc<common_core::metrics::LatencyHistogram>`; p50/p99/count/sum are queryable after `execute`.
+
+11. **New runtime adaptation** → Use `ComponentAdapter::new(arc).with_name_override("...").with_field_override("k", "v")` to layer runtime decisions on top of an existing `Component` without modifying it.
+
+12. **New test component** → Use `fluent_wvr_testutil::StubComponent` for `ok`/`fail`/`panic`/`with_dep`/`with_provides`/`with_handler` builders. Avoid hand-rolled `WorkUnit + FieldAccess + Describable + impl_component!` quads in test code.
 
 ### Never do these
 
@@ -1692,17 +2036,62 @@ When writing new code in `rust-src/`:
 
 21. **Never define `field_names` or `describe` as static associated functions.** They must be `&self` instance methods for trait-object dispatch.
 
+22. **Never hand-write `as_any`/`as_any_mut`.** Use `impl_component!`.
+
+23. **Never drop a `Scope` without closing.** Use `Scope::defer()` or `scope.close().await` — drop without close panics.
+
+24. **Never treat `WorkError::Execution` as a panic.** Handler errors land in `ZoneSummary::failed`; only `JoinError::is_panic()` lands in `panicked`.
+
+### The throwaway rule
+
+25. **Never add a new public API surface (function, type, error variant, or builder helper) without at least one in-tree production consumer.** The codebase has a documented rule against throwaway additions — three APIs shipped in a prior roadmap cycle (`Reserve`, `FieldError::ReadOnly`, `WorkContext::for_unit_in_zone`) had no production consumer on landing. The cost shows up in unused code paths, surprise behaviour, and dead documentation. If a feature must ship ahead of its consumer, file a tracking issue and link it from the API's doc comment.
+
 ### Verification
 
-22. **Run `cargo clippy` before finishing.** The project enforces `#![deny(warnings)]`.
+28. **Run `cargo clippy --workspace -- -D warnings` before finishing.** The project enforces `#![deny(warnings)]`. (Pre-existing `uninlined_format_args` warnings at `fluent-wvr/src/work.rs:278,284` are grandfathered — do not introduce more.)
 
-23. **Run `cargo test` before finishing.** All 448 tests must pass.
+29. **Run `cargo test --workspace` before finishing.** All 1213 tests must pass.
 
-24. **Check for `unsafe` blocks.** The project has only 7 `unsafe` blocks (3 packed struct reads in `wasm_ipc`, 4 libc ioctl in `terminal.rs`). Every new `unsafe` block must be justified and documented.
+30. **Check for `unsafe` blocks.** The workspace has 3 `unsafe` blocks, all in `wasm_ipc/src/lib.rs` for `read_unaligned` of packed struct fields. Every new `unsafe` block must be justified and documented; the `forbid(unsafe_code)` lint is set at the crate level for both `fluent-wvr` and `fluent-concurrency`.
+
+31. **Run `cargo doc --workspace --no-deps` before finishing.** Doc warnings are part of the quality bar.
 
 ---
 
-## 21. Future Work — MCP Handler as WorkUnit
+## 21. Companion crate: `fluent-concurrency`
+
+The trait framework in `fluent-wvr` is paired with a structured-concurrency
+runtime in `fluent-concurrency`. The full surface is documented in
+`doc/skills/fluent-concurrency/SKILL.md`. The high-level primitives are:
+
+| Primitive | File | Purpose |
+|-----------|------|---------|
+| `Runtime` (trait) | `fluent-concurrency/src/runtime/` | Pluggable backend: `TokioRuntime` (production), `TestRuntime` (deterministic, paused-time), `NoopRuntime` (in `fluent-wvr/src/runtime.rs`, init-only) |
+| `Capability` + `CapabilitySet` | `fluent-wvr/src/capability.rs` | Type-map of capability tokens; `with`/`get`/`remove`/`remove_as`/`contains`/`iter`/`len`/`is_empty` |
+| `Scope` | `fluent-concurrency/src/scope.rs` | Structured concurrency; `spawn` + `close().await` or `defer()`; drop-without-close panics |
+| `Zone` | `fluent-concurrency/src/zone.rs` | `Scope` + dependency graph + panic/fail/cancel distinct tracking; `ZoneSummary { completed, panicked, failed, cancelled }`; `Zone::register` returns `Result<_, ZoneError>`; `ZoneError::DuplicateName` |
+| `WorkerPool<T>` | `fluent-concurrency/src/pool.rs` | Bounded FIFO worker pool; capacity + backpressure |
+| `ResultPool<T, R, E>` | `fluent-concurrency/src/pool.rs` | Worker pool that returns a typed `Result<R, ResultPoolError<E>>`; `ResultPoolError` is `Inner(E) \| Canceled \| Pool(PoolError)` |
+| `PriorityResultPool<T, R, E>` | `fluent-concurrency/src/pool.rs` | Priority-ordered variant; workers drain fully before blocking on `Notify`; `submit` uses `notify_waiters` to avoid wakeup collapse |
+| `Limiter` | `fluent-concurrency/src/pool.rs` | Concurrency cap (N-at-a-time), no queue |
+| `Queue<T>` | `fluent-concurrency/src/queue.rs` | Bounded async FIFO; `PoolError::Full` on overflow |
+| `PriorityQueue<T>` | `fluent-concurrency/src/queue.rs` | O(log P) for distinct priorities, O(1) for all-zero fast path |
+| `PartitionedRouter<K, J>` | `fluent-concurrency/src/router.rs` | Hash-based sharding; preserves causal ordering per key |
+| `CreditFlow` | `fluent-concurrency/src/flow.rs` | Sender/receiver backpressure with `CreditSpec { initial, more_after }` |
+| `Reserve` | `fluent-concurrency/src/reserve.rs` | RAII permit from a shared `AtomicUsize`; `try_acquire`/`commit`; **currently has no in-tree production consumer** (throwaway rule candidate) |
+
+A `Zone` is a `Scope` plus the `WorkUnit` integration: tasks implement
+`Component` and are registered with `zone.register(arc).unwrap()`.
+The `Zone` runs each unit through `execute_with_timeout_and_retry`
+using the per-unit `default_timeout_ms()` and the zone-wide
+`max_retries`/`timeout_ms` set on the `WorkContext`. The four-way
+summary discriminates: `Ok(_)` → `completed`, `Err(WorkError::*)` →
+`failed`, `JoinError::is_panic()` → `panicked`, `JoinError::is_cancelled()`
+or `Timeout` → `cancelled` (with `CancelReason::{Timeout, DependencyFailed, Aborted}`).
+
+---
+
+## 22. Future Work — MCP Handler as WorkUnit
 
 An MCP method handler (e.g. `coral_query`, `guidance_explain`) is a natural `WorkUnit`: the method name maps to `name()`, and the dispatch body maps to `execute()`. Converting MCP handlers to `WorkUnit` implementations would allow them to participate in the DAG orchestration pipeline, middleware chains, and `Instrumented`/`WithRetry` wrappers.
 

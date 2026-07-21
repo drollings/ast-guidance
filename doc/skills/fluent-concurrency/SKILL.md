@@ -15,71 +15,324 @@ This document specifies `fluent-concurrency`, a thin, safe, composable extension
 | Question | Resolution | Rationale |
 |----------|------------|-----------|
 | **Q1 — Supervision restart** | **Containment-only.** A `Zone` catches task panics, emits a typed `ZoneEvent`, and cancels dependent tasks. It does **not** automatically restart. | Restarting async tasks from arbitrary state is a checkpoint-semantics problem. RabbitMQ's `supervisor2` gets away with it because Erlang processes are stateless on restart. Rust async tasks carry arbitrary stack state; automatic restart is a trap. We add restart only when profiling proves it necessary. |
-| **Q2 — Capability granularity** | **Per-scope establishment with task-local inheritance.** Entering a `Zone` or `Scope` installs a `CapabilitySet` into a `tokio::task_local!`. All `spawn` calls within the scope capture the current set and reinstall it in the child task. | Per-call `&Capability` at every `spawn` site adds ceremony without meaningful security gain when zone boundaries are already enforced. Effect *entry points* (e.g., `fs::read`, `db::query`) still require an explicit `&Capability` parameter in their signature. |
-| **Q3 — Deterministic testing** | **Both, phased.** The `Runtime` trait supports a `TestRuntime` that uses Tokio's `start_paused` virtual time + a deterministic `Rng` seed for **record-replay**. For **combinatorial exploration**, the trait is designed to swap in a future `LoomRuntime` backend. The initial stack ships record-replay; loom integration is a future primitive. | A full loom-compatible async executor is a research project. Shipping it now would violate the "no academic abstraction inflation" red flag. The trait boundary is wide enough to add it later without breaking user code. |
+| **Q2 — Capability granularity** | **Per-scope establishment with task-local inheritance.** Entering a `Scope` (which the `Zone` builds on top of) installs a `CapabilitySet` into `tokio::task_local! CURRENT_CAPS`. All `Scope::spawn` calls capture the current set and reinstall it in the child task via `CURRENT_CAPS.scope(caps, future)`. | Per-call `&Capability` at every `spawn` site adds ceremony without meaningful security gain when scope boundaries are already enforced. Effect *entry points* (e.g., `fs::read`, `db::query`) still require an explicit `&Capability` parameter in their signature, and the gating check (`check_capability`) reads `CURRENT_CAPS.try_with` to enforce presence. |
+| **Q3 — Deterministic testing** | **Both, phased.** The `Runtime` trait supports a `TestRuntime` that uses Tokio's `start_paused` virtual time + a seeded `fastrand::Rng` for **record-replay**. For **combinatorial exploration**, the trait is designed to swap in a future `LoomRuntime` backend. The initial stack ships record-replay; loom integration is a future primitive. | A full loom-compatible async executor is a research project. Shipping it now would violate the "no academic abstraction inflation" red flag. The trait boundary is wide enough to add it later without breaking user code. |
 
 ## 3. Core Primitives
 
+The crate exports the following modules from `src/lib.rs:3-13`:
+
+```text
+capability  flow  io  llm_queue  pool  queue  reserve  router  runtime  scope  zone
+```
+
+Each is described below. The 9 spec primitives are in §3.1–§3.9; the bonus primitives (`ResultPool`, `PriorityResultPool`, `Reserve`, `LlmRequestQueue`) are in §3.10.
+
 ### 3.1 `Capability` — Bounded Resource Access
 
-Every high-overhead effect (file system, database, AI inference endpoint, blocking thread pool) requires a non-cloneable capability token.
+Every high-overhead effect (file system, database, AI inference endpoint, blocking thread pool) requires a non-cloneable capability token. The `Capability` trait (defined in `fluent-wvr::capability`) and the `CapabilitySet` typed-map container (also in `fluent-wvr`) form the abstract layer. This crate provides the concrete tokens and the gating.
+
+**Concrete capability tokens** (`src/io/`):
+
+- `FsCapability` — gates `tokio::fs::{read, write, metadata}`. Constructed via `FsCapability::new()`.
+- `NetCapability` — wraps a `reqwest::Client` configured via `NetConfig { max_idle_per_host, idle_timeout, connect_timeout, request_timeout, user_agent }`. Constructed via `NetCapability::new()` or `with_config(&NetConfig)`. Exposes `http_get`, `http_post`, `tcp_connect`, and the raw `client()`.
+- `DbCapability` — opens a 5-connection `rusqlite` pool with WAL mode enabled. Constructed via `DbCapability::open(path)`. Exposes `query(sql) -> Vec<HashMap<String, String>>` and `execute(sql) -> usize`, both of which `spawn_blocking` the synchronous `rusqlite` work and return a `PooledConnection` (RAII; the connection returns to the pool on `Drop`).
+
+**Helpers** (`capability.rs`):
+
+- `default_capability_set() -> CapabilitySet` — pre-populated with `FsCapability` and `NetCapability`.
+- `capability_set_with_db(path) -> Result<CapabilitySet, IoError>` — also adds a `DbCapability` rooted at `path`.
+
+**Gating** (`io/mod.rs:37-46`): `check_capability<C: Capability>(cap: &C)` reads `CURRENT_CAPS.try_with(|caps| caps.get::<C>().is_some())`. If absent, returns `Err(io::Error::new(PermissionDenied, CapabilityError::Missing { name: cap.name() }))`. The `name()` field on the trait is informational only; `CapabilitySet::get` uses `TypeId::of::<C>()` for the actual lookup.
+
+**Error type** (`io/mod.rs:9-14`): `CapabilityError::{Missing { name }, Exhausted { name, detail }}`. The `Exhausted` variant is currently only used by `DbCapability`'s pool-empty branch.
 
 This is a lightweight, safe, two-phase effect pipeline. It maps directly to RabbitMQ's `credit_flow` and Tokio's `Semaphore` semantics, but without the lifetime complications of `tokio::sync::SemaphorePermit`.
 
 ### 3.2 `Scope` — Structured Concurrency & Region Ownership
 
-A `Scope` is the fundamental owner of tasks. It is **`must_use`** and requires explicit `await` to close.
+A `Scope` is the fundamental owner of tasks. It is **`#[must_use]`** and requires explicit close. The `Scope` wraps a `tokio::task::JoinSet<()>` plus a `closed: bool` flag.
 
-**Why not `async Drop`?** Rust does not have async drop. The RabbitMQ Erlang model achieves this because `supervisor2` runs in its own process and can block on `receive`. In Rust, the only way to *guarantee* a child is awaited before the parent frame exits is to make the parent frame itself a `Future` that ends with `scope.close().await`. The `must_use` + `debug_assert!` pattern enforces this at the API level without unsafe or proc macros.
+**Close variants** (`scope.rs:67-139`):
+
+- `close(&mut self).await` — async; sets `closed = true`, calls `abort_all()`, and drains the `JoinSet`. Use this from within an async context.
+- `close_sync(&mut self)` — synchronous; sets `closed = true`, calls `abort_all()`, and replaces the `JoinSet` with a fresh one. Aborted tasks are guaranteed not to make progress past their next yield point. Use this from `Drop` or anywhere that cannot await.
+- `close_graceful(&mut self, timeout: Duration).await` — waits up to `timeout` for tasks to complete naturally, then aborts and drains any stragglers.
+- `defer(&mut self) -> ScopeGuard<'_>` — returns an RAII guard whose `Drop` calls `close_sync()`. The canonical ergonomic alternative to manual `close().await`. Note: the guard does **not** spawn a `close` task; it uses `close_sync()` directly to avoid a fire-and-forget task that could itself be aborted if the runtime drops.
+
+**Spawn and propagation** (`scope.rs:67-75`): `Scope::spawn` captures the current `CURRENT_CAPS` (defaulting to `CapabilitySet::default()` outside a task-local) and re-installs it in the child task via `CURRENT_CAPS.scope(caps, future)`. This is the load-bearing mechanism for the Q2 design decision.
+
+**Drop semantics** (`scope.rs:148-168`): dropping a `Scope` without closing it panics with a structured-concurrency violation message. The panic is suppressed during a panic unwind to let the original panic propagate; instead, an `error!` is logged and tasks are aborted.
+
+**Why not `async Drop`?** Rust does not have async drop. The RabbitMQ Erlang model achieves this because `supervisor2` runs in its own process and can block on `receive`. In Rust, the only way to *guarantee* a child is awaited before the parent frame exits is to make the parent frame itself a `Future` that ends with `scope.close().await`. The `#[must_use]` + `Drop`-panics pattern enforces this at the API level without unsafe or proc macros.
 
 ### 3.3 `Zone` — Failure Containment & Supervision
 
-A `Zone` is a `Scope` plus a dependency graph and a diagnostic event sink.
+A `Zone` is a `Scope` plus a dependency graph, a typed event sink, retry-with-backoff, and per-task timeouts. It is **also** a `Future<Output = ZoneSummary>` (`zone.rs:273-376`), so the canonical use is `let summary: ZoneSummary = zone.await`.
+
+**Construction** (`zone.rs:117-144`):
+
+- `Zone::new(runtime: Arc<dyn Runtime>, caps: CapabilitySet) -> Self` — defaults to `ZoneConfig::default()`.
+- `Zone::new_with_config(runtime, caps, config: ZoneConfig) -> Self`.
+
+**Configuration** (`zone.rs:48-59`): `ZoneConfig { poll_budget: usize }` — maximum tasks polled per `Zone::poll` invocation. Default `64`. When the budget is exhausted, the zone wakes itself with `cx.waker().wake_by_ref()` to prevent executor starvation.
+
+**Registration** (`zone.rs:152-193`):
+
+- `register(unit: Arc<dyn Component>) -> Result<&mut Self, ZoneError>` — builds a `WorkContext` via `WorkContext::for_unit_in_zone(&self.runtime, &self.caps, |_| {})` and forwards.
+- `register_with_context(unit, ctx: WorkContext) -> Result<&mut Self, ZoneError>` — explicit context.
+- `ZoneError::DuplicateName(ArcIntern<str>)` — duplicate `name()` rejection. The signature is `Result`, not panicking, so callers can decide.
+
+**Dependency tracking** (`zone.rs:101-111, 174-189, 210-270`): each registered unit contributes to two inverted maps:
+
+- `deps: HashMap<ArcIntern<str>, Vec<ArcIntern<str>>>` — `unit_name → [assets it depends on]`.
+- `task_provides: HashMap<ArcIntern<str>, Vec<ArcIntern<str>>>` — `unit_name → [assets it provides]`.
+- `provides_to_dependents: HashMap<ArcIntern<str>, Vec<ArcIntern<str>>>` — `asset → [units that depend on it]`. This is the O(1) lookup for transitive cancellation.
+
+When a unit fails/panics/times out, `cancel_dependents_of(name)` performs a DFS over the inverted index, with separate `visited` and `active_path` sets to detect cycles. A back-edge into `active_path` emits a `tracing::warn!` rather than panicking — the cycle is left in place but the offending dependents are not double-cancelled.
+
+**Retry and timeout** (`zone.rs:386-427`): each registered unit is wrapped in `execute_with_timeout_and_retry` which:
+
+- Yields once before the first attempt so pending abort signals are processed.
+- Calls `unit.execute(&ctx)`.
+- On `Err(WorkError)`, sleeps `100 * attempts` ms and retries up to `max_retries` times.
+- Wraps the whole thing in `tokio::time::timeout(timeout_ms, …)`; on timeout returns `Err(WorkError::Timeout { duration_ms, unit })`.
+
+**Panic propagation**: panics are *not* caught via `catch_unwind`. They propagate through `JoinSet` as `JoinError::Panic`, which `Zone::poll` intercepts at `zone.rs:336-348` and records as `ZoneEvent::Panicked`. This is deliberate: a `catch_unwind` would lose the panic site and prevent the dependency-aware cancellation graph from firing.
+
+**Event taxonomy** (`zone.rs:19-74`):
+
+```text
+ZoneEvent::Completed   { name, output }
+ZoneEvent::Panicked    { name, info }
+ZoneEvent::Failed      { name, error: WorkError }
+ZoneEvent::Cancelled   { name, reason: CancelReason }
+
+CancelReason::Timeout
+CancelReason::DependencyFailed
+CancelReason::Aborted
+```
+
+`WorkError` and `WorkOutput` are defined in `fluent-wvr::work` with three error variants: `Execution(String)`, `Dependency(String)`, and `Timeout { duration_ms: u64, unit: String }`. `WorkOutput` carries a `serde_json::Value data` field with `typed`/`typed_infallible`/`data_as`/`data_take` accessors for structured-data round-tripping.
+
+**Summary** (`zone.rs:68-74`): `ZoneSummary { completed, panicked, failed, cancelled: Vec<ZoneEvent> }`. The zone `await`s to completion (when all `JoinSet` entries are drained and `active_count == 0`) and yields the summary.
 
 **Key properties:**
 - A panic in task A does **not** propagate to the parent runtime thread. It is caught as a `JoinError` by the zone's `poll` loop.
 - The zone cancels only the dependents of the failed task; independent tasks continue.
 - Neighboring zones are fully isolated because each zone owns its own `JoinSet`.
+- `WorkError::Execution` failures go to `summary.failed`; real panics go to `summary.panicked`. These are distinct buckets, by design (M3.2 contract from `ROADMAP_20260720_WVR_MORE.md`).
 
 ### 3.4 `WorkerPool` — Bounded Worker Pool
 
-RabbitMQ's `worker_pool` uses a central queue and a fixed set of worker processes that pull jobs. We translate this directly to Tokio tasks.
+RabbitMQ's `worker_pool` uses a central queue and a fixed set of worker processes that pull jobs. We translate this directly to Tokio tasks. `WorkerPool` is the fire-and-forget variant: each worker calls the handler, the result is discarded.
 
-**Why not `tokio::sync::Semaphore`?** A `Semaphore` is perfect for a *limiter* (see below), but it does not provide a FIFO queue of jobs or dedicated workers. RabbitMQ's `worker_pool` explicitly wants workers to pull from a queue, allowing prioritization and monitoring of queue depth. Our `WorkerPool` gives exactly that.
+**API** (`pool.rs:147-220`):
+
+```rust
+pub struct WorkerPool<T: Send + 'static> { /* queue, workers, shutdown */ }
+
+impl<T: Send + Sync + 'static> WorkerPool<T> {
+    pub fn new<F, Fut>(
+        runtime: Arc<dyn Runtime>,
+        cap: usize,
+        queue_capacity: usize,
+        handler: F,
+    ) -> Self
+    where F: Fn(T) -> Fut + Send + Sync + 'static,
+          Fut: Future<Output = ()> + Send;
+
+    pub async fn try_submit(&self, job: T) -> Result<(), PoolError>;  // Err(Full) if at cap
+    pub async fn submit(&self, job: T) -> Result<(), PoolError>;      // waits, Err(Closed) if closed
+    pub async fn shutdown(self);                                       // close queue, await workers
+}
+```
+
+Internally it uses a `Queue<T>` (see below) and a `Notify` for close-wakes-waiters. Workers loop on `tokio::select! { shutdown.notified() | queue.pop() }`. If you don't need the result, this is the zero-allocation-per-submit primitive. For the result-returning variant, see `ResultPool` (§3.10).
+
+**Why not `tokio::sync::Semaphore`?** A `Semaphore` is perfect for a *limiter* (see §3.5), but it does not provide a FIFO queue of jobs or dedicated workers. RabbitMQ's `worker_pool` explicitly wants workers to pull from a queue, allowing prioritization and monitoring of queue depth. Our `WorkerPool` gives exactly that.
 
 ### 3.5 `Limiter` — Lightweight Concurrency Cap
 
-For cases where you don't need a dedicated worker pool, just a cap on concurrent executions:
+For cases where you don't need a dedicated worker pool, just a cap on concurrent executions, the `Limiter` is a `Semaphore`-backed wrapper (`pool.rs:376-422`).
+
+**API**:
+
+```rust
+pub struct Limiter { sem: Arc<Semaphore> }
+
+impl Limiter {
+    pub fn new(cap: usize) -> Self;
+    pub async fn run<F, Fut, T>(&self, f: F) -> T
+        where F: FnOnce() -> Fut, Fut: Future<Output = T>;
+    pub fn run_sync<F, Fut, T>(&self, f: F) -> T
+        where F: FnOnce() -> Fut, Fut: Future<Output = T>;
+}
+```
+
+`run_sync` first tries `tokio::runtime::Handle::try_current()`. If a runtime is active, it `block_on`s the permit-acquire + closure. Otherwise, it builds a dedicated current-thread runtime for the duration of the call. This is the right tool for synchronous callers (e.g., a CLI handler invoked outside an async context) that need to bound concurrency.
 
 This is the Rust equivalent of the `credit_flow` sender side: acquire a slot, run the work, release the slot on completion.
 
 ### 3.6 `PriorityQueue` — Event Queue
 
-A simple priority queue optimized for the common case where most items have priority 0, exactly like RabbitMQ's `priority_queue.erl`.
+A simple priority queue optimized for the common case where most items have priority 0, exactly like RabbitMQ's `priority_queue.erl` (`queue.rs:7-145`).
+
+**Storage**: a `VecDeque<T>` for the all-zero-priority fast path, plus a `BTreeMap<i32, VecDeque<T>>` for distinct non-zero priorities. A cached `count: usize` makes `len()` and `is_empty()` O(1).
+
+**API**:
+
+```rust
+pub struct PriorityQueue<T> { /* simple: VecDeque<T>, prioritized: BTreeMap<i32, VecDeque<T>>, count: usize */ }
+
+impl<T> PriorityQueue<T> {
+    pub fn new() -> Self;
+    pub fn push(&mut self, item: T, priority: i32);   // priority 0 → VecDeque; non-zero → BTreeMap
+    pub fn pop(&mut self) -> Option<T>;               // positive priorities first, then 0, then negative
+    pub fn peek(&self) -> Option<(&T, i32)>;          // highest-priority item without removing
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+    pub fn into_iter(self) -> impl Iterator<Item = (i32, T)>;  // priority order, consumes self
+    pub fn drain(&mut self) -> impl Iterator<Item = (i32, T)> + '_;  // same, but borrows
+}
+```
 
 This is O(log P) for `push` and `pop`, where P is the number of distinct non-zero priorities. It is zero-allocation for the all-zero-priority case.
 
 ### 3.7 `CreditFlow` — Chain Backpressure
 
-RabbitMQ's `credit_flow` module throttles publishers end-to-end. Our `CreditFlow` uses explicit message passing between sender and receiver, preserving the exact semantics.
+RabbitMQ's `credit_flow` module throttles publishers end-to-end. Our `CreditFlow` uses explicit message passing between sender and receiver, preserving the exact semantics (`flow.rs:13-98`).
+
+**API**:
+
+```rust
+pub struct CreditSpec { pub initial: usize, pub more_after: usize }
+
+pub struct CreditSender  { credit: AtomicIsize, bump_rx: Mutex<mpsc::UnboundedReceiver<usize>>, blocked: AtomicBool }
+pub struct CreditReceiver { spec: CreditSpec, counter: AtomicUsize, bump_tx: mpsc::UnboundedSender<usize> }
+
+pub fn new(spec: CreditSpec) -> (CreditSender, CreditReceiver);
+
+impl CreditSender {
+    pub async fn send<F, Fut, T>(&self, op: F) -> T
+        where F: FnOnce() -> Fut, Fut: Future<Output = T>;
+    pub fn is_blocked(&self) -> bool;
+    pub fn current_credit(&self) -> isize;
+}
+
+impl CreditReceiver {
+    pub fn recv(&self);  // increments counter; sends `more_after` as bump when counter ≥ more_after
+}
+```
+
+The sender's `send` is a CAS loop: load credit, if `> 0` decrement and run `op().await`; if `<= 0` mark `blocked = true` and `await` a bump from the receiver. The receiver's `recv` is non-async: it `fetch_add(1)` and, when the counter crosses `more_after`, resets to 0 and sends a `more_after`-sized bump.
 
 This maps 1:1 to the Erlang `credit_flow` semantics: `send` decrements credit, `ack` (called `recv` here) counts down and sends a `bump_credit` when the counter hits zero.
 
 ### 3.8 `PartitionedRouter` — Delegate / Sharding
 
-RabbitMQ's `delegate` module groups PIDs by node and routes them to local delegates to reduce inter-node chatter. In a single-process Rust system, this becomes a key-based router.
+RabbitMQ's `delegate` module groups PIDs by node and routes them to local delegates to reduce inter-node chatter. In a single-process Rust system, this becomes a key-based router (`router.rs:7-21`).
 
-This preserves causal ordering: all jobs with the same key always go to the same shard.
+**API**:
+
+```rust
+pub struct PartitionedRouter<K, J: Send + 'static> {
+    shards: Vec<WorkerPool<J>>,
+    hash: fn(&K) -> usize,
+}
+
+impl<K, J: Send + Sync + 'static> PartitionedRouter<K, J> {
+    pub fn new(shards: Vec<WorkerPool<J>>, hash: fn(&K) -> usize) -> Self;
+    pub async fn submit(&self, key: &K, job: J) -> Result<(), PoolError>;
+}
+```
+
+The implementation is intentionally thin: it hashes once per submit and forwards to the appropriate shard. This preserves causal ordering: all jobs with the same key always go to the same shard. There is no per-shard statistics, no shard rebalancing, and no fail-over — the primitive is a shim, not a full delegate supervisor. If you need shard observability, build it on top.
 
 ### 3.9 `Runtime` Trait — Pluggable Backend
 
-**Why `BoxFuture`?** The `Runtime` trait is object-safe so it can be stored as `Arc<dyn Runtime>` in the Control Plane. The cost of one `Box` per `sleep` is negligible because `sleep` is a boundary operation, not a hot-loop inner operation.
+The `Runtime` trait is defined in `fluent-wvr::runtime` (`fluent-wvr/src/runtime.rs:20-24`) and has three methods:
+
+```rust
+pub trait Runtime: Send + Sync + 'static {
+    fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) -> JoinHandle<()>;
+    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+    fn now(&self) -> Instant;
+}
+```
+
+**Why `BoxFuture`?** The `Runtime` trait is object-safe so it can be stored as `Arc<dyn Runtime>` in the Control Plane. The cost of one `Box` per `sleep` is negligible because `sleep` is a boundary operation, not a hot-loop inner operation. `spawn` returns `JoinHandle<()>` directly (no Box) because the type is concrete.
+
+**Three backends** ship today:
+
+- `NoopRuntime` (in `fluent-wvr/src/runtime.rs:33-55`) — for `WorkContext::default()`. `spawn` panics with a clear message if called outside a tokio runtime; inside one, it spawns an empty future. `sleep` returns immediately. `now` returns `Instant::now()`.
+- `TokioRuntime` (in `fluent-concurrency/src/runtime/tokio.rs:11-26`) — production. Delegates to `tokio::spawn` and `tokio::time::sleep`. Constructed via the convenience function `fluent_concurrency::tokio_runtime() -> Arc<dyn Runtime>` (`lib.rs:19-21`).
+- `TestRuntime` (in `fluent-concurrency/src/runtime/test.rs:13-54`) — wraps a `tokio::runtime::Handle` plus a seeded `fastrand::Rng` for reproducible non-determinism. Use with `tokio::time::start_paused` for record-replay tests. Note: `TestRuntime::Clone` re-seeds from a draw of the parent's PRNG, so cloned runtimes do **not** preserve the original seed sequence — this is a known limitation; test designs should construct fresh `TestRuntime`s from a fixed seed rather than cloning.
+
+### 3.10 Bonus Primitives
+
+These exist in the crate but are not in the original spec. They earn their place by filling gaps that real consumers hit.
+
+**`ResultPool<T, R, E>`** (`pool.rs:245-359`) — the result-returning variant of `WorkerPool`. The handler is `Fn(T) -> Fut where Fut: Future<Output = Result<R, E>>`, and `submit(job) -> Future<Output = Result<R, ResultPoolError<E>>>`. Internally each `submit` allocates a `tokio::sync::oneshot::channel`; the worker sends its `Result<R, E>` back through the channel. The cost is one `oneshot` per submit; the benefit is that the submitter gets the result as an `await`able future rather than passing through a side channel. This is the canonical pool for "fan out N independent jobs, collect N results" workloads (e.g., `AST_POOL` and `DB_POOL` in `src/guidance/src/runtime.rs`).
+
+```rust
+pub enum ResultPoolError<E> { Pool(PoolError), Inner(E), Canceled }
+
+impl<T, R, E> ResultPool<T, R, E> {
+    pub fn new<F, Fut>(runtime, cap, queue_capacity, handler: F) -> Self;
+    pub fn worker_count(&self) -> usize;
+    pub async fn submit(&self, job: T) -> Result<R, ResultPoolError<E>>;
+    pub async fn try_submit(&self, job: T) -> Result<(), PoolError>;   // see note below
+    pub async fn submit_forget(&self, job: T) -> Result<(), PoolError>; // alias for try_submit
+    pub async fn shutdown(self);
+}
+```
+
+Note on `try_submit` / `submit_forget`: these are provided for API compatibility with `WorkerPool` but, because `ResultPool`'s worker protocol requires a `oneshot::Sender`, they still allocate a `oneshot` channel whose receiver is immediately dropped. They are not fire-and-forget. If you need true fan-out with no result, use `WorkerPool` instead.
+
+**`PriorityResultPool<T, R, E>`** (`pool.rs:435-528`) — priority-ordered variant of `ResultPool`. Jobs are submitted with `submit(job, priority)`; higher priority values are dispatched first, FIFO within the same priority. Internally it uses the `PriorityQueue` from §3.6 wrapped in a `tokio::sync::Mutex`. Workers follow the **drain-then-wait** pattern (the M9 contract from `ROADMAP_20260720_WVR_MORE.md`): on each wake they drain the entire queue before blocking on `Notify`, preventing wakeup collapse under burst. This is the right tool when some jobs are time-sensitive and others can wait.
+
+**`LlmRequestQueue`** (`llm_queue.rs:142-181`) — typed wrapper over `ResultPool` for LLM chat completions. The crate is transport-agnostic: the `Fn(LlmTask) -> Result<String, LlmError>` handler is supplied at construction time; the default OpenAI-compatible HTTP handler lives in `guidance-llm`. This split keeps `reqwest` out of the boundary that downstream callers care about.
+
+```rust
+pub struct LlmRequestQueue { pool: Arc<ResultPool<LlmTask, String, LlmError>> }
+
+pub struct LlmTask    { pub messages: Vec<ChatMessage>, pub config: LlmConfig }
+pub struct LlmConfig  { pub api_url: String, pub model: String, pub think: Option<bool>,
+                        pub timeout_ms: u64 (default 2000), pub debug: bool, pub show_prompts: bool }
+pub struct ChatMessage { pub role: String, pub content: String }
+pub struct LlmQueueConfig { pub worker_count: usize, pub queue_capacity: usize }
+
+pub enum LlmError { Api(String), Http(String), NoResponse, RateLimited }
+```
+
+**`Reserve`** (`reserve.rs:7-94`) — RAII permit on a shared `Arc<AtomicUsize>`. `try_acquire(counter) -> Option<Self>` atomically decrements and returns the permit, or `None` if already at zero. `commit(self)` consumes the permit permanently; otherwise `Drop` returns it to the counter. This is a lower-level primitive than `Limiter`: it does not own the counter (the caller supplies it), and it does not run a closure. Use `Limiter` for "run this with a permit" and `Reserve` for "acquire now, release later" patterns. The crate's own tests are the only in-tree consumer today.
 
 ## 4. Control Plane / Data Plane Integration (Fluent WVR)
 
-The `fluent-wvr` crate defines `WorkUnit`, `WorkContext`, `WorkOutput`, and `Component`. `fluent-concurrency` does not redefine these; it **consumes** them.
+The `fluent-wvr` crate defines `Component`, `WorkUnit`, `FieldAccess`, `Describable`, `SchemaProvider`, `Capability`, `CapabilitySet`, `Runtime`, `WorkContext`, `WorkError`, `WorkOutput`, and `MetadataValue`. `fluent-concurrency` does not redefine these; it **consumes** them.
 
-**Cross-cutting concerns** (retry, timing, rate limiting) are applied via the `Instrumented` and `WithRetry` newtype wrappers from `fluent-wvr` *before* type erasure, preserving zero-cost inlining.
+**WorkContext** (`fluent-wvr/src/work.rs:122-191`) is the per-execution environment carried by every `WorkUnit::execute`. It bundles `rt: Arc<dyn Runtime>`, `caps: CapabilitySet`, `metadata: HashMap<String, MetadataValue>`, `dry_run: bool`, `max_retries: u32`, `timeout_ms: u64`. Three constructors are provided:
+
+- `WorkContext::default()` — uses `NoopRuntime`; safe for dry-run / init paths but panics on `spawn` if not inside a tokio runtime.
+- `WorkContext::for_unit(unit, caps)` — uses the unit's `default_timeout_ms()` and a default runtime; the right entry point for a single unit.
+- `WorkContext::for_unit_in_zone(zone_rt, zone_caps, |ctx| { ... })` — clones the zone's runtime and caps, then lets the caller mutate; the canonical entry point inside a `Zone`.
+
+**Wrappers from `fluent-wvr`**:
+
+- `Instrumented<U>` — wraps any `WorkUnit`/`Component` with `tracing::info!` timing on every `execute`, plus optional `Arc<LatencyHistogram>` recording via `Instrumented::with_metrics(inner, label, histogram)`. The histogram is the canonical latency surface from `common_core::metrics`.
+- `WithRetry<U>` — wraps any `WorkUnit`/`Component` with jittered-exponential retry. Configurable via `WithRetry::new(inner, max_attempts, backoff_ms)` (default 50% jitter) or `WithRetry::new_jittered(inner, max_attempts, base_ms, jitter_pct)` (0–100, clamped).
+- `ComponentAdapter` — runtime override of `name`, `execute`, and any field on a `Component`. `set_field` forwards via `Arc::get_mut` when possible and otherwise stores an override on the adapter. This is the only wrapper that handles the shared-Arc case correctly; `Instrumented` and `WithRetry` are deliberately read-only wrappers and reject `set_field` with `FieldError::NotFound`.
+- `retry_call(max_attempts, base_ms, f)` — the free-function sync retry with the same jittered-exponential backoff as `WithRetry`. Returns `Result<RetryResult<T>, E>` where `RetryResult` carries the attempt count.
+
+**Macros from `fluent-wvr`**:
+
+- `impl_component!(MyType)` and `impl_component!(generic (U: Component + 'static) for Wrapper<U>)` — eliminates the 7-line `as_any`/`as_any_mut` boilerplate that every `Component` implementor would otherwise write.
+- `#[derive(FieldAccess, Describable)]` (in `fluent-wvr-macros`) — `#[field(...)]` attributes support `skip`, `desc`, `min`/`max` (numeric), `format`, `max_len`, `sanitize` (trim/lowercase/strip_html/slugify), `pattern` (substring, not regex), `required` (default true), and `empty_is_none` (default true for `Option<String>`).
+
+**Arc blanket impls** (`fluent-wvr/src/lib.rs:50-129`): the type `Arc<dyn Component>` is the universal wire type. Blanket impls provide `WorkUnit`/`FieldAccess`/`Describable`/`Component` for `Arc<dyn Component>` and `WorkUnit` for `Arc<dyn WorkUnit>`. The latter exists for cases where the implementor doesn't need the full `Component` surface. This is the boundary that lets `Zone`, `ComponentAdapter`, and any orchestrator dispatch through a uniform `Arc<dyn Component>` without knowing the concrete type.
+
+**Cross-cutting concerns** (retry, timing, rate limiting) are applied via these wrappers *before* type erasure, preserving zero-cost inlining. Note that `Zone` also has its own internal retry (per-task, with 100ms backoff and a `WorkContext`-driven timeout) — this is *not* a third implementation of the same algorithm, but rather the zone-level primitive that exists because the wrapper-level retry is single-shot (per `submit`-equivalent), whereas the zone manages a long-lived set of units with retries driven by `WorkContext::max_retries` and `WorkContext::timeout_ms`.
 
 ## 5. Performance & Locality Guarantees
 
@@ -87,35 +340,59 @@ The `fluent-wvr` crate defines `WorkUnit`, `WorkContext`, `WorkOutput`, and `Com
 |----------|-----------|-----|
 | Task scheduling | Tokio's local queue + LIFO slot | We do not add indirection. |
 | Worker pool job dispatch | `VecDeque` in `Mutex` | One lock per pop; workers sleep on `Notify`. No `dyn` dispatch per job. |
+| Result pool per-submit | `oneshot::channel` per submit | One allocation per job; the worker sends the result through the channel. |
 | Priority queue (all same priority) | `VecDeque` fast path | Zero overhead for the common case. |
+| Zone dependency lookup | Inverted index `provides_to_dependents: HashMap<asset, Vec<task>>` | O(1) dependent lookup at cancellation time; avoids scanning the full DAG. |
+| Zone poll budget | `cx.waker().wake_by_ref()` after N polls | Prevents one zone from starving the executor when many tasks complete in the same wake. |
+| Capability gating | `HashMap<TypeId, Arc<dyn Any>>` lookup on `CURRENT_CAPS` | `TypeId` is pointer-sized; no string comparison. `name()` is informational only. |
 | Data transformation | Concrete enums + pattern matching | `WorkUnit::execute` is one vtable call per task; inside it, all work is monomorphized. |
-| Capability check | `AtomicUsize` counter | Lock-free, no heap allocation. |
+| `Reserve` permit | `AtomicUsize` `fetch_sub`/`fetch_add` | Lock-free, no heap allocation. |
 
-## 6. Crate Layout (Proposed)
+## 6. Crate Layout (Actual)
+
+The crate is no longer "proposed" — it ships. The current `Cargo.toml`:
 
 **Dependencies:**
-- `tokio` (features: `rt-multi-thread`, `sync`, `time`, `macros`)
-- `fluent-wvr` (for `WorkUnit`, `Component`, `ArcIntern`)
-- `serde_json` (for `Describable`)
-- `internment` (for `ArcIntern`)
 
-No `async-trait`, no `proc-macro` crates, no `bumpalo`, no `crossbeam` (Tokio's channels and `Notify` are sufficient).
+- `tokio` (workspace, with the `rt-multi-thread`, `sync`, `time`, `macros` features in production)
+- `fluent-wvr` (path = `"../fluent-wvr"`) — for `WorkUnit`, `Component`, `CapabilitySet`, `Runtime`, `ArcIntern`
+- `serde`, `serde_json` — for `WorkOutput::data` and `Describable`
+- `bon` — derive builder for `LlmConfig` and `ChatMessage`
+- `thiserror` — error enums (`PoolError`, `ResultPoolError`, `ZoneError`, `LlmError`, `CapabilityError`)
+- `tracing` — `info!`, `warn!`, `error!` from `Instrumented`, `Zone`'s cycle detection, and `Scope`'s panic-during-unwind path
+- `reqwest` — backing HTTP client for `NetCapability`
+- `common-core` (with `sqlite` feature) — `LatencyHistogram` (used by `Instrumented::with_metrics` in `fluent-wvr` consumers) and `open_wal` for `DbCapability`'s connection pool
+- `rusqlite` — backing driver for `DbCapability`
+- `fastrand` — seeded PRNG for `TestRuntime` and jitter in `WithRetry` / `retry_call`
+- `internment` (with `arc` and `serde` features) — `ArcIntern<str>` for work unit names, dependency asset names, and configuration keys
+
+**Dev-dependencies:**
+
+- `tokio` (with `test-util` feature) — for `start_paused` in tests
+- `tempfile` — for filesystem-based tests
+- `fluent-wvr-testutil` — `impl_component_for_test!` and `StubComponent` for unit-test scaffolding
+
+No `async-trait`, no `bumpalo`, no `crossbeam`. Tokio's channels, `Notify`, and `Semaphore` are sufficient. (One macro: `impl_component!` lives in `fluent-wvr`, not here; derive macros for `FieldAccess` and `Describable` live in `fluent-wvr-macros`.)
 
 ## 7. Anti-Patterns Explicitly Rejected
 
-1. **No `#[async_trait]` or macro-heavy execution.** The framework uses manual `Future` impls and `async fn` where the compiler can see the boundaries.
-2. **No `tokio::spawn` without a scope.** The only `spawn` in the framework is `Scope::spawn`, which tracks the handle.
-3. **No `dyn Trait` in a per-item loop.** The `PartitionedRouter` hashes once per batch; `PriorityQueue` dispatches via `BTreeMap` keys, not vtables.
-4. **No ambient `tokio::fs::read` or `tokio::time::sleep`.** All I/O must be called with a `&Capability` or within a capability-bearing scope.
+1. **No `#[async_trait]` or macro-heavy execution.** The framework uses manual `Future` impls and `async fn` where the compiler can see the boundaries. The `Zone` is a hand-written `impl Future` (`zone.rs:273-376`); `Scope` uses `tokio::task::JoinSet` directly.
+2. **No `tokio::spawn` without a scope.** The `tokio::spawn` calls in the crate are limited to: `Scope::close` (drain) and `Scope::close_graceful` (drain); `Zone`'s `JoinSet`; `WorkerPool`/`ResultPool`/`PriorityResultPool` worker loops; and `DbCapability::query`/`execute` (which `spawn_blocking` for sync `rusqlite` work). Every async effect outside these sites flows through `Scope::spawn` (which tracks the handle) or through a pool (which tracks workers).
+3. **No `dyn Trait` in a per-item loop.** The `PartitionedRouter` hashes once per submit; `PriorityQueue` dispatches via `BTreeMap` keys, not vtables; `CapabilitySet::get` uses `TypeId` (pointer-sized) rather than string comparison; `PartitionedRouter` does no per-job vtable dispatch.
+4. **No ambient `tokio::fs::read` or `tokio::time::sleep`.** All I/O is called through a capability method (`FsCapability::read`, `NetCapability::http_get`, `DbCapability::query`, etc.) which calls `check_capability(self)` first. `tokio::time::sleep` is allowed in the framework's own internals (Zone retry, Zone timeout) and in the `Runtime::sleep` backend, but consumer code is expected to use `Limiter::run`, `WithRetry`, or `Zone` rather than calling it directly.
 5. **No automatic restart.** Zones contain; they do not restart. Restart is a deliberate operator action.
 
 ## 8. Rejected as Scope Creep
 
 Here are examples of what fluent-concurrency does not try to do as a lightweight single-node runtime, compared to RabbitMQ:
 
-- Actor Hibernation / Idle Backoff: RabbitMQ's gen_server2 needs hibernation because it manages hundreds of thousands of idle, long-lived connections. fluent-concurrency is a pipeline execution engine—tasks are spawned to complete work and terminate. Workers parked on tokio::select! are sleeping efficiently on native OS epoll/kqueue event loops. Adding an explicit backoff framework here adds unnecessary overhead.
-- Multi-hop Credit Chains: Our single-hop producer/consumer backpressure is perfectly tailored for a single-node pipeline. We do not need a multi-process AMQP chain.
+- **Actor Hibernation / Idle Backoff**: RabbitMQ's `gen_server2` needs hibernation because it manages hundreds of thousands of idle, long-lived connections. fluent-concurrency is a pipeline execution engine—tasks are spawned to complete work and terminate. Workers parked on `tokio::select!` are sleeping efficiently on native OS epoll/kqueue event loops. Adding an explicit backoff framework here adds unnecessary overhead.
+- **Multi-hop Credit Chains**: Our single-hop producer/consumer backpressure is perfectly tailored for a single-node pipeline. We do not need a multi-process AMQP chain.
+- **Distributed tracing / OpenTelemetry export**: not in scope; `tracing::info!` is sufficient for the current consumers. If a future consumer needs OTel, the `tracing` crate has compatible subscribers.
+- **Loom-style combinatorial scheduler exploration**: the `Runtime` trait is wide enough to add a `LoomRuntime` later, but it is not built today. Q3 from §2 documents this as a future primitive.
 
 ## 9. Summary
 
 `fluent-concurrency` is a **thin, safe, opinionated harness** over Tokio. It adds the operational primitives that RabbitMQ proved necessary in production (pools, credit flow, supervision, priority) while keeping the Data Plane as fast and flat as `smol`. It follows the Fluent WVR pattern so the orchestrator sees a uniform interface, and it enforces the five architectural pillars of the manifest without unsafe code, bloat, or overengineering.
+
+The crate consumes the trait crate (`fluent-wvr`) rather than redefining it, applies cross-cutting concerns via wrapper newtypes before type erasure, and exposes three runtime backends (`NoopRuntime`, `TokioRuntime`, `TestRuntime`) so the same code paths run in production, in unit tests, and in record-replay simulations. The result is a single coherent vocabulary for "how do I run this work unit" that holds across the guidance crate, the job-copilot server, the LLM queue, and the benchmark harness.

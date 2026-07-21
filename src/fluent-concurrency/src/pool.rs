@@ -240,8 +240,7 @@ struct WrappedJob<T, R, E> {
 }
 
 /// Worker pool where the handler returns a `Result<R, E>` and `submit`
-/// returns a future resolving to that result. Replaces the
-/// `oneshot::channel` + `try_submit` + `rx.await` pattern.
+/// returns a future resolving to that result.
 pub struct ResultPool<T, R, E>
 where
     T: Send + 'static,
@@ -322,30 +321,6 @@ where
         rx.await
             .map_err(|_| ResultPoolError::Canceled)?
             .map_err(ResultPoolError::Inner)
-    }
-
-    /// Tries to submit a job without waiting for the result. Returns
-    /// `Err(Full)` if the queue is at capacity.
-    ///
-    /// The job's result is discarded: a `oneshot` channel is created to
-    /// satisfy the worker protocol, and the receiver is dropped, so any
-    /// value the worker tries to send is silently lost. Use `submit` if
-    /// you need the result.
-    ///
-    /// Provided for API compatibility with `Queue::try_submit`.
-    pub async fn try_submit(&self, job: T) -> Result<(), PoolError> {
-        // Note: try_submit for ResultPool requires a oneshot sender, so use submit() instead.
-        // This is provided for API compatibility but always creates a channel.
-        let (tx, _rx) = tokio::sync::oneshot::channel();
-        let wrapped = WrappedJob { job, result_tx: tx };
-        self.queue.push(wrapped).await
-    }
-
-    /// Submits a job and discards the result. Alias for
-    /// [`try_submit`](Self::try_submit) with a clearer name reflecting the
-    /// fire-and-forget semantics.
-    pub async fn submit_forget(&self, job: T) -> Result<(), PoolError> {
-        self.try_submit(job).await
     }
 
     /// Shuts down the pool: closes the queue, notifies workers, and awaits their completion.

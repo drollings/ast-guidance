@@ -45,4 +45,5 @@ impl From<bool> for MetadataValue {
 }
 
 /// Legacy type alias for backward compatibility. Prefer `MetadataValue`.
+#[deprecated(note = "Use `MetadataValue` instead. This alias has no known consumers.")]
 pub type MetadataEntry = (String, String);

@@ -19,15 +19,17 @@ pub struct RetryResult<T> {
 
 /// Retry with jittered exponential backoff using `std::thread::sleep`.
 ///
-/// Delay per attempt: `base_ms * attempt + fastrand::u64(0..base_ms)`.
-/// The jitter defaults to 50% of the base delay. This is a synchronous
-/// wrapper; the async path belongs in `fluent-concurrency::AsyncRetry`
-/// when a second async consumer materializes.
+/// Delay per attempt: `base_ms * attempt + fastrand::u64(0..jitter_range)`.
+/// Jitter defaults to 50% of `base_ms` (the `base_ms` value is doubled to
+/// produce the jitter range). This is a synchronous wrapper; the async path
+/// belongs in `fluent-concurrency::AsyncRetry` when a second async consumer
+/// materializes.
 pub fn retry_call<F, T, E>(max_attempts: usize, base_ms: u64, f: F) -> Result<RetryResult<T>, E>
 where
     F: Fn() -> Result<T, E>,
 {
     assert!(max_attempts >= 1);
+    let jitter_ms = base_ms;
     let mut attempts = 0;
     loop {
         attempts += 1;
@@ -42,12 +44,20 @@ where
                 if attempts >= max_attempts {
                     return Err(e);
                 }
-                let jitter = fastrand::u64(0..base_ms);
-                let delay = Duration::from_millis(base_ms * attempts as u64 + jitter);
-                std::thread::sleep(delay);
+                sleep_backoff(attempts, base_ms, jitter_ms);
             }
         }
     }
+}
+
+fn sleep_backoff(attempts: usize, base_ms: u64, jitter_ms: u64) {
+    let jitter = if jitter_ms > 0 {
+        fastrand::u64(0..jitter_ms)
+    } else {
+        0
+    };
+    let delay = Duration::from_millis(base_ms * attempts as u64 + jitter);
+    std::thread::sleep(delay);
 }
 
 /// A `WorkUnit` wrapper that logs execution timing and optionally records
@@ -142,12 +152,8 @@ impl<U: WorkUnit> WorkUnit for Instrumented<U> {
 }
 
 impl<U: crate::Component> FieldAccess for Instrumented<U> {
-    fn set_field(&mut self, name: &str, _value: &str) -> Result<(), FieldError> {
-        // Delegated to inner — instrumentation does not own configuration.
-        // Requires mutable access to the wrapper (configure before sharing).
-        Err(FieldError::NotFound(format!(
-            "{name}: instrumented wrapper is read-only; configure the inner component directly"
-        )))
+    fn set_field(&mut self, name: &str, value: &str) -> Result<(), FieldError> {
+        <U as FieldAccess>::set_field(&mut self.inner, name, value)
     }
     fn get_field(&self, name: &str) -> Result<String, FieldError> {
         <U as FieldAccess>::get_field(&self.inner, name)
@@ -212,6 +218,7 @@ impl<U: WorkUnit> WorkUnit for WithRetry<U> {
 
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
         let mut attempts = 0u32;
+        let jitter_ms = self.base_ms * u64::from(self.jitter_pct) / 100;
         loop {
             attempts += 1;
             match self.inner.execute(ctx) {
@@ -220,14 +227,7 @@ impl<U: WorkUnit> WorkUnit for WithRetry<U> {
                     if attempts >= self.max_attempts {
                         return Err(e);
                     }
-                    let jitter_range = self.base_ms * u64::from(self.jitter_pct) / 100;
-                    let jitter = if jitter_range > 0 {
-                        fastrand::u64(0..jitter_range)
-                    } else {
-                        0
-                    };
-                    let delay = Duration::from_millis(self.base_ms * u64::from(attempts) + jitter);
-                    std::thread::sleep(delay);
+                    sleep_backoff(attempts as usize, self.base_ms, jitter_ms);
                 }
             }
         }
@@ -239,10 +239,8 @@ impl<U: WorkUnit> WorkUnit for WithRetry<U> {
 }
 
 impl<U: crate::Component> FieldAccess for WithRetry<U> {
-    fn set_field(&mut self, name: &str, _value: &str) -> Result<(), FieldError> {
-        Err(FieldError::NotFound(format!(
-            "{name}: retry wrapper is read-only; configure the inner component directly"
-        )))
+    fn set_field(&mut self, name: &str, value: &str) -> Result<(), FieldError> {
+        <U as FieldAccess>::set_field(&mut self.inner, name, value)
     }
     fn get_field(&self, name: &str) -> Result<String, FieldError> {
         <U as FieldAccess>::get_field(&self.inner, name)

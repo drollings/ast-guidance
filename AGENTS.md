@@ -103,7 +103,6 @@ Which consumers use which `fluent-concurrency` primitives:
 |---|---|---|
 | `Zone` | `job-copilot` handler | `src/job-copilot/src/server/handler.rs` |
 | `Scope::defer` | `job-copilot` handler | `src/job-copilot/src/server/handler.rs` |
-| `Limiter::run_sync` | `guidance-llm` client | `src/llm/src/client.rs` |
 | `ResultPool` | `guidance-llm` request queue | `src/llm/src/client.rs` |
 | `PriorityResultPool` | `fluent-concurrency` tests only | `src/fluent-concurrency/src/pool.rs` |
 | `WorkerPool` | `fluent-concurrency` tests only | `src/fluent-concurrency/src/pool.rs` |

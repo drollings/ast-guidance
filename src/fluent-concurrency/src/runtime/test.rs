@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 /// The seeded PRNG provides reproducible non-determinism for tests.
 pub struct TestRuntime {
     handle: tokio::runtime::Handle,
+    seed: u64,
     rng: Mutex<fastrand::Rng>,
 }
 
@@ -19,6 +20,7 @@ impl TestRuntime {
     pub fn new(handle: tokio::runtime::Handle, seed: u64) -> Self {
         Self {
             handle,
+            seed,
             rng: Mutex::new(fastrand::Rng::with_seed(seed)),
         }
     }
@@ -31,10 +33,10 @@ impl TestRuntime {
 
 impl Clone for TestRuntime {
     fn clone(&self) -> Self {
-        let seed = self.rng.lock().unwrap().u64(..);
         Self {
             handle: self.handle.clone(),
-            rng: Mutex::new(fastrand::Rng::with_seed(seed)),
+            seed: self.seed,
+            rng: Mutex::new(fastrand::Rng::with_seed(self.seed)),
         }
     }
 }

@@ -34,10 +34,8 @@ pub struct NoopRuntime;
 
 impl Runtime for NoopRuntime {
     fn spawn(&self, _future: Pin<Box<dyn Future<Output = ()> + Send>>) -> JoinHandle<()> {
-        tracing::warn!("NoopRuntime::spawn called — no runtime configured; task will not execute");
-        let has_runtime = tokio::runtime::Handle::try_current().is_ok();
         assert!(
-            has_runtime,
+            tokio::runtime::Handle::try_current().is_ok(),
             "NoopRuntime::spawn called outside a tokio runtime. \
              Either supply a real Runtime (e.g. via WorkContext with rt: tokio_runtime()) \
              or use NoopRuntime only for dry-run / init code paths."
