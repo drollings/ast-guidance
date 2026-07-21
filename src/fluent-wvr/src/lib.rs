@@ -17,439 +17,35 @@
 
 extern crate self as fluent_wvr;
 
+pub mod capability;
+pub mod macros;
+pub mod metadata;
+pub mod runtime;
+pub mod traits;
+pub mod work;
+
+pub mod prelude;
 pub mod wrapper;
 
+pub use capability::{Capability, CapabilitySet, Reserve};
 pub use fluent_wvr_macros::{Describable, FieldAccess};
 pub use internment::ArcIntern;
-use serde::{Deserialize, Serialize};
-use std::any::{Any, TypeId};
-use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
+pub use metadata::{MetadataEntry, MetadataValue};
+pub use runtime::{NoopRuntime, Runtime};
+pub use traits::{
+    component_downcast_mut, component_downcast_ref, Component, ComponentArcExt, Describable,
+    FieldAccess, FieldError, FieldSchema, PersistableComponent, SchemaProvider, WorkUnit,
+};
+pub use work::{WorkContext, WorkError, WorkOutput};
+
+// Re-export string utilities from common-core for use in derive macros and consumers.
+pub use common_core::string::{
+    contains_ident_word, contains_ignore_case, contains_word, looks_like_identifier, slugify,
+    strip_html, truncate_at_sentence,
+};
+
+use std::any::Any;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use thiserror::Error;
-use tokio::task::JoinHandle;
-
-/// Typed metadata value for `WorkContext`.
-///
-/// Replaces the old `Vec<(String, String)>` with a type-safe, structured
-/// representation. Supports string, integer, float, boolean, and null values.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum MetadataValue {
-    String(String),
-    Number(i64),
-    Float(f64),
-    Bool(bool),
-    Null,
-}
-
-impl From<&str> for MetadataValue {
-    fn from(s: &str) -> Self {
-        MetadataValue::String(s.to_string())
-    }
-}
-
-impl From<String> for MetadataValue {
-    fn from(s: String) -> Self {
-        MetadataValue::String(s)
-    }
-}
-
-impl From<i64> for MetadataValue {
-    fn from(n: i64) -> Self {
-        MetadataValue::Number(n)
-    }
-}
-
-impl From<f64> for MetadataValue {
-    fn from(f: f64) -> Self {
-        MetadataValue::Float(f)
-    }
-}
-
-impl From<bool> for MetadataValue {
-    fn from(b: bool) -> Self {
-        MetadataValue::Bool(b)
-    }
-}
-
-/// Legacy type alias for backward compatibility. Prefer `MetadataValue`.
-pub type MetadataEntry = (String, String);
-
-/// A capability token that can be placed in a `CapabilitySet` to gate access
-/// to resources (network, filesystem, database).
-///
-/// # Examples
-///
-/// ```
-/// use fluent_wvr::Capability;
-///
-/// struct NetCapability;
-/// impl Capability for NetCapability {
-///     fn name(&self) -> &'static str { "net" }
-/// }
-/// ```
-pub trait Capability: Send + Sync + 'static {
-    fn name(&self) -> &'static str;
-}
-
-/// A type-map of capability tokens, used to gate access to resources.
-///
-/// # Examples
-///
-/// ```
-/// use fluent_wvr::{Capability, CapabilitySet};
-///
-/// struct FsCapability;
-/// impl Capability for FsCapability {
-///     fn name(&self) -> &'static str { "fs" }
-/// }
-///
-/// let caps = CapabilitySet::new().with(FsCapability);
-/// assert!(caps.get::<FsCapability>().is_some());
-/// ```
-#[derive(Default, Debug)]
-pub struct CapabilitySet {
-    caps: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
-}
-
-impl Clone for CapabilitySet {
-    fn clone(&self) -> Self {
-        Self {
-            caps: self.caps.clone(),
-        }
-    }
-}
-
-impl CapabilitySet {
-    pub fn new() -> Self {
-        Self {
-            caps: HashMap::new(),
-        }
-    }
-
-    #[must_use]
-    pub fn with<C: Capability>(mut self, cap: C) -> Self {
-        self.caps.insert(TypeId::of::<C>(), Arc::new(cap));
-        self
-    }
-
-    pub fn get<C: Capability>(&self) -> Option<&C> {
-        self.caps
-            .get(&TypeId::of::<C>())
-            .and_then(|arc| (&**arc as &dyn Any).downcast_ref::<C>())
-    }
-}
-
-pub struct Reserve {
-    counter: Arc<std::sync::atomic::AtomicUsize>,
-    committed: bool,
-}
-
-impl Reserve {
-    /// Attempt to acquire a permit from the counter.
-    ///
-    /// Returns `None` if the counter is already at zero (no permits available).
-    /// Does NOT underflow — this is the safe alternative to `new()`.
-    pub fn try_acquire(counter: Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
-        let prev = counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        if prev == 0 {
-            // Underflow would occur — restore counter and return None
-            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            None
-        } else {
-            Some(Self {
-                counter,
-                committed: false,
-            })
-        }
-    }
-
-    pub fn commit(mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for Reserve {
-    fn drop(&mut self) {
-        if !self.committed {
-            self.counter
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-}
-
-/// Async runtime abstraction. All async primitives in the workspace accept
-/// this trait so that production code uses `tokio` and tests can substitute
-/// a deterministic runtime.
-///
-/// # Examples
-///
-/// ```no_run
-/// use std::sync::Arc;
-/// use fluent_wvr::{Runtime, NoopRuntime};
-///
-/// let rt: Arc<dyn Runtime> = Arc::new(NoopRuntime);
-/// rt.spawn(Box::pin(async { /* background work */ }));
-/// ```
-pub trait Runtime: Send + Sync + 'static {
-    fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) -> JoinHandle<()>;
-    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>>;
-    fn now(&self) -> Instant;
-}
-
-/// A no-op runtime for contexts where `spawn` and `sleep` are never called.
-///
-/// `spawn` logs a warning and returns a dummy `JoinHandle`. If called outside
-/// a tokio runtime, it panics with a clear message directing the caller to
-/// provide a real `Runtime`. `sleep` returns immediately. This runtime is
-/// intended for testing or initialization code that doesn't actually need
-/// async execution.
-pub struct NoopRuntime;
-
-impl Runtime for NoopRuntime {
-    fn spawn(&self, _future: Pin<Box<dyn Future<Output = ()> + Send>>) -> JoinHandle<()> {
-        tracing::warn!("NoopRuntime::spawn called — no runtime configured; task will not execute");
-        let has_runtime = tokio::runtime::Handle::try_current().is_ok();
-        assert!(
-            has_runtime,
-            "NoopRuntime::spawn called outside a tokio runtime. \
-             Either supply a real Runtime (e.g. via WorkContext with rt: tokio_runtime()) \
-             or use NoopRuntime only for dry-run / init code paths."
-        );
-        tokio::spawn(async {})
-    }
-
-    fn sleep(&self, _duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        Box::pin(async {})
-    }
-
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
-}
-
-#[derive(Error, Debug)]
-pub enum FieldError {
-    #[error("field not found: {0}")]
-    NotFound(String),
-    #[error("field parse error: {0}")]
-    Parse(String),
-    #[error("constraint violation: {0}")]
-    Constraint(String),
-}
-
-#[derive(Error, Debug)]
-pub enum WorkError {
-    #[error("execution failed: {0}")]
-    Execution(String),
-    #[error("dependency not satisfied: {0}")]
-    Dependency(String),
-    #[error("timeout after {duration_ms}ms ({unit})")]
-    Timeout { duration_ms: u64, unit: String },
-}
-
-/// Execution context passed to `WorkUnit::execute`. Carries configuration
-/// (dry-run, retries, timeout), typed metadata, a runtime, and a capability set.
-///
-/// # Examples
-///
-/// ```no_run
-/// use fluent_wvr::{WorkContext, CapabilitySet, NoopRuntime};
-/// use std::sync::Arc;
-///
-/// let ctx = WorkContext {
-///     dry_run: true,
-///     max_retries: 3,
-///     timeout_ms: 10_000,
-///     metadata: Default::default(),
-///     rt: Arc::new(NoopRuntime),
-///     caps: CapabilitySet::new(),
-/// };
-/// assert!(ctx.dry_run);
-/// ```
-#[derive(Clone)]
-pub struct WorkContext {
-    pub dry_run: bool,
-    pub max_retries: u32,
-    pub timeout_ms: u64,
-    pub metadata: HashMap<String, MetadataValue>,
-    pub rt: Arc<dyn Runtime>,
-    pub caps: CapabilitySet,
-}
-
-impl std::fmt::Debug for WorkContext {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WorkContext")
-            .field("dry_run", &self.dry_run)
-            .field("max_retries", &self.max_retries)
-            .field("timeout_ms", &self.timeout_ms)
-            .field("metadata", &self.metadata)
-            .field("rt", &"<dyn Runtime>")
-            .field("caps", &self.caps)
-            .finish()
-    }
-}
-
-impl Default for WorkContext {
-    fn default() -> Self {
-        Self {
-            dry_run: false,
-            max_retries: 0,
-            timeout_ms: 30_000,
-            metadata: HashMap::new(),
-            rt: Arc::new(NoopRuntime),
-            caps: CapabilitySet::new(),
-        }
-    }
-}
-
-impl WorkContext {
-    /// Construct a `WorkContext` for a specific unit with a given capability set.
-    /// Uses the unit's `default_timeout_ms()` and a default runtime.
-    pub fn for_unit(unit: &dyn WorkUnit, caps: CapabilitySet) -> Self {
-        Self {
-            dry_run: false,
-            max_retries: 0,
-            timeout_ms: unit.default_timeout_ms(),
-            metadata: HashMap::new(),
-            rt: Arc::new(NoopRuntime),
-            caps,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkOutput {
-    pub success: bool,
-    pub message: String,
-    pub data: serde_json::Value,
-}
-
-impl WorkOutput {
-    pub fn ok(message: impl Into<String>) -> Self {
-        Self {
-            success: true,
-            message: message.into(),
-            data: serde_json::Value::Null,
-        }
-    }
-    pub fn ok_with_data(message: impl Into<String>, data: serde_json::Value) -> Self {
-        Self {
-            success: true,
-            message: message.into(),
-            data,
-        }
-    }
-    pub fn fail(message: impl Into<String>) -> Self {
-        Self {
-            success: false,
-            message: message.into(),
-            data: serde_json::Value::Null,
-        }
-    }
-}
-
-pub trait FieldAccess {
-    fn set_field(&mut self, name: &str, value: &str) -> Result<(), FieldError>;
-    fn get_field(&self, name: &str) -> Result<String, FieldError>;
-    fn field_names(&self) -> &'static [&'static str];
-}
-
-pub trait Describable {
-    fn describe(&self) -> serde_json::Value;
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FieldSchema {
-    pub name: String,
-    pub type_name: String,
-    pub description: Option<String>,
-    pub min: Option<f64>,
-    pub max: Option<f64>,
-    pub required: bool,
-    pub format: Option<String>,
-}
-
-pub trait SchemaProvider {
-    fn schema(&self) -> Vec<FieldSchema>;
-}
-
-/// The core execution unit in the component system. Every `Component` implements
-/// this trait. The `Zone` supervisor and `MiddlewareChain` operate on `WorkUnit`s.
-///
-/// # Examples
-///
-/// ```
-/// use fluent_wvr::{WorkUnit, WorkContext, WorkOutput, WorkError};
-/// use internment::ArcIntern;
-///
-/// struct PingUnit;
-///
-/// impl WorkUnit for PingUnit {
-///     fn name(&self) -> &str { "ping" }
-///     fn depends(&self) -> &[ArcIntern<str>] { &[] }
-///     fn provides(&self) -> &[ArcIntern<str>] { &[] }
-///     fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-///         Ok(WorkOutput::ok("pong"))
-///     }
-/// }
-///
-/// let unit = PingUnit;
-/// assert_eq!(unit.name(), "ping");
-/// ```
-pub trait WorkUnit: Send + Sync {
-    fn name(&self) -> &str;
-    fn depends(&self) -> &[ArcIntern<str>];
-    fn provides(&self) -> &[ArcIntern<str>];
-    fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError>;
-
-    /// Returns the default timeout in milliseconds for this unit.
-    /// Override this to set a unit-specific timeout. Default: 30,000ms.
-    fn default_timeout_ms(&self) -> u64 {
-        30_000
-    }
-}
-
-/// A fully-featured component: `FieldAccess` + `Describable` + `WorkUnit` + `Send + Sync`.
-///
-/// Any type that implements all four traits automatically implements `Component`
-/// via a blanket impl. The derive macros (`#[derive(FieldAccess, Describable)]`)
-/// plus a manual `WorkUnit` impl is the 80% path.
-///
-/// # Examples
-///
-/// ```no_run
-/// use fluent_wvr::{Component, WorkUnit, WorkContext, WorkOutput, WorkError,
-///     FieldAccess, Describable, FieldError};
-/// use internment::ArcIntern;
-///
-/// struct MyUnit { port: u16 }
-///
-/// impl WorkUnit for MyUnit {
-///     fn name(&self) -> &str { "my_unit" }
-///     fn depends(&self) -> &[ArcIntern<str>] { &[] }
-///     fn provides(&self) -> &[ArcIntern<str>] { &[] }
-///     fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-///         Ok(WorkOutput::ok("done"))
-///     }
-/// }
-/// impl FieldAccess for MyUnit {
-///     fn set_field(&mut self, _: &str, _: &str) -> Result<(), FieldError> { Ok(()) }
-///     fn get_field(&self, _: &str) -> Result<String, FieldError> { Err(FieldError::NotFound("none".into())) }
-///     fn field_names(&self) -> &'static [&'static str] { &[] }
-/// }
-/// impl Describable for MyUnit {
-///     fn describe(&self) -> serde_json::Value { serde_json::json!({}) }
-/// }
-///
-/// // MyUnit is now a Component — can be wrapped in Arc<dyn Component>.
-/// let _comp: std::sync::Arc<dyn Component> = std::sync::Arc::new(MyUnit { port: 8080 });
-/// ```
-pub trait Component: FieldAccess + Describable + WorkUnit + Send + Sync {}
-impl<T: FieldAccess + Describable + WorkUnit + Send + Sync> Component for T {}
 
 impl WorkUnit for Arc<dyn WorkUnit> {
     fn name(&self) -> &str {
@@ -466,6 +62,9 @@ impl WorkUnit for Arc<dyn WorkUnit> {
     }
     fn default_timeout_ms(&self) -> u64 {
         (**self).default_timeout_ms()
+    }
+    fn type_name(&self) -> &'static str {
+        (**self).type_name()
     }
 }
 
@@ -484,6 +83,9 @@ impl WorkUnit for Arc<dyn Component> {
     }
     fn default_timeout_ms(&self) -> u64 {
         (**self).default_timeout_ms()
+    }
+    fn type_name(&self) -> &'static str {
+        (**self).type_name()
     }
 }
 
@@ -509,9 +111,25 @@ impl Describable for Arc<dyn Component> {
     }
 }
 
+impl Component for Arc<dyn Component> {
+    fn as_any(&self) -> &dyn Any {
+        (**self).as_any()
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        Arc::get_mut(self)
+            .expect(
+                "Arc<dyn Component>::as_any_mut: Arc has multiple owners. \
+                 Use ComponentArcExt::try_as_any_mut to handle this case safely.",
+            )
+            .as_any_mut()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use internment::ArcIntern;
 
     struct TestComponent {
         name: ArcIntern<str>,
@@ -560,6 +178,8 @@ mod tests {
         }
     }
 
+    impl_component!(TestComponent);
+
     #[test]
     fn test_field_access() {
         let mut comp = TestComponent {
@@ -571,17 +191,7 @@ mod tests {
         assert_eq!(comp.get_field("value").unwrap(), "99");
         assert!(comp.set_field("nonexistent", "x").is_err());
     }
-    #[test]
-    fn test_work_context_default() {
-        let ctx = WorkContext::default();
-        assert!(!ctx.dry_run);
-        assert_eq!(ctx.timeout_ms, 30000);
-    }
-    #[test]
-    fn test_work_output_helpers() {
-        assert!(WorkOutput::ok("done").success);
-        assert!(!WorkOutput::fail("error").success);
-    }
+
     #[test]
     fn test_component_trait_object() {
         let comp = TestComponent {
@@ -615,6 +225,8 @@ mod tests {
             Ok(WorkOutput::ok("done"))
         }
     }
+
+    impl_component!(BasicConfig);
 
     #[test]
     fn test_derive_field_access_basic() {
@@ -685,6 +297,8 @@ mod tests {
             Ok(WorkOutput::ok("done"))
         }
     }
+
+    impl_component!(ConstrainedConfig);
 
     #[test]
     fn test_derive_field_access_constraint_valid() {
@@ -759,7 +373,6 @@ mod tests {
 
     #[test]
     fn test_schema_provider() {
-        use super::SchemaProvider;
         let cfg = ConstrainedConfig {
             port: 8080,
             retries: 3,
@@ -808,7 +421,7 @@ mod tests {
         assert!(c.set_field("scale", "1.5").is_ok());
     }
 
-    #[derive(Describable)]
+    #[derive(FieldAccess, Describable)]
     #[allow(dead_code)]
     struct OptionalConfig {
         name: String,
@@ -830,6 +443,8 @@ mod tests {
             Ok(WorkOutput::ok("done"))
         }
     }
+
+    impl_component!(OptionalConfig);
 
     #[test]
     fn describable_required_false_excludes_from_required_array() {
@@ -862,7 +477,7 @@ mod tests {
         assert!(!nick_field.required);
     }
 
-    #[derive(Describable)]
+    #[derive(FieldAccess, Describable)]
     #[allow(dead_code)]
     struct FormatConfig {
         #[field(desc = "Endpoint URL", format = "url")]
@@ -887,6 +502,8 @@ mod tests {
         }
     }
 
+    impl_component!(FormatConfig);
+
     #[test]
     fn format_attribute_reaches_describable_json() {
         let c = FormatConfig {
@@ -904,7 +521,6 @@ mod tests {
 
     #[test]
     fn format_attribute_reaches_field_schema() {
-        use super::SchemaProvider;
         let c = FormatConfig {
             endpoint: "https://example.com".into(),
             timeout_ms: 5000,
@@ -919,29 +535,400 @@ mod tests {
         assert!(name_field.format.is_none());
     }
 
+    // --- FieldAccess derive: string sanitization tests ---
+
+    #[derive(FieldAccess, Describable)]
+    struct SanitizedConfig {
+        #[field(max_len = 10)]
+        short_name: String,
+        #[field(sanitize = "trim")]
+        trimmed: String,
+        #[field(sanitize = "lowercase")]
+        lowercased: String,
+        #[field(pattern = "hello")]
+        patterned: String,
+        name: String,
+    }
+
+    impl WorkUnit for SanitizedConfig {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn depends(&self) -> &[ArcIntern<str>] {
+            &[]
+        }
+        fn provides(&self) -> &[ArcIntern<str>] {
+            &[]
+        }
+        fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+            Ok(WorkOutput::ok("done"))
+        }
+    }
+
+    impl_component!(SanitizedConfig);
+
     #[test]
-    fn noop_runtime_spawn_panics_outside_tokio_with_clear_message() {
-        let rt = NoopRuntime;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            #[allow(clippy::let_underscore_future)]
-            let _ = rt.spawn(Box::pin(async {}));
-        }));
-        assert!(result.is_err(), "should panic outside tokio runtime");
-        let payload = result.unwrap_err();
-        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-            s.to_string()
-        } else if let Some(s) = payload.downcast_ref::<String>() {
+    fn max_len_rejects_long_string() {
+        let mut cfg = SanitizedConfig {
+            short_name: "x".into(),
+            trimmed: "x".into(),
+            lowercased: "x".into(),
+            patterned: "hello".into(),
+            name: "test".into(),
+        };
+        let err = cfg
+            .set_field("short_name", "this is way too long")
+            .unwrap_err();
+        match err {
+            FieldError::Constraint(msg) => {
+                assert!(msg.contains("exceeds maximum"), "unexpected: {msg}");
+            }
+            other => panic!("expected Constraint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn max_len_allows_short_string() {
+        let mut cfg = SanitizedConfig {
+            short_name: "x".into(),
+            trimmed: "x".into(),
+            lowercased: "x".into(),
+            patterned: "hello".into(),
+            name: "test".into(),
+        };
+        cfg.set_field("short_name", "ok").unwrap();
+        assert_eq!(cfg.short_name, "ok");
+    }
+
+    #[test]
+    fn sanitize_trim_strips_whitespace() {
+        let mut cfg = SanitizedConfig {
+            short_name: "x".into(),
+            trimmed: "x".into(),
+            lowercased: "x".into(),
+            patterned: "hello".into(),
+            name: "test".into(),
+        };
+        cfg.set_field("trimmed", "  hello  ").unwrap();
+        assert_eq!(cfg.trimmed, "hello");
+    }
+
+    #[test]
+    fn sanitize_lowercase_lowercases_input() {
+        let mut cfg = SanitizedConfig {
+            short_name: "x".into(),
+            trimmed: "x".into(),
+            lowercased: "x".into(),
+            patterned: "hello".into(),
+            name: "test".into(),
+        };
+        cfg.set_field("lowercased", "HELLO World").unwrap();
+        assert_eq!(cfg.lowercased, "hello world");
+    }
+
+    #[test]
+    fn pattern_rejects_non_matching() {
+        let mut cfg = SanitizedConfig {
+            short_name: "x".into(),
+            trimmed: "x".into(),
+            lowercased: "x".into(),
+            patterned: "hello".into(),
+            name: "test".into(),
+        };
+        let err = cfg.set_field("patterned", "goodbye").unwrap_err();
+        match err {
+            FieldError::Constraint(msg) => {
+                assert!(msg.contains("does not match pattern"), "unexpected: {msg}");
+            }
+            other => panic!("expected Constraint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pattern_allows_matching() {
+        let mut cfg = SanitizedConfig {
+            short_name: "x".into(),
+            trimmed: "x".into(),
+            lowercased: "x".into(),
+            patterned: "hello".into(),
+            name: "test".into(),
+        };
+        cfg.set_field("patterned", "say hello world").unwrap();
+        assert_eq!(cfg.patterned, "say hello world");
+    }
+
+    #[derive(FieldAccess, Describable)]
+    struct OptionConfig {
+        name: String,
+        #[field(required = false)]
+        nickname: Option<String>,
+    }
+
+    impl WorkUnit for OptionConfig {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn depends(&self) -> &[ArcIntern<str>] {
+            &[]
+        }
+        fn provides(&self) -> &[ArcIntern<str>] {
+            &[]
+        }
+        fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+            Ok(WorkOutput::ok("done"))
+        }
+    }
+
+    impl_component!(OptionConfig);
+
+    #[derive(FieldAccess, Describable)]
+    struct EmptyIsNoneConfig {
+        name: String,
+        #[field(required = false)]
+        nickname: Option<String>,
+        #[field(required = false, empty_is_none = false)]
+        email: Option<String>,
+    }
+
+    impl WorkUnit for EmptyIsNoneConfig {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn depends(&self) -> &[ArcIntern<str>] {
+            &[]
+        }
+        fn provides(&self) -> &[ArcIntern<str>] {
+            &[]
+        }
+        fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+            Ok(WorkOutput::ok("done"))
+        }
+    }
+
+    impl_component!(EmptyIsNoneConfig);
+
+    #[test]
+    fn option_string_empty_is_none_default() {
+        let mut cfg = EmptyIsNoneConfig {
+            name: "test".into(),
+            nickname: Some("nick".into()),
+            email: Some("e@x.com".into()),
+        };
+        cfg.set_field("nickname", "").unwrap();
+        assert!(
+            cfg.nickname.is_none(),
+            "default empty_is_none should convert '' to None"
+        );
+    }
+
+    #[test]
+    fn option_string_empty_is_none_false_keeps_some() {
+        let mut cfg = EmptyIsNoneConfig {
+            name: "test".into(),
+            nickname: None,
+            email: Some("e@x.com".into()),
+        };
+        cfg.set_field("email", "").unwrap();
+        assert_eq!(
+            cfg.email.as_deref(),
+            Some(""),
+            "empty_is_none=false should preserve Some('')"
+        );
+    }
+
+    #[test]
+    fn option_string_empty_gives_none() {
+        let mut cfg = OptionConfig {
+            name: "test".into(),
+            nickname: Some("nick".into()),
+        };
+        cfg.set_field("nickname", "").unwrap();
+        assert!(cfg.nickname.is_none());
+    }
+
+    #[test]
+    fn option_string_non_empty_gives_some() {
+        let mut cfg = OptionConfig {
+            name: "test".into(),
+            nickname: None,
+        };
+        cfg.set_field("nickname", "alice").unwrap();
+        assert_eq!(cfg.nickname.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn option_string_get_returns_empty_when_none() {
+        let cfg = OptionConfig {
+            name: "test".into(),
+            nickname: None,
+        };
+        assert_eq!(cfg.get_field("nickname").unwrap(), "");
+    }
+
+    #[test]
+    fn option_string_get_returns_value_when_some() {
+        let cfg = OptionConfig {
+            name: "test".into(),
+            nickname: Some("bob".into()),
+        };
+        assert_eq!(cfg.get_field("nickname").unwrap(), "bob");
+    }
+
+    #[test]
+    fn describable_includes_max_len_and_pattern() {
+        let cfg = SanitizedConfig {
+            short_name: "x".into(),
+            trimmed: "x".into(),
+            lowercased: "x".into(),
+            patterned: "hello".into(),
+            name: "test".into(),
+        };
+        let desc = cfg.describe();
+        let short_schema = &desc["properties"]["short_name"];
+        assert_eq!(short_schema["maxLength"], "10");
+        let patterned_schema = &desc["properties"]["patterned"];
+        assert_eq!(patterned_schema["pattern"], "hello");
+
+        let fields = cfg.schema();
+        let short_field = fields.iter().find(|f| f.name == "short_name").unwrap();
+        assert_eq!(short_field.max_len, Some(10));
+        let pattern_field = fields.iter().find(|f| f.name == "patterned").unwrap();
+        assert_eq!(pattern_field.pattern.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn describable_option_field_not_required() {
+        let cfg = OptionConfig {
+            name: "test".into(),
+            nickname: None,
+        };
+        let desc = cfg.describe();
+        let required = desc["required"].as_array().unwrap();
+        assert!(required.iter().any(|v| v == "name"));
+        assert!(!required.iter().any(|v| v == "nickname"));
+    }
+
+    // --- M3: Runtime type identification and typed data tests ---
+
+    #[test]
+    fn as_any_returns_correct_concrete_type() {
+        let comp = TestComponent {
+            name: ArcIntern::from("test"),
+            value: 42,
+        };
+        let arc: Arc<dyn Component> = Arc::new(comp);
+        let any_ref = arc.as_any();
+        let downcasted = any_ref.downcast_ref::<TestComponent>();
+        assert!(downcasted.is_some());
+        assert_eq!(downcasted.unwrap().value, 42);
+    }
+
+    #[test]
+    fn downcast_ref_succeeds_for_correct_type() {
+        let comp = TestComponent {
+            name: ArcIntern::from("test"),
+            value: 10,
+        };
+        let arc: Arc<dyn Component> = Arc::new(comp);
+        assert!(component_downcast_ref::<TestComponent>(&*arc).is_some());
+    }
+
+    #[test]
+    fn downcast_ref_fails_for_wrong_type() {
+        let comp = TestComponent {
+            name: ArcIntern::from("test"),
+            value: 10,
+        };
+        let arc: Arc<dyn Component> = Arc::new(comp);
+        assert!(component_downcast_ref::<ConstrainedConfig>(&*arc).is_none());
+    }
+
+    #[test]
+    fn type_name_returns_concrete_type_through_arc_dyn() {
+        let comp = TestComponent {
+            name: ArcIntern::from("test"),
+            value: 10,
+        };
+        let arc: Arc<dyn Component> = Arc::new(comp);
+        let name = arc.type_name();
+        assert!(
+            name.contains("TestComponent"),
+            "expected concrete type name, got: {name}"
+        );
+    }
+
+    #[test]
+    fn try_as_any_mut_succeeds_with_single_owner() {
+        let mut arc: Arc<dyn Component> = Arc::new(TestComponent {
+            name: ArcIntern::from("t"),
+            value: 1,
+        });
+        let result = ComponentArcExt::try_as_any_mut(&mut arc);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn try_as_any_mut_returns_none_with_multiple_owners() {
+        let arc: Arc<dyn Component> = Arc::new(TestComponent {
+            name: ArcIntern::from("t"),
+            value: 1,
+        });
+        let _clone = Arc::clone(&arc);
+        // Now there are 2 owners — try_as_any_mut should return None
+        let mut arc_mut = arc;
+        let result = ComponentArcExt::try_as_any_mut(&mut arc_mut);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn as_any_mut_panic_message_mentions_try_variant() {
+        let arc: Arc<dyn Component> = Arc::new(TestComponent {
+            name: ArcIntern::from("t"),
+            value: 1,
+        });
+        let _clone = Arc::clone(&arc);
+        // Now there are 2 owners — as_any_mut will panic
+        let mut arc_mut = arc;
+        let msg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = arc_mut.as_any_mut();
+        }))
+        .unwrap_err();
+        let payload = if let Some(s) = msg.downcast_ref::<String>() {
             s.clone()
+        } else if let Some(s) = msg.downcast_ref::<&str>() {
+            s.to_string()
         } else {
-            panic!("unexpected panic payload type");
+            String::new()
         };
         assert!(
-            msg.contains("NoopRuntime::spawn called outside a tokio runtime"),
-            "panic message should be clear, got: {msg}"
+            payload.contains("ComponentArcExt::try_as_any_mut"),
+            "panic message should mention ComponentArcExt::try_as_any_mut, got: {payload}"
         );
-        assert!(
-            msg.contains("supply a real Runtime"),
-            "panic message should suggest fix, got: {msg}"
-        );
+    }
+
+    #[test]
+    fn test_work_unit_delegates_to_inner_for_arc_dyn_work_unit() {
+        let inner = TestComponent {
+            name: ArcIntern::from("test"),
+            value: 10,
+        };
+        let arc: Arc<dyn WorkUnit> = Arc::new(inner);
+        assert_eq!(arc.name(), "test");
+        let ctx = WorkContext::default();
+        let result = arc.execute(&ctx).unwrap();
+        assert_eq!(result.message, "computed: 20");
+    }
+
+    #[test]
+    fn test_work_unit_delegates_to_inner_for_arc_dyn_component() {
+        let inner = TestComponent {
+            name: ArcIntern::from("test"),
+            value: 10,
+        };
+        let arc: Arc<dyn Component> = Arc::new(inner);
+        assert_eq!(arc.name(), "test");
+        let ctx = WorkContext::default();
+        let result = arc.execute(&ctx).unwrap();
+        assert_eq!(result.message, "computed: 20");
     }
 }

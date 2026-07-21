@@ -11,8 +11,8 @@ use common_core::jsonrpc::{JsonRpcError, JsonRpcHandler, JsonRpcRequest, JsonRpc
 use common_core::metrics::LatencyHistogram;
 use fluent_concurrency::zone::ZoneSummary;
 use fluent_wvr::{
-    CapabilitySet, Component, Describable, FieldAccess, FieldError, WorkContext, WorkError,
-    WorkOutput, WorkUnit,
+    impl_component, CapabilitySet, Component, Describable, FieldAccess, FieldError, WorkContext,
+    WorkError, WorkOutput, WorkUnit,
 };
 use std::sync::RwLock;
 
@@ -355,6 +355,8 @@ impl Describable for NamedComponent {
         self.inner.describe()
     }
 }
+
+impl_component!(NamedComponent);
 
 /// Parse the index suffix from a `NamedComponent` name (e.g., "analyze_form:3" → Some(3)).
 fn parse_index(name: &str) -> Option<usize> {

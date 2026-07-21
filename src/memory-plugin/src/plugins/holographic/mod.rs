@@ -13,7 +13,8 @@ pub mod store;
 use crate::traits::MemoryOps;
 use crate::types::*;
 use fluent_wvr::{
-    Describable, FieldAccess, FieldError, WorkContext, WorkError, WorkOutput, WorkUnit,
+    impl_component, Describable, FieldAccess, FieldError, WorkContext, WorkError, WorkOutput,
+    WorkUnit,
 };
 use internment::ArcIntern;
 use serde_json::json;
@@ -474,6 +475,8 @@ impl Describable for HolographicMemory {
         })
     }
 }
+
+impl_component!(HolographicMemory);
 
 impl WorkUnit for HolographicMemory {
     fn name(&self) -> &str {

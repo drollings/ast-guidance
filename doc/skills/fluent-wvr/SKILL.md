@@ -109,10 +109,21 @@ pub trait WorkUnit: Send + Sync {
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError>;
 }
 
-/// The unified process boundary. Any type implementing all three sub-traits
-/// is automatically a Component via the blanket impl.
-pub trait Component: FieldAccess + Describable + WorkUnit + Send + Sync {}
-impl<T: FieldAccess + Describable + WorkUnit + Send + Sync> Component for T {}
+/// The unified process boundary. Requires as_any/as_any_mut for runtime
+/// type identification after dyn Component erasure.
+pub trait Component: FieldAccess + Describable + WorkUnit + Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+/// Use the `impl_component!` macro instead of hand-writing `as_any`/`as_any_mut`:
+/// ```ignore
+/// impl_component!(MyConfig);
+/// ```
+
+/// Free functions for downcasting (no blanket impl — Rust dyn-compatibility).
+pub fn component_downcast_ref<T: 'static>(comp: &dyn Component) -> Option<&T>;
+pub fn component_downcast_mut<T: 'static>(comp: &mut dyn Component) -> Option<&mut T>;
 ```
 
 > **Critical design note on `field_names` and `describe`:** Both are defined as `&self` instance methods, not static associated functions. This is deliberate: it makes them callable through `dyn Component`. A `fn field_names() -> &'static [&'static str]` associated function is not object-safe and cannot be dispatched through a trait object. Always use the instance method form.
@@ -311,12 +322,18 @@ let config: Config = serde_json::from_str(json)?;
 pub struct ToolConfig {
     #[field(desc = "TCP listen port", min = 1, max = 65535)]
     pub port: u16,
-    #[field(desc = "Host address")]
+    #[field(desc = "Host address", max_len = 255)]
     pub host: String,
     #[field(desc = "Enable verbose logging")]
     pub verbose: bool,
+    #[field(desc = "API endpoint URL", pattern = "https://")]
+    pub endpoint: String,
+    #[field(desc = "Display name", sanitize = "trim,lowercase")]
+    pub name: String,
 }
 ```
+
+> **Note:** Patterns are substring matches, not regex. The value must contain the pattern string.
 
 The derive macro generates this implementation:
 
@@ -594,6 +611,10 @@ pub enum ProviderConfig {
 }
 ```
 
+### Component serialization (deferred)
+
+Adding `Serialize` to the `Component` trait would require every implementor to be serializable — a breaking change for types holding `Arc<dyn Provider>`, `Mutex<Plugin>`, etc. A `PersistableComponent` trait stub exists in `fluent-wvr/src/lib.rs` as a design placeholder. Do NOT implement it until a second consumer materializes that needs to persist component state.
+
 ### Rules
 
 1. **Always add `Send + Sync`** to traits stored in registries or shared across threads.
@@ -814,10 +835,19 @@ pub struct WorkContext {
 }
 
 pub struct WorkOutput {
-    pub provides: BitVec,
-    pub output: Vec<u8>,
     pub success: bool,
+    pub message: String,
+    pub data: serde_json::Value,
 }
+
+impl WorkOutput {
+    pub fn ok(message: impl Into<String>) -> Self;
+    pub fn fail(message: impl Into<String>) -> Self;
+    pub fn typed<T: Serialize>(message: impl Into<String>, data: &T) -> Self;
+    pub fn data_as<T: Deserialize>(&self) -> Result<T, WorkError>;
+}
+
+impl std::fmt::Display for WorkOutput { /* "OK: msg" or "FAIL: msg" */ }
 
 pub trait WorkUnit: Send + Sync {
     fn name(&self) -> &str;
@@ -1105,6 +1135,7 @@ registry.register(adapted);
 - **Adapters implement `Component`**, so they store in the same registry as any other component.
 - **Delegate to the inner component** for all methods you don't override.
 - **`set_field` on an adapter is intentionally limited.** Configure the inner component before wrapping if mutation is needed.
+- **`get_field` falls back to the inner component** when no override exists for the requested field.
 
 ---
 

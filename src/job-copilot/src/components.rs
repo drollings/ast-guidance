@@ -3,7 +3,8 @@ use std::sync::Arc;
 use bon::Builder;
 use common_core::hash::blake3_hex;
 use fluent_wvr::{
-    ArcIntern, Capability, Describable, FieldAccess, WorkContext, WorkError, WorkOutput, WorkUnit,
+    impl_component, ArcIntern, Capability, Describable, FieldAccess, WorkContext, WorkError,
+    WorkOutput, WorkUnit,
 };
 
 use crate::dispatcher::FieldValueDispatcher;
@@ -146,6 +147,8 @@ impl WorkUnit for AnalyzeFormComponent {
         Ok(WorkOutput::ok_with_data("form analyzed", data))
     }
 }
+
+impl_component!(AnalyzeFormComponent);
 
 impl AnalyzeFormComponent {
     /// Execute the form analysis and return the deserialized response.

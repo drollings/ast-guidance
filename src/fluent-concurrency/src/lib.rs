@@ -569,13 +569,16 @@ mod tests {
             zone.register_with_context(unit, ctx);
             let summary: ZoneSummary = (&mut zone).await;
             assert_eq!(summary.completed.len(), 0);
-            assert_eq!(summary.panicked.len(), 1);
-            assert_eq!(summary.cancelled.len(), 0);
-            match &summary.panicked[0] {
-                crate::zone::ZoneEvent::Panicked { info, .. } => {
-                    assert!(info.contains("timed out"));
+            assert_eq!(summary.panicked.len(), 0);
+            assert_eq!(summary.cancelled.len(), 1);
+            match &summary.cancelled[0] {
+                crate::zone::ZoneEvent::Cancelled {
+                    name,
+                    reason: CancelReason::Timeout,
+                } => {
+                    assert_eq!(&**name, "slow");
                 }
-                _ => panic!("expected Panicked event"),
+                _ => panic!("expected Cancelled(Timeout) event"),
             }
         }
 

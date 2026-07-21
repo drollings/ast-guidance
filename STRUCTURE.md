@@ -234,8 +234,15 @@ Then you you must read
     ├── fluent-wvr/
     │   ├── Cargo.toml
     │   └── src/
-    │       ├── lib.rs  # #![forbid(unsafe_code)]
-    │       └── wrapper.rs  # use std::sync::Arc;
+    │       ├── lib.rs  # re-exports + Arc<dyn Component> blanket impls
+    │       ├── traits.rs  # FieldAccess, Describable, WorkUnit, Component, FieldError, downcast helpers
+    │       ├── work.rs  # WorkContext, WorkOutput, WorkError
+    │       ├── capability.rs  # Capability, CapabilitySet, Reserve
+    │       ├── runtime.rs  # Runtime, NoopRuntime
+    │       ├── metadata.rs  # MetadataValue + From impls
+    │       ├── macros.rs  # impl_component! macro
+    │       ├── prelude.rs  # The fluent-wvr prelude
+    │       └── wrapper.rs  # Instrumented, WithRetry, ComponentAdapter, Pipeline
     ├── fluent-wvr-macros/
     │   ├── Cargo.toml
     │   └── src/

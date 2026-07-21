@@ -12,6 +12,10 @@ struct FieldMeta {
     skip: bool,
     required: bool,
     format: Option<String>,
+    max_len: Option<usize>,
+    sanitize: Option<String>,
+    pattern: Option<String>,
+    empty_is_none: bool,
 }
 
 fn parse_field_attrs(field: &syn::Field) -> FieldMeta {
@@ -22,6 +26,10 @@ fn parse_field_attrs(field: &syn::Field) -> FieldMeta {
         skip: false,
         required: true,
         format: None,
+        max_len: None,
+        sanitize: None,
+        pattern: None,
+        empty_is_none: true,
     };
 
     for attr in &field.attrs {
@@ -78,8 +86,52 @@ fn parse_field_attrs(field: &syn::Field) -> FieldMeta {
                 }
                 return Ok(());
             }
+            if meta.path.is_ident("max_len") {
+                let value = meta.value()?;
+                let lit: Lit = value.parse()?;
+                if let Lit::Int(i) = lit {
+                    result.max_len = Some(i.base10_parse::<usize>().unwrap());
+                }
+                return Ok(());
+            }
+            if meta.path.is_ident("sanitize") {
+                let value = meta.value()?;
+                let lit: Lit = value.parse()?;
+                if let Lit::Str(s) = lit {
+                    let mode = s.value();
+                    match mode.as_str() {
+                        "trim" | "lowercase" | "strip_html" | "slugify" => {
+                            result.sanitize = Some(mode);
+                        }
+                        _ => {
+                            return Err(meta.error(
+                                "unknown sanitize mode, expected `trim`, `lowercase`, `strip_html`, or `slugify`",
+                            ));
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            if meta.path.is_ident("pattern") {
+                // Substring pattern, not regex. The value must contain
+                // the pattern string. Kept dependency-free (no regex crate).
+                let value = meta.value()?;
+                let lit: Lit = value.parse()?;
+                if let Lit::Str(s) = lit {
+                    result.pattern = Some(s.value());
+                }
+                return Ok(());
+            }
+            if meta.path.is_ident("empty_is_none") {
+                let value = meta.value()?;
+                let lit: Lit = value.parse()?;
+                if let Lit::Bool(b) = lit {
+                    result.empty_is_none = b.value();
+                }
+                return Ok(());
+            }
             Err(meta.error(
-                "unknown field attribute, expected `skip`, `desc`, `min`, `max`, `required`, or `format`",
+                "unknown field attribute, expected `skip`, `desc`, `min`, `max`, `required`, `format`, `max_len`, `sanitize`, `pattern`, or `empty_is_none`",
             ))
         });
     }
@@ -142,6 +194,10 @@ fn quote_type_string(ty_str: &str) -> TokenStream2 {
 /// - `#[field(desc = "...")]` — field description (used by `Describable`)
 /// - `#[field(min = N)]` — minimum value constraint (numeric fields only)
 /// - `#[field(max = N)]` — maximum value constraint (numeric fields only)
+/// - `#[field(format = "...")]` — JSON Schema format hint (informational)
+/// - `#[field(max_len = N)]` — maximum string length
+/// - `#[field(sanitize = "trim,lowercase")]` — sanitization mode
+/// - `#[field(pattern = "...")]` — substring pattern; value must contain this string
 #[proc_macro_derive(FieldAccess, attributes(field))]
 pub fn derive_field_access(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -186,7 +242,49 @@ pub fn derive_field_access(input: TokenStream) -> TokenStream {
 
         let has_constraints = meta.min.is_some() || meta.max.is_some();
 
-        let mut parse_and_set = if ty_str == "String"
+        // Detect Option<T> by checking if the type string contains "Option" with angle brackets
+        let normalized_ty = ty_str.replace(' ', "");
+        let is_option = normalized_ty.starts_with("Option<")
+            || normalized_ty.starts_with("std::option::Option<");
+        let inner_ty_str = if is_option {
+            normalized_ty
+                .strip_prefix("Option<")
+                .or_else(|| normalized_ty.strip_prefix("std::option::Option<"))
+                .and_then(|s| s.strip_suffix('>'))
+                .unwrap_or("String")
+                .to_string()
+        } else {
+            ty_str.clone()
+        };
+
+        let mut parse_and_set = if is_option {
+            let inner_is_string = inner_ty_str == "String"
+                || inner_ty_str == "std::string::String"
+                || inner_ty_str.ends_with("::String");
+            if inner_is_string && meta.empty_is_none {
+                quote! {
+                    if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    }
+                }
+            } else if inner_is_string {
+                quote! {
+                    Some(value.to_string())
+                }
+            } else {
+                quote! {
+                    if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.parse::<#ty>().map_err(|_| fluent_wvr::FieldError::Parse(
+                            format!("invalid Option<{}> for '{}': {}", #inner_ty_str, #field_name_str, value)
+                        ))?)
+                    }
+                }
+            }
+        } else if ty_str == "String"
             || ty_str == "std::string::String"
             || ty_str.ends_with("::String")
         {
@@ -215,6 +313,94 @@ pub fn derive_field_access(input: TokenStream) -> TokenStream {
                 ))?
             }
         };
+
+        // Apply string sanitization before constraint checks
+        if !is_option
+            && (ty_str == "String"
+                || ty_str == "std::string::String"
+                || ty_str.ends_with("::String"))
+        {
+            if let Some(ref sanitize_mode) = meta.sanitize {
+                match sanitize_mode.as_str() {
+                    "trim" => {
+                        parse_and_set = quote! {
+                            {
+                                let s: String = #parse_and_set;
+                                s.trim().to_string()
+                            }
+                        };
+                    }
+                    "lowercase" => {
+                        parse_and_set = quote! {
+                            {
+                                let s: String = #parse_and_set;
+                                s.to_lowercase()
+                            }
+                        };
+                    }
+                    "strip_html" => {
+                        parse_and_set = quote! {
+                            {
+                                let s: String = #parse_and_set;
+                                ::fluent_wvr::strip_html(&s)
+                            }
+                        };
+                    }
+                    "slugify" => {
+                        parse_and_set = quote! {
+                            {
+                                let s: String = #parse_and_set;
+                                ::fluent_wvr::slugify(&s)
+                            }
+                        };
+                    }
+                    _ => {
+                        return syn::Error::new_spanned(
+                            f,
+                            format!("unknown sanitize mode: {}", sanitize_mode),
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
+                }
+            }
+
+            // Apply max_len check
+            if let Some(max_len) = meta.max_len {
+                let max_len_lit = proc_macro2::Literal::usize_suffixed(max_len);
+                let max_len_err = format!(
+                    "{}: string length exceeds maximum {}",
+                    field_name_str, max_len
+                );
+                parse_and_set = quote! {
+                    {
+                        let s: String = #parse_and_set;
+                        if s.chars().count() > #max_len_lit {
+                            return Err(fluent_wvr::FieldError::Constraint(#max_len_err.into()));
+                        }
+                        s
+                    }
+                };
+            }
+
+            // Apply pattern check
+            if let Some(ref pattern) = meta.pattern {
+                let pattern_lit = pattern.clone();
+                let pattern_err = format!(
+                    "{}: value does not match pattern '{}'",
+                    field_name_str, pattern
+                );
+                parse_and_set = quote! {
+                    {
+                        let s: String = #parse_and_set;
+                        if !s.contains(#pattern_lit) {
+                            return Err(fluent_wvr::FieldError::Constraint(#pattern_err.into()));
+                        }
+                        s
+                    }
+                };
+            }
+        }
 
         if is_numeric_type(&ty_str) {
             let min_check = meta.min.map(|min_val| {
@@ -269,7 +455,9 @@ pub fn derive_field_access(input: TokenStream) -> TokenStream {
             });
         }
 
-        let to_string_expr = if ty_str == "String"
+        let to_string_expr = if is_option {
+            quote! { self.#field_ident.as_deref().unwrap_or("").to_string() }
+        } else if ty_str == "String"
             || ty_str == "std::string::String"
             || ty_str.ends_with("::String")
         {
@@ -383,6 +571,12 @@ pub fn derive_describable(input: TokenStream) -> TokenStream {
         let type_str = quote_type_string(&ty_str);
         schema.push(quote! { "type": #type_str });
 
+        // Option<T> fields are not required
+        let normalized_ty_for_desc = ty_str.replace(' ', "");
+        let is_option = normalized_ty_for_desc.starts_with("Option<")
+            || normalized_ty_for_desc.starts_with("std::option::Option<");
+        let effective_required = if is_option { false } else { meta.required };
+
         if let Some(ref desc) = meta.desc {
             schema.push(quote! { "description": #desc });
         }
@@ -400,6 +594,19 @@ pub fn derive_describable(input: TokenStream) -> TokenStream {
 
         if let Some(ref fmt) = meta.format {
             schema.push(quote! { "format": #fmt });
+        }
+
+        if let Some(max_len) = meta.max_len {
+            let max_len_str = max_len.to_string();
+            schema.push(quote! { "maxLength": #max_len_str });
+        }
+
+        if let Some(ref sanitize) = meta.sanitize {
+            schema.push(quote! { "sanitize": #sanitize });
+        }
+
+        if let Some(ref pattern) = meta.pattern {
+            schema.push(quote! { "pattern": #pattern });
         }
 
         let field_name_lit = field_name_str.clone();
@@ -423,7 +630,7 @@ pub fn derive_describable(input: TokenStream) -> TokenStream {
         };
         let type_name_str = ty_str.clone();
 
-        let required_expr = if meta.required {
+        let required_expr = if effective_required {
             quote! { true }
         } else {
             quote! { false }
@@ -431,6 +638,18 @@ pub fn derive_describable(input: TokenStream) -> TokenStream {
 
         let format_expr = match &meta.format {
             Some(f) => quote! { Some(#f.into()) },
+            None => quote! { None },
+        };
+        let max_len_expr = match meta.max_len {
+            Some(v) => quote! { Some(#v) },
+            None => quote! { None },
+        };
+        let sanitize_expr = match &meta.sanitize {
+            Some(s) => quote! { Some(#s.into()) },
+            None => quote! { None },
+        };
+        let pattern_expr = match &meta.pattern {
+            Some(p) => quote! { Some(#p.into()) },
             None => quote! { None },
         };
 
@@ -443,10 +662,13 @@ pub fn derive_describable(input: TokenStream) -> TokenStream {
                 max: #max_expr,
                 required: #required_expr,
                 format: #format_expr,
+                max_len: #max_len_expr,
+                sanitize: #sanitize_expr,
+                pattern: #pattern_expr,
             }
         });
 
-        if meta.required {
+        if effective_required {
             required.push(field_name_str);
         }
     }
@@ -472,4 +694,170 @@ pub fn derive_describable(input: TokenStream) -> TokenStream {
     };
 
     TokenStream::from(expanded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_field(attrs: &str, ty: &str, name: &str) -> syn::Field {
+        let input: syn::DeriveInput = syn::parse_str(&format!(
+            "struct Foo {{ #[field({})] {}: {} }}",
+            attrs, name, ty
+        ))
+        .unwrap();
+        match input.data {
+            syn::Data::Struct(s) => match s.fields {
+                syn::Fields::Named(named) => named.named.into_iter().next().unwrap(),
+                _ => panic!("expected named fields"),
+            },
+            _ => panic!("expected struct"),
+        }
+    }
+
+    #[test]
+    fn parse_field_attrs_extracts_desc() {
+        let field = make_field(r#"desc = "TCP port""#, "u16", "port");
+        let meta = parse_field_attrs(&field);
+        assert_eq!(meta.desc.as_deref(), Some("TCP port"));
+        assert!(meta.min.is_none());
+        assert!(meta.max.is_none());
+        assert!(!meta.skip);
+        assert!(meta.required);
+    }
+
+    #[test]
+    fn parse_field_attrs_extracts_min_max() {
+        let field = make_field("min = 1, max = 65535", "u16", "port");
+        let meta = parse_field_attrs(&field);
+        assert_eq!(meta.min, Some(1.0));
+        assert_eq!(meta.max, Some(65535.0));
+    }
+
+    #[test]
+    fn parse_field_attrs_extracts_skip() {
+        let field = make_field("skip", "String", "ignored");
+        let meta = parse_field_attrs(&field);
+        assert!(meta.skip);
+    }
+
+    #[test]
+    fn parse_field_attrs_extracts_required_false() {
+        let field = make_field("required = false", "Option<String>", "nickname");
+        let meta = parse_field_attrs(&field);
+        assert!(!meta.required);
+    }
+
+    #[test]
+    fn parse_field_attrs_extracts_format() {
+        let field = make_field(r#"format = "url""#, "String", "endpoint");
+        let meta = parse_field_attrs(&field);
+        assert_eq!(meta.format.as_deref(), Some("url"));
+    }
+
+    #[test]
+    fn parse_field_attrs_extracts_max_len() {
+        let field = make_field("max_len = 100", "String", "name");
+        let meta = parse_field_attrs(&field);
+        assert_eq!(meta.max_len, Some(100));
+    }
+
+    #[test]
+    fn parse_field_attrs_extracts_sanitize() {
+        let field = make_field(r#"sanitize = "trim""#, "String", "name");
+        let meta = parse_field_attrs(&field);
+        assert_eq!(meta.sanitize.as_deref(), Some("trim"));
+    }
+
+    #[test]
+    fn parse_field_attrs_extracts_pattern() {
+        let field = make_field(r#"pattern = "https://""#, "String", "url");
+        let meta = parse_field_attrs(&field);
+        assert_eq!(meta.pattern.as_deref(), Some("https://"));
+    }
+
+    #[test]
+    fn parse_field_attrs_extracts_empty_is_none() {
+        let field = make_field("empty_is_none = false", "Option<String>", "email");
+        let meta = parse_field_attrs(&field);
+        assert!(!meta.empty_is_none);
+    }
+
+    #[test]
+    fn parse_field_attrs_default_empty_is_none_true() {
+        let field = make_field("required = false", "Option<String>", "nickname");
+        let meta = parse_field_attrs(&field);
+        assert!(meta.empty_is_none);
+    }
+
+    #[test]
+    fn is_numeric_type_true_for_integers() {
+        for ty in &[
+            "u8", "u16", "u32", "u64", "u128", "i8", "i16", "i32", "i64", "i128", "usize", "isize",
+        ] {
+            assert!(is_numeric_type(ty), "expected {ty} to be numeric");
+        }
+    }
+
+    #[test]
+    fn is_numeric_type_true_for_floats() {
+        assert!(is_numeric_type("f32"));
+        assert!(is_numeric_type("f64"));
+    }
+
+    #[test]
+    fn is_numeric_type_false_for_non_numeric() {
+        assert!(!is_numeric_type("String"));
+        assert!(!is_numeric_type("bool"));
+        assert!(!is_numeric_type("Option<u32>"));
+        assert!(!is_numeric_type("Vec<u8>"));
+    }
+
+    #[test]
+    fn quote_type_string_maps_integers_to_integer() {
+        for ty in &[
+            "u8", "u16", "u32", "u64", "u128", "i8", "i16", "i32", "i64", "i128", "usize", "isize",
+        ] {
+            let ts = quote_type_string(ty);
+            let s = ts.to_string();
+            assert_eq!(
+                s.trim_matches('"'),
+                "integer",
+                "expected {ty} -> integer, got {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn quote_type_string_maps_floats_to_number() {
+        let ts = quote_type_string("f64");
+        let s = ts.to_string();
+        assert_eq!(s.trim_matches('"'), "number", "got {s}");
+    }
+
+    #[test]
+    fn quote_type_string_maps_bool_to_boolean() {
+        let ts = quote_type_string("bool");
+        let s = ts.to_string();
+        assert_eq!(s.trim_matches('"'), "boolean", "got {s}");
+    }
+
+    #[test]
+    fn quote_type_string_maps_string_to_string() {
+        let ts = quote_type_string("String");
+        let s = ts.to_string();
+        assert_eq!(s.trim_matches('"'), "string", "got {s}");
+    }
+
+    #[test]
+    fn unknown_sanitize_mode_returns_none() {
+        // parse_field_attrs returns sanitize: None for unknown modes
+        // (the error from parse_nested_meta is swallowed by `let _ =`)
+        let field = make_field(r#"sanitize = "invalid""#, "String", "x");
+        let meta = parse_field_attrs(&field);
+        assert_eq!(
+            meta.sanitize, None,
+            "unknown sanitize mode should not be set"
+        );
+    }
 }

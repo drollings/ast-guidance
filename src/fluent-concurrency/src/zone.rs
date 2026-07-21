@@ -9,8 +9,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use common_core::error::IoError;
-use fluent_wvr::{CapabilitySet, Component, Runtime, WorkContext, WorkOutput, WorkUnit};
+use fluent_wvr::{CapabilitySet, Component, Runtime, WorkContext, WorkError, WorkOutput, WorkUnit};
 use internment::ArcIntern;
 use tokio::task::JoinSet;
 
@@ -96,7 +95,7 @@ pub struct Zone {
     task_names: HashMap<tokio::task::Id, ArcIntern<str>>,
     abort_handles: HashMap<ArcIntern<str>, tokio::task::AbortHandle>,
     cancelled_tasks: HashSet<ArcIntern<str>>,
-    join_set: JoinSet<Result<WorkOutput, IoError>>,
+    join_set: JoinSet<Result<WorkOutput, WorkError>>,
     active_count: usize,
     summary: ZoneSummary,
     done: bool,
@@ -272,6 +271,19 @@ impl Future for Zone {
                     this.active_count -= 1;
                     budget -= 1;
                 }
+                Poll::Ready(Some(Ok((id, Err(WorkError::Timeout { .. }))))) => {
+                    let name = this
+                        .task_names
+                        .remove(&id)
+                        .unwrap_or_else(|| ArcIntern::from("unknown"));
+                    this.cancel_dependents_of(&name);
+                    this.summary.cancelled.push(ZoneEvent::Cancelled {
+                        name,
+                        reason: CancelReason::Timeout,
+                    });
+                    this.active_count -= 1;
+                    budget -= 1;
+                }
                 Poll::Ready(Some(Ok((id, Err(e))))) => {
                     let name = this
                         .task_names
@@ -354,7 +366,7 @@ async fn execute_with_timeout_and_retry(
     ctx: WorkContext,
     max_retries: u32,
     timeout_ms: u64,
-) -> Result<WorkOutput, IoError> {
+) -> Result<WorkOutput, WorkError> {
     // Yield to allow pending abort signals to be processed before
     // executing the synchronous work unit body.
     tokio::task::yield_now().await;
@@ -372,7 +384,7 @@ async fn execute_with_timeout_and_retry(
                 Ok(output) => return Ok(output),
                 Err(e) => {
                     if attempts > max_retries {
-                        return Err(IoError(std::io::Error::other(e.to_string())));
+                        return Err(e);
                     }
                     tokio::time::sleep(Duration::from_millis(100 * u64::from(attempts))).await;
                 }
@@ -383,10 +395,10 @@ async fn execute_with_timeout_and_retry(
     if timeout_ms > 0 {
         match tokio::time::timeout(Duration::from_millis(timeout_ms), fut).await {
             Ok(result) => result,
-            Err(_) => Err(IoError(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "zone task timed out",
-            ))),
+            Err(_) => Err(WorkError::Timeout {
+                duration_ms: timeout_ms,
+                unit: unit.name().to_string(),
+            }),
         }
     } else {
         fut.await

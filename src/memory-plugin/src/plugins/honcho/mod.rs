@@ -6,7 +6,8 @@
 use crate::traits::MemoryOps;
 use crate::types::*;
 use fluent_wvr::{
-    Describable, FieldAccess, FieldError, WorkContext, WorkError, WorkOutput, WorkUnit,
+    impl_component, Describable, FieldAccess, FieldError, WorkContext, WorkError, WorkOutput,
+    WorkUnit,
 };
 use internment::ArcIntern;
 use serde::{Deserialize, Serialize};
@@ -480,6 +481,8 @@ impl Describable for HonchoMemory {
         })
     }
 }
+
+impl_component!(HonchoMemory);
 
 impl WorkUnit for HonchoMemory {
     fn name(&self) -> &str {

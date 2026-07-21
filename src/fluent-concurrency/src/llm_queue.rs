@@ -147,21 +147,12 @@ impl LlmRequestQueue {
     /// Creates a new queue with `config.worker_count` workers and a queue
     /// capacity of `config.queue_capacity`. The `handler` closure is invoked
     /// for each submitted task; its return value is the LLM response.
-    pub fn new<F, Fut>(
-        runtime: Arc<dyn Runtime>,
-        config: &LlmQueueConfig,
-        handler: F,
-    ) -> Self
+    pub fn new<F, Fut>(runtime: Arc<dyn Runtime>, config: &LlmQueueConfig, handler: F) -> Self
     where
         F: Fn(LlmTask) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<String, LlmError>> + Send,
     {
-        let pool = ResultPool::new(
-            runtime,
-            config.worker_count,
-            config.queue_capacity,
-            handler,
-        );
+        let pool = ResultPool::new(runtime, config.worker_count, config.queue_capacity, handler);
         Self {
             pool: Arc::new(pool),
         }
@@ -291,7 +282,11 @@ mod tests {
         // Yield to allow concurrent invocations from other workers.
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         counter.fetch_sub(1, Ordering::SeqCst);
-        Ok(task.messages.first().map(|m| m.content.clone()).unwrap_or_default())
+        Ok(task
+            .messages
+            .first()
+            .map(|m| m.content.clone())
+            .unwrap_or_default())
     }
 
     #[tokio::test]

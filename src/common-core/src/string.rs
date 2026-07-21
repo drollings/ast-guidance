@@ -123,6 +123,109 @@ pub fn lower_into<'a>(dst: &'a mut [u8], src: &[u8]) -> &'a [u8] {
     &dst[..len]
 }
 
+/// Lightweight HTML tag stripper — no regex dependency. Strips `<script>`,
+/// `<style>`, and all other tags, decodes common entities, and collapses
+/// whitespace. Suitable for untrusted text going to an LLM or field validator.
+pub fn strip_html(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut in_script = false;
+    let mut in_style = false;
+    let mut chars = s.char_indices().peekable();
+
+    while let Some((i, c)) = chars.next() {
+        if c == '<' {
+            // Peek ahead to detect tag name
+            let rest = &s[i + 1..];
+            let tag_start = rest.trim_start();
+            let lower: String = tag_start
+                .chars()
+                .take_while(|ch| ch.is_alphanumeric())
+                .collect();
+            let lower = lower.to_ascii_lowercase();
+
+            if lower.starts_with("script") {
+                in_script = true;
+                continue;
+            }
+            if lower.starts_with("style") {
+                in_style = true;
+                continue;
+            }
+            // Skip everything until '>'
+            while let Some(&(_, ch)) = chars.peek() {
+                chars.next();
+                if ch == '>' {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if in_script {
+            if c == '<' {
+                // Check for </script>
+                let rest = &s[i + 1..];
+                if rest
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("/script")
+                {
+                    in_script = false;
+                    // Skip until '>'
+                    while let Some(&(_, ch)) = chars.peek() {
+                        chars.next();
+                        if ch == '>' {
+                            break;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        if in_style {
+            if c == '<' {
+                let rest = &s[i + 1..];
+                if rest.trim_start().to_ascii_lowercase().starts_with("/style") {
+                    in_style = false;
+                    while let Some(&(_, ch)) = chars.peek() {
+                        chars.next();
+                        if ch == '>' {
+                            break;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        result.push(c);
+    }
+
+    // Decode common HTML entities
+    let result = result.replace("&amp;", "&");
+    let result = result.replace("&lt;", "<");
+    let result = result.replace("&gt;", ">");
+    let result = result.replace("&quot;", "\"");
+    let result = result.replace("&#39;", "'");
+
+    // Collapse whitespace
+    let mut out = String::with_capacity(result.len());
+    let mut prev_space = false;
+    for c in result.chars() {
+        if c.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
 pub fn slugify(text: &str) -> String {
     text.to_lowercase()
         .chars()

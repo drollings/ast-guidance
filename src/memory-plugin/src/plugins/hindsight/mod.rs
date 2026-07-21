@@ -7,7 +7,8 @@
 use crate::traits::MemoryOps;
 use crate::types::*;
 use fluent_wvr::{
-    Describable, FieldAccess, FieldError, WorkContext, WorkError, WorkOutput, WorkUnit,
+    impl_component, Describable, FieldAccess, FieldError, WorkContext, WorkError, WorkOutput,
+    WorkUnit,
 };
 use internment::ArcIntern;
 use serde::{Deserialize, Serialize};
@@ -650,6 +651,8 @@ impl Describable for HindsightMemory {
         })
     }
 }
+
+impl_component!(HindsightMemory);
 
 impl WorkUnit for HindsightMemory {
     fn name(&self) -> &str {

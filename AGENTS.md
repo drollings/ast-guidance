@@ -181,6 +181,11 @@ helper there before re-implementing it locally.
 | Shell / subprocess helpers | `common-core::shell` | `src/common-core/src/shell.rs` |
 | JSON config load-or-default | `common-core::config` | `src/common-core/src/config.rs` |
 | Test utilities (`impl_component_for_test!`, `PassthroughUnit`, `tempdir()`) | `fluent-wvr-testutil` | `src/fluent-wvr-testutil/src/lib.rs` |
+| 80% import line for component work (`Component`, `WorkUnit`, `FieldAccess`, `prelude::*`) | `fluent-wvr::prelude` | `src/fluent-wvr/src/prelude.rs` |
+| HTML stripping (`strip_html`) | `common-core::string` | `src/common-core/src/string.rs` |
+| `impl_component!` macro (eliminates as_any boilerplate) | `fluent-wvr::impl_component!` | `src/fluent-wvr/src/macros.rs` |
+| `ComponentArcExt::try_as_any_mut` (safe mutable access to shared Arc) | `fluent-wvr::ComponentArcExt` | `src/fluent-wvr/src/traits.rs` |
+| `WorkOutput::typed` (Result-returning) and `WorkOutput::data_take` (zero-copy) | `fluent-wvr::WorkOutput` | `src/fluent-wvr/src/work.rs` |
 
 Cross-crate limits that currently have a single consumer stay in their
 domain crate but **must** be moved to `common-core::constants` if a second
@@ -231,6 +236,27 @@ The active refinement plan lives in `ROADMAP_REFINE.md` (checklist:
 3. **`Handle::block_on(tokio::time::sleep)` MUST NOT appear inside a
    `WorkUnit::execute`** — sync `WorkUnit::execute` is a real boundary;
    `WithRetry` uses `std::thread::sleep` unconditionally (M5).
+
+---
+
+## WVR Update contract
+
+The completed fluent-wvr refinement plan lives in
+`ROADMAP_20260720_WVR_PT2.md` (checklist:
+`ROADMAP_20260720_WVR_PT2_CHECKLIST.md`). The preceding update plan was in
+`ROADMAP_20260720_WVR_UPDATE.md` (checklist:
+`ROADMAP_20260720_WVR_UPDATE_CHECKLIST.md`). Three non-negotiables for new
+`fluent-wvr` code:
+
+1. **`Component` MUST support `as_any()` / `as_any_mut()`** — runtime type
+   identification is required for safe downcasting after `Arc<dyn Component>`
+   erasure (M3.1).
+2. **`CapabilitySet` MUST support revocation and enumeration** — `remove`,
+   `contains`, `iter`, `len`, `is_empty` are required for WASM sandbox
+   capability narrowing (M1.1).
+3. **`FieldAccess` derive MUST support string sanitization attributes**
+   — `sanitize`, `max_len`, `pattern` are required in addition to numeric
+   `min`/`max` for input validation (M2.1–M2.3).
 
 ---
 

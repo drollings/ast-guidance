@@ -1,11 +1,12 @@
 use std::sync::{Arc, Weak};
 
 use fluent_wvr::{
-    Component, Describable, FieldAccess, FieldError, WorkContext, WorkError, WorkOutput, WorkUnit,
+    impl_component, Component, Describable, FieldAccess, FieldError, WorkContext, WorkError,
+    WorkOutput, WorkUnit,
 };
 use guidance_llm::client::{is_malformed_response, ChatBackend, LlmClient};
-use guidance_llm::LlmConfig;
 use guidance_llm::decomposer::Decomposer;
+use guidance_llm::LlmConfig;
 use internment::ArcIntern;
 
 use crate::cache_l1::{CacheTier, RoutingResult};
@@ -170,6 +171,8 @@ impl Describable for L2WasmUnit {
     }
 }
 
+impl_component!(L2WasmUnit);
+
 // ---------------------------------------------------------------------------
 // L3 — Graph traversal / keyword search tier
 // ---------------------------------------------------------------------------
@@ -231,6 +234,8 @@ impl Describable for L3GraphUnit {
         })
     }
 }
+
+impl_component!(L3GraphUnit);
 
 // ---------------------------------------------------------------------------
 // L4 — Semantic (embedding-based) search tier
@@ -305,6 +310,8 @@ impl Describable for L4SemanticUnit {
         })
     }
 }
+
+impl_component!(L4SemanticUnit);
 
 // ---------------------------------------------------------------------------
 // L4.5 — Local decomposition tier
@@ -415,6 +422,8 @@ impl Describable for L4_5DecomposeUnit {
     }
 }
 
+impl_component!(L4_5DecomposeUnit);
+
 // ---------------------------------------------------------------------------
 // L5 — Frontier LLM fallback tier
 // ---------------------------------------------------------------------------
@@ -515,6 +524,8 @@ impl Describable for L5FrontierUnit {
         })
     }
 }
+
+impl_component!(L5FrontierUnit);
 
 // ---------------------------------------------------------------------------
 // TierRegistry — sequential tier cascade

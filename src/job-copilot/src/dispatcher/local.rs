@@ -26,22 +26,24 @@ static FIELD_TABLE: &[(&str, ProfileExtractor)] = &[
         &p.personal.last_name
     }),
     (r"\b(e?mail|email)\b", |p| &p.personal.email),
-    (r"\b(phone|mobile|cell|tel|telephone)\b", |p| &p.personal.phone),
-    (r"\b(address.?1|street|addr1)\b", |p| &p.personal.address_line1),
-    (
-        r"\b(address.?2|apt|suite|addr2)\b",
-        |p| &p.personal.address_line2,
-    ),
+    (r"\b(phone|mobile|cell|tel|telephone)\b", |p| {
+        &p.personal.phone
+    }),
+    (r"\b(address.?1|street|addr1)\b", |p| {
+        &p.personal.address_line1
+    }),
+    (r"\b(address.?2|apt|suite|addr2)\b", |p| {
+        &p.personal.address_line2
+    }),
     (r"\b(city|locality)\b", |p| &p.personal.city),
     (r"\b(state|region|province)\b", |p| &p.personal.region),
     (r"\b(zip|postal)\b", |p| &p.personal.postal_code),
     (r"\b(country)\b", |p| &p.personal.country),
     (r"\b(linkedin)\b", |p| &p.personal.linkedin_url),
     (r"\b(github)\b", |p| &p.personal.github_url),
-    (
-        r"\b(portfolio|website|homepage)\b",
-        |p| &p.personal.portfolio_url,
-    ),
+    (r"\b(portfolio|website|homepage)\b", |p| {
+        &p.personal.portfolio_url
+    }),
 ];
 
 fn compiled_field_table() -> &'static [(Regex, ProfileExtractor)] {

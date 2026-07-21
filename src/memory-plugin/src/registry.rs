@@ -123,7 +123,8 @@ mod tests {
     use crate::traits::MemoryOps;
     use crate::types::*;
     use fluent_wvr::{
-        Describable, FieldAccess, FieldError, WorkContext, WorkError, WorkOutput, WorkUnit,
+        impl_component, Component, Describable, FieldAccess, FieldError, WorkContext, WorkError,
+        WorkOutput, WorkUnit,
     };
     use internment::ArcIntern;
     use serde_json::json;
@@ -224,8 +225,9 @@ mod tests {
         }
     }
 
-    // StubPlugin is automatically a Component via the blanket impl,
-    // and therefore a MemoryPlugin via our blanket impl.
+    impl_component!(StubPlugin);
+
+    // StubPlugin satisfies MemoryPlugin via our blanket impl.
 
     #[test]
     fn register_and_activate() {

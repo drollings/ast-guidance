@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -7,7 +8,8 @@ use internment::ArcIntern;
 use tracing::info;
 
 use crate::{
-    Component, Describable, FieldAccess, FieldError, WorkContext, WorkError, WorkOutput, WorkUnit,
+    impl_component, Component, Describable, FieldAccess, FieldError, WorkContext, WorkError,
+    WorkOutput, WorkUnit,
 };
 
 pub struct RetryResult<T> {
@@ -71,6 +73,7 @@ where
 /// let unit = Instrumented::with_metrics(MyUnit, "my.unit", hist.clone());
 /// // unit.execute(ctx) will log timing and record to hist
 /// ```
+#[derive(Clone)]
 pub struct Instrumented<U> {
     inner: U,
     label: String,
@@ -132,6 +135,10 @@ impl<U: WorkUnit> WorkUnit for Instrumented<U> {
         info!(target: "instrumented", label = %self.label, elapsed = ?elapsed, name = %self.inner.name(), "executed");
         result
     }
+
+    fn type_name(&self) -> &'static str {
+        self.inner.type_name()
+    }
 }
 
 impl<U: crate::Component> FieldAccess for Instrumented<U> {
@@ -156,6 +163,16 @@ impl<U: crate::Component> crate::Describable for Instrumented<U> {
     }
 }
 
+impl<U: crate::Component + 'static> crate::Component for Instrumented<U> {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+#[derive(Clone)]
 pub struct WithRetry<U> {
     inner: U,
     max_attempts: u32,
@@ -222,6 +239,10 @@ impl<U: WorkUnit> WorkUnit for WithRetry<U> {
             }
         }
     }
+
+    fn type_name(&self) -> &'static str {
+        self.inner.type_name()
+    }
 }
 
 impl<U: crate::Component> FieldAccess for WithRetry<U> {
@@ -241,6 +262,15 @@ impl<U: crate::Component> FieldAccess for WithRetry<U> {
 impl<U: crate::Component> crate::Describable for WithRetry<U> {
     fn describe(&self) -> serde_json::Value {
         <U as crate::Describable>::describe(&self.inner)
+    }
+}
+
+impl<U: crate::Component + 'static> crate::Component for WithRetry<U> {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
 
@@ -273,7 +303,18 @@ pub struct ComponentAdapter {
     inner: Arc<dyn Component>,
     name_override: Option<String>,
     execute_override: Option<ExecuteFn>,
-    field_overrides: Vec<(String, String)>,
+    field_overrides: HashMap<String, String>,
+}
+
+impl Clone for ComponentAdapter {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            name_override: self.name_override.clone(),
+            execute_override: self.execute_override.clone(),
+            field_overrides: self.field_overrides.clone(),
+        }
+    }
 }
 
 impl ComponentAdapter {
@@ -284,7 +325,7 @@ impl ComponentAdapter {
             inner,
             name_override: None,
             execute_override: None,
-            field_overrides: Vec::new(),
+            field_overrides: HashMap::new(),
         }
     }
 
@@ -305,22 +346,35 @@ impl ComponentAdapter {
         self
     }
 
-    /// Add a field override. Overrides stack in reverse order — the
-    /// most recently set value for a given field name is the one
-    /// `get_field` returns.
+    /// Add a field override. If a value for this name already exists,
+    /// it is replaced — the most recently set value wins.
     #[must_use]
     pub fn with_field_override(
         mut self,
         name: impl Into<String>,
         value: impl Into<String>,
     ) -> Self {
-        self.field_overrides.push((name.into(), value.into()));
+        self.field_overrides.insert(name.into(), value.into());
         self
     }
 
     /// Borrow the wrapped component.
     pub fn inner(&self) -> &Arc<dyn Component> {
         &self.inner
+    }
+
+    /// Bulk-set field overrides from a pre-built `HashMap`. Existing
+    /// overrides for the same keys are replaced.
+    #[must_use]
+    pub fn with_field_overrides(mut self, overrides: HashMap<String, String>) -> Self {
+        self.field_overrides.extend(overrides);
+        self
+    }
+
+    /// Remove all field overrides. After calling this, the inner
+    /// component is the sole authority for all field values.
+    pub fn clear_field_overrides(&mut self) {
+        self.field_overrides.clear();
     }
 }
 
@@ -345,6 +399,10 @@ impl WorkUnit for ComponentAdapter {
             None => self.inner.execute(ctx),
         }
     }
+
+    fn type_name(&self) -> &'static str {
+        self.inner.type_name()
+    }
 }
 
 impl FieldAccess for ComponentAdapter {
@@ -352,16 +410,14 @@ impl FieldAccess for ComponentAdapter {
         if let Some(inner) = Arc::get_mut(&mut self.inner) {
             inner.set_field(name, value)?;
         }
-        self.field_overrides.push((name.into(), value.into()));
+        self.field_overrides.insert(name.into(), value.into());
         Ok(())
     }
     fn get_field(&self, name: &str) -> Result<String, FieldError> {
-        self.field_overrides
-            .iter()
-            .rev()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.clone())
-            .ok_or_else(|| FieldError::NotFound(name.into()))
+        if let Some(v) = self.field_overrides.get(name) {
+            return Ok(v.clone());
+        }
+        self.inner.get_field(name)
     }
     fn field_names(&self) -> &'static [&'static str] {
         self.inner.field_names()
@@ -370,13 +426,25 @@ impl FieldAccess for ComponentAdapter {
 
 impl Describable for ComponentAdapter {
     fn describe(&self) -> serde_json::Value {
-        serde_json::json!({
-            "name": self.name(),
-            "adapted": true,
-            "field_overrides": self.field_overrides,
-        })
+        let mut schema = self.inner.describe();
+        if let Some(name) = &self.name_override {
+            schema["name"] = serde_json::Value::String(name.clone());
+        }
+        if !self.field_overrides.is_empty() {
+            let mut pairs: Vec<(&String, &String)> = self.field_overrides.iter().collect();
+            pairs.sort_by(|a, b| a.0.cmp(b.0));
+            let arr: Vec<Vec<String>> = pairs
+                .into_iter()
+                .map(|(k, v)| vec![k.clone(), v.clone()])
+                .collect();
+            schema["field_overrides"] = serde_json::json!(arr);
+        }
+        schema["adapted"] = serde_json::Value::Bool(true);
+        schema
     }
 }
+
+impl_component!(ComponentAdapter);
 
 #[cfg(test)]
 mod tests {
@@ -425,6 +493,44 @@ mod tests {
         // we can assert both are positive which proves the delays fired.
     }
 
+    #[derive(Clone)]
+    struct CloneableUnit;
+
+    impl WorkUnit for CloneableUnit {
+        fn name(&self) -> &str {
+            "cloneable"
+        }
+        fn depends(&self) -> &[ArcIntern<str>] {
+            &[]
+        }
+        fn provides(&self) -> &[ArcIntern<str>] {
+            &[]
+        }
+        fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+            Ok(WorkOutput::ok("ok"))
+        }
+    }
+
+    impl FieldAccess for CloneableUnit {
+        fn set_field(&mut self, _: &str, _: &str) -> Result<(), FieldError> {
+            Ok(())
+        }
+        fn get_field(&self, _: &str) -> Result<String, FieldError> {
+            Ok(String::new())
+        }
+        fn field_names(&self) -> &'static [&'static str] {
+            &[]
+        }
+    }
+
+    impl Describable for CloneableUnit {
+        fn describe(&self) -> serde_json::Value {
+            serde_json::Value::Object(serde_json::Map::new())
+        }
+    }
+
+    impl_component!(CloneableUnit);
+
     struct MockUnit {
         name: ArcIntern<str>,
         should_fail: bool,
@@ -460,6 +566,26 @@ mod tests {
             }
         }
     }
+
+    impl FieldAccess for MockUnit {
+        fn set_field(&mut self, _: &str, _: &str) -> Result<(), FieldError> {
+            Ok(())
+        }
+        fn get_field(&self, _: &str) -> Result<String, FieldError> {
+            Err(FieldError::NotFound("test type: no fields".into()))
+        }
+        fn field_names(&self) -> &'static [&'static str] {
+            &[]
+        }
+    }
+
+    impl Describable for MockUnit {
+        fn describe(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+    }
+
+    impl_component!(MockUnit);
 
     #[test]
     fn pipeline_retry_success() {
@@ -566,6 +692,7 @@ mod tests {
             serde_json::json!({"name": &*self.name})
         }
     }
+    impl_component!(AdapterHost);
     impl WorkUnit for AdapterHost {
         fn name(&self) -> &str {
             &self.name
@@ -707,6 +834,7 @@ mod tests {
                 serde_json::json!({})
             }
         }
+        impl_component!(DepProvider);
         let inner = DepProvider {
             name: ArcIntern::from("dp"),
             deps: vec![ArcIntern::from("a"), ArcIntern::from("b")],
@@ -758,6 +886,7 @@ mod tests {
                 serde_json::json!({})
             }
         }
+        impl_component!(FieldedHost);
 
         let inner = FieldedHost {
             name: ArcIntern::from("fielded"),
@@ -806,6 +935,7 @@ mod tests {
             serde_json::json!({})
         }
     }
+    impl_component!(ConstrainedHost);
     impl WorkUnit for ConstrainedHost {
         fn name(&self) -> &str {
             "constrained_host"
@@ -851,5 +981,93 @@ mod tests {
             }
             other => panic!("expected Parse error, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn instrumented_clone() {
+        let unit = CloneableUnit;
+        let inst = Instrumented::new(unit, "test.label");
+        let cloned = inst.clone();
+        assert_eq!(cloned.label, "test.label");
+    }
+
+    #[test]
+    fn with_retry_clone() {
+        let unit = CloneableUnit;
+        let wr = WithRetry::new(unit, 3, 100);
+        let cloned = wr.clone();
+        assert_eq!(cloned.max_attempts, 3);
+        assert_eq!(cloned.base_ms, 100);
+    }
+
+    #[test]
+    fn component_adapter_clone() {
+        let host = ConstrainedHost { port: 8080 };
+        let adapter = ComponentAdapter::new(Arc::new(host)).with_name_override("cloned-name");
+        let cloned = adapter.clone();
+        assert_eq!(cloned.name_override.as_deref(), Some("cloned-name"));
+    }
+
+    #[test]
+    fn adapter_get_field_falls_back_to_inner() {
+        let host = ConstrainedHost { port: 8080 };
+        let adapter = ComponentAdapter::new(Arc::new(host));
+        assert_eq!(adapter.get_field("port").unwrap(), "8080");
+    }
+
+    #[test]
+    fn adapter_override_takes_priority_over_inner() {
+        let host = ConstrainedHost { port: 8080 };
+        let adapter = ComponentAdapter::new(Arc::new(host)).with_field_override("port", "9090");
+        assert_eq!(adapter.get_field("port").unwrap(), "9090");
+    }
+
+    #[test]
+    fn adapter_hashmap_lookup_is_o1() {
+        let host = ConstrainedHost { port: 0 };
+        let mut adapter = ComponentAdapter::new(Arc::new(host));
+        let n = 1000;
+        for i in 0..n {
+            adapter = adapter.with_field_override(format!("k{i}"), format!("v{i}"));
+        }
+        assert_eq!(
+            adapter.get_field(&format!("k{}", n - 1)).unwrap(),
+            format!("v{}", n - 1)
+        );
+    }
+
+    #[test]
+    fn adapter_describe_field_overrides_sorted() {
+        let host = ConstrainedHost { port: 0 };
+        let adapter = ComponentAdapter::new(Arc::new(host))
+            .with_field_override("c", "3")
+            .with_field_override("a", "1")
+            .with_field_override("b", "2");
+        let schema = adapter.describe();
+        let overrides = schema["field_overrides"].as_array().unwrap();
+        assert_eq!(overrides.len(), 3);
+        assert_eq!(overrides[0][0], "a");
+        assert_eq!(overrides[1][0], "b");
+        assert_eq!(overrides[2][0], "c");
+    }
+
+    #[test]
+    fn adapter_with_field_overrides_bulk() {
+        let host = ConstrainedHost { port: 0 };
+        let mut map = HashMap::new();
+        map.insert("x".to_string(), "10".to_string());
+        map.insert("y".to_string(), "20".to_string());
+        let adapter = ComponentAdapter::new(Arc::new(host)).with_field_overrides(map);
+        assert_eq!(adapter.get_field("x").unwrap(), "10");
+        assert_eq!(adapter.get_field("y").unwrap(), "20");
+    }
+
+    #[test]
+    fn adapter_clear_field_overrides_reverts_to_inner() {
+        let host = ConstrainedHost { port: 8080 };
+        let mut adapter = ComponentAdapter::new(Arc::new(host)).with_field_override("port", "9090");
+        assert_eq!(adapter.get_field("port").unwrap(), "9090");
+        adapter.clear_field_overrides();
+        assert_eq!(adapter.get_field("port").unwrap(), "8080");
     }
 }

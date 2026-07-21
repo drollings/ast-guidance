@@ -7,9 +7,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use guidance_llm::client::ChatBackend;
-use guidance_llm::{ChatMessage, LlmError};
 use guidance_llm::decomposer::Decomposer;
 use guidance_llm::embeddings::{BatchEmbedding, EmbeddingError, EmbeddingProvider};
+use guidance_llm::{ChatMessage, LlmError};
 
 // ---------------------------------------------------------------------------
 // StubEmbedder — deterministic embedding provider

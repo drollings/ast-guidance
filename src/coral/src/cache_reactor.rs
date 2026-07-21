@@ -5,8 +5,8 @@ use crate::wasm_runtime::WasmRuntime;
 use bon::Builder;
 use common_core::hash::content_hash_with_model;
 use common_core::metrics::LatencyHistogram;
-use guidance_llm::LlmConfig;
 use guidance_llm::decomposer::Decomposer;
+use guidance_llm::LlmConfig;
 use guidance_types::{ContextNode, NodeId, WasmTool};
 
 use crate::cache_l1::{CacheTier, L1Cache, RoutingResult};
@@ -732,7 +732,7 @@ mod tests {
     #[test]
     fn component_adapter_name_override_reports_new_name() {
         use fluent_wvr::wrapper::ComponentAdapter;
-        use fluent_wvr::{ArcIntern, FieldAccess, FieldError, WorkUnit};
+        use fluent_wvr::{impl_component, ArcIntern, FieldAccess, FieldError, WorkUnit};
 
         struct StubUnit {
             name: ArcIntern<str>,
@@ -770,6 +770,7 @@ mod tests {
                 serde_json::json!({"name": &*self.name})
             }
         }
+        impl_component!(StubUnit);
 
         let stub = StubUnit {
             name: ArcIntern::from("inner_unit"),

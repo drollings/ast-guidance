@@ -125,7 +125,8 @@ impl WasmPlugin for ExtismPlugin {
 }
 
 use fluent_wvr::{
-    Describable, FieldAccess, FieldError, WorkContext, WorkError, WorkOutput, WorkUnit,
+    impl_component, Describable, FieldAccess, FieldError, WorkContext, WorkError, WorkOutput,
+    WorkUnit,
 };
 use internment::ArcIntern;
 
@@ -194,6 +195,8 @@ impl Describable for WasmComponent {
         })
     }
 }
+
+impl_component!(WasmComponent);
 
 impl WorkUnit for WasmComponent {
     fn name(&self) -> &str {

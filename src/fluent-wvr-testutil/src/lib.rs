@@ -4,7 +4,8 @@
 //! and `make_tree()` to reduce boilerplate in test modules.
 
 pub use fluent_wvr::{
-    Component, Describable, FieldAccess, FieldError, WorkContext, WorkError, WorkOutput, WorkUnit,
+    impl_component, Component, Describable, FieldAccess, FieldError, WorkContext, WorkError,
+    WorkOutput, WorkUnit,
 };
 pub use internment::ArcIntern;
 
@@ -37,6 +38,7 @@ macro_rules! impl_component_for_test {
                 serde_json::json!({})
             }
         }
+        ::fluent_wvr::impl_component!($type);
     };
 }
 

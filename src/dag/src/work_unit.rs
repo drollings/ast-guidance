@@ -1,5 +1,6 @@
 use bon::Builder;
-use fluent_wvr::{FieldAccess, FieldError, WorkContext, WorkError, WorkOutput, WorkUnit};
+use fluent_wvr::WorkUnit;
+use fluent_wvr::{impl_component, FieldAccess, FieldError, WorkContext, WorkError, WorkOutput};
 use internment::ArcIntern;
 
 #[derive(Builder)]
@@ -87,6 +88,8 @@ impl fluent_wvr::Describable for CommandUnit {
         })
     }
 }
+
+impl_component!(CommandUnit);
 
 #[cfg(test)]
 mod tests {

@@ -7,6 +7,7 @@ use std::convert::TryInto;
 pub const BINARY_MAGIC: [u8; 4] = [0x47, 0x52, 0x50, 0x48]; // "GRPH"
 pub const BINARY_SCHEMA_VERSION: u32 = 1;
 pub const MAX_WASM_HOST_CALLS: u32 = 10_000;
+pub const MAX_IPC_PAYLOAD_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -40,6 +41,8 @@ pub enum IpcError {
     UnknownPayloadType(u32),
     #[error("checksum mismatch")]
     ChecksumMismatch,
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(u32),
 }
 
 #[repr(C, packed)]
@@ -87,8 +90,7 @@ pub struct BinaryContextNode {
     pub lod_lengths: [u32; 6],
 }
 
-#[cfg(test)]
-fn compute_checksum(data: &[u8]) -> u32 {
+pub(crate) fn compute_checksum(data: &[u8]) -> u32 {
     data.iter()
         .fold(0u32, |acc, &b| acc.wrapping_add(u32::from(b)))
 }
@@ -110,6 +112,57 @@ pub fn encode_request(req: &BinaryExecutionRequest, input: &[u8]) -> Vec<u8> {
     buf.extend_from_slice(&req.flags.to_le_bytes());
 
     buf.extend_from_slice(input);
+    buf
+}
+
+#[must_use]
+pub fn encode_result(result: &BinaryExecutionResult, output: &[u8]) -> Vec<u8> {
+    let fixed_size = std::mem::size_of::<BinaryExecutionResult>();
+    let mut buf = Vec::with_capacity(fixed_size + output.len());
+
+    buf.extend_from_slice(&result.header.magic);
+    buf.extend_from_slice(&result.header.version.to_le_bytes());
+    buf.extend_from_slice(&result.header.payload_type.to_le_bytes());
+    buf.extend_from_slice(&result.header.payload_size.to_le_bytes());
+    buf.extend_from_slice(&result.header.checksum.to_le_bytes());
+
+    buf.extend_from_slice(&result.success.to_le_bytes());
+    buf.extend_from_slice(&result.error_code.to_le_bytes());
+    buf.extend_from_slice(&result.output_offset.to_le_bytes());
+    buf.extend_from_slice(&result.output_len.to_le_bytes());
+    buf.extend_from_slice(&result.provides_words_offset.to_le_bytes());
+    buf.extend_from_slice(&result.provides_words_count.to_le_bytes());
+
+    buf.extend_from_slice(output);
+    buf
+}
+
+#[must_use]
+pub fn encode_context_node(node: &BinaryContextNode, lod_data: &[u8]) -> Vec<u8> {
+    let fixed_size = std::mem::size_of::<BinaryContextNode>();
+    let mut buf = Vec::with_capacity(fixed_size + lod_data.len());
+
+    buf.extend_from_slice(&node.header.magic);
+    buf.extend_from_slice(&node.header.version.to_le_bytes());
+    buf.extend_from_slice(&node.header.payload_type.to_le_bytes());
+    buf.extend_from_slice(&node.header.payload_size.to_le_bytes());
+    buf.extend_from_slice(&node.header.checksum.to_le_bytes());
+
+    buf.extend_from_slice(&node.id.to_le_bytes());
+    buf.extend_from_slice(&node.valid_from_ts.to_le_bytes());
+    buf.extend_from_slice(&node.valid_to_ts.to_le_bytes());
+    buf.extend_from_slice(&node.confidence.to_le_bytes());
+    buf.extend_from_slice(&node.provenance_id.to_le_bytes());
+    let lod_offsets = node.lod_offsets;
+    for offset in &lod_offsets {
+        buf.extend_from_slice(&offset.to_le_bytes());
+    }
+    let lod_lengths = node.lod_lengths;
+    for length in &lod_lengths {
+        buf.extend_from_slice(&length.to_le_bytes());
+    }
+
+    buf.extend_from_slice(lod_data);
     buf
 }
 
@@ -137,6 +190,9 @@ pub fn decode_result(buf: &[u8]) -> Result<(BinaryExecutionResult, Vec<u8>), Ipc
     }
     let payload_type = read_u32(&mut offset);
     let payload_size = read_u32(&mut offset);
+    if payload_size as usize > MAX_IPC_PAYLOAD_SIZE {
+        return Err(IpcError::PayloadTooLarge(payload_size));
+    }
     let checksum = read_u32(&mut offset);
 
     // result fields follow header (no target_id — that's in the request)
@@ -146,6 +202,17 @@ pub fn decode_result(buf: &[u8]) -> Result<(BinaryExecutionResult, Vec<u8>), Ipc
     let output_len = read_u32(&mut offset);
     let provides_words_offset = read_u32(&mut offset);
     let provides_words_count = read_u32(&mut offset);
+
+    let payload_start = offset;
+    let payload_end = payload_start + payload_size as usize;
+    let actual_checksum = if payload_end <= buf.len() {
+        compute_checksum(&buf[payload_start..payload_end])
+    } else {
+        compute_checksum(&buf[payload_start..])
+    };
+    if checksum != 0 && actual_checksum != checksum {
+        return Err(IpcError::ChecksumMismatch);
+    }
 
     let output = if output_offset as usize + output_len as usize <= buf.len() {
         buf[output_offset as usize..][..output_len as usize].to_vec()
@@ -321,5 +388,47 @@ mod tests {
         let c1 = compute_checksum(data);
         let c2 = compute_checksum(data);
         assert_eq!(c1, c2);
+    }
+
+    #[test]
+    fn decode_result_wrong_checksum() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&BINARY_MAGIC);
+        buf.extend_from_slice(&BINARY_SCHEMA_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(PayloadType::ExecutionResult as u32).to_le_bytes());
+        buf.extend_from_slice(&100u32.to_le_bytes()); // payload_size
+        buf.extend_from_slice(&999u32.to_le_bytes()); // wrong checksum
+        buf.extend_from_slice(&1u32.to_le_bytes()); // success
+        buf.extend_from_slice(&0u32.to_le_bytes()); // error_code
+        let result_size = std::mem::size_of::<BinaryExecutionResult>();
+        buf.extend_from_slice(&(result_size as u32).to_le_bytes()); // output_offset
+        buf.extend_from_slice(&5u32.to_le_bytes()); // output_len
+        buf.extend_from_slice(&0u32.to_le_bytes()); // provides_words_offset
+        buf.extend_from_slice(&0u32.to_le_bytes()); // provides_words_count
+        buf.extend_from_slice(b"hello"); // output
+
+        let result = decode_result(&buf);
+        assert!(matches!(result, Err(IpcError::ChecksumMismatch)));
+    }
+
+    #[test]
+    fn decode_result_zero_checksum_skips_validation() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&BINARY_MAGIC);
+        buf.extend_from_slice(&BINARY_SCHEMA_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(PayloadType::ExecutionResult as u32).to_le_bytes());
+        buf.extend_from_slice(&100u32.to_le_bytes()); // payload_size
+        buf.extend_from_slice(&0u32.to_le_bytes()); // checksum = 0 (skip validation)
+        buf.extend_from_slice(&1u32.to_le_bytes()); // success
+        buf.extend_from_slice(&0u32.to_le_bytes()); // error_code
+        let result_size = std::mem::size_of::<BinaryExecutionResult>();
+        buf.extend_from_slice(&(result_size as u32).to_le_bytes()); // output_offset
+        buf.extend_from_slice(&5u32.to_le_bytes()); // output_len
+        buf.extend_from_slice(&0u32.to_le_bytes()); // provides_words_offset
+        buf.extend_from_slice(&0u32.to_le_bytes()); // provides_words_count
+        buf.extend_from_slice(b"hello"); // output
+
+        let result = decode_result(&buf);
+        assert!(result.is_ok());
     }
 }
