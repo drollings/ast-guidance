@@ -1,17 +1,18 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use common_core::ensure_dir_or_panic;
 use common_core::shell::run_command;
 use guidance_core::config;
 use guidance_core::memory::MemoryBridge;
+use fluent_concurrency::pool::ResultPoolError;
 use guidance_core::runtime;
 use guidance_core::sync::json_store::walk_guidance_docs;
 use guidance_core::sync_engine::SyncEngine;
 use guidance_core::walk;
 use guidance_search_vector::GuidanceDb;
 use time::OffsetDateTime;
-use tokio::sync::oneshot;
 
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::sync::mpsc;
@@ -602,19 +603,16 @@ async fn cmd_sync(
                 }
                 return;
             }
-            let (tx, rx) = oneshot::channel();
-            runtime::AST_POOL
-                .submit(runtime::AstGenJob {
+            match runtime::AST_POOL
+                .submit(runtime::AstGenPayload {
                     source_path: source_path.to_path_buf(),
                     source_dir,
                     guidance_dir: guidance_dir.clone(),
                     config: guidance_core::sync_engine::GenConfig::default(),
-                    result_tx: tx,
                 })
                 .await
-                .expect("queue closed during gen");
-            match rx.await {
-                Ok(Ok(doc)) => {
+            {
+                Ok(doc) => {
                     if verbose {
                         println!("  gen: {path} ({} members)", doc.members.len());
                     }
@@ -625,8 +623,11 @@ async fn cmd_sync(
                         doc.meta.language
                     );
                 }
-                Ok(Err(e)) => eprintln!("error generating {path}: {e}"),
-                Err(_) => eprintln!("error: pool response canceled for {path}"),
+                Err(ResultPoolError::Inner(e)) => eprintln!("error generating {path}: {e}"),
+                Err(ResultPoolError::Canceled) => {
+                    eprintln!("error: pool response canceled for {path}")
+                }
+                Err(ResultPoolError::Pool(e)) => eprintln!("error: pool queue {e} for {path}"),
             }
         }
     } else if let Some(scan_dir) = scan {
@@ -667,19 +668,21 @@ async fn cmd_sync(
         if !no_db && !dry_run {
             let json_src = guidance_dir.join("src");
             if json_src.is_dir() {
-                let (tx, rx) = oneshot::channel();
-                runtime::DB_POOL
-                    .submit(runtime::DbSyncJob {
+                match runtime::DB_POOL
+                    .submit(runtime::DbSyncPayload {
                         json_dir: json_src,
                         db_path: db,
-                        result_tx: tx,
                     })
                     .await
-                    .expect("db sync queue closed");
-                match rx.await {
-                    Ok(Ok(count)) => println!("Synced {count} nodes to {db_path}"),
-                    Ok(Err(e)) => eprintln!("Warning: db sync failed: {e}"),
-                    Err(_) => eprintln!("Warning: db sync canceled"),
+                {
+                    Ok(count) => println!("Synced {count} nodes to {db_path}"),
+                    Err(ResultPoolError::Inner(e)) => {
+                        eprintln!("Warning: db sync failed: {e}")
+                    }
+                    Err(ResultPoolError::Canceled) => eprintln!("Warning: db sync canceled"),
+                    Err(ResultPoolError::Pool(e)) => {
+                        eprintln!("Warning: db sync queue: {e}")
+                    }
                 }
             }
         }
@@ -734,7 +737,6 @@ async fn walk_and_gen_async(
         return 0;
     }
 
-    let pool = &*runtime::AST_POOL;
     let mut handles = Vec::with_capacity(files.len());
     let mut generated = 0usize;
 
@@ -751,38 +753,50 @@ async fn walk_and_gen_async(
             continue;
         }
 
-        let (tx, rx) = oneshot::channel();
-        pool.submit(runtime::AstGenJob {
-            source_path: path.clone(),
-            source_dir: source_dir.clone(),
-            guidance_dir: guidance_dir.clone(),
-            config: guidance_core::sync_engine::GenConfig::default(),
-            result_tx: tx,
-        })
-        .await
-        .expect("queue closed during gen");
-        handles.push((rel.display().to_string(), rx));
+        let pool = Arc::clone(&*runtime::AST_POOL);
+        let source_path = path.clone();
+        let src_dir = source_dir.clone();
+        let gd = guidance_dir.clone();
+        let rel_str = rel.display().to_string();
+        handles.push(tokio::spawn(async move {
+            let result = pool
+                .submit(runtime::AstGenPayload {
+                    source_path,
+                    source_dir: src_dir,
+                    guidance_dir: gd,
+                    config: guidance_core::sync_engine::GenConfig::default(),
+                })
+                .await;
+            (rel_str, result)
+        }));
     }
 
     let mut gen_failed = 0usize;
-    for (rel_path, rx) in handles {
-        match rx.await {
-            Ok(Ok(doc)) => {
+    for handle in handles {
+        let (rel_path, result) = handle.await.unwrap();
+        match result {
+            Ok(doc) => {
                 generated += 1;
                 if verbose {
                     println!("  gen: {rel_path} ({} members)", doc.members.len());
                 }
             }
-            Ok(Err(e)) => {
+            Err(ResultPoolError::Inner(e)) => {
                 gen_failed += 1;
                 if verbose {
                     eprintln!("  warn: {rel_path} — {e}");
                 }
             }
-            Err(_) => {
+            Err(ResultPoolError::Canceled) => {
                 gen_failed += 1;
                 if verbose {
                     eprintln!("  warn: {rel_path} — pool response canceled");
+                }
+            }
+            Err(ResultPoolError::Pool(e)) => {
+                gen_failed += 1;
+                if verbose {
+                    eprintln!("  warn: {rel_path} — pool queue {e}");
                 }
             }
         }
@@ -835,24 +849,32 @@ async fn start_watcher(
                         println!("  change detected: {}", path.display());
                     }
 
-                    let (tx_job, rx_job) = oneshot::channel();
-                    runtime::AST_POOL
-                        .submit(runtime::AstGenJob {
+                    match runtime::AST_POOL
+                        .submit(runtime::AstGenPayload {
                             source_path: path.clone(),
                             source_dir: source_dir.unwrap_or_else(|| workspace_path.clone()),
                             guidance_dir: guidance_dir.clone(),
                             config: guidance_core::sync_engine::GenConfig::default(),
-                            result_tx: tx_job,
                         })
                         .await
-                        .expect("queue closed during gen");
-                    if let Ok(Ok(doc)) = rx_job.await {
-                        if verbose {
-                            println!(
-                                "  regenerated: {} ({} members)",
-                                path.display(),
-                                doc.members.len()
-                            );
+                    {
+                        Ok(doc) => {
+                            if verbose {
+                                println!(
+                                    "  regenerated: {} ({} members)",
+                                    path.display(),
+                                    doc.members.len()
+                                );
+                            }
+                        }
+                        Err(ResultPoolError::Inner(e)) => {
+                            eprintln!("  regeneration failed: {e}");
+                        }
+                        Err(ResultPoolError::Canceled) => {
+                            eprintln!("  regeneration canceled");
+                        }
+                        Err(ResultPoolError::Pool(e)) => {
+                            eprintln!("  regeneration queue error: {e}");
                         }
                     }
                 }

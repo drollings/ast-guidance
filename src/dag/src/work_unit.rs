@@ -1,6 +1,5 @@
 use bon::Builder;
-use fluent_wvr::WorkUnit;
-use fluent_wvr::{impl_component, FieldAccess, FieldError, WorkContext, WorkError, WorkOutput};
+use fluent_wvr::prelude::*;
 use internment::ArcIntern;
 
 #[derive(Builder)]
@@ -94,7 +93,6 @@ impl_component!(CommandUnit);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluent_wvr::Describable;
 
     #[test]
     fn test_command_unit_noop() {
@@ -174,7 +172,6 @@ mod tests {
     }
     #[test]
     fn test_command_unit_is_component() {
-        use fluent_wvr::Component;
         fn assert_component<T: Component>() {}
         assert_component::<CommandUnit>();
         let unit = CommandUnit::new()

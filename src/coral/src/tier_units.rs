@@ -1,9 +1,6 @@
 use std::sync::{Arc, Weak};
 
-use fluent_wvr::{
-    impl_component, Component, Describable, FieldAccess, FieldError, WorkContext, WorkError,
-    WorkOutput, WorkUnit,
-};
+use fluent_wvr::prelude::*;
 use guidance_llm::client::{is_malformed_response, ChatBackend, LlmClient};
 use guidance_llm::decomposer::Decomposer;
 use guidance_llm::LlmConfig;

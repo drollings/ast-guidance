@@ -2,10 +2,7 @@ use std::sync::Arc;
 
 use bon::Builder;
 use common_core::hash::blake3_hex;
-use fluent_wvr::{
-    impl_component, ArcIntern, Capability, Describable, FieldAccess, WorkContext, WorkError,
-    WorkOutput, WorkUnit,
-};
+use fluent_wvr::prelude::*;
 
 use crate::dispatcher::FieldValueDispatcher;
 use crate::memory::FormFillStore;

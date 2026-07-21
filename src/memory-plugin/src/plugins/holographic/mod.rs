@@ -12,10 +12,7 @@ pub mod store;
 
 use crate::traits::MemoryOps;
 use crate::types::*;
-use fluent_wvr::{
-    impl_component, Describable, FieldAccess, FieldError, WorkContext, WorkError, WorkOutput,
-    WorkUnit,
-};
+use fluent_wvr::prelude::*;
 use internment::ArcIntern;
 use serde_json::json;
 use std::future::Future;

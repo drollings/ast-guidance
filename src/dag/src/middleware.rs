@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
 use common_core::metrics::LatencyHistogram;
-use fluent_wvr::wrapper::{Instrumented, WithRetry};
-use fluent_wvr::Component;
+use fluent_wvr::prelude::*;
 
 pub trait Middleware: Send + Sync {
     fn wrap(&self, inner: Arc<dyn Component>) -> Arc<dyn Component>;
@@ -94,7 +93,6 @@ impl Default for MiddlewareChain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluent_wvr::{WorkContext, WorkUnit};
     use fluent_wvr_testutil::PassthroughUnit;
 
     #[test]

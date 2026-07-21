@@ -10,10 +10,7 @@ use common_core::hash::blake3_hex;
 use common_core::jsonrpc::{JsonRpcError, JsonRpcHandler, JsonRpcRequest, JsonRpcResponse};
 use common_core::metrics::LatencyHistogram;
 use fluent_concurrency::zone::ZoneSummary;
-use fluent_wvr::{
-    impl_component, CapabilitySet, Component, Describable, FieldAccess, FieldError, WorkContext,
-    WorkError, WorkOutput, WorkUnit,
-};
+use fluent_wvr::prelude::*;
 use std::sync::RwLock;
 
 /// Central handler for all JSON-RPC methods.
@@ -269,7 +266,7 @@ impl DaemonHandler {
 
         for unit in &units {
             let ctx = WorkContext::for_unit(unit.as_ref(), CapabilitySet::new());
-            zone.register_with_context(Arc::clone(unit), ctx);
+            zone.register_with_context(Arc::clone(unit), ctx).unwrap();
         }
 
         let summary: ZoneSummary = (&mut zone).await;
@@ -289,6 +286,13 @@ impl DaemonHandler {
             if let fluent_concurrency::zone::ZoneEvent::Panicked { name, info } = event {
                 if let Some(idx) = parse_index(name) {
                     results[idx] = Err(info.clone());
+                }
+            }
+        }
+        for event in &summary.failed {
+            if let fluent_concurrency::zone::ZoneEvent::Failed { name, error } = event {
+                if let Some(idx) = parse_index(name) {
+                    results[idx] = Err(error.to_string());
                 }
             }
         }

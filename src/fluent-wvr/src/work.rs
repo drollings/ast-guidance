@@ -9,7 +9,7 @@ use crate::metadata::MetadataValue;
 use crate::runtime::{NoopRuntime, Runtime};
 use crate::traits::WorkUnit;
 
-#[derive(Error, Debug, PartialEq, Eq)]
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum WorkError {
     #[error("execution failed: {0}")]
     Execution(String),
@@ -167,6 +167,26 @@ impl WorkContext {
             rt: Arc::new(NoopRuntime),
             caps,
         }
+    }
+
+    /// Returns a new `WorkContext` with `rt` and `caps` cloned from the zone's
+    /// defaults, with `max_retries`/`timeout_ms`/etc overridden by the supplied
+    /// closure.
+    ///
+    /// For batched registration of identical contexts, construct one `WorkContext`
+    /// and reuse it with `register_with_context` directly.
+    pub fn for_unit_in_zone(
+        zone_rt: &Arc<dyn Runtime>,
+        zone_caps: &CapabilitySet,
+        mutate: impl FnOnce(&mut WorkContext),
+    ) -> Self {
+        let mut ctx = WorkContext {
+            rt: Arc::clone(zone_rt),
+            caps: zone_caps.clone(),
+            ..WorkContext::default()
+        };
+        mutate(&mut ctx);
+        ctx
     }
 }
 

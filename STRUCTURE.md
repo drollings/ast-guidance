@@ -222,6 +222,7 @@ Then you you must read
     │       │   ├── mod.rs  # //! Capability-gated I/O primitive engin
     │       │   └── net.rs  # //! Capability-gated network I/O (TCP co
     │       ├── lib.rs  # #![forbid(unsafe_code)]
+    │       ├── llm_queue.rs  # //! LLM request queue — async, queu...
     │       ├── pool.rs  # //! Bounded async queue, worker pool, an
     │       ├── queue.rs  # //! A priority queue with a fast path fo
     │       ├── router.rs  # //! A partitioned router that distribute
@@ -234,15 +235,15 @@ Then you you must read
     ├── fluent-wvr/
     │   ├── Cargo.toml
     │   └── src/
-    │       ├── lib.rs  # re-exports + Arc<dyn Component> blanket impls
-    │       ├── traits.rs  # FieldAccess, Describable, WorkUnit, Component, FieldError, downcast helpers
-    │       ├── work.rs  # WorkContext, WorkOutput, WorkError
-    │       ├── capability.rs  # Capability, CapabilitySet, Reserve
-    │       ├── runtime.rs  # Runtime, NoopRuntime
-    │       ├── metadata.rs  # MetadataValue + From impls
-    │       ├── macros.rs  # impl_component! macro
-    │       ├── prelude.rs  # The fluent-wvr prelude
-    │       └── wrapper.rs  # Instrumented, WithRetry, ComponentAdapter, Pipeline
+    │       ├── capability.rs  # use std::any::{Any, TypeId};
+    │       ├── lib.rs  # #![forbid(unsafe_code)]
+    │       ├── macros.rs  # /// Eliminates the 7-line `as_any`/`as_a
+    │       ├── metadata.rs  # use serde::{Deserialize, Serialize};
+    │       ├── prelude.rs  # //! The fluent-wvr prelude — import...
+    │       ├── runtime.rs  # use std::future::Future;
+    │       ├── traits.rs  # use std::any::Any;
+    │       ├── work.rs  # use std::collections::HashMap;
+    │       └── wrapper.rs  # use std::collections::HashMap;
     ├── fluent-wvr-macros/
     │   ├── Cargo.toml
     │   └── src/

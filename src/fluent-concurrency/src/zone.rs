@@ -9,8 +9,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use fluent_wvr::{CapabilitySet, Component, Runtime, WorkContext, WorkError, WorkOutput, WorkUnit};
+use fluent_wvr::Runtime;
+use fluent_wvr::prelude::*;
 use internment::ArcIntern;
+use thiserror::Error;
 use tokio::task::JoinSet;
 
 /// Events emitted by tasks running inside a `Zone`.
@@ -23,6 +25,10 @@ pub enum ZoneEvent {
     Panicked {
         name: ArcIntern<str>,
         info: String,
+    },
+    Failed {
+        name: ArcIntern<str>,
+        error: WorkError,
     },
     Cancelled {
         name: ArcIntern<str>,
@@ -52,11 +58,18 @@ impl Default for ZoneConfig {
     }
 }
 
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum ZoneError {
+    #[error("task already registered: {0}")]
+    DuplicateName(ArcIntern<str>),
+}
+
 /// Summary of a zone's execution result.
 #[derive(Debug, Default)]
 pub struct ZoneSummary {
     pub completed: Vec<ZoneEvent>,
     pub panicked: Vec<ZoneEvent>,
+    pub failed: Vec<ZoneEvent>,
     pub cancelled: Vec<ZoneEvent>,
 }
 
@@ -77,7 +90,7 @@ pub struct ZoneSummary {
 /// // zone.register(component_a);
 /// // zone.register(component_b);
 /// let summary = zone.await;
-/// assert!(summary.panicked.is_empty());
+/// assert!(summary.panicked.is_empty() && summary.failed.is_empty());
 /// # }
 /// ```
 #[must_use = "Zone must be awaited to completion to get a ZoneSummary"]
@@ -131,22 +144,32 @@ impl Zone {
     }
 
     /// Registers a `Component` in the zone. Returns `&mut Self` for builder chaining.
-    pub fn register(&mut self, unit: Arc<dyn Component>) -> &mut Self {
-        let ctx = WorkContext {
-            rt: Arc::clone(&self.runtime),
-            caps: self.caps.clone(),
-            ..WorkContext::default()
-        };
+    ///
+    /// Returns `Err(ZoneError::DuplicateName)` if a unit with the same `name()`
+    /// has already been registered. If you intentionally want to replace an
+    /// existing task, use `register_or_replace` (not yet implemented — file
+    /// a feature request if you need it).
+    pub fn register(
+        &mut self,
+        unit: Arc<dyn Component>,
+    ) -> Result<&mut Self, ZoneError> {
+        let ctx = WorkContext::for_unit_in_zone(&self.runtime, &self.caps, |_| {});
         self.register_with_context(unit, ctx)
     }
 
     /// Registers a `Component` with a custom `WorkContext`.
+    ///
+    /// Returns `Err(ZoneError::DuplicateName)` if a unit with the same `name()`
+    /// has already been registered.
     pub fn register_with_context(
         &mut self,
         unit: Arc<dyn Component>,
         ctx: WorkContext,
-    ) -> &mut Self {
+    ) -> Result<&mut Self, ZoneError> {
         let name: ArcIntern<str> = ArcIntern::from(unit.name());
+        if self.abort_handles.contains_key(&name) {
+            return Err(ZoneError::DuplicateName(name));
+        }
         let depends: Vec<ArcIntern<str>> = unit.depends().to_vec();
         let provides: Vec<ArcIntern<str>> = unit.provides().to_vec();
 
@@ -166,7 +189,7 @@ impl Zone {
         }
 
         self.spawn_unit(unit, ctx);
-        self
+        Ok(self)
     }
 
     fn spawn_unit(&mut self, unit: Arc<dyn Component>, ctx: WorkContext) {
@@ -290,10 +313,9 @@ impl Future for Zone {
                         .remove(&id)
                         .unwrap_or_else(|| ArcIntern::from("unknown"));
                     this.cancel_dependents_of(&name);
-                    this.summary.panicked.push(ZoneEvent::Panicked {
-                        name,
-                        info: e.to_string(),
-                    });
+                    this.summary
+                        .failed
+                        .push(ZoneEvent::Failed { name, error: e });
                     this.active_count -= 1;
                     budget -= 1;
                 }

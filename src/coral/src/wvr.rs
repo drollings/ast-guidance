@@ -4,6 +4,4 @@
 //! Coral's WasmComponent implements WorkUnit via guidance_traits (now fluent-wvr).
 //! Add new Fluent WVR integration code here.
 
-pub use fluent_wvr::{
-    Component, Describable, FieldAccess, FieldError, WorkContext, WorkError, WorkOutput, WorkUnit,
-};
+pub use fluent_wvr::prelude::*;

@@ -14,6 +14,8 @@ pub enum FieldError {
     Parse(String),
     #[error("constraint violation: {0}")]
     Constraint(String),
+    #[error("field {0:?} is read-only on a shared Arc: {1}")]
+    ReadOnly(String, String),
 }
 use thiserror::Error;
 
@@ -51,6 +53,24 @@ pub trait SchemaProvider {
 /// The core execution unit in the component system. Every `Component` implements
 /// this trait. The `Zone` supervisor and `MiddlewareChain` operate on `WorkUnit`s.
 ///
+/// ## Purity contract
+///
+/// `execute` MUST be synchronous and non-blocking. Specifically:
+///
+/// - Do NOT call `tokio::spawn`, `tokio::time::sleep`, or
+///   `Handle::block_on` inside `execute`.
+/// - Do NOT perform I/O; instead emit a `WorkError` and let the
+///   supervisor (`Zone`) handle retry/backoff/timeout.
+/// - Do NOT mutate any shared state external to `self` without
+///   synchronization; `execute` MUST be a pure function of `(&self,
+///   &WorkContext)`.
+///
+/// `Zone::execute_with_timeout_and_retry` runs `execute` in an async
+/// context but expects `execute` itself to return promptly. Violations
+/// defeat the supervisor's timeout and retry invariants.
+///
+/// See: `ROADMAP_REFINE.md#M5` and `AGENTS.md` "Refinement contract" §3.
+///
 /// # Examples
 ///
 /// ```
@@ -64,12 +84,21 @@ pub trait SchemaProvider {
 ///     fn depends(&self) -> &[ArcIntern<str>] { &[] }
 ///     fn provides(&self) -> &[ArcIntern<str>] { &[] }
 ///     fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+///         // Ok — fully synchronous, no I/O, no tokio calls.
 ///         Ok(WorkOutput::ok("pong"))
 ///     }
 /// }
 ///
 /// let unit = PingUnit;
 /// assert_eq!(unit.name(), "ping");
+/// ```
+///
+/// ```text
+/// // BAD: this would block the executor.
+/// // fn execute(&self, _: &WorkContext) -> Result<WorkOutput, WorkError> {
+/// //     Handle::block_on(tokio::time::sleep(Duration::from_secs(1)));
+/// //     Ok(WorkOutput::ok("done"))
+/// // }
 /// ```
 pub trait WorkUnit: Send + Sync {
     fn name(&self) -> &str;

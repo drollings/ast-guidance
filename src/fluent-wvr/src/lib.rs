@@ -27,7 +27,7 @@ pub mod work;
 pub mod prelude;
 pub mod wrapper;
 
-pub use capability::{Capability, CapabilitySet, Reserve};
+pub use capability::{Capability, CapabilitySet};
 pub use fluent_wvr_macros::{Describable, FieldAccess};
 pub use internment::ArcIntern;
 pub use metadata::{MetadataEntry, MetadataValue};
@@ -93,7 +93,10 @@ impl FieldAccess for Arc<dyn Component> {
     fn set_field(&mut self, name: &str, value: &str) -> Result<(), FieldError> {
         Arc::get_mut(self)
             .ok_or_else(|| {
-                FieldError::NotFound("Arc has multiple owners; configure before wrapping".into())
+                FieldError::ReadOnly(
+                    name.to_string(),
+                    "Arc has multiple owners; configure before wrapping".into(),
+                )
             })?
             .set_field(name, value)
     }
@@ -930,5 +933,23 @@ mod tests {
         let ctx = WorkContext::default();
         let result = arc.execute(&ctx).unwrap();
         assert_eq!(result.message, "computed: 20");
+    }
+
+    #[test]
+    fn set_field_on_shared_arc_returns_readonly() {
+        let arc: Arc<dyn Component> = Arc::new(TestComponent {
+            name: ArcIntern::from("shared"),
+            value: 1,
+        });
+        let _clone = Arc::clone(&arc);
+        // Now there are 2 owners — set_field should return ReadOnly
+        let mut arc_mut = arc;
+        match arc_mut.set_field("value", "42") {
+            Err(FieldError::ReadOnly(field, reason)) => {
+                assert_eq!(field, "value");
+                assert!(reason.contains("multiple owners"), "reason: {reason}");
+            }
+            other => panic!("expected ReadOnly, got: {other:?}"),
+        }
     }
 }

@@ -163,14 +163,7 @@ impl<U: crate::Component> crate::Describable for Instrumented<U> {
     }
 }
 
-impl<U: crate::Component + 'static> crate::Component for Instrumented<U> {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-}
+impl_component!(generic (U: crate::Component + 'static) for Instrumented<U>);
 
 #[derive(Clone)]
 pub struct WithRetry<U> {
@@ -265,14 +258,7 @@ impl<U: crate::Component> crate::Describable for WithRetry<U> {
     }
 }
 
-impl<U: crate::Component + 'static> crate::Component for WithRetry<U> {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-}
+impl_component!(generic (U: crate::Component + 'static) for WithRetry<U>);
 
 /// A wrapper that adapts any `Arc<dyn Component>` at runtime.
 ///
@@ -658,6 +644,28 @@ mod tests {
         assert_eq!(arc.name(), "mock");
         let result = arc.execute(&ctx);
         assert!(result.is_ok());
+    }
+
+    // --- M1.3: Downcast round-trip tests ---
+
+    #[test]
+    fn instrumented_downcast_roundtrip() {
+        let inner = MockUnit::ok("mock");
+        let instr = Instrumented::new(inner, "test");
+        let arc: Arc<dyn Component> = Arc::new(instr);
+        assert!(crate::component_downcast_ref::<Instrumented<MockUnit>>(&*arc).is_some());
+        // Instrumented does not auto-leak the inner type
+        assert!(crate::component_downcast_ref::<MockUnit>(&*arc).is_none());
+    }
+
+    #[test]
+    fn with_retry_downcast_roundtrip() {
+        let inner = MockUnit::ok("mock");
+        let wr = WithRetry::new(inner, 3, 1);
+        let arc: Arc<dyn Component> = Arc::new(wr);
+        assert!(crate::component_downcast_ref::<WithRetry<MockUnit>>(&*arc).is_some());
+        // WithRetry does not auto-leak the inner type
+        assert!(crate::component_downcast_ref::<MockUnit>(&*arc).is_none());
     }
 
     // --- ComponentAdapter tests ---

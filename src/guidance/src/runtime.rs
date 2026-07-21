@@ -2,84 +2,77 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
-use fluent_concurrency::pool::WorkerPool;
+use fluent_concurrency::pool::ResultPool;
 use fluent_concurrency::runtime::tokio::TokioRuntime;
 use fluent_concurrency::zone::{Zone, ZoneConfig};
-use fluent_wvr::{CapabilitySet, Runtime};
-use tokio::sync::oneshot;
+use fluent_wvr::Runtime;
+use fluent_wvr::prelude::*;
 
 use crate::ast_parser::AstParser;
 use crate::sync_engine::{GenConfig, SyncEngine, SyncEngineError};
 use guidance_search_vector::GuidanceDb;
 
-/// A file for AST generation in the worker pool.
-pub struct AstGenJob {
+/// A file for AST generation in the result pool.
+pub struct AstGenPayload {
     pub source_path: PathBuf,
     pub source_dir: PathBuf,
     pub guidance_dir: PathBuf,
     pub config: GenConfig,
-    pub result_tx: oneshot::Sender<Result<GuidanceDoc, SyncEngineError>>,
 }
 
-/// A database sync job for the worker pool.
-pub struct DbSyncJob {
+/// A database sync job for the result pool.
+pub struct DbSyncPayload {
     pub json_dir: PathBuf,
     pub db_path: PathBuf,
-    pub result_tx: oneshot::Sender<Result<usize, String>>,
 }
 
 use guidance_types::GuidanceDoc;
 
 /// Shared AST generation pool — sized to available cores, backpressure-managed queue.
-pub static AST_POOL: LazyLock<Arc<WorkerPool<AstGenJob>>> = LazyLock::new(|| {
-    let workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
-    Arc::new(WorkerPool::new(
-        Arc::new(TokioRuntime),
-        workers,
-        workers * 4,
-        |job: AstGenJob| async move {
-            let path_display = job.source_path.display().to_string();
-            let result = tokio::task::spawn_blocking(move || {
-                thread_local! {
-                    static PARSER: RefCell<Option<AstParser>> = const { RefCell::new(None) };
-                }
-                PARSER.with(|cell| {
-                    let parser = cell.borrow_mut().take().unwrap_or_else(AstParser::new);
-                    let mut engine =
-                        SyncEngine::with_parser(job.guidance_dir, job.source_dir, parser);
-                    let r = engine.gen_with_config(&job.source_path, &job.config);
-                    *cell.borrow_mut() = Some(engine.ast_parser);
-                    r
+pub static AST_POOL: LazyLock<Arc<ResultPool<AstGenPayload, GuidanceDoc, SyncEngineError>>> =
+    LazyLock::new(|| {
+        let workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+        Arc::new(ResultPool::new(
+            Arc::new(TokioRuntime),
+            workers,
+            workers * 4,
+            |job: AstGenPayload| async move {
+                tokio::task::spawn_blocking(move || {
+                    thread_local! {
+                        static PARSER: RefCell<Option<AstParser>> = const { RefCell::new(None) };
+                    }
+                    PARSER.with(|cell| {
+                        let parser = cell.borrow_mut().take().unwrap_or_else(AstParser::new);
+                        let mut engine =
+                            SyncEngine::with_parser(job.guidance_dir, job.source_dir, parser);
+                        let r = engine.gen_with_config(&job.source_path, &job.config);
+                        *cell.borrow_mut() = Some(engine.ast_parser);
+                        r
+                    })
                 })
-            })
-            .await
-            .unwrap_or_else(|e| Err(SyncEngineError::Parse(e.to_string())));
-            if job.result_tx.send(result).is_err() {
-                tracing::warn!(path = %path_display, "ast_gen result receiver dropped");
-            }
-        },
-    ))
-});
+                .await
+                .unwrap_or_else(|e| Err(SyncEngineError::Parse(e.to_string())))
+            },
+        ))
+    });
 
 /// Shared database sync pool — serializes writes to avoid SQLite contention.
-pub static DB_POOL: LazyLock<Arc<WorkerPool<DbSyncJob>>> = LazyLock::new(|| {
-    Arc::new(WorkerPool::new(
-        Arc::new(TokioRuntime),
-        1,
-        100,
-        |job: DbSyncJob| async move {
-            let result = tokio::task::spawn_blocking(move || {
-                let db = GuidanceDb::open(&job.db_path).map_err(|e| e.to_string())?;
-                db.sync_from_dir(&job.json_dir).map_err(|e| e.to_string())
-            })
-            .await
-            .unwrap_or_else(|e| Err(e.to_string()));
-            if job.result_tx.send(result).is_err() {
-                tracing::warn!("db_sync result receiver dropped");
-            }
-        },
-    ))
-});
+pub static DB_POOL: LazyLock<Arc<ResultPool<DbSyncPayload, usize, String>>> =
+    LazyLock::new(|| {
+        Arc::new(ResultPool::new(
+            Arc::new(TokioRuntime),
+            1,
+            100,
+            |job: DbSyncPayload| async move {
+                tokio::task::spawn_blocking(move || {
+                    let db = GuidanceDb::open(&job.db_path).map_err(|e| e.to_string())?;
+                    db.sync_from_dir(&job.json_dir).map_err(|e| e.to_string())
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()))
+            },
+        ))
+    });
 
 /// Create a Zone that provides structured concurrency, failure containment,
 /// and dependency tracking for a batch of AST generation tasks.

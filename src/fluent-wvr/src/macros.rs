@@ -16,11 +16,29 @@
 /// ```
 ///
 /// Place `impl_component!(MyConfig);` after the `FieldAccess`,
-/// `Describable`, and `WorkUnit` impls. The macro accepts a single type
-/// identifier (no generics — generic types should implement `Component`
-/// by hand or via a per-instantiation macro call).
+/// `Describable`, and `WorkUnit` impls.
+///
+/// # Generic types
+///
+/// For generic types, use the generic form:
+///
+/// ```ignore
+/// impl_component!(generic (U: crate::Component + 'static) for Instrumented<U>);
+/// ```
 #[macro_export]
 macro_rules! impl_component {
+    // Generic form: `generic (bounds) for Type<...>`
+    (generic ( $($generics:tt)* ) for $type:ty) => {
+        impl < $($generics)* > $crate::Component for $type {
+            fn as_any(&self) -> &dyn ::std::any::Any {
+                self
+            }
+            fn as_any_mut(&mut self) -> &mut dyn ::std::any::Any {
+                self
+            }
+        }
+    };
+    // Concrete type (no generics)
     ($type:ty) => {
         impl $crate::Component for $type {
             fn as_any(&self) -> &dyn ::std::any::Any {

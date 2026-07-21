@@ -14,8 +14,7 @@ use crate::cache_router::ParallelRouter;
 use crate::db::Library;
 use crate::tier_units::{L2WasmUnit, L3GraphUnit, L4SemanticUnit, L5FrontierUnit, TierRegistry};
 use crate::wasm_runtime::PluginPool;
-use fluent_wvr::wrapper::{ComponentAdapter, Instrumented};
-use fluent_wvr::Component;
+use fluent_wvr::prelude::*;
 
 #[derive(Builder)]
 pub struct QueueReactorCreateArgs {
@@ -309,7 +308,6 @@ pub struct CoralStats {
 mod tests {
     use super::*;
     use crate::test_stubs::{StubChatBackend, StubDecomposer, StubEmbedder};
-    use fluent_wvr::WorkUnit;
     use guidance_types::ContextNode;
     use std::collections::HashMap;
 
@@ -731,9 +729,6 @@ mod tests {
 
     #[test]
     fn component_adapter_name_override_reports_new_name() {
-        use fluent_wvr::wrapper::ComponentAdapter;
-        use fluent_wvr::{impl_component, ArcIntern, FieldAccess, FieldError, WorkUnit};
-
         struct StubUnit {
             name: ArcIntern<str>,
         }

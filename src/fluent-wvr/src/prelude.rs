@@ -5,9 +5,9 @@
 //! ```
 
 pub use crate::impl_component;
-pub use crate::wrapper::{retry_call, ComponentAdapter, Instrumented, RetryResult, WithRetry};
+pub use crate::wrapper::{retry_call, ComponentAdapter, ExecuteFn, Instrumented, WithRetry};
 pub use crate::{
-    Capability, CapabilitySet, Component, ComponentArcExt, Describable, FieldAccess, FieldError,
-    FieldSchema, MetadataValue, SchemaProvider, WorkContext, WorkError, WorkOutput, WorkUnit,
+    Capability, CapabilitySet, Component, Describable, FieldAccess, FieldError, MetadataValue,
+    WorkContext, WorkError, WorkOutput, WorkUnit,
 };
 pub use internment::ArcIntern;

@@ -124,10 +124,7 @@ impl WasmPlugin for ExtismPlugin {
     }
 }
 
-use fluent_wvr::{
-    impl_component, Describable, FieldAccess, FieldError, WorkContext, WorkError, WorkOutput,
-    WorkUnit,
-};
+use fluent_wvr::prelude::*;
 use internment::ArcIntern;
 
 pub struct WasmComponent {

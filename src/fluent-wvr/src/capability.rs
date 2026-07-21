@@ -105,44 +105,6 @@ impl CapabilitySet {
     }
 }
 
-pub struct Reserve {
-    counter: Arc<std::sync::atomic::AtomicUsize>,
-    committed: bool,
-}
-
-impl Reserve {
-    /// Attempt to acquire a permit from the counter.
-    ///
-    /// Returns `None` if the counter is already at zero (no permits available).
-    /// Does NOT underflow — this is the safe alternative to `new()`.
-    pub fn try_acquire(counter: Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
-        let prev = counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        if prev == 0 {
-            // Underflow would occur — restore counter and return None
-            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            None
-        } else {
-            Some(Self {
-                counter,
-                committed: false,
-            })
-        }
-    }
-
-    pub fn commit(mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for Reserve {
-    fn drop(&mut self) {
-        if !self.committed {
-            self.counter
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

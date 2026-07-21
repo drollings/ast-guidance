@@ -474,18 +474,21 @@ where
             let nf = Arc::clone(&notify);
             workers.push(r.spawn(Box::pin(async move {
                 loop {
-                    tokio::select! {
-                        () = sd.notified() => break,
-                        () = nf.notified() => {
-                            let wrapped = {
-                                let mut pq = q.lock().await;
-                                pq.pop()
-                            };
-                            if let Some(w) = wrapped {
+                    // Drain everything currently queued.
+                    loop {
+                        let wrapped = { let mut pq = q.lock().await; pq.pop() };
+                        match wrapped {
+                            Some(w) => {
                                 let result = h(w.job).await;
                                 let _ = w.result_tx.send(result);
                             }
+                            None => break,
                         }
+                    }
+                    // Nothing left — wait for a new item or shutdown.
+                    tokio::select! {
+                        () = sd.notified() => break,
+                        () = nf.notified() => {},
                     }
                 }
             })));
@@ -508,8 +511,8 @@ where
             let mut pq = self.queue.lock().await;
             pq.push(wrapped, priority);
         }
-        // Wake one worker to pick up the new job.
-        self.notify.notify_one();
+        // Wake workers to drain the queue.
+        self.notify.notify_waiters();
         rx.await
             .map_err(|_| ResultPoolError::Canceled)?
             .map_err(ResultPoolError::Inner)
@@ -528,6 +531,7 @@ where
 mod priority_pool_tests {
     use super::*;
     use crate::tokio_runtime;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn priority_pool_dispatches_high_first() {
@@ -550,6 +554,33 @@ mod priority_pool_tests {
         // Both should complete successfully.
         assert_eq!(high_result, "job_100");
         assert_eq!(low_result, "job_1");
+
+        pool.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_priority_pool_burst_drains_all() {
+        let rt = tokio_runtime();
+        let pool = PriorityResultPool::<i32, i32, String>::new(
+            Arc::clone(&rt) as Arc<dyn Runtime>,
+            4,
+            |job: i32| async move { Ok(job * 2) },
+        );
+
+        // Submit 100 high-priority items back-to-back with 4 workers.
+        let mut handles = Vec::with_capacity(100);
+        for i in 0..100 {
+            handles.push(pool.submit(i, 10));
+        }
+
+        // All 100 results must resolve before timeout.
+        for (i, h) in handles.into_iter().enumerate() {
+            let result = tokio::time::timeout(Duration::from_secs(5), h)
+                .await
+                .expect("burst result must not hang")
+                .unwrap();
+            assert_eq!(result, i as i32 * 2);
+        }
 
         pool.shutdown().await;
     }

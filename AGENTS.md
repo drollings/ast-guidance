@@ -255,8 +255,33 @@ The completed fluent-wvr refinement plan lives in
    `contains`, `iter`, `len`, `is_empty` are required for WASM sandbox
    capability narrowing (M1.1).
 3. **`FieldAccess` derive MUST support string sanitization attributes**
-   — `sanitize`, `max_len`, `pattern` are required in addition to numeric
-   `min`/`max` for input validation (M2.1–M2.3).
+    — `sanitize`, `max_len`, `pattern` are required in addition to numeric
+    `min`/`max` for input validation (M2.1–M2.3).
+
+## WVR More contract
+
+Completed by `ROADMAP_20260720_WVR_MORE.md` (checklist:
+`ROADMAP_20260720_WVR_MORE_CHECKLIST.md`). New contracts:
+
+1. **`Zone::register` returns `Result`** — duplicate name registration is
+   rejected with `Err(ZoneError::DuplicateName)`. Use `register_or_replace`
+   if overwrite is needed (not yet implemented).
+2. **`ZoneEvent::Failed` distinct from `Panicked`** — Execution errors
+   (`Err(WorkError::Execution)`) are recorded under `summary.failed`, not
+   `summary.panicked`. Only true panics (`JoinError::is_panic()`) go to
+   `panicked`.
+3. **`FieldError::ReadOnly`** is the variant for shared-Arc mutation, not
+   `NotFound`.
+4. **`Reserve` lives in `fluent-concurrency`** at
+   `fluent_concurrency::reserve::Reserve`.
+5. **`WorkUnit::execute` purity contract** documented in the trait doc comment.
+6. **`fluent-wvr::prelude::*`** is the canonical consumer import.
+7. **`WorkContext::for_unit_in_zone`** is the builder for constructing
+   contexts from zone defaults.
+8. **`ResultPool` adopted in `guidance/runtime.rs`** — `AstGenJob`/`DbSyncJob`
+   no longer carry `result_tx` fields.
+9. **`PriorityResultPool` worker drains fully** before blocking on `Notify`,
+   preventing wakeup collapse under burst.
 
 ---
 
