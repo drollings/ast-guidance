@@ -1,5 +1,5 @@
 use common_core::string::contains_ignore_case;
-use guidance_types::GuidanceDoc;
+use fluent_types::GuidanceDoc;
 
 use super::identifier;
 use super::llm_filter::LlmFilter;

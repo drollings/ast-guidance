@@ -1,4 +1,4 @@
-use guidance_types::LOD_COUNT;
+use fluent_types::LOD_COUNT;
 use std::any::Any;
 use std::fmt::Debug;
 

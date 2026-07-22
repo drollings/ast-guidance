@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-guidance-types = { path = "../types" }
+fluent-types = { path = "../types" }
 guidance-rdf = { path = "../rdf" }
 blake3 = { workspace = true }
 thiserror = { workspace = true }

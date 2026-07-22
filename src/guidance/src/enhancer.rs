@@ -1,6 +1,6 @@
 use guidance_llm::client::LlmClient;
 use guidance_llm::ChatMessage;
-use guidance_types::GuidanceDoc;
+use fluent_types::GuidanceDoc;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -263,15 +263,15 @@ pub fn enhance_doc(
             .map_or(member.name.as_str(), smol_str::SmolStr::as_str);
 
         let result = match member.type_name {
-            guidance_types::MemberType::FnDecl
-            | guidance_types::MemberType::FnPrivate
-            | guidance_types::MemberType::Method
-            | guidance_types::MemberType::MethodPrivate => {
+            fluent_types::MemberType::FnDecl
+            | fluent_types::MemberType::FnPrivate
+            | fluent_types::MemberType::Method
+            | fluent_types::MemberType::MethodPrivate => {
                 enhancer.enhance_function(member.name.as_str(), sig, module, language)
             }
-            guidance_types::MemberType::Struct
-            | guidance_types::MemberType::Enum
-            | guidance_types::MemberType::Union => {
+            fluent_types::MemberType::Struct
+            | fluent_types::MemberType::Enum
+            | fluent_types::MemberType::Union => {
                 enhancer.enhance_struct(member.name.as_str(), sig, module, language)
             }
             _ => continue,
@@ -300,7 +300,7 @@ pub fn enhance_doc(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use guidance_types::{GuidanceDoc, Member, MemberType, Meta};
+    use fluent_types::{GuidanceDoc, Member, MemberType, Meta};
 
     #[test]
     fn test_score_docstring_short() {

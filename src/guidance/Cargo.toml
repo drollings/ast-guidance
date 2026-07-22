@@ -6,8 +6,8 @@ edition.workspace = true
 [dependencies]
 common-core = { path = "../common-core" }
 guidance-project-knowledge = { path = "../project-knowledge" }
-guidance-types = { path = "../types" }
-guidance-search-vector = { path = "../search-vector" }
+fluent-types = { path = "../types" }
+search-vector = { path = "../search-vector" }
 guidance-llm = { path = "../llm" }
 fluent-concurrency = { path = "../fluent-concurrency" }
 fluent-wvr = { path = "../fluent-wvr" }

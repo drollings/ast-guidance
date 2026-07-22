@@ -1,5 +1,5 @@
 use common_core::string::contains_ignore_case;
-use guidance_types::GuidanceDoc;
+use fluent_types::GuidanceDoc;
 use regex::Regex;
 
 #[derive(Debug, Clone)]
@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn test_find_members_by_name() {
-        use guidance_types::{GuidanceDoc, Member, MemberType, Meta};
+        use fluent_types::{GuidanceDoc, Member, MemberType, Meta};
 
         let doc = GuidanceDoc {
             meta: Meta {
@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn test_find_members_by_signature() {
-        use guidance_types::{GuidanceDoc, Member, MemberType, Meta};
+        use fluent_types::{GuidanceDoc, Member, MemberType, Meta};
 
         let doc = GuidanceDoc {
             meta: Meta {

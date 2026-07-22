@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
 common-core = { path = "../common-core", features = ["sqlite"] }
 fluent-wvr = { path = "../fluent-wvr" }
 fluent-concurrency = { path = "../fluent-concurrency" }
-guidance-types = { path = "../types" }
+fluent-types = { path = "../types" }
 
 internment = { workspace = true }
 serde = { workspace = true }

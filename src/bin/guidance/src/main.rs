@@ -11,7 +11,7 @@ use guidance_core::runtime;
 use guidance_core::sync::json_store::walk_guidance_docs;
 use guidance_core::sync_engine::SyncEngine;
 use guidance_core::walk;
-use guidance_search_vector::GuidanceDb;
+use search_vector::GuidanceDb;
 use time::OffsetDateTime;
 
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -371,7 +371,7 @@ async fn cmd_explain(
         String::new()
     };
 
-    let mut results: Vec<guidance_search_vector::db::SearchResult> = Vec::new();
+    let mut results: Vec<search_vector::db::SearchResult> = Vec::new();
 
     if db.exists() {
         if let Ok(gdb) = GuidanceDb::open(&db) {
@@ -427,7 +427,7 @@ fn collect_json_results(
     dir: &Path,
     lower_query: &str,
     tokens: &[&str],
-    results: &mut Vec<guidance_search_vector::db::SearchResult>,
+    results: &mut Vec<search_vector::db::SearchResult>,
 ) {
     for (_path, doc) in walk_guidance_docs(dir) {
         for member in &doc.members {
@@ -451,7 +451,7 @@ fn collect_json_results(
             });
 
             if exact {
-                results.push(guidance_search_vector::db::SearchResult {
+                results.push(search_vector::db::SearchResult {
                     id: 0,
                     name: member.name.as_str().to_string(),
                     source: doc.meta.source.as_str().to_string(),
@@ -459,7 +459,7 @@ fn collect_json_results(
                     similarity: 1.0,
                 });
             } else if name_match {
-                results.push(guidance_search_vector::db::SearchResult {
+                results.push(search_vector::db::SearchResult {
                     id: 0,
                     name: member.name.as_str().to_string(),
                     source: doc.meta.source.as_str().to_string(),
@@ -467,7 +467,7 @@ fn collect_json_results(
                     similarity: 0.8,
                 });
             } else if token_match {
-                results.push(guidance_search_vector::db::SearchResult {
+                results.push(search_vector::db::SearchResult {
                     id: 0,
                     name: member.name.as_str().to_string(),
                     source: doc.meta.source.as_str().to_string(),

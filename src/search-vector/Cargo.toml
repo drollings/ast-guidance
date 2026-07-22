@@ -1,5 +1,5 @@
 [package]
-name = "guidance-search-vector"
+name = "search-vector"
 version.workspace = true
 edition.workspace = true
 

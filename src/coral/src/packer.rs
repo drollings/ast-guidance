@@ -1,5 +1,5 @@
 use common_core::tokens::DEFAULT_CHARS_PER_TOKEN;
-use guidance_types::{ContextNode, NodeId};
+use fluent_types::{ContextNode, NodeId};
 use thiserror::Error;
 
 use crate::db::Library;

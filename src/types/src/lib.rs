@@ -1,4 +1,4 @@
-//! guidance-types: Shared data types (GuidanceDoc, Member, FileType, etc.).
+//! fluent-types: Shared data types (GuidanceDoc, Member, FileType, etc.).
 //! No business logic — only type definitions, serde, and validation.
 
 use internment::ArcIntern;

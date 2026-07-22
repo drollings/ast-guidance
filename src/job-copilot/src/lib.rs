@@ -6,7 +6,7 @@
 //!
 //! **Dependency policy** (from `AGENTS.md`):
 //! This crate may import from `common-core`, `fluent-wvr`,
-//! `fluent-concurrency`, `guidance-llm`, `guidance-types`, `dag`,
+//! `fluent-concurrency`, `guidance-llm`, `fluent-types`, `dag`,
 //! `search-vector`, `memory-plugin`, `content-node`, and the standard
 //! library / `tokio` / `reqwest`. It must NOT import from `guidance`,
 //! `coral`, `wasm_ipc`, `project-knowledge`, `ontology`, or `rdf`.

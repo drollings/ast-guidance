@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use guidance_types::{CapabilityEval, GuidanceDoc, Member, MemberType, Meta, Param, Skill};
+use fluent_types::{CapabilityEval, GuidanceDoc, Member, MemberType, Meta, Param, Skill};
 use smol_str::SmolStr;
 use thiserror::Error;
 
@@ -318,7 +318,7 @@ pub fn save_guidance(path: &Path, doc: &GuidanceDoc) -> Result<(), JsonError> {
 mod tests {
     use super::*;
     use fluent_wvr_testutil::tempdir;
-    use guidance_types::{GuidanceDoc, Member, MemberType, Meta};
+    use fluent_types::{GuidanceDoc, Member, MemberType, Meta};
 
     fn make_test_member(name: &str, sig: &str, hash: &str, comment: Option<&str>) -> Member {
         Member {

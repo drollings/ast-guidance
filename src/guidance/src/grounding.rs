@@ -32,7 +32,7 @@ impl GroundingResult {
 /// and a line number — this is the minimum requirement for grounded synthesis.
 pub fn can_synthesize(stages: &[Stage]) -> bool {
     stages.iter().any(|s| {
-        s.kind == guidance_types::StageKind::Code && !s.source.is_empty() && s.line.is_some()
+        s.kind == fluent_types::StageKind::Code && !s.source.is_empty() && s.line.is_some()
     })
 }
 
@@ -100,7 +100,7 @@ fn extract_citation_at(text: &str, colon_pos: usize) -> Option<String> {
 pub fn verify_citations(output: &str, stages: &[Stage]) -> GroundingResult {
     let grounded_refs: HashSet<String> = stages
         .iter()
-        .filter(|s| s.kind == guidance_types::StageKind::Code && s.line.is_some())
+        .filter(|s| s.kind == fluent_types::StageKind::Code && s.line.is_some())
         .map(|s| {
             let file = std::path::Path::new(&s.source)
                 .file_name()
@@ -141,7 +141,7 @@ pub fn verify_citations(output: &str, stages: &[Stage]) -> GroundingResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use guidance_types::StageKind;
+    use fluent_types::StageKind;
 
     fn make_code_stage(source: &str, line: u32) -> Stage {
         Stage {

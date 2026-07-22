@@ -1,4 +1,4 @@
-//! Fluent WVR integration for `guidance-content-node`.
+//! Fluent WVR integration for `content-node`.
 //!
 //! Provides the `ContentNodeRef` wrapper type with downcasting support
 //! for implementing `WorkUnit` and related traits from `fluent-wvr`.

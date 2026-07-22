@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use guidance_project_knowledge::word_index::WordIndex;
-use guidance_types::GuidanceDoc;
+use fluent_types::GuidanceDoc;
 use thiserror::Error;
 
 use crate::ast_parser;
@@ -17,8 +17,8 @@ use crate::query::search_backend::{
 use crate::query::strategy::{self, QueryIntent};
 use crate::query::synthesize::{Stage, Synthesizer};
 use crate::walk;
-use guidance_search_vector::GuidanceDb;
-use guidance_search_vector::SemanticAliases;
+use search_vector::GuidanceDb;
+use search_vector::SemanticAliases;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OutputFormat {
@@ -363,7 +363,7 @@ impl QueryEngine {
 /// Resolve line numbers for stages that have member metadata but no lines.
 /// Re-parses the source file with tree-sitter to get fresh positions.
 fn resolve_stage_lines(stages: &mut [Stage], parser: &mut ast_parser::AstParser) {
-    let mut cache: Option<(std::path::PathBuf, String, guidance_types::GuidanceDoc)> = None;
+    let mut cache: Option<(std::path::PathBuf, String, fluent_types::GuidanceDoc)> = None;
 
     for stage in stages.iter_mut() {
         if stage.line.is_some() {
@@ -408,7 +408,7 @@ mod tests {
     use super::*;
     use fluent_wvr_testutil::tempdir;
     use guidance_project_knowledge::word_index::WordIndex;
-    use guidance_types::{GuidanceDoc, Member, MemberType, Meta};
+    use fluent_types::{GuidanceDoc, Member, MemberType, Meta};
 
     fn make_test_doc() -> GuidanceDoc {
         GuidanceDoc {

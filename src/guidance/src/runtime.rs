@@ -10,7 +10,7 @@ use fluent_wvr::prelude::*;
 
 use crate::ast_parser::AstParser;
 use crate::sync_engine::{GenConfig, SyncEngine, SyncEngineError};
-use guidance_search_vector::GuidanceDb;
+use search_vector::GuidanceDb;
 
 /// A file for AST generation in the result pool.
 pub struct AstGenPayload {
@@ -26,7 +26,7 @@ pub struct DbSyncPayload {
     pub db_path: PathBuf,
 }
 
-use guidance_types::GuidanceDoc;
+use fluent_types::GuidanceDoc;
 
 /// Shared AST generation pool — sized to available cores, backpressure-managed queue.
 pub static AST_POOL: LazyLock<Arc<ResultPool<AstGenPayload, GuidanceDoc, SyncEngineError>>> =

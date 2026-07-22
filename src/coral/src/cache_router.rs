@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::error::CacheError;
-use guidance_types::GraphNode;
+use fluent_types::GraphNode;
 
 use crate::cache_l1::{CacheTier, RoutingResult};
 use crate::db::Library;
@@ -91,7 +91,7 @@ impl ParallelRouter {
 
 #[cfg(test)]
 mod tests {
-    use guidance_types::ContextNode;
+    use fluent_types::ContextNode;
 
     use super::*;
     use crate::cache_l1::CacheTier;

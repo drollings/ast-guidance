@@ -4,9 +4,9 @@ use std::collections::HashMap;
 
 use guidance_ontology::mapper::PendingNode;
 use guidance_ontology::yago;
-use guidance_search_vector::error::DbError;
-use guidance_types::ContextNode;
-use guidance_types::NodeId;
+use search_vector::error::DbError;
+use fluent_types::ContextNode;
+use fluent_types::NodeId;
 use thiserror::Error;
 
 use crate::db::Library;

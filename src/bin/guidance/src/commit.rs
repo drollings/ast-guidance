@@ -103,7 +103,7 @@ fn members_in_hunks(
 }
 
 fn collect_members(
-    members: &[guidance_types::Member],
+    members: &[fluent_types::Member],
     hunk_ranges: &[HunkRange],
     out: &mut Vec<ChangedMember>,
 ) {

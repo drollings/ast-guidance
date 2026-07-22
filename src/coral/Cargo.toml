@@ -6,8 +6,8 @@ edition.workspace = true
 [dependencies]
 fluent-wvr = { path = "../fluent-wvr" }
 common-core = { path = "../common-core", features = ["sqlite"] }
-guidance-types = { path = "../types" }
-guidance-search-vector = { path = "../search-vector" }
+fluent-types = { path = "../types" }
+search-vector = { path = "../search-vector" }
 guidance-llm = { path = "../llm" }
 guidance-ontology = { path = "../ontology" }
 guidance-rdf = { path = "../rdf" }

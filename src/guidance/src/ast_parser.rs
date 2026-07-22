@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use guidance_types::{FileType, GuidanceDoc, Member, MemberType, Meta, Param, Span};
+use fluent_types::{FileType, GuidanceDoc, Member, MemberType, Meta, Param, Span};
 use thiserror::Error;
 
 #[derive(Error, Debug)]

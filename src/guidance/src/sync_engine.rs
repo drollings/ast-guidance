@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use guidance_types::GuidanceDoc;
+use fluent_types::GuidanceDoc;
 use thiserror::Error;
 
 use crate::ast_parser::AstParser;
@@ -9,7 +9,7 @@ use crate::sync::comments;
 use crate::sync::json_store;
 use crate::sync::staleness;
 use crate::walk;
-use guidance_search_vector::GuidanceDb;
+use search_vector::GuidanceDb;
 
 #[derive(Error, Debug)]
 pub enum SyncEngineError {

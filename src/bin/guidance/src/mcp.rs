@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use common_core::jsonrpc::{JsonRpcError, JsonRpcHandler, JsonRpcRequest, JsonRpcResponse};
 use guidance_core::memory::MemoryBridge;
-use guidance_search_vector::GuidanceDb;
+use search_vector::GuidanceDb;
 use thiserror::Error;
 
 #[derive(Error, Debug)]

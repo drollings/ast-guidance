@@ -177,11 +177,11 @@ Then you you must read
     │   └── src/
     │       ├── doc_node.rs  # use std::any::Any;
     │       ├── file_node.rs  # use std::any::Any;
-    │       ├── lib.rs  # //! guidance-content-node: Level-of-deta
+    │       ├── lib.rs  # //! content-node: Level-of-detail text s
     │       ├── lod.rs  # pub fn generate_lod_slices(full_text: &s
-    │       ├── node.rs  # use guidance_types::LOD_COUNT;
+    │       ├── node.rs  # use fluent_types::LOD_COUNT;
     │       ├── source_node.rs  # use std::any::Any;
-    │       └── wvr.rs  # //! Fluent WVR integration for `guidance
+    │       └── wvr.rs  # //! Fluent WVR integration for `content-
     ├── coral/
     │   ├── Cargo.toml
     │   └── src/
@@ -225,12 +225,21 @@ Then you you must read
     │       ├── llm_queue.rs  # //! LLM request queue — async, queu...
     │       ├── pool.rs  # //! Bounded async queue, worker pool, an
     │       ├── queue.rs  # //! A priority queue with a fast path fo
+    │       ├── reserve.rs  # //! Available primitive: RAII permit on 
     │       ├── router.rs  # //! A partitioned router that distribute
     │       ├── runtime/
     │       │   ├── mod.rs  # //! Pluggable `Runtime` backends (produc
     │       │   ├── test.rs  # //! Test `Runtime` implementation with p
     │       │   └── tokio.rs  # //! Production `Runtime` implementation 
     │       ├── scope.rs  # //! Structured concurrency via `Scope...
+    │       ├── tests/
+    │       │   ├── e2e.rs  # use crate::pool::WorkerPool;
+    │       │   ├── m1.rs  # use super::*;
+    │       │   ├── m2.rs  # use super::*;
+    │       │   ├── m3.rs  # use super::*;
+    │       │   ├── m4.rs  # use super::*;
+    │       │   ├── m5.rs  # use crate::io::db::DbCapability;
+    │       │   └── mod.rs  # use std::sync::atomic::{AtomicUsize, Ord
     │       └── zone.rs  # //! Supervision zone with async retry, d
     ├── fluent-wvr/
     │   ├── Cargo.toml
@@ -241,6 +250,7 @@ Then you you must read
     │       ├── metadata.rs  # use serde::{Deserialize, Serialize};
     │       ├── prelude.rs  # //! The fluent-wvr prelude — import...
     │       ├── runtime.rs  # use std::future::Future;
+    │       ├── tests.rs  # use crate::*;
     │       ├── traits.rs  # use std::any::Any;
     │       ├── work.rs  # use std::collections::HashMap;
     │       └── wrapper.rs  # use std::collections::HashMap;
@@ -270,15 +280,15 @@ Then you you must read
     │   │   │   ├── mod.rs  # pub mod formatter;
     │   │   │   ├── search_backend.rs  # use common_core::string::contains_ignore
     │   │   │   ├── snapshot.rs  # use std::path::Path;
-    │   │   │   ├── strategy.rs  # use guidance_types::GuidanceDoc;
-    │   │   │   └── synthesize.rs  # use guidance_types::{GuidanceDoc, Member
+    │   │   │   ├── strategy.rs  # use fluent_types::GuidanceDoc;
+    │   │   │   └── synthesize.rs  # use fluent_types::{GuidanceDoc, Member, 
     │   │   ├── query_engine.rs  # use std::path::Path;
     │   │   ├── runtime.rs  # use std::cell::RefCell;
     │   │   ├── scanner.rs  # use common_core::string::{contains_any, 
     │   │   ├── sync/
     │   │   │   ├── comments.rs  # use std::path::Path;
     │   │   │   ├── json_store.rs  # use std::path::{Path, PathBuf};
-    │   │   │   ├── json_writer.rs  # use guidance_types::{GuidanceDoc, Member
+    │   │   │   ├── json_writer.rs  # use fluent_types::{GuidanceDoc, Member};
     │   │   │   ├── mod.rs  # pub mod comments;
     │   │   │   └── staleness.rs  # use std::path::Path;
     │   │   └── sync_engine.rs  # use std::path::{Path, PathBuf};
@@ -380,12 +390,12 @@ Then you you must read
     │       ├── aliases.rs  # use std::collections::HashMap;
     │       ├── db.rs  # use std::path::Path;
     │       ├── error.rs  # use thiserror::Error;
-    │       ├── lib.rs  # //! guidance-search-vector: SQLite hybri
+    │       ├── lib.rs  # //! search-vector: SQLite hybrid search 
     │       └── math.rs  # pub fn cosine_similarity(a: &[f32], b: &
     ├── types/
     │   ├── Cargo.toml
     │   └── src/
-    │       └── lib.rs  # //! guidance-types: Shared data types (G
+    │       └── lib.rs  # //! fluent-types: Shared data types (Gui
     └── wasm_ipc/
         ├── Cargo.toml
         └── src/

@@ -3,7 +3,7 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::ast_parser::AstParser;
-use guidance_types::GuidanceDoc;
+use fluent_types::GuidanceDoc;
 
 #[derive(Error, Debug)]
 pub enum SyncError {
@@ -112,7 +112,7 @@ fn apply_insertions(source: &str, mut insertions: Vec<(usize, Vec<String>)>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use guidance_types::{GuidanceDoc, Member, MemberType, Meta};
+    use fluent_types::{GuidanceDoc, Member, MemberType, Meta};
 
     #[test]
     fn test_insert_comment_on_function() {

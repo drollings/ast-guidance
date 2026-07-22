@@ -54,7 +54,7 @@ fn routing_to_work_result(
 
 pub struct L2WasmUnit {
     pub runtime: Arc<dyn crate::wasm_runtime::WasmRuntime>,
-    pub tool: guidance_types::WasmTool,
+    pub tool: fluent_types::WasmTool,
     pub library: Arc<Library>,
     pub pool: Arc<PluginPool>,
     depends: Vec<ArcIntern<str>>,
@@ -65,7 +65,7 @@ pub struct L2WasmUnit {
 impl L2WasmUnit {
     pub fn new(
         runtime: Arc<dyn crate::wasm_runtime::WasmRuntime>,
-        tool: guidance_types::WasmTool,
+        tool: fluent_types::WasmTool,
         library: Arc<Library>,
         pool: Arc<PluginPool>,
     ) -> Self {

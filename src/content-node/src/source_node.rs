@@ -2,7 +2,7 @@ use std::any::Any;
 
 use crate::file_node::FileContentNode;
 use crate::node::{ContentNode, LodLevel, NodeType, NodeTypeInfo};
-use guidance_types::GuidanceDoc;
+use fluent_types::GuidanceDoc;
 
 const SOURCE_LOD_LABELS: &[&str] = &[
     "path",

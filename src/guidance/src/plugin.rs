@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use guidance_types::GuidanceDoc;
+use fluent_types::GuidanceDoc;
 use thiserror::Error;
 
 #[derive(Error, Debug)]

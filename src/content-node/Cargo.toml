@@ -1,10 +1,10 @@
 [package]
-name = "guidance-content-node"
+name = "content-node"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-guidance-types = { path = "../types" }
+fluent-types = { path = "../types" }
 common-core = { path = "../common-core" }
 
 [lints]

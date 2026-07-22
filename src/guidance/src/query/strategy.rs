@@ -1,4 +1,4 @@
-use guidance_types::GuidanceDoc;
+use fluent_types::GuidanceDoc;
 
 use super::identifier;
 

@@ -1,6 +1,6 @@
 //! Shared types for the memory plugin system.
 
-use guidance_types::SessionId;
+use fluent_types::SessionId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;

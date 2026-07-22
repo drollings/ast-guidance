@@ -9,11 +9,11 @@ common-core        = { path = "../common-core", features = ["http", "sqlite", "t
 fluent-wvr         = { path = "../fluent-wvr" }
 fluent-concurrency = { path = "../fluent-concurrency" }
 guidance-llm       = { path = "../llm" }
-guidance-types     = { path = "../types" }
+fluent-types       = { path = "../types" }
 dag                = { path = "../dag", package = "fluent-dag" }
-search-vector      = { path = "../search-vector", package = "guidance-search-vector" }
+search-vector      = { path = "../search-vector", package = "search-vector" }
 memory-plugin      = { path = "../memory-plugin" }
-content-node       = { path = "../content-node", package = "guidance-content-node" }
+content-node       = { path = "../content-node", package = "content-node" }
 bon                = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }

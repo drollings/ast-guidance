@@ -9,11 +9,11 @@
 //!
 //! **Design contract:**
 //! - No implementation logic beyond blanket impls and helper types
-//! - No domain-specific dependencies (no rusqlite, no LLM, no guidance-types)
+//! - No domain-specific dependencies (no rusqlite, no LLM, no fluent-types)
 //! - The thinness is intentional — value is in the trait boundaries
 //! - If a derive macro (`#[derive(FieldAccess)]`) is added later, it goes here
 //!
-//! Consumers: `fluent-dag`, `coral-context`, `guidance-content-node`
+//! Consumers: `fluent-dag`, `coral-context`, `content-node`
 
 extern crate self as fluent_wvr;
 

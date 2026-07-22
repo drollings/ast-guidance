@@ -1,4 +1,4 @@
-//! guidance-search-vector: SQLite hybrid search engine — KNN vector search,
+//! search-vector: SQLite hybrid search engine — KNN vector search,
 //! keyword search, RRF merge, quantized embeddings, and semantic aliases.
 
 pub mod aliases;

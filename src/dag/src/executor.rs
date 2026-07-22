@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::target::{Target, TargetRegistry};
-use guidance_types::ExecutorKind;
+use fluent_types::ExecutorKind;
 use thiserror::Error;
 use tracing::{info, span, Level};
 
@@ -112,7 +112,7 @@ mod tests {
     use crate::resolver::DependencyResolver;
     use crate::target::{Target, TargetRegistry};
     use bitvec::prelude::*;
-    use guidance_types::{ExecutorKind, TargetType};
+    use fluent_types::{ExecutorKind, TargetType};
 
     fn make_bitset(bits: &[usize]) -> BitVec {
         let max = bits.iter().max().copied().unwrap_or(0) + 1;

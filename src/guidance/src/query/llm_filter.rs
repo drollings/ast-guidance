@@ -1,5 +1,5 @@
 use common_core::string::contains_ignore_case;
-use guidance_types::GuidanceDoc;
+use fluent_types::GuidanceDoc;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -101,7 +101,7 @@ impl LlmFilterBackend for NoopLlmFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use guidance_types::{GuidanceDoc, Member, MemberType, Meta};
+    use fluent_types::{GuidanceDoc, Member, MemberType, Meta};
 
     #[test]
     fn test_noop_filter_basic() {

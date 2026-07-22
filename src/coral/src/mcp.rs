@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use common_core::jsonrpc::{JsonRpcError, JsonRpcHandler, JsonRpcRequest, JsonRpcResponse};
-use guidance_types::ContextNode;
+use fluent_types::ContextNode;
 use thiserror::Error;
 
 use crate::cache_reactor::QueueReactor;
@@ -158,8 +158,8 @@ impl McpServer {
             .and_then(|p| p.get("node_id"))
             .and_then(serde_json::Value::as_i64)
             .map_or(
-                guidance_types::NodeId::from_int(0),
-                guidance_types::NodeId::from_int,
+                fluent_types::NodeId::from_int(0),
+                fluent_types::NodeId::from_int,
             );
 
         let max_depth = request

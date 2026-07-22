@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use guidance_types::SessionId;
+use fluent_types::SessionId;
 use memory_plugin::capability::MemoryCapability;
 use memory_plugin::plugins::holographic::{HolographicConfig, HolographicMemory};
 use memory_plugin::registry::MemoryPluginRegistry;

@@ -1,6 +1,6 @@
 use bitvec::vec::BitVec;
 use bon::Builder;
-pub use guidance_types::{ExecutorKind, TargetType};
+pub use fluent_types::{ExecutorKind, TargetType};
 use internment::ArcIntern;
 use std::collections::HashMap;
 

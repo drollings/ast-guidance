@@ -1,7 +1,7 @@
 use std::fmt::Write;
 
 use crate::query::synthesize::Stage;
-use guidance_types::StageKind;
+use fluent_types::StageKind;
 
 /// Output formatter — the fluent-wvr control plane for result presentation.
 ///
@@ -113,7 +113,7 @@ impl Formatter for DebugFormatter {
 mod tests {
     use super::*;
     use crate::query::synthesize::Synthesizer;
-    use guidance_types::{GuidanceDoc, Member, MemberType, Meta};
+    use fluent_types::{GuidanceDoc, Member, MemberType, Meta};
 
     fn test_stages() -> Vec<Stage> {
         let doc = GuidanceDoc {

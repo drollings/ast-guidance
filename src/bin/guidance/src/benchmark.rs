@@ -50,9 +50,9 @@ use guidance_core::sync::json_store::load_guidance;
 use guidance_core::walk;
 use guidance_llm::llm_queue::build_default_queue;
 use guidance_llm::{strip_think_block, ChatMessage, LlmClient, LlmConfig, LlmRequestQueue};
-use guidance_search_vector::db::SearchResult;
-use guidance_search_vector::GuidanceDb;
-use guidance_types::{GuidanceDoc, MemberType, StageKind};
+use search_vector::db::SearchResult;
+use search_vector::GuidanceDb;
+use fluent_types::{GuidanceDoc, MemberType, StageKind};
 use thiserror::Error;
 
 const BENCHMARK_FILE: &str = "benchmarks.md";

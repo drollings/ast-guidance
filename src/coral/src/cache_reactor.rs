@@ -7,7 +7,7 @@ use common_core::hash::content_hash_with_model;
 use common_core::metrics::LatencyHistogram;
 use guidance_llm::decomposer::Decomposer;
 use guidance_llm::LlmConfig;
-use guidance_types::{ContextNode, NodeId, WasmTool};
+use fluent_types::{ContextNode, NodeId, WasmTool};
 
 use crate::cache_l1::{CacheTier, L1Cache, RoutingResult};
 use crate::cache_router::ParallelRouter;
@@ -308,7 +308,7 @@ pub struct CoralStats {
 mod tests {
     use super::*;
     use crate::test_stubs::{StubChatBackend, StubDecomposer, StubEmbedder};
-    use guidance_types::ContextNode;
+    use fluent_types::ContextNode;
     use std::collections::HashMap;
 
     // ---- Helpers ----

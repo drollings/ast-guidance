@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::target::TargetRegistry;
 use bitvec::vec::BitVec;
 use common_core::error::ResolverError;
-use guidance_types::TargetType;
+use fluent_types::TargetType;
 
 #[derive(Debug, Clone)]
 pub struct ExecutionPlan {
@@ -186,7 +186,7 @@ impl<'a> DependencyResolver<'a> {
 mod tests {
     use super::*;
     use crate::target::{Target, TargetRegistry};
-    use guidance_types::{ExecutorKind, TargetType};
+    use fluent_types::{ExecutorKind, TargetType};
 
     fn make_bitset(bits: &[usize]) -> BitVec {
         let max = bits.iter().max().copied().unwrap_or(0) + 1;

@@ -6,10 +6,10 @@ edition.workspace = true
 [dependencies]
 common-core = { path = "../../common-core" }
 guidance-core = { path = "../../guidance" }
-guidance-search-vector = { path = "../../search-vector" }
+search-vector = { path = "../../search-vector" }
 guidance-llm = { path = "../../llm" }
-guidance-content-node = { path = "../../content-node" }
-guidance-types = { path = "../../types" }
+content-node = { path = "../../content-node" }
+fluent-types = { path = "../../types" }
 fluent-concurrency = { path = "../../fluent-concurrency" }
 clap = { workspace = true, features = ["derive"] }
 serde = { workspace = true }
