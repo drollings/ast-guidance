@@ -151,6 +151,7 @@ Then you you must read
     ├── common-core/
     │   ├── Cargo.toml
     │   └── src/
+    │       ├── cache.rs  # //! A read-through cache abstraction: ch
     │       ├── config.rs  # //! JSON config loaders: `load_json_or_d
     │       ├── constants.rs  # //! Cross-crate magic numbers (size caps
     │       ├── drift.rs  # //! Bit-set drift analysis: compute "mis
@@ -180,8 +181,7 @@ Then you you must read
     │       ├── lib.rs  # //! content-node: Level-of-detail text s
     │       ├── lod.rs  # pub fn generate_lod_slices(full_text: &s
     │       ├── node.rs  # use fluent_types::LOD_COUNT;
-    │       ├── source_node.rs  # use crate::file_node::FileContentNode;
-    │       └── wvr.rs
+    │       └── source_node.rs  # use crate::file_node::FileContentNode;
     ├── coral/
     │   ├── Cargo.toml
     │   └── src/
@@ -202,6 +202,7 @@ Then you you must read
     │   ├── Cargo.toml
     │   └── src/
     │       ├── adapter.rs  # //! Re-export of `ComponentAdapter` and 
+    │       ├── dep_graph.rs  # //! Pure dependency-graph algorithms sha
     │       ├── error.rs  # use thiserror::Error;
     │       ├── executor.rs  # use std::collections::HashMap;
     │       ├── lib.rs  # //! fluent-dag: DAG executor with resolv
@@ -240,6 +241,7 @@ Then you you must read
     │       │   ├── m4.rs  # use super::*;
     │       │   ├── m5.rs  # use crate::io::db::DbCapability;
     │       │   └── mod.rs  # use std::sync::atomic::{AtomicUsize, Ord
+    │       ├── thread_resource.rs  # //! Per-thread lazy-initialized resource
     │       └── zone.rs  # //! Supervision zone with async retry, d
     ├── fluent-wvr/
     │   ├── Cargo.toml
@@ -384,6 +386,45 @@ Then you you must read
     │       ├── nquads.rs  # use crate::lexer::{Lexer, TokenKind};
     │       └── parser.rs  # use std::collections::{HashMap, VecDeque
     ├── requirements.txt
+    ├── router/
+    │   ├── Cargo.toml
+    │   └── src/
+    │       ├── agent.rs  # //! Agent registry — keyed on `(mod...
+    │       ├── compaction.rs  # //! LOD compaction policy — shrink ...
+    │       ├── config.rs  # //! Router configuration types — de...
+    │       ├── dispatch/
+    │       │   ├── agent.rs  # use std::sync::Arc;
+    │       │   ├── frontier.rs  # use std::collections::HashMap;
+    │       │   └── mod.rs  # pub mod agent;
+    │       ├── kv_cache.rs  # //! KV cache snapshot management — ...
+    │       ├── lib.rs  # //! LLM Router & Agent Orchestration Fra
+    │       ├── orchestrator.rs  # //! Long-lived orchestrator session ...
+    │       ├── pipeline.rs  # //! Pipeline orchestrator — sequenc...
+    │       ├── pipeline_types.rs  # //! Pipeline decision types — struc...
+    │       ├── session.rs  # //! Session context node schema — e...
+    │       ├── stage_tests.rs  # #[cfg(test)]
+    │       ├── stages/
+    │       │   ├── common.rs  # //! Shared helpers for pipeline stages.
+    │       │   ├── deterministic.rs  # //! Stage 1: DeterministicPreFilter ...
+    │       │   ├── guardrail.rs  # //! Stage 4: GuardrailCheck — polic...
+    │       │   ├── mod.rs  # pub mod common;
+    │       │   ├── planning.rs  # //! Stage 3: PlanningRefinementAgent ...
+    │       │   ├── quality_gate.rs  # //! Stage 2: QualityGate — classifi...
+    │       │   └── router.rs  # //! Stage 5: RouterStage — selects ...
+    │       ├── summarization.rs  # //! Summarization and result acceptance.
+    │       ├── test_stubs.rs  # use std::collections::VecDeque;
+    │       ├── tests/
+    │       │   ├── mod.rs  # //! Router test modules.
+    │       │   └── rubric_fixtures.rs  # //! Rubric-based test fixtures for `Resu
+    │       ├── transforms/
+    │       │   ├── decompose_hypothetical.rs  # use guidance_llm::anonymize;
+    │       │   ├── decompose_subtasks.rs  # use guidance_llm::Decomposer;
+    │       │   ├── mod.rs  # pub mod none;
+    │       │   ├── none.rs  # use crate::transforms::{TransformError, 
+    │       │   ├── pii_anonymize.rs  # use std::collections::HashMap;
+    │       │   └── tests.rs  # #[cfg(test)]
+    │       ├── types.rs  # //! Unified request/response types ...
+    │       └── watchdog.rs  # use std::collections::VecDeque;
     ├── search-vector/
     │   ├── Cargo.toml
     │   └── src/

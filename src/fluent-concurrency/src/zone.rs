@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use fluent_dag::dep_graph::DependencyGraph;
 use fluent_wvr::Runtime;
 use fluent_wvr::prelude::*;
 use internment::ArcIntern;
@@ -98,13 +99,10 @@ pub struct Zone {
     runtime: Arc<dyn Runtime>,
     caps: CapabilitySet,
     config: ZoneConfig,
-    /// Maps task_name → assets that task depends on.
-    deps: HashMap<ArcIntern<str>, Vec<ArcIntern<str>>>,
-    /// Maps task_name → assets that task provides.
-    task_provides: HashMap<ArcIntern<str>, Vec<ArcIntern<str>>>,
-    /// Inverted index: asset → task_names that depend on it.
-    /// Built during registration for O(1) lookup in cancel_dependents_of.
-    provides_to_dependents: HashMap<ArcIntern<str>, Vec<ArcIntern<str>>>,
+    /// Dependency graph: tracks which tasks depend on which assets,
+    /// which tasks provide which assets, and an inverted index for
+    /// O(1) dependent lookup. Composed from `fluent_dag::dep_graph`.
+    graph: DependencyGraph<ArcIntern<str>>,
     task_names: HashMap<tokio::task::Id, ArcIntern<str>>,
     abort_handles: HashMap<ArcIntern<str>, tokio::task::AbortHandle>,
     cancelled_tasks: HashSet<ArcIntern<str>>,
@@ -130,9 +128,7 @@ impl Zone {
             runtime,
             caps,
             config,
-            deps: HashMap::new(),
-            task_provides: HashMap::new(),
-            provides_to_dependents: HashMap::new(),
+            graph: DependencyGraph::new(),
             task_names: HashMap::new(),
             abort_handles: HashMap::new(),
             cancelled_tasks: HashSet::new(),
@@ -167,26 +163,12 @@ impl Zone {
         ctx: WorkContext,
     ) -> Result<&mut Self, ZoneError> {
         let name: ArcIntern<str> = ArcIntern::from(unit.name());
-        if self.abort_handles.contains_key(&name) {
-            return Err(ZoneError::DuplicateName(name));
-        }
         let depends: Vec<ArcIntern<str>> = unit.depends().to_vec();
         let provides: Vec<ArcIntern<str>> = unit.provides().to_vec();
 
-        if !depends.is_empty() {
-            self.deps.insert(name.clone(), depends.clone());
-            // Build inverted index: for each asset this task depends on,
-            // record that this task is a dependent.
-            for dep in &depends {
-                self.provides_to_dependents
-                    .entry(dep.clone())
-                    .or_default()
-                    .push(name.clone());
-            }
-        }
-        if !provides.is_empty() {
-            self.task_provides.insert(name.clone(), provides);
-        }
+        self.graph
+            .register(&name, &depends, &provides)
+            .map_err(|_| ZoneError::DuplicateName(name))?;
 
         self.spawn_unit(unit, ctx);
         Ok(self)
@@ -208,57 +190,12 @@ impl Zone {
     }
 
     fn cancel_dependents_of(&mut self, name: &ArcIntern<str>) {
-        let mut to_cancel: Vec<ArcIntern<str>> = Vec::new();
-        // visited: all nodes ever processed (to cancel each at most once).
-        let mut visited: HashSet<ArcIntern<str>> = HashSet::new();
-        // active_path: nodes currently on the DFS recursion stack — used for
-        // cycle detection (a back-edge into active_path indicates a cycle).
-        let mut active_path: HashSet<ArcIntern<str>> = HashSet::new();
-        // Stack entries: (node, whether children have been expanded).
-        let mut stack: Vec<(ArcIntern<str>, bool)> = vec![(name.clone(), false)];
-        active_path.insert(name.clone());
-
-        while let Some((current, expanded)) = stack.last_mut() {
-            if *expanded {
-                // Backtrack: remove from active path.
-                active_path.remove(current);
-                stack.pop();
-                continue;
-            }
-            *expanded = true;
-
-            if !visited.insert(current.clone()) {
-                // Already processed this node from another path; still
-                // need to remove it from active_path before backtracking.
-                active_path.remove(current);
-                stack.pop();
-                continue;
-            }
-
-            // O(1): look up what this task provides, then look up which
-            // tasks depend on each provided asset via the inverted index.
-            if let Some(provides) = self.task_provides.get(current) {
-                for provided in provides {
-                    if let Some(dependents) = self.provides_to_dependents.get(provided) {
-                        for dep_name in dependents {
-                            if active_path.contains(dep_name) {
-                                tracing::warn!(
-                                    "Dependency cycle detected: '{}' transitively depends on itself",
-                                    dep_name,
-                                );
-                                continue;
-                            }
-                            if !visited.contains(dep_name) {
-                                to_cancel.push(dep_name.clone());
-                                active_path.insert(dep_name.clone());
-                                stack.push((dep_name.clone(), false));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
+        // Delegate the dependency traversal to `DependencyGraph::dependents_of`,
+        // which performs the DFS with cycle detection (ported verbatim from
+        // the original hand-rolled implementation). The graph returns the
+        // transitive set of nodes that depend on `name`; Zone applies the
+        // abort side effect to each.
+        let to_cancel = self.graph.dependents_of(name);
         for task_name in &to_cancel {
             if let Some(handle) = self.abort_handles.get(task_name) {
                 if !handle.is_finished() {

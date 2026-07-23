@@ -53,7 +53,7 @@ src/
                        drift, type_inference, target, capability registry, error types
   fluent-wvr/          Fluent WVR: Component, WorkUnit, FieldAccess, Describable traits
   fluent-wvr-macros/   Proc macros for FieldAccess derive
-  fluent-concurrency/  WorkerPool, Scope, Zone, Limiter, PriorityQueue, CreditFlow
+  fluent-concurrency/  WorkerPool, Scope, Limiter, PriorityQueue, CreditFlow
   llm/                 LLM HTTP client + embeddings (CachedEmbeddingProvider, LlmRequestQueue,
                        LlmClient, url, error)
   types/               guidance-types (FileType, MemberType, Param, Member, etc.)
@@ -88,7 +88,7 @@ doc/
 
 ## Composability guide
 
-For day-to-day patterns (Component, Zone, Scope, Limiter, JSON-RPC, prelude)
+For day-to-day patterns (Component, Scope, Limiter, JSON-RPC, prelude)
 see `doc/COMPOSABILITY.md`. The full API inventory and roadmap lives in
 `ROADMAP_20260709_COMPOSABILITY.md` (checklist:
 `ROADMAP_20260709_COMPOSABILITY_CHECKLIST.md`).
@@ -101,7 +101,6 @@ Which consumers use which `fluent-concurrency` primitives:
 
 | Primitive | Production consumer | Location |
 |---|---|---|
-| `Zone` | `job-copilot` handler | `src/job-copilot/src/server/handler.rs` |
 | `Scope::defer` | `job-copilot` handler | `src/job-copilot/src/server/handler.rs` |
 | `ResultPool` | `guidance-llm` request queue | `src/llm/src/client.rs` |
 | `PriorityResultPool` | `fluent-concurrency` tests only | `src/fluent-concurrency/src/pool.rs` |
@@ -223,69 +222,6 @@ are documented in the `with_metrics` doc comment (the L4 Semantic KNN dispatch
 in `coral::cache_reactor`, and the top-level dispatch in `dag::executor`).
 Adoption at any of those moves M12 from "test-only" to a real consumer
 wiring; see `ROADMAP_20260625_CONSOLIDATE_CHECKLIST.md` M12 notes.
-
----
-
-## Refinement contract
-
-The active refinement plan lives in `ROADMAP_REFINE.md` (checklist:
-`ROADMAP_REFINE_CHECKLIST.md`). Three non-negotiables for new coral code:
-
-1. **Cache tiers MUST be `WorkUnit` implementations** — the orchestrator
-   never branches on implementation type; every tier is an `Arc<dyn Component>`
-   behind a uniform registry (M3).
-2. **`RoutingResult` MUST be shared via `Arc`, never cloned under a lock** —
-   `L1Cache::get` returns `Option<Arc<RoutingResult>>`; callers hold the `Arc`
-   clone, not a deep copy (M1).
-3. **`Handle::block_on(tokio::time::sleep)` MUST NOT appear inside a
-   `WorkUnit::execute`** — sync `WorkUnit::execute` is a real boundary;
-   `WithRetry` uses `std::thread::sleep` unconditionally (M5).
-
----
-
-## WVR Update contract
-
-The completed fluent-wvr refinement plan lives in
-`ROADMAP_20260720_WVR_PT2.md` (checklist:
-`ROADMAP_20260720_WVR_PT2_CHECKLIST.md`). The preceding update plan was in
-`ROADMAP_20260720_WVR_UPDATE.md` (checklist:
-`ROADMAP_20260720_WVR_UPDATE_CHECKLIST.md`). Three non-negotiables for new
-`fluent-wvr` code:
-
-1. **`Component` MUST support `as_any()` / `as_any_mut()`** — runtime type
-   identification is required for safe downcasting after `Arc<dyn Component>`
-   erasure (M3.1).
-2. **`CapabilitySet` MUST support revocation and enumeration** — `remove`,
-   `contains`, `iter`, `len`, `is_empty` are required for WASM sandbox
-   capability narrowing (M1.1).
-3. **`FieldAccess` derive MUST support string sanitization attributes**
-    — `sanitize`, `max_len`, `pattern` are required in addition to numeric
-    `min`/`max` for input validation (M2.1–M2.3).
-
-## WVR More contract
-
-Completed by `ROADMAP_20260720_WVR_MORE.md` (checklist:
-`ROADMAP_20260720_WVR_MORE_CHECKLIST.md`). New contracts:
-
-1. **`Zone::register` returns `Result`** — duplicate name registration is
-   rejected with `Err(ZoneError::DuplicateName)`. Use `register_or_replace`
-   if overwrite is needed (not yet implemented).
-2. **`ZoneEvent::Failed` distinct from `Panicked`** — Execution errors
-   (`Err(WorkError::Execution)`) are recorded under `summary.failed`, not
-   `summary.panicked`. Only true panics (`JoinError::is_panic()`) go to
-   `panicked`.
-3. **`FieldError::ReadOnly`** is the variant for shared-Arc mutation, not
-   `NotFound`.
-4. **`Reserve` lives in `fluent-concurrency`** at
-   `fluent_concurrency::reserve::Reserve`.
-5. **`WorkUnit::execute` purity contract** documented in the trait doc comment.
-6. **`fluent-wvr::prelude::*`** is the canonical consumer import.
-7. **`WorkContext::for_unit_in_zone`** is the builder for constructing
-   contexts from zone defaults.
-8. **`ResultPool` adopted in `guidance/runtime.rs`** — `AstGenJob`/`DbSyncJob`
-   no longer carry `result_tx` fields.
-9. **`PriorityResultPool` worker drains fully** before blocking on `Notify`,
-   preventing wakeup collapse under burst.
 
 ---
 

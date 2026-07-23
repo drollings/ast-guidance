@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 tokio = { workspace = true }
 fluent-wvr = { path = "../fluent-wvr" }
+fluent-dag = { path = "../dag" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bon = { workspace = true }
