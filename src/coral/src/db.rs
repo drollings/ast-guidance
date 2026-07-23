@@ -35,23 +35,6 @@ impl From<rusqlite::Error> for LibraryError {
     }
 }
 
-/// Build a cosine-distance HNSW index from `HnswParams` with a pluggable
-/// `initial_capacity`. Centralizing the positional-argument unpacking here
-/// means the (max_nb_connection, initial_capacity, max_layer,
-/// ef_construction, DistCosine) ordering is decided in exactly one place per
-/// crate — see `ROADMAP_20260625_CONSOLIDATE.md` Priority 6. The rebuild
-/// path passes `count.max(p.initial_capacity)` so the index grows with the
-/// loaded row count while the insert path uses the default capacity.
-fn make_hnsw(p: &HnswParams, initial_capacity: usize) -> Hnsw<'static, f32, DistCosine> {
-    Hnsw::<f32, DistCosine>::new(
-        p.max_nb_connection,
-        initial_capacity,
-        p.max_layer,
-        p.ef_construction,
-        DistCosine,
-    )
-}
-
 pub struct Library {
     conn: Mutex<rusqlite::Connection>,
     hnsw: RwLock<Option<Hnsw<'static, f32, DistCosine>>>,
@@ -552,7 +535,7 @@ impl Library {
         let mut guard = self.hnsw.write().unwrap();
         let hnsw = guard.get_or_insert_with(|| {
             let p = HnswParams::default();
-            make_hnsw(&p, p.initial_capacity)
+            common_core::sqlite::make_hnsw(&p, p.initial_capacity)
         });
 
         let external_id = {
@@ -582,7 +565,7 @@ impl Library {
 
         let count = rows.len();
         let p = HnswParams::default();
-        let hnsw = make_hnsw(&p, count.max(p.initial_capacity));
+        let hnsw = common_core::sqlite::make_hnsw(&p, count.max(p.initial_capacity));
 
         let mut id_map = Vec::with_capacity(count);
         for (node_id, blob) in rows {
@@ -690,6 +673,65 @@ impl Library {
         merged.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
         Ok(merged.into_iter().take(k).map(|(_, hit)| hit).collect())
+    }
+}
+
+impl Library {
+    /// Initialize router-specific schema: session columns on `context_nodes`,
+    /// and new tables for KV cache snapshots, session checkpoints, and model catalog.
+    pub fn init_router_schema(&self) -> Result<(), LibraryError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(
+            "ALTER TABLE context_nodes ADD COLUMN session_id TEXT;
+             ALTER TABLE context_nodes ADD COLUMN role TEXT DEFAULT 'user';
+             ALTER TABLE context_nodes ADD COLUMN turn_index INTEGER DEFAULT 0;
+             ALTER TABLE context_nodes ADD COLUMN accepted INTEGER DEFAULT 1;
+             ALTER TABLE context_nodes ADD COLUMN acceptance_score REAL;
+             ALTER TABLE context_nodes ADD COLUMN parent_id INTEGER REFERENCES context_nodes(id);
+             ALTER TABLE context_nodes ADD COLUMN step_id TEXT;
+             ALTER TABLE context_nodes ADD COLUMN step_status TEXT;
+
+             CREATE TABLE IF NOT EXISTS kv_cache_snapshots (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 model_name TEXT NOT NULL,
+                 adapter_name TEXT,
+                 session_id TEXT NOT NULL,
+                 file_path TEXT NOT NULL,
+                 created_at TEXT DEFAULT (datetime('now')),
+                 last_used_at TEXT DEFAULT (datetime('now')),
+                 token_count INTEGER NOT NULL,
+                 llama_cpp_version TEXT,
+                 model_quant TEXT,
+                 base_model_hash TEXT,
+                 UNIQUE(model_name, adapter_name, session_id)
+             );
+
+             CREATE TABLE IF NOT EXISTS session_checkpoints (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id TEXT NOT NULL,
+                 checkpoint_name TEXT NOT NULL,
+                 node_id INTEGER NOT NULL REFERENCES context_nodes(id),
+                 created_at TEXT DEFAULT (datetime('now')),
+                 UNIQUE(session_id, checkpoint_name)
+             );
+
+             CREATE TABLE IF NOT EXISTS model_catalog (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 name TEXT NOT NULL UNIQUE,
+                 role TEXT NOT NULL,
+                 path TEXT,
+                 model_name TEXT,
+                 provider TEXT,
+                 api_base TEXT,
+                 api_key_env TEXT,
+                 credentials_ref TEXT,
+                 context_size INTEGER,
+                 quant TEXT,
+                 base_model TEXT,
+                 created_at TEXT DEFAULT (datetime('now'))
+             );",
+        )?;
+        Ok(())
     }
 }
 

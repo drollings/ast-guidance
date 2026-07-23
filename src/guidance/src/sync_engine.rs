@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use fluent_types::GuidanceDoc;
+use fluent_wvr::wrapper::Pipeline;
 use thiserror::Error;
 
 use crate::ast_parser::AstParser;
@@ -44,6 +45,15 @@ pub struct SyncEngine {
     pub workspace_root: PathBuf,
     pub source_dir: PathBuf,
     pub enhancer: Option<Enhancer>,
+}
+
+struct SyncContext {
+    doc: GuidanceDoc,
+    source_path: PathBuf,
+    source: String,
+    config: GenConfig,
+    source_dir: PathBuf,
+    guidance_dir: PathBuf,
 }
 
 impl SyncEngine {
@@ -90,7 +100,6 @@ impl SyncEngine {
     ) -> Result<GuidanceDoc, SyncEngineError> {
         let source = common_core::io::read_to_string_err(source_path)?;
 
-        // Module name is relative to source_dir (for logical module path).
         let module_rel = source_path
             .strip_prefix(&self.source_dir)
             .unwrap_or(source_path);
@@ -106,11 +115,11 @@ impl SyncEngine {
             .unwrap_or(&module_rel.to_string_lossy())
             .replace(['/', '\\'], ".");
 
-        // Source path is relative to workspace root (canonical display path).
         let source_path_str = source_path
             .strip_prefix(&self.workspace_root)
             .unwrap_or(source_path)
-            .to_string_lossy();
+            .to_string_lossy()
+            .to_string();
 
         let mut doc = self
             .ast_parser
@@ -118,41 +127,77 @@ impl SyncEngine {
             .map_err(|e| SyncEngineError::Parse(e.to_string()))?;
 
         doc.meta.module = module_name.as_str().into();
-        doc.meta.source = source_path_str.as_ref().into();
+        doc.meta.source = source_path_str.as_str().into();
 
-        // G5: LLM enhancement — generate missing comments before JSON save
-        if let Some(ref enhancer) = self.enhancer {
-            if let Err(e) = enhance_doc(enhancer, &mut doc, &source) {
-                tracing::warn!("LLM enhancement failed for {:?}: {e}", source_path);
-            }
+        let mut ctx = SyncContext {
+            doc,
+            source_path: source_path.to_path_buf(),
+            source,
+            config: config.clone(),
+            source_dir: self.source_dir.clone(),
+            guidance_dir: self.guidance_dir.clone(),
+        };
+
+        let mut pipeline = Self::build_pipeline(self.enhancer.as_ref(), &mut self.ast_parser, config.db_sync);
+        pipeline.run(&mut ctx)?;
+
+        Ok(ctx.doc)
+    }
+
+    fn build_pipeline<'a>(
+        enhancer: Option<&'a Enhancer>,
+        ast_parser: &'a mut AstParser,
+        db_sync: bool,
+    ) -> Pipeline<'a, SyncContext, SyncEngineError> {
+        let mut p = Pipeline::new()
+            .step(move |ctx: &mut SyncContext| {
+                if let Some(enhancer) = enhancer {
+                    if let Err(e) = enhance_doc(enhancer, &mut ctx.doc, &ctx.source) {
+                        tracing::warn!(
+                            "LLM enhancement failed for {:?}: {e}",
+                            ctx.source_path
+                        );
+                    }
+                }
+                Ok(())
+            })
+            .step(|ctx: &mut SyncContext| {
+                let json_path = guidance_json_path(ctx);
+                json_store::save_guidance(&json_path, &ctx.doc)?;
+                Ok(())
+            })
+            .step(move |ctx: &mut SyncContext| {
+                if let Err(e) =
+                    comments::sync_comments(&ctx.source_path, &ctx.doc, ast_parser)
+                {
+                    tracing::warn!("comment sync failed for {:?}: {e}", ctx.source_path);
+                }
+                Ok(())
+            });
+
+        if db_sync {
+            p = p.maybe(
+                |_ctx: &SyncContext| true,
+                move |ctx: &mut SyncContext| {
+                    let db_path = ctx
+                        .config
+                        .db_path
+                        .clone()
+                        .unwrap_or_else(|| ctx.guidance_dir.join("..").join(".guidance.db"));
+                    let json_base = ctx
+                        .config
+                        .json_base
+                        .clone()
+                        .unwrap_or_else(|| ctx.guidance_dir.join("src"));
+                    if let Ok(db) = GuidanceDb::open(&db_path) {
+                        let _ = db.sync_from_dir(&json_base);
+                    }
+                    Ok(())
+                },
+            );
         }
 
-        let json_path = self.guidance_json_path(source_path);
-        json_store::save_guidance(&json_path, &doc)?;
-
-        // Sync comments back to source file after generation
-        if let Err(e) = comments::sync_comments(source_path, &doc, &mut self.ast_parser) {
-            tracing::warn!("comment sync failed for {:?}: {e}", source_path);
-        }
-
-        // Database sync after JSON write
-        if config.db_sync {
-            let db_path = config
-                .db_path
-                .clone()
-                .unwrap_or_else(|| self.guidance_dir.join("..").join(".guidance.db"));
-
-            let json_base = config
-                .json_base
-                .clone()
-                .unwrap_or_else(|| self.guidance_dir.join("src"));
-
-            if let Ok(db) = GuidanceDb::open(&db_path) {
-                let _ = db.sync_from_dir(&json_base);
-            }
-        }
-
-        Ok(doc)
+        p
     }
 
     pub fn gen_if_stale(&mut self, source_path: &Path) -> Result<bool, SyncEngineError> {
@@ -208,6 +253,15 @@ impl SyncEngine {
     {
         walk::walk_files(&self.source_dir, walk::SOURCE_EXTENSIONS, &mut callback);
     }
+}
+
+fn guidance_json_path(ctx: &SyncContext) -> PathBuf {
+    let relative = ctx
+        .source_path
+        .strip_prefix(&ctx.source_dir)
+        .unwrap_or(&ctx.source_path);
+    let json_name = format!("{}.json", relative.display());
+    ctx.guidance_dir.join("src").join(&json_name)
 }
 
 #[derive(Debug, Clone)]
@@ -284,20 +338,16 @@ mod tests {
         let source_dir = dir.path().join("src");
         std::fs::create_dir(&source_dir).expect("create src");
 
-        // Source with a function but no comment
         let zig_file = source_dir.join("test.zig");
         std::fs::write(&zig_file, "pub fn hello() void {}\n").expect("write");
 
         let guidance_dir = dir.path().join(".guidance");
         let mut engine = SyncEngine::new(guidance_dir, source_dir);
 
-        // gen() should call sync_comments which adds /// comments
         let doc = engine.gen(&zig_file).expect("gen");
         assert_eq!(doc.members.len(), 1);
 
-        // Reread source to verify comments were synced
         let source_after = std::fs::read_to_string(&zig_file).expect("read");
-        // The member has no comment, so no /// should be added — just verifying no crash
         assert!(source_after.contains("pub fn hello() void {}"));
     }
 }

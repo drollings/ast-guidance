@@ -1,8 +1,7 @@
-use std::any::Any;
-
 use crate::file_node::FileContentNode;
 use crate::lod::generate_lod_slices;
 use crate::node::{ContentNode, LodLevel, NodeType, NodeTypeInfo};
+use fluent_wvr::prelude::*;
 
 const DOC_LOD_LABELS: &[&str] = &[
     "full text",
@@ -61,10 +60,49 @@ impl ContentNode for DocumentContentNode {
             lod_labels: DOC_LOD_LABELS,
         }
     }
-    fn as_any(&self) -> &dyn Any {
-        self
+}
+
+impl WorkUnit for DocumentContentNode {
+    fn name(&self) -> &str {
+        "DocumentContentNode"
     }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
+    fn depends(&self) -> &[ArcIntern<str>] {
+        &[]
+    }
+    fn provides(&self) -> &[ArcIntern<str>] {
+        &[]
+    }
+    fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+        WorkOutput::typed("content node loaded", &self.inner.path().to_string_lossy())
     }
 }
+
+impl FieldAccess for DocumentContentNode {
+    fn set_field(&mut self, name: &str, _value: &str) -> Result<(), FieldError> {
+        Err(FieldError::NotFound(name.to_string()))
+    }
+    fn get_field(&self, name: &str) -> Result<String, FieldError> {
+        match name {
+            "path" => Ok(self.inner.path().to_string_lossy().to_string()),
+            "lod_count" => Ok(self.lod.len().to_string()),
+            _ => Err(FieldError::NotFound(name.to_string())),
+        }
+    }
+    fn field_names(&self) -> &'static [&'static str] {
+        &["path", "lod_count"]
+    }
+}
+
+impl Describable for DocumentContentNode {
+    fn describe(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path":       { "type": "string", "description": "File path" },
+                "lod_count":  { "type": "integer", "description": "Number of LOD levels" }
+            }
+        })
+    }
+}
+
+impl_component!(DocumentContentNode);

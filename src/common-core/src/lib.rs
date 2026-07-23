@@ -15,6 +15,7 @@
 //!
 //! See `ROADMAP_20260625_CONSOLIDATE.md` for the full consolidation plan.
 
+pub mod cache;
 pub mod config;
 pub mod constants;
 pub mod drift;
@@ -65,7 +66,7 @@ pub use metrics::LatencyHistogram;
 pub use shell::{run_capture, run_command, run_shell_capture, shell_cmd, CommandOutput};
 #[cfg(feature = "sqlite")]
 pub use sqlite::{
-    init_embedding_cache, open_in_memory, open_wal, run_batch, EMBEDDING_CACHE_SCHEMA,
+    init_embedding_cache, make_hnsw, open_in_memory, open_wal, run_batch, EMBEDDING_CACHE_SCHEMA,
 };
 pub use string::{
     contains_any, contains_any_word, contains_ident_word, contains_ignore_case, contains_word,

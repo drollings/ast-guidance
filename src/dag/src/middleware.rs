@@ -2,10 +2,7 @@ use std::sync::Arc;
 
 use common_core::metrics::LatencyHistogram;
 use fluent_wvr::prelude::*;
-
-pub trait Middleware: Send + Sync {
-    fn wrap(&self, inner: Arc<dyn Component>) -> Arc<dyn Component>;
-}
+use fluent_wvr::wrapper::Middleware;
 
 pub struct TimingMiddleware {
     histogram: Option<Arc<LatencyHistogram>>,
@@ -62,34 +59,6 @@ impl Middleware for RetryMiddleware {
     }
 }
 
-pub struct MiddlewareChain {
-    middlewares: Vec<Box<dyn Middleware>>,
-}
-impl MiddlewareChain {
-    pub fn new() -> Self {
-        Self {
-            middlewares: Vec::new(),
-        }
-    }
-    #[must_use]
-    pub fn push(mut self, m: Box<dyn Middleware>) -> Self {
-        self.middlewares.push(m);
-        self
-    }
-    pub fn apply(&self, unit: Arc<dyn Component>) -> Arc<dyn Component> {
-        let mut result = unit;
-        for mw in &self.middlewares {
-            result = mw.wrap(result);
-        }
-        result
-    }
-}
-impl Default for MiddlewareChain {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,7 +87,7 @@ mod tests {
     }
     #[test]
     fn test_middleware_chain() {
-        let chain = MiddlewareChain::new()
+        let chain = fluent_wvr::wrapper::MiddlewareChain::new()
             .push(Box::new(TimingMiddleware::new()))
             .push(Box::new(RetryMiddleware::new(2, 1)));
         let wrapped = chain.apply(Arc::new(PassthroughUnit::new("chained")));

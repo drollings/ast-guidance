@@ -1,34 +1,19 @@
 use crate::ChatMessage;
-use common_core::tokens::estimate_tokens;
+use common_core::tokens::TokenBudget;
 
 pub struct ContextPacker {
-    max_tokens: usize,
+    budget: TokenBudget,
 }
 
 impl ContextPacker {
     pub fn new(max_tokens: usize) -> Self {
-        Self { max_tokens }
+        Self {
+            budget: TokenBudget(max_tokens),
+        }
     }
 
     pub fn max_tokens(&self) -> usize {
-        self.max_tokens
-    }
-
-    pub fn estimate_tokens(text: &str) -> usize {
-        estimate_tokens(text)
-    }
-
-    pub fn truncate_to_budget(&self, text: &str) -> String {
-        let budget = self.max_tokens;
-        let estimated = Self::estimate_tokens(text);
-        if estimated <= budget {
-            return text.to_string();
-        }
-        let ratio = budget as f64 / estimated as f64;
-        let target_len = (text.len() as f64 * ratio).max(1.0) as usize;
-        let mut result = text.chars().take(target_len).collect::<String>();
-        result.push_str("...");
-        result
+        self.budget.0
     }
 
     pub fn pack_context(
@@ -37,7 +22,7 @@ impl ContextPacker {
         context: &str,
         query: &str,
     ) -> Vec<ChatMessage> {
-        let truncated_context = self.truncate_to_budget(context);
+        let truncated_context = self.budget.truncate_to_budget(context);
         vec![
             ChatMessage {
                 role: "system".into(),
@@ -56,17 +41,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_estimate_tokens() {
-        assert_eq!(ContextPacker::estimate_tokens("hi"), 1);
-        assert_eq!(ContextPacker::estimate_tokens("a"), 1);
-        assert_eq!(ContextPacker::estimate_tokens(""), 0);
-    }
-
-    #[test]
     fn test_no_truncation_when_within_budget() {
         let packer = ContextPacker::new(100);
         let text = "short text";
-        let result = packer.truncate_to_budget(text);
+        let result = packer.budget.truncate_to_budget(text);
         assert_eq!(result, "short text");
     }
 
@@ -74,7 +52,7 @@ mod tests {
     fn test_truncation_when_over_budget() {
         let packer = ContextPacker::new(2);
         let text = "this is a longer text that exceeds the budget";
-        let result = packer.truncate_to_budget(text);
+        let result = packer.budget.truncate_to_budget(text);
         assert!(result.ends_with("..."));
         assert!(result.len() < text.len());
     }

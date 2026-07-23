@@ -20,6 +20,7 @@ members = [
     "src/project-knowledge",
     "src/wasm_ipc",
     "src/memory-plugin",
+    "src/router",
     "src/job-copilot",
     "src/bin/job-copilot-daemon",
 ]

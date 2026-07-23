@@ -1,0 +1,433 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use fluent_concurrency::pool::Limiter;
+use serde_json::Value;
+use thiserror::Error;
+
+use crate::types::{
+    RouterChoice, RouterMessage, RouterMessageContent, RouterRequest, RouterResponse, Usage,
+};
+
+#[derive(Debug, Error)]
+pub enum FrontierError {
+    #[error("unsupported provider: {0}")]
+    UnsupportedProvider(String),
+    #[error("HTTP error: {0}")]
+    Http(String),
+    #[error("request build error: {0}")]
+    RequestBuild(String),
+    #[error("response parse error: {0}")]
+    ResponseParse(String),
+    #[error("stream parse error: {0}")]
+    StreamParse(String),
+    #[error("rate limited")]
+    RateLimited,
+    #[error("all backends failed")]
+    AllBackendsFailed,
+}
+
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    Chunk {
+        delta: String,
+        finish_reason: Option<String>,
+    },
+    Done,
+    Error(String),
+}
+
+pub trait FrontierBackend: Send + Sync {
+    fn provider_name(&self) -> &str;
+    fn build_request(&self, request: &RouterRequest) -> Result<Value, FrontierError>;
+    fn parse_response(&self, body: &Value) -> Result<RouterResponse, FrontierError>;
+    fn parse_stream_event(&self, event: &[u8]) -> Result<StreamEvent, FrontierError>;
+}
+
+pub struct OpenAiBackend {
+    pub api_base: String,
+    pub api_key: Option<String>,
+}
+
+impl OpenAiBackend {
+    pub fn new(api_base: impl Into<String>, api_key: Option<String>) -> Self {
+        Self {
+            api_base: api_base.into(),
+            api_key,
+        }
+    }
+}
+
+impl FrontierBackend for OpenAiBackend {
+    fn provider_name(&self) -> &str {
+        "openai"
+    }
+
+    fn build_request(&self, request: &RouterRequest) -> Result<Value, FrontierError> {
+        let messages: Vec<Value> = request
+            .messages
+            .iter()
+            .map(|m| {
+                let content = match &m.content {
+                    RouterMessageContent::Text(s) => Value::String(s.clone()),
+                    RouterMessageContent::Parts(parts) => Value::Array(
+                        parts.iter().map(|p| serde_json::to_value(p).unwrap()).collect(),
+                    ),
+                };
+                let mut msg = serde_json::json!({
+                    "role": m.role,
+                    "content": content,
+                });
+                if let Some(ref calls) = m.tool_calls {
+                    msg["tool_calls"] = serde_json::to_value(calls).unwrap();
+                }
+                if let Some(ref id) = m.tool_call_id {
+                    msg["tool_call_id"] = Value::String(id.clone());
+                }
+                msg
+            })
+            .collect();
+
+        let mut body = serde_json::json!({
+            "model": request.model,
+            "messages": messages,
+        });
+
+        if let Some(temp) = request.temperature {
+            body["temperature"] = Value::Number(serde_json::Number::from_f64(temp).unwrap());
+        }
+        if let Some(max_tokens) = request.max_tokens {
+            body["max_tokens"] = Value::Number(serde_json::Number::from(max_tokens));
+        }
+        if let Some(ref tools) = request.tools {
+            body["tools"] = serde_json::to_value(tools).unwrap();
+        }
+        if let Some(ref tool_choice) = request.tool_choice {
+            body["tool_choice"] = Value::String(tool_choice.clone());
+        }
+
+        Ok(body)
+    }
+
+    fn parse_response(&self, body: &Value) -> Result<RouterResponse, FrontierError> {
+        let id = body.get("id").and_then(Value::as_str).unwrap_or("unknown").to_string();
+        let model = body.get("model").and_then(Value::as_str).unwrap_or("unknown").to_string();
+        let created = body.get("created").and_then(Value::as_u64).unwrap_or(0);
+
+        let choices = body
+            .get("choices")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| {
+                        let index = c.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
+                        let finish_reason = c
+                            .get("finish_reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("stop")
+                            .to_string();
+                        let msg = c.get("message")?;
+                        let role = msg.get("role").and_then(Value::as_str).unwrap_or("assistant").to_string();
+                        let content = msg.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+                        Some(RouterChoice {
+                            index,
+                            message: RouterMessage {
+                                role,
+                                content: RouterMessageContent::Text(content),
+                                tool_calls: None,
+                                tool_call_id: None,
+                            },
+                            finish_reason,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let usage = body.get("usage").map_or(
+            Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+            |u| Usage {
+                prompt_tokens: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+                completion_tokens: u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+                total_tokens: u.get("total_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+            },
+        );
+
+        Ok(RouterResponse {
+            id,
+            object: "chat.completion".into(),
+            created,
+            model,
+            choices,
+            usage,
+        })
+    }
+
+    fn parse_stream_event(&self, event: &[u8]) -> Result<StreamEvent, FrontierError> {
+        let text =
+            std::str::from_utf8(event).map_err(|e| FrontierError::StreamParse(format!("invalid UTF-8 in stream: {e}")))?;
+
+        if text == "[DONE]" {
+            return Ok(StreamEvent::Done);
+        }
+
+        let v: Value = serde_json::from_str(text).map_err(|e| FrontierError::StreamParse(e.to_string()))?;
+        let empty_choices = vec![];
+        let choices = v.get("choices").and_then(|v| v.as_array()).unwrap_or(&empty_choices);
+
+        if let Some(choice) = choices.first() {
+            let delta = choice
+                .get("delta")
+                .and_then(|d| d.get("content"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            let finish_reason = choice.get("finish_reason").and_then(Value::as_str).map(ToString::to_string);
+            Ok(StreamEvent::Chunk { delta, finish_reason })
+        } else {
+            Err(FrontierError::StreamParse("no choices in stream event".into()))
+        }
+    }
+}
+
+pub struct AnthropicBackend;
+
+impl FrontierBackend for AnthropicBackend {
+    fn provider_name(&self) -> &str {
+        "anthropic"
+    }
+
+    fn build_request(&self, request: &RouterRequest) -> Result<Value, FrontierError> {
+        let mut system_parts: Vec<String> = Vec::new();
+        let mut messages: Vec<Value> = Vec::new();
+
+        for msg in &request.messages {
+            match msg.role.as_str() {
+                "system" => {
+                    if let RouterMessageContent::Text(s) = &msg.content {
+                        system_parts.push(s.clone());
+                    }
+                }
+                role => {
+                    let content = match &msg.content {
+                        RouterMessageContent::Text(s) => Value::String(s.clone()),
+                        RouterMessageContent::Parts(parts) => {
+                            Value::Array(parts.iter().map(|p| serde_json::to_value(p).unwrap()).collect())
+                        }
+                    };
+                    let mut m = serde_json::json!({ "role": role, "content": content });
+                    if let Some(ref id) = msg.tool_call_id {
+                        m["tool_call_id"] = Value::String(id.clone());
+                    }
+                    messages.push(m);
+                }
+            }
+        }
+
+        let mut body = serde_json::json!({
+            "model": request.model,
+            "messages": messages,
+            "max_tokens": request.max_tokens.unwrap_or(4096),
+        });
+
+        if !system_parts.is_empty() {
+            body["system"] = Value::String(system_parts.join("\n"));
+        }
+        if let Some(temp) = request.temperature {
+            body["temperature"] = Value::Number(serde_json::Number::from_f64(temp).unwrap());
+        }
+
+        Ok(body)
+    }
+
+    fn parse_response(&self, body: &Value) -> Result<RouterResponse, FrontierError> {
+        let id = body.get("id").and_then(Value::as_str).unwrap_or("unknown").to_string();
+        let model = body.get("model").and_then(Value::as_str).unwrap_or("unknown").to_string();
+        let created = body.get("created").and_then(Value::as_u64).unwrap_or(0);
+
+        let content = body
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.first())
+            .and_then(|block| block.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        let input_tokens = body
+            .get("usage")
+            .and_then(|u| u.get("input_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32;
+        let output_tokens = body
+            .get("usage")
+            .and_then(|u| u.get("output_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32;
+
+        Ok(RouterResponse {
+            id,
+            object: "chat.completion".into(),
+            created,
+            model,
+            choices: vec![RouterChoice {
+                index: 0,
+                message: RouterMessage {
+                    role: "assistant".into(),
+                    content: RouterMessageContent::Text(content),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: "stop".into(),
+            }],
+            usage: Usage {
+                prompt_tokens: input_tokens,
+                completion_tokens: output_tokens,
+                total_tokens: input_tokens + output_tokens,
+            },
+        })
+    }
+
+    fn parse_stream_event(&self, event: &[u8]) -> Result<StreamEvent, FrontierError> {
+        let text =
+            std::str::from_utf8(event).map_err(|e| FrontierError::StreamParse(format!("invalid UTF-8 in stream: {e}")))?;
+
+        if text.starts_with("event: message_stop") || text.contains("[DONE]") {
+            return Ok(StreamEvent::Done);
+        }
+
+        if let Some(data) = text.strip_prefix("data: ") {
+            let v: Value =
+                serde_json::from_str(data).map_err(|e| FrontierError::StreamParse(e.to_string()))?;
+            if let Some(delta) = v.get("delta").and_then(|d| d.get("text")).and_then(|t| t.as_str()) {
+                Ok(StreamEvent::Chunk { delta: delta.to_string(), finish_reason: None })
+            } else {
+                Ok(StreamEvent::Chunk { delta: String::new(), finish_reason: Some("stop".into()) })
+            }
+        } else {
+            Err(FrontierError::StreamParse("unexpected SSE format".into()))
+        }
+    }
+}
+
+pub struct OpenAiCompatibleBackend {
+    pub api_base: String,
+    pub api_key: Option<String>,
+    pub provider_label: String,
+}
+
+impl OpenAiCompatibleBackend {
+    pub fn new(api_base: impl Into<String>, api_key: Option<String>, provider_label: impl Into<String>) -> Self {
+        Self {
+            api_base: api_base.into(),
+            api_key,
+            provider_label: provider_label.into(),
+        }
+    }
+}
+
+impl FrontierBackend for OpenAiCompatibleBackend {
+    fn provider_name(&self) -> &str {
+        &self.provider_label
+    }
+
+    fn build_request(&self, request: &RouterRequest) -> Result<Value, FrontierError> {
+        let openai = OpenAiBackend::new(&self.api_base, self.api_key.clone());
+        openai.build_request(request)
+    }
+
+    fn parse_response(&self, body: &Value) -> Result<RouterResponse, FrontierError> {
+        let openai = OpenAiBackend::new(&self.api_base, self.api_key.clone());
+        openai.parse_response(body)
+    }
+
+    fn parse_stream_event(&self, event: &[u8]) -> Result<StreamEvent, FrontierError> {
+        let openai = OpenAiBackend::new(&self.api_base, self.api_key.clone());
+        openai.parse_stream_event(event)
+    }
+}
+
+struct ProviderConfig {
+    backend: Arc<dyn FrontierBackend>,
+    api_key: Option<String>,
+}
+
+pub struct FrontierDispatcher {
+    providers: HashMap<String, ProviderConfig>,
+    http_client: reqwest::Client,
+    limiter: Limiter,
+}
+
+impl FrontierDispatcher {
+    pub fn new(max_concurrent: usize) -> Self {
+        Self {
+            providers: HashMap::new(),
+            http_client: reqwest::Client::new(),
+            limiter: Limiter::new(max_concurrent),
+        }
+    }
+
+    pub fn register_backend(
+        &mut self,
+        name: impl Into<String>,
+        backend: Arc<dyn FrontierBackend>,
+        api_key: Option<String>,
+    ) {
+        self.providers.insert(
+            name.into(),
+            ProviderConfig { backend, api_key },
+        );
+    }
+
+    pub fn get_backend(&self, name: &str) -> Option<&Arc<dyn FrontierBackend>> {
+        self.providers.get(name).map(|pc| &pc.backend)
+    }
+
+    pub async fn dispatch(
+        &self,
+        provider: &str,
+        _model: &str,
+        request: &RouterRequest,
+    ) -> Result<RouterResponse, FrontierError> {
+        let pc = self
+            .providers
+            .get(provider)
+            .ok_or_else(|| FrontierError::UnsupportedProvider(provider.into()))?;
+
+        let body = pc.backend.build_request(request)?;
+
+        let api_url = match provider {
+            "openai" => "https://api.openai.com/v1/chat/completions",
+            "anthropic" => "https://api.anthropic.com/v1/messages",
+            other => {
+                if other.starts_with("http://") || other.starts_with("https://") {
+                    other
+                } else {
+                    return Err(FrontierError::UnsupportedProvider(format!(
+                        "no known API URL for provider: {other}"
+                    )));
+                }
+            }
+        };
+
+        let api_key = pc.api_key.clone();
+
+        let response = self
+            .limiter
+            .run(|| async {
+                let mut req = self.http_client.post(api_url).json(&body);
+                if let Some(ref key) = api_key {
+                    req = req.header("Authorization", format!("Bearer {key}"));
+                }
+                req.send()
+                    .await
+                    .map_err(|e| FrontierError::Http(e.to_string()))?
+                    .json::<Value>()
+                    .await
+                    .map_err(|e| FrontierError::ResponseParse(e.to_string()))
+            })
+            .await?;
+
+        pc.backend.parse_response(&response)
+    }
+}

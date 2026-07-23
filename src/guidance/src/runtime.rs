@@ -1,9 +1,9 @@
-use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
-use fluent_concurrency::pool::ResultPool;
+use fluent_concurrency::pool::{global_pool_config, ResultPool};
 use fluent_concurrency::runtime::tokio::TokioRuntime;
+use fluent_concurrency::thread_resource::with_tlr;
 use fluent_concurrency::zone::{Zone, ZoneConfig};
 use fluent_wvr::Runtime;
 use fluent_wvr::prelude::*;
@@ -28,25 +28,23 @@ pub struct DbSyncPayload {
 
 use fluent_types::GuidanceDoc;
 
+fluent_concurrency::thread_local_resource!(static PARSER: AstParser);
+
 /// Shared AST generation pool — sized to available cores, backpressure-managed queue.
 pub static AST_POOL: LazyLock<Arc<ResultPool<AstGenPayload, GuidanceDoc, SyncEngineError>>> =
     LazyLock::new(|| {
-        let workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+        let (workers, queue_cap) = global_pool_config(4, 4);
         Arc::new(ResultPool::new(
             Arc::new(TokioRuntime),
             workers,
-            workers * 4,
+            queue_cap,
             |job: AstGenPayload| async move {
                 tokio::task::spawn_blocking(move || {
-                    thread_local! {
-                        static PARSER: RefCell<Option<AstParser>> = const { RefCell::new(None) };
-                    }
-                    PARSER.with(|cell| {
-                        let parser = cell.borrow_mut().take().unwrap_or_else(AstParser::new);
+                    with_tlr(&PARSER, |parser| {
                         let mut engine =
-                            SyncEngine::with_parser(job.guidance_dir, job.source_dir, parser);
+                            SyncEngine::with_parser(job.guidance_dir, job.source_dir, std::mem::take(parser));
                         let r = engine.gen_with_config(&job.source_path, &job.config);
-                        *cell.borrow_mut() = Some(engine.ast_parser);
+                        *parser = engine.ast_parser;
                         r
                     })
                 })

@@ -5,7 +5,10 @@
 //! ```
 
 pub use crate::impl_component;
-pub use crate::wrapper::{retry_call, ComponentAdapter, ExecuteFn, Instrumented, WithRetry};
+pub use crate::wrapper::{
+    retry_call, ComponentAdapter, ExecuteFn, Instrumented, Middleware, MiddlewareChain, Pipeline,
+    SuffixedComponent, WithRetry,
+};
 pub use crate::{
     Capability, CapabilitySet, Component, Describable, FieldAccess, FieldError, MetadataValue,
     WorkContext, WorkError, WorkOutput, WorkUnit,

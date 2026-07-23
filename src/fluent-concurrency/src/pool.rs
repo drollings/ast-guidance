@@ -333,6 +333,18 @@ where
     }
 }
 
+/// Factory helper for auto-sized global `ResultPool` singletons.
+///
+/// Workers = max(available_parallelism, min_workers).
+/// Queue capacity = workers * queue_multiplier.
+pub fn global_pool_config(min_workers: usize, queue_multiplier: usize) -> (usize, usize) {
+    let workers = std::thread::available_parallelism()
+        .map_or(min_workers, std::num::NonZero::get)
+        .max(min_workers);
+    let queue_cap = workers * queue_multiplier;
+    (workers, queue_cap)
+}
+
 /// A semaphore-based concurrency limiter. Runs at most `cap` futures concurrently.
 ///
 /// # Examples

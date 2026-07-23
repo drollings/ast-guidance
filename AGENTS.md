@@ -185,6 +185,14 @@ helper there before re-implementing it locally.
 | `impl_component!` macro (eliminates as_any boilerplate) | `fluent-wvr::impl_component!` | `src/fluent-wvr/src/macros.rs` |
 | `ComponentArcExt::try_as_any_mut` (safe mutable access to shared Arc) | `fluent-wvr::ComponentArcExt` | `src/fluent-wvr/src/traits.rs` |
 | `WorkOutput::typed` (Result-returning) and `WorkOutput::data_take` (zero-copy) | `fluent-wvr::WorkOutput` | `src/fluent-wvr/src/work.rs` |
+| `make_hnsw()` | `common-core::sqlite` | `src/common-core/src/sqlite.rs` (feature `sqlite`) |
+| `Middleware` trait | `fluent-wvr::wrapper` | `src/fluent-wvr/src/wrapper.rs` |
+| `MiddlewareChain` | `fluent-wvr::wrapper` | `src/fluent-wvr/src/wrapper.rs` |
+| `SuffixedComponent` | `fluent-wvr::wrapper` | `src/fluent-wvr/src/wrapper.rs` |
+| `Pipeline<T, E>` | `fluent-wvr::wrapper` | `src/fluent-wvr/src/wrapper.rs` |
+| `global_pool_config()` | `fluent-concurrency::pool` | `src/fluent-concurrency/src/pool.rs` |
+| `thread_local_resource!` / `with_tlr` | `fluent-concurrency::thread_resource` | `src/fluent-concurrency/src/thread_resource.rs` |
+| `ReadThroughCache<K, V>` | `common-core::cache` | `src/common-core/src/cache.rs` |
 
 Cross-crate limits that currently have a single consumer stay in their
 domain crate but **must** be moved to `common-core::constants` if a second
@@ -196,16 +204,13 @@ in `src/wasm_ipc/src/lib.rs:17`.
 ### HNSW instances
 
 `coral` and `search-vector` each maintain **separate** HNSW indices backed by
-the same `HnswParams::default()` constants (Milestone 2). They remain separate
-because no shared vector store exists between the two crates today. If a shared
-store appears in the future, host the HNSW index in `search-vector` and have
-`coral` delegate. Both crates use `knn_brute_force` from `search-vector::math`
-for brute-force fallback. Each crate owns a private `make_hnsw(&HnswParams,
-initial_capacity)` helper that centralizes the positional-argument unpacking
-of `Hnsw::new(...)` so the `(max_nb_connection, initial_capacity, max_layer,
-ef_construction, DistCosine)` ordering is decided exactly once per crate
-(`ROADMAP_20260625_CONSOLIDATE.md` Priority 6). The rebuild paths pass
-`count.max(p.initial_capacity)` to grow the index with the loaded row count.
+the same `HnswParams::default()` constants. They remain separate because no
+shared vector store exists between the two crates today. If a shared store
+appears in the future, host the HNSW index in `search-vector` and have `coral`
+delegate. Both crates use `knn_brute_force` from `search-vector::math` for
+brute-force fallback and `common_core::sqlite::make_hnsw()` for index
+construction — the positional-argument unpacking of `Hnsw::new(...)` is now
+centralized in exactly one place (`ROADMAP_20260721_WVR_DEDUPE.md` M1).
 
 ### Metrics / Instrumented wiring (M12)
 

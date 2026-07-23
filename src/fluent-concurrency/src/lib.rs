@@ -10,6 +10,7 @@ pub mod reserve;
 pub mod router;
 pub mod runtime;
 pub mod scope;
+pub mod thread_resource;
 pub mod zone;
 
 use std::sync::Arc;

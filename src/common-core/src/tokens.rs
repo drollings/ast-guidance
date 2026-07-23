@@ -50,6 +50,22 @@ impl TokenBudget {
             false
         }
     }
+
+    pub fn truncate_to_budget(&self, text: &str) -> String {
+        let budget = self.0;
+        if budget == 0 {
+            return String::new();
+        }
+        let estimated = estimate_tokens(text);
+        if estimated <= budget {
+            return text.to_string();
+        }
+        let ratio = budget as f64 / estimated as f64;
+        let target_len = (text.len() as f64 * ratio).max(1.0) as usize;
+        let mut result = text.chars().take(target_len).collect::<String>();
+        result.push_str("...");
+        result
+    }
 }
 
 #[cfg(test)]
@@ -69,6 +85,24 @@ mod tests {
     fn test_estimate_tokens_with() {
         assert_eq!(estimate_tokens_with("abcdefgh", 2), 4);
         assert_eq!(estimate_tokens_with("abcdefgh", 0), 8);
+    }
+
+    #[test]
+    fn test_token_budget_truncate_to_budget() {
+        let budget = TokenBudget(100);
+        assert_eq!(budget.truncate_to_budget("short"), "short");
+        assert_eq!(budget.truncate_to_budget(""), "");
+        let budget_zero = TokenBudget(0);
+        assert_eq!(budget_zero.truncate_to_budget("anything"), "");
+    }
+
+    #[test]
+    fn test_token_budget_truncate_over_budget() {
+        let budget = TokenBudget(2);
+        let text = "this is a longer text that exceeds the budget";
+        let result = budget.truncate_to_budget(text);
+        assert!(result.ends_with("..."));
+        assert!(result.len() < text.len());
     }
 
     #[test]

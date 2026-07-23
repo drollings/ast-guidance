@@ -1,4 +1,5 @@
-use common_core::tokens::DEFAULT_CHARS_PER_TOKEN;
+use common_core::tokens::{estimate_tokens, DEFAULT_CHARS_PER_TOKEN};
+use common_core::tokens::TokenBudget;
 use fluent_types::{ContextNode, NodeId};
 use thiserror::Error;
 
@@ -21,21 +22,21 @@ pub struct PackedNode {
 }
 
 pub struct ContextPacker {
-    pub token_budget: usize,
+    pub budget: TokenBudget,
     pub chars_per_token: usize,
 }
 
 impl ContextPacker {
     pub fn new(token_budget: usize) -> Self {
         Self {
-            token_budget,
+            budget: TokenBudget(token_budget),
             chars_per_token: DEFAULT_CHARS_PER_TOKEN,
         }
     }
 
     /// Estimate token count from text length.
     pub fn estimate_tokens(text: &str) -> usize {
-        common_core::tokens::estimate_tokens(text)
+        estimate_tokens(text)
     }
 
     /// Select the appropriate LOD level based on graph distance.
@@ -146,7 +147,7 @@ impl ContextPacker {
 
         for candidate in &sorted {
             let tokens = Self::estimate_tokens(&candidate.text);
-            if used_tokens + tokens <= self.token_budget {
+            if used_tokens + tokens <= self.budget.0 {
                 packed.push((*candidate).clone());
                 used_tokens += tokens;
             }

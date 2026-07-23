@@ -1,5 +1,4 @@
 use fluent_types::LOD_COUNT;
-use std::any::Any;
 use std::fmt::Debug;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +33,4 @@ pub trait ContentNode: Debug + Send + Sync {
     fn set_lod(&mut self, level: LodLevel, value: &str);
     fn lod_label(&self, level: LodLevel) -> Option<&str>;
     fn type_info(&self) -> NodeTypeInfo;
-    fn as_any(&self) -> &dyn Any;
-    fn as_any_mut(&mut self) -> &mut dyn Any;
 }

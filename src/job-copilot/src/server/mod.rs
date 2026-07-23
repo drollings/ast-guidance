@@ -17,8 +17,9 @@ use crate::profile::Profile;
 use crate::server::audit::AuditLog;
 use crate::similarity::FieldSimilarityStore;
 use common_core::metrics::LatencyHistogram;
-use dag::middleware::{MiddlewareChain, RetryMiddleware, TimingMiddleware};
+use dag::middleware::{RetryMiddleware, TimingMiddleware};
 use fluent_concurrency::io::net::NetCapability;
+use fluent_wvr::wrapper::MiddlewareChain;
 use fluent_wvr::Component;
 
 /// Start the Native Messaging STDIO transport.

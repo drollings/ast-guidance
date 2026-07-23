@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 fluent-types = { path = "../types" }
 common-core = { path = "../common-core" }
+fluent-wvr = { path = "../fluent-wvr" }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

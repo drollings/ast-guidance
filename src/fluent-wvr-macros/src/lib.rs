@@ -9,6 +9,7 @@ struct FieldMeta {
     desc: Option<String>,
     min: Option<f64>,
     max: Option<f64>,
+    clamp: bool,
     skip: bool,
     required: bool,
     format: Option<String>,
@@ -23,6 +24,7 @@ fn parse_field_attrs(field: &syn::Field) -> FieldMeta {
         desc: None,
         min: None,
         max: None,
+        clamp: false,
         skip: false,
         required: true,
         format: None,
@@ -130,8 +132,12 @@ fn parse_field_attrs(field: &syn::Field) -> FieldMeta {
                 }
                 return Ok(());
             }
+            if meta.path.is_ident("clamp") {
+                result.clamp = true;
+                return Ok(());
+            }
             Err(meta.error(
-                "unknown field attribute, expected `skip`, `desc`, `min`, `max`, `required`, `format`, `max_len`, `sanitize`, `pattern`, or `empty_is_none`",
+                "unknown field attribute, expected `skip`, `desc`, `min`, `max`, `clamp`, `required`, `format`, `max_len`, `sanitize`, `pattern`, or `empty_is_none`",
             ))
         });
     }
@@ -403,36 +409,64 @@ pub fn derive_field_access(input: TokenStream) -> TokenStream {
         }
 
         if is_numeric_type(&ty_str) {
-            let min_check = meta.min.map(|min_val| {
-                let min_lit = proc_macro2::Literal::f64_suffixed(min_val);
-                let min_err = format!("{}: value below minimum {}", field_name_str, min_val);
-                quote! {
-                    if wide < #min_lit {
-                        return Err(fluent_wvr::FieldError::Constraint(#min_err.into()));
-                    }
-                }
-            });
-            let max_check = meta.max.map(|max_val| {
-                let max_lit = proc_macro2::Literal::f64_suffixed(max_val);
-                let max_err = format!("{}: value above maximum {}", field_name_str, max_val);
-                quote! {
-                    if wide > #max_lit {
-                        return Err(fluent_wvr::FieldError::Constraint(#max_err.into()));
-                    }
-                }
-            });
+            let min_val = meta.min;
+            let max_val = meta.max;
 
-            if min_check.is_some() || max_check.is_some() {
-                parse_and_set = quote! {
-                    {
-                        let wide: f64 = value.parse().map_err(|_| fluent_wvr::FieldError::Parse(
-                            format!("invalid {} for '{}': {}", #ty_str, #field_name_str, value)
-                        ))?;
-                        #min_check
-                        #max_check
-                        wide as #ty
+            if meta.clamp {
+                let min_lit = min_val.map(proc_macro2::Literal::f64_suffixed);
+                let max_lit = max_val.map(proc_macro2::Literal::f64_suffixed);
+                match (min_lit, max_lit) {
+                    (Some(min), Some(max)) => {
+                        parse_and_set = quote! {
+                            {
+                                let wide: f64 = value.parse().map_err(|_| fluent_wvr::FieldError::Parse(
+                                    format!("invalid {} for '{}': {}", #ty_str, #field_name_str, value)
+                                ))?;
+                                (wide.clamp(#min, #max)) as #ty
+                            }
+                        };
                     }
-                };
+                    _ => {
+                        return syn::Error::new_spanned(
+                            f,
+                            "`clamp` requires both `min` and `max` to be specified",
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
+                }
+            } else {
+                let min_check = min_val.map(|min_val| {
+                    let min_lit = proc_macro2::Literal::f64_suffixed(min_val);
+                    let min_err = format!("{}: value below minimum {}", field_name_str, min_val);
+                    quote! {
+                        if wide < #min_lit {
+                            return Err(fluent_wvr::FieldError::Constraint(#min_err.into()));
+                        }
+                    }
+                });
+                let max_check = max_val.map(|max_val| {
+                    let max_lit = proc_macro2::Literal::f64_suffixed(max_val);
+                    let max_err = format!("{}: value above maximum {}", field_name_str, max_val);
+                    quote! {
+                        if wide > #max_lit {
+                            return Err(fluent_wvr::FieldError::Constraint(#max_err.into()));
+                        }
+                    }
+                });
+
+                if min_check.is_some() || max_check.is_some() {
+                    parse_and_set = quote! {
+                        {
+                            let wide: f64 = value.parse().map_err(|_| fluent_wvr::FieldError::Parse(
+                                format!("invalid {} for '{}': {}", #ty_str, #field_name_str, value)
+                            ))?;
+                            #min_check
+                            #max_check
+                            wide as #ty
+                        }
+                    };
+                }
             }
         }
 

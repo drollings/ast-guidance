@@ -1,0 +1,25 @@
+[package]
+name = "fluent-router"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fluent-wvr = { path = "../fluent-wvr" }
+fluent-concurrency = { path = "../fluent-concurrency" }
+common-core = { path = "../common-core", features = ["sqlite"] }
+fluent-types = { path = "../types" }
+guidance-llm = { path = "../llm" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+lru = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

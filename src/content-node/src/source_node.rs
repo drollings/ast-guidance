@@ -1,8 +1,7 @@
-use std::any::Any;
-
 use crate::file_node::FileContentNode;
 use crate::node::{ContentNode, LodLevel, NodeType, NodeTypeInfo};
 use fluent_types::GuidanceDoc;
+use fluent_wvr::prelude::*;
 
 const SOURCE_LOD_LABELS: &[&str] = &[
     "path",
@@ -67,10 +66,49 @@ impl ContentNode for SourceCodeContentNode {
             lod_labels: SOURCE_LOD_LABELS,
         }
     }
-    fn as_any(&self) -> &dyn Any {
-        self
+}
+
+impl WorkUnit for SourceCodeContentNode {
+    fn name(&self) -> &str {
+        "SourceCodeContentNode"
     }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
+    fn depends(&self) -> &[ArcIntern<str>] {
+        &[]
+    }
+    fn provides(&self) -> &[ArcIntern<str>] {
+        &[]
+    }
+    fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+        WorkOutput::typed("content node loaded", &self.inner.path().to_string_lossy())
     }
 }
+
+impl FieldAccess for SourceCodeContentNode {
+    fn set_field(&mut self, name: &str, _value: &str) -> Result<(), FieldError> {
+        Err(FieldError::NotFound(name.to_string()))
+    }
+    fn get_field(&self, name: &str) -> Result<String, FieldError> {
+        match name {
+            "path" => Ok(self.inner.path().to_string_lossy().to_string()),
+            "has_ast" => Ok((self.ast_doc.is_some()).to_string()),
+            _ => Err(FieldError::NotFound(name.to_string())),
+        }
+    }
+    fn field_names(&self) -> &'static [&'static str] {
+        &["path", "has_ast"]
+    }
+}
+
+impl Describable for SourceCodeContentNode {
+    fn describe(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path":    { "type": "string", "description": "Source file path" },
+                "has_ast": { "type": "boolean", "description": "Whether AST doc is loaded" }
+            }
+        })
+    }
+}
+
+impl_component!(SourceCodeContentNode);

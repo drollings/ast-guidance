@@ -175,13 +175,13 @@ Then you you must read
     ├── content-node/
     │   ├── Cargo.toml
     │   └── src/
-    │       ├── doc_node.rs  # use std::any::Any;
-    │       ├── file_node.rs  # use std::any::Any;
+    │       ├── doc_node.rs  # use crate::file_node::FileContentNode;
+    │       ├── file_node.rs  # use std::fmt::Debug;
     │       ├── lib.rs  # //! content-node: Level-of-detail text s
     │       ├── lod.rs  # pub fn generate_lod_slices(full_text: &s
     │       ├── node.rs  # use fluent_types::LOD_COUNT;
-    │       ├── source_node.rs  # use std::any::Any;
-    │       └── wvr.rs  # //! Fluent WVR integration for `content-
+    │       ├── source_node.rs  # use crate::file_node::FileContentNode;
+    │       └── wvr.rs
     ├── coral/
     │   ├── Cargo.toml
     │   └── src/
@@ -193,7 +193,7 @@ Then you you must read
     │       ├── ingest.rs  # use std::sync::Arc;
     │       ├── lib.rs  # //! Coral: Context-graph library for gui
     │       ├── mcp.rs  # use std::path::Path;
-    │       ├── packer.rs  # use common_core::tokens::DEFAULT_CHARS_P
+    │       ├── packer.rs  # use common_core::tokens::{estimate_token
     │       ├── test_stubs.rs  # //! Test stubs for coral cache reactor t
     │       ├── tier_units.rs  # use std::sync::{Arc, Weak};
     │       ├── wasm_runtime.rs  # use std::num::NonZeroUsize;
@@ -283,7 +283,7 @@ Then you you must read
     │   │   │   ├── strategy.rs  # use fluent_types::GuidanceDoc;
     │   │   │   └── synthesize.rs  # use fluent_types::{GuidanceDoc, Member, 
     │   │   ├── query_engine.rs  # use std::path::Path;
-    │   │   ├── runtime.rs  # use std::cell::RefCell;
+    │   │   ├── runtime.rs  # use std::path::PathBuf;
     │   │   ├── scanner.rs  # use common_core::string::{contains_any, 
     │   │   ├── sync/
     │   │   │   ├── comments.rs  # use std::path::Path;

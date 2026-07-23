@@ -430,6 +430,174 @@ impl Describable for ComponentAdapter {
 
 impl_component!(ComponentAdapter);
 
+/// Post-erasure Component wrapper. Unlike newtype wrappers (Instrumented,
+/// WithRetry), middleware wraps an already-erased `Arc<dyn Component>`.
+pub trait Middleware: Send + Sync {
+    fn wrap(&self, inner: Arc<dyn Component>) -> Arc<dyn Component>;
+}
+
+/// Ordered chain of `Middleware` layers.  `apply` folds the component
+/// through each layer: `result = inner; for mw in &middlewares { result = mw.wrap(result); }`.
+pub struct MiddlewareChain {
+    middlewares: Vec<Box<dyn Middleware>>,
+}
+
+impl MiddlewareChain {
+    pub fn new() -> Self {
+        Self {
+            middlewares: Vec::new(),
+        }
+    }
+    #[must_use]
+    pub fn push(mut self, m: Box<dyn Middleware>) -> Self {
+        self.middlewares.push(m);
+        self
+    }
+    pub fn apply(&self, unit: Arc<dyn Component>) -> Arc<dyn Component> {
+        let mut result = unit;
+        for mw in &self.middlewares {
+            result = mw.wrap(result);
+        }
+        result
+    }
+}
+
+impl Default for MiddlewareChain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A sequential, fallible step chain.  Steps are applied in registration
+/// order.  Optional steps (gated by `.maybe(condition, step)`) are skipped
+/// when their condition returns false.
+pub struct Pipeline<'a, T: 'a, E> {
+    steps: Vec<Step<'a, T, E>>,
+}
+
+type StepFn<'a, T, E> = Box<dyn FnMut(&mut T) -> Result<(), E> + Send + Sync + 'a>;
+type StepCond<'a, T> = Box<dyn Fn(&T) -> bool + Send + Sync + 'a>;
+
+enum Step<'a, T: 'a, E> {
+    Required(StepFn<'a, T, E>),
+    Optional {
+        condition: StepCond<'a, T>,
+        step: StepFn<'a, T, E>,
+    },
+}
+
+impl<'a, T: 'a, E> Pipeline<'a, T, E> {
+    pub fn new() -> Self {
+        Self { steps: Vec::new() }
+    }
+
+    #[must_use]
+    pub fn step(
+        mut self,
+        f: impl FnMut(&mut T) -> Result<(), E> + Send + Sync + 'a,
+    ) -> Self {
+        self.steps.push(Step::Required(Box::new(f)));
+        self
+    }
+
+    #[must_use]
+    pub fn maybe(
+        mut self,
+        condition: impl Fn(&T) -> bool + Send + Sync + 'a,
+        step: impl FnMut(&mut T) -> Result<(), E> + Send + Sync + 'a,
+    ) -> Self {
+        self.steps.push(Step::Optional {
+            condition: Box::new(condition),
+            step: Box::new(step),
+        });
+        self
+    }
+
+    pub fn run(&mut self, initial: &mut T) -> Result<(), E> {
+        for step in &mut self.steps {
+            match step {
+                Step::Required(f) => f(initial)?,
+                Step::Optional { condition, step } => {
+                    if condition(initial) {
+                        step(initial)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'a, T: 'a, E> Default for Pipeline<'a, T, E> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Wraps a `Component` with a name suffix (useful for scatter-gather Zone
+/// dispatch where the same component type is registered multiple times).
+///
+/// `execute` merges the zone-supplied runtime (`ctx.rt`) with per-task
+/// configuration from `self.ctx`, so the task gets the live runtime but
+/// retains its own capabilities and metadata.
+pub struct SuffixedComponent {
+    inner: Arc<dyn Component>,
+    name: String,
+    ctx: WorkContext,
+}
+
+impl SuffixedComponent {
+    pub fn new(inner: Arc<dyn Component>, suffix: impl AsRef<str>, ctx: WorkContext) -> Self {
+        let name = format!("{}:{}", inner.name(), suffix.as_ref());
+        Self { inner, name, ctx }
+    }
+}
+
+impl WorkUnit for SuffixedComponent {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn depends(&self) -> &[ArcIntern<str>] {
+        self.inner.depends()
+    }
+    fn provides(&self) -> &[ArcIntern<str>] {
+        self.inner.provides()
+    }
+    fn execute(&self, zone_ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+        let merged = WorkContext {
+            rt: Arc::clone(&zone_ctx.rt),
+            ..self.ctx.clone()
+        };
+        self.inner.execute(&merged)
+    }
+    fn default_timeout_ms(&self) -> u64 {
+        self.inner.default_timeout_ms()
+    }
+    fn type_name(&self) -> &'static str {
+        self.inner.type_name()
+    }
+}
+
+impl FieldAccess for SuffixedComponent {
+    fn set_field(&mut self, name: &str, value: &str) -> Result<(), FieldError> {
+        self.inner.set_field(name, value)
+    }
+    fn get_field(&self, name: &str) -> Result<String, FieldError> {
+        self.inner.get_field(name)
+    }
+    fn field_names(&self) -> &'static [&'static str] {
+        self.inner.field_names()
+    }
+}
+
+impl Describable for SuffixedComponent {
+    fn describe(&self) -> serde_json::Value {
+        self.inner.describe()
+    }
+}
+
+impl_component!(SuffixedComponent);
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -8,6 +8,10 @@ use std::path::Path;
 
 use rusqlite::{Connection, Result};
 
+use crate::constants::HnswParams;
+use anndists::dist::DistCosine;
+use hnsw_rs::hnsw::Hnsw;
+
 /// Open a connection to `path` with WAL journal mode and a busy timeout.
 ///
 /// `PRAGMA journal_mode=WAL` allows concurrent readers while one writer holds
@@ -45,6 +49,23 @@ pub const EMBEDDING_CACHE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS embedding_c
     embedding BLOB NOT NULL,
     created_at TEXT DEFAULT (datetime('now'))
 )";
+
+/// Build a cosine-distance HNSW index from `HnswParams` with a pluggable
+/// `initial_capacity`.
+///
+/// Centralizes the positional-argument unpacking so the
+/// (max_nb_connection, initial_capacity, max_layer, ef_construction,
+/// DistCosine) ordering is decided in exactly one place across the
+/// workspace.  Previously duplicated in coral and search-vector.
+pub fn make_hnsw(p: &HnswParams, initial_capacity: usize) -> Hnsw<'static, f32, DistCosine> {
+    Hnsw::<f32, DistCosine>::new(
+        p.max_nb_connection,
+        initial_capacity,
+        p.max_layer,
+        p.ef_construction,
+        DistCosine,
+    )
+}
 
 /// Create the `embedding_cache` table if it doesn't already exist.
 pub fn init_embedding_cache(conn: &Connection) -> Result<()> {

@@ -27,23 +27,6 @@ impl From<rusqlite::Error> for VectorDbError {
     }
 }
 
-/// Build a cosine-distance HNSW index from `HnswParams` with a pluggable
-/// `initial_capacity`. Centralizing the positional-argument unpacking here
-/// means the (max_nb_connection, initial_capacity, max_layer,
-/// ef_construction, DistCosine) ordering is decided in exactly one place per
-/// crate — see `ROADMAP_20260625_CONSOLIDATE.md` Priority 6. The rebuild
-/// path passes `count.max(p.initial_capacity)` so the index grows with the
-/// loaded row count while the insert path uses the default capacity.
-fn make_hnsw(p: &HnswParams, initial_capacity: usize) -> Hnsw<'static, f32, DistCosine> {
-    Hnsw::<f32, DistCosine>::new(
-        p.max_nb_connection,
-        initial_capacity,
-        p.max_layer,
-        p.ef_construction,
-        DistCosine,
-    )
-}
-
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub id: i64,
@@ -149,7 +132,7 @@ impl GuidanceDb {
         let mut guard = self.hnsw.write().unwrap();
         let hnsw = guard.get_or_insert_with(|| {
             let p = HnswParams::default();
-            make_hnsw(&p, p.initial_capacity)
+            common_core::sqlite::make_hnsw(&p, p.initial_capacity)
         });
 
         let external_id = {
@@ -179,7 +162,7 @@ impl GuidanceDb {
 
         // Build new HNSW index
         let p = HnswParams::default();
-        let hnsw = make_hnsw(&p, count.max(p.initial_capacity));
+        let hnsw = common_core::sqlite::make_hnsw(&p, count.max(p.initial_capacity));
 
         let mut id_map = Vec::with_capacity(count);
         for (i, (node_id, blob)) in rows.into_iter().enumerate() {

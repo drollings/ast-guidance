@@ -267,7 +267,8 @@ mod tests {
     use crate::dispatcher::{FieldValueDispatcher, LocalDispatcher, TieredDispatcher};
     use crate::profile::Profile;
     use crate::server::handler::DaemonHandler;
-    use dag::middleware::{MiddlewareChain, RetryMiddleware, TimingMiddleware};
+    use dag::middleware::{RetryMiddleware, TimingMiddleware};
+    use fluent_wvr::wrapper::MiddlewareChain;
     use fluent_wvr::Component;
     use std::sync::{Arc, RwLock};
 

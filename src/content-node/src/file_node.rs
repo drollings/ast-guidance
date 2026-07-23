@@ -1,8 +1,8 @@
-use std::any::Any;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 
 use crate::node::{ContentNode, LodLevel, NodeType, NodeTypeInfo};
+use fluent_wvr::prelude::*;
 
 const FILE_LOD_LABELS: &[&str] = &["path", "inode+hash", "", "", "", ""];
 
@@ -50,10 +50,51 @@ impl ContentNode for FileContentNode {
             lod_labels: FILE_LOD_LABELS,
         }
     }
-    fn as_any(&self) -> &dyn Any {
-        self
+}
+
+impl WorkUnit for FileContentNode {
+    fn name(&self) -> &str {
+        "FileContentNode"
     }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
+    fn depends(&self) -> &[ArcIntern<str>] {
+        &[]
+    }
+    fn provides(&self) -> &[ArcIntern<str>] {
+        &[]
+    }
+    fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+        WorkOutput::typed("content node loaded", &self.path.to_string_lossy())
     }
 }
+
+impl FieldAccess for FileContentNode {
+    fn set_field(&mut self, name: &str, _value: &str) -> Result<(), FieldError> {
+        Err(FieldError::NotFound(name.to_string()))
+    }
+    fn get_field(&self, name: &str) -> Result<String, FieldError> {
+        match name {
+            "path" => Ok(self.path.to_string_lossy().to_string()),
+            "inode" => Ok(self.inode.to_string()),
+            "hash" => Ok(common_core::hash::hex_encode(&self.hash)),
+            _ => Err(FieldError::NotFound(name.to_string())),
+        }
+    }
+    fn field_names(&self) -> &'static [&'static str] {
+        &["path", "inode", "hash"]
+    }
+}
+
+impl Describable for FileContentNode {
+    fn describe(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path":  { "type": "string", "description": "File path" },
+                "inode": { "type": "integer", "description": "Inode number" },
+                "hash":  { "type": "string", "description": "Blake3 hash (hex)" }
+            }
+        })
+    }
+}
+
+impl_component!(FileContentNode);

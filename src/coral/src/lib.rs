@@ -8,6 +8,7 @@
 //! - `ingest` — Batch ingestion with deferred transactional flush
 //! - `mcp` — JSON-RPC 2.0 server (Model Context Protocol) over STDIO
 //! - `wasm_runtime` — WASM plugin bridge implementing `WorkUnit` + `Component`
+//! - `router` — LLM Router & Agent Orchestration Framework
 pub mod cache_l1;
 pub mod cache_reactor;
 pub mod cache_router;

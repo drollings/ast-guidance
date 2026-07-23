@@ -11,6 +11,7 @@ use common_core::jsonrpc::{JsonRpcError, JsonRpcHandler, JsonRpcRequest, JsonRpc
 use common_core::metrics::LatencyHistogram;
 use fluent_concurrency::zone::ZoneSummary;
 use fluent_wvr::prelude::*;
+use fluent_wvr::wrapper::SuffixedComponent;
 use std::sync::RwLock;
 
 /// Central handler for all JSON-RPC methods.
@@ -259,7 +260,7 @@ impl DaemonHandler {
                     self.unit.as_ref(),
                     CapabilitySet::new().with(AnalyzeFormParamsCap(params.clone())),
                 );
-                let named = NamedComponent::new(Arc::clone(&self.unit), i, ctx);
+                let named = SuffixedComponent::new(Arc::clone(&self.unit), i.to_string(), ctx);
                 Arc::new(named) as Arc<dyn Component>
             })
             .collect();
@@ -301,68 +302,7 @@ impl DaemonHandler {
     }
 }
 
-/// A `Component` wrapper that gives the inner unit a unique name by appending
-/// an index suffix. Used by `dispatch_concurrent` so the `Zone` can
-/// distinguish between tasks that share the same base name.
-struct NamedComponent {
-    inner: Arc<dyn Component>,
-    name: String,
-    ctx: WorkContext,
-}
-
-impl NamedComponent {
-    fn new(inner: Arc<dyn Component>, index: usize, ctx: WorkContext) -> Self {
-        let name = format!("{}:{index}", inner.name());
-        Self { inner, name, ctx }
-    }
-}
-
-impl WorkUnit for NamedComponent {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn depends(&self) -> &[fluent_wvr::ArcIntern<str>] {
-        self.inner.depends()
-    }
-    fn provides(&self) -> &[fluent_wvr::ArcIntern<str>] {
-        self.inner.provides()
-    }
-    fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-        // Use the Zone-supplied runtime (real tokio) and per-unit capabilities
-        // from self.ctx. Self.ctx carries `AnalyzeFormParamsCap`; the Zone's
-        // ctx carries the live runtime and any other zone-wide capabilities.
-        let merged = WorkContext {
-            rt: Arc::clone(&ctx.rt),
-            ..self.ctx.clone()
-        };
-        self.inner.execute(&merged)
-    }
-    fn default_timeout_ms(&self) -> u64 {
-        self.inner.default_timeout_ms()
-    }
-}
-
-impl FieldAccess for NamedComponent {
-    fn set_field(&mut self, name: &str, value: &str) -> Result<(), FieldError> {
-        self.inner.set_field(name, value)
-    }
-    fn get_field(&self, name: &str) -> Result<String, FieldError> {
-        self.inner.get_field(name)
-    }
-    fn field_names(&self) -> &'static [&'static str] {
-        self.inner.field_names()
-    }
-}
-
-impl Describable for NamedComponent {
-    fn describe(&self) -> serde_json::Value {
-        self.inner.describe()
-    }
-}
-
-impl_component!(NamedComponent);
-
-/// Parse the index suffix from a `NamedComponent` name (e.g., "analyze_form:3" → Some(3)).
+/// Parse the index suffix from a suffixed component name (e.g., "analyze_form:3" → Some(3)).
 fn parse_index(name: &str) -> Option<usize> {
     name.rsplit(':').next()?.parse().ok()
 }
@@ -382,7 +322,8 @@ mod tests {
     use crate::dispatcher::{FieldValueDispatcher, LocalDispatcher, TieredDispatcher};
     use crate::profile::Profile;
     use crate::schema::{AnalyzeFormResponse, FieldDescription, PageAnalyzeFormParams};
-    use dag::middleware::{MiddlewareChain, RetryMiddleware, TimingMiddleware};
+    use dag::middleware::{RetryMiddleware, TimingMiddleware};
+    use fluent_wvr::wrapper::MiddlewareChain;
     use proptest::prelude::*;
     use tempfile::TempDir;
 
