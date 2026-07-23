@@ -18,22 +18,29 @@ struct Args {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    // Load configuration
     let config: RouterConfig = load_json_or_default(args.config.as_ref());
 
-    // Initialize structured logging
     init_router_logging(&config.logging)?;
 
-    // Build the pipeline from config
     let pipeline = Arc::new(config.build_pipeline());
+
+    let frontier_url = config
+        .models
+        .frontier
+        .first()
+        .map(|f| {
+            f.api_base
+                .clone()
+                .unwrap_or_else(|| f.provider.clone())
+        });
 
     tracing::info!(
         bind_addr = %config.server.bind_addr,
+        frontier_url = ?frontier_url,
         "starting coral-router server"
     );
 
-    // Start the HTTP server
-    let server = RouterServer::new(pipeline, &config.server);
+    let server = RouterServer::new(pipeline, &config.server, frontier_url);
     server.serve().await?;
 
     Ok(())

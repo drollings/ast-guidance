@@ -67,6 +67,9 @@ pub fn init_router_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::er
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
+    std::fs::create_dir_all(&config.log_dir)
+        .map_err(|e| format!("failed to create log directory '{}': {e}", config.log_dir.display()))?;
+
     let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
         .rotation(tracing_appender::rolling::Rotation::NEVER)
         .filename_prefix("router")

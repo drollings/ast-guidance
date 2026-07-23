@@ -12,10 +12,12 @@ pub fn extract_user_message(ctx: &WorkContext) -> Result<String, WorkError> {
         })
         .ok_or_else(|| WorkError::Execution("missing request".into()))?;
 
-    let messages: Vec<serde_json::Value> =
-        serde_json::from_str(request_str).unwrap_or_default();
+    let parsed: serde_json::Value =
+        serde_json::from_str(request_str).map_err(|e| WorkError::Execution(e.to_string()))?;
 
-    messages
+    parsed["messages"]
+        .as_array()
+        .ok_or_else(|| WorkError::Execution("no messages array in request".into()))?
         .iter()
         .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
         .filter_map(|m| m.get("content").and_then(|c| c.as_str()))

@@ -191,13 +191,13 @@ impl MockRouter {
     ///
     /// Returns the pipeline result on success or a router error on pipeline failure.
     pub fn route(&self, request: &RouterRequest) -> Result<PipelineResult, WorkError> {
-        let messages_json = serde_json::to_value(&request.messages)
+        let request_json = serde_json::to_string(request)
             .map_err(|e| WorkError::Execution(format!("serialization error: {e}")))?;
 
         let mut ctx = WorkContext::default();
         ctx.metadata.insert(
             "request".into(),
-            MetadataValue::String(messages_json.to_string()),
+            MetadataValue::String(request_json),
         );
 
         let output = self.pipeline.execute(&ctx)?;
@@ -245,13 +245,13 @@ impl RouterOnlyMock {
     /// path; the differentiation is in how the mock stages are constructed
     /// (always fixtures, never real LLM).
     pub fn route(&self, request: &RouterRequest) -> Result<PipelineResult, WorkError> {
-        let messages_json = serde_json::to_value(&request.messages)
+        let request_json = serde_json::to_string(request)
             .map_err(|e| WorkError::Execution(format!("serialization error: {e}")))?;
 
         let mut ctx = WorkContext::default();
         ctx.metadata.insert(
             "request".into(),
-            MetadataValue::String(messages_json.to_string()),
+            MetadataValue::String(request_json),
         );
 
         let output = self.pipeline.execute(&ctx)?;

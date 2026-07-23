@@ -9,7 +9,10 @@ use crate::summarization::{ResultScorer, ScoredResult, Summarizer};
 use crate::test_stubs::StubChatBackend;
 
 fn scorer_ctx(query: &str, response: &str) -> WorkContext {
-    let request_json = serde_json::json!([{"role": "user", "content": query}]);
+    let request_json = serde_json::json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": query}]
+    });
     let mut ctx = WorkContext::default();
     ctx.metadata.insert(
         "request".into(),
@@ -177,7 +180,10 @@ fn test_scorer_missing_request_returns_error() {
 fn test_scorer_missing_response_returns_error() {
     let config = test_config();
     let scorer = ResultScorer::new(config, 0.7);
-    let request_json = serde_json::json!([{"role": "user", "content": "hello"}]);
+    let request_json = serde_json::json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
     let mut ctx = WorkContext::default();
     ctx.metadata.insert(
         "request".into(),

@@ -131,7 +131,7 @@ pub struct RouterChoice {
     pub finish_reason: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,

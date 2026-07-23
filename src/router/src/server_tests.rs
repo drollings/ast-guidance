@@ -17,7 +17,7 @@ mod server_tests {
     fn router_server_creates_with_config() {
         let pipeline = make_echo_pipeline();
         let config = ServerConfig::default();
-        let server = RouterServer::new(pipeline, &config);
+        let server = RouterServer::new(pipeline, &config, None);
         assert_eq!(server.name(), "router.server");
         assert!(server.provides().contains(&ArcIntern::from("http.endpoint")));
     }

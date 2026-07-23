@@ -13,7 +13,7 @@ use tokio::net::TcpListener;
 use crate::config::ServerConfig;
 use crate::normalize;
 use crate::pipeline::PipelineOrchestrator;
-use crate::types::{RouterMessage, RouterMessageContent, RouterResponse, Usage};
+use crate::types::{RouterMessage, RouterMessageContent, RouterRequest, RouterResponse, Usage};
 
 const CORS_HEADERS: &str = "Access-Control-Allow-Origin: *\r\n\
      Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n\
@@ -25,6 +25,7 @@ pub struct RouterServer {
     pipeline: Arc<PipelineOrchestrator>,
     bind_addr: String,
     max_payload: usize,
+    frontier_url: Option<String>,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
@@ -39,12 +40,14 @@ impl RouterServer {
     pub fn new(
         pipeline: Arc<PipelineOrchestrator>,
         config: &ServerConfig,
+        frontier_url: Option<String>,
     ) -> Self {
         Self {
             name: ArcIntern::from("router.server"),
             pipeline,
             bind_addr: config.bind_addr.clone(),
             max_payload: config.max_payload,
+            frontier_url,
             depends: vec![],
             provides: vec![ArcIntern::from("http.endpoint")],
         }
@@ -52,7 +55,7 @@ impl RouterServer {
 
     /// Start the HTTP server and block the current task.
     pub async fn serve(&self) -> Result<(), String> {
-        run_http(self.pipeline.clone(), &self.bind_addr, self.max_payload).await
+        run_http(self.pipeline.clone(), &self.bind_addr, self.max_payload, self.frontier_url.clone()).await
     }
 }
 
@@ -73,11 +76,12 @@ impl WorkUnit for RouterServer {
         let pipeline = self.pipeline.clone();
         let bind_addr = self.bind_addr.clone();
         let max_payload = self.max_payload;
+        let frontier_url = self.frontier_url.clone();
 
         let rt = ctx.rt.clone();
 
         let _handle = rt.spawn(Box::pin(async move {
-            if let Err(e) = run_http(pipeline, &bind_addr, max_payload).await {
+            if let Err(e) = run_http(pipeline, &bind_addr, max_payload, frontier_url).await {
                 tracing::error!(target: "router.server", error = %e, "HTTP server error");
             }
         }));
@@ -120,6 +124,7 @@ async fn run_http(
     pipeline: Arc<PipelineOrchestrator>,
     bind_addr: &str,
     max_payload: usize,
+    frontier_url: Option<String>,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(bind_addr)
         .await
@@ -144,9 +149,10 @@ async fn run_http(
 
         let pipeline = pipeline.clone();
         let stats = stats.clone();
+        let frontier_url = frontier_url.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, pipeline, stats, max_payload).await {
+            if let Err(e) = handle_connection(stream, pipeline, stats, max_payload, frontier_url).await {
                 tracing::error!(target: "router.server", error = %e, "connection error");
             }
         });
@@ -158,6 +164,7 @@ async fn handle_connection(
     pipeline: Arc<PipelineOrchestrator>,
     stats: Arc<ServerStats>,
     max_payload: usize,
+    frontier_url: Option<String>,
 ) -> Result<(), String> {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 1024];
@@ -373,37 +380,21 @@ async fn handle_connection(
 
     // Build response
     if let Some(resp_str) = &pipeline_result.final_response {
-        // Pipeline provided a final response directly
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{CORS_HEADERS}Connection: close\r\n\r\n{resp_str}",
             resp_str.len()
         );
         stream.write_all(resp.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
     } else {
-        // Build a basic completion response
-        let completion = RouterResponse {
-            id: String::new(),
-            object: "chat.completion".into(),
-            created: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            model: model_name.clone(),
-            choices: vec![crate::types::RouterChoice {
-                index: 0,
-                message: RouterMessage {
-                    role: "assistant".into(),
-                    content: RouterMessageContent::Text("pipeline completed successfully".into()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                },
-                finish_reason: "stop".into(),
-            }],
-            usage: Usage {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0,
-            },
+        let completion = if let Some(ref url) = frontier_url {
+            dispatch_to_frontier(url, &router_request)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(target: "router.server", error = %e, "frontier dispatch failed, using fallback");
+                    fallback_completion(&model_name)
+                })
+        } else {
+            fallback_completion(&model_name)
         };
 
         let body = if is_stream {
@@ -444,6 +435,139 @@ fn parse_headers(header_str: &str) -> HashMap<String, String> {
         }
     }
     map
+}
+
+fn fallback_completion(model_name: &str) -> RouterResponse {
+    RouterResponse {
+        id: String::new(),
+        object: "chat.completion".into(),
+        created: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        model: model_name.to_string(),
+        choices: vec![crate::types::RouterChoice {
+            index: 0,
+            message: RouterMessage {
+                role: "assistant".into(),
+                content: RouterMessageContent::Text("pipeline completed successfully".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            finish_reason: "stop".into(),
+        }],
+        usage: Usage::default(),
+    }
+}
+
+async fn dispatch_to_frontier(
+    frontier_url: &str,
+    request: &RouterRequest,
+) -> Result<RouterResponse, String> {
+    let client = reqwest::Client::new();
+    let url = if frontier_url.ends_with("/chat/completions") {
+        frontier_url.to_string()
+    } else {
+        format!(
+            "{}/chat/completions",
+            frontier_url.trim_end_matches('/')
+        )
+    };
+
+    let messages: Vec<serde_json::Value> = request
+        .messages
+        .iter()
+        .map(|m| {
+            let content = match &m.content {
+                RouterMessageContent::Text(s) => serde_json::Value::String(s.clone()),
+                RouterMessageContent::Parts(parts) => serde_json::Value::Array(
+                    parts.iter().map(|p| serde_json::to_value(p).unwrap()).collect(),
+                ),
+            };
+            let mut msg = serde_json::json!({"role": m.role, "content": content});
+            if let Some(ref tc) = m.tool_calls {
+                msg["tool_calls"] = serde_json::to_value(tc).unwrap();
+            }
+            if let Some(ref id) = m.tool_call_id {
+                msg["tool_call_id"] = serde_json::Value::String(id.clone());
+            }
+            msg
+        })
+        .collect();
+
+    let mut body = serde_json::json!({
+        "model": request.model,
+        "messages": messages,
+    });
+    if let Some(temp) = request.temperature {
+        body["temperature"] = serde_json::Value::Number(
+            serde_json::Number::from_f64(temp).ok_or("invalid temperature")?,
+        );
+    }
+    if let Some(max_tokens) = request.max_tokens {
+        body["max_tokens"] = serde_json::Value::Number(max_tokens.into());
+    }
+
+    let response = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("frontier HTTP error: {e}"))?;
+
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("frontier JSON parse: {e}"))?;
+
+    parse_openai_response(&json, &request.model)
+}
+
+fn parse_openai_response(json: &serde_json::Value, fallback_model: &str) -> Result<RouterResponse, String> {
+    let id = json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let model = json.get("model").and_then(|v| v.as_str()).unwrap_or(fallback_model).to_string();
+    let created = json.get("created").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let choices: Vec<crate::types::RouterChoice> = json
+        .get("choices")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| {
+                    let index = c.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    let finish = c.get("finish_reason").and_then(|v| v.as_str()).unwrap_or("stop").to_string();
+                    let msg = c.get("message")?;
+                    let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("assistant").to_string();
+                    let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    Some(crate::types::RouterChoice {
+                        index,
+                        message: RouterMessage {
+                            role,
+                            content: RouterMessageContent::Text(content),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        },
+                        finish_reason: finish,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let usage = json.get("usage").map_or(Usage::default(), |u| Usage {
+        prompt_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        completion_tokens: u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+    });
+
+    Ok(RouterResponse {
+        id,
+        object: "chat.completion".into(),
+        created,
+        model,
+        choices,
+        usage,
+    })
 }
 
 #[cfg(test)]

@@ -32,6 +32,17 @@ pub struct LlmClient {
     pub queue: Option<Arc<LlmRequestQueue>>,
 }
 
+impl Clone for LlmClient {
+    fn clone(&self) -> Self {
+        Self {
+            api_base: self.api_base.clone(),
+            model: self.model.clone(),
+            config: self.config.clone(),
+            queue: self.queue.clone(),
+        }
+    }
+}
+
 impl LlmClient {
     pub fn new(api_base: &str, model: &str) -> Self {
         let config = LlmConfig::new()
@@ -126,12 +137,18 @@ impl LlmClient {
         }
     }
 
-    /// Sync adapter for `chat_complete_async`. Bridges to the caller's
-    /// tokio runtime via `Handle::block_on` if one is active, otherwise
-    /// uses a process-wide fallback runtime.
+    /// Sync adapter for `chat_complete_async`. Uses `tokio::task::block_in_place`
+    /// when inside a tokio runtime to prevent worker-thread starvation; falls
+    /// back to the process-wide fallback runtime when no runtime is active.
     pub fn chat_complete(&self, messages: &[ChatMessage]) -> Result<String, LlmError> {
         match tokio::runtime::Handle::try_current() {
-            Ok(handle) => handle.block_on(self.chat_complete_async(messages)),
+            Ok(handle) => {
+                let client = self.clone();
+                let messages = messages.to_vec();
+                tokio::task::block_in_place(move || {
+                    handle.block_on(client.chat_complete_async(&messages))
+                })
+            }
             Err(_) => fallback_runtime().block_on(self.chat_complete_async(messages)),
         }
     }

@@ -10,9 +10,12 @@ mod tests {
     use crate::stages::router::{RouterStage, RoutingPolicy};
 
     fn make_ctx(user_text: &str) -> WorkContext {
-        let request_json = serde_json::json!([
-            {"role": "user", "content": user_text}
-        ]);
+        let request_json = serde_json::json!({
+            "model": "test",
+            "messages": [
+                {"role": "user", "content": user_text}
+            ]
+        });
         let mut ctx = WorkContext::default();
         ctx.metadata.insert(
             "request".into(),
