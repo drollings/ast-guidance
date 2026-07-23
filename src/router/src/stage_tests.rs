@@ -108,7 +108,7 @@ mod tests {
         let ctx = make_ctx("My email is user@example.com");
         let output = filter.execute(&ctx).expect("execute");
         let decision: StageDecision = output.data_as().expect("data_as");
-        assert_eq!(decision.verdict, StageVerdict::Passed);
+        assert_eq!(decision.verdict, StageVerdict::Rejected);
         assert!(decision.reason.contains("email"));
         let pii_classes = decision
             .metadata
@@ -124,7 +124,7 @@ mod tests {
         let ctx = make_ctx("My SSN is 123-45-6789");
         let output = filter.execute(&ctx).expect("execute");
         let decision: StageDecision = output.data_as().expect("data_as");
-        assert_eq!(decision.verdict, StageVerdict::Passed);
+        assert_eq!(decision.verdict, StageVerdict::Rejected);
         assert!(decision.reason.contains("ssn"));
     }
 

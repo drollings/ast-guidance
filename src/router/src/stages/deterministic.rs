@@ -184,15 +184,19 @@ impl WorkUnit for DeterministicPreFilter {
         }
 
         WorkOutput::typed(
-            "passed",
+            if pii_found.is_empty() { "passed" } else { "pii_blocked" },
             &StageDecision {
                 stage: PipelineStage::DeterministicPreFilter,
-                verdict: StageVerdict::Passed,
+                verdict: if pii_found.is_empty() {
+                    StageVerdict::Passed
+                } else {
+                    StageVerdict::Rejected
+                },
                 score: Some(1.0),
                 reason: if pii_found.is_empty() {
                     "no command, no PII flags".into()
                 } else {
-                    format!("flagged PII classes: {}", pii_found.join(", "))
+                    format!("blocked: flagged PII classes: {}", pii_found.join(", "))
                 },
                 latency_ms: 0,
                 metadata: serde_json::json!({ "pii_classes": pii_found }),

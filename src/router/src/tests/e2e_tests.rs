@@ -189,10 +189,11 @@ fn test_e2e_pii_flagging_detected() {
     let request = make_request("My email is user@example.com and SSN is 123-45-6789");
     let result = mock.route(&request).expect("pipeline should complete");
 
-    // PII flagging is in stage 1, which should pass (flag only, not policy)
+    assert!(result.rejected, "should be rejected for PII");
+
     let stage1 = &result.decisions[0];
     assert_eq!(stage1.stage, PipelineStage::DeterministicPreFilter);
-    assert_eq!(stage1.verdict, StageVerdict::Passed);
+    assert_eq!(stage1.verdict, StageVerdict::Rejected);
 
     let pii_classes = stage1
         .metadata

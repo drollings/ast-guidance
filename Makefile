@@ -139,11 +139,30 @@ router: $(CORAL_ROUTER_BIN) ## Build coral-router
 
 .PHONY: router-test
 router-test: $(CORAL_ROUTER_BIN) ## Run all router unit, golden, and e2e mock tests; validate binary
+	$(Q)pkill coral-router 2>/dev/null || true
 	$(Q)echo "Running fluent-router unit + e2e mock tests"
 	$(Q)cargo test -p fluent-router
 	$(Q)echo "Running coral-router dry-run (--help)"
 	$(Q)cargo run --bin coral-router -- --help
 	$(Q)echo "All router tests passed."
+
+ROUTER_MOCK_TEST_SCRIPT := bin/router-mock-tests.sh
+
+.PHONY: router-start
+router-start: $(CORAL_ROUTER_BIN) ## Build (if needed) and start coral-router on :8081
+	$(Q)pkill coral-router 2>/dev/null || true
+	$(Q)sleep 0.5
+	$(Q)nohup target/debug/coral-router -c env/coral-router.json > /tmp/coral-router.out 2>&1 &
+	$(Q)for i in $$(seq 1 10); do \
+		if curl -s -m 1 http://127.0.0.1:8081/health > /dev/null 2>&1; then \
+			echo "coral-router started (attempt $$i)"; break; \
+		fi; \
+		echo "Waiting for coral-router..."; sleep 1; \
+	done
+
+.PHONY: router-mock
+router-mock: router-start $(ROUTER_MOCK_TEST_SCRIPT) ## Start coral-router, then run curl smoke-test suite (leaves server running)
+	$(Q)bash $(ROUTER_MOCK_TEST_SCRIPT)
 
 # ── Standard Targets ──────────────────────────────────────────────────────────
 
