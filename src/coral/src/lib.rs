@@ -19,6 +19,7 @@ pub mod mcp;
 pub mod packer;
 pub mod tier_units;
 pub mod wasm_runtime;
+pub use fluent_router as router;
 pub mod wvr;
 
 #[cfg(test)]

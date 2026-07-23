@@ -1,0 +1,415 @@
+//! End-to-end tests for the router pipeline.
+//!
+//! All tests use `MockRouter` — no LLM inference, no network, no GPU.
+//! Pipeline stages that normally depend on LLM calls are replaced with
+//! mock stages that return fixture data.
+
+use crate::pipeline_types::{PipelineStage, StageVerdict};
+use crate::session::StepStatus;
+use crate::testing::mock::{MockFixtures, MockRouter};
+use crate::types::{RouterMessage, RouterMessageContent, RouterRequest};
+
+fn make_request(text: &str) -> RouterRequest {
+    RouterRequest {
+        model: "orchestrator:llama3.1".into(),
+        messages: vec![RouterMessage {
+            role: "user".into(),
+            content: RouterMessageContent::Text(text.into()),
+            tool_calls: None,
+            tool_call_id: None,
+        }],
+        temperature: None,
+        max_tokens: None,
+        stream: None,
+        tools: None,
+        tool_choice: None,
+        session_id: Some("e2e-test-session".into()),
+        agent_id: None,
+        adapter: None,
+        metadata: Default::default(),
+    }
+}
+
+#[allow(dead_code)]
+fn make_request_with_messages(messages: Vec<RouterMessage>) -> RouterRequest {
+    RouterRequest {
+        model: "orchestrator:llama3.1".into(),
+        messages,
+        temperature: None,
+        max_tokens: None,
+        stream: None,
+        tools: None,
+        tool_choice: None,
+        session_id: Some("e2e-test-session".into()),
+        agent_id: None,
+        adapter: None,
+        metadata: Default::default(),
+    }
+}
+
+fn default_fixtures() -> MockFixtures {
+    MockFixtures::new()
+}
+
+// ── Normal Request ──────────────────────────────────────────────────────
+
+#[test]
+fn test_e2e_normal_request_passes_all_stages() {
+    let mock = MockRouter::new(default_fixtures());
+    let request = make_request("What is Rust?");
+    let result = mock.route(&request).expect("pipeline should complete");
+
+    assert!(!result.rejected, "normal request should not be rejected");
+    assert!(
+        result.decisions.len() >= 5,
+        "pipeline should run through all 5 stages, got {}",
+        result.decisions.len()
+    );
+
+    // Verify stage order: DeterministicPreFilter → QualityGate → Planning → Guardrail → Router
+    let stage_order: Vec<PipelineStage> = result
+        .decisions
+        .iter()
+        .map(|d| d.stage)
+        .collect();
+    assert_eq!(stage_order[0], PipelineStage::DeterministicPreFilter);
+    assert_eq!(stage_order[1], PipelineStage::QualityGate);
+    assert_eq!(stage_order[2], PipelineStage::PlanningRefinement);
+    assert_eq!(stage_order[3], PipelineStage::GuardrailCheck);
+    assert_eq!(stage_order[4], PipelineStage::Router);
+}
+
+#[test]
+fn test_e2e_all_stages_pass_verdict() {
+    let mock = MockRouter::new(default_fixtures());
+    let request = make_request("Explain monads in Haskell");
+    let result = mock.route(&request).expect("pipeline should complete");
+
+    for decision in &result.decisions {
+        assert_eq!(
+            decision.verdict,
+            StageVerdict::Passed,
+            "stage {:?} should have Passed verdict",
+            decision.stage
+        );
+    }
+}
+
+// ── Garbage Input Rejection ─────────────────────────────────────────────
+
+#[test]
+fn test_e2e_garbage_rejected_by_quality_gate() {
+    let mut fixtures = default_fixtures();
+    let reject_decision = serde_json::json!({
+        "stage": "QualityGate",
+        "verdict": "Rejected",
+        "score": 0.15,
+        "reason": "rejected: intent=garbage, coherence=0.15",
+        "latency_ms": 0,
+        "metadata": {
+            "intent": "garbage",
+            "coherence": 0.15,
+            "is_code": false,
+            "language": "english"
+        }
+    });
+    fixtures.quality_gate.insert(
+        "asdfghjkl qwerty zxcvbnm".into(),
+        serde_json::to_string(&reject_decision).unwrap(),
+    );
+
+    let mock = MockRouter::new(fixtures);
+    let request = make_request("asdfghjkl qwerty zxcvbnm");
+    let result = mock.route(&request).expect("pipeline should handle rejection");
+
+    assert!(result.rejected, "garbage input should be rejected");
+    assert!(
+        result
+            .reject_reason
+            .unwrap_or_default()
+            .contains("garbage"),
+        "rejection reason should mention garbage"
+    );
+}
+
+// ── Command Dispatch ────────────────────────────────────────────────────
+
+#[test]
+fn test_e2e_help_command_dispatch() {
+    let mock = MockRouter::new(default_fixtures());
+    let request = make_request("/help");
+    let result = mock.route(&request).expect("pipeline should handle command");
+
+    assert!(result.rejected, "command should be intercepted");
+    assert_eq!(result.decisions.len(), 1);
+    assert_eq!(
+        result.decisions[0].stage,
+        PipelineStage::DeterministicPreFilter
+    );
+    assert_eq!(result.decisions[0].verdict, StageVerdict::Rejected);
+    assert!(
+        result.decisions[0].reason.contains("help"),
+        "reason should mention 'help', got: {}",
+        result.decisions[0].reason
+    );
+}
+
+#[test]
+fn test_e2e_stats_command_dispatch() {
+    let mock = MockRouter::new(default_fixtures());
+    let request = make_request(".stats");
+    let result = mock.route(&request).expect("pipeline should handle command");
+
+    assert!(result.rejected, "command should be intercepted");
+    assert_eq!(result.decisions.len(), 1);
+    assert_eq!(result.decisions[0].stage, PipelineStage::DeterministicPreFilter);
+}
+
+#[test]
+fn test_e2e_unknown_command_dispatch() {
+    let mock = MockRouter::new(default_fixtures());
+    let request = make_request("/nonexistent");
+    let result = mock.route(&request).expect("pipeline should handle unknown command");
+
+    assert!(result.rejected);
+    assert!(
+        result
+            .reject_reason
+            .unwrap_or_default()
+            .contains("unknown command"),
+        "reject reason should mention unknown command"
+    );
+}
+
+// ── PII Flagging ────────────────────────────────────────────────────────
+
+#[test]
+fn test_e2e_pii_flagging_detected() {
+    let mock = MockRouter::new(default_fixtures());
+    let request = make_request("My email is user@example.com and SSN is 123-45-6789");
+    let result = mock.route(&request).expect("pipeline should complete");
+
+    // PII flagging is in stage 1, which should pass (flag only, not policy)
+    let stage1 = &result.decisions[0];
+    assert_eq!(stage1.stage, PipelineStage::DeterministicPreFilter);
+    assert_eq!(stage1.verdict, StageVerdict::Passed);
+
+    let pii_classes = stage1
+        .metadata
+        .get("pii_classes")
+        .and_then(|v| v.as_array())
+        .expect("should have pii_classes array");
+    let detected: Vec<&str> = pii_classes
+        .iter()
+        .filter_map(|c| c.as_str())
+        .collect();
+    assert!(
+        detected.contains(&"email"),
+        "email should be detected, got: {:?}",
+        detected
+    );
+    assert!(
+        detected.contains(&"ssn"),
+        "ssn should be detected, got: {:?}",
+        detected
+    );
+}
+
+#[test]
+fn test_e2e_pii_not_flagged_for_clean_input() {
+    let mock = MockRouter::new(default_fixtures());
+    let request = make_request("What is the capital of France?");
+    let result = mock.route(&request).expect("pipeline should complete");
+
+    let stage1 = &result.decisions[0];
+    assert_eq!(stage1.stage, PipelineStage::DeterministicPreFilter);
+    let reason = &stage1.reason;
+    assert!(
+        reason.contains("no PII"),
+        "should indicate no PII, got: {reason}"
+    );
+}
+
+// ── Streaming Response Support ──────────────────────────────────────────
+
+#[test]
+fn test_e2e_streaming_flag_preserved() {
+    let mock = MockRouter::new(default_fixtures());
+    let mut request = make_request("Tell me a story");
+    request.stream = Some(true);
+    let result = mock.route(&request).expect("pipeline should complete");
+    assert!(!result.rejected, "streaming request should not be rejected");
+}
+
+// ── Routing Decision ────────────────────────────────────────────────────
+
+#[test]
+fn test_e2e_routing_decision_included() {
+    let mock = MockRouter::new(default_fixtures());
+    let request = make_request("Help me debug Rust code");
+    let result = mock.route(&request).expect("pipeline should complete");
+
+    // The router stage (last) should have routing metadata
+    let router_decision = result.decisions.last().expect("should have router decision");
+    assert_eq!(router_decision.stage, PipelineStage::Router);
+    assert_eq!(router_decision.verdict, StageVerdict::Passed);
+
+    let routing_decision = router_decision
+        .metadata
+        .get("routing_decision")
+        .expect("router decision should have routing_decision metadata");
+    assert!(
+        routing_decision.get("destination").is_some(),
+        "routing decision should have a destination"
+    );
+}
+
+// ── Error Handling ──────────────────────────────────────────────────────
+
+#[test]
+fn test_e2e_empty_request_handled() {
+    let mock = MockRouter::new(default_fixtures());
+    let request = make_request_with_messages(vec![]);
+    let result = mock.route(&request);
+    assert!(
+        result.is_err(),
+        "empty messages should produce an error"
+    );
+}
+
+#[test]
+fn test_e2e_missing_user_message_handled() {
+    let mock = MockRouter::new(default_fixtures());
+    let request = make_request_with_messages(vec![RouterMessage {
+        role: "system".into(),
+        content: RouterMessageContent::Text("You are a helpful assistant.".into()),
+        tool_calls: None,
+        tool_call_id: None,
+    }]);
+    let result = mock.route(&request);
+    assert!(
+        result.is_err(),
+        "missing user message should produce an error"
+    );
+}
+
+// ── Full Pipeline with Custom Fixtures ──────────────────────────────────
+
+#[test]
+fn test_e2e_custom_fixtures_produce_expected_results() {
+    use crate::pipeline_types::StageDecision;
+
+    let mut fixtures = default_fixtures();
+
+    // Configure quality gate to reject "bad" input
+    let reject_decision = StageDecision {
+        stage: PipelineStage::QualityGate,
+        verdict: StageVerdict::Rejected,
+        score: Some(0.2),
+        reason: "mock rejection: low quality".into(),
+        latency_ms: 0,
+        metadata: serde_json::json!({"intent": "garbage", "coherence": 0.2}),
+    };
+    fixtures.quality_gate.insert(
+        "bad input that should be rejected".into(),
+        serde_json::to_string(&reject_decision).unwrap(),
+    );
+
+    // Configure quality gate to pass "good" input
+    let pass_decision = StageDecision {
+        stage: PipelineStage::QualityGate,
+        verdict: StageVerdict::Passed,
+        score: Some(0.95),
+        reason: "mock: high quality".into(),
+        latency_ms: 0,
+        metadata: serde_json::json!({"intent": "question", "coherence": 0.95}),
+    };
+    fixtures.quality_gate.insert(
+        "good quality input".into(),
+        serde_json::to_string(&pass_decision).unwrap(),
+    );
+
+    let mock = MockRouter::new(fixtures);
+
+    // Test rejection path
+    let bad_result = mock
+        .route(&make_request("bad input that should be rejected"))
+        .expect("pipeline should handle rejection");
+    assert!(bad_result.rejected, "bad input should be rejected");
+
+    // Test pass path
+    let good_result = mock
+        .route(&make_request("good quality input"))
+        .expect("pipeline should complete");
+    assert!(!good_result.rejected, "good input should not be rejected");
+}
+
+// ── Checkpoint/Rewind Cycle (DAG session-level) ─────────────────────────
+// These tests verify the DependencySession checkpoint/rewind logic
+// using the existing dag_session module.
+
+#[test]
+fn test_e2e_dag_session_checkpoint_rewind() {
+    use crate::dag_session::{DependencySession, SessionStep, StepResult};
+
+    let mut session = DependencySession::new("e2e-session");
+
+    // Add steps with dependencies
+    session
+        .add_step(SessionStep::new("step1", "Initial research"))
+        .expect("add step1");
+    session
+        .add_step(SessionStep::new("step2", "Analysis").with_depends(vec!["step1".into()]))
+        .expect("add step2");
+    session
+        .add_step(
+            SessionStep::new("step3", "Implementation")
+                .with_depends(vec!["step2".into()])
+                .with_checkpoint(),
+        )
+        .expect("add step3");
+    session
+        .add_step(SessionStep::new("step4", "Testing").with_depends(vec!["step3".into()]))
+        .expect("add step4");
+
+    // Complete step1 and step2
+    let ok = |content: &str| StepResult {
+        content: content.into(),
+        accepted: true,
+        score: Some(1.0),
+        latency_ms: 100,
+        error: None,
+    };
+
+    session
+        .complete_step("step1", ok("Research complete"))
+        .expect("complete step1");
+    session
+        .complete_step("step2", ok("Analysis complete"))
+        .expect("complete step2");
+
+    // Verify checkpoint was registered (step3 has checkpoint=true)
+    let checkpoints = session.checkpoints();
+    assert!(!checkpoints.is_empty(), "step3 should be a checkpoint");
+
+    // Complete step3
+    session
+        .complete_step("step3", ok("Implementation complete"))
+        .expect("complete step3");
+
+    // Rewind to step3 checkpoint should reset step3 and step4 to Pending
+    session
+        .rewind_to_checkpoint("step3")
+        .expect("rewind");
+
+    assert_eq!(
+        session.get_step("step3").map(|s| s.status),
+        Some(StepStatus::Pending),
+        "step3 should be reset to Pending after rewind"
+    );
+    assert_eq!(
+        session.get_step("step4").map(|s| s.status),
+        Some(StepStatus::Pending),
+        "step4 should be reset to Pending after rewind"
+    );
+}

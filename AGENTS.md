@@ -50,10 +50,12 @@ src/
   guidance/            guidance-core: AST parser, sync engine, query engine, config
   coral/               coral-context: graph DB, cache router, MCP server, WASM runtime
   dag/                 guidance-dag: executor, resolver, work_unit, adapter, middleware,
-                       drift, type_inference, target, capability registry, error types
+                       drift, type_inference, target, capability registry, error types,
+                       dep_graph (DependencyGraph<K> — canonical dependency-tracking primitive)
   fluent-wvr/          Fluent WVR: Component, WorkUnit, FieldAccess, Describable traits
   fluent-wvr-macros/   Proc macros for FieldAccess derive
-  fluent-concurrency/  WorkerPool, Scope, Limiter, PriorityQueue, CreditFlow
+  fluent-concurrency/  WorkerPool, Scope, Limiter, PriorityQueue, CreditFlow,
+                       Zone (supervision + dependency cancellation via DependencyGraph)
   llm/                 LLM HTTP client + embeddings (CachedEmbeddingProvider, LlmRequestQueue,
                        LlmClient, url, error)
   types/               guidance-types (FileType, MemberType, Param, Member, etc.)
@@ -67,6 +69,9 @@ src/
   rdf/                 guidance-rdf (Turtle/N-Quads parser, normalization)
   wasm_ipc/            guidance-wasm-ipc (WASM IPC binary types)
   memory-plugin/       Pluggable memory tier (holographic, hindsight, honcho backends)
+  router/              fluent-router: LLM Router & Agent Orchestration Framework,
+                       DependencySession (composes DependencyGraph), pipeline,
+                       config, stages, transforms, dispatch, watchdog, server
   bin/
     job-copilot-daemon/ job-copilot binary (serve, validate-profile, install-native-messaging, doctor)
   job-copilot/          job-copilot-core: config, schema, sanitize, profile, dispatcher, server, components
@@ -109,6 +114,8 @@ Which consumers use which `fluent-concurrency` primitives:
 | `Instrumented::with_metrics` | `bin/guidance` histogram | `src/bin/guidance/src/main.rs` |
 | `ComponentAdapter` | `coral` cache reactor | `src/coral/src/cache_reactor.rs` |
 | `PartitionedRouter` | `job-copilot` dispatcher | `src/job-copilot/src/dispatcher/llm.rs` |
+| `Zone` | `fluent-concurrency` supervision | `src/fluent-concurrency/src/zone.rs` |
+| `DependencyGraph` | `Zone` cancellation, `DependencySession` | `src/dag/src/dep_graph.rs`, `src/router/src/dag_session.rs` |
 
 ---
 
@@ -192,6 +199,7 @@ helper there before re-implementing it locally.
 | `global_pool_config()` | `fluent-concurrency::pool` | `src/fluent-concurrency/src/pool.rs` |
 | `thread_local_resource!` / `with_tlr` | `fluent-concurrency::thread_resource` | `src/fluent-concurrency/src/thread_resource.rs` |
 | `ReadThroughCache<K, V>` | `common-core::cache` | `src/common-core/src/cache.rs` |
+| Generic dependency graph (`DependencyGraph<K>`, `GraphError`) | `fluent-dag::dep_graph` | `src/dag/src/dep_graph.rs` |
 
 Cross-crate limits that currently have a single consumer stay in their
 domain crate but **must** be moved to `common-core::constants` if a second
@@ -222,6 +230,22 @@ are documented in the `with_metrics` doc comment (the L4 Semantic KNN dispatch
 in `coral::cache_reactor`, and the top-level dispatch in `dag::executor`).
 Adoption at any of those moves M12 from "test-only" to a real consumer
 wiring; see `ROADMAP_20260625_CONSOLIDATE_CHECKLIST.md` M12 notes.
+
+### Dependency tracking
+
+`fluent_dag::dep_graph::DependencyGraph<K>` (`src/dag/src/dep_graph.rs`)
+is the **canonical dependency-graph primitive** for the workspace. It
+provides `register`, `dependents_of` (transitive dependent set via
+cycle-resilient DFS), `topo_sort` / `topo_sort_from` (Kahn's algorithm),
+`is_ready` / `ready_nodes`, and `unresolved_deps` (unsatisfiable
+dependency detection). Any new dependency-tracking workflow — session
+step DAGs, build-target graphs, task-supervision cancellation trees —
+MUST compose `DependencyGraph<K>` rather than re-implementing graph
+algorithms. The reference integration is `fluent-concurrency`'s `Zone`
+(`src/fluent-concurrency/src/zone.rs`), which replaced three hand-rolled
+`HashMap`s with a single `DependencyGraph<ArcIntern<str>>`. Future
+consumers (e.g. the coral router's `DependencySession`, M5.2 of
+`ROADMAP_20260722_CORAL_ROUTER.md`) must follow the same pattern.
 
 ---
 

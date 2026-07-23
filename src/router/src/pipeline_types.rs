@@ -45,7 +45,7 @@ impl StageDecision {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PipelineStage {
     DeterministicPreFilter,
     QualityGate,
@@ -54,7 +54,7 @@ pub enum PipelineStage {
     Router,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StageVerdict {
     Passed,
     Rejected,

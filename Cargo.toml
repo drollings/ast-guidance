@@ -23,6 +23,7 @@ members = [
     "src/router",
     "src/job-copilot",
     "src/bin/job-copilot-daemon",
+    "src/bin/coral-router",
 ]
 
 [workspace.package]

@@ -1,0 +1,71 @@
+{
+    "pipeline": {
+        "deterministic_prefilter": true,
+        "quality_gate": true,
+        "planning_refinement": true,
+        "guardrail_check": true,
+        "router": true,
+        "quality_threshold": 0.7,
+        "guardrail_mode": "FrontierOnly"
+    },
+    "models": {
+        "orchestrators": [
+            {
+                "name": "code",
+                "path": "http://localhost:8080/v1",
+                "context_size": 131072
+            }
+        ],
+        "agents": [
+            {
+                "name": "agent",
+                "path": "http://localhost:8080/v1",
+                "context_size": 65536
+            }
+        ],
+        "frontier": [
+            {
+                "provider": "http://localhost:8080/v1/chat/completions",
+                "model": "fast",
+                "max_tokens": 512,
+                "temperature": 0.1
+            }
+        ]
+    },
+    "server": {
+        "bind_addr": "127.0.0.1:8081",
+        "max_payload": 1048576
+    },
+    "sessions": {
+        "orchestrator_context_size": 131072,
+        "agent_context_size": 65536,
+        "compaction_policy": "Recency",
+        "max_nodes_before_compaction": 100
+    },
+    "kv_cache": {
+        "hot_tier_mb": 4096,
+        "cold_tier_mount": "/tmp/coral-kv-cache",
+        "cold_tier_max_mb": 32768,
+        "cold_tier_ttl_secs": 86400,
+        "cold_tier_eviction": "Lru"
+    },
+    "watchdogs": {
+        "max_tokens": 4096,
+        "wall_clock_secs": 300,
+        "repeat_threshold": 50,
+        "repeat_window": 100
+    },
+    "guardrails": {
+        "pii_classes": ["ssn", "card_number", "email", "phone"],
+        "blocked_topics": [],
+        "check_local_agents": false
+    },
+    "logging": {
+        "log_dir": "logs",
+        "max_file_size_mb": 100,
+        "max_age_days": 7,
+        "max_files": 10,
+        "json_format": false,
+        "console_output": true
+    }
+}

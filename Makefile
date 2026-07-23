@@ -18,6 +18,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := pre-commit
 
 TARGET_BIN  := guidance
+CORAL_ROUTER_BIN := target/debug/coral-router
 CONFIG      := .guidance/guidance-config.json
 INSTALLDIR  := $(HOME)/.local/bin
 
@@ -119,16 +120,30 @@ RUST_SRC_FILES := $(shell find $(RUST_SRC_DIR) -name '*.rs' 2>/dev/null)
 
 CARGO_BIN := target/debug/$(TARGET_BIN)
 
-$(CARGO_BIN): $(RUST_SRC_FILES)
-	$(Q)echo "Building $(TARGET_BIN)"
+$(CARGO_BIN) $(CORAL_ROUTER_BIN): $(RUST_SRC_FILES)
+	$(Q)echo "Building guidance + coral-router"
 	$(Q)cargo build
-	$(Q)echo "Build complete: $(TARGET_BIN)"
+	$(Q)echo "Build complete"
 
 .PHONY: install
-install: $(CARGO_BIN)
+install: $(CARGO_BIN) $(CORAL_ROUTER_BIN)
 	$(Q)mkdir -p $(INSTALLDIR)
 	$(Q)cp $(CARGO_BIN) $(INSTALLDIR)/guidance
-	$(Q)echo "Installed $(TARGET_BIN) in $(INSTALLDIR)/guidance"
+	$(Q)cp $(CORAL_ROUTER_BIN) $(INSTALLDIR)/coral-router
+	$(Q)echo "Installed guidance and coral-router in $(INSTALLDIR)"
+
+# ── Router Targets ────────────────────────────────────────────────────────────
+
+.PHONY: router
+router: $(CORAL_ROUTER_BIN) ## Build coral-router
+
+.PHONY: router-test
+router-test: $(CORAL_ROUTER_BIN) ## Run all router unit, golden, and e2e mock tests; validate binary
+	$(Q)echo "Running fluent-router unit + e2e mock tests"
+	$(Q)cargo test -p fluent-router
+	$(Q)echo "Running coral-router dry-run (--help)"
+	$(Q)cargo run --bin coral-router -- --help
+	$(Q)echo "All router tests passed."
 
 # ── Standard Targets ──────────────────────────────────────────────────────────
 
@@ -161,8 +176,10 @@ STRUCTURE.md: $(GUIDANCE_DB) | $(CARGO_BIN)
 # Full RALPH loop: build → check (validate) → sync (generate)
 # guidance check runs config commands (test/lint/fmt) and validates staleness.
 # guidance sync regenerates JSON + DB for stale files.
-.PHONY: pre-commit
-pre-commit: STRUCTURE.md $(CARGO_BIN) ## Run full RALPH loop
+.PHONY: pre-commit build
+build: $(CARGO_BIN) $(CORAL_ROUTER_BIN) ## Build guidance and coral-router binaries
+
+pre-commit: STRUCTURE.md $(CARGO_BIN) $(CORAL_ROUTER_BIN) ## Run full RALPH loop
 	$(Q)$(TARGET_BIN) sync --workspace .
 	$(Q)echo "✓ All checks passed. Ready to commit."
 

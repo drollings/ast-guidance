@@ -382,7 +382,28 @@ No `async-trait`, no `bumpalo`, no `crossbeam`. Tokio's channels, `Notify`, and 
 4. **No ambient `tokio::fs::read` or `tokio::time::sleep`.** All I/O is called through a capability method (`FsCapability::read`, `NetCapability::http_get`, `DbCapability::query`, etc.) which calls `check_capability(self)` first. `tokio::time::sleep` is allowed in the framework's own internals (Zone retry, Zone timeout) and in the `Runtime::sleep` backend, but consumer code is expected to use `Limiter::run`, `WithRetry`, or `Zone` rather than calling it directly.
 5. **No automatic restart.** Zones contain; they do not restart. Restart is a deliberate operator action.
 
-## 8. Rejected as Scope Creep
+## 8. Dependency Resolution with DependencyGraph
+
+`Zone` (`src/fluent-concurrency/src/zone.rs`) composes `fluent_dag::dep_graph::DependencyGraph<K>` for dependency tracking and cancellation. This replaced three hand-rolled `HashMap`s with a single canonical primitive.
+
+### How it works
+
+Each `Zone::register(unit)` call registers the unit's `name()` and its return value of `provides()` in the `DependencyGraph<ArcIntern<str>>`. When a unit fails or panics, `Zone::cancel_dependents_of(name)` calls `DependencyGraph::dependents_of(name)` (cycle-resilient DFS) to find all transitive dependents and cancels them.
+
+### When to compose DependencyGraph directly
+
+If you need dependency tracking outside a `Zone` (e.g., pipeline step DAGs, build-target graphs, session step ordering), compose `DependencyGraph<K>` directly. Examples:
+
+| Consumer | Pattern | Location |
+|----------|---------|----------|
+| `DependencySession` | Session steps with checkpoint/rewind | `src/router/src/dag_session.rs` |
+| `Zone` | Task supervision cancellation tree | `src/fluent-concurrency/src/zone.rs` |
+
+**Rule**: Any new dependency-tracking workflow MUST compose `DependencyGraph<K>` rather than re-implementing graph algorithms. See `dag/SKILL.md` for the full API.
+
+---
+
+## 9. Rejected as Scope Creep
 
 Here are examples of what fluent-concurrency does not try to do as a lightweight single-node runtime, compared to RabbitMQ:
 
@@ -391,7 +412,7 @@ Here are examples of what fluent-concurrency does not try to do as a lightweight
 - **Distributed tracing / OpenTelemetry export**: not in scope; `tracing::info!` is sufficient for the current consumers. If a future consumer needs OTel, the `tracing` crate has compatible subscribers.
 - **Loom-style combinatorial scheduler exploration**: the `Runtime` trait is wide enough to add a `LoomRuntime` later, but it is not built today. Q3 from §2 documents this as a future primitive.
 
-## 9. Summary
+## 10. Summary
 
 `fluent-concurrency` is a **thin, safe, opinionated harness** over Tokio. It adds the operational primitives that RabbitMQ proved necessary in production (pools, credit flow, supervision, priority) while keeping the Data Plane as fast and flat as `smol`. It follows the Fluent WVR pattern so the orchestrator sees a uniform interface, and it enforces the five architectural pillars of the manifest without unsafe code, bloat, or overengineering.
 

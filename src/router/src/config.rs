@@ -1,8 +1,15 @@
 //! Router configuration types — deserialized from JSON via `common_core::config`.
 
+use std::sync::Arc;
+
+use fluent_wvr::prelude::Component;
+use guidance_llm::LlmConfig;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+use crate::logging::LoggingConfig;
+use crate::pipeline::PipelineOrchestrator;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RouterConfig {
     #[serde(default = "PipelineConfig::default")]
     pub pipeline: PipelineConfig,
@@ -16,6 +23,34 @@ pub struct RouterConfig {
     pub watchdogs: WatchdogConfig,
     #[serde(default = "GuardrailConfig::default")]
     pub guardrails: GuardrailConfig,
+    #[serde(default = "ServerConfig::default")]
+    pub server: ServerConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    #[serde(default = "default_bind_addr")]
+    pub bind_addr: String,
+    #[serde(default = "default_max_payload")]
+    pub max_payload: usize,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            bind_addr: default_bind_addr(),
+            max_payload: default_max_payload(),
+        }
+    }
+}
+
+fn default_bind_addr() -> String {
+    "127.0.0.1:8080".into()
+}
+fn default_max_payload() -> usize {
+    1048576
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +232,96 @@ pub struct GuardrailConfig {
     pub blocked_topics: Vec<String>,
     #[serde(default)]
     pub check_local_agents: bool,
+}
+
+// ── Pipeline construction ──────────────────────────────────────────────
+
+impl RouterConfig {
+    /// Build a `PipelineOrchestrator` from the config.
+    ///
+    /// Stages that require an LLM (quality gate, planning, guardrail) are
+    /// only included when `PipelineConfig` enables them AND a model entry
+    /// exists in the catalog. The deterministic pre-filter and router
+    /// stages are always included when enabled (they need no LLM).
+    pub fn build_pipeline(&self) -> PipelineOrchestrator {
+        let mut stages: Vec<Arc<dyn Component>> = Vec::new();
+
+        // Stage 1: deterministic pre-filter (no LLM)
+        if self.pipeline.deterministic_prefilter {
+            stages.push(Arc::new(
+                crate::stages::deterministic::DeterministicPreFilter::new(),
+            ));
+        }
+
+        // Derive an LlmConfig from the first orchestrator or frontier entry
+        let llm_config = self
+            .models
+            .orchestrators
+            .first()
+            .map(|m| {
+                LlmConfig::new()
+                    .api_url(m.path.clone())
+                    .model(m.name.clone())
+                    .build()
+            })
+            .or_else(|| {
+                self.models.frontier.first().map(|f| {
+                    LlmConfig::new()
+                        .api_url(
+                            f.api_base
+                                .clone()
+                                .unwrap_or_else(|| "http://localhost:11434/v1".into()),
+                        )
+                        .model(f.model.clone())
+                        .build()
+                })
+            });
+
+        if let Some(ref cfg) = llm_config {
+            // Stage 2: quality gate
+            if self.pipeline.quality_gate {
+                stages.push(Arc::new(
+                    crate::stages::quality_gate::QualityGate::new(
+                        cfg.clone(),
+                        self.pipeline.quality_threshold,
+                    ),
+                ));
+            }
+            // Stage 3: planning refinement
+            if self.pipeline.planning_refinement {
+                stages.push(Arc::new(
+                    crate::stages::planning::PlanningRefinementAgent::new(
+                        cfg.clone(),
+                        true,
+                    ),
+                ));
+            }
+            // Stage 4: guardrail check
+            if self.pipeline.guardrail_check {
+                stages.push(Arc::new(
+                    crate::stages::guardrail::GuardrailCheck::new(
+                        cfg.clone(),
+                        self.guardrails.pii_classes.clone(),
+                        self.guardrails.check_local_agents,
+                    ),
+                ));
+            }
+        }
+
+        // Stage 5: router stage (no LLM — policy-based decision)
+        if self.pipeline.router {
+            let policy = if self.models.frontier.is_empty() {
+                crate::stages::router::RoutingPolicy::LocalFirst
+            } else {
+                crate::stages::router::RoutingPolicy::FrontierOnly
+            };
+            stages.push(Arc::new(
+                crate::stages::router::RouterStage::new(policy),
+            ));
+        }
+
+        crate::pipeline::PipelineOrchestrator::new(stages)
+    }
 }
 
 fn default_true() -> bool {

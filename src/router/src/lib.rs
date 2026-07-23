@@ -17,6 +17,8 @@
 //! - `compaction` — `CompactionStrategy`, `RecencyCompaction`
 //! - `kv_cache` — `HotKvCache`, `ColdKvCache`, `KvCacheManager`
 //! - `summarization` — `ResultScorer`, `ScoredResult`, `Summarizer`
+//! - `scheduler` — `AffinityScheduler`, `ScheduledTask`, `AgingConfig`
+//! - `dag_session` — `DependencySession`, `SessionStep`, `StepResult`, `DagError`
 
 pub mod pipeline_types;
 pub mod types;
@@ -32,12 +34,24 @@ pub mod orchestrator;
 pub mod compaction;
 pub mod kv_cache;
 pub mod summarization;
+pub mod scheduler;
+pub mod dag_session;
+pub mod normalize;
+pub mod streaming;
+pub mod server;
+pub mod indexer;
+pub mod logging;
+pub mod metrics;
+
+/// Testing utilities — available in all build profiles for use by
+/// downstream crates' test code (e.g., E2E tests in coral-context).
+pub mod testing;
 
 #[cfg(test)]
 pub(crate) mod test_stubs;
-
 #[cfg(test)]
 mod stage_tests;
-
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod server_tests;

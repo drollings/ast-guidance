@@ -9,16 +9,21 @@ fluent-concurrency = { path = "../fluent-concurrency" }
 common-core = { path = "../common-core", features = ["sqlite"] }
 fluent-types = { path = "../types" }
 guidance-llm = { path = "../llm" }
+fluent-dag = { path = "../dag" }
+fluent-wvr-testutil = { path = "../fluent-wvr-testutil" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 regex = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
 lru = { workspace = true }
 reqwest = { workspace = true }
+tokio = { workspace = true }
+time = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
 
 [lints]

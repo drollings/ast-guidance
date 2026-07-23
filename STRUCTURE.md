@@ -135,6 +135,10 @@ Then you you must read
     │   │   ├── Cargo.toml
     │   │   └── src/
     │   │       └── main.rs  # use clap::{Parser, Subcommand};
+    │   ├── coral-router/
+    │   │   ├── Cargo.toml
+    │   │   └── src/
+    │   │       └── main.rs  # use std::sync::Arc;
     │   ├── guidance/
     │   │   ├── Cargo.toml
     │   │   └── src/
@@ -392,15 +396,23 @@ Then you you must read
     │       ├── agent.rs  # //! Agent registry — keyed on `(mod...
     │       ├── compaction.rs  # //! LOD compaction policy — shrink ...
     │       ├── config.rs  # //! Router configuration types — de...
+    │       ├── dag_session.rs  # //! Dependency-aware session with DAG st
     │       ├── dispatch/
     │       │   ├── agent.rs  # use std::sync::Arc;
     │       │   ├── frontier.rs  # use std::collections::HashMap;
     │       │   └── mod.rs  # pub mod agent;
+    │       ├── indexer.rs  # //! Adapter/model/frontier indexer ...
     │       ├── kv_cache.rs  # //! KV cache snapshot management — ...
     │       ├── lib.rs  # //! LLM Router & Agent Orchestration Fra
+    │       ├── logging.rs  # //! Structured logging infrastructure fo
+    │       ├── metrics.rs  # //! Metrics and monitoring for the route
+    │       ├── normalize.rs  # //! Request and response normalizatio...
     │       ├── orchestrator.rs  # //! Long-lived orchestrator session ...
     │       ├── pipeline.rs  # //! Pipeline orchestrator — sequenc...
     │       ├── pipeline_types.rs  # //! Pipeline decision types — struc...
+    │       ├── scheduler.rs  # //! Affinity-aware priority scheduler.
+    │       ├── server.rs  # //! HTTP server exposing the router pipe
+    │       ├── server_tests.rs  # #[cfg(test)]
     │       ├── session.rs  # //! Session context node schema — e...
     │       ├── stage_tests.rs  # #[cfg(test)]
     │       ├── stages/
@@ -411,9 +423,15 @@ Then you you must read
     │       │   ├── planning.rs  # //! Stage 3: PlanningRefinementAgent ...
     │       │   ├── quality_gate.rs  # //! Stage 2: QualityGate — classifi...
     │       │   └── router.rs  # //! Stage 5: RouterStage — selects ...
+    │       ├── streaming.rs  # //! SSE streaming handler — transla...
     │       ├── summarization.rs  # //! Summarization and result acceptance.
     │       ├── test_stubs.rs  # use std::collections::VecDeque;
+    │       ├── testing/
+    │       │   ├── mock.rs  # use std::collections::HashMap;
+    │       │   └── mod.rs  # //! Testing utilities for the router pip
     │       ├── tests/
+    │       │   ├── e2e_tests.rs  # //! End-to-end tests for the router pipe
+    │       │   ├── golden.rs  # //! Golden test set for the router pipel
     │       │   ├── mod.rs  # //! Router test modules.
     │       │   └── rubric_fixtures.rs  # //! Rubric-based test fixtures for `Resu
     │       ├── transforms/
