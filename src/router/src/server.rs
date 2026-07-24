@@ -427,12 +427,13 @@ async fn handle_connection(
         } else {
             format!("{}/chat/completions", rt.url.trim_end_matches('/'))
         };
-        let completion = dispatch_to_frontier(&url, &router_request, &rt.model)
+        let mut completion = dispatch_to_frontier(&url, &router_request, &rt.model)
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!(target: "router.server", error = %e, "classifier route dispatch failed, using fallback");
                 fallback_completion(&model_name)
             });
+        completion.model = model_name.clone();
 
         let body = if is_stream {
             let mut handler = crate::streaming::StreamingHandler::new(
@@ -456,12 +457,13 @@ async fn handle_connection(
         );
         stream.write_all(resp.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
     } else if let Some(ref url) = frontier_url {
-        let completion = dispatch_to_frontier(url, &router_request, &model_name)
+        let mut completion = dispatch_to_frontier(url, &router_request, &model_name)
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!(target: "router.server", error = %e, "frontier dispatch failed, using fallback");
                 fallback_completion(&model_name)
             });
+        completion.model = model_name.clone();
 
         let body = if is_stream {
             let mut handler = crate::streaming::StreamingHandler::new(
