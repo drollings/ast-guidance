@@ -10,7 +10,7 @@
 //! - `pipeline` — `PipelineOrchestrator`, `PipelineResult`
 //! - `stages` — pipeline stage implementations (deterministic, classifier, router)
 //! - `transforms` — `TransformStrategy`, transforms (NoTransform, PiiAnonymize, etc.)
-//! - `dispatch` — `FrontierDispatcher`, `AgentDispatcher`
+//! - `dispatch` — `LlmDispatcher`, `AgentDispatcher`
 //! - `watchdog` — `WatchdogSet`, `MaxTokenWatchdog`, `WallClockWatchdog`, `RepetitionWatchdog`
 //! - `agent` — `AgentRegistry`, `AgentIdentity`, `AgentTask`, `AgentError`
 //! - `orchestrator` — `OrchestratorSession`

@@ -2,9 +2,16 @@
 //! PlanningRefinement, and GuardrailCheck. Acts as an FSM switch: the LLM
 //! returns either a direct response, a routing target, or a rejection.
 //! Configurable via `RoutingConfig` from the top-level coral-router config.
+//!
+//! The LLM backend is injected as `Arc<dyn ChatBackend>` rather than a
+//! concrete `LlmClient`, so mock/stub backends can be injected for testing
+//! without duplicating the pipeline wiring.
+
+use std::sync::Arc;
 
 use fluent_wvr::prelude::*;
-use guidance_llm::{ChatMessage, LlmClient, LlmConfig};
+use guidance_llm::client::ChatBackend;
+use guidance_llm::ChatMessage;
 
 use crate::config::{ClassifierOutput, RoutingConfig};
 use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
@@ -12,7 +19,7 @@ use crate::stages::common::extract_user_message;
 
 pub struct ClassifierStage {
     name: ArcIntern<str>,
-    client: LlmClient,
+    client: Arc<dyn ChatBackend>,
     routing_config: RoutingConfig,
     coherence_threshold: f64,
     depends: Vec<ArcIntern<str>>,
@@ -21,13 +28,13 @@ pub struct ClassifierStage {
 
 impl ClassifierStage {
     pub fn new(
-        config: LlmConfig,
+        client: Arc<dyn ChatBackend>,
         routing_config: RoutingConfig,
         coherence_threshold: f64,
     ) -> Self {
         Self {
             name: ArcIntern::from("pipeline.stage2.classifier"),
-            client: LlmClient::with_config(config),
+            client,
             routing_config,
             coherence_threshold,
             depends: vec![ArcIntern::from("pipeline.stage1.output")],

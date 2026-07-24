@@ -33,7 +33,6 @@ Coral Router exposes a single OpenAI-compatible HTTP endpoint (`POST /v1/chat/co
 │    (no model call; pure regex, PII detection)                           │
 │  Stage 2: ClassifierStage         — single LLM call                    │
 │    returns structured JSON: { action, response, target, coherence, ... }│
-│    replaces QualityGate + PlanningRefinement + GuardrailCheck           │
 │  Stage 3: RouterStage             — selects destination                │
 │    emits RoutingDecision: LocalAgent or Frontier                        │
 └─────────────────────────────────────────────────────────────────────────┘

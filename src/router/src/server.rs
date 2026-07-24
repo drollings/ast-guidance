@@ -13,6 +13,7 @@ use tokio::net::TcpListener;
 use crate::config::{RouteRef, ServerConfig};
 use crate::normalize;
 use crate::pipeline::PipelineOrchestrator;
+use crate::testing::mock::MockDispatchContext;
 use crate::types::{RouterMessage, RouterMessageContent, RouterRequest, RouterResponse, Usage};
 
 const CORS_HEADERS: &str = "Access-Control-Allow-Origin: *\r\n\
@@ -27,6 +28,7 @@ pub struct RouterServer {
     bind_addr: String,
     max_payload: usize,
     classifier_url: Option<String>,
+    mock_dispatch: Option<Arc<MockDispatchContext>>,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
@@ -51,9 +53,16 @@ impl RouterServer {
             bind_addr: config.bind_addr.clone(),
             max_payload: config.max_payload,
             classifier_url,
+            mock_dispatch: None,
             depends: vec![],
             provides: vec![ArcIntern::from("http.endpoint")],
         }
+    }
+
+    #[must_use]
+    pub fn with_mock(mut self, mock_dispatch: MockDispatchContext) -> Self {
+        self.mock_dispatch = Some(Arc::new(mock_dispatch));
+        self
     }
 
     /// Start the HTTP server and block the current task.
@@ -64,6 +73,7 @@ impl RouterServer {
             &self.bind_addr,
             self.max_payload,
             self.classifier_url.clone(),
+            self.mock_dispatch.clone(),
         )
         .await
     }
@@ -88,16 +98,23 @@ impl WorkUnit for RouterServer {
         let bind_addr = self.bind_addr.clone();
         let max_payload = self.max_payload;
         let classifier_url = self.classifier_url.clone();
+        let mock_dispatch = self.mock_dispatch.clone();
 
         let rt = ctx.rt.clone();
 
         let _handle = rt.spawn(Box::pin(async move {
-            if let Err(e) = run_http(pipelines, routes, &bind_addr, max_payload, classifier_url).await {
+            if let Err(e) =
+                run_http(pipelines, routes, &bind_addr, max_payload, classifier_url, mock_dispatch)
+                    .await
+            {
                 tracing::error!(target: "router.server", error = %e, "HTTP server error");
             }
         }));
 
-        Ok(WorkOutput::ok(format!("HTTP server bound to {}", self.bind_addr)))
+        Ok(WorkOutput::ok(format!(
+            "HTTP server bound to {}",
+            self.bind_addr
+        )))
     }
 }
 
@@ -137,6 +154,7 @@ async fn run_http(
     bind_addr: &str,
     max_payload: usize,
     classifier_url: Option<String>,
+    mock_dispatch: Option<Arc<MockDispatchContext>>,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(bind_addr)
         .await
@@ -163,9 +181,20 @@ async fn run_http(
         let routes = routes.clone();
         let stats = stats.clone();
         let classifier_url = classifier_url.clone();
+        let mock_dispatch = mock_dispatch.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, pipelines, routes, stats, max_payload, classifier_url).await {
+            if let Err(e) = handle_connection(
+                stream,
+                pipelines,
+                routes,
+                stats,
+                max_payload,
+                classifier_url,
+                mock_dispatch,
+            )
+            .await
+            {
                 tracing::error!(target: "router.server", error = %e, "connection error");
             }
         });
@@ -181,13 +210,14 @@ fn execute_pipeline_sequence(
     let mut last_result: Option<crate::pipeline::PipelineResult> = None;
 
     for name in pipeline_names {
-        // OK to block here: pipeline stages are sync WorkUnit impls
         let Some(pipeline) = pipelines.get(name) else {
             tracing::warn!(target: "router.server", pipeline = %name, "pipeline not found, skipping");
             continue;
         };
 
-        let output = pipeline.execute(ctx).map_err(|e| format!("pipeline '{name}' error: {e}"))?;
+        let output = pipeline
+            .execute(ctx)
+            .map_err(|e| format!("pipeline '{name}' error: {e}"))?;
         let mut result: crate::pipeline::PipelineResult = output
             .data_take()
             .map_err(|e| format!("pipeline '{name}' output decode: {e}"))?;
@@ -226,6 +256,7 @@ async fn handle_connection(
     stats: Arc<ServerStats>,
     max_payload: usize,
     classifier_url: Option<String>,
+    mock_dispatch: Option<Arc<MockDispatchContext>>,
 ) -> Result<(), String> {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 1024];
@@ -258,7 +289,8 @@ async fn handle_connection(
 
     // CORS preflight
     if method == "OPTIONS" {
-        let resp = format!("HTTP/1.1 204 No Content\r\n{CORS_HEADERS}Connection: close\r\n\r\n");
+        let resp =
+            format!("HTTP/1.1 204 No Content\r\n{CORS_HEADERS}Connection: close\r\n\r\n");
         stream
             .write_all(resp.as_bytes())
             .await
@@ -272,7 +304,10 @@ async fn handle_connection(
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{CORS_HEADERS}Connection: close\r\n\r\n{{\"status\":\"ok\"}}"
             );
-            stream.write_all(resp.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
+            stream
+                .write_all(resp.as_bytes())
+                .await
+                .map_err(|e| format!("write: {e}"))?;
             return Ok(());
         }
         ("GET", "/stats") => {
@@ -287,7 +322,10 @@ async fn handle_connection(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{CORS_HEADERS}Connection: close\r\n\r\n{}",
                 body_str.len(), body_str
             );
-            stream.write_all(resp.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
+            stream
+                .write_all(resp.as_bytes())
+                .await
+                .map_err(|e| format!("write: {e}"))?;
             return Ok(());
         }
         ("POST", "/v1/chat/completions") => {}
@@ -298,7 +336,10 @@ async fn handle_connection(
                 "404 Not Found"
             };
             let resp = format!("HTTP/1.1 {code}\r\nConnection: close\r\n\r\n");
-            stream.write_all(resp.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
+            stream
+                .write_all(resp.as_bytes())
+                .await
+                .map_err(|e| format!("write: {e}"))?;
             return Ok(());
         }
     }
@@ -311,7 +352,10 @@ async fn handle_connection(
 
     if content_length > max_payload {
         let resp = "HTTP/1.1 413 Payload Too Large\r\nConnection: close\r\n\r\n";
-        stream.write_all(resp.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
+        stream
+            .write_all(resp.as_bytes())
+            .await
+            .map_err(|e| format!("write: {e}"))?;
         return Ok(());
     }
 
@@ -325,7 +369,10 @@ async fn handle_connection(
             "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{CORS_HEADERS}Connection: close\r\n\r\n{body}",
             body.len()
         );
-        stream.write_all(resp.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
+        stream
+            .write_all(resp.as_bytes())
+            .await
+            .map_err(|e| format!("write: {e}"))?;
         stats.errors.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
@@ -348,13 +395,17 @@ async fn handle_connection(
     let body_json: serde_json::Value = match serde_json::from_str(body_str) {
         Ok(v) => v,
         Err(e) => {
-            let err = normalize::error_response(&format!("invalid JSON: {e}"), "invalid_request_error");
+            let err =
+                normalize::error_response(&format!("invalid JSON: {e}"), "invalid_request_error");
             let err_str = serde_json::to_string(&err).unwrap_or_default();
             let resp = format!(
                 "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{CORS_HEADERS}Connection: close\r\n\r\n{err_str}",
                 err_str.len()
             );
-            stream.write_all(resp.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
+            stream
+                .write_all(resp.as_bytes())
+                .await
+                .map_err(|e| format!("write: {e}"))?;
             stats.errors.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
@@ -370,7 +421,10 @@ async fn handle_connection(
                 "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{CORS_HEADERS}Connection: close\r\n\r\n{err_str}",
                 err_str.len()
             );
-            stream.write_all(resp.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
+            stream
+                .write_all(resp.as_bytes())
+                .await
+                .map_err(|e| format!("write: {e}"))?;
             stats.errors.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
@@ -397,27 +451,44 @@ async fn handle_connection(
     let pipeline_result = match execute_pipeline_sequence(&pipelines, &pipeline_names, &mut ctx) {
         Ok(result) => result,
         Err(e) => {
-            let err = normalize::error_response(
-                &format!("pipeline error: {e}"),
-                "server_error",
-            );
+            let err =
+                normalize::error_response(&format!("pipeline error: {e}"), "server_error");
             let err_str = serde_json::to_string(&err).unwrap_or_default();
             let resp = format!(
                 "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{CORS_HEADERS}Connection: close\r\n\r\n{err_str}",
                 err_str.len()
             );
-            stream.write_all(resp.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
+            stream
+                .write_all(resp.as_bytes())
+                .await
+                .map_err(|e| format!("write: {e}"))?;
             stats.errors.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
     };
 
+    // Extract user message for mock lookup
+    let user_message = router_request
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.to_string_lossy())
+        .unwrap_or_default();
+
     if pipeline_result.rejected {
-        let reason = pipeline_result.reject_reason.as_deref().unwrap_or("request rejected");
+        let reason = pipeline_result
+            .reject_reason
+            .as_deref()
+            .unwrap_or("request rejected");
         stats.rejections.fetch_add(1, Ordering::Relaxed);
 
-        // Return "ERROR: <msg>" as a model output instead of an HTTP error,
-        // so the caller does not confuse it with a model availability issue.
+        if let Some(ref mock) = mock_dispatch {
+            if let Some(entry) = mock.lookup(&user_message) {
+                mock.validate_rejection(entry, reason);
+            }
+        }
+
         let error_output = format!("ERROR: {reason}");
         let completion = RouterResponse {
             id: String::new(),
@@ -439,32 +510,12 @@ async fn handle_connection(
             }],
             usage: Usage::default(),
         };
-        let body = if is_stream {
-            let mut handler = crate::streaming::StreamingHandler::new(
-                &completion.id,
-                &completion.model,
-            );
-            let mut resp_body = String::new();
-            if let Some(choice) = completion.choices.first() {
-                resp_body.push_str(&handler.format_choice_chunk(choice));
-            }
-            resp_body.push_str(&handler.format_done());
-            resp_body
-        } else {
-            serde_json::to_string(&normalize::normalize_response(&completion))
-                .unwrap_or_default()
-        };
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n{CORS_HEADERS}Connection: close\r\n\r\n{body}",
-            if is_stream { "text/event-stream" } else { "application/json" },
-            body.len()
-        );
-        stream.write_all(resp.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
+        write_completion_response(&mut stream, &completion, is_stream).await?;
         return Ok(());
     }
 
     // Build response
-    if let Some(resp_str) = &pipeline_result.classifier_response {
+    if let Some(ref resp_str) = pipeline_result.classifier_response {
         let completion = RouterResponse {
             id: String::new(),
             object: "chat.completion".into(),
@@ -485,127 +536,110 @@ async fn handle_connection(
             }],
             usage: Usage::default(),
         };
-        let body = if is_stream {
-            let mut handler = crate::streaming::StreamingHandler::new(
-                &completion.id,
-                &completion.model,
-            );
-            let mut resp_body = String::new();
-            if let Some(choice) = completion.choices.first() {
-                resp_body.push_str(&handler.format_choice_chunk(choice));
-            }
-            resp_body.push_str(&handler.format_done());
-            resp_body
-        } else {
-            serde_json::to_string(&normalize::normalize_response(&completion))
-                .unwrap_or_default()
-        };
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n{CORS_HEADERS}Connection: close\r\n\r\n{body}",
-            if is_stream { "text/event-stream" } else { "application/json" },
-            body.len()
-        );
-        stream.write_all(resp.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
+        write_completion_response(&mut stream, &completion, is_stream).await?;
     } else if let Some(ref rt) = pipeline_result.routing_target {
-        let url = if rt.url.ends_with("/chat/completions") {
-            rt.url.clone()
-        } else {
-            format!("{}/chat/completions", rt.url.trim_end_matches('/'))
-        };
-                        let mut completion = dispatch_to_frontier(
-                                &url,
-                                &router_request,
-                                &rt.model,
-                                rt.params.as_ref(),
-                                rt.filter_thinking,
-                                rt.retry_count,
-                                rt.retry_base_interval_s,
-                            )
-                            .await
-                            .unwrap_or_else(|e| {
-                                tracing::warn!(target: "router.server", error = %e, "classifier route dispatch failed, using fallback");
-                                fallback_completion(&model_name)
-                            });
-                        completion.model = model_name.clone();
-
-        let body = if is_stream {
-            let mut handler = crate::streaming::StreamingHandler::new(
-                &completion.id,
-                &completion.model,
-            );
-            let mut resp_body = String::new();
-            if let Some(choice) = completion.choices.first() {
-                resp_body.push_str(&handler.format_choice_chunk(choice));
+        // Mock mode: validate routing and return canned response
+        if let Some(ref mock) = mock_dispatch {
+            if let Some(entry) = mock.lookup(&user_message) {
+                mock.validate_route(entry, Some(rt));
+                let completion = mock.dispatch_response(entry, &model_name);
+                write_completion_response(&mut stream, &completion, is_stream).await?;
+            } else {
+                // No transcript entry for this message — use real dispatch as fallback
+                let url = build_dispatch_url(&rt.url);
+                let mut completion = dispatch_to_llm(
+                    &url,
+                    &router_request,
+                    &rt.model,
+                    rt.params.as_ref(),
+                    rt.filter_thinking,
+                    rt.retry_count,
+                    rt.retry_base_interval_s,
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(target: "router.server", error = %e, "dispatch failed, using fallback");
+                    fallback_completion(&model_name)
+                });
+                completion.model = model_name.clone();
+                write_completion_response(&mut stream, &completion, is_stream).await?;
             }
-            resp_body.push_str(&handler.format_done());
-            resp_body
         } else {
-            serde_json::to_string(&normalize::normalize_response(&completion))
-                .unwrap_or_default()
-        };
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n{CORS_HEADERS}Connection: close\r\n\r\n{body}",
-            if is_stream { "text/event-stream" } else { "application/json" },
-            body.len()
-        );
-        stream.write_all(resp.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
-    } else if let Some(ref url) = classifier_url {
-        let mut completion = dispatch_to_frontier(url, &router_request, &model_name, None, false, 0, 1)
+            // Real dispatch
+            let url = build_dispatch_url(&rt.url);
+            let mut completion = dispatch_to_llm(
+                &url,
+                &router_request,
+                &rt.model,
+                rt.params.as_ref(),
+                rt.filter_thinking,
+                rt.retry_count,
+                rt.retry_base_interval_s,
+            )
             .await
             .unwrap_or_else(|e| {
-                tracing::warn!(target: "router.server", error = %e, "classifier dispatch failed, using fallback");
+                tracing::warn!(target: "router.server", error = %e, "dispatch failed, using fallback");
                 fallback_completion(&model_name)
             });
+            completion.model = model_name.clone();
+            write_completion_response(&mut stream, &completion, is_stream).await?;
+        }
+    } else if let Some(ref url) = classifier_url {
+        let mut completion = dispatch_to_llm(
+            url, &router_request, &model_name, None, false, 0, 1,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(target: "router.server", error = %e, "classifier dispatch failed, using fallback");
+            fallback_completion(&model_name)
+        });
         completion.model = model_name.clone();
-
-        let body = if is_stream {
-            let mut handler = crate::streaming::StreamingHandler::new(
-                &completion.id,
-                &completion.model,
-            );
-            let mut resp_body = String::new();
-            if let Some(choice) = completion.choices.first() {
-                resp_body.push_str(&handler.format_choice_chunk(choice));
-            }
-            resp_body.push_str(&handler.format_done());
-            resp_body
-        } else {
-            serde_json::to_string(&normalize::normalize_response(&completion))
-                .unwrap_or_default()
-        };
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n{CORS_HEADERS}Connection: close\r\n\r\n{body}",
-            if is_stream { "text/event-stream" } else { "application/json" },
-            body.len()
-        );
-        stream.write_all(resp.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
+        write_completion_response(&mut stream, &completion, is_stream).await?;
     } else {
         let completion = fallback_completion(&model_name);
-
-        let body = if is_stream {
-            let mut handler = crate::streaming::StreamingHandler::new(
-                &completion.id,
-                &completion.model,
-            );
-            let mut resp_body = String::new();
-            if let Some(choice) = completion.choices.first() {
-                resp_body.push_str(&handler.format_choice_chunk(choice));
-            }
-            resp_body.push_str(&handler.format_done());
-            resp_body
-        } else {
-            serde_json::to_string(&normalize::normalize_response(&completion))
-                .unwrap_or_default()
-        };
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n{CORS_HEADERS}Connection: close\r\n\r\n{body}",
-            if is_stream { "text/event-stream" } else { "application/json" },
-            body.len()
-        );
-        stream.write_all(resp.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
+        write_completion_response(&mut stream, &completion, is_stream).await?;
     }
 
     Ok(())
+}
+
+fn build_dispatch_url(endpoint_url: &str) -> String {
+    if endpoint_url.ends_with("/chat/completions") {
+        endpoint_url.to_string()
+    } else {
+        format!(
+            "{}/chat/completions",
+            endpoint_url.trim_end_matches('/')
+        )
+    }
+}
+
+async fn write_completion_response(
+    stream: &mut tokio::net::TcpStream,
+    completion: &RouterResponse,
+    is_stream: bool,
+) -> Result<(), String> {
+    let body = if is_stream {
+        let mut handler =
+            crate::streaming::StreamingHandler::new(&completion.id, &completion.model);
+        let mut resp_body = String::new();
+        if let Some(choice) = completion.choices.first() {
+            resp_body.push_str(&handler.format_choice_chunk(choice));
+        }
+        resp_body.push_str(&handler.format_done());
+        resp_body
+    } else {
+        serde_json::to_string(&normalize::normalize_response(completion)).unwrap_or_default()
+    };
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n{CORS_HEADERS}Connection: close\r\n\r\n{body}",
+        if is_stream { "text/event-stream" } else { "application/json" },
+        body.len()
+    );
+    stream
+        .write_all(resp.as_bytes())
+        .await
+        .map_err(|e| format!("write: {e}"))
 }
 
 fn parse_headers(header_str: &str) -> HashMap<String, String> {
@@ -644,7 +678,7 @@ fn fallback_completion(model_name: &str) -> RouterResponse {
     }
 }
 
-async fn dispatch_to_frontier(
+async fn dispatch_to_llm(
     endpoint_url: &str,
     request: &RouterRequest,
     model_name: &str,
@@ -654,14 +688,7 @@ async fn dispatch_to_frontier(
     retry_base_interval_s: u64,
 ) -> Result<RouterResponse, String> {
     let client = reqwest::Client::new();
-    let url = if endpoint_url.ends_with("/chat/completions") {
-        endpoint_url.to_string()
-    } else {
-        format!(
-            "{}/chat/completions",
-            endpoint_url.trim_end_matches('/')
-        )
-    };
+    let url = build_dispatch_url(endpoint_url);
 
     let messages: Vec<serde_json::Value> = request
         .messages
@@ -670,7 +697,10 @@ async fn dispatch_to_frontier(
             let content = match &m.content {
                 RouterMessageContent::Text(s) => serde_json::Value::String(s.clone()),
                 RouterMessageContent::Parts(parts) => serde_json::Value::Array(
-                    parts.iter().map(|p| serde_json::to_value(p).unwrap()).collect(),
+                    parts
+                        .iter()
+                        .map(|p| serde_json::to_value(p).unwrap())
+                        .collect(),
                 ),
             };
             let mut msg = serde_json::json!({"role": m.role, "content": content});
@@ -689,8 +719,6 @@ async fn dispatch_to_frontier(
         "messages": messages,
     });
 
-    // Merge model-level params into the request body (e.g. stop, num_ctx,
-    // repeat_penalty, temperature, top_k, top_p, n_gpu_layers, etc.).
     if let Some(p) = params {
         if let Some(obj) = p.as_object() {
             for (k, v) in obj {
@@ -699,15 +727,20 @@ async fn dispatch_to_frontier(
         }
     }
 
-    // Only fall back to request-level temperature/max_tokens if params didn't set them.
-    if !body.as_object().is_some_and(|o| o.contains_key("temperature")) {
+    if !body
+        .as_object()
+        .is_some_and(|o| o.contains_key("temperature"))
+    {
         if let Some(temp) = request.temperature {
             body["temperature"] = serde_json::Value::Number(
                 serde_json::Number::from_f64(temp).ok_or("invalid temperature")?,
             );
         }
     }
-    if !body.as_object().is_some_and(|o| o.contains_key("max_tokens")) {
+    if !body
+        .as_object()
+        .is_some_and(|o| o.contains_key("max_tokens"))
+    {
         if let Some(max_tokens) = request.max_tokens {
             body["max_tokens"] = serde_json::Value::Number(max_tokens.into());
         }
@@ -717,11 +750,7 @@ async fn dispatch_to_frontier(
     let mut last_err = String::new();
 
     for attempt in 0..max_attempts {
-        let result = client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await;
+        let result = client.post(&url).json(&body).send().await;
 
         match result {
             Ok(response) => {
@@ -746,13 +775,26 @@ async fn dispatch_to_frontier(
         }
     }
 
-    Err(format!("dispatch failed after {max_attempts} attempts: {last_err}"))
+    Err(format!(
+        "dispatch failed after {max_attempts} attempts: {last_err}"
+    ))
 }
 
 fn parse_openai_response(json: &serde_json::Value, fallback_model: &str) -> RouterResponse {
-    let id = json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let model = json.get("model").and_then(|v| v.as_str()).unwrap_or(fallback_model).to_string();
-    let created = json.get("created").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let id = json
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let model = json
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or(fallback_model)
+        .to_string();
+    let created = json
+        .get("created")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
 
     let choices: Vec<crate::types::RouterChoice> = json
         .get("choices")
@@ -760,11 +802,26 @@ fn parse_openai_response(json: &serde_json::Value, fallback_model: &str) -> Rout
         .map(|arr| {
             arr.iter()
                 .filter_map(|c| {
-                    let index = c.get("index").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32;
-                    let finish = c.get("finish_reason").and_then(|v| v.as_str()).unwrap_or("stop").to_string();
+                    let index = c
+                        .get("index")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0) as u32;
+                    let finish = c
+                        .get("finish_reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("stop")
+                        .to_string();
                     let msg = c.get("message")?;
-                    let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("assistant").to_string();
-                    let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let role = msg
+                        .get("role")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("assistant")
+                        .to_string();
+                    let content = msg
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     Some(crate::types::RouterChoice {
                         index,
                         message: RouterMessage {
@@ -780,11 +837,22 @@ fn parse_openai_response(json: &serde_json::Value, fallback_model: &str) -> Rout
         })
         .unwrap_or_default();
 
-    let usage = json.get("usage").map_or(Usage::default(), |u| Usage {
-        prompt_tokens: u.get("prompt_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32,
-        completion_tokens: u.get("completion_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32,
-        total_tokens: u.get("total_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32,
-    });
+    let usage = json
+        .get("usage")
+        .map_or(Usage::default(), |u| Usage {
+            prompt_tokens: u
+                .get("prompt_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32,
+            completion_tokens: u
+                .get("completion_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32,
+            total_tokens: u
+                .get("total_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32,
+        });
 
     RouterResponse {
         id,

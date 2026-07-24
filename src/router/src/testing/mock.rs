@@ -2,181 +2,213 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use fluent_wvr::prelude::*;
-use fluent_wvr_testutil::StubComponent;
+use guidance_llm::client::ChatBackend;
+use guidance_llm::{ChatMessage, LlmError};
 use serde::{Deserialize, Serialize};
 
-use crate::pipeline::{PipelineOrchestrator, PipelineResult};
-use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
-use crate::stages::common::extract_user_message;
-use crate::stages::deterministic::DeterministicPreFilter;
-use crate::stages::router::{RouterStage, RoutingPolicy};
-use crate::types::RouterRequest;
+use crate::config::ClassifierOutput;
+use crate::pipeline::RoutingTarget;
+use crate::types::{RouterMessage, RouterMessageContent, RouterResponse, Usage};
+
+pub struct TranscriptProvider {
+    entries: HashMap<String, String>,
+    default_response: String,
+}
+
+impl TranscriptProvider {
+    pub fn new(entries: HashMap<String, String>) -> Self {
+        Self {
+            entries,
+            default_response: Self::default_pass_response(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_default(mut self, response: String) -> Self {
+        self.default_response = response;
+        self
+    }
+
+    fn default_pass_response() -> String {
+        serde_json::to_string(&ClassifierOutput {
+            action: "route".into(),
+            response: None,
+            target: Some("fast".into()),
+            coherence_score: 0.95,
+            safety_score: 0.9,
+            complexity: None,
+            intent: Some("question".into()),
+            reason: "well-formed factual query".into(),
+        })
+        .unwrap_or_default()
+    }
+}
+
+impl ChatBackend for TranscriptProvider {
+    fn chat_complete(&self, messages: &[ChatMessage]) -> Result<String, LlmError> {
+        let user_msg = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .and_then(|m| {
+                let content = m.content.trim();
+                if content.is_empty() { None } else { Some(content) }
+            })
+            .unwrap_or("");
+
+        if user_msg.is_empty() {
+            return Ok(self.default_response.clone());
+        }
+
+        Ok(self
+            .entries
+            .get(user_msg)
+            .cloned()
+            .unwrap_or_else(|| self.default_response.clone()))
+    }
+}
+
+pub fn default_transcript() -> TranscriptProvider {
+    TranscriptProvider::new(HashMap::new())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MockFixtures {
+pub struct MockTranscriptEntry {
+    pub user_message: String,
+    pub classifier_response: String,
     #[serde(default)]
-    pub quality_gate: HashMap<String, String>,
-
+    pub expected_route: Option<String>,
     #[serde(default)]
-    pub guardrail: HashMap<String, String>,
-
+    pub dispatch_response: Option<String>,
     #[serde(default)]
-    pub planning: HashMap<String, String>,
-
+    pub rejected: bool,
     #[serde(default)]
-    pub classifier: HashMap<String, String>,
-
-    #[serde(default)]
-    pub agent_responses: HashMap<String, String>,
-
-    #[serde(default)]
-    pub frontier_responses: HashMap<String, String>,
+    pub reject_reason_contains: Option<String>,
 }
 
-impl MockFixtures {
-    pub fn new() -> Self {
+pub fn load_transcript_file(
+    path: impl AsRef<Path>,
+) -> Result<Vec<MockTranscriptEntry>, Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(path.as_ref())?;
+    Ok(serde_json::from_str(&content)?)
+}
+
+pub fn transcript_provider_from_entries(
+    entries: &[MockTranscriptEntry],
+) -> TranscriptProvider {
+    let map: HashMap<String, String> = entries
+        .iter()
+        .map(|e| (e.user_message.clone(), e.classifier_response.clone()))
+        .collect();
+    TranscriptProvider::new(map)
+}
+
+pub struct MockDispatchContext {
+    pub transcripts: Arc<Vec<MockTranscriptEntry>>,
+    pub failures: std::sync::Mutex<Vec<String>>,
+}
+
+impl MockDispatchContext {
+    pub fn new(transcripts: Vec<MockTranscriptEntry>) -> Self {
         Self {
-            quality_gate: HashMap::new(),
-            guardrail: HashMap::new(),
-            planning: HashMap::new(),
-            classifier: HashMap::new(),
-            agent_responses: HashMap::new(),
-            frontier_responses: HashMap::new(),
+            transcripts: Arc::new(transcripts),
+            failures: std::sync::Mutex::new(Vec::new()),
         }
     }
 
-    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
-        let content = std::fs::read_to_string(path.as_ref())?;
-        Ok(serde_json::from_str(&content)?)
+    pub fn lookup(&self, user_message: &str) -> Option<&MockTranscriptEntry> {
+        self.transcripts
+            .iter()
+            .find(|t| t.user_message == user_message)
     }
 
-    fn passed_classifier() -> StageDecision {
-        StageDecision {
-            stage: PipelineStage::Classifier,
-            verdict: StageVerdict::Passed,
-            score: Some(0.95),
-            reason: "intent=question, action=route, coherence=0.95".into(),
-            latency_ms: 0,
-            metadata: serde_json::json!({
-                "coherence_score": 0.95,
-                "safety_score": 0.9,
-                "intent": "question",
-                "action": "route",
-                "reason": "well-formed factual query",
-                "routing_target": {
-                    "url": "http://localhost:8080/v1",
-                    "model": "fast",
-                    "target_name": "fast"
+    pub fn validate_route(&self, entry: &MockTranscriptEntry, routing_target: Option<&RoutingTarget>) {
+        let result = match (&entry.expected_route, routing_target) {
+            (None, None) => Ok(()),
+            (Some(expected), Some(actual)) => {
+                let actual_route = actual
+                    .target_name
+                    .as_deref()
+                    .unwrap_or(&actual.model);
+                if actual_route == expected {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "route mismatch for '{}': expected '{}', got '{}' (model={}, url={})",
+                        entry.user_message, expected, actual_route, actual.model, actual.url
+                    ))
                 }
-            }),
+            }
+            (Some(expected), None) => Err(format!(
+                "route mismatch for '{}': expected '{}', but no routing target was set",
+                entry.user_message, expected
+            )),
+            (None, Some(actual)) => {
+                let actual_route = actual
+                    .target_name
+                    .as_deref()
+                    .unwrap_or(&actual.model);
+                Err(format!(
+                    "route mismatch for '{}': expected no route, but got '{}' (model={})",
+                    entry.user_message, actual_route, actual.model
+                ))
+            }
+        };
+
+        if let Err(msg) = result {
+            self.failures.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(msg);
         }
     }
-}
 
-impl Default for MockFixtures {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn build_mock_pipeline(fixtures: &Arc<MockFixtures>) -> PipelineOrchestrator {
-    let stages: Vec<Arc<dyn Component>> = vec![
-        Arc::new(DeterministicPreFilter::new()),
-        Arc::new(
-            StubComponent::new("pipeline.stage2.classifier")
-                .with_dep("pipeline.stage1.output")
-                .with_provides("pipeline.stage2.output")
-                .with_handler({
-                    let fixtures = Arc::clone(fixtures);
-                    move |ctx| {
-                        let input = extract_user_message(ctx)?;
-                        let decision = fixtures
-                            .classifier
-                            .get(&input)
-                            .and_then(|json| serde_json::from_str::<StageDecision>(json).ok())
-                            .unwrap_or_else(|| {
-                                MockFixtures::passed_classifier()
-                            });
-                        WorkOutput::typed("classified", &decision)
-                    }
-                }),
-        ),
-        Arc::new(RouterStage::new(RoutingPolicy::LocalFirst)),
-    ];
-
-    PipelineOrchestrator::new(stages)
-}
-
-pub struct MockRouter {
-    pipeline: PipelineOrchestrator,
-    fixtures: Arc<MockFixtures>,
-}
-
-impl MockRouter {
-    pub fn new(fixtures: MockFixtures) -> Self {
-        let fixtures = Arc::new(fixtures);
-        let pipeline = build_mock_pipeline(&fixtures);
-        Self { pipeline, fixtures }
+    pub fn validate_rejection(&self, entry: &MockTranscriptEntry, reject_reason: &str) {
+        if let Some(expected_substr) = &entry.reject_reason_contains {
+            if !reject_reason.contains(expected_substr.as_str()) {
+                self.failures
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(format!(
+                        "rejection reason mismatch for '{}': expected reason to contain '{}', got '{}'",
+                        entry.user_message, expected_substr, reject_reason
+                    ));
+            }
+        }
     }
 
-    pub fn from_fixture_file(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
-        let fixtures = MockFixtures::from_file(path)?;
-        Ok(Self::new(fixtures))
+    pub fn dispatch_response(
+        &self,
+        entry: &MockTranscriptEntry,
+        model_name: &str,
+    ) -> RouterResponse {
+        RouterResponse {
+            id: "mock-resp".into(),
+            object: "chat.completion".into(),
+            created: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            model: model_name.to_string(),
+            choices: vec![crate::types::RouterChoice {
+                index: 0,
+                message: RouterMessage {
+                    role: "assistant".into(),
+                    content: RouterMessageContent::Text(
+                        entry.dispatch_response.clone().unwrap_or_default(),
+                    ),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: "stop".into(),
+            }],
+            usage: Usage::default(),
+        }
     }
 
-    pub fn route(&self, request: &RouterRequest) -> Result<PipelineResult, WorkError> {
-        let request_json = serde_json::to_string(request)
-            .map_err(|e| WorkError::Execution(format!("serialization error: {e}")))?;
-
-        let mut ctx = WorkContext::default();
-        ctx.metadata.insert(
-            "request".into(),
-            MetadataValue::String(request_json),
-        );
-
-        let output = self.pipeline.execute(&ctx)?;
-        output.data_take().map_err(|e| WorkError::Execution(e.to_string()))
-    }
-
-    pub fn pipeline(&self) -> &PipelineOrchestrator {
-        &self.pipeline
-    }
-
-    pub fn fixtures(&self) -> &MockFixtures {
-        &self.fixtures
-    }
-}
-
-pub struct RouterOnlyMock {
-    pipeline: PipelineOrchestrator,
-    #[allow(dead_code)]
-    fixtures: Arc<MockFixtures>,
-}
-
-impl RouterOnlyMock {
-    pub fn new(fixtures: MockFixtures) -> Self {
-        let fixtures = Arc::new(fixtures);
-        let pipeline = build_mock_pipeline(&fixtures);
-        Self { pipeline, fixtures }
-    }
-
-    pub fn from_fixture_file(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
-        let fixtures = MockFixtures::from_file(path)?;
-        Ok(Self::new(fixtures))
-    }
-
-    pub fn route(&self, request: &RouterRequest) -> Result<PipelineResult, WorkError> {
-        let request_json = serde_json::to_string(request)
-            .map_err(|e| WorkError::Execution(format!("serialization error: {e}")))?;
-
-        let mut ctx = WorkContext::default();
-        ctx.metadata.insert(
-            "request".into(),
-            MetadataValue::String(request_json),
-        );
-
-        let output = self.pipeline.execute(&ctx)?;
-        output.data_take().map_err(|e| WorkError::Execution(e.to_string()))
+    pub fn take_failures(&self) -> Vec<String> {
+        std::mem::take(
+            &mut self
+                .failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 }

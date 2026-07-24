@@ -25,8 +25,8 @@
             "retry_count": 2,
             "retry_base_interval_s": 1,
             "params": {
-                "num_ctx": 16384,
-                "max_tokens": 512,
+                "num_ctx": 32768,
+                "max_tokens": 1024,
                 "temperature": 0.1
             }
         },

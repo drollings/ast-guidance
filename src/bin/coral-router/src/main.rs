@@ -1,12 +1,14 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
 use common_core::config::load_json_or_default;
 use fluent_router::config::RouterConfig;
 use fluent_router::logging::init_router_logging;
-use fluent_router::pipeline::PipelineOrchestrator;
 use fluent_router::server::RouterServer;
+use fluent_router::testing::{
+    load_transcript_file, transcript_provider_from_entries, MockDispatchContext,
+};
+use guidance_llm::client::ChatBackend;
 
 #[derive(Parser)]
 #[command(name = "coral-router", about = "LLM Router & Agent Orchestration Server")]
@@ -14,6 +16,11 @@ struct Args {
     /// Path to the router configuration JSON file.
     #[arg(short, long, default_value = "coral-router.json")]
     config: String,
+
+    /// Run in mock mode with a transcript file (bypasses the mock.transcript_path
+    /// in config if set).
+    #[arg(long)]
+    mock: Option<String>,
 }
 
 #[tokio::main]
@@ -24,7 +31,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     init_router_logging(&config.logging)?;
 
-    let pipelines: HashMap<String, Arc<PipelineOrchestrator>> = config.build_all_pipelines();
+    let transcript_path = args
+        .mock
+        .or_else(|| config.mock.as_ref().map(|m| m.transcript_path.clone()));
+
+    let (pipelines, mock_dispatch) = if let Some(ref path) = transcript_path {
+        tracing::info!(target: "coral-router", transcript = %path, "mock mode enabled");
+
+        let entries = load_transcript_file(path)?;
+        let provider = transcript_provider_from_entries(&entries);
+        let provider: Arc<dyn ChatBackend> = Arc::new(provider);
+        let dispatch_ctx = MockDispatchContext::new(entries);
+
+        let pipelines = config.build_all_pipelines_with_backend(Some(&provider));
+        (pipelines, Some(dispatch_ctx))
+    } else {
+        let pipelines = config.build_all_pipelines();
+        (pipelines, None)
+    };
+
     let routes = config.routes.clone();
 
     let classifier_url = config
@@ -40,7 +65,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "starting coral-router server"
     );
 
-    let server = RouterServer::new(pipelines, routes, &config.server, classifier_url);
+    let mut server = RouterServer::new(
+        pipelines,
+        routes,
+        &config.server,
+        classifier_url,
+    );
+
+    if let Some(ctx) = mock_dispatch {
+        server = server.with_mock(ctx);
+    }
+
     server.serve().await?;
 
     Ok(())

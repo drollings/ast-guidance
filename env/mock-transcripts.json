@@ -1,0 +1,39 @@
+[
+    {
+        "user_message": "What is 2+2?",
+        "classifier_response": "{\"action\":\"route\",\"target\":\"fast\",\"coherence_score\":0.95,\"safety_score\":0.9,\"intent\":\"question\",\"reason\":\"simple factual query\"}",
+        "expected_route": "fast",
+        "dispatch_response": "2 + 2 = 4",
+        "rejected": false
+    },
+    {
+        "user_message": "What is the capital of France?",
+        "classifier_response": "{\"action\":\"route\",\"target\":\"fast\",\"coherence_score\":0.95,\"safety_score\":0.9,\"intent\":\"question\",\"reason\":\"factual query\"}",
+        "expected_route": "fast",
+        "dispatch_response": "The capital of France is Paris.",
+        "rejected": false
+    },
+    {
+        "user_message": "My SSN is 123-45-6789",
+        "classifier_response": "{\"action\":\"reject\",\"coherence_score\":1.0,\"safety_score\":1.0,\"intent\":null,\"reason\":\"PII detected\"}",
+        "expected_route": null,
+        "dispatch_response": null,
+        "rejected": true,
+        "reject_reason_contains": "blocked"
+    },
+    {
+        "user_message": "/help",
+        "classifier_response": "{\"action\":\"reject\",\"coherence_score\":1.0,\"safety_score\":1.0,\"intent\":null,\"reason\":\"command\"}",
+        "expected_route": null,
+        "dispatch_response": null,
+        "rejected": true,
+        "reject_reason_contains": "help"
+    },
+    {
+        "user_message": "Write a Rust function to compute Fibonacci numbers.",
+        "classifier_response": "{\"action\":\"route\",\"target\":\"fast\",\"coherence_score\":0.95,\"safety_score\":0.9,\"complexity\":4,\"intent\":\"code\",\"reason\":\"code generation request\"}",
+        "expected_route": "fast",
+        "dispatch_response": "fn fibonacci(n: u32) -> u64 { ... }",
+        "rejected": false
+    }
+]

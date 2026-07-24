@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 fluent-router = { path = "../../router" }
 common-core = { path = "../../common-core" }
+guidance-llm = { path = "../../llm" }
 clap = { workspace = true, features = ["derive"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

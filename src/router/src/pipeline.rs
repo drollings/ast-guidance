@@ -8,6 +8,7 @@ use fluent_wvr::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
+use crate::stages::common::get_metadata_string;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingTarget {
@@ -255,13 +256,6 @@ impl WorkUnit for PipelineOrchestrator {
             },
         )
     }
-}
-
-fn get_metadata_string(ctx: &WorkContext, key: &str) -> Option<String> {
-    ctx.metadata.get(key).and_then(|v| match v {
-        MetadataValue::String(s) => Some(s.clone()),
-        _ => None,
-    })
 }
 
 impl FieldAccess for PipelineOrchestrator {

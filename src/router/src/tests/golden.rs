@@ -1,14 +1,21 @@
 //! Golden test set for the router pipeline.
 //!
 //! A checked-in labeled corpus covering intent categories, quality levels,
-//! PII presence, and adversarial edge cases. Tests validate that mock
-//! pipeline stages produce the expected decisions for each case.
+//! PII presence, and adversarial edge cases. Tests validate that pipeline
+//! stages produce the expected decisions for each case.
 //!
-//! All tests use `MockRouter` — no LLM, no network.
+//! All tests use the real `PipelineOrchestrator` with `TranscriptProvider`
+//! injected — no LLM, no network.
 
 use crate::pipeline_types::PipelineStage;
-use crate::testing::mock::{MockFixtures, MockRouter};
+use crate::testing::mock::TranscriptProvider;
 use crate::types::{RouterMessage, RouterMessageContent, RouterRequest};
+use std::sync::Arc;
+
+use crate::config::RouterConfig;
+use crate::pipeline::{PipelineOrchestrator, PipelineResult};
+use fluent_wvr::prelude::*;
+use guidance_llm::client::ChatBackend;
 
 struct GoldenCase {
     name: &'static str,
@@ -17,8 +24,30 @@ struct GoldenCase {
     expected_pii: &'static [&'static str],
 }
 
-fn default_pass_fixtures() -> MockFixtures {
-    MockFixtures::new()
+fn default_provider() -> TranscriptProvider {
+    TranscriptProvider::new(std::collections::HashMap::new())
+}
+
+
+fn make_test_config() -> RouterConfig {
+    match serde_json::from_str::<RouterConfig>(r#"{
+        "pipelines": {"default": {"deterministic_prefilter": true, "classifier": true, "router": true}},
+        "models": {"fast": {"endpoint": "http://localhost:8080/v1/chat/completions", "name": "fast", "intelligence": 1, "cost_input": 0.000001, "cost_output": 0.000006, "cost_cached_read": 0.0000004, "speed": 10, "total_timeout_ms": 5000, "idle_timeout_ms": 2000, "stream": false, "filter_thinking": false, "retry_count": 0, "retry_base_interval_s": 1}},
+        "model_groups": {"fast": ["fast"]},
+        "routes": {"fast": {"group": "fast", "pipelines": ["default"]}},
+        "default_route": "fast"
+    }"#) {
+        Ok(c) => c,
+        Err(e) => panic!("invalid test config: {e}"),
+    }
+}
+
+fn make_pipeline(provider: TranscriptProvider) -> PipelineOrchestrator {
+    let config = make_test_config();
+    let backend = Arc::new(provider) as Arc<dyn ChatBackend>;
+    config
+        .build_named_pipeline_with_backend("default", Some(backend))
+        .expect("default pipeline should build")
 }
 
 fn make_request(text: &str) -> RouterRequest {
@@ -40,6 +69,15 @@ fn make_request(text: &str) -> RouterRequest {
         adapter: None,
         metadata: Default::default(),
     }
+}
+
+fn route(pipeline: &PipelineOrchestrator, request: &RouterRequest) -> Result<PipelineResult, WorkError> {
+    let request_json = serde_json::to_string(request)
+        .map_err(|e| WorkError::Execution(format!("serialization error: {e}")))?;
+    let mut ctx = WorkContext::default();
+    ctx.metadata.insert("request".into(), MetadataValue::String(request_json));
+    let output = pipeline.execute(&ctx)?;
+    output.data_take().map_err(|e| WorkError::Execution(e.to_string()))
 }
 
 const INTENT_CASES: &[GoldenCase] = &[
@@ -141,12 +179,12 @@ const ADVERSARIAL_CASES: &[GoldenCase] = &[
     },
 ];
 
-fn run_golden_cases(cases: &[GoldenCase], fixtures: MockFixtures) {
-    let router = MockRouter::new(fixtures);
+fn run_golden_cases(cases: &[GoldenCase], provider: TranscriptProvider) {
+    let pipeline = make_pipeline(provider);
 
     for case in cases {
         let request = make_request(case.input);
-        let result = router.route(&request);
+        let result = route(&pipeline, &request);
 
         match case.expected_reject_stage {
             None => {
@@ -197,9 +235,7 @@ fn run_golden_cases(cases: &[GoldenCase], fixtures: MockFixtures) {
                             .get("pii_classes")
                             .and_then(|v| v.as_array())
                             .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|c| c.as_str())
-                                    .collect::<Vec<_>>()
+                                arr.iter().filter_map(|c| c.as_str()).collect::<Vec<_>>()
                             })
                             .unwrap_or_default();
                         for expected in case.expected_pii {
@@ -220,26 +256,24 @@ fn run_golden_cases(cases: &[GoldenCase], fixtures: MockFixtures) {
 
 #[test]
 fn golden_intent_categories() {
-    run_golden_cases(INTENT_CASES, default_pass_fixtures());
+    run_golden_cases(INTENT_CASES, default_provider());
 }
 
 #[test]
 fn golden_pii_detection() {
-    run_golden_cases(PII_CASES, default_pass_fixtures());
+    run_golden_cases(PII_CASES, default_provider());
 }
 
 #[test]
 fn golden_adversarial_cases() {
-    run_golden_cases(ADVERSARIAL_CASES, default_pass_fixtures());
+    run_golden_cases(ADVERSARIAL_CASES, default_provider());
 }
 
 #[test]
 fn golden_pipeline_has_all_stages() {
-    let fixtures = default_pass_fixtures();
-    let router = MockRouter::new(fixtures);
-
+    let pipeline = make_pipeline(default_provider());
     let request = make_request("What is the capital of France?");
-    let result = router.route(&request).expect("pipeline should complete");
+    let result = route(&pipeline, &request).expect("pipeline should complete");
     assert!(!result.rejected, "normal request should not be rejected");
     assert!(
         result.decisions.len() >= 2,
@@ -250,29 +284,20 @@ fn golden_pipeline_has_all_stages() {
 
 #[test]
 fn golden_command_is_rejected() {
-    let fixtures = default_pass_fixtures();
-    let router = MockRouter::new(fixtures);
-
+    let pipeline = make_pipeline(default_provider());
     let request = make_request("/help");
-    let result = router.route(&request).expect("pipeline should handle command");
+    let result = route(&pipeline, &request).expect("pipeline should handle command");
     assert!(result.rejected, "command should be rejected");
 }
 
 #[test]
 fn golden_unknown_command_is_rejected() {
-    let fixtures = default_pass_fixtures();
-    let router = MockRouter::new(fixtures);
-
+    let pipeline = make_pipeline(default_provider());
     let request = make_request("/nonexistent_command_xyz");
-    let result = router
-        .route(&request)
-        .expect("pipeline should handle unknown cmd");
+    let result = route(&pipeline, &request).expect("pipeline should handle unknown cmd");
     assert!(result.rejected, "unknown command should be rejected");
     assert!(
-        result
-            .reject_reason
-            .unwrap_or_default()
-            .contains("unknown command"),
+        result.reject_reason.unwrap_or_default().contains("unknown command"),
         "reject reason should mention unknown command"
     );
 }

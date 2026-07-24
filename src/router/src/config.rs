@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use common_core::config::load_json_or_default;
 use fluent_wvr::prelude::Component;
-use guidance_llm::LlmConfig;
+use guidance_llm::client::ChatBackend;
+use guidance_llm::{LlmClient, LlmConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::logging::LoggingConfig;
@@ -33,6 +34,26 @@ pub struct RouterConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    /// Mock mode configuration. When set, the server runs with a transcript
+    /// provider instead of real LLM calls, and validates routing decisions.
+    #[serde(default)]
+    pub mock: Option<MockConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MockConfig {
+    /// Path to a JSON transcript file containing mock test cases.
+    pub transcript_path: String,
+    /// Whether to fail (exit non-zero) on unexpected routing decisions.
+    #[serde(default = "default_true")]
+    pub fail_on_unexpected: bool,
+    /// Base URL for mock LLM dispatch responses (default: http://127.0.0.1:8081).
+    #[serde(default = "default_mock_base_url")]
+    pub base_url: String,
+}
+
+fn default_mock_base_url() -> String {
+    "http://127.0.0.1:8081".into()
 }
 
 impl Default for RouterConfig {
@@ -49,6 +70,7 @@ impl Default for RouterConfig {
             default_route: "fast".into(),
             server: ServerConfig::default(),
             logging: LoggingConfig::default(),
+            mock: None,
         }
     }
 }
@@ -286,6 +308,17 @@ impl RouterConfig {
 
     /// Build stages for a single named pipeline.
     pub fn build_named_pipeline(&self, name: &str) -> Option<PipelineOrchestrator> {
+        self.build_named_pipeline_with_backend(name, None)
+    }
+
+    /// Build stages for a single named pipeline, optionally injecting a mock
+    /// backend for the classifier stage. When `classifier_backend` is `None`,
+    /// the real `LlmClient` is constructed from the config.
+    pub fn build_named_pipeline_with_backend(
+        &self,
+        name: &str,
+        classifier_backend: Option<Arc<dyn ChatBackend>>,
+    ) -> Option<PipelineOrchestrator> {
         let params = self.pipelines.get(name)?;
         let mut stages: Vec<Arc<dyn Component>> = Vec::new();
 
@@ -304,39 +337,48 @@ impl RouterConfig {
             }
         }
 
-        let classifier_llm_config = self
-            .model_groups
-            .get(params.classifier_group.as_str())
-            .and_then(|names| names.first())
-            .and_then(|n| {
-                self.models
-                    .get(n)
-                    .map(|m| (m.endpoint.clone(), m.total_timeout_ms))
-            })
-            .map(|(endpoint, timeout_ms)| {
-                LlmConfig::new()
-                    .api_url(endpoint)
-                    .model("classifier".into())
-                    .timeout_ms(timeout_ms.max(5000))
-                    .build()
-            });
-
         if params.classifier {
-            if let Some(ref cfg) = classifier_llm_config {
-                let routing_config = self.routing_config();
+            let routing_config = self.routing_config();
+            let client: Arc<dyn ChatBackend> = if let Some(backend) = classifier_backend {
+                backend
+            } else {
+                let classifier_llm_config = self
+                    .model_groups
+                    .get(params.classifier_group.as_str())
+                    .and_then(|names| names.first())
+                    .and_then(|n| {
+                        self.models
+                            .get(n)
+                            .map(|m| (m.endpoint.clone(), m.total_timeout_ms))
+                    })
+                    .map(|(endpoint, timeout_ms)| {
+                        LlmConfig::new()
+                            .api_url(endpoint)
+                            .model("classifier".into())
+                            .timeout_ms(timeout_ms.max(5000))
+                            .build()
+                    });
+                let cfg = classifier_llm_config?;
                 let classifier_config = LlmConfig::new()
                     .api_url(cfg.api_url.clone())
                     .model(cfg.model.clone())
                     .timeout_ms(5000)
                     .build();
-                stages.push(Arc::new(
-                    crate::stages::classifier::ClassifierStage::new(
-                        classifier_config,
-                        routing_config,
-                        params.coherence_threshold,
-                    ),
-                ));
-            }
+                Arc::new(LlmClient::with_config(classifier_config))
+            };
+            stages.push(Arc::new(
+                crate::stages::classifier::ClassifierStage::new(
+                    client,
+                    routing_config,
+                    params.coherence_threshold,
+                ),
+            ));
+        } else if classifier_backend.is_some() {
+            tracing::warn!(
+                target: "router.config",
+                pipeline = %name,
+                "classifier backend was provided but classifier is disabled for this pipeline"
+            );
         }
 
         if params.router {
@@ -349,9 +391,20 @@ impl RouterConfig {
 
     /// Build all named pipelines defined in the config.
     pub fn build_all_pipelines(&self) -> HashMap<String, Arc<PipelineOrchestrator>> {
+        self.build_all_pipelines_with_backend(None)
+    }
+
+    /// Build all named pipelines with an optional classifier backend injection.
+    pub fn build_all_pipelines_with_backend(
+        &self,
+        classifier_backend: Option<&Arc<dyn ChatBackend>>,
+    ) -> HashMap<String, Arc<PipelineOrchestrator>> {
         let mut map = HashMap::new();
         for name in self.pipelines.keys() {
-            if let Some(pipeline) = self.build_named_pipeline(name) {
+            let backend_for_pipeline = classifier_backend.cloned();
+            if let Some(pipeline) =
+                self.build_named_pipeline_with_backend(name, backend_for_pipeline)
+            {
                 map.insert(name.clone(), Arc::new(pipeline));
             }
         }

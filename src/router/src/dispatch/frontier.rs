@@ -10,7 +10,7 @@ use crate::types::{
 };
 
 #[derive(Debug, Error)]
-pub enum FrontierError {
+pub enum DispatchError {
     #[error("unsupported provider: {0}")]
     UnsupportedProvider(String),
     #[error("HTTP error: {0}")]
@@ -37,11 +37,11 @@ pub enum StreamEvent {
     Error(String),
 }
 
-pub trait FrontierBackend: Send + Sync {
+pub trait DispatchBackend: Send + Sync {
     fn provider_name(&self) -> &str;
-    fn build_request(&self, request: &RouterRequest) -> Result<Value, FrontierError>;
-    fn parse_response(&self, body: &Value) -> Result<RouterResponse, FrontierError>;
-    fn parse_stream_event(&self, event: &[u8]) -> Result<StreamEvent, FrontierError>;
+    fn build_request(&self, request: &RouterRequest) -> Result<Value, DispatchError>;
+    fn parse_response(&self, body: &Value) -> Result<RouterResponse, DispatchError>;
+    fn parse_stream_event(&self, event: &[u8]) -> Result<StreamEvent, DispatchError>;
 }
 
 pub struct OpenAiBackend {
@@ -58,12 +58,12 @@ impl OpenAiBackend {
     }
 }
 
-impl FrontierBackend for OpenAiBackend {
+impl DispatchBackend for OpenAiBackend {
     fn provider_name(&self) -> &str {
         "openai"
     }
 
-    fn build_request(&self, request: &RouterRequest) -> Result<Value, FrontierError> {
+    fn build_request(&self, request: &RouterRequest) -> Result<Value, DispatchError> {
         let messages: Vec<Value> = request
             .messages
             .iter()
@@ -109,7 +109,7 @@ impl FrontierBackend for OpenAiBackend {
         Ok(body)
     }
 
-    fn parse_response(&self, body: &Value) -> Result<RouterResponse, FrontierError> {
+    fn parse_response(&self, body: &Value) -> Result<RouterResponse, DispatchError> {
         let id = body.get("id").and_then(Value::as_str).unwrap_or("unknown").to_string();
         let model = body.get("model").and_then(Value::as_str).unwrap_or("unknown").to_string();
         let created = body.get("created").and_then(Value::as_u64).unwrap_or(0);
@@ -163,15 +163,15 @@ impl FrontierBackend for OpenAiBackend {
         })
     }
 
-    fn parse_stream_event(&self, event: &[u8]) -> Result<StreamEvent, FrontierError> {
+    fn parse_stream_event(&self, event: &[u8]) -> Result<StreamEvent, DispatchError> {
         let text =
-            std::str::from_utf8(event).map_err(|e| FrontierError::StreamParse(format!("invalid UTF-8 in stream: {e}")))?;
+            std::str::from_utf8(event).map_err(|e| DispatchError::StreamParse(format!("invalid UTF-8 in stream: {e}")))?;
 
         if text == "[DONE]" {
             return Ok(StreamEvent::Done);
         }
 
-        let v: Value = serde_json::from_str(text).map_err(|e| FrontierError::StreamParse(e.to_string()))?;
+        let v: Value = serde_json::from_str(text).map_err(|e| DispatchError::StreamParse(e.to_string()))?;
         let empty_choices = vec![];
         let choices = v.get("choices").and_then(|v| v.as_array()).unwrap_or(&empty_choices);
 
@@ -185,19 +185,19 @@ impl FrontierBackend for OpenAiBackend {
             let finish_reason = choice.get("finish_reason").and_then(Value::as_str).map(ToString::to_string);
             Ok(StreamEvent::Chunk { delta, finish_reason })
         } else {
-            Err(FrontierError::StreamParse("no choices in stream event".into()))
+            Err(DispatchError::StreamParse("no choices in stream event".into()))
         }
     }
 }
 
 pub struct AnthropicBackend;
 
-impl FrontierBackend for AnthropicBackend {
+impl DispatchBackend for AnthropicBackend {
     fn provider_name(&self) -> &str {
         "anthropic"
     }
 
-    fn build_request(&self, request: &RouterRequest) -> Result<Value, FrontierError> {
+    fn build_request(&self, request: &RouterRequest) -> Result<Value, DispatchError> {
         let mut system_parts: Vec<String> = Vec::new();
         let mut messages: Vec<Value> = Vec::new();
 
@@ -240,7 +240,7 @@ impl FrontierBackend for AnthropicBackend {
         Ok(body)
     }
 
-    fn parse_response(&self, body: &Value) -> Result<RouterResponse, FrontierError> {
+    fn parse_response(&self, body: &Value) -> Result<RouterResponse, DispatchError> {
         let id = body.get("id").and_then(Value::as_str).unwrap_or("unknown").to_string();
         let model = body.get("model").and_then(Value::as_str).unwrap_or("unknown").to_string();
         let created = body.get("created").and_then(Value::as_u64).unwrap_or(0);
@@ -288,9 +288,9 @@ impl FrontierBackend for AnthropicBackend {
         })
     }
 
-    fn parse_stream_event(&self, event: &[u8]) -> Result<StreamEvent, FrontierError> {
+    fn parse_stream_event(&self, event: &[u8]) -> Result<StreamEvent, DispatchError> {
         let text =
-            std::str::from_utf8(event).map_err(|e| FrontierError::StreamParse(format!("invalid UTF-8 in stream: {e}")))?;
+            std::str::from_utf8(event).map_err(|e| DispatchError::StreamParse(format!("invalid UTF-8 in stream: {e}")))?;
 
         if text.starts_with("event: message_stop") || text.contains("[DONE]") {
             return Ok(StreamEvent::Done);
@@ -298,25 +298,25 @@ impl FrontierBackend for AnthropicBackend {
 
         if let Some(data) = text.strip_prefix("data: ") {
             let v: Value =
-                serde_json::from_str(data).map_err(|e| FrontierError::StreamParse(e.to_string()))?;
+                serde_json::from_str(data).map_err(|e| DispatchError::StreamParse(e.to_string()))?;
             if let Some(delta) = v.get("delta").and_then(|d| d.get("text")).and_then(|t| t.as_str()) {
                 Ok(StreamEvent::Chunk { delta: delta.to_string(), finish_reason: None })
             } else {
                 Ok(StreamEvent::Chunk { delta: String::new(), finish_reason: Some("stop".into()) })
             }
         } else {
-            Err(FrontierError::StreamParse("unexpected SSE format".into()))
+            Err(DispatchError::StreamParse("unexpected SSE format".into()))
         }
     }
 }
 
-pub struct OpenAiCompatibleBackend {
+pub struct OpenAiCompatBackend {
     pub api_base: String,
     pub api_key: Option<String>,
     pub provider_label: String,
 }
 
-impl OpenAiCompatibleBackend {
+impl OpenAiCompatBackend {
     pub fn new(api_base: impl Into<String>, api_key: Option<String>, provider_label: impl Into<String>) -> Self {
         Self {
             api_base: api_base.into(),
@@ -326,39 +326,39 @@ impl OpenAiCompatibleBackend {
     }
 }
 
-impl FrontierBackend for OpenAiCompatibleBackend {
+impl DispatchBackend for OpenAiCompatBackend {
     fn provider_name(&self) -> &str {
         &self.provider_label
     }
 
-    fn build_request(&self, request: &RouterRequest) -> Result<Value, FrontierError> {
+    fn build_request(&self, request: &RouterRequest) -> Result<Value, DispatchError> {
         let openai = OpenAiBackend::new(&self.api_base, self.api_key.clone());
         openai.build_request(request)
     }
 
-    fn parse_response(&self, body: &Value) -> Result<RouterResponse, FrontierError> {
+    fn parse_response(&self, body: &Value) -> Result<RouterResponse, DispatchError> {
         let openai = OpenAiBackend::new(&self.api_base, self.api_key.clone());
         openai.parse_response(body)
     }
 
-    fn parse_stream_event(&self, event: &[u8]) -> Result<StreamEvent, FrontierError> {
+    fn parse_stream_event(&self, event: &[u8]) -> Result<StreamEvent, DispatchError> {
         let openai = OpenAiBackend::new(&self.api_base, self.api_key.clone());
         openai.parse_stream_event(event)
     }
 }
 
 struct ProviderConfig {
-    backend: Arc<dyn FrontierBackend>,
+    backend: Arc<dyn DispatchBackend>,
     api_key: Option<String>,
 }
 
-pub struct FrontierDispatcher {
+pub struct LlmDispatcher {
     providers: HashMap<String, ProviderConfig>,
     http_client: reqwest::Client,
     limiter: Limiter,
 }
 
-impl FrontierDispatcher {
+impl LlmDispatcher {
     pub fn new(max_concurrent: usize) -> Self {
         Self {
             providers: HashMap::new(),
@@ -370,7 +370,7 @@ impl FrontierDispatcher {
     pub fn register_backend(
         &mut self,
         name: impl Into<String>,
-        backend: Arc<dyn FrontierBackend>,
+        backend: Arc<dyn DispatchBackend>,
         api_key: Option<String>,
     ) {
         self.providers.insert(
@@ -379,7 +379,7 @@ impl FrontierDispatcher {
         );
     }
 
-    pub fn get_backend(&self, name: &str) -> Option<&Arc<dyn FrontierBackend>> {
+    pub fn get_backend(&self, name: &str) -> Option<&Arc<dyn DispatchBackend>> {
         self.providers.get(name).map(|pc| &pc.backend)
     }
 
@@ -388,11 +388,11 @@ impl FrontierDispatcher {
         provider: &str,
         _model: &str,
         request: &RouterRequest,
-    ) -> Result<RouterResponse, FrontierError> {
+    ) -> Result<RouterResponse, DispatchError> {
         let pc = self
             .providers
             .get(provider)
-            .ok_or_else(|| FrontierError::UnsupportedProvider(provider.into()))?;
+            .ok_or_else(|| DispatchError::UnsupportedProvider(provider.into()))?;
 
         let body = pc.backend.build_request(request)?;
 
@@ -403,7 +403,7 @@ impl FrontierDispatcher {
                 if other.starts_with("http://") || other.starts_with("https://") {
                     other
                 } else {
-                    return Err(FrontierError::UnsupportedProvider(format!(
+                    return Err(DispatchError::UnsupportedProvider(format!(
                         "no known API URL for provider: {other}"
                     )));
                 }
@@ -421,10 +421,10 @@ impl FrontierDispatcher {
                 }
                 req.send()
                     .await
-                    .map_err(|e| FrontierError::Http(e.to_string()))?
+                    .map_err(|e| DispatchError::Http(e.to_string()))?
                     .json::<Value>()
                     .await
-                    .map_err(|e| FrontierError::ResponseParse(e.to_string()))
+                    .map_err(|e| DispatchError::ResponseParse(e.to_string()))
             })
             .await?;
 
