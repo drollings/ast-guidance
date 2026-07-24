@@ -1,7 +1,10 @@
 //! Router configuration types — deserialized from JSON via `common_core::config`.
 
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
+use common_core::config::load_json_or_default;
 use fluent_wvr::prelude::Component;
 use guidance_llm::LlmConfig;
 use serde::{Deserialize, Serialize};
@@ -27,6 +30,10 @@ pub struct RouterConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub reject_patterns_path: Option<String>,
+    #[serde(default)]
+    pub routing_fsm_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,11 +66,7 @@ pub struct PipelineConfig {
     #[serde(default = "default_true")]
     pub deterministic_prefilter: bool,
     #[serde(default = "default_true")]
-    pub quality_gate: bool,
-    #[serde(default = "default_true")]
-    pub planning_refinement: bool,
-    #[serde(default = "default_true")]
-    pub guardrail_check: bool,
+    pub classifier: bool,
     #[serde(default = "default_true")]
     pub router: bool,
     #[serde(default = "default_quality_threshold")]
@@ -76,9 +79,7 @@ impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
             deterministic_prefilter: true,
-            quality_gate: true,
-            planning_refinement: true,
-            guardrail_check: true,
+            classifier: true,
             router: true,
             quality_threshold: default_quality_threshold(),
             guardrail_mode: GuardrailMode::default(),
@@ -234,26 +235,111 @@ pub struct GuardrailConfig {
     pub check_local_agents: bool,
 }
 
+// ── Reject Patterns ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RejectPatterns {
+    #[serde(default)]
+    pub blacklist: Vec<BlacklistEntry>,
+    #[serde(default)]
+    pub commands: Option<CommandConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlacklistEntry {
+    pub name: String,
+    pub http_code: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    #[serde(default)]
+    pub regexes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandConfig {
+    pub pattern: String,
+    #[serde(default)]
+    pub handlers: HashMap<String, String>,
+}
+
+// ── Routing FSM ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingFsm {
+    pub system_prompt: String,
+    #[serde(default = "default_quality_threshold")]
+    pub quality_threshold: f64,
+    #[serde(default)]
+    pub safety_threshold: f64,
+    #[serde(default)]
+    pub routes: HashMap<String, RouteTarget>,
+    #[serde(default = "default_fast_route")]
+    pub default_route: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteTarget {
+    pub url: String,
+    pub model: String,
+}
+
+impl Default for RoutingFsm {
+    fn default() -> Self {
+        Self {
+            system_prompt: String::new(),
+            quality_threshold: default_quality_threshold(),
+            safety_threshold: 0.0,
+            routes: HashMap::new(),
+            default_route: default_fast_route(),
+        }
+    }
+}
+
+// ── Classifier output ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassifierOutput {
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    pub coherence_score: f64,
+    pub safety_score: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+    pub reason: String,
+}
+
 // ── Pipeline construction ──────────────────────────────────────────────
 
 impl RouterConfig {
-    /// Build a `PipelineOrchestrator` from the config.
-    ///
-    /// Stages that require an LLM (quality gate, planning, guardrail) are
-    /// only included when `PipelineConfig` enables them AND a model entry
-    /// exists in the catalog. The deterministic pre-filter and router
-    /// stages are always included when enabled (they need no LLM).
+    pub fn reject_patterns(&self) -> RejectPatterns {
+        self.reject_patterns_path
+            .as_deref()
+            .map(|p| load_json_or_default::<RejectPatterns>(Path::new(p)))
+            .unwrap_or_default()
+    }
+
+    pub fn routing_fsm(&self) -> RoutingFsm {
+        self.routing_fsm_path
+            .as_deref()
+            .and_then(|p| common_core::config::load_json::<RoutingFsm>(Path::new(p)).ok())
+            .unwrap_or_default()
+    }
+
     pub fn build_pipeline(&self) -> PipelineOrchestrator {
         let mut stages: Vec<Arc<dyn Component>> = Vec::new();
 
-        // Stage 1: deterministic pre-filter (no LLM)
         if self.pipeline.deterministic_prefilter {
+            let reject_patterns = self.reject_patterns();
             stages.push(Arc::new(
-                crate::stages::deterministic::DeterministicPreFilter::new(),
+                crate::stages::deterministic::DeterministicPreFilter::from_config(
+                    &reject_patterns,
+                ),
             ));
         }
 
-        // Derive an LlmConfig from the first orchestrator or frontier entry
         let llm_config = self
             .models
             .orchestrators
@@ -277,38 +363,24 @@ impl RouterConfig {
                 })
             });
 
-        if let Some(ref cfg) = llm_config {
-            // Stage 2: quality gate
-            if self.pipeline.quality_gate {
+        if self.pipeline.classifier {
+            if let Some(ref cfg) = llm_config {
+                let routing_fsm = self.routing_fsm();
+                let classifier_config = LlmConfig::new()
+                    .api_url(cfg.api_url.clone())
+                    .model(cfg.model.clone())
+                    .timeout_ms(5000)
+                    .build();
                 stages.push(Arc::new(
-                    crate::stages::quality_gate::QualityGate::new(
-                        cfg.clone(),
+                    crate::stages::classifier::ClassifierStage::new(
+                        classifier_config,
+                        routing_fsm,
                         self.pipeline.quality_threshold,
-                    ),
-                ));
-            }
-            // Stage 3: planning refinement
-            if self.pipeline.planning_refinement {
-                stages.push(Arc::new(
-                    crate::stages::planning::PlanningRefinementAgent::new(
-                        cfg.clone(),
-                        true,
-                    ),
-                ));
-            }
-            // Stage 4: guardrail check
-            if self.pipeline.guardrail_check {
-                stages.push(Arc::new(
-                    crate::stages::guardrail::GuardrailCheck::new(
-                        cfg.clone(),
-                        self.guardrails.pii_classes.clone(),
-                        self.guardrails.check_local_agents,
                     ),
                 ));
             }
         }
 
-        // Stage 5: router stage (no LLM — policy-based decision)
         if self.pipeline.router {
             let policy = if self.models.frontier.is_empty() {
                 crate::stages::router::RoutingPolicy::LocalFirst
@@ -329,6 +401,9 @@ fn default_true() -> bool {
 }
 fn default_quality_threshold() -> f64 {
     0.7
+}
+fn default_fast_route() -> String {
+    "fast".into()
 }
 fn default_orchestrator_ctx() -> usize {
     131_072

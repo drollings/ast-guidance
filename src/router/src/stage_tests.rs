@@ -273,7 +273,6 @@ mod tests {
         let stage1 = Arc::new(DeterministicPreFilter::new());
         let stage2 = Arc::new(RouterStage::new(RoutingPolicy::LocalFirst));
         let orchestrator = PipelineOrchestrator::new(vec![stage1, stage2]);
-        // Command dispatch should reject immediately, RouterStage never runs
         let ctx = make_ctx("/help");
         let output = orchestrator.execute(&ctx).expect("execute");
         let result: crate::pipeline::PipelineResult =

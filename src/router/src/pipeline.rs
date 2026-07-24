@@ -7,15 +7,26 @@ use std::time::Instant;
 use fluent_wvr::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::pipeline_types::{StageDecision, StageVerdict};
+use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
 
-/// Result returned by the `PipelineOrchestrator` after all stages complete.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingTarget {
+    pub url: String,
+    pub model: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineResult {
     pub decisions: Vec<StageDecision>,
     pub final_response: Option<String>,
     pub rejected: bool,
     pub reject_reason: Option<String>,
+    /// Routing target from the classifier stage (URL + model to dispatch to).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_target: Option<RoutingTarget>,
+    /// Direct response from the classifier stage (for trivial queries).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classifier_response: Option<String>,
 }
 
 /// Holds pipeline stages as `Arc<dyn Component>` and executes them sequentially.
@@ -87,6 +98,8 @@ impl WorkUnit for PipelineOrchestrator {
         let mut decisions: Vec<StageDecision> = Vec::new();
         let mut current_request = get_metadata_string(ctx, "request")
             .unwrap_or_default();
+        let mut routing_target: Option<RoutingTarget> = None;
+        let mut classifier_response: Option<String> = None;
 
         for stage in &self.stages {
             let stage_ctx = Self::build_stage_context(ctx, &current_request, &decisions);
@@ -103,10 +116,28 @@ impl WorkUnit for PipelineOrchestrator {
                         ..decision
                     };
                     let verdict = decision.verdict.clone();
+                    let stage_name = decision.stage;
+
                     decisions.push(decision.clone());
 
                     match verdict {
-                        StageVerdict::Passed | StageVerdict::Skipped => {}
+                        StageVerdict::Passed | StageVerdict::Skipped => {
+                            if stage_name == PipelineStage::Classifier {
+                                if let Some(resp) = decision
+                                    .metadata
+                                    .get("response")
+                                    .and_then(|v| v.as_str())
+                                {
+                                    classifier_response = Some(resp.to_string());
+                                }
+                                if let Some(rt) = decision.metadata.get("routing_target") {
+                                    routing_target = Some(RoutingTarget {
+                                        url: rt.get("url").and_then(|v| v.as_str()).unwrap_or("").into(),
+                                        model: rt.get("model").and_then(|v| v.as_str()).unwrap_or("").into(),
+                                    });
+                                }
+                            }
+                        }
                         StageVerdict::Rerouted => {
                             if let Some(rewritten) = decision.metadata.get("rewritten_request") {
                                 if let Some(s) = rewritten.as_str() {
@@ -122,6 +153,8 @@ impl WorkUnit for PipelineOrchestrator {
                                     final_response: None,
                                     rejected: true,
                                     reject_reason: Some(decision.reason),
+                                    routing_target: None,
+                                    classifier_response: None,
                                 },
                             );
                         }
@@ -136,6 +169,8 @@ impl WorkUnit for PipelineOrchestrator {
                                         "stage error: {}",
                                         decision.reason
                                     )),
+                                    routing_target: None,
+                                    classifier_response: None,
                                 },
                             );
                         }
@@ -143,7 +178,7 @@ impl WorkUnit for PipelineOrchestrator {
                 }
                 Err(e) => {
                     decisions.push(StageDecision {
-                        stage: crate::pipeline_types::PipelineStage::Router,
+                        stage: PipelineStage::Router,
                         verdict: StageVerdict::Error,
                         score: None,
                         reason: e.to_string(),
@@ -162,6 +197,8 @@ impl WorkUnit for PipelineOrchestrator {
                 final_response: None,
                 rejected: false,
                 reject_reason: None,
+                routing_target,
+                classifier_response,
             },
         )
     }

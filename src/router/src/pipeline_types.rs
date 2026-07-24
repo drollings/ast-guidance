@@ -48,9 +48,7 @@ impl StageDecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PipelineStage {
     DeterministicPreFilter,
-    QualityGate,
-    PlanningRefinement,
-    GuardrailCheck,
+    Classifier,
     Router,
 }
 

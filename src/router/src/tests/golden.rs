@@ -10,21 +10,13 @@ use crate::pipeline_types::PipelineStage;
 use crate::testing::mock::{MockFixtures, MockRouter};
 use crate::types::{RouterMessage, RouterMessageContent, RouterRequest};
 
-/// A single golden test case.
 struct GoldenCase {
-    /// Display name for the test case.
     name: &'static str,
-    /// Input user message.
     input: &'static str,
-    /// Expected stage that rejects (or None if pipeline should complete).
     expected_reject_stage: Option<PipelineStage>,
-    /// Expected PII classes (may be empty).
     expected_pii: &'static [&'static str],
 }
 
-/// Build a `MockFixtures` instance that returns "passed" for all
-/// LLM-dependent stages, so the golden test only exercises the
-/// deterministic pre-filter and router stages.
 fn default_pass_fixtures() -> MockFixtures {
     MockFixtures::new()
 }
@@ -49,8 +41,6 @@ fn make_request(text: &str) -> RouterRequest {
         metadata: Default::default(),
     }
 }
-
-// ── Intent Categories ───────────────────────────────────────────────────
 
 const INTENT_CASES: &[GoldenCase] = &[
     GoldenCase {
@@ -91,8 +81,6 @@ const INTENT_CASES: &[GoldenCase] = &[
     },
 ];
 
-// ── PII Cases ───────────────────────────────────────────────────────────
-
 const PII_CASES: &[GoldenCase] = &[
     GoldenCase {
         name: "ssn_present",
@@ -132,8 +120,6 @@ const PII_CASES: &[GoldenCase] = &[
     },
 ];
 
-// ── Adversarial / Edge Cases ────────────────────────────────────────────
-
 const ADVERSARIAL_CASES: &[GoldenCase] = &[
     GoldenCase {
         name: "prose_resembling_command",
@@ -154,8 +140,6 @@ const ADVERSARIAL_CASES: &[GoldenCase] = &[
         expected_pii: &[],
     },
 ];
-
-// ── Helpers ─────────────────────────────────────────────────────────────
 
 fn run_golden_cases(cases: &[GoldenCase], fixtures: MockFixtures) {
     let router = MockRouter::new(fixtures);
@@ -204,7 +188,6 @@ fn run_golden_cases(cases: &[GoldenCase], fixtures: MockFixtures) {
             }
         }
 
-        // Validate PII classes were detected
         if !case.expected_pii.is_empty() {
             if let Ok(pipeline_result) = &result {
                 for decision in &pipeline_result.decisions {
@@ -234,8 +217,6 @@ fn run_golden_cases(cases: &[GoldenCase], fixtures: MockFixtures) {
         }
     }
 }
-
-// ── Tests ───────────────────────────────────────────────────────────────
 
 #[test]
 fn golden_intent_categories() {

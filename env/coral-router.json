@@ -1,9 +1,7 @@
 {
     "pipeline": {
         "deterministic_prefilter": true,
-        "quality_gate": true,
-        "planning_refinement": true,
-        "guardrail_check": true,
+        "classifier": true,
         "router": true,
         "quality_threshold": 0.7,
         "guardrail_mode": "FrontierOnly"
@@ -67,5 +65,7 @@
         "max_files": 10,
         "json_format": false,
         "console_output": true
-    }
+    },
+    "reject_patterns_path": "env/reject-patterns.json",
+    "routing_fsm_path": "env/routing-fsm.json"
 }

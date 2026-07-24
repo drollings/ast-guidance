@@ -379,23 +379,60 @@ async fn handle_connection(
     }
 
     // Build response
-    if let Some(resp_str) = &pipeline_result.final_response {
+    if let Some(resp_str) = &pipeline_result.classifier_response {
+        let completion = RouterResponse {
+            id: String::new(),
+            object: "chat.completion".into(),
+            created: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            model: model_name.clone(),
+            choices: vec![crate::types::RouterChoice {
+                index: 0,
+                message: RouterMessage {
+                    role: "assistant".into(),
+                    content: RouterMessageContent::Text(resp_str.clone()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: "stop".into(),
+            }],
+            usage: Usage::default(),
+        };
+        let body = if is_stream {
+            let mut handler = crate::streaming::StreamingHandler::new(
+                &completion.id,
+                &completion.model,
+            );
+            let mut resp_body = String::new();
+            if let Some(choice) = completion.choices.first() {
+                resp_body.push_str(&handler.format_choice_chunk(choice));
+            }
+            resp_body.push_str(&handler.format_done());
+            resp_body
+        } else {
+            serde_json::to_string(&normalize::normalize_response(&completion))
+                .unwrap_or_default()
+        };
         let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{CORS_HEADERS}Connection: close\r\n\r\n{resp_str}",
-            resp_str.len()
+            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n{CORS_HEADERS}Connection: close\r\n\r\n{body}",
+            if is_stream { "text/event-stream" } else { "application/json" },
+            body.len()
         );
         stream.write_all(resp.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
-    } else {
-        let completion = if let Some(ref url) = frontier_url {
-            dispatch_to_frontier(url, &router_request)
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!(target: "router.server", error = %e, "frontier dispatch failed, using fallback");
-                    fallback_completion(&model_name)
-                })
+    } else if let Some(ref rt) = pipeline_result.routing_target {
+        let url = if rt.url.ends_with("/chat/completions") {
+            rt.url.clone()
         } else {
-            fallback_completion(&model_name)
+            format!("{}/chat/completions", rt.url.trim_end_matches('/'))
         };
+        let completion = dispatch_to_frontier(&url, &router_request, &rt.model)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(target: "router.server", error = %e, "classifier route dispatch failed, using fallback");
+                fallback_completion(&model_name)
+            });
 
         let body = if is_stream {
             let mut handler = crate::streaming::StreamingHandler::new(
@@ -412,7 +449,59 @@ async fn handle_connection(
             serde_json::to_string(&normalize::normalize_response(&completion))
                 .unwrap_or_default()
         };
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n{CORS_HEADERS}Connection: close\r\n\r\n{body}",
+            if is_stream { "text/event-stream" } else { "application/json" },
+            body.len()
+        );
+        stream.write_all(resp.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
+    } else if let Some(ref url) = frontier_url {
+        let completion = dispatch_to_frontier(url, &router_request, &model_name)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(target: "router.server", error = %e, "frontier dispatch failed, using fallback");
+                fallback_completion(&model_name)
+            });
 
+        let body = if is_stream {
+            let mut handler = crate::streaming::StreamingHandler::new(
+                &completion.id,
+                &completion.model,
+            );
+            let mut resp_body = String::new();
+            if let Some(choice) = completion.choices.first() {
+                resp_body.push_str(&handler.format_choice_chunk(choice));
+            }
+            resp_body.push_str(&handler.format_done());
+            resp_body
+        } else {
+            serde_json::to_string(&normalize::normalize_response(&completion))
+                .unwrap_or_default()
+        };
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n{CORS_HEADERS}Connection: close\r\n\r\n{body}",
+            if is_stream { "text/event-stream" } else { "application/json" },
+            body.len()
+        );
+        stream.write_all(resp.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
+    } else {
+        let completion = fallback_completion(&model_name);
+
+        let body = if is_stream {
+            let mut handler = crate::streaming::StreamingHandler::new(
+                &completion.id,
+                &completion.model,
+            );
+            let mut resp_body = String::new();
+            if let Some(choice) = completion.choices.first() {
+                resp_body.push_str(&handler.format_choice_chunk(choice));
+            }
+            resp_body.push_str(&handler.format_done());
+            resp_body
+        } else {
+            serde_json::to_string(&normalize::normalize_response(&completion))
+                .unwrap_or_default()
+        };
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n{CORS_HEADERS}Connection: close\r\n\r\n{body}",
             if is_stream { "text/event-stream" } else { "application/json" },
@@ -463,6 +552,7 @@ fn fallback_completion(model_name: &str) -> RouterResponse {
 async fn dispatch_to_frontier(
     frontier_url: &str,
     request: &RouterRequest,
+    model_name: &str,
 ) -> Result<RouterResponse, String> {
     let client = reqwest::Client::new();
     let url = if frontier_url.ends_with("/chat/completions") {
@@ -496,7 +586,7 @@ async fn dispatch_to_frontier(
         .collect();
 
     let mut body = serde_json::json!({
-        "model": request.model,
+        "model": model_name,
         "messages": messages,
     });
     if let Some(temp) = request.temperature {
@@ -520,13 +610,13 @@ async fn dispatch_to_frontier(
         .await
         .map_err(|e| format!("frontier JSON parse: {e}"))?;
 
-    parse_openai_response(&json, &request.model)
+    Ok(parse_openai_response(&json, model_name))
 }
 
-fn parse_openai_response(json: &serde_json::Value, fallback_model: &str) -> Result<RouterResponse, String> {
+fn parse_openai_response(json: &serde_json::Value, fallback_model: &str) -> RouterResponse {
     let id = json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let model = json.get("model").and_then(|v| v.as_str()).unwrap_or(fallback_model).to_string();
-    let created = json.get("created").and_then(|v| v.as_u64()).unwrap_or(0);
+    let created = json.get("created").and_then(serde_json::Value::as_u64).unwrap_or(0);
 
     let choices: Vec<crate::types::RouterChoice> = json
         .get("choices")
@@ -534,7 +624,7 @@ fn parse_openai_response(json: &serde_json::Value, fallback_model: &str) -> Resu
         .map(|arr| {
             arr.iter()
                 .filter_map(|c| {
-                    let index = c.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    let index = c.get("index").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32;
                     let finish = c.get("finish_reason").and_then(|v| v.as_str()).unwrap_or("stop").to_string();
                     let msg = c.get("message")?;
                     let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("assistant").to_string();
@@ -555,19 +645,19 @@ fn parse_openai_response(json: &serde_json::Value, fallback_model: &str) -> Resu
         .unwrap_or_default();
 
     let usage = json.get("usage").map_or(Usage::default(), |u| Usage {
-        prompt_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-        completion_tokens: u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-        total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        prompt_tokens: u.get("prompt_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32,
+        completion_tokens: u.get("completion_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32,
+        total_tokens: u.get("total_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32,
     });
 
-    Ok(RouterResponse {
+    RouterResponse {
         id,
         object: "chat.completion".into(),
         created,
         model,
         choices,
         usage,
-    })
+    }
 }
 
 #[cfg(test)]

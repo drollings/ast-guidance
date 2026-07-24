@@ -1,0 +1,44 @@
+{
+  "blacklist": [
+    {
+      "name": "ssn",
+      "http_code": 400,
+      "error_message": "SSN detected in request",
+      "regexes": [
+        "\\b\\d{3}-\\d{2}-\\d{4}\\b"
+      ]
+    },
+    {
+      "name": "card_number",
+      "http_code": 400,
+      "error_message": "Credit card number detected in request",
+      "regexes": [
+        "\\b(?:\\d[ -]*?){13,19}\\b"
+      ]
+    },
+    {
+      "name": "email",
+      "http_code": 400,
+      "error_message": "Email address detected in request",
+      "regexes": [
+        "\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}\\b"
+      ]
+    },
+    {
+      "name": "phone",
+      "http_code": 400,
+      "error_message": "Phone number detected in request",
+      "regexes": [
+        "\\b(?:\\+\\d{1,3}[-.\\s]?)?\\(?\\d{3}\\)?[-.\\s]?\\d{3}[-.\\s]?\\d{4}\\b"
+      ]
+    }
+  ],
+  "commands": {
+    "pattern": "^[/.](\\w[\\w-]*)(?:\\s+(.*))?$",
+    "handlers": {
+      "help": "Available commands: /help, /stats, /checkpoint <name>",
+      "stats": "Router statistics not yet available.",
+      "checkpoint": "checkpoint '$1' created."
+    }
+  }
+}

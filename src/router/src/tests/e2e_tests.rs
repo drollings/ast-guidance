@@ -61,22 +61,19 @@ fn test_e2e_normal_request_passes_all_stages() {
 
     assert!(!result.rejected, "normal request should not be rejected");
     assert!(
-        result.decisions.len() >= 5,
-        "pipeline should run through all 5 stages, got {}",
+        result.decisions.len() >= 3,
+        "pipeline should run through all 3 stages, got {}",
         result.decisions.len()
     );
 
-    // Verify stage order: DeterministicPreFilter → QualityGate → Planning → Guardrail → Router
     let stage_order: Vec<PipelineStage> = result
         .decisions
         .iter()
         .map(|d| d.stage)
         .collect();
     assert_eq!(stage_order[0], PipelineStage::DeterministicPreFilter);
-    assert_eq!(stage_order[1], PipelineStage::QualityGate);
-    assert_eq!(stage_order[2], PipelineStage::PlanningRefinement);
-    assert_eq!(stage_order[3], PipelineStage::GuardrailCheck);
-    assert_eq!(stage_order[4], PipelineStage::Router);
+    assert_eq!(stage_order[1], PipelineStage::Classifier);
+    assert_eq!(stage_order[2], PipelineStage::Router);
 }
 
 #[test]
@@ -98,22 +95,22 @@ fn test_e2e_all_stages_pass_verdict() {
 // ── Garbage Input Rejection ─────────────────────────────────────────────
 
 #[test]
-fn test_e2e_garbage_rejected_by_quality_gate() {
+fn test_e2e_garbage_rejected_by_classifier() {
     let mut fixtures = default_fixtures();
     let reject_decision = serde_json::json!({
-        "stage": "QualityGate",
+        "stage": "Classifier",
         "verdict": "Rejected",
         "score": 0.15,
-        "reason": "rejected: intent=garbage, coherence=0.15",
+        "reason": "rejected: coherence 0.15 below threshold 0.30",
         "latency_ms": 0,
         "metadata": {
+            "coherence_score": 0.15,
+            "safety_score": 0.9,
             "intent": "garbage",
-            "coherence": 0.15,
-            "is_code": false,
-            "language": "english"
+            "action": "reject"
         }
     });
-    fixtures.quality_gate.insert(
+    fixtures.classifier.insert(
         "asdfghjkl qwerty zxcvbnm".into(),
         serde_json::to_string(&reject_decision).unwrap(),
     );
@@ -126,9 +123,10 @@ fn test_e2e_garbage_rejected_by_quality_gate() {
     assert!(
         result
             .reject_reason
-            .unwrap_or_default()
-            .contains("garbage"),
-        "rejection reason should mention garbage"
+            .as_ref()
+            .map_or(false, |r| r.contains("coherence")),
+        "rejection reason should mention coherence, got: {:?}",
+        result.reject_reason
     );
 }
 
@@ -250,7 +248,6 @@ fn test_e2e_routing_decision_included() {
     let request = make_request("Help me debug Rust code");
     let result = mock.route(&request).expect("pipeline should complete");
 
-    // The router stage (last) should have routing metadata
     let router_decision = result.decisions.last().expect("should have router decision");
     assert_eq!(router_decision.stage, PipelineStage::Router);
     assert_eq!(router_decision.verdict, StageVerdict::Passed);
@@ -262,6 +259,20 @@ fn test_e2e_routing_decision_included() {
     assert!(
         routing_decision.get("destination").is_some(),
         "routing decision should have a destination"
+    );
+}
+
+// ── Classifier routing target ───────────────────────────────────────────
+
+#[test]
+fn test_e2e_classifier_provides_routing_target() {
+    let mock = MockRouter::new(default_fixtures());
+    let request = make_request("What is 2+2?");
+    let result = mock.route(&request).expect("pipeline should complete");
+    assert!(!result.rejected, "normal request should not be rejected");
+    assert!(
+        result.routing_target.is_some(),
+        "classifier should provide routing target"
     );
 }
 
@@ -302,43 +313,43 @@ fn test_e2e_custom_fixtures_produce_expected_results() {
 
     let mut fixtures = default_fixtures();
 
-    // Configure quality gate to reject "bad" input
     let reject_decision = StageDecision {
-        stage: PipelineStage::QualityGate,
+        stage: PipelineStage::Classifier,
         verdict: StageVerdict::Rejected,
         score: Some(0.2),
         reason: "mock rejection: low quality".into(),
         latency_ms: 0,
-        metadata: serde_json::json!({"intent": "garbage", "coherence": 0.2}),
+        metadata: serde_json::json!({"coherence_score": 0.2, "safety_score": 0.9, "action": "reject"}),
     };
-    fixtures.quality_gate.insert(
+    fixtures.classifier.insert(
         "bad input that should be rejected".into(),
         serde_json::to_string(&reject_decision).unwrap(),
     );
 
-    // Configure quality gate to pass "good" input
     let pass_decision = StageDecision {
-        stage: PipelineStage::QualityGate,
+        stage: PipelineStage::Classifier,
         verdict: StageVerdict::Passed,
         score: Some(0.95),
         reason: "mock: high quality".into(),
         latency_ms: 0,
-        metadata: serde_json::json!({"intent": "question", "coherence": 0.95}),
+        metadata: serde_json::json!({
+            "coherence_score": 0.95, "safety_score": 0.9,
+            "intent": "question", "action": "route",
+            "routing_target": {"url": "http://localhost:8080/v1", "model": "fast", "target_name": "fast"}
+        }),
     };
-    fixtures.quality_gate.insert(
+    fixtures.classifier.insert(
         "good quality input".into(),
         serde_json::to_string(&pass_decision).unwrap(),
     );
 
     let mock = MockRouter::new(fixtures);
 
-    // Test rejection path
     let bad_result = mock
         .route(&make_request("bad input that should be rejected"))
         .expect("pipeline should handle rejection");
     assert!(bad_result.rejected, "bad input should be rejected");
 
-    // Test pass path
     let good_result = mock
         .route(&make_request("good quality input"))
         .expect("pipeline should complete");
@@ -346,8 +357,6 @@ fn test_e2e_custom_fixtures_produce_expected_results() {
 }
 
 // ── Checkpoint/Rewind Cycle (DAG session-level) ─────────────────────────
-// These tests verify the DependencySession checkpoint/rewind logic
-// using the existing dag_session module.
 
 #[test]
 fn test_e2e_dag_session_checkpoint_rewind() {
@@ -355,7 +364,6 @@ fn test_e2e_dag_session_checkpoint_rewind() {
 
     let mut session = DependencySession::new("e2e-session");
 
-    // Add steps with dependencies
     session
         .add_step(SessionStep::new("step1", "Initial research"))
         .expect("add step1");
@@ -373,7 +381,6 @@ fn test_e2e_dag_session_checkpoint_rewind() {
         .add_step(SessionStep::new("step4", "Testing").with_depends(vec!["step3".into()]))
         .expect("add step4");
 
-    // Complete step1 and step2
     let ok = |content: &str| StepResult {
         content: content.into(),
         accepted: true,
@@ -389,16 +396,13 @@ fn test_e2e_dag_session_checkpoint_rewind() {
         .complete_step("step2", ok("Analysis complete"))
         .expect("complete step2");
 
-    // Verify checkpoint was registered (step3 has checkpoint=true)
     let checkpoints = session.checkpoints();
     assert!(!checkpoints.is_empty(), "step3 should be a checkpoint");
 
-    // Complete step3
     session
         .complete_step("step3", ok("Implementation complete"))
         .expect("complete step3");
 
-    // Rewind to step3 checkpoint should reset step3 and step4 to Pending
     session
         .rewind_to_checkpoint("step3")
         .expect("rewind");

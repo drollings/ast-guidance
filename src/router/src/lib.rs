@@ -8,7 +8,7 @@
 //! - `session` — `SessionNode`, `StepStatus`
 //! - `config` — `RouterConfig` and all sub-config types
 //! - `pipeline` — `PipelineOrchestrator`, `PipelineResult`
-//! - `stages` — pipeline stage implementations
+//! - `stages` — pipeline stage implementations (deterministic, classifier, router)
 //! - `transforms` — `TransformStrategy`, transforms (NoTransform, PiiAnonymize, etc.)
 //! - `dispatch` — `FrontierDispatcher`, `AgentDispatcher`
 //! - `watchdog` — `WatchdogSet`, `MaxTokenWatchdog`, `WallClockWatchdog`, `RepetitionWatchdog`

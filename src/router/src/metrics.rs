@@ -185,7 +185,7 @@ mod tests {
     fn record_stage_decision_increments_counter() {
         let m = RouterMetrics::new();
         let d = StageDecision::new(
-            PipelineStage::QualityGate,
+            PipelineStage::Classifier,
             StageVerdict::Passed,
             "test",
         );
@@ -194,7 +194,7 @@ mod tests {
 
         let snap = m.snapshot_stage_verdicts();
         assert_eq!(
-            snap.get(&(PipelineStage::QualityGate, StageVerdict::Passed)),
+            snap.get(&(PipelineStage::Classifier, StageVerdict::Passed)),
             Some(&2)
         );
     }
