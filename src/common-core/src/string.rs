@@ -257,6 +257,21 @@ pub fn truncate_at_sentence(text: &str, max_chars: usize) -> String {
     truncated.to_string()
 }
 
+/// Return the first sentence of `text` — trimmed text up to and including
+/// the first `.`, `!`, or `?`. If no sentence-ending punctuation is found,
+/// returns up to 120 characters.
+pub fn first_sentence(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Some(idx) = trimmed.find(['.', '!', '?']) {
+        trimmed[..=idx].trim().to_string()
+    } else {
+        trimmed.chars().take(120).collect()
+    }
+}
+
 pub fn is_path_token(s: &str) -> bool {
     s.len() >= 3 && (s.contains('/') || s.contains('\\'))
 }
@@ -615,6 +630,46 @@ mod tests {
     #[test]
     fn strip_nl_prefix_new_semantics_explain() {
         assert_eq!(strip_nl_prefix("explain Z"), "Z");
+    }
+
+    #[test]
+    fn first_sentence_with_period() {
+        assert_eq!(first_sentence("Hello world. More text"), "Hello world.");
+    }
+
+    #[test]
+    fn first_sentence_with_exclamation() {
+        assert_eq!(first_sentence("Great answer! Follow up"), "Great answer!");
+    }
+
+    #[test]
+    fn first_sentence_with_question() {
+        assert_eq!(
+            first_sentence("What is this? More text."),
+            "What is this?"
+        );
+    }
+
+    #[test]
+    fn first_sentence_no_punctuation() {
+        let result = first_sentence("Single sentence no punctuation");
+        assert!(result.len() <= 120);
+        assert_eq!(result, "Single sentence no punctuation");
+    }
+
+    #[test]
+    fn first_sentence_empty() {
+        assert_eq!(first_sentence(""), "");
+    }
+
+    #[test]
+    fn first_sentence_whitespace_only() {
+        assert_eq!(first_sentence("  "), "");
+    }
+
+    #[test]
+    fn first_sentence_trims_leading_whitespace() {
+        assert_eq!(first_sentence("  Hello. World"), "Hello.");
     }
 
     #[test]

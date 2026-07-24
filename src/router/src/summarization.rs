@@ -149,7 +149,7 @@ impl WorkUnit for ResultScorer {
         scored.accepted = scored.score >= self.acceptance_threshold;
 
         if !scored.accepted {
-            scored.summary = truncate_at_sentence(&scored.summary);
+            scored.summary = common_core::string::first_sentence(&scored.summary);
         }
 
         WorkOutput::typed("scored", &scored)
@@ -336,49 +336,9 @@ impl Describable for Summarizer {
 
 impl_component!(Summarizer);
 
-/// Truncate text at the first sentence-ending punctuation (. ! ?).
-fn truncate_at_sentence(text: &str) -> String {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    if let Some(idx) = trimmed.find(['.', '!', '?']) {
-        trimmed[..=idx].trim().to_string()
-    } else {
-        trimmed.chars().take(120).collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_truncate_at_sentence_with_period() {
-        assert_eq!(truncate_at_sentence("Hello world. More text"), "Hello world.");
-    }
-
-    #[test]
-    fn test_truncate_at_sentence_with_exclamation() {
-        assert_eq!(truncate_at_sentence("Great answer! Follow up"), "Great answer!");
-    }
-
-    #[test]
-    fn test_truncate_at_sentence_no_punctuation() {
-        let result = truncate_at_sentence("Single sentence no punctuation");
-        assert!(result.len() <= 120);
-        assert_eq!(result, "Single sentence no punctuation");
-    }
-
-    #[test]
-    fn test_truncate_at_sentence_empty() {
-        assert_eq!(truncate_at_sentence(""), "");
-    }
-
-    #[test]
-    fn test_truncate_at_sentence_whitespace() {
-        assert_eq!(truncate_at_sentence("  "), "");
-    }
 
     #[test]
     fn test_result_scorer_name() {

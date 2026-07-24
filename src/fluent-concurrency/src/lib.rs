@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod affinity;
 pub mod capability;
 pub mod flow;
 pub mod io;
