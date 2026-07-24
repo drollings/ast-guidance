@@ -532,7 +532,6 @@ async fn dispatch_real(
             &rt.model,
             model_name,
             rt.params.as_ref(),
-            rt.filter_thinking,
             rt.retry_count,
             rt.retry_base_interval_s,
             rt.idle_timeout_ms,
@@ -692,7 +691,6 @@ fn dispatch_to_llm_streaming(
     model_name: &str,
     response_model: &str,
     params: Option<&serde_json::Value>,
-    filter_thinking: bool,
     retry_count: u32,
     retry_base_interval_s: u64,
     idle_timeout_ms: u64,
@@ -739,7 +737,7 @@ fn dispatch_to_llm_streaming(
     tokio::spawn(async move {
         if let Err(e) = stream_dispatch_inner(
             &client, &url, &body, &model, &request_id, &resp_model,
-            filter_thinking, retry_count, retry_base_interval_s,
+            retry_count, retry_base_interval_s,
             idle_timeout_ms, total_timeout_ms, &mut tx,
         )
         .await
@@ -758,7 +756,6 @@ async fn stream_dispatch_inner(
     model_name: &str,
     request_id: &str,
     response_model: &str,
-    filter_thinking: bool,
     retry_count: u32,
     retry_base_interval_s: u64,
     idle_timeout_ms: u64,
@@ -810,7 +807,6 @@ async fn stream_dispatch_inner(
 
     let mut handler = StreamingHandler::new(request_id, format!("{response_model}#stream"));
     let mut line_buf = Vec::new();
-    let mut thinking = filter_thinking;
     let mut sent_first_chunk = false;
 
     loop {
@@ -875,17 +871,23 @@ async fn stream_dispatch_inner(
                         if let Some(fr) = finish_reason {
                             let _ = tx.send_data(Bytes::from(handler.format_chunk(delta, Some(fr)))).await;
                             let _ = tx.send_data(Bytes::from(handler.format_done())).await;
+
+                            let raw_content = handler.accumulated_content();
+                            if raw_content.contains("<thinking>") {
+                                let filtered_len = handler.filtered_content().len();
+                                tracing::debug!(target: "router.dispatch",
+                                    raw_len = raw_content.len(),
+                                    filtered_len = filtered_len,
+                                    "stream complete — thinking blocks stripped from context"
+                                );
+                            }
                             return Ok(());
                         }
 
-                        if thinking && !delta.is_empty() {
-                            thinking = false;
-                        }
-
-                        if !thinking {
-                            sent_first_chunk = true;
-                            let _ = tx.send_data(Bytes::from(handler.format_chunk(delta, None))).await;
-                        }
+                        sent_first_chunk = true;
+                        let _ = tx
+                            .send_data(Bytes::from(handler.format_chunk(delta, None)))
+                            .await;
                     }
                 }
             }

@@ -70,6 +70,50 @@ impl StreamingHandler {
     pub fn accumulated_content(&self) -> &str {
         &self.buffer
     }
+
+    /// Return the accumulated content with `<thinking>...</thinking>` blocks
+    /// stripped. Intended for session context / KV cache accumulation where
+    /// reasoning tokens should not pollute the working context.
+    pub fn filtered_content(&self) -> String {
+        let mut result = String::with_capacity(self.buffer.len());
+        let mut in_thinking = false;
+        let mut pos = 0;
+        let bytes = self.buffer.as_bytes();
+
+        while pos < bytes.len() {
+            if in_thinking {
+                if let Some(end) = find_subseq(bytes, pos, b"</thinking>") {
+                    in_thinking = false;
+                    pos = end + b"</thinking>".len();
+                } else {
+                    break;
+                }
+            } else if let Some(start) = find_subseq(bytes, pos, b"<thinking>") {
+                result.push_str(&self.buffer[pos..start]);
+                if let Some(end) = find_subseq(bytes, start + b"<thinking>".len(), b"</thinking>") {
+                    pos = end + b"</thinking>".len();
+                } else {
+                    return result;
+                }
+            } else {
+                result.push_str(&self.buffer[pos..]);
+                return result;
+            }
+        }
+
+        result
+    }
+}
+
+/// Find the first occurrence of a subsequence in bytes starting from `start`.
+fn find_subseq(haystack: &[u8], start: usize, needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    haystack[start..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|i| start + i)
 }
 
 #[cfg(test)]
@@ -126,5 +170,58 @@ mod tests {
         h.format_chunk("hello", None);
         h.format_chunk(" world", None);
         assert_eq!(h.accumulated_content(), "hello world");
+    }
+
+    #[test]
+    fn filtered_content_strips_thinking_blocks() {
+        let mut h = StreamingHandler::new("req-1", "test");
+        h.format_chunk("Hello ", None);
+        h.format_chunk("<thinking>let me think", None);
+        h.format_chunk(" carefully</thinking>", None);
+        h.format_chunk(" world", None);
+        assert_eq!(h.filtered_content(), "Hello  world");
+    }
+
+    #[test]
+    fn filtered_content_handles_unclosed_thinking() {
+        let mut h = StreamingHandler::new("req-1", "test");
+        h.format_chunk("A ", None);
+        h.format_chunk("<thinking>unclosed", None);
+        assert_eq!(h.filtered_content(), "A ");
+    }
+
+    #[test]
+    fn filtered_content_no_thinking_noop() {
+        let mut h = StreamingHandler::new("req-1", "test");
+        h.format_chunk("hello", None);
+        h.format_chunk(" world", None);
+        assert_eq!(h.filtered_content(), "hello world");
+    }
+
+    #[test]
+    fn filtered_content_multiple_thinking_blocks() {
+        let mut h = StreamingHandler::new("req-1", "test");
+        h.format_chunk("A", None);
+        h.format_chunk("<thinking>skip</thinking>", None);
+        h.format_chunk("B", None);
+        h.format_chunk("<thinking>skip2</thinking>", None);
+        h.format_chunk("C", None);
+        assert_eq!(h.filtered_content(), "ABC");
+    }
+
+    #[test]
+    fn filtered_content_thinking_at_start() {
+        let mut h = StreamingHandler::new("req-1", "test");
+        h.format_chunk("<thinking>reasoning</thinking>", None);
+        h.format_chunk("result", None);
+        assert_eq!(h.filtered_content(), "result");
+    }
+
+    #[test]
+    fn filtered_content_thinking_at_end() {
+        let mut h = StreamingHandler::new("req-1", "test");
+        h.format_chunk("result", None);
+        h.format_chunk("<thinking>reasoning</thinking>", None);
+        assert_eq!(h.filtered_content(), "result");
     }
 }
