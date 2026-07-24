@@ -21,7 +21,6 @@
 //! (timestamps, model hash, version). Pulling gigabyte-scale KV buffers into
 //! the router's own memory space would add unnecessary overhead and latency.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -102,7 +101,7 @@ impl HotKvCache {
     /// Insert snapshot metadata into the hot cache.
     pub fn put(&self, snapshot: KvSnapshot) {
         let key = Self::key(&snapshot.model, snapshot.adapter.as_deref(), &snapshot.session_id);
-        self.snapshots.lock().unwrap().put(key, Arc::new(snapshot));
+        self.snapshots.lock().unwrap_or_else(std::sync::PoisonError::into_inner).put(key, Arc::new(snapshot));
     }
 
     /// Get snapshot metadata from the hot cache.
@@ -114,7 +113,7 @@ impl HotKvCache {
     ) -> Option<Arc<KvSnapshot>> {
         self.snapshots
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&Self::key(model, adapter, session_id))
             .cloned()
     }
@@ -123,18 +122,18 @@ impl HotKvCache {
     pub fn remove(&self, model: &str, adapter: Option<&str>, session_id: &str) {
         self.snapshots
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pop(&Self::key(model, adapter, session_id));
     }
 
     /// Current number of entries in the hot cache.
     pub fn len(&self) -> usize {
-        self.snapshots.lock().unwrap().len()
+        self.snapshots.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
     }
 
     /// Returns true if the hot cache is empty.
     pub fn is_empty(&self) -> bool {
-        self.snapshots.lock().unwrap().is_empty()
+        self.snapshots.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty()
     }
 
     /// The max RAM budget in MB.
@@ -163,7 +162,7 @@ impl ColdKvCache {
         eviction: crate::config::EvictionPolicy,
     ) -> Self {
         let mp = mountpoint.into();
-        if let Err(e) = fs::create_dir_all(&mp) {
+        if let Err(e) = std::fs::create_dir_all(&mp) {
             tracing::warn!("could not create cold cache directory {mp:?}: {e}");
         }
         Self {
@@ -209,13 +208,13 @@ impl ColdKvCache {
     /// written by llama.cpp's server via its slot save endpoint. This method
     /// copies it into the managed directory layout and records the sidecar
     /// metadata.
-    pub fn save(&self, snapshot: &KvSnapshot) -> Result<(), KvCacheError> {
+    pub async fn save(&self, snapshot: &KvSnapshot) -> Result<(), KvCacheError> {
         let dir = self.snapshot_dir(
             &snapshot.model,
             snapshot.adapter.as_deref(),
             &snapshot.session_id,
         );
-        fs::create_dir_all(&dir)?;
+        tokio::fs::create_dir_all(&dir).await?;
 
         let target = self.snapshot_path(
             &snapshot.model,
@@ -223,10 +222,8 @@ impl ColdKvCache {
             &snapshot.session_id,
         );
 
-        // Copy from the source path (where llama.cpp wrote it) to the managed path.
-        // If the source is already at the target, this is a no-op.
         if snapshot.file_path != target {
-            fs::copy(&snapshot.file_path, &target)?;
+            tokio::fs::copy(&snapshot.file_path, &target).await?;
         }
 
         Ok(())
@@ -243,7 +240,7 @@ impl ColdKvCache {
     /// `model_quant` against the current environment before attempting
     /// restoration. Mismatch should return an error, not attempt best-effort
     /// restore.
-    pub fn load(
+    pub async fn load(
         &self,
         model: &str,
         adapter: Option<&str>,
@@ -251,14 +248,9 @@ impl ColdKvCache {
     ) -> Result<KvSnapshot, KvCacheError> {
         let path = self.snapshot_path(model, adapter, session_id);
 
-        if !path.exists() {
-            return Err(KvCacheError::NotFound(format!(
-                "no snapshot at {}",
-                path.display()
-            )));
-        }
-
-        let metadata = fs::metadata(&path)?;
+        let metadata = tokio::fs::metadata(&path).await.map_err(|_| {
+            KvCacheError::NotFound(format!("no snapshot at {}", path.display()))
+        })?;
         let created = metadata
             .created()
             .unwrap_or(UNIX_EPOCH)
@@ -285,14 +277,14 @@ impl ColdKvCache {
     }
 
     /// Evict stale or over-budget snapshots. Returns the number evicted.
-    pub fn evict(&self) -> Result<usize, KvCacheError> {
+    pub async fn evict(&self) -> Result<usize, KvCacheError> {
         let now = now_secs();
         let mut evicted = 0;
 
-        let entries = self.walk_snapshots()?;
+        let entries = self.walk_snapshots().await?;
 
         for (path, _snapshot) in entries {
-            let metadata = fs::metadata(&path)?;
+            let metadata = tokio::fs::metadata(&path).await?;
             let last_used = metadata
                 .modified()
                 .unwrap_or(UNIX_EPOCH)
@@ -308,7 +300,7 @@ impl ColdKvCache {
             };
 
             if should_evict {
-                fs::remove_file(&path)?;
+                tokio::fs::remove_file(&path).await?;
                 evicted += 1;
             }
         }
@@ -317,9 +309,9 @@ impl ColdKvCache {
     }
 
     /// List all snapshots for a session.
-    pub fn list_snapshots(&self, session_id: &str) -> Vec<KvSnapshot> {
+    pub async fn list_snapshots(&self, session_id: &str) -> Vec<KvSnapshot> {
         let mut results = Vec::new();
-        if let Ok(entries) = self.walk_snapshots() {
+        if let Ok(entries) = self.walk_snapshots().await {
             for (path, snapshot) in entries {
                 if snapshot.session_id == session_id {
                     let mut s = snapshot;
@@ -332,36 +324,36 @@ impl ColdKvCache {
     }
 
     /// Walk the mountpoint and collect snapshot entries with basic metadata.
-    fn walk_snapshots(&self) -> Result<Vec<(PathBuf, KvSnapshot)>, KvCacheError> {
+    async fn walk_snapshots(&self) -> Result<Vec<(PathBuf, KvSnapshot)>, KvCacheError> {
         let mut results = Vec::new();
-        self.walk_dir(&self.mountpoint, &mut results)?;
+        self.walk_dir(&self.mountpoint, &mut results).await?;
         Ok(results)
     }
 
-    fn walk_dir(
+    async fn walk_dir(
         &self,
         dir: &Path,
         results: &mut Vec<(PathBuf, KvSnapshot)>,
     ) -> Result<(), KvCacheError> {
-        if !dir.exists() {
+        if tokio::fs::metadata(dir).await.is_err() {
             return Ok(());
         }
 
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
+        let mut entries = tokio::fs::read_dir(dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
             if path.is_dir() {
-                self.walk_dir(&path, results)?;
+                Box::pin(self.walk_dir(&path, results)).await?;
             } else if path.extension().is_some_and(|e| e == "kv") {
-                let snapshot = self.read_file_meta(&path)?;
+                let snapshot = self.read_file_meta(&path).await?;
                 results.push((path, snapshot));
             }
         }
         Ok(())
     }
 
-    fn read_file_meta(&self, path: &Path) -> Result<KvSnapshot, KvCacheError> {
-        let metadata = fs::metadata(path)?;
+    async fn read_file_meta(&self, path: &Path) -> Result<KvSnapshot, KvCacheError> {
+        let metadata = tokio::fs::metadata(path).await?;
         let created = metadata
             .created()
             .unwrap_or(UNIX_EPOCH)
@@ -432,8 +424,8 @@ impl KvCacheManager {
 
     /// Store snapshot metadata in both tiers. Copies the KV cache file into
     /// the cold tier's organized directory tree and promotes to the hot tier.
-    pub fn store(&self, snapshot: KvSnapshot) -> Result<(), KvCacheError> {
-        self.cold.save(&snapshot)?;
+    pub async fn store(&self, snapshot: KvSnapshot) -> Result<(), KvCacheError> {
+        self.cold.save(&snapshot).await?;
         self.hot.put(snapshot);
         Ok(())
     }
@@ -443,7 +435,7 @@ impl KvCacheManager {
     ///
     /// Returns metadata only — callers must pass the returned `file_path` to
     /// llama.cpp's server for KV cache restoration.
-    pub fn retrieve(
+    pub async fn retrieve(
         &self,
         model: &str,
         adapter: Option<&str>,
@@ -453,12 +445,12 @@ impl KvCacheManager {
             return Ok(snapshot);
         }
 
-        let snapshot = self.cold.load(model, adapter, session_id)?;
+        let snapshot = self.cold.load(model, adapter, session_id).await?;
         let arc = Arc::new(snapshot);
         self.hot
             .snapshots
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .put(
                 HotKvCache::key(model, adapter, session_id),
                 Arc::clone(&arc),
@@ -467,8 +459,8 @@ impl KvCacheManager {
     }
 
     /// Evict from cold tier based on policy.
-    pub fn evict(&self) -> Result<usize, KvCacheError> {
-        self.cold.evict()
+    pub async fn evict(&self) -> Result<usize, KvCacheError> {
+        self.cold.evict().await
     }
 }
 
@@ -549,8 +541,8 @@ mod tests {
         assert!(cache.get("m", None, "sess-2").is_some());
     }
 
-    #[test]
-    fn test_cold_cache_save_load() {
+    #[tokio::test]
+    async fn test_cold_cache_save_load() {
         let dir = tempfile::tempdir().unwrap();
         let src_dir = tempfile::tempdir().unwrap();
         let cold = ColdKvCache::new(
@@ -561,20 +553,20 @@ mod tests {
         );
 
         let src_file = src_dir.path().join("src.kv");
-        fs::write(&src_file, b"dummy kv cache bytes").unwrap();
+        tokio::fs::write(&src_file, b"dummy kv cache bytes").await.unwrap();
 
         let mut snap = test_snapshot("sess-cold");
         snap.file_path = src_file;
-        cold.save(&snap).unwrap();
+        cold.save(&snap).await.unwrap();
 
-        let loaded = cold.load("test-model", None, "sess-cold").unwrap();
+        let loaded = cold.load("test-model", None, "sess-cold").await.unwrap();
         assert_eq!(loaded.model, "test-model");
         assert_eq!(loaded.session_id, "sess-cold");
         assert!(loaded.file_path.exists());
     }
 
-    #[test]
-    fn test_cold_cache_load_nonexistent() {
+    #[tokio::test]
+    async fn test_cold_cache_load_nonexistent() {
         let dir = tempfile::tempdir().unwrap();
         let cold = ColdKvCache::new(
             dir.path(),
@@ -583,12 +575,12 @@ mod tests {
             crate::config::EvictionPolicy::Lru,
         );
 
-        let result = cold.load("test-model", None, "no-such-session");
+        let result = cold.load("test-model", None, "no-such-session").await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_kv_cache_manager_two_tier() {
+    #[tokio::test]
+    async fn test_kv_cache_manager_two_tier() {
         let dir = tempfile::tempdir().unwrap();
         let src_dir = tempfile::tempdir().unwrap();
         let hot = Arc::new(HotKvCache::new(10, 1024));
@@ -601,24 +593,24 @@ mod tests {
         let mgr = KvCacheManager::new(Arc::clone(&hot), Arc::clone(&cold));
 
         let src_file = src_dir.path().join("tier-src.kv");
-        fs::write(&src_file, b"tier kv cache bytes").unwrap();
+        tokio::fs::write(&src_file, b"tier kv cache bytes").await.unwrap();
 
         let mut snap = test_snapshot("sess-tier");
         snap.file_path = src_file;
-        mgr.store(snap).unwrap();
+        mgr.store(snap).await.unwrap();
 
         // Should be in hot tier
-        let retrieved = mgr.retrieve("test-model", None, "sess-tier").unwrap();
+        let retrieved = mgr.retrieve("test-model", None, "sess-tier").await.unwrap();
         assert_eq!(retrieved.session_id, "sess-tier");
 
         // Remove from hot, should fall back to cold
         hot.remove("test-model", None, "sess-tier");
-        let retrieved2 = mgr.retrieve("test-model", None, "sess-tier").unwrap();
+        let retrieved2 = mgr.retrieve("test-model", None, "sess-tier").await.unwrap();
         assert_eq!(retrieved2.session_id, "sess-tier");
     }
 
-    #[test]
-    fn test_cold_cache_evict_by_ttl() {
+    #[tokio::test]
+    async fn test_cold_cache_evict_by_ttl() {
         let dir = tempfile::tempdir().unwrap();
         let src_dir = tempfile::tempdir().unwrap();
         let cold = ColdKvCache::new(
@@ -629,18 +621,18 @@ mod tests {
         );
 
         let src_file = src_dir.path().join("evict-src.kv");
-        fs::write(&src_file, b"evict kv cache bytes").unwrap();
+        tokio::fs::write(&src_file, b"evict kv cache bytes").await.unwrap();
 
         let mut snap = test_snapshot("sess-evict");
         snap.file_path = src_file;
-        cold.save(&snap).unwrap();
+        cold.save(&snap).await.unwrap();
 
-        let evicted = cold.evict().unwrap();
+        let evicted = cold.evict().await.unwrap();
         assert_eq!(evicted, 1);
     }
 
-    #[test]
-    fn test_list_snapshots() {
+    #[tokio::test]
+    async fn test_list_snapshots() {
         let dir = tempfile::tempdir().unwrap();
         let src_dir = tempfile::tempdir().unwrap();
         let cold = ColdKvCache::new(
@@ -651,13 +643,13 @@ mod tests {
         );
 
         let src_file = src_dir.path().join("list-src.kv");
-        fs::write(&src_file, b"list kv cache bytes").unwrap();
+        tokio::fs::write(&src_file, b"list kv cache bytes").await.unwrap();
 
         let mut snap = test_snapshot("sess-list");
         snap.file_path = src_file;
-        cold.save(&snap).unwrap();
+        cold.save(&snap).await.unwrap();
 
-        let snapshots = cold.list_snapshots("sess-list");
+        let snapshots = cold.list_snapshots("sess-list").await;
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].session_id, "sess-list");
     }

@@ -417,11 +417,6 @@ impl RouterConfig {
             );
         }
 
-        if params.router {
-            let policy = crate::stages::router::RoutingPolicy::LocalFirst;
-            stages.push(Arc::new(crate::stages::router::RouterStage::new(policy)));
-        }
-
         Some(crate::pipeline::PipelineOrchestrator::new(stages))
     }
 

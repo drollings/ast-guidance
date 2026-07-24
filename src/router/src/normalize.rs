@@ -52,8 +52,8 @@ struct OpenAiMessage {
 }
 
 /// Normalize an OpenAI-compatible chat completion request JSON into a RouterRequest.
-pub fn normalize_request(body: &serde_json::Value) -> Result<RouterRequest, NormalizeError> {
-    let raw: OpenAiChatRequest = serde_json::from_value(body.clone())
+pub fn normalize_request(body: serde_json::Value) -> Result<RouterRequest, NormalizeError> {
+    let raw: OpenAiChatRequest = serde_json::from_value(body)
         .map_err(|e| NormalizeError::Parse(e.to_string()))?;
 
     if raw.messages.is_empty() {
@@ -64,7 +64,7 @@ pub fn normalize_request(body: &serde_json::Value) -> Result<RouterRequest, Norm
         .messages
         .into_iter()
         .map(|m| {
-            let content = normalize_message_content(&m.content)?;
+            let content = normalize_message_content(m.content)?;
             let tool_calls = m
                 .tool_calls
                 .map(|tc| {
@@ -106,11 +106,11 @@ pub fn normalize_request(body: &serde_json::Value) -> Result<RouterRequest, Norm
     })
 }
 
-fn normalize_message_content(raw: &serde_json::Value) -> Result<RouterMessageContent, NormalizeError> {
+fn normalize_message_content(raw: serde_json::Value) -> Result<RouterMessageContent, NormalizeError> {
     match raw {
-        serde_json::Value::String(s) => Ok(RouterMessageContent::Text(s.clone())),
+        serde_json::Value::String(s) => Ok(RouterMessageContent::Text(s)),
         serde_json::Value::Array(_) => {
-            let parts = serde_json::from_value(raw.clone())
+            let parts = serde_json::from_value(raw)
                 .map_err(|e| NormalizeError::Parse(e.to_string()))?;
             Ok(RouterMessageContent::Parts(parts))
         }
@@ -170,6 +170,34 @@ pub fn error_response(message: &str, error_type: &str) -> serde_json::Value {
     })
 }
 
+/// Convert RouterRequest messages into Vec<serde_json::Value> for dispatch.
+/// Used by both server.rs dispatch_to_llm and dispatch::frontier backends.
+pub fn messages_to_json(request: &RouterRequest) -> Vec<serde_json::Value> {
+    request
+        .messages
+        .iter()
+        .map(|m| {
+            let content = match &m.content {
+                RouterMessageContent::Text(s) => serde_json::Value::String(s.clone()),
+                RouterMessageContent::Parts(parts) => serde_json::Value::Array(
+                    parts
+                        .iter()
+                        .map(|p| serde_json::to_value(p).unwrap())
+                        .collect(),
+                ),
+            };
+            let mut msg = serde_json::json!({"role": m.role, "content": content});
+            if let Some(ref tc) = m.tool_calls {
+                msg["tool_calls"] = serde_json::to_value(tc).unwrap();
+            }
+            if let Some(ref id) = m.tool_call_id {
+                msg["tool_call_id"] = serde_json::Value::String(id.clone());
+            }
+            msg
+        })
+        .collect()
+}
+
 /// Build a minimal RouterResponse for pipeline rejections.
 pub fn rejection_response(_reason: &str, model: &str) -> RouterResponse {
     RouterResponse {
@@ -202,7 +230,7 @@ mod tests {
                 {"role": "user", "content": "hello"}
             ]
         });
-        let req = normalize_request(&body).unwrap();
+        let req = normalize_request(body).unwrap();
         assert_eq!(req.model, "test-model");
         assert_eq!(req.messages.len(), 1);
         assert_eq!(req.messages[0].role, "user");
@@ -216,14 +244,14 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "session_id": "sess-123"
         });
-        let req = normalize_request(&body).unwrap();
+        let req = normalize_request(body).unwrap();
         assert_eq!(req.session_id.as_deref(), Some("sess-123"));
     }
 
     #[test]
     fn normalize_missing_messages_errors() {
         let body = serde_json::json!({"model": "test"});
-        assert!(normalize_request(&body).is_err());
+        assert!(normalize_request(body).is_err());
     }
 
     #[test]
@@ -232,7 +260,7 @@ mod tests {
             "model": "test",
             "messages": []
         });
-        assert!(normalize_request(&body).is_err());
+        assert!(normalize_request(body).is_err());
     }
 
     #[test]

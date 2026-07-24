@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::agent::{AgentConfig, AgentError, AgentIdentity, AgentRegistry, AgentTask};
 use crate::kv_cache::{HotKvCache, KvSnapshot};
-use crate::stages::router::RoutingDestination;
+use crate::pipeline_types::RoutingDestination;
 use crate::types::{RouterMessageContent, RouterRequest};
 use crate::watchdog::WatchdogSet;
 

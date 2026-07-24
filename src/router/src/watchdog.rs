@@ -157,7 +157,7 @@ impl RepetitionWatchdog {
     }
 
     pub fn check(&self, token: &str) -> Option<WatchdogEvent> {
-        let mut buffer = self.buffer.lock().unwrap();
+        let mut buffer = self.buffer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         buffer.push_back(token.to_string());
         if buffer.len() > self.window {
             buffer.pop_front();
@@ -177,7 +177,7 @@ impl RepetitionWatchdog {
     }
 
     pub fn reset(&self) {
-        self.buffer.lock().unwrap().clear();
+        self.buffer.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
     }
 }
 

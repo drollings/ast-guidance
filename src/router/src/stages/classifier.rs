@@ -41,6 +41,28 @@ impl ClassifierStage {
             provides: vec![ArcIntern::from("pipeline.stage2.output")],
         }
     }
+
+    fn build_routing_target_json(
+        &self,
+        route_name: &str,
+        model: &crate::config::ModelEntry,
+        model_name: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "url": model.endpoint,
+            "model": model_name,
+            "group": self.routing_config
+                .routes
+                .get(route_name)
+                .or_else(|| self.routing_config.routes.get(&self.routing_config.default_route))
+                .map_or("", |r| r.group.as_str()),
+            "target_name": route_name,
+            "params": model.params,
+            "filter_thinking": model.filter_thinking,
+            "retry_count": model.retry_count,
+            "retry_base_interval_s": model.retry_base_interval_s,
+        })
+    }
 }
 
 impl WorkUnit for ClassifierStage {
@@ -176,20 +198,11 @@ impl WorkUnit for ClassifierStage {
                     tracing::warn!(target: "router.pipeline.stage2", route = %resolved_route, "resolve_route returned None — no dispatch target");
                 }
                 resolved.map(|(model, model_name)| {
-                    serde_json::json!({
-                        "url": model.endpoint,
-                        "model": model_name,
-                        "group": self.routing_config
-                            .routes
-                            .get(resolved_route)
-                            .or_else(|| self.routing_config.routes.get(&self.routing_config.default_route))
-                            .map_or("", |r| r.group.as_str()),
-                        "target_name": resolved_route,
-                        "params": model.params,
-                        "filter_thinking": model.filter_thinking,
-                        "retry_count": model.retry_count,
-                        "retry_base_interval_s": model.retry_base_interval_s,
-                    })
+                    self.build_routing_target_json(
+                        resolved_route,
+                        model,
+                        &model_name,
+                    )
                 })
             }
             _ => {
@@ -205,19 +218,11 @@ impl WorkUnit for ClassifierStage {
                     );
                 }
                 resolved.map(|(model, model_name)| {
-                    serde_json::json!({
-                        "url": model.endpoint,
-                        "model": model_name,
-                        "group": self.routing_config
-                            .routes
-                            .get(fallback_route)
-                            .map_or("", |r| r.group.as_str()),
-                        "target_name": fallback_route,
-                        "params": model.params,
-                        "filter_thinking": model.filter_thinking,
-                        "retry_count": model.retry_count,
-                        "retry_base_interval_s": model.retry_base_interval_s,
-                    })
+                    self.build_routing_target_json(
+                        fallback_route,
+                        model,
+                        &model_name,
+                    )
                 })
             }
         };

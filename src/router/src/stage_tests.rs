@@ -7,7 +7,6 @@ mod tests {
     use crate::pipeline::PipelineOrchestrator;
     use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
     use crate::stages::deterministic::DeterministicPreFilter;
-    use crate::stages::router::{RouterStage, RoutingPolicy};
 
     fn make_ctx(user_text: &str) -> WorkContext {
         let request_json = serde_json::json!({
@@ -170,50 +169,6 @@ mod tests {
         assert!(pii.len() >= 2);
     }
 
-    // ── RouterStage ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_router_local_first_policy() {
-        let stage = RouterStage::new(RoutingPolicy::LocalFirst);
-        let ctx = WorkContext::default();
-        let output = stage.execute(&ctx).expect("execute");
-        let decision: StageDecision = output.data_as().expect("data_as");
-        assert_eq!(decision.verdict, StageVerdict::Passed);
-        assert!(decision.reason.contains("LocalFirst"));
-    }
-
-    #[test]
-    fn test_router_frontier_only_policy() {
-        let stage = RouterStage::new(RoutingPolicy::FrontierOnly);
-        let ctx = WorkContext::default();
-        let output = stage.execute(&ctx).expect("execute");
-        let decision: StageDecision = output.data_as().expect("data_as");
-        assert_eq!(decision.verdict, StageVerdict::Passed);
-        assert!(decision.reason.contains("FrontierOnly"));
-    }
-
-    #[test]
-    fn test_router_auto_routing_policy() {
-        let stage = RouterStage::new(RoutingPolicy::AutoRouting {
-            classifier_model: "test-model".into(),
-        });
-        let ctx = WorkContext::default();
-        let output = stage.execute(&ctx).expect("execute");
-        let decision: StageDecision = output.data_as().expect("data_as");
-        assert_eq!(decision.verdict, StageVerdict::Passed);
-        assert!(decision.reason.contains("auto-routing"));
-    }
-
-    #[test]
-    fn test_router_cost_minimizing_policy() {
-        let stage = RouterStage::new(RoutingPolicy::CostMinimizing);
-        let ctx = WorkContext::default();
-        let output = stage.execute(&ctx).expect("execute");
-        let decision: StageDecision = output.data_as().expect("data_as");
-        assert_eq!(decision.verdict, StageVerdict::Passed);
-        assert!(decision.reason.contains("LocalFirst"));
-    }
-
     // ── PipelineOrchestrator ─────────────────────────────────────────────────
 
     #[test]
@@ -254,35 +209,6 @@ mod tests {
     }
 
     #[test]
-    fn test_pipeline_multiple_stages_sequential() {
-        let stage1 = Arc::new(DeterministicPreFilter::new());
-        let stage2 = Arc::new(RouterStage::new(RoutingPolicy::LocalFirst));
-        let orchestrator = PipelineOrchestrator::new(vec![stage1, stage2]);
-        let ctx = make_ctx("What is Rust?");
-        let output = orchestrator.execute(&ctx).expect("execute");
-        let result: crate::pipeline::PipelineResult =
-            output.data_as().expect("data_as");
-        assert!(!result.rejected);
-        assert_eq!(result.decisions.len(), 2);
-        assert_eq!(result.decisions[0].verdict, StageVerdict::Passed);
-        assert_eq!(result.decisions[1].verdict, StageVerdict::Passed);
-    }
-
-    #[test]
-    fn test_pipeline_early_termination_on_rejected() {
-        let stage1 = Arc::new(DeterministicPreFilter::new());
-        let stage2 = Arc::new(RouterStage::new(RoutingPolicy::LocalFirst));
-        let orchestrator = PipelineOrchestrator::new(vec![stage1, stage2]);
-        let ctx = make_ctx("/help");
-        let output = orchestrator.execute(&ctx).expect("execute");
-        let result: crate::pipeline::PipelineResult =
-            output.data_as().expect("data_as");
-        assert!(result.rejected);
-        assert_eq!(result.decisions.len(), 1);
-        assert_eq!(result.decisions[0].verdict, StageVerdict::Rejected);
-    }
-
-    #[test]
     fn test_pipeline_orchestrator_name() {
         let orchestrator = PipelineOrchestrator::new(vec![]);
         assert_eq!(orchestrator.name(), "pipeline.orchestrator");
@@ -311,13 +237,6 @@ mod tests {
     fn test_deterministic_prefilter_describable() {
         let filter = DeterministicPreFilter::new();
         let desc = filter.describe();
-        assert_eq!(desc["type"], "object");
-    }
-
-    #[test]
-    fn test_router_stage_describable() {
-        let stage = RouterStage::new(RoutingPolicy::LocalFirst);
-        let desc = stage.describe();
         assert_eq!(desc["type"], "object");
     }
 }

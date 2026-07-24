@@ -248,7 +248,7 @@ impl DependencySession {
     /// for audit (it is not deleted). If a `KvCacheManager` is attached
     /// and a model name is provided, the KV cache snapshot is restored
     /// from the cold tier.
-    pub fn rewind_to_checkpoint(
+    pub async fn rewind_to_checkpoint(
         &mut self,
         checkpoint_name: &str,
     ) -> Result<(), DagError> {
@@ -292,7 +292,9 @@ impl DependencySession {
                 "unknown", // model not tracked in DependencySession — caller sets via metadata
                 None,
                 &self.session_id,
-            ) {
+            )
+            .await
+            {
                 Ok(snapshot) => {
                     tracing::info!(
                         session_id = %self.session_id,
@@ -556,8 +558,8 @@ mod tests {
         assert!(cps.contains(&"b".to_string()));
     }
 
-    #[test]
-    fn test_rewind_to_checkpoint() {
+    #[tokio::test]
+    async fn test_rewind_to_checkpoint() {
         let mut session = DependencySession::new("sess-1");
 
         session
@@ -585,7 +587,7 @@ mod tests {
         assert_eq!(session.completed_count(), 2);
 
         // Rewind to checkpoint "a"
-        session.rewind_to_checkpoint("a").unwrap();
+        session.rewind_to_checkpoint("a").await.unwrap();
 
         // "a" is reset, "b" is reset
         assert_eq!(
@@ -604,10 +606,10 @@ mod tests {
         assert_eq!(session.completed_count(), 0);
     }
 
-    #[test]
-    fn test_rewind_missing_checkpoint() {
+    #[tokio::test]
+    async fn test_rewind_missing_checkpoint() {
         let mut session = DependencySession::new("sess-1");
-        let result = session.rewind_to_checkpoint("nonexistent");
+        let result = session.rewind_to_checkpoint("nonexistent").await;
         assert!(matches!(result, Err(DagError::CheckpointNotFound(_))));
     }
 
@@ -696,8 +698,8 @@ mod tests {
         assert!(unresolved.contains(&"missing".to_string()));
     }
 
-    #[test]
-    fn test_step_result_data_preserved_on_rewind() {
+    #[tokio::test]
+    async fn test_step_result_data_preserved_on_rewind() {
         let mut session = DependencySession::new("sess-1");
 
         session
@@ -707,7 +709,7 @@ mod tests {
             .unwrap();
 
         session.complete_step("a", ok_result("important result")).unwrap();
-        session.rewind_to_checkpoint("a").unwrap();
+        session.rewind_to_checkpoint("a").await.unwrap();
 
         let step = session.get_step("a").unwrap();
         assert_eq!(step.status, StepStatus::Pending);

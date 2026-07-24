@@ -72,41 +72,33 @@ impl RouterMetrics {
     /// Increments the verdict counter for `(decision.stage, decision.verdict)`.
     pub fn record_stage_decision(&self, decision: &StageDecision) {
         let key = (decision.stage, decision.verdict.clone());
-        let map = self.stage_verdicts.read().unwrap();
-        if let Some(counter) = map.get(&key) {
-            counter.fetch_add(1, Ordering::Relaxed);
-        } else {
-            drop(map);
-            let mut map = self.stage_verdicts.write().unwrap();
-            map.entry(key).or_insert_with(|| AtomicU64::new(1));
-        }
+        self.stage_verdicts
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(key)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a watchdog fire event.
     pub fn record_watchdog_fire(&self, event: &WatchdogEvent) {
         let event_type = WatchdogEventType::from(event);
-        let map = self.watchdog_events.read().unwrap();
-        if let Some(counter) = map.get(&event_type) {
-            counter.fetch_add(1, Ordering::Relaxed);
-        } else {
-            drop(map);
-            let mut map = self.watchdog_events.write().unwrap();
-            map.entry(event_type)
-                .or_insert_with(|| AtomicU64::new(1));
-        }
+        self.watchdog_events
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(event_type)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record an error by category name.
     pub fn record_error(&self, category: &str) {
-        let map = self.error_counts.read().unwrap();
-        if let Some(counter) = map.get(category) {
-            counter.fetch_add(1, Ordering::Relaxed);
-        } else {
-            drop(map);
-            let mut map = self.error_counts.write().unwrap();
-            map.entry(category.to_string())
-                .or_insert_with(|| AtomicU64::new(1));
-        }
+        self.error_counts
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(category.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record model latency.
@@ -114,17 +106,12 @@ impl RouterMetrics {
     /// Gets or creates a `LatencyHistogram` for the given model name
     /// and records the duration.
     pub fn record_model_latency(&self, model: &str, latency_ms: u64) {
-        let map = self.model_latency.read().unwrap();
-        if let Some(hist) = map.get(model) {
-            hist.observe(latency_ms);
-        } else {
-            drop(map);
-            let mut map = self.model_latency.write().unwrap();
-            let hist = map
-                .entry(model.to_string())
-                .or_insert_with(|| Arc::new(LatencyHistogram::new()));
-            hist.observe(latency_ms);
-        }
+        self.model_latency
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(model.to_string())
+            .or_insert_with(|| Arc::new(LatencyHistogram::new()))
+            .observe(latency_ms);
     }
 
     /// Record agent latency.
@@ -132,22 +119,17 @@ impl RouterMetrics {
     /// Gets or creates a `LatencyHistogram` for the given agent identity
     /// and records the duration.
     pub fn record_agent_latency(&self, agent: &str, latency_ms: u64) {
-        let map = self.agent_latency.read().unwrap();
-        if let Some(hist) = map.get(agent) {
-            hist.observe(latency_ms);
-        } else {
-            drop(map);
-            let mut map = self.agent_latency.write().unwrap();
-            let hist = map
-                .entry(agent.to_string())
-                .or_insert_with(|| Arc::new(LatencyHistogram::new()));
-            hist.observe(latency_ms);
-        }
+        self.agent_latency
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(agent.to_string())
+            .or_insert_with(|| Arc::new(LatencyHistogram::new()))
+            .observe(latency_ms);
     }
 
     /// Snapshot stage verdict counts (non-atomic read of all counters).
     pub fn snapshot_stage_verdicts(&self) -> HashMap<(PipelineStage, StageVerdict), u64> {
-        let map = self.stage_verdicts.read().unwrap();
+        let map = self.stage_verdicts.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         map.iter()
             .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
             .collect()
@@ -155,7 +137,7 @@ impl RouterMetrics {
 
     /// Snapshot watchdog event counts.
     pub fn snapshot_watchdog_events(&self) -> HashMap<WatchdogEventType, u64> {
-        let map = self.watchdog_events.read().unwrap();
+        let map = self.watchdog_events.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         map.iter()
             .map(|(k, v)| (*k, v.load(Ordering::Relaxed)))
             .collect()
@@ -163,7 +145,7 @@ impl RouterMetrics {
 
     /// Snapshot error counts.
     pub fn snapshot_errors(&self) -> HashMap<String, u64> {
-        let map = self.error_counts.read().unwrap();
+        let map = self.error_counts.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         map.iter()
             .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
             .collect()
@@ -231,7 +213,7 @@ mod tests {
         m.record_model_latency("llama3.1:8b", 100);
         m.record_model_latency("llama3.1:8b", 200);
 
-        let map = m.model_latency.read().unwrap();
+        let map = m.model_latency.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         let hist = map.get("llama3.1:8b").unwrap();
         assert_eq!(hist.count(), 2);
         assert_eq!(hist.sum_ms(), 300);
@@ -243,7 +225,7 @@ mod tests {
         m.record_agent_latency("agent-code-review", 50);
         m.record_agent_latency("agent-code-review", 150);
 
-        let map = m.agent_latency.read().unwrap();
+        let map = m.agent_latency.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         let hist = map.get("agent-code-review").unwrap();
         assert_eq!(hist.count(), 2);
         assert_eq!(hist.sum_ms(), 200);

@@ -67,7 +67,7 @@ fn default_provider() -> TranscriptProvider {
 
 fn make_test_config() -> RouterConfig {
     match serde_json::from_str::<RouterConfig>(r#"{
-        "pipelines": {"default": {"deterministic_prefilter": true, "classifier": true, "router": true}},
+        "pipelines": {"default": {"deterministic_prefilter": true, "classifier": true}},
         "models": {"fast": {"endpoint": "http://localhost:8080/v1/chat/completions", "name": "fast", "intelligence": 1, "cost_input": 0.000001, "cost_output": 0.000006, "cost_cached_read": 0.0000004, "speed": 10, "total_timeout_ms": 5000, "idle_timeout_ms": 2000, "stream": false, "filter_thinking": false, "retry_count": 0, "retry_base_interval_s": 1}},
         "model_groups": {"fast": ["fast"]},
         "routes": {"fast": {"group": "fast", "pipelines": ["default"]}},
@@ -128,15 +128,14 @@ fn test_e2e_normal_request_passes_all_stages() {
 
     assert!(!result.rejected, "normal request should not be rejected");
     assert!(
-        result.decisions.len() >= 3,
-        "pipeline should run through all 3 stages, got {}",
+        result.decisions.len() >= 2,
+        "pipeline should run through all 2 stages, got {}",
         result.decisions.len()
     );
 
     let stage_order: Vec<PipelineStage> = result.decisions.iter().map(|d| d.stage).collect();
     assert_eq!(stage_order[0], PipelineStage::DeterministicPreFilter);
     assert_eq!(stage_order[1], PipelineStage::Classifier);
-    assert_eq!(stage_order[2], PipelineStage::Router);
 }
 
 #[test]
@@ -286,17 +285,17 @@ fn test_e2e_routing_decision_included() {
     let request = make_request("Help me debug Rust code");
     let result = route(&pipeline, &request).expect("pipeline should complete");
 
-    let router_decision = result.decisions.last().expect("should have router decision");
-    assert_eq!(router_decision.stage, PipelineStage::Router);
-    assert_eq!(router_decision.verdict, StageVerdict::Passed);
+    let classifier_decision = result.decisions.last().expect("should have classifier decision");
+    assert!(classifier_decision.stage == PipelineStage::Classifier);
+    assert_eq!(classifier_decision.verdict, StageVerdict::Passed);
 
-    let routing_decision = router_decision
+    let routing_target = classifier_decision
         .metadata
-        .get("routing_decision")
-        .expect("router decision should have routing_decision metadata");
+        .get("routing_target")
+        .expect("classifier decision should have routing_target metadata");
     assert!(
-        routing_decision.get("destination").is_some(),
-        "routing decision should have a destination"
+        routing_target.get("url").is_some(),
+        "routing target should have a url"
     );
 }
 
@@ -364,8 +363,8 @@ fn test_e2e_custom_fixtures_produce_expected_results() {
 
 // ── Checkpoint/Rewind Cycle (DAG session-level) ─────────────────────────
 
-#[test]
-fn test_e2e_dag_session_checkpoint_rewind() {
+#[tokio::test]
+async fn test_e2e_dag_session_checkpoint_rewind() {
     use crate::dag_session::{DependencySession, SessionStep, StepResult};
 
     let mut session = DependencySession::new("e2e-session");
@@ -411,6 +410,7 @@ fn test_e2e_dag_session_checkpoint_rewind() {
 
     session
         .rewind_to_checkpoint("step3")
+        .await
         .expect("rewind");
 
     assert_eq!(

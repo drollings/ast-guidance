@@ -423,7 +423,7 @@ async fn handle_connection(
     };
 
     // Normalize to RouterRequest
-    let router_request = match normalize::normalize_request(&body_json) {
+    let router_request = match normalize::normalize_request(body_json) {
         Ok(r) => r,
         Err(e) => {
             let err = normalize::error_response(&e.to_string(), "invalid_request_error");
@@ -843,29 +843,7 @@ async fn dispatch_to_llm(
         "dispatching to LLM"
     );
 
-    let messages: Vec<serde_json::Value> = request
-        .messages
-        .iter()
-        .map(|m| {
-            let content = match &m.content {
-                RouterMessageContent::Text(s) => serde_json::Value::String(s.clone()),
-                RouterMessageContent::Parts(parts) => serde_json::Value::Array(
-                    parts
-                        .iter()
-                        .map(|p| serde_json::to_value(p).unwrap())
-                        .collect(),
-                ),
-            };
-            let mut msg = serde_json::json!({"role": m.role, "content": content});
-            if let Some(ref tc) = m.tool_calls {
-                msg["tool_calls"] = serde_json::to_value(tc).unwrap();
-            }
-            if let Some(ref id) = m.tool_call_id {
-                msg["tool_call_id"] = serde_json::Value::String(id.clone());
-            }
-            msg
-        })
-        .collect();
+    let messages: Vec<serde_json::Value> = normalize::messages_to_json(request);
 
     let mut body = serde_json::json!({
         "model": model_name,

@@ -64,29 +64,7 @@ impl DispatchBackend for OpenAiBackend {
     }
 
     fn build_request(&self, request: &RouterRequest) -> Result<Value, DispatchError> {
-        let messages: Vec<Value> = request
-            .messages
-            .iter()
-            .map(|m| {
-                let content = match &m.content {
-                    RouterMessageContent::Text(s) => Value::String(s.clone()),
-                    RouterMessageContent::Parts(parts) => Value::Array(
-                        parts.iter().map(|p| serde_json::to_value(p).unwrap()).collect(),
-                    ),
-                };
-                let mut msg = serde_json::json!({
-                    "role": m.role,
-                    "content": content,
-                });
-                if let Some(ref calls) = m.tool_calls {
-                    msg["tool_calls"] = serde_json::to_value(calls).unwrap();
-                }
-                if let Some(ref id) = m.tool_call_id {
-                    msg["tool_call_id"] = Value::String(id.clone());
-                }
-                msg
-            })
-            .collect();
+        let messages: Vec<Value> = crate::normalize::messages_to_json(request);
 
         let mut body = serde_json::json!({
             "model": request.model,
