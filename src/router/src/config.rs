@@ -34,6 +34,11 @@ pub struct RouterConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    /// Explicit model name for classifier/internal LLM calls.
+    /// When set, this model is used directly for classification instead of
+    /// resolving via `classifier_group`. Defaults to `"fast"`.
+    #[serde(default)]
+    pub classifier_model: Option<String>,
     /// Mock mode configuration. When set, the server runs with a transcript
     /// provider instead of real LLM calls, and validates routing decisions.
     #[serde(default)]
@@ -70,6 +75,7 @@ impl Default for RouterConfig {
             default_route: "fast".into(),
             server: ServerConfig::default(),
             logging: LoggingConfig::default(),
+            classifier_model: None,
             mock: None,
         }
     }
@@ -342,22 +348,23 @@ impl RouterConfig {
             let client: Arc<dyn ChatBackend> = if let Some(backend) = classifier_backend {
                 backend
             } else {
-                let classifier_llm_config = self
-                    .model_groups
-                    .get(params.classifier_group.as_str())
-                    .and_then(|names| names.first())
-                    .and_then(|n| {
-                        self.models
-                            .get(n)
-                            .map(|m| (m.endpoint.clone(), m.total_timeout_ms))
-                    })
-                    .map(|(endpoint, timeout_ms)| {
-                        LlmConfig::new()
-                            .api_url(endpoint)
-                            .model("classifier".into())
-                            .timeout_ms(timeout_ms.max(5000))
-                            .build()
+                let classifier_entry = self
+                    .classifier_model
+                    .as_ref()
+                    .and_then(|name| self.models.get(name))
+                    .or_else(|| {
+                        self.model_groups
+                            .get(params.classifier_group.as_str())
+                            .and_then(|names| names.first())
+                            .and_then(|n| self.models.get(n))
                     });
+                let classifier_llm_config = classifier_entry.map(|m| {
+                    LlmConfig::new()
+                        .api_url(m.endpoint.clone())
+                        .model("classifier".into())
+                        .timeout_ms(m.total_timeout_ms.max(5000))
+                        .build()
+                });
                 let cfg = classifier_llm_config?;
                 let classifier_config = LlmConfig::new()
                     .api_url(cfg.api_url.clone())

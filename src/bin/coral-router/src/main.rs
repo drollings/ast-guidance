@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -21,6 +22,12 @@ struct Args {
     /// in config if set).
     #[arg(long)]
     mock: Option<String>,
+
+    /// Comma-separated list of model names that should NOT be mocked.
+    /// Only meaningful when --mock is also set. These models make real
+    /// LLM calls instead of returning canned dispatch responses.
+    #[arg(long, value_delimiter = ',')]
+    mock_except: Vec<String>,
 }
 
 #[tokio::main]
@@ -35,33 +42,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .mock
         .or_else(|| config.mock.as_ref().map(|m| m.transcript_path.clone()));
 
+    let mock_except_models: HashSet<String> = args.mock_except.iter().cloned().collect();
+
     let (pipelines, mock_dispatch) = if let Some(ref path) = transcript_path {
         tracing::info!(target: "coral-router", transcript = %path, "mock mode enabled");
 
         let entries = load_transcript_file(path)?;
-        let provider = transcript_provider_from_entries(&entries);
-        let provider: Arc<dyn ChatBackend> = Arc::new(provider);
-        let dispatch_ctx = MockDispatchContext::new(entries);
+        let dispatch_ctx = MockDispatchContext::new(
+            entries,
+            args.mock_except.clone(),
+        );
 
-        let pipelines = config.build_all_pipelines_with_backend(Some(&provider));
+        let classifier_model_name = config.classifier_model.as_deref().unwrap_or("fast");
+        let classifier_is_excepted = mock_except_models.contains(classifier_model_name);
+
+        let pipelines = if classifier_is_excepted {
+            // Classifier model is in the except list — use real LLM backend
+            config.build_all_pipelines_with_backend(None::<&Arc<dyn ChatBackend>>)
+        } else {
+            let provider =
+                transcript_provider_from_entries(dispatch_ctx.transcripts());
+            let provider: Arc<dyn ChatBackend> = Arc::new(provider);
+            config.build_all_pipelines_with_backend(Some(&provider))
+        };
+
         (pipelines, Some(dispatch_ctx))
     } else {
+        if !args.mock_except.is_empty() {
+            tracing::warn!(target: "coral-router", "--mock-except has no effect without --mock");
+        }
         let pipelines = config.build_all_pipelines();
         (pipelines, None)
     };
 
     let routes = config.routes.clone();
 
+    let classifier_model_name = config.classifier_model.as_deref().unwrap_or("fast");
     let classifier_url = config
-        .model_groups
-        .get("fast")
-        .and_then(|names| names.first())
-        .and_then(|name| config.models.get(name))
+        .models
+        .get(classifier_model_name)
         .map(|m| m.endpoint.clone());
 
     tracing::info!(
         bind_addr = %config.server.bind_addr,
         classifier_url = ?classifier_url,
+        classifier_model = %classifier_model_name,
         "starting coral-router server"
     );
 

@@ -106,14 +106,31 @@ pub fn transcript_provider_from_entries(
 pub struct MockDispatchContext {
     pub transcripts: Arc<Vec<MockTranscriptEntry>>,
     pub failures: std::sync::Mutex<Vec<String>>,
+    /// Model names that should NOT be mocked — these make real LLM calls.
+    pub except_models: Vec<String>,
 }
 
 impl MockDispatchContext {
-    pub fn new(transcripts: Vec<MockTranscriptEntry>) -> Self {
+    pub fn new(
+        transcripts: Vec<MockTranscriptEntry>,
+        except_models: Vec<String>,
+    ) -> Self {
         Self {
             transcripts: Arc::new(transcripts),
             failures: std::sync::Mutex::new(Vec::new()),
+            except_models,
         }
+    }
+
+    /// Reference to the underlying transcript entries.
+    pub fn transcripts(&self) -> &[MockTranscriptEntry] {
+        &self.transcripts
+    }
+
+    /// Returns `true` if the given model name is in the except list
+    /// (i.e., should make real LLM calls instead of returning canned responses).
+    pub fn is_model_excepted(&self, model: &str) -> bool {
+        self.except_models.iter().any(|m| m == model)
     }
 
     pub fn lookup(&self, user_message: &str) -> Option<&MockTranscriptEntry> {

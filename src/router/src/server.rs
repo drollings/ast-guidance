@@ -538,12 +538,34 @@ async fn handle_connection(
         };
         write_completion_response(&mut stream, &completion, is_stream).await?;
     } else if let Some(ref rt) = pipeline_result.routing_target {
-        // Mock mode: validate routing and return canned response
+        // Mock mode: validate routing, then dispatch
         if let Some(ref mock) = mock_dispatch {
             if let Some(entry) = mock.lookup(&user_message) {
                 mock.validate_route(entry, Some(rt));
-                let completion = mock.dispatch_response(entry, &model_name);
-                write_completion_response(&mut stream, &completion, is_stream).await?;
+
+                if mock.is_model_excepted(&rt.model) || mock.is_model_excepted(&model_name) {
+                    // Excepted model — real LLM call (still validates routing)
+                    let url = build_dispatch_url(&rt.url);
+                    let mut completion = dispatch_to_llm(
+                        &url,
+                        &router_request,
+                        &rt.model,
+                        rt.params.as_ref(),
+                        rt.filter_thinking,
+                        rt.retry_count,
+                        rt.retry_base_interval_s,
+                    )
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(target: "router.server", error = %e, "excepted dispatch failed, using fallback");
+                        fallback_completion(&model_name)
+                    });
+                    completion.model = model_name.clone();
+                    write_completion_response(&mut stream, &completion, is_stream).await?;
+                } else {
+                    let completion = mock.dispatch_response(entry, &model_name);
+                    write_completion_response(&mut stream, &completion, is_stream).await?;
+                }
             } else {
                 // No transcript entry for this message — use real dispatch as fallback
                 let url = build_dispatch_url(&rt.url);
