@@ -3,7 +3,14 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::AdapterEntry;
+/// A LoRA adapter entry. Defined here rather than in config since the
+/// config-level `adapters` field was removed (unused in production).
+#[derive(Debug, Clone)]
+pub struct AdapterEntry {
+    pub name: String,
+    pub path: String,
+    pub base_model: String,
+}
 
 /// Errors produced by the adapter indexer at validation/index time.
 #[derive(Debug, thiserror::Error)]

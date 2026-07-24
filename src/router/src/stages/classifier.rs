@@ -74,6 +74,7 @@ impl WorkUnit for ClassifierStage {
                         target: Some(self.routing_config.default_route.clone()),
                         coherence_score: 1.0,
                         safety_score: 1.0,
+                        complexity: None,
                         intent: None,
                         reason: format!("parse error: {e}"),
                     }, false)
@@ -87,6 +88,7 @@ impl WorkUnit for ClassifierStage {
                     target: Some(self.routing_config.default_route.clone()),
                     coherence_score: 1.0,
                     safety_score: 1.0,
+                    complexity: None,
                     intent: None,
                     reason: format!("LLM error: {e}"),
                 }, false)
@@ -127,6 +129,7 @@ impl WorkUnit for ClassifierStage {
         }
 
         let action = output.action.as_str();
+        let min_complexity = output.complexity;
         let routing_target = match action {
             "respond" => None,
             "route" => {
@@ -134,7 +137,7 @@ impl WorkUnit for ClassifierStage {
                     .target
                     .as_deref()
                     .unwrap_or(&self.routing_config.default_route);
-                self.routing_config.resolve_route(target_name).map(|(model, model_name)| {
+                self.routing_config.resolve_route(target_name, min_complexity).map(|(model, model_name)| {
                     serde_json::json!({
                         "url": model.endpoint,
                         "model": model_name,
@@ -144,12 +147,16 @@ impl WorkUnit for ClassifierStage {
                             .or_else(|| self.routing_config.routes.get(&self.routing_config.default_route))
                             .map_or("", |r| r.group.as_str()),
                         "target_name": target_name,
+                        "params": model.params,
+                        "filter_thinking": model.filter_thinking,
+                        "retry_count": model.retry_count,
+                        "retry_base_interval_s": model.retry_base_interval_s,
                     })
                 })
             }
             _ => {
                 self.routing_config
-                    .resolve_route(&self.routing_config.default_route)
+                    .resolve_route(&self.routing_config.default_route, min_complexity)
                     .map(|(model, model_name)| {
                         serde_json::json!({
                             "url": model.endpoint,
@@ -159,6 +166,10 @@ impl WorkUnit for ClassifierStage {
                             .get(&self.routing_config.default_route)
                             .map_or("", |r| r.group.as_str()),
                             "target_name": &self.routing_config.default_route,
+                            "params": model.params,
+                            "filter_thinking": model.filter_thinking,
+                            "retry_count": model.retry_count,
+                            "retry_base_interval_s": model.retry_base_interval_s,
                         })
                     })
             }
@@ -167,6 +178,7 @@ impl WorkUnit for ClassifierStage {
         let mut metadata = serde_json::json!({
             "coherence_score": output.coherence_score,
             "safety_score": output.safety_score,
+            "complexity": output.complexity,
             "intent": output.intent,
             "action": output.action,
             "reason": output.reason,

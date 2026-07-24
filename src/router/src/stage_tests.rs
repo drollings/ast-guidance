@@ -99,7 +99,7 @@ mod tests {
         let output = filter.execute(&ctx).expect("execute");
         let decision: StageDecision = output.data_as().expect("data_as");
         assert_eq!(decision.verdict, StageVerdict::Passed);
-        assert!(decision.reason.contains("no PII flags"));
+        assert!(decision.reason.contains("no command, no PII flags"));
     }
 
     #[test]

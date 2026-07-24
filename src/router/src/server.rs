@@ -10,7 +10,7 @@ use fluent_wvr::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::config::ServerConfig;
+use crate::config::{RouteRef, ServerConfig};
 use crate::normalize;
 use crate::pipeline::PipelineOrchestrator;
 use crate::types::{RouterMessage, RouterMessageContent, RouterRequest, RouterResponse, Usage};
@@ -22,10 +22,11 @@ const CORS_HEADERS: &str = "Access-Control-Allow-Origin: *\r\n\
 /// Router HTTP server. Implements `WorkUnit` so it can be registered in a `Zone`.
 pub struct RouterServer {
     name: ArcIntern<str>,
-    pipeline: Arc<PipelineOrchestrator>,
+    pipelines: HashMap<String, Arc<PipelineOrchestrator>>,
+    routes: HashMap<String, RouteRef>,
     bind_addr: String,
     max_payload: usize,
-    frontier_url: Option<String>,
+    classifier_url: Option<String>,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
@@ -38,16 +39,18 @@ struct ServerStats {
 
 impl RouterServer {
     pub fn new(
-        pipeline: Arc<PipelineOrchestrator>,
+        pipelines: HashMap<String, Arc<PipelineOrchestrator>>,
+        routes: HashMap<String, RouteRef>,
         config: &ServerConfig,
-        frontier_url: Option<String>,
+        classifier_url: Option<String>,
     ) -> Self {
         Self {
             name: ArcIntern::from("router.server"),
-            pipeline,
+            pipelines,
+            routes,
             bind_addr: config.bind_addr.clone(),
             max_payload: config.max_payload,
-            frontier_url,
+            classifier_url,
             depends: vec![],
             provides: vec![ArcIntern::from("http.endpoint")],
         }
@@ -55,7 +58,14 @@ impl RouterServer {
 
     /// Start the HTTP server and block the current task.
     pub async fn serve(&self) -> Result<(), String> {
-        run_http(self.pipeline.clone(), &self.bind_addr, self.max_payload, self.frontier_url.clone()).await
+        run_http(
+            Arc::new(self.pipelines.clone()),
+            Arc::new(self.routes.clone()),
+            &self.bind_addr,
+            self.max_payload,
+            self.classifier_url.clone(),
+        )
+        .await
     }
 }
 
@@ -73,15 +83,16 @@ impl WorkUnit for RouterServer {
     }
 
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-        let pipeline = self.pipeline.clone();
+        let pipelines = Arc::new(self.pipelines.clone());
+        let routes = Arc::new(self.routes.clone());
         let bind_addr = self.bind_addr.clone();
         let max_payload = self.max_payload;
-        let frontier_url = self.frontier_url.clone();
+        let classifier_url = self.classifier_url.clone();
 
         let rt = ctx.rt.clone();
 
         let _handle = rt.spawn(Box::pin(async move {
-            if let Err(e) = run_http(pipeline, &bind_addr, max_payload, frontier_url).await {
+            if let Err(e) = run_http(pipelines, routes, &bind_addr, max_payload, classifier_url).await {
                 tracing::error!(target: "router.server", error = %e, "HTTP server error");
             }
         }));
@@ -121,10 +132,11 @@ impl Describable for RouterServer {
 impl_component!(RouterServer);
 
 async fn run_http(
-    pipeline: Arc<PipelineOrchestrator>,
+    pipelines: Arc<HashMap<String, Arc<PipelineOrchestrator>>>,
+    routes: Arc<HashMap<String, RouteRef>>,
     bind_addr: &str,
     max_payload: usize,
-    frontier_url: Option<String>,
+    classifier_url: Option<String>,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(bind_addr)
         .await
@@ -147,24 +159,73 @@ async fn run_http(
             }
         };
 
-        let pipeline = pipeline.clone();
+        let pipelines = pipelines.clone();
+        let routes = routes.clone();
         let stats = stats.clone();
-        let frontier_url = frontier_url.clone();
+        let classifier_url = classifier_url.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, pipeline, stats, max_payload, frontier_url).await {
+            if let Err(e) = handle_connection(stream, pipelines, routes, stats, max_payload, classifier_url).await {
                 tracing::error!(target: "router.server", error = %e, "connection error");
             }
         });
     }
 }
 
+fn execute_pipeline_sequence(
+    pipelines: &HashMap<String, Arc<PipelineOrchestrator>>,
+    pipeline_names: &[String],
+    ctx: &mut WorkContext,
+) -> Result<crate::pipeline::PipelineResult, String> {
+    let mut all_decisions = Vec::new();
+    let mut last_result: Option<crate::pipeline::PipelineResult> = None;
+
+    for name in pipeline_names {
+        // OK to block here: pipeline stages are sync WorkUnit impls
+        let Some(pipeline) = pipelines.get(name) else {
+            tracing::warn!(target: "router.server", pipeline = %name, "pipeline not found, skipping");
+            continue;
+        };
+
+        let output = pipeline.execute(ctx).map_err(|e| format!("pipeline '{name}' error: {e}"))?;
+        let mut result: crate::pipeline::PipelineResult = output
+            .data_take()
+            .map_err(|e| format!("pipeline '{name}' output decode: {e}"))?;
+
+        if result.rejected {
+            return Ok(crate::pipeline::PipelineResult {
+                decisions: result.decisions,
+                final_response: None,
+                rejected: true,
+                reject_reason: result.reject_reason,
+                routing_target: None,
+                classifier_response: None,
+            });
+        }
+
+        all_decisions.append(&mut result.decisions);
+        last_result = Some(result);
+    }
+
+    let mut final_result = last_result.unwrap_or(crate::pipeline::PipelineResult {
+        decisions: vec![],
+        final_response: None,
+        rejected: false,
+        reject_reason: None,
+        routing_target: None,
+        classifier_response: None,
+    });
+    final_result.decisions = all_decisions;
+    Ok(final_result)
+}
+
 async fn handle_connection(
     mut stream: tokio::net::TcpStream,
-    pipeline: Arc<PipelineOrchestrator>,
+    pipelines: Arc<HashMap<String, Arc<PipelineOrchestrator>>>,
+    routes: Arc<HashMap<String, RouteRef>>,
     stats: Arc<ServerStats>,
     max_payload: usize,
-    frontier_url: Option<String>,
+    classifier_url: Option<String>,
 ) -> Result<(), String> {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 1024];
@@ -319,18 +380,22 @@ async fn handle_connection(
     let model_name = router_request.model.clone();
     let request_json = serde_json::to_string(&router_request).unwrap_or_default();
 
-    // Run pipeline
+    // Determine which pipelines to run for this route
+    let route = routes
+        .get(&model_name)
+        .or_else(|| routes.get("local"))
+        .cloned();
+    let pipeline_names = route
+        .as_ref()
+        .map_or_else(|| vec!["default".into()], |r| r.pipelines.clone());
+
+    // Run pipeline sequence
     let mut ctx = WorkContext::default();
     ctx.metadata
         .insert("request".into(), MetadataValue::String(request_json));
 
-    let pipeline_result = match pipeline.execute(&ctx) {
-        Ok(output) => {
-            let result: crate::pipeline::PipelineResult = output
-                .data_take()
-                .map_err(|e| format!("pipeline output decode: {e}"))?;
-            result
-        }
+    let pipeline_result = match execute_pipeline_sequence(&pipelines, &pipeline_names, &mut ctx) {
+        Ok(result) => result,
         Err(e) => {
             let err = normalize::error_response(
                 &format!("pipeline error: {e}"),
@@ -351,27 +416,47 @@ async fn handle_connection(
         let reason = pipeline_result.reject_reason.as_deref().unwrap_or("request rejected");
         stats.rejections.fetch_add(1, Ordering::Relaxed);
 
+        // Return "ERROR: <msg>" as a model output instead of an HTTP error,
+        // so the caller does not confuse it with a model availability issue.
+        let error_output = format!("ERROR: {reason}");
+        let completion = RouterResponse {
+            id: String::new(),
+            object: "chat.completion".into(),
+            created: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            model: model_name.clone(),
+            choices: vec![crate::types::RouterChoice {
+                index: 0,
+                message: RouterMessage {
+                    role: "assistant".into(),
+                    content: RouterMessageContent::Text(error_output),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: "stop".into(),
+            }],
+            usage: Usage::default(),
+        };
         let body = if is_stream {
-            // For streaming, send an error chunk then [DONE]
-            let chunk = serde_json::json!({
-                "id": "error",
-                "object": "chat.completion.chunk",
-                "created": 0,
-                "model": model_name,
-                "choices": [{
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": "error"
-                }],
-                "error": {"message": reason, "type": "invalid_request_error"}
-            });
-            format!("data: {}\n\ndata: [DONE]\n\n", serde_json::to_string(&chunk).unwrap_or_default())
+            let mut handler = crate::streaming::StreamingHandler::new(
+                &completion.id,
+                &completion.model,
+            );
+            let mut resp_body = String::new();
+            if let Some(choice) = completion.choices.first() {
+                resp_body.push_str(&handler.format_choice_chunk(choice));
+            }
+            resp_body.push_str(&handler.format_done());
+            resp_body
         } else {
-            serde_json::to_string(&normalize::error_response(reason, "invalid_request_error"))
+            serde_json::to_string(&normalize::normalize_response(&completion))
                 .unwrap_or_default()
         };
         let resp = format!(
-            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{CORS_HEADERS}Connection: close\r\n\r\n{body}",
+            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n{CORS_HEADERS}Connection: close\r\n\r\n{body}",
+            if is_stream { "text/event-stream" } else { "application/json" },
             body.len()
         );
         stream.write_all(resp.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
@@ -427,13 +512,21 @@ async fn handle_connection(
         } else {
             format!("{}/chat/completions", rt.url.trim_end_matches('/'))
         };
-        let mut completion = dispatch_to_frontier(&url, &router_request, &rt.model)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(target: "router.server", error = %e, "classifier route dispatch failed, using fallback");
-                fallback_completion(&model_name)
-            });
-        completion.model = model_name.clone();
+                        let mut completion = dispatch_to_frontier(
+                                &url,
+                                &router_request,
+                                &rt.model,
+                                rt.params.as_ref(),
+                                rt.filter_thinking,
+                                rt.retry_count,
+                                rt.retry_base_interval_s,
+                            )
+                            .await
+                            .unwrap_or_else(|e| {
+                                tracing::warn!(target: "router.server", error = %e, "classifier route dispatch failed, using fallback");
+                                fallback_completion(&model_name)
+                            });
+                        completion.model = model_name.clone();
 
         let body = if is_stream {
             let mut handler = crate::streaming::StreamingHandler::new(
@@ -456,11 +549,11 @@ async fn handle_connection(
             body.len()
         );
         stream.write_all(resp.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
-    } else if let Some(ref url) = frontier_url {
-        let mut completion = dispatch_to_frontier(url, &router_request, &model_name)
+    } else if let Some(ref url) = classifier_url {
+        let mut completion = dispatch_to_frontier(url, &router_request, &model_name, None, false, 0, 1)
             .await
             .unwrap_or_else(|e| {
-                tracing::warn!(target: "router.server", error = %e, "frontier dispatch failed, using fallback");
+                tracing::warn!(target: "router.server", error = %e, "classifier dispatch failed, using fallback");
                 fallback_completion(&model_name)
             });
         completion.model = model_name.clone();
@@ -552,17 +645,21 @@ fn fallback_completion(model_name: &str) -> RouterResponse {
 }
 
 async fn dispatch_to_frontier(
-    frontier_url: &str,
+    endpoint_url: &str,
     request: &RouterRequest,
     model_name: &str,
+    params: Option<&serde_json::Value>,
+    _filter_thinking: bool,
+    retry_count: u32,
+    retry_base_interval_s: u64,
 ) -> Result<RouterResponse, String> {
     let client = reqwest::Client::new();
-    let url = if frontier_url.ends_with("/chat/completions") {
-        frontier_url.to_string()
+    let url = if endpoint_url.ends_with("/chat/completions") {
+        endpoint_url.to_string()
     } else {
         format!(
             "{}/chat/completions",
-            frontier_url.trim_end_matches('/')
+            endpoint_url.trim_end_matches('/')
         )
     };
 
@@ -591,28 +688,65 @@ async fn dispatch_to_frontier(
         "model": model_name,
         "messages": messages,
     });
-    if let Some(temp) = request.temperature {
-        body["temperature"] = serde_json::Value::Number(
-            serde_json::Number::from_f64(temp).ok_or("invalid temperature")?,
-        );
+
+    // Merge model-level params into the request body (e.g. stop, num_ctx,
+    // repeat_penalty, temperature, top_k, top_p, n_gpu_layers, etc.).
+    if let Some(p) = params {
+        if let Some(obj) = p.as_object() {
+            for (k, v) in obj {
+                body[k] = v.clone();
+            }
+        }
     }
-    if let Some(max_tokens) = request.max_tokens {
-        body["max_tokens"] = serde_json::Value::Number(max_tokens.into());
+
+    // Only fall back to request-level temperature/max_tokens if params didn't set them.
+    if !body.as_object().is_some_and(|o| o.contains_key("temperature")) {
+        if let Some(temp) = request.temperature {
+            body["temperature"] = serde_json::Value::Number(
+                serde_json::Number::from_f64(temp).ok_or("invalid temperature")?,
+            );
+        }
+    }
+    if !body.as_object().is_some_and(|o| o.contains_key("max_tokens")) {
+        if let Some(max_tokens) = request.max_tokens {
+            body["max_tokens"] = serde_json::Value::Number(max_tokens.into());
+        }
     }
 
-    let response = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("frontier HTTP error: {e}"))?;
+    let max_attempts = (retry_count + 1).max(1);
+    let mut last_err = String::new();
 
-    let json: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("frontier JSON parse: {e}"))?;
+    for attempt in 0..max_attempts {
+        let result = client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await;
 
-    Ok(parse_openai_response(&json, model_name))
+        match result {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    let json: serde_json::Value = response
+                        .json()
+                        .await
+                        .map_err(|e| format!("response JSON parse: {e}"))?;
+                    return Ok(parse_openai_response(&json, model_name));
+                }
+                last_err = format!("HTTP {status}");
+            }
+            Err(e) => {
+                last_err = format!("HTTP error: {e}");
+            }
+        }
+
+        if attempt + 1 < max_attempts {
+            let delay = retry_base_interval_s * 1000 * (1u64 << attempt);
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+    }
+
+    Err(format!("dispatch failed after {max_attempts} attempts: {last_err}"))
 }
 
 fn parse_openai_response(json: &serde_json::Value, fallback_model: &str) -> RouterResponse {

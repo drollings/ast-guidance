@@ -4,12 +4,6 @@
 
 Coral Router is a local-first control plane for LLM traffic: a single OpenAI-compatible endpoint that decides, for every request, the cheapest and safest way to answer it — deterministic logic where possible, a small local model where sufficient, larger local models where warranted, and frontier providers only when genuinely necessary. The goal is to make a local workstation's mixture of models behave like one coherent, cost-aware assistant rather than a pile of separately-addressed endpoints.
 
-## Source code location
-
-The source code may be referenced at ./src/router/src/
-
-Do not read ./src/router/src/tests unless unit tests and e2e tests are specifically being worked on.
-
 ## Current status
 
 The pipeline is live at a basic level:

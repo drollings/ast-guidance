@@ -1,5 +1,9 @@
 # Coral Router — Architecture
 
+## Source code location
+
+The source code may be referenced at ./src/router/src/
+
 ## Overview
 
 Coral Router exposes a single OpenAI-compatible HTTP endpoint (`POST /v1/chat/completions` on `:8081`) that runs every incoming request through a three-stage pipeline before dispatching to a model. The pipeline is built from `Arc<dyn Component>` units (the Fluent WVR uniform interface) and the server itself is also a `WorkUnit` — everything is composable.

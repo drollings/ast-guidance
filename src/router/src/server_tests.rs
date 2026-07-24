@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod server_tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use fluent_wvr::prelude::*;
@@ -15,9 +16,11 @@ mod server_tests {
 
     #[test]
     fn router_server_creates_with_config() {
-        let pipeline = make_echo_pipeline();
+        let mut pipelines = HashMap::new();
+        pipelines.insert("default".into(), make_echo_pipeline());
+        let routes = HashMap::new();
         let config = ServerConfig::default();
-        let server = RouterServer::new(pipeline, &config, None);
+        let server = RouterServer::new(pipelines, routes, &config, None);
         assert_eq!(server.name(), "router.server");
         assert!(server.provides().contains(&ArcIntern::from("http.endpoint")));
     }

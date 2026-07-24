@@ -7,7 +7,7 @@ use std::sync::{Arc, LazyLock};
 use fluent_wvr::prelude::*;
 use regex::Regex;
 
-use crate::config::{BlacklistEntry, RejectPatterns};
+use crate::config::{PatternEntry, RejectPatterns};
 use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
 use crate::stages::common::extract_user_message;
 
@@ -19,13 +19,13 @@ type CommandHandler = Arc<dyn Fn(&[String]) -> Result<String, String> + Send + S
 pub struct DeterministicPreFilter {
     name: ArcIntern<str>,
     command_registry: HashMap<String, CommandHandler>,
-    blacklist_entries: Vec<CachedBlacklistEntry>,
+    patterns: Vec<CachedPatternEntry>,
     commands_enabled: bool,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
 
-struct CachedBlacklistEntry {
+struct CachedPatternEntry {
     name: String,
     http_code: u16,
     error_message: Option<String>,
@@ -34,7 +34,7 @@ struct CachedBlacklistEntry {
 
 impl DeterministicPreFilter {
     pub fn new() -> Self {
-        let blacklist_entries: Vec<CachedBlacklistEntry> = vec![
+        let patterns: Vec<CachedPatternEntry> = vec![
             ("ssn", vec![r"\b\d{3}-\d{2}-\d{4}\b"]),
             ("card_number", vec![r"\b(?:\d[ -]*?){13,19}\b"]),
             ("email", vec![r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"]),
@@ -42,15 +42,15 @@ impl DeterministicPreFilter {
         ]
         .into_iter()
         .map(|(name, regexes)| {
-            let patterns: Vec<Regex> = regexes
+            let re: Vec<Regex> = regexes
                 .iter()
                 .filter_map(|r| Regex::new(r).ok())
                 .collect();
-            CachedBlacklistEntry {
+            CachedPatternEntry {
                 name: name.into(),
                 http_code: 400,
                 error_message: Some("Request contains sensitive personal information".into()),
-                patterns,
+                patterns: re,
             }
         })
         .collect();
@@ -78,7 +78,7 @@ impl DeterministicPreFilter {
         Self {
             name: ArcIntern::from("pipeline.stage1.deterministic"),
             command_registry,
-            blacklist_entries,
+            patterns,
             commands_enabled: true,
             depends: vec![],
             provides: vec![ArcIntern::from("pipeline.stage1.output")],
@@ -86,19 +86,19 @@ impl DeterministicPreFilter {
     }
 
     pub fn from_config(config: &RejectPatterns) -> Self {
-        let mut blacklist_entries: Vec<CachedBlacklistEntry> = Vec::new();
-        for entry in &config.blacklist {
-            let patterns: Vec<Regex> = entry
+        let mut patterns: Vec<CachedPatternEntry> = Vec::new();
+        for entry in &config.patterns {
+            let re: Vec<Regex> = entry
                 .regexes
                 .iter()
                 .filter_map(|r| Regex::new(r).ok())
                 .collect();
-            if !patterns.is_empty() {
-                blacklist_entries.push(CachedBlacklistEntry {
+            if !re.is_empty() {
+                patterns.push(CachedPatternEntry {
                     name: entry.name.clone(),
                     http_code: entry.http_code,
                     error_message: entry.error_message.clone(),
-                    patterns,
+                    patterns: re,
                 });
             }
         }
@@ -115,7 +115,7 @@ impl DeterministicPreFilter {
         Self {
             name: ArcIntern::from("pipeline.stage1.deterministic"),
             command_registry,
-            blacklist_entries,
+            patterns,
             commands_enabled,
             depends: vec![],
             provides: vec![ArcIntern::from("pipeline.stage1.output")],
@@ -134,19 +134,19 @@ impl DeterministicPreFilter {
     }
 
     #[must_use]
-    pub fn with_blacklist(mut self, entries: Vec<BlacklistEntry>) -> Self {
+    pub fn with_blacklist(mut self, entries: Vec<PatternEntry>) -> Self {
         for entry in entries {
-            let patterns: Vec<Regex> = entry
+            let re: Vec<Regex> = entry
                 .regexes
                 .iter()
                 .filter_map(|r| Regex::new(r).ok())
                 .collect();
-            if !patterns.is_empty() {
-                self.blacklist_entries.push(CachedBlacklistEntry {
+            if !re.is_empty() {
+                self.patterns.push(CachedPatternEntry {
                     name: entry.name,
                     http_code: entry.http_code,
                     error_message: entry.error_message,
-                    patterns,
+                    patterns: re,
                 });
             }
         }
@@ -249,7 +249,7 @@ impl WorkUnit for DeterministicPreFilter {
                     }
                 }
 
-                let matched = self.blacklist_entries.iter().find(|entry| {
+                let matched = self.patterns.iter().find(|entry| {
                     entry.patterns.iter().any(|re| re.is_match(trimmed))
                 });
 
@@ -264,7 +264,7 @@ impl WorkUnit for DeterministicPreFilter {
                             stage: PipelineStage::DeterministicPreFilter,
                             verdict: StageVerdict::Rejected,
                             score: Some(1.0),
-                            reason: format!("blacklist '{}': {msg}", entry.name),
+                            reason: format!("pattern match '{}': {msg}", entry.name),
                             latency_ms: 0,
                             metadata: serde_json::json!({
                                 "blacklist": entry.name,
@@ -289,7 +289,7 @@ impl WorkUnit for DeterministicPreFilter {
         }
 
         let mut pii_found: Vec<String> = Vec::new();
-        for entry in &self.blacklist_entries {
+        for entry in &self.patterns {
             if entry.patterns.iter().any(|re| re.is_match(&input)) {
                 pii_found.push(entry.name.clone());
             }
@@ -302,7 +302,7 @@ impl WorkUnit for DeterministicPreFilter {
                     stage: PipelineStage::DeterministicPreFilter,
                     verdict: StageVerdict::Rejected,
                     score: Some(1.0),
-                    reason: format!("blocked: blacklist classes: {}", pii_found.join(", ")),
+                    reason: format!("blocked: patterns: {}", pii_found.join(", ")),
                     latency_ms: 0,
                     metadata: serde_json::json!({ "pii_classes": pii_found }),
                 },

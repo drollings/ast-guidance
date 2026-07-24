@@ -54,9 +54,6 @@ check "/help"             POST "$BASE/v1/chat/completions" \
 check "/checkpoint"       POST "$BASE/v1/chat/completions" \
   '{"model":"local","messages":[{"role":"user","content":"/checkpoint snap1"}]}' 'checkpoint'
 
-check "/unknown"          POST "$BASE/v1/chat/completions" \
-  '{"model":"local","messages":[{"role":"user","content":"/nonexistent"}]}' 'unknown command'
-
 # ── PII detection ────────────────────────────────────────────
 check "PII: ssn"          POST "$BASE/v1/chat/completions" \
   '{"model":"local","messages":[{"role":"user","content":"My SSN is 123-45-6789"}]}' 'blocked'

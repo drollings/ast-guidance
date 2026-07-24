@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
 use common_core::config::load_json_or_default;
 use fluent_router::config::RouterConfig;
 use fluent_router::logging::init_router_logging;
+use fluent_router::pipeline::PipelineOrchestrator;
 use fluent_router::server::RouterServer;
 
 #[derive(Parser)]
@@ -22,22 +24,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     init_router_logging(&config.logging)?;
 
-    let pipeline = Arc::new(config.build_pipeline());
+    let pipelines: HashMap<String, Arc<PipelineOrchestrator>> = config.build_all_pipelines();
+    let routes = config.routes.clone();
 
-    let frontier_url = config
+    let classifier_url = config
         .model_groups
-        .get(config.pipeline.frontier_group.as_str())
+        .get("fast")
         .and_then(|names| names.first())
         .and_then(|name| config.models.get(name))
         .map(|m| m.endpoint.clone());
 
     tracing::info!(
         bind_addr = %config.server.bind_addr,
-        frontier_url = ?frontier_url,
+        classifier_url = ?classifier_url,
         "starting coral-router server"
     );
 
-    let server = RouterServer::new(pipeline, &config.server, frontier_url);
+    let server = RouterServer::new(pipelines, routes, &config.server, classifier_url);
     server.serve().await?;
 
     Ok(())

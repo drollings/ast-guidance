@@ -17,6 +17,22 @@ pub struct RoutingTarget {
     pub group: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_name: Option<String>,
+    /// Model inference params to merge into the request body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+    /// Whether to filter thinking blocks from idle timeout.
+    #[serde(default)]
+    pub filter_thinking: bool,
+    /// Number of retry attempts.
+    #[serde(default)]
+    pub retry_count: u32,
+    /// Base interval between retries in seconds.
+    #[serde(default = "default_retry_interval")]
+    pub retry_base_interval_s: u64,
+}
+
+fn default_retry_interval() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +171,22 @@ impl WorkUnit for PipelineOrchestrator {
                                             .get("target_name")
                                             .and_then(|v| v.as_str())
                                             .map(String::from),
+                                        params: rt
+                                            .get("params")
+                                            .cloned()
+                                            .filter(|v| !v.is_null()),
+                                        filter_thinking: rt
+                                            .get("filter_thinking")
+                                            .and_then(serde_json::Value::as_bool)
+                                            .unwrap_or(false),
+                                        retry_count: rt
+                                            .get("retry_count")
+                                            .and_then(serde_json::Value::as_u64)
+                                            .unwrap_or(0) as u32,
+                                        retry_base_interval_s: rt
+                                            .get("retry_base_interval_s")
+                                            .and_then(serde_json::Value::as_u64)
+                                            .unwrap_or(1),
                                     });
                                 }
                             }
