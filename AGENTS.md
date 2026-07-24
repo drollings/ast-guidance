@@ -23,6 +23,7 @@ This is a rust monorepo with multiple projects and shared infrastructure.  coral
 4. VERIFY:      cargo build --workspace && cargo test --workspace
                 && cargo clippy --workspace -- -D warnings
 
+
 ### Quick Reference
 
 | Target         | Purpose |
@@ -32,8 +33,6 @@ This is a rust monorepo with multiple projects and shared infrastructure.  coral
 | `make router-test`  | Kill server + run 181 unit tests + --help dry-run |
 | `make router-mock`  | Depends on router-start, runs 18 curl smoke tests, leaves server running |
 
-### Key Source Layout
-
 
 ### Import Boundaries
 
@@ -42,9 +41,6 @@ This is a rust monorepo with multiple projects and shared infrastructure.  coral
 It must NOT import from `guidance`, `coral`, `wasm_ipc`, `project-knowledge`,
 `ontology`, or `rdf`.
 
-
-
----
 
 ## Source Layout
 

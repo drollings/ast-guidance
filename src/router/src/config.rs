@@ -16,8 +16,20 @@ use crate::pipeline::PipelineOrchestrator;
 pub struct RouterConfig {
     #[serde(default = "PipelineConfig::default")]
     pub pipeline: PipelineConfig,
-    #[serde(default = "ModelCatalog::default")]
-    pub models: ModelCatalog,
+    #[serde(default)]
+    pub models: HashMap<String, ModelEntry>,
+    #[serde(default)]
+    pub model_groups: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub adapters: Vec<AdapterEntry>,
+    #[serde(default)]
+    pub routes: HashMap<String, RouteRef>,
+    #[serde(default)]
+    pub system_prompt: String,
+    #[serde(default)]
+    pub safety_threshold: f64,
+    #[serde(default = "default_fast_route")]
+    pub default_route: String,
     #[serde(default = "SessionConfig::default")]
     pub sessions: SessionConfig,
     #[serde(default = "KvCacheConfig::default")]
@@ -32,8 +44,6 @@ pub struct RouterConfig {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub reject_patterns_path: Option<String>,
-    #[serde(default)]
-    pub routing_fsm_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,10 +79,14 @@ pub struct PipelineConfig {
     pub classifier: bool,
     #[serde(default = "default_true")]
     pub router: bool,
-    #[serde(default = "default_quality_threshold")]
-    pub quality_threshold: f64,
+    #[serde(default = "default_coherence_threshold")]
+    pub coherence_threshold: f64,
     #[serde(default)]
     pub guardrail_mode: GuardrailMode,
+    #[serde(default = "default_generic")]
+    pub classifier_group: String,
+    #[serde(default = "default_generic")]
+    pub frontier_group: String,
 }
 
 impl Default for PipelineConfig {
@@ -81,8 +95,10 @@ impl Default for PipelineConfig {
             deterministic_prefilter: true,
             classifier: true,
             router: true,
-            quality_threshold: default_quality_threshold(),
+            coherence_threshold: default_coherence_threshold(),
             guardrail_mode: GuardrailMode::default(),
+            classifier_group: default_generic(),
+            frontier_group: default_generic(),
         }
     }
 }
@@ -94,41 +110,27 @@ pub enum GuardrailMode {
     Always,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ModelCatalog {
-    #[serde(default)]
-    pub orchestrators: Vec<ModelEntry>,
-    #[serde(default)]
-    pub agents: Vec<ModelEntry>,
-    #[serde(default)]
-    pub frontier: Vec<FrontierEntry>,
-    #[serde(default)]
-    pub adapters: Vec<AdapterEntry>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelEntry {
-    pub name: String,
-    pub path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub name: Option<String>,
+    pub endpoint: String,
+    pub intelligence: u8,
+    pub cost_input: f64,
+    pub cost_output: f64,
+    pub cost_cached_read: f64,
+    pub speed: u8,
+    #[serde(default = "default_total_timeout_ms")]
+    pub total_timeout_ms: u64,
+    #[serde(default = "default_idle_timeout_ms")]
+    pub idle_timeout_ms: u64,
+    #[serde(default)]
     pub context_size: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub quant: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FrontierEntry {
-    pub provider: String,
-    pub model: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_base: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_key_env: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub credentials_ref: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default = "default_true")]
+    pub stream: bool,
+    #[serde(default)]
     pub max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub temperature: Option<f64>,
 }
 
@@ -140,26 +142,16 @@ pub struct AdapterEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteRef {
+    pub group: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionConfig {
-    #[serde(default = "default_orchestrator_ctx")]
-    pub orchestrator_context_size: usize,
-    #[serde(default = "default_agent_ctx")]
-    pub agent_context_size: usize,
     #[serde(default)]
     pub compaction_policy: CompactionPolicy,
     #[serde(default = "default_max_nodes")]
     pub max_nodes_before_compaction: usize,
-}
-
-impl Default for SessionConfig {
-    fn default() -> Self {
-        Self {
-            orchestrator_context_size: default_orchestrator_ctx(),
-            agent_context_size: default_agent_ctx(),
-            compaction_policy: CompactionPolicy::default(),
-            max_nodes_before_compaction: default_max_nodes(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -262,40 +254,7 @@ pub struct CommandConfig {
     pub handlers: HashMap<String, String>,
 }
 
-// ── Routing FSM ─────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RoutingFsm {
-    pub system_prompt: String,
-    #[serde(default = "default_quality_threshold")]
-    pub quality_threshold: f64,
-    #[serde(default)]
-    pub safety_threshold: f64,
-    #[serde(default)]
-    pub routes: HashMap<String, RouteTarget>,
-    #[serde(default = "default_fast_route")]
-    pub default_route: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RouteTarget {
-    pub url: String,
-    pub model: String,
-}
-
-impl Default for RoutingFsm {
-    fn default() -> Self {
-        Self {
-            system_prompt: String::new(),
-            quality_threshold: default_quality_threshold(),
-            safety_threshold: 0.0,
-            routes: HashMap::new(),
-            default_route: default_fast_route(),
-        }
-    }
-}
-
-// ── Classifier output ────────────────────────────────────────────────────
+// ── Classifier output ───────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClassifierOutput {
@@ -311,7 +270,40 @@ pub struct ClassifierOutput {
     pub reason: String,
 }
 
-// ── Pipeline construction ──────────────────────────────────────────────
+// ── Resolved routing target ─────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingConfig {
+    pub routes: HashMap<String, RouteRef>,
+    pub models: HashMap<String, ModelEntry>,
+    pub model_groups: HashMap<String, Vec<String>>,
+    pub system_prompt: String,
+    pub safety_threshold: f64,
+    pub default_route: String,
+}
+
+impl RoutingConfig {
+    pub fn resolve_route(&self, route_name: &str) -> Option<(&ModelEntry, String)> {
+        let route_ref = self
+            .routes
+            .get(route_name)
+            .or_else(|| self.routes.get(&self.default_route))?;
+        let model_names = self.model_groups.get(route_ref.group.as_str())?;
+        let (entry_key, entry) = model_names
+            .iter()
+            .filter_map(|n| self.models.get(n).map(|m| (n, m)))
+            .min_by(|(_, a), (_, b)| {
+                (a.cost_input + a.cost_output)
+                    .partial_cmp(&(b.cost_input + b.cost_output))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })?;
+        let name = entry
+            .name
+            .clone()
+            .unwrap_or_else(|| entry_key.clone());
+        Some((entry, name))
+    }
+}
 
 impl RouterConfig {
     pub fn reject_patterns(&self) -> RejectPatterns {
@@ -321,11 +313,15 @@ impl RouterConfig {
             .unwrap_or_default()
     }
 
-    pub fn routing_fsm(&self) -> RoutingFsm {
-        self.routing_fsm_path
-            .as_deref()
-            .and_then(|p| common_core::config::load_json::<RoutingFsm>(Path::new(p)).ok())
-            .unwrap_or_default()
+    pub fn routing_config(&self) -> RoutingConfig {
+        RoutingConfig {
+            routes: self.routes.clone(),
+            models: self.models.clone(),
+            model_groups: self.model_groups.clone(),
+            system_prompt: self.system_prompt.clone(),
+            safety_threshold: self.safety_threshold,
+            default_route: self.default_route.clone(),
+        }
     }
 
     pub fn build_pipeline(&self) -> PipelineOrchestrator {
@@ -340,32 +336,26 @@ impl RouterConfig {
             ));
         }
 
-        let llm_config = self
-            .models
-            .orchestrators
-            .first()
-            .map(|m| {
-                LlmConfig::new()
-                    .api_url(m.path.clone())
-                    .model(m.name.clone())
-                    .build()
+        let classifier_llm_config = self
+            .model_groups
+            .get(self.pipeline.classifier_group.as_str())
+            .and_then(|names| names.first())
+            .and_then(|n| {
+                self.models
+                    .get(n)
+                    .map(|m| (m.endpoint.clone(), m.total_timeout_ms))
             })
-            .or_else(|| {
-                self.models.frontier.first().map(|f| {
-                    LlmConfig::new()
-                        .api_url(
-                            f.api_base
-                                .clone()
-                                .unwrap_or_else(|| "http://localhost:11434/v1".into()),
-                        )
-                        .model(f.model.clone())
-                        .build()
-                })
+            .map(|(endpoint, timeout_ms)| {
+                LlmConfig::new()
+                    .api_url(endpoint)
+                    .model("classifier".into())
+                    .timeout_ms(timeout_ms.max(5000))
+                    .build()
             });
 
         if self.pipeline.classifier {
-            if let Some(ref cfg) = llm_config {
-                let routing_fsm = self.routing_fsm();
+            if let Some(ref cfg) = classifier_llm_config {
+                let routing_config = self.routing_config();
                 let classifier_config = LlmConfig::new()
                     .api_url(cfg.api_url.clone())
                     .model(cfg.model.clone())
@@ -374,22 +364,24 @@ impl RouterConfig {
                 stages.push(Arc::new(
                     crate::stages::classifier::ClassifierStage::new(
                         classifier_config,
-                        routing_fsm,
-                        self.pipeline.quality_threshold,
+                        routing_config,
+                        self.pipeline.coherence_threshold,
                     ),
                 ));
             }
         }
 
         if self.pipeline.router {
-            let policy = if self.models.frontier.is_empty() {
+            let policy = if self
+                .model_groups
+                .get(self.pipeline.frontier_group.as_str())
+                .is_none_or(std::vec::Vec::is_empty)
+            {
                 crate::stages::router::RoutingPolicy::LocalFirst
             } else {
                 crate::stages::router::RoutingPolicy::FrontierOnly
             };
-            stages.push(Arc::new(
-                crate::stages::router::RouterStage::new(policy),
-            ));
+            stages.push(Arc::new(crate::stages::router::RouterStage::new(policy)));
         }
 
         crate::pipeline::PipelineOrchestrator::new(stages)
@@ -399,17 +391,20 @@ impl RouterConfig {
 fn default_true() -> bool {
     true
 }
-fn default_quality_threshold() -> f64 {
-    0.7
+fn default_coherence_threshold() -> f64 {
+    0.70
 }
 fn default_fast_route() -> String {
     "fast".into()
 }
-fn default_orchestrator_ctx() -> usize {
-    131_072
+fn default_generic() -> String {
+    String::new()
 }
-fn default_agent_ctx() -> usize {
-    65_536
+fn default_total_timeout_ms() -> u64 {
+    300_000
+}
+fn default_idle_timeout_ms() -> u64 {
+    30_000
 }
 fn default_max_nodes() -> usize {
     100

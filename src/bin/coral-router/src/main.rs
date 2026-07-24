@@ -25,14 +25,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pipeline = Arc::new(config.build_pipeline());
 
     let frontier_url = config
-        .models
-        .frontier
-        .first()
-        .map(|f| {
-            f.api_base
-                .clone()
-                .unwrap_or_else(|| f.provider.clone())
-        });
+        .model_groups
+        .get(config.pipeline.frontier_group.as_str())
+        .and_then(|names| names.first())
+        .and_then(|name| config.models.get(name))
+        .map(|m| m.endpoint.clone());
 
     tracing::info!(
         bind_addr = %config.server.bind_addr,

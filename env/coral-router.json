@@ -3,40 +3,77 @@
         "deterministic_prefilter": true,
         "classifier": true,
         "router": true,
-        "quality_threshold": 0.7,
-        "guardrail_mode": "FrontierOnly"
+        "coherence_threshold": 0.70,
+        "guardrail_mode": "FrontierOnly",
+        "classifier_group": "orchestrator",
+        "frontier_group": "fast"
     },
     "models": {
-        "orchestrators": [
-            {
-                "name": "code",
-                "path": "http://localhost:8080/v1",
-                "context_size": 131072
-            }
-        ],
-        "agents": [
-            {
-                "name": "agent",
-                "path": "http://localhost:8080/v1",
-                "context_size": 65536
-            }
-        ],
-        "frontier": [
-            {
-                "provider": "http://localhost:8080/v1/chat/completions",
-                "model": "fast",
-                "max_tokens": 512,
-                "temperature": 0.1
-            }
-        ]
+        "fast": {
+            "endpoint": "http://localhost:8080/v1/chat/completions",
+            "name": "fast:latest",
+            "intelligence": 1,
+            "cost_input": 0.000001,
+            "cost_output": 0.000006,
+            "cost_cached_read": 0.0000004,
+            "speed": 10,
+            "total_timeout_ms": 10000,
+            "idle_timeout_ms": 5000,
+            "context_size": 16384,
+            "stream": true,
+            "max_tokens": 512,
+            "temperature": 0.1
+        },
+        "code": {
+            "endpoint": "http://localhost:8080/v1/chat/completions",
+            "name": "code:latest",
+            "intelligence": 3,
+            "cost_input": 0.000003,
+            "cost_output": 0.000018,
+            "cost_cached_read": 0.0000012,
+            "speed": 5,
+            "total_timeout_ms": 60000,
+            "idle_timeout_ms": 15000,
+            "context_size": 131072,
+            "stream": true
+        },
+        "agent": {
+            "endpoint": "http://localhost:8080/v1/chat/completions",
+            "name": "agent:latest",
+            "intelligence": 3,
+            "cost_input": 0.000003,
+            "cost_output": 0.000018,
+            "cost_cached_read": 0.0000012,
+            "speed": 6,
+            "total_timeout_ms": 60000,
+            "idle_timeout_ms": 15000,
+            "context_size": 65536,
+            "stream": true
+        }
     },
+    "model_groups": {
+        "orchestrator": ["code"],
+        "code": ["code"],
+        "fast": ["fast"],
+        "router": ["fast"],
+        "agents": ["agent"]
+    },
+    "adapters": [],
+    "routes": {
+        "router": { "group": "router" },
+        "fast": { "group": "fast" },
+        "orchestrator": { "group": "orchestrator" },
+        "code": { "group": "code" },
+        "agent": { "group": "agents" }
+    },
+    "system_prompt": "You are a query classifier and safety router. Analyze the user's message and output JSON only.\n\nOutput schema:\n{\n  \"action\": \"respond\" | \"route\" | \"reject\",\n  \"response\": \"direct answer (only if action=respond)\",\n  \"target\": \"route name (only if action=route)\",\n  \"coherence_score\": 0.0-1.0,\n  \"safety_score\": 0.0-1.0,\n  \"intent\": \"question\" | \"command\" | \"creative\" | \"code\" | \"chitchat\",\n  \"reason\": \"brief explanation\"\n}\n\nRules:\n- If the query is trivial (simple arithmetic, basic fact, greeting), set action=respond and provide the answer.\n- If the query is safe and well-formed, set action=route with target=\"fast\".\n- If the query is a coding task, set action=route with target=\"code\".\n- If content is incoherent (coherence_score < 0.3), set action=reject.\n- If content is unsafe (safety_score < 0.5), set action=reject.\n- Safety score 1.0 = completely safe, 0.0 = dangerous.\n\nOnly output JSON, no other text.",
+    "safety_threshold": 0.5,
+    "default_route": "router",
     "server": {
         "bind_addr": "127.0.0.1:8081",
         "max_payload": 1048576
     },
     "sessions": {
-        "orchestrator_context_size": 131072,
-        "agent_context_size": 65536,
         "compaction_policy": "Recency",
         "max_nodes_before_compaction": 100
     },
@@ -66,6 +103,5 @@
         "json_format": false,
         "console_output": true
     },
-    "reject_patterns_path": "env/reject-patterns.json",
-    "routing_fsm_path": "env/routing-fsm.json"
+    "reject_patterns_path": "env/reject-patterns.json"
 }

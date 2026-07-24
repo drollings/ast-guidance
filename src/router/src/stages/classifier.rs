@@ -1,31 +1,35 @@
 //! Stage 2: ClassifierStage — single LLM call that replaces QualityGate,
 //! PlanningRefinement, and GuardrailCheck. Acts as an FSM switch: the LLM
 //! returns either a direct response, a routing target, or a rejection.
-//! Configurable via `RoutingFsm` from JSON.
+//! Configurable via `RoutingConfig` from the top-level coral-router config.
 
 use fluent_wvr::prelude::*;
 use guidance_llm::{ChatMessage, LlmClient, LlmConfig};
 
-use crate::config::{ClassifierOutput, RoutingFsm};
+use crate::config::{ClassifierOutput, RoutingConfig};
 use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
 use crate::stages::common::extract_user_message;
 
 pub struct ClassifierStage {
     name: ArcIntern<str>,
     client: LlmClient,
-    fsm: RoutingFsm,
-    quality_threshold: f64,
+    routing_config: RoutingConfig,
+    coherence_threshold: f64,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
 
 impl ClassifierStage {
-    pub fn new(config: LlmConfig, fsm: RoutingFsm, quality_threshold: f64) -> Self {
+    pub fn new(
+        config: LlmConfig,
+        routing_config: RoutingConfig,
+        coherence_threshold: f64,
+    ) -> Self {
         Self {
             name: ArcIntern::from("pipeline.stage2.classifier"),
             client: LlmClient::with_config(config),
-            fsm,
-            quality_threshold,
+            routing_config,
+            coherence_threshold,
             depends: vec![ArcIntern::from("pipeline.stage1.output")],
             provides: vec![ArcIntern::from("pipeline.stage2.output")],
         }
@@ -51,7 +55,7 @@ impl WorkUnit for ClassifierStage {
         let messages = vec![
             ChatMessage {
                 role: "system".into(),
-                content: self.fsm.system_prompt.clone(),
+                content: self.routing_config.system_prompt.clone(),
             },
             ChatMessage {
                 role: "user".into(),
@@ -67,7 +71,7 @@ impl WorkUnit for ClassifierStage {
                     (ClassifierOutput {
                         action: "route".into(),
                         response: None,
-                        target: Some(self.fsm.default_route.clone()),
+                        target: Some(self.routing_config.default_route.clone()),
                         coherence_score: 1.0,
                         safety_score: 1.0,
                         intent: None,
@@ -80,7 +84,7 @@ impl WorkUnit for ClassifierStage {
                 (ClassifierOutput {
                     action: "route".into(),
                     response: None,
-                    target: Some(self.fsm.default_route.clone()),
+                    target: Some(self.routing_config.default_route.clone()),
                     coherence_score: 1.0,
                     safety_score: 1.0,
                     intent: None,
@@ -89,19 +93,19 @@ impl WorkUnit for ClassifierStage {
             }
         };
 
-        let coherence_ok = output.coherence_score >= self.quality_threshold;
-        let safety_ok = output.safety_score >= self.fsm.safety_threshold;
+        let coherence_ok = output.coherence_score >= self.coherence_threshold;
+        let safety_ok = output.safety_score >= self.routing_config.safety_threshold;
 
         if !coherence_ok || !safety_ok {
             let reason = if coherence_ok {
                 format!(
                     "rejected: safety {:.2} below threshold {:.2}",
-                    output.safety_score, self.fsm.safety_threshold
+                    output.safety_score, self.routing_config.safety_threshold
                 )
             } else {
                 format!(
                     "rejected: coherence {:.2} below threshold {:.2}",
-                    output.coherence_score, self.quality_threshold
+                    output.coherence_score, self.coherence_threshold
                 )
             };
             return WorkOutput::typed(
@@ -126,25 +130,37 @@ impl WorkUnit for ClassifierStage {
         let routing_target = match action {
             "respond" => None,
             "route" => {
-                let target_name = output.target.as_deref().unwrap_or(&self.fsm.default_route);
-                let route = self.fsm.routes.get(target_name);
-                route.map(|r| {
+                let target_name = output
+                    .target
+                    .as_deref()
+                    .unwrap_or(&self.routing_config.default_route);
+                self.routing_config.resolve_route(target_name).map(|(model, model_name)| {
                     serde_json::json!({
-                        "url": r.url,
-                        "model": r.model,
+                        "url": model.endpoint,
+                        "model": model_name,
+                        "group": self.routing_config
+                            .routes
+                            .get(target_name)
+                            .or_else(|| self.routing_config.routes.get(&self.routing_config.default_route))
+                            .map_or("", |r| r.group.as_str()),
                         "target_name": target_name,
                     })
                 })
             }
             _ => {
-                let route = self.fsm.routes.get(&self.fsm.default_route);
-                route.map(|r| {
-                    serde_json::json!({
-                        "url": r.url,
-                        "model": r.model,
-                        "target_name": &self.fsm.default_route,
+                self.routing_config
+                    .resolve_route(&self.routing_config.default_route)
+                    .map(|(model, model_name)| {
+                        serde_json::json!({
+                            "url": model.endpoint,
+                            "model": model_name,
+                        "group": self.routing_config
+                            .routes
+                            .get(&self.routing_config.default_route)
+                            .map_or("", |r| r.group.as_str()),
+                            "target_name": &self.routing_config.default_route,
+                        })
                     })
-                })
             }
         };
 

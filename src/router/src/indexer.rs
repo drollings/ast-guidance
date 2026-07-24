@@ -1,30 +1,22 @@
-//! Adapter/model/frontier indexer — validates entries at index time so
+//! Adapter indexer — validates LoRA adapter entries at index time so
 //! mismatches are caught before the first request, not during dispatch.
 
 use std::path::{Path, PathBuf};
 
-use crate::config::{AdapterEntry, FrontierEntry, ModelEntry};
+use crate::config::AdapterEntry;
 
 /// Errors produced by the adapter indexer at validation/index time.
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
     #[error("adapter file not found: {0}")]
     AdapterNotFound(PathBuf),
-    #[error("model file not found: {0}")]
-    ModelNotFound(PathBuf),
     #[error("base model not found for adapter '{adapter}': {base_model}")]
     BaseModelNotFound {
         adapter: String,
         base_model: PathBuf,
     },
-    #[error("empty provider for frontier entry '{model}'")]
-    EmptyProvider { model: String },
-    #[error("empty model name for frontier entry from provider '{provider}'")]
-    EmptyModel { provider: String },
     #[error("invalid path for adapter '{name}': {path}")]
     InvalidAdapterPath { name: String, path: String },
-    #[error("invalid path for model '{name}': {path}")]
-    InvalidModelPath { name: String, path: String },
     #[error("I/O error at '{path}': {source}")]
     Io {
         path: PathBuf,
@@ -33,7 +25,7 @@ pub enum IndexError {
     },
 }
 
-/// Validates adapters, models, and frontier entries at index time.
+/// Validates adapter entries at index time.
 ///
 /// All validation happens eagerly — a mismatched adapter is rejected at
 /// startup, not deferred to the first request that needs it.
@@ -81,54 +73,6 @@ impl AdapterIndexer {
         Ok(())
     }
 
-    /// Index a GGUF model file. Validates the file exists and is readable.
-    pub fn index_model(&self, entry: &ModelEntry) -> Result<(), IndexError> {
-        let model_path = Self::validate_path(&entry.name, &entry.path)?;
-        if !model_path.exists() {
-            return Err(IndexError::ModelNotFound(model_path));
-        }
-        if !model_path.is_file() {
-            return Err(IndexError::InvalidModelPath {
-                name: entry.name.clone(),
-                path: entry.path.clone(),
-            });
-        }
-
-        tracing::info!(
-            target: "router.indexer",
-            model = %entry.name,
-            quant = ?entry.quant,
-            context_size = ?entry.context_size,
-            "model indexed successfully"
-        );
-
-        Ok(())
-    }
-
-    /// Index a frontier provider entry. Validates provider and model
-    /// names are non-empty.
-    pub fn index_frontier(&self, entry: &FrontierEntry) -> Result<(), IndexError> {
-        if entry.provider.trim().is_empty() {
-            return Err(IndexError::EmptyProvider {
-                model: entry.model.clone(),
-            });
-        }
-        if entry.model.trim().is_empty() {
-            return Err(IndexError::EmptyModel {
-                provider: entry.provider.clone(),
-            });
-        }
-
-        tracing::info!(
-            target: "router.indexer",
-            provider = %entry.provider,
-            model = %entry.model,
-            "frontier entry indexed successfully"
-        );
-
-        Ok(())
-    }
-
     /// Verify adapter-model compatibility.
     ///
     /// Checks that both files exist and are readable. In a full
@@ -161,24 +105,9 @@ impl AdapterIndexer {
         Ok(())
     }
 
-    /// Index all entries from a catalog. Reports the first error;
+    /// Index all adapter entries from a catalog. Reports the first error;
     /// subsequent entries are not validated.
-    pub fn index_all(
-        &self,
-        orchestrators: &[ModelEntry],
-        agents: &[ModelEntry],
-        frontier: &[FrontierEntry],
-        adapters: &[AdapterEntry],
-    ) -> Result<(), IndexError> {
-        for entry in orchestrators {
-            self.index_model(entry)?;
-        }
-        for entry in agents {
-            self.index_model(entry)?;
-        }
-        for entry in frontier {
-            self.index_frontier(entry)?;
-        }
+    pub fn index_all(&self, adapters: &[AdapterEntry]) -> Result<(), IndexError> {
         for entry in adapters {
             self.index_adapter(entry)?;
         }
@@ -187,7 +116,7 @@ impl AdapterIndexer {
 
     fn validate_path(name: &str, path_str: &str) -> Result<PathBuf, IndexError> {
         if path_str.trim().is_empty() {
-            return Err(IndexError::InvalidModelPath {
+            return Err(IndexError::InvalidAdapterPath {
                 name: name.to_string(),
                 path: path_str.to_string(),
             });
@@ -207,79 +136,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn index_frontier_rejects_empty_provider() {
-        let indexer = AdapterIndexer::new();
-        let entry = FrontierEntry {
-            provider: String::new(),
-            model: "gpt-4".into(),
-            api_base: None,
-            api_key_env: None,
-            credentials_ref: None,
-            max_tokens: None,
-            temperature: None,
-        };
-        let err = indexer.index_frontier(&entry).unwrap_err();
-        assert!(matches!(err, IndexError::EmptyProvider { .. }));
-    }
-
-    #[test]
-    fn index_frontier_rejects_empty_model() {
-        let indexer = AdapterIndexer::new();
-        let entry = FrontierEntry {
-            provider: "openai".into(),
-            model: String::new(),
-            api_base: None,
-            api_key_env: None,
-            credentials_ref: None,
-            max_tokens: None,
-            temperature: None,
-        };
-        let err = indexer.index_frontier(&entry).unwrap_err();
-        assert!(matches!(err, IndexError::EmptyModel { .. }));
-    }
-
-    #[test]
-    fn index_frontier_accepts_valid_entry() {
-        let indexer = AdapterIndexer::new();
-        let entry = FrontierEntry {
-            provider: "openai".into(),
-            model: "gpt-4".into(),
-            api_base: None,
-            api_key_env: None,
-            credentials_ref: None,
-            max_tokens: None,
-            temperature: None,
-        };
-        assert!(indexer.index_frontier(&entry).is_ok());
-    }
-
-    #[test]
-    fn index_model_rejects_empty_path() {
-        let indexer = AdapterIndexer::new();
-        let entry = ModelEntry {
-            name: "test-model".into(),
-            path: String::new(),
-            context_size: None,
-            quant: None,
-        };
-        let err = indexer.index_model(&entry).unwrap_err();
-        assert!(matches!(err, IndexError::InvalidModelPath { .. }));
-    }
-
-    #[test]
-    fn index_model_rejects_missing_file() {
-        let indexer = AdapterIndexer::new();
-        let entry = ModelEntry {
-            name: "nonexistent".into(),
-            path: "/tmp/nonexistent-model-12345.gguf".into(),
-            context_size: None,
-            quant: None,
-        };
-        let err = indexer.index_model(&entry).unwrap_err();
-        assert!(matches!(err, IndexError::ModelNotFound(_)));
-    }
-
-    #[test]
     fn index_adapter_rejects_missing_base_model_with_tmp_file() {
         let indexer = AdapterIndexer::new();
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -294,31 +150,15 @@ mod tests {
     }
 
     #[test]
-    fn index_model_accepts_existing_file() {
-        let indexer = AdapterIndexer::new();
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let entry = ModelEntry {
-            name: "existing-model".into(),
-            path: tmp.path().to_string_lossy().to_string(),
-            context_size: None,
-            quant: None,
-        };
-        assert!(indexer.index_model(&entry).is_ok());
-    }
-
-    #[test]
     fn index_all_returns_first_error() {
         let indexer = AdapterIndexer::new();
-        let bad = vec![ModelEntry {
+        let bad = vec![AdapterEntry {
             name: "bad".into(),
-            path: "/tmp/nonexistent-model-99999.gguf".into(),
-            context_size: None,
-            quant: None,
+            path: "/tmp/nonexistent-adapter-99999.bin".into(),
+            base_model: "/tmp/nonexistent-base.gguf".into(),
         }];
-        let err = indexer
-            .index_all(&bad, &[], &[], &[])
-            .unwrap_err();
-        assert!(matches!(err, IndexError::ModelNotFound(_)));
+        let err = indexer.index_all(&bad).unwrap_err();
+        assert!(matches!(err, IndexError::AdapterNotFound(_)));
     }
 
     #[test]

@@ -13,6 +13,10 @@ use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
 pub struct RoutingTarget {
     pub url: String,
     pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,8 +100,8 @@ impl WorkUnit for PipelineOrchestrator {
 
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
         let mut decisions: Vec<StageDecision> = Vec::new();
-        let mut current_request = get_metadata_string(ctx, "request")
-            .unwrap_or_default();
+        let mut current_request =
+            get_metadata_string(ctx, "request").unwrap_or_default();
         let mut routing_target: Option<RoutingTarget> = None;
         let mut classifier_response: Option<String> = None;
 
@@ -132,8 +136,25 @@ impl WorkUnit for PipelineOrchestrator {
                                 }
                                 if let Some(rt) = decision.metadata.get("routing_target") {
                                     routing_target = Some(RoutingTarget {
-                                        url: rt.get("url").and_then(|v| v.as_str()).unwrap_or("").into(),
-                                        model: rt.get("model").and_then(|v| v.as_str()).unwrap_or("").into(),
+                                        url: rt
+                                            .get("url")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .into(),
+                                        model: rt
+                                            .get("model")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .into(),
+                                        group: rt
+                                            .get("group")
+                                            .and_then(|v| v.as_str())
+                                            .map(String::from)
+                                            .filter(|s| !s.is_empty()),
+                                        target_name: rt
+                                            .get("target_name")
+                                            .and_then(|v| v.as_str())
+                                            .map(String::from),
                                     });
                                 }
                             }
