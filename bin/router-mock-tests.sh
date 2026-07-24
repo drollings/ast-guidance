@@ -33,12 +33,12 @@ check() {
 check "health"           GET  "$BASE/health"                              ''     'ok'
 check "stats"            GET  "$BASE/stats"                               ''     'requests'
 
-# ── Model "fast" (frontier) ──────────────────────────────────
-check "fast: 2+2"        POST "$BASE/v1/chat/completions" \
-  '{"model":"fast","messages":[{"role":"user","content":"What is 2+2?"}]}' '4'
+# ── Model "local" (local) ──────────────────────────────────
+check "local: 2+2"        POST "$BASE/v1/chat/completions" \
+  '{"model":"local","messages":[{"role":"user","content":"What is 2+2?"}]}' '4'
 
-check "fast: color of sky"    POST "$BASE/v1/chat/completions" \
-  '{"model":"fast","messages":[{"role":"user","content":"What color is the sky?"}]}' 'blue'
+check "local: color of sky"    POST "$BASE/v1/chat/completions" \
+  '{"model":"local","messages":[{"role":"user","content":"What color is the sky?"}]}' 'blue'
 
 # ── Model "code" (orchestrator) ──────────────────────────────
 check "code: 2+2"        POST "$BASE/v1/chat/completions" \
@@ -49,24 +49,24 @@ check "code: explain GC" POST "$BASE/v1/chat/completions" \
 
 # ── Command dispatch (deterministic pre-filter) ──────────────
 check "/help"             POST "$BASE/v1/chat/completions" \
-  '{"model":"fast","messages":[{"role":"user","content":"/help"}]}' 'help'
+  '{"model":"local","messages":[{"role":"user","content":"/help"}]}' 'help'
 
 check "/checkpoint"       POST "$BASE/v1/chat/completions" \
-  '{"model":"fast","messages":[{"role":"user","content":"/checkpoint snap1"}]}' 'checkpoint'
+  '{"model":"local","messages":[{"role":"user","content":"/checkpoint snap1"}]}' 'checkpoint'
 
 check "/unknown"          POST "$BASE/v1/chat/completions" \
-  '{"model":"fast","messages":[{"role":"user","content":"/nonexistent"}]}' 'unknown command'
+  '{"model":"local","messages":[{"role":"user","content":"/nonexistent"}]}' 'unknown command'
 
 # ── PII detection ────────────────────────────────────────────
 check "PII: ssn"          POST "$BASE/v1/chat/completions" \
-  '{"model":"fast","messages":[{"role":"user","content":"My SSN is 123-45-6789"}]}' 'blocked'
+  '{"model":"local","messages":[{"role":"user","content":"My SSN is 123-45-6789"}]}' 'blocked'
 
 check "PII: email"        POST "$BASE/v1/chat/completions" \
-  '{"model":"fast","messages":[{"role":"user","content":"Email me@test.com please"}]}' 'email'
+  '{"model":"local","messages":[{"role":"user","content":"Email me@test.com please"}]}' 'email'
 
 # ── Error cases ──────────────────────────────────────────────
 check "empty messages"    POST "$BASE/v1/chat/completions" \
-  '{"model":"fast","messages":[]}'   'error'
+  '{"model":"local","messages":[]}'   'error'
 
 check "bad JSON"          POST "$BASE/v1/chat/completions" \
   'not json'                         'error'
@@ -95,7 +95,7 @@ fi
 # ── Streaming flag preserved ─────────────────────────────────
 resp=$(curl -s -m 30 -X POST "$BASE/v1/chat/completions" \
     -H "Content-Type: application/json" \
-    -d '{"model":"fast","messages":[{"role":"user","content":"hi"}],"stream":true}')
+    -d '{"model":"local","messages":[{"role":"user","content":"hi"}],"stream":true}')
 if echo "$resp" | grep -q 'data:'; then
     echo -e "  ${GREEN}PASS${NC} [200] stream flag returns SSE chunks"
     PASS=$((PASS + 1))
@@ -107,23 +107,23 @@ fi
 # ── Model routing verification ───────────────────────────────
 resp=$(curl -s -m 30 -X POST "$BASE/v1/chat/completions" \
     -H "Content-Type: application/json" \
-    -d '{"model":"fast","messages":[{"role":"user","content":"hi"}]}')
-if echo "$resp" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['model']=='fast'" 2>/dev/null; then
-    echo -e "  ${GREEN}PASS${NC} [200] frontier routes to model=fast"
+    -d '{"model":"local","messages":[{"role":"user","content":"hi"}]}')
+if echo "$resp" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['model']=='local'" 2>/dev/null; then
+    echo -e "  ${GREEN}PASS${NC} [200] local routes to model=local"
     PASS=$((PASS + 1))
 else
-    echo -e "  ${RED}FAIL${NC}        frontier routes to model=fast"
+    echo -e "  ${RED}FAIL${NC}        local routes to model=local"
     FAIL=$((FAIL + 1))
 fi
 
 resp=$(curl -s -m 30 -X POST "$BASE/v1/chat/completions" \
     -H "Content-Type: application/json" \
     -d '{"model":"code","messages":[{"role":"user","content":"hi"}]}')
-if echo "$resp" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d.get('model')=='code' or d.get('model')=='fast'" 2>/dev/null; then
-    echo -e "  ${GREEN}PASS${NC} [200] frontier routes model name correctly"
+if echo "$resp" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d.get('model')=='code' or d.get('model')=='local'" 2>/dev/null; then
+    echo -e "  ${GREEN}PASS${NC} [200] local routes model name correctly"
     PASS=$((PASS + 1))
 else
-    echo -e "  ${RED}FAIL${NC}        frontier routes model name correctly"
+    echo -e "  ${RED}FAIL${NC}        local routes model name correctly"
     FAIL=$((FAIL + 1))
 fi
 
