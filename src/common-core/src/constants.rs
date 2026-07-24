@@ -5,6 +5,11 @@ pub const MAX_FILE_SIZE: usize = 100 * 1024 * 1024;
 pub const MAX_JSON_DEPTH: usize = 100;
 pub const MAX_EMBEDDING_DIMENSIONS: usize = 4_096;
 
+/// Serde default helper that returns `true`.
+pub const fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HnswParams {
     pub max_nb_connection: usize,

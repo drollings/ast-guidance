@@ -23,7 +23,6 @@ reqwest = { workspace = true }
 tokio = { workspace = true }
 futures-util = { workspace = true }
 time = { workspace = true }
-fastrand = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }

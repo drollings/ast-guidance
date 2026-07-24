@@ -3,37 +3,34 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Three distinct, independently configurable watchdogs.
+/// Three independent, composable guardrails for long-running operations.
 ///
-/// # Design
-/// Each watchdog is its own struct with its own state. `WatchdogSet` composes
-/// them and provides a unified `check()` method. This is explicitly NOT a
-/// single generic timeout — each watchdog tracks a different signal and has
-/// independent configuration.
+/// Each watchdog tracks a distinct signal — item budget, wall-clock
+/// deadline, or repetition — and fires when its threshold is exceeded.
+/// `WatchdogSet` composes them with a unified `check()`.
 pub struct WatchdogSet {
-    pub max_tokens: MaxTokenWatchdog,
+    pub budget: BudgetWatchdog,
     pub wall_clock: WallClockWatchdog,
     pub repetition: RepetitionWatchdog,
 }
 
 impl WatchdogSet {
-    /// Create a new watchdog set with the given configurations.
     pub fn new(
-        max_token_limit: u32,
+        budget_limit: u32,
         wall_clock_secs: u64,
         repeat_threshold: usize,
         repeat_window: usize,
     ) -> Self {
         Self {
-            max_tokens: MaxTokenWatchdog::new(max_token_limit),
+            budget: BudgetWatchdog::new(budget_limit),
             wall_clock: WallClockWatchdog::new(wall_clock_secs),
             repetition: RepetitionWatchdog::new(repeat_threshold, repeat_window),
         }
     }
 
-    /// Check all watchdogs. Returns the first watchdog that fired.
-    pub fn check(&self, token: Option<&str>) -> Option<WatchdogEvent> {
-        if let Some(event) = self.max_tokens.check() {
+    /// Check all watchdogs. Returns the first event that fired.
+    pub fn check(&self, item: Option<&str>) -> Option<WatchdogEvent> {
+        if let Some(event) = self.budget.check() {
             return Some(event);
         }
 
@@ -41,8 +38,8 @@ impl WatchdogSet {
             return Some(event);
         }
 
-        if let Some(token) = token {
-            if let Some(event) = self.repetition.check(token) {
+        if let Some(item) = item {
+            if let Some(event) = self.repetition.check(item) {
                 return Some(event);
             }
         }
@@ -50,11 +47,11 @@ impl WatchdogSet {
         None
     }
 
-    /// Log which watchdog fired.
+    /// Log which watchdog fired via `tracing::warn!`.
     pub fn log_event(event: &WatchdogEvent) {
         match event {
-            WatchdogEvent::MaxTokens { limit, actual } => {
-                tracing::warn!("watchdog: max tokens ({limit}) reached with {actual} tokens");
+            WatchdogEvent::BudgetExceeded { limit, actual } => {
+                tracing::warn!("watchdog: budget ({limit}) exceeded with {actual} items");
             }
             WatchdogEvent::WallClock {
                 deadline_secs,
@@ -69,20 +66,20 @@ impl WatchdogSet {
                 consecutive,
             } => {
                 tracing::warn!(
-                    "watchdog: repetition threshold ({threshold}) exceeded with {consecutive} consecutive identical tokens"
+                    "watchdog: repetition threshold ({threshold}) exceeded with {consecutive} consecutive identical items"
                 );
             }
         }
     }
 }
 
-/// Token budget watchdog. Fires when the total token count exceeds the limit.
-pub struct MaxTokenWatchdog {
+/// Item budget guardrail. Fires when the total item count exceeds the limit.
+pub struct BudgetWatchdog {
     pub limit: u32,
     pub count: AtomicU32,
 }
 
-impl MaxTokenWatchdog {
+impl BudgetWatchdog {
     pub fn new(limit: u32) -> Self {
         Self {
             limit,
@@ -93,7 +90,7 @@ impl MaxTokenWatchdog {
     pub fn check(&self) -> Option<WatchdogEvent> {
         let current = self.count.fetch_add(1, Ordering::Relaxed) + 1;
         if current > self.limit {
-            Some(WatchdogEvent::MaxTokens {
+            Some(WatchdogEvent::BudgetExceeded {
                 limit: self.limit,
                 actual: current,
             })
@@ -107,7 +104,7 @@ impl MaxTokenWatchdog {
     }
 }
 
-/// Wall-clock deadline watchdog. Fires when the deadline is exceeded.
+/// Wall-clock deadline guardrail. Fires when the elapsed time exceeds the deadline.
 pub struct WallClockWatchdog {
     pub deadline_secs: u64,
     pub started_at: Instant,
@@ -139,8 +136,8 @@ impl WallClockWatchdog {
     }
 }
 
-/// Repetition/loop detection watchdog. Fires when N consecutive identical
-/// tokens are observed within a sliding window.
+/// Repetition / loop-detection guardrail. Fires when N consecutive identical
+/// items are observed within a sliding window.
 pub struct RepetitionWatchdog {
     pub threshold: usize,
     pub window: usize,
@@ -156,15 +153,15 @@ impl RepetitionWatchdog {
         }
     }
 
-    pub fn check(&self, token: &str) -> Option<WatchdogEvent> {
+    pub fn check(&self, item: &str) -> Option<WatchdogEvent> {
         let mut buffer = self.buffer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        buffer.push_back(token.to_string());
+        buffer.push_back(item.to_string());
         if buffer.len() > self.window {
             buffer.pop_front();
         }
 
         if buffer.len() >= self.threshold {
-            let all_same = buffer.iter().rev().take(self.threshold).all(|t| t == token);
+            let all_same = buffer.iter().rev().take(self.threshold).all(|t| t == item);
             if all_same {
                 return Some(WatchdogEvent::Repetition {
                     threshold: self.threshold,
@@ -181,10 +178,10 @@ impl RepetitionWatchdog {
     }
 }
 
-/// Events that can fire from any of the three watchdogs.
+/// Events emitted by the three watchdogs.
 #[derive(Debug, Clone)]
 pub enum WatchdogEvent {
-    MaxTokens {
+    BudgetExceeded {
         limit: u32,
         actual: u32,
     },
@@ -198,37 +195,58 @@ pub enum WatchdogEvent {
     },
 }
 
+/// Discriminant keys for watchdog event counters in metrics aggregation.
+///
+/// Distinct from `WatchdogEvent` (which carries payload data); this enum
+/// provides label-safe variant keys suitable for `HashMap` keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WatchdogEventType {
+    BudgetExceeded,
+    WallClock,
+    Repetition,
+}
+
+impl From<&WatchdogEvent> for WatchdogEventType {
+    fn from(event: &WatchdogEvent) -> Self {
+        match event {
+            WatchdogEvent::BudgetExceeded { .. } => WatchdogEventType::BudgetExceeded,
+            WatchdogEvent::WallClock { .. } => WatchdogEventType::WallClock,
+            WatchdogEvent::Repetition { .. } => WatchdogEventType::Repetition,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_max_token_watchdog_fires() {
-        let dog = MaxTokenWatchdog::new(3);
+    fn test_budget_watchdog_fires() {
+        let dog = BudgetWatchdog::new(3);
         assert!(dog.check().is_none());
         assert!(dog.check().is_none());
         assert!(dog.check().is_none());
-        let event = dog.check().expect("should fire on 4th token");
+        let event = dog.check().expect("should fire on 4th item");
         match event {
-            WatchdogEvent::MaxTokens { limit, actual } => {
+            WatchdogEvent::BudgetExceeded { limit, actual } => {
                 assert_eq!(limit, 3);
                 assert_eq!(actual, 4);
             }
-            _ => panic!("expected MaxTokens"),
+            _ => panic!("expected BudgetExceeded"),
         }
     }
 
     #[test]
-    fn test_max_token_watchdog_never_fires_within_limit() {
-        let dog = MaxTokenWatchdog::new(100);
+    fn test_budget_watchdog_never_fires_within_limit() {
+        let dog = BudgetWatchdog::new(100);
         for _ in 0..100 {
             assert!(dog.check().is_none());
         }
     }
 
     #[test]
-    fn test_max_token_watchdog_reset() {
-        let dog = MaxTokenWatchdog::new(2);
+    fn test_budget_watchdog_reset() {
+        let dog = BudgetWatchdog::new(2);
         assert!(dog.check().is_none());
         assert!(dog.check().is_none());
         dog.reset();
@@ -272,10 +290,10 @@ mod tests {
     }
 
     #[test]
-    fn test_repetition_watchdog_not_fires_with_different_tokens() {
+    fn test_repetition_watchdog_not_fires_with_different_items() {
         let dog = RepetitionWatchdog::new(4, 10);
-        let tokens = ["a", "b", "c", "d", "e"];
-        for t in &tokens {
+        let items = ["a", "b", "c", "d", "e"];
+        for t in &items {
             assert!(dog.check(t).is_none());
         }
     }
@@ -291,7 +309,6 @@ mod tests {
 
     #[test]
     fn test_watchdog_set_composition() {
-        // Use a high max_tokens limit so repetition fires first
         let set = WatchdogSet::new(100, 3600, 3, 10);
         assert!(set.check(Some("hello")).is_none());
         assert!(set.check(Some("hello")).is_none());
@@ -303,19 +320,19 @@ mod tests {
     }
 
     #[test]
-    fn test_watchdog_set_max_tokens_triggers() {
+    fn test_watchdog_set_budget_triggers() {
         let set = WatchdogSet::new(1, 3600, 10, 10);
         assert!(set.check(None).is_none());
-        let event = set.check(Some("hello")).expect("max tokens should fire");
+        let event = set.check(Some("hello")).expect("budget should fire");
         match event {
-            WatchdogEvent::MaxTokens { .. } => {}
-            _ => panic!("expected MaxTokens"),
+            WatchdogEvent::BudgetExceeded { .. } => {}
+            _ => panic!("expected BudgetExceeded"),
         }
     }
 
     #[test]
     fn test_log_event_does_not_panic() {
-        let event = WatchdogEvent::MaxTokens {
+        let event = WatchdogEvent::BudgetExceeded {
             limit: 100,
             actual: 101,
         };
@@ -330,5 +347,21 @@ mod tests {
             consecutive: 10,
         };
         WatchdogSet::log_event(&event);
+    }
+
+    #[test]
+    fn test_watchdog_event_type_from_event() {
+        assert_eq!(
+            WatchdogEventType::from(&WatchdogEvent::BudgetExceeded { limit: 1, actual: 2 }),
+            WatchdogEventType::BudgetExceeded
+        );
+        assert_eq!(
+            WatchdogEventType::from(&WatchdogEvent::WallClock { deadline_secs: 1, elapsed_secs: 2 }),
+            WatchdogEventType::WallClock
+        );
+        assert_eq!(
+            WatchdogEventType::from(&WatchdogEvent::Repetition { threshold: 1, consecutive: 2 }),
+            WatchdogEventType::Repetition
+        );
     }
 }

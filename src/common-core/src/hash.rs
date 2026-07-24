@@ -166,6 +166,27 @@ pub fn hex_encode(data: &[u8]) -> String {
         .concat()
 }
 
+/// Generate a time-based pseudo-UUID v4 string.
+///
+/// Uses `SystemTime` nanoseconds, process ID, and `fastrand` for entropy.
+/// Formatted as `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` (36 chars, 4 dashes).
+pub fn uuid_v4() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let nanos = now.as_nanos();
+    let pid = u64::from(std::process::id());
+    let rng = fastrand::u64(..);
+    let time_hi = (nanos >> 32) as u32;
+    let time_mid = (nanos >> 16) as u32 & 0xFFFF;
+    let time_lo = nanos as u32 & 0xFFFF;
+    let version = (u64::from(pid as u32 & 0xFFF)) as u32 | 0x4000;
+    let variant = (((pid >> 12) ^ rng) as u32 & 0x3FFF) | 0x8000;
+    let node = (rng >> 32) as u32;
+    format!("{time_hi:08x}-{time_mid:04x}-{time_lo:04x}-{version:04x}-{variant:04x}{node:08x}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

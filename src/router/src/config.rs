@@ -470,9 +470,8 @@ impl RouterConfig {
     }
 }
 
-fn default_true() -> bool {
-    true
-}
+use common_core::constants::default_true;
+
 fn default_coherence_threshold() -> f64 {
     0.70
 }

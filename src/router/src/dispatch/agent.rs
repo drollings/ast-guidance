@@ -4,7 +4,7 @@ use crate::agent::{AgentConfig, AgentError, AgentIdentity, AgentRegistry, AgentT
 use crate::kv_cache::{HotKvCache, KvSnapshot};
 use crate::pipeline_types::RoutingDestination;
 use crate::types::{RouterMessageContent, RouterRequest};
-use crate::watchdog::WatchdogSet;
+use common_core::watchdog::WatchdogSet;
 
 #[derive(Debug, Clone)]
 pub struct AgentResponse {

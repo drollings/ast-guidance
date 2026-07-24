@@ -7,6 +7,8 @@ use std::time::Instant;
 use fluent_wvr::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use common_core::constants::default_true;
+
 use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
 use crate::stages::common::get_metadata_string;
 
@@ -43,10 +45,6 @@ pub struct RoutingTarget {
 
 fn default_retry_interval() -> u64 {
     1
-}
-
-fn default_true() -> bool {
-    true
 }
 
 fn default_idle_timeout_ms() -> u64 {

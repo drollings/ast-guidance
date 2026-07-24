@@ -23,8 +23,9 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
+use common_core::now_secs;
 use lru::LruCache;
 use thiserror::Error;
 
@@ -462,12 +463,6 @@ impl KvCacheManager {
     pub async fn evict(&self) -> Result<usize, KvCacheError> {
         self.cold.evict().await
     }
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
 }
 
 #[cfg(test)]

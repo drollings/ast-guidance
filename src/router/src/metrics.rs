@@ -11,28 +11,7 @@ use std::sync::{Arc, RwLock};
 use common_core::metrics::LatencyHistogram;
 
 use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
-use crate::watchdog::WatchdogEvent;
-
-/// Discriminant keys for watchdog event counters.
-///
-/// Distinct from `WatchdogEvent` (which carries payload data);
-/// this enum provides label-safe variant keys for metric aggregation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum WatchdogEventType {
-    MaxTokens,
-    WallClock,
-    Repetition,
-}
-
-impl From<&WatchdogEvent> for WatchdogEventType {
-    fn from(event: &WatchdogEvent) -> Self {
-        match event {
-            WatchdogEvent::MaxTokens { .. } => WatchdogEventType::MaxTokens,
-            WatchdogEvent::WallClock { .. } => WatchdogEventType::WallClock,
-            WatchdogEvent::Repetition { .. } => WatchdogEventType::Repetition,
-        }
-    }
-}
+use common_core::watchdog::{WatchdogEvent, WatchdogEventType};
 
 /// Aggregated router metrics.
 ///
@@ -184,7 +163,7 @@ mod tests {
     #[test]
     fn record_watchdog_fire_increments_counter() {
         let m = RouterMetrics::new();
-        let event = WatchdogEvent::MaxTokens {
+        let event = WatchdogEvent::BudgetExceeded {
             limit: 4096,
             actual: 4097,
         };
@@ -192,7 +171,7 @@ mod tests {
         m.record_watchdog_fire(&event);
 
         let snap = m.snapshot_watchdog_events();
-        assert_eq!(snap.get(&WatchdogEventType::MaxTokens), Some(&2));
+        assert_eq!(snap.get(&WatchdogEventType::BudgetExceeded), Some(&2));
     }
 
     #[test]

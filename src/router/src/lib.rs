@@ -11,7 +11,6 @@
 //! - `stages` — pipeline stage implementations (deterministic, classifier, router)
 //! - `transforms` — `TransformStrategy`, transforms (NoTransform, PiiAnonymize, etc.)
 //! - `dispatch` — `LlmDispatcher`, `AgentDispatcher`
-//! - `watchdog` — `WatchdogSet`, `MaxTokenWatchdog`, `WallClockWatchdog`, `RepetitionWatchdog`
 //! - `agent` — `AgentRegistry`, `AgentIdentity`, `AgentTask`, `AgentError`
 //! - `orchestrator` — `OrchestratorSession`
 //! - `compaction` — `CompactionStrategy`, `RecencyCompaction`
@@ -28,7 +27,6 @@ pub mod pipeline;
 pub mod stages;
 pub mod transforms;
 pub mod dispatch;
-pub mod watchdog;
 pub mod agent;
 pub mod orchestrator;
 pub mod compaction;

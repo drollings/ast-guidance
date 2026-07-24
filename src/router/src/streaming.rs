@@ -105,16 +105,7 @@ impl StreamingHandler {
     }
 }
 
-/// Find the first occurrence of a subsequence in bytes starting from `start`.
-fn find_subseq(haystack: &[u8], start: usize, needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return None;
-    }
-    haystack[start..]
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .map(|i| start + i)
-}
+use common_core::string::find_subseq;
 
 #[cfg(test)]
 mod tests {

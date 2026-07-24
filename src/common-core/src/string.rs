@@ -343,6 +343,17 @@ pub fn skill_name_from_ref(ref_path: &str) -> String {
     }
 }
 
+/// Find the first occurrence of a byte subsequence in a slice starting from `start`.
+pub fn find_subseq(haystack: &[u8], start: usize, needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    haystack[start..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|i| start + i)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

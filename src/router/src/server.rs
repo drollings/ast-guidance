@@ -8,6 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use common_core::hash::uuid_v4;
+use common_core::now_secs;
 use fluent_wvr::prelude::*;
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
@@ -1042,10 +1044,7 @@ fn fallback_completion(model_name: &str) -> RouterResponse {
     RouterResponse {
         id: String::new(),
         object: "chat.completion".into(),
-        created: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
+        created: now_secs(),
         model: model_name.to_string(),
         choices: vec![crate::types::RouterChoice {
             index: 0,
@@ -1069,10 +1068,7 @@ fn make_text_completion(model_name: &str, text: &str) -> RouterResponse {
     RouterResponse {
         id: String::new(),
         object: "chat.completion".into(),
-        created: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
+        created: now_secs(),
         model: model_name.to_string(),
         choices: vec![crate::types::RouterChoice {
             index: 0,
@@ -1168,26 +1164,10 @@ fn add_cors_headers(headers: &mut hyper::HeaderMap) {
     }
 }
 
-fn uuid_v4() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let nanos = now.as_nanos();
-    let pid = u64::from(std::process::id());
-    let rng = fastrand::u64(..);
-    let time_hi = (nanos >> 32) as u32;
-    let time_mid = (nanos >> 16) as u32 & 0xFFFF;
-    let time_lo = nanos as u32 & 0xFFFF;
-    let version = (u64::from(pid as u32 & 0xFFF)) as u32 | 0x4000;
-    let variant = (((pid >> 12) ^ rng) as u32 & 0x3FFF) | 0x8000;
-    let node = (rng >> 32) as u32;
-    format!("{time_hi:08x}-{time_mid:04x}-{time_lo:04x}-{version:04x}-{variant:04x}{node:08x}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common_core::hash::uuid_v4;
 
     #[test]
     fn uuid_is_formatted_correctly() {

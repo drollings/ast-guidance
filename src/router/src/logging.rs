@@ -150,9 +150,7 @@ const fn default_max_files() -> usize {
     10
 }
 
-const fn default_true() -> bool {
-    true
-}
+use common_core::constants::default_true;
 
 #[cfg(test)]
 mod tests {

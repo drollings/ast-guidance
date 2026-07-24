@@ -12,6 +12,7 @@ sqlite = ["dep:rusqlite", "dep:hnsw_rs", "dep:anndists"]
 [dependencies]
 bitvec = { workspace = true }
 blake3 = { workspace = true }
+fastrand = { workspace = true }
 internment = { workspace = true, features = ["arc"] }
 reqwest = { workspace = true, optional = true }
 anndists = { workspace = true, optional = true }
@@ -21,6 +22,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
