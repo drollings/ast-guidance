@@ -34,9 +34,9 @@ pub struct RouterConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
-    /// Explicit model name for classifier/internal LLM calls.
-    /// When set, this model is used directly for classification instead of
-    /// resolving via `classifier_group`. Defaults to `"fast"`.
+    /// Root-level classifier model name.  Used by all pipelines that do not
+    /// set their own `classifier_model`.  Falls back to the first model in the
+    /// `"fast"` model group when unset.
     #[serde(default)]
     pub classifier_model: Option<String>,
     /// Mock mode configuration. When set, the server runs with a transcript
@@ -117,8 +117,11 @@ pub struct PipelineParams {
     pub router: bool,
     #[serde(default = "default_coherence_threshold")]
     pub coherence_threshold: f64,
-    #[serde(default = "default_generic")]
-    pub classifier_group: String,
+    /// Pipeline-level classifier model name.  When set, overrides the
+    /// root-level `classifier_model`.  Falls back to root `classifier_model`
+    /// then to the `"fast"` model group when unset.
+    #[serde(default)]
+    pub classifier_model: Option<String>,
     /// Path to a reject-patterns JSON file. When set, the patterns from that
     /// file are used as a blacklist (matches are rejected).
     #[serde(default)]
@@ -132,7 +135,7 @@ impl Default for PipelineParams {
             classifier: true,
             router: true,
             coherence_threshold: default_coherence_threshold(),
-            classifier_group: "fast".into(),
+            classifier_model: None,
             blacklist: None,
         }
     }
@@ -259,8 +262,27 @@ impl RoutingConfig {
         let route_ref = self
             .routes
             .get(route_name)
-            .or_else(|| self.routes.get(&self.default_route))?;
-        let model_names = self.model_groups.get(route_ref.group.as_str())?;
+            .or_else(|| self.routes.get(&self.default_route));
+
+        let Some(route_ref) = route_ref else {
+            tracing::warn!(target: "router.config", route = %route_name, default = %self.default_route, "no route found");
+            return None;
+        };
+
+        let model_names = self.model_groups.get(route_ref.group.as_str());
+        let Some(model_names) = model_names else {
+            tracing::warn!(target: "router.config", route = %route_name, group = %route_ref.group, "model group not found for route");
+            return None;
+        };
+
+        tracing::debug!(target: "router.config",
+            route = %route_name,
+            group = %route_ref.group,
+            model_count = model_names.len(),
+            min_complexity = ?min_complexity,
+            "resolving route"
+        );
+
         let candidates: Vec<(&String, &ModelEntry)> = model_names
             .iter()
             .filter_map(|n| self.models.get(n).map(|m| (n, m)))
@@ -268,8 +290,10 @@ impl RoutingConfig {
                 m.intelligence >= min_complexity.unwrap_or(0)
             })
             .collect();
+
         if candidates.is_empty() {
             // Fall back to any model in the group if complexity filter eliminates all.
+            tracing::debug!(target: "router.config", route = %route_name, "no candidates passed complexity filter, falling back to cheapest in group");
             model_names
                 .iter()
                 .filter_map(|n| self.models.get(n).map(|m| (n, m)))
@@ -280,6 +304,7 @@ impl RoutingConfig {
                 })
                 .map(|(entry_key, entry)| {
                     let name = entry.name.clone().unwrap_or_else(|| entry_key.clone());
+                    tracing::info!(target: "router.config", route = %route_name, model = %name, "route resolved (cheapest fallback)");
                     (entry, name)
                 })
         } else {
@@ -291,6 +316,7 @@ impl RoutingConfig {
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })?;
             let name = entry.name.clone().unwrap_or_else(|| entry_key.clone());
+            tracing::info!(target: "router.config", route = %route_name, model = %name, "route resolved");
             Some((entry, name))
         }
     }
@@ -346,29 +372,32 @@ impl RouterConfig {
         if params.classifier {
             let routing_config = self.routing_config();
             let client: Arc<dyn ChatBackend> = if let Some(backend) = classifier_backend {
+                tracing::info!(target: "router.config", pipeline = %name, backend = "mock/transcript", "classifier using injected backend");
                 backend
             } else {
-                let classifier_entry = self
+                // Priority: pipeline classifier_model > root classifier_model > "fast" group
+                let classifier_key = params
                     .classifier_model
                     .as_ref()
-                    .and_then(|name| self.models.get(name))
+                    .or(self.classifier_model.as_ref())
                     .or_else(|| {
                         self.model_groups
-                            .get(params.classifier_group.as_str())
+                            .get("fast")
                             .and_then(|names| names.first())
-                            .and_then(|n| self.models.get(n))
                     });
-                let classifier_llm_config = classifier_entry.map(|m| {
-                    LlmConfig::new()
-                        .api_url(m.endpoint.clone())
-                        .model("classifier".into())
-                        .timeout_ms(m.total_timeout_ms.max(5000))
-                        .build()
-                });
-                let cfg = classifier_llm_config?;
+                let classifier_entry = classifier_key.and_then(|k| self.models.get(k));
+                let (entry, model_key) = if let Some(e) = classifier_entry {
+                    let key = classifier_key.unwrap();
+                    (e, key.as_str())
+                } else {
+                    tracing::error!(target: "router.config", pipeline = %name, pipeline_model = ?params.classifier_model, root_model = ?self.classifier_model, "no classifier model found in config");
+                    return None;
+                };
+                let model_name_for_llm = entry.name.as_deref().unwrap_or(model_key);
+                tracing::info!(target: "router.config", pipeline = %name, classifier_url = %entry.endpoint, model_name = %model_name_for_llm, "classifier using real LLM client");
                 let classifier_config = LlmConfig::new()
-                    .api_url(cfg.api_url.clone())
-                    .model(cfg.model.clone())
+                    .api_url(entry.endpoint.clone())
+                    .model(model_name_for_llm.to_string())
                     .timeout_ms(5000)
                     .build();
                 Arc::new(LlmClient::with_config(classifier_config))
@@ -407,6 +436,9 @@ impl RouterConfig {
         classifier_backend: Option<&Arc<dyn ChatBackend>>,
     ) -> HashMap<String, Arc<PipelineOrchestrator>> {
         let mut map = HashMap::new();
+        let pipeline_count = self.pipelines.len();
+        let has_mock = classifier_backend.is_some();
+        tracing::info!(target: "router.config", pipeline_count = pipeline_count, mock_backend = has_mock, classifier_model = ?self.classifier_model, default_route = %self.default_route, "building pipelines");
         for name in self.pipelines.keys() {
             let backend_for_pipeline = classifier_backend.cloned();
             if let Some(pipeline) =
@@ -415,6 +447,7 @@ impl RouterConfig {
                 map.insert(name.clone(), Arc::new(pipeline));
             }
         }
+        tracing::info!(target: "router.config", built = map.len(), "pipelines built");
         map
     }
 
@@ -434,9 +467,6 @@ fn default_coherence_threshold() -> f64 {
 }
 fn default_fast_route() -> String {
     "fast".into()
-}
-fn default_generic() -> String {
-    String::new()
 }
 fn default_total_timeout_ms() -> u64 {
     300_000

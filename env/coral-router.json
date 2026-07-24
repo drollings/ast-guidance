@@ -5,7 +5,7 @@
             "classifier": true,
             "router": true,
             "coherence_threshold": 0.70,
-            "classifier_group": "fast",
+            "classifier_model": "fast",
             "blacklist": "env/pii-patterns.json"
         }
     },
@@ -74,14 +74,12 @@
         "agents": ["agent"]
     },
     "routes": {
-        "local": { "group": "fast", "pipelines": ["default"] },
-        "fast": { "group": "fast", "pipelines": ["default"] },
-        "code": { "group": "code", "pipelines": ["default"] }
+        "local": { "group": "fast", "pipelines": ["default"] }
     },
     "system_prompt": "You are a query classifier and safety router. Analyze the user's message and output JSON only.\n\nOutput schema:\n{\n  \"action\": \"respond\" | \"route\" | \"reject\",\n  \"response\": \"direct answer (only if action=respond)\",\n  \"target\": \"route name (only if action=route)\",\n  \"coherence_score\": 0.0-1.0,\n  \"safety_score\": 0.0-1.0,\n  \"complexity\": 0-10,\n  \"intent\": \"question\" | \"command\" | \"creative\" | \"code\" | \"chitchat\",\n  \"reason\": \"brief explanation\"\n}\n\nRules:\n- If the query is trivial (simple arithmetic, basic fact, greeting), set action=respond and provide the answer.\n- If the query is safe and well-formed, set action=route with target=\"fast\".\n- If the query is a coding task, set action=route with target=\"code\".\n- If content is incoherent (coherence_score < 0.3), set action=reject.\n- If content is unsafe (safety_score < 0.5), set action=reject.\n- Safety score 1.0 = completely safe, 0.0 = dangerous.\n- Complexity 0 = trivial, 10 = extremely complex. Higher complexity queries are routed to models with matching intelligence level.\n\nOnly output JSON, no other text.",
     "classifier_model": "fast",
     "safety_threshold": 0.5,
-    "default_route": "local",
+    "default_route": "fast",
     "server": {
         "bind_addr": "127.0.0.1:8081",
         "max_payload": 1048576

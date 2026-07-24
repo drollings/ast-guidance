@@ -134,9 +134,15 @@ impl MockDispatchContext {
     }
 
     pub fn lookup(&self, user_message: &str) -> Option<&MockTranscriptEntry> {
-        self.transcripts
+        let result = self.transcripts
             .iter()
-            .find(|t| t.user_message == user_message)
+            .find(|t| t.user_message == user_message);
+        tracing::debug!(target: "router.mock",
+            user_message_len = user_message.len(),
+            found = result.is_some(),
+            "transcript lookup"
+        );
+        result
     }
 
     pub fn validate_route(&self, entry: &MockTranscriptEntry, routing_target: Option<&RoutingTarget>) {

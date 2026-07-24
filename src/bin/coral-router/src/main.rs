@@ -44,8 +44,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mock_except_models: HashSet<String> = args.mock_except.iter().cloned().collect();
 
+    if !args.mock_except.is_empty() {
+        tracing::info!(target: "coral-router", except_models = ?args.mock_except, "mock-except models configured");
+    }
+
     let (pipelines, mock_dispatch) = if let Some(ref path) = transcript_path {
-        tracing::info!(target: "coral-router", transcript = %path, "mock mode enabled");
+        tracing::info!(target: "coral-router", transcript = %path, mock_except = ?args.mock_except, "mock mode enabled");
 
         let entries = load_transcript_file(path)?;
         let dispatch_ctx = MockDispatchContext::new(
@@ -55,9 +59,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let classifier_model_name = config.classifier_model.as_deref().unwrap_or("fast");
         let classifier_is_excepted = mock_except_models.contains(classifier_model_name);
+        tracing::info!(target: "coral-router", classifier_model = %classifier_model_name, classifier_excepted = classifier_is_excepted, "classifier mock decision");
 
         let pipelines = if classifier_is_excepted {
-            // Classifier model is in the except list — use real LLM backend
+            tracing::info!(target: "coral-router", "classifier model is excepted — building with real LLM backend");
             config.build_all_pipelines_with_backend(None::<&Arc<dyn ChatBackend>>)
         } else {
             let provider =
@@ -93,6 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut server = RouterServer::new(
         pipelines,
         routes,
+        config.models,
         &config.server,
         classifier_url,
     );

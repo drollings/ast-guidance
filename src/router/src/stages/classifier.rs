@@ -66,29 +66,48 @@ impl WorkUnit for ClassifierStage {
             },
             ChatMessage {
                 role: "user".into(),
-                content: input,
+                content: input.clone(),
             },
         ];
 
+        tracing::debug!(target: "router.pipeline.stage2", input_len = input.len(), "classifier stage");
+
         let (output, ok) = match self.client.chat_complete(&messages) {
-            Ok(response) => match serde_json::from_str::<ClassifierOutput>(&response) {
-                Ok(o) => (o, true),
-                Err(e) => {
-                    tracing::warn!(target: "classifier", error = %e, "classifier parse error, falling back to default route");
-                    (ClassifierOutput {
-                        action: "route".into(),
-                        response: None,
-                        target: Some(self.routing_config.default_route.clone()),
-                        coherence_score: 1.0,
-                        safety_score: 1.0,
-                        complexity: None,
-                        intent: None,
-                        reason: format!("parse error: {e}"),
-                    }, false)
+            Ok(response) => {
+                tracing::debug!(target: "router.pipeline.stage2", raw_response_len = response.len(), raw_response = %response, "classifier LLM response received");
+                match serde_json::from_str::<ClassifierOutput>(&response) {
+                    Ok(o) => {
+                        tracing::info!(target: "router.pipeline.stage2",
+                            action = %o.action,
+                            target = ?o.target,
+                            response_direct = o.response.is_some(),
+                            coherence = %o.coherence_score,
+                            safety = %o.safety_score,
+                            complexity = ?o.complexity,
+                            intent = ?o.intent,
+                            reason = %o.reason,
+                            fallback = false,
+                            "classifier verdict"
+                        );
+                        (o, true)
+                    }
+                    Err(e) => {
+                        tracing::error!(target: "router.pipeline.stage2", error = %e, raw_response_len = response.len(), raw_response = %response, "classifier LLM response was not valid ClassifierOutput JSON — falling back to default route");
+                        (ClassifierOutput {
+                            action: "route".into(),
+                            response: None,
+                            target: Some(self.routing_config.default_route.clone()),
+                            coherence_score: 1.0,
+                            safety_score: 1.0,
+                            complexity: None,
+                            intent: None,
+                            reason: format!("parse error: {e}"),
+                        }, false)
+                    }
                 }
-            },
+            }
             Err(e) => {
-                tracing::warn!(target: "classifier", error = %e, "classifier LLM error, falling back to default route");
+                tracing::error!(target: "router.pipeline.stage2", error = %e, input_len = input.len(), "classifier LLM call failed — falling back to default route");
                 (ClassifierOutput {
                     action: "route".into(),
                     response: None,
@@ -137,23 +156,35 @@ impl WorkUnit for ClassifierStage {
 
         let action = output.action.as_str();
         let min_complexity = output.complexity;
+        let resolved_route = output.target.as_deref().unwrap_or(&self.routing_config.default_route);
         let routing_target = match action {
-            "respond" => None,
+            "respond" => {
+                tracing::info!(target: "router.pipeline.stage2", "direct response — no dispatch");
+                None
+            }
             "route" => {
-                let target_name = output
-                    .target
-                    .as_deref()
-                    .unwrap_or(&self.routing_config.default_route);
-                self.routing_config.resolve_route(target_name, min_complexity).map(|(model, model_name)| {
+                let resolved = self.routing_config.resolve_route(resolved_route, min_complexity);
+                if let Some((model, model_name)) = &resolved {
+                    tracing::info!(target: "router.pipeline.stage2",
+                        route = %resolved_route,
+                        model = %model_name,
+                        endpoint = %model.endpoint,
+                        group = ?self.routing_config.routes.get(resolved_route).map(|r| &r.group),
+                        "routing target resolved"
+                    );
+                } else {
+                    tracing::warn!(target: "router.pipeline.stage2", route = %resolved_route, "resolve_route returned None — no dispatch target");
+                }
+                resolved.map(|(model, model_name)| {
                     serde_json::json!({
                         "url": model.endpoint,
                         "model": model_name,
                         "group": self.routing_config
                             .routes
-                            .get(target_name)
+                            .get(resolved_route)
                             .or_else(|| self.routing_config.routes.get(&self.routing_config.default_route))
                             .map_or("", |r| r.group.as_str()),
-                        "target_name": target_name,
+                        "target_name": resolved_route,
                         "params": model.params,
                         "filter_thinking": model.filter_thinking,
                         "retry_count": model.retry_count,
@@ -162,23 +193,32 @@ impl WorkUnit for ClassifierStage {
                 })
             }
             _ => {
-                self.routing_config
-                    .resolve_route(&self.routing_config.default_route, min_complexity)
-                    .map(|(model, model_name)| {
-                        serde_json::json!({
-                            "url": model.endpoint,
-                            "model": model_name,
+                let fallback_route = &self.routing_config.default_route;
+                tracing::warn!(target: "router.pipeline.stage2", action = %action, fallback_route = %fallback_route, "unknown action, falling back to default route");
+                let resolved = self.routing_config.resolve_route(fallback_route, min_complexity);
+                if let Some((model, model_name)) = &resolved {
+                    tracing::info!(target: "router.pipeline.stage2",
+                        route = %fallback_route,
+                        model = %model_name,
+                        endpoint = %model.endpoint,
+                        "fallback routing target"
+                    );
+                }
+                resolved.map(|(model, model_name)| {
+                    serde_json::json!({
+                        "url": model.endpoint,
+                        "model": model_name,
                         "group": self.routing_config
                             .routes
-                            .get(&self.routing_config.default_route)
+                            .get(fallback_route)
                             .map_or("", |r| r.group.as_str()),
-                            "target_name": &self.routing_config.default_route,
-                            "params": model.params,
-                            "filter_thinking": model.filter_thinking,
-                            "retry_count": model.retry_count,
-                            "retry_base_interval_s": model.retry_base_interval_s,
-                        })
+                        "target_name": fallback_route,
+                        "params": model.params,
+                        "filter_thinking": model.filter_thinking,
+                        "retry_count": model.retry_count,
+                        "retry_base_interval_s": model.retry_base_interval_s,
                     })
+                })
             }
         };
 

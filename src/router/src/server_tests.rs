@@ -19,8 +19,9 @@ mod server_tests {
         let mut pipelines = HashMap::new();
         pipelines.insert("default".into(), make_echo_pipeline());
         let routes = HashMap::new();
+        let models = HashMap::new();
         let config = ServerConfig::default();
-        let server = RouterServer::new(pipelines, routes, &config, None);
+        let server = RouterServer::new(pipelines, routes, models, &config, None);
         assert_eq!(server.name(), "router.server");
         assert!(server.provides().contains(&ArcIntern::from("http.endpoint")));
     }

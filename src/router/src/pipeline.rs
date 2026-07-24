@@ -126,18 +126,30 @@ impl WorkUnit for PipelineOrchestrator {
             let stage_ctx = Self::build_stage_context(ctx, &current_request, &decisions);
             let start = Instant::now();
 
+            let stage_name_human = stage.name().to_string();
+            tracing::debug!(target: "router.pipeline", stage = %stage_name_human, "stage entering");
+
             match stage.execute(&stage_ctx) {
                 Ok(output) => {
-                    let decision: StageDecision = output
+                    let mut decision: StageDecision = output
                         .data_take()
                         .map_err(|e| WorkError::Execution(e.to_string()))?;
                     let latency_ms = start.elapsed().as_millis() as u64;
-                    let decision = StageDecision {
-                        latency_ms,
-                        ..decision
-                    };
+                    decision.latency_ms = latency_ms;
                     let verdict = decision.verdict.clone();
                     let stage_name = decision.stage;
+
+                    let fallback = stage_name == PipelineStage::Classifier
+                        && decision.metadata.get("fallback").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                    tracing::info!(target: "router.pipeline",
+                        stage = ?stage_name,
+                        verdict = ?verdict,
+                        latency_ms = latency_ms,
+                        score = ?decision.score,
+                        reason = %decision.reason,
+                        fallback = fallback,
+                        "stage complete"
+                    );
 
                     decisions.push(decision.clone());
 
@@ -149,20 +161,25 @@ impl WorkUnit for PipelineOrchestrator {
                                     .get("response")
                                     .and_then(|v| v.as_str())
                                 {
+                                    tracing::info!(target: "router.pipeline",
+                                        response_len = resp.len(),
+                                        "classifier direct response"
+                                    );
                                     classifier_response = Some(resp.to_string());
                                 }
                                 if let Some(rt) = decision.metadata.get("routing_target") {
+                                    let model = rt.get("model").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let target_name = rt.get("target_name").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let url = rt.get("url").and_then(|v| v.as_str()).unwrap_or("?");
+                                    tracing::info!(target: "router.pipeline",
+                                        target_route = %target_name,
+                                        target_model = %model,
+                                        target_url = %url,
+                                        "classifier set routing target"
+                                    );
                                     routing_target = Some(RoutingTarget {
-                                        url: rt
-                                            .get("url")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .into(),
-                                        model: rt
-                                            .get("model")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .into(),
+                                        url: url.into(),
+                                        model: model.into(),
                                         group: rt
                                             .get("group")
                                             .and_then(|v| v.as_str())
@@ -195,11 +212,17 @@ impl WorkUnit for PipelineOrchestrator {
                         StageVerdict::Rerouted => {
                             if let Some(rewritten) = decision.metadata.get("rewritten_request") {
                                 if let Some(s) = rewritten.as_str() {
+                                    tracing::info!(target: "router.pipeline", new_request_len = s.len(), "request rerouted");
                                     current_request = s.to_string();
                                 }
                             }
                         }
                         StageVerdict::Rejected => {
+                            tracing::info!(target: "router.pipeline",
+                                stage = ?stage_name,
+                                reason = %decision.reason,
+                                "pipeline rejected request"
+                            );
                             return WorkOutput::typed(
                                 "rejected",
                                 &PipelineResult {
@@ -213,6 +236,11 @@ impl WorkUnit for PipelineOrchestrator {
                             );
                         }
                         StageVerdict::Error => {
+                            tracing::error!(target: "router.pipeline",
+                                stage = ?stage_name,
+                                reason = %decision.reason,
+                                "stage error"
+                            );
                             return WorkOutput::typed(
                                 "pipeline_error",
                                 &PipelineResult {
@@ -231,6 +259,12 @@ impl WorkUnit for PipelineOrchestrator {
                     }
                 }
                 Err(e) => {
+                    tracing::error!(target: "router.pipeline",
+                        stage = %stage_name_human,
+                        error = %e,
+                        latency_ms = %start.elapsed().as_millis(),
+                        "stage execution error"
+                    );
                     decisions.push(StageDecision {
                         stage: PipelineStage::Router,
                         verdict: StageVerdict::Error,
@@ -243,6 +277,17 @@ impl WorkUnit for PipelineOrchestrator {
                 }
             }
         }
+
+        let has_routing = routing_target.is_some();
+        let has_classifier_resp = classifier_response.is_some();
+        tracing::info!(target: "router.pipeline",
+            stages = decisions.len(),
+            has_routing_target = has_routing,
+            has_classifier_response = has_classifier_resp,
+            routing_model = ?routing_target.as_ref().map(|rt| &rt.model),
+            routing_route = ?routing_target.as_ref().and_then(|rt| rt.target_name.as_ref()),
+            "pipeline complete"
+        );
 
         WorkOutput::typed(
             "pipeline_complete",

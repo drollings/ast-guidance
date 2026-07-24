@@ -10,7 +10,7 @@ use fluent_wvr::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::config::{RouteRef, ServerConfig};
+use crate::config::{ModelEntry, RouteRef, ServerConfig};
 use crate::normalize;
 use crate::pipeline::PipelineOrchestrator;
 use crate::testing::mock::MockDispatchContext;
@@ -25,6 +25,7 @@ pub struct RouterServer {
     name: ArcIntern<str>,
     pipelines: HashMap<String, Arc<PipelineOrchestrator>>,
     routes: HashMap<String, RouteRef>,
+    models: HashMap<String, ModelEntry>,
     bind_addr: String,
     max_payload: usize,
     classifier_url: Option<String>,
@@ -43,6 +44,7 @@ impl RouterServer {
     pub fn new(
         pipelines: HashMap<String, Arc<PipelineOrchestrator>>,
         routes: HashMap<String, RouteRef>,
+        models: HashMap<String, ModelEntry>,
         config: &ServerConfig,
         classifier_url: Option<String>,
     ) -> Self {
@@ -50,6 +52,7 @@ impl RouterServer {
             name: ArcIntern::from("router.server"),
             pipelines,
             routes,
+            models,
             bind_addr: config.bind_addr.clone(),
             max_payload: config.max_payload,
             classifier_url,
@@ -61,15 +64,18 @@ impl RouterServer {
 
     #[must_use]
     pub fn with_mock(mut self, mock_dispatch: MockDispatchContext) -> Self {
+        tracing::info!(target: "router.server", except_count = mock_dispatch.except_models.len(), "mock dispatch enabled");
         self.mock_dispatch = Some(Arc::new(mock_dispatch));
         self
     }
 
     /// Start the HTTP server and block the current task.
     pub async fn serve(&self) -> Result<(), String> {
+        tracing::info!(target: "router.server", bind_addr = %self.bind_addr, has_mock = self.mock_dispatch.is_some(), "serving HTTP");
         run_http(
             Arc::new(self.pipelines.clone()),
             Arc::new(self.routes.clone()),
+            Arc::new(self.models.clone()),
             &self.bind_addr,
             self.max_payload,
             self.classifier_url.clone(),
@@ -95,6 +101,7 @@ impl WorkUnit for RouterServer {
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
         let pipelines = Arc::new(self.pipelines.clone());
         let routes = Arc::new(self.routes.clone());
+        let models = Arc::new(self.models.clone());
         let bind_addr = self.bind_addr.clone();
         let max_payload = self.max_payload;
         let classifier_url = self.classifier_url.clone();
@@ -104,7 +111,7 @@ impl WorkUnit for RouterServer {
 
         let _handle = rt.spawn(Box::pin(async move {
             if let Err(e) =
-                run_http(pipelines, routes, &bind_addr, max_payload, classifier_url, mock_dispatch)
+                run_http(pipelines, routes, models, &bind_addr, max_payload, classifier_url, mock_dispatch)
                     .await
             {
                 tracing::error!(target: "router.server", error = %e, "HTTP server error");
@@ -151,6 +158,7 @@ impl_component!(RouterServer);
 async fn run_http(
     pipelines: Arc<HashMap<String, Arc<PipelineOrchestrator>>>,
     routes: Arc<HashMap<String, RouteRef>>,
+    models: Arc<HashMap<String, ModelEntry>>,
     bind_addr: &str,
     max_payload: usize,
     classifier_url: Option<String>,
@@ -179,6 +187,7 @@ async fn run_http(
 
         let pipelines = pipelines.clone();
         let routes = routes.clone();
+        let models = models.clone();
         let stats = stats.clone();
         let classifier_url = classifier_url.clone();
         let mock_dispatch = mock_dispatch.clone();
@@ -188,6 +197,7 @@ async fn run_http(
                 stream,
                 pipelines,
                 routes,
+                models,
                 stats,
                 max_payload,
                 classifier_url,
@@ -253,6 +263,7 @@ async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     pipelines: Arc<HashMap<String, Arc<PipelineOrchestrator>>>,
     routes: Arc<HashMap<String, RouteRef>>,
+    models: Arc<HashMap<String, ModelEntry>>,
     stats: Arc<ServerStats>,
     max_payload: usize,
     classifier_url: Option<String>,
@@ -432,38 +443,105 @@ async fn handle_connection(
 
     let is_stream = router_request.stream.unwrap_or(false);
     let model_name = router_request.model.clone();
+    let user_message_preview: String = router_request
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| {
+            let s = m.content.to_string_lossy();
+            if s.len() > 120 { format!("{}...", &s[..120]) } else { s }
+        })
+        .unwrap_or_default();
     let request_json = serde_json::to_string(&router_request).unwrap_or_default();
 
-    // Determine which pipelines to run for this route
-    let route = routes
-        .get(&model_name)
-        .or_else(|| routes.get("local"))
-        .cloned();
-    let pipeline_names = route
-        .as_ref()
-        .map_or_else(|| vec!["default".into()], |r| r.pipelines.clone());
+    tracing::info!(target: "router.server",
+        model = %model_name,
+        user_message = %user_message_preview,
+        messages = router_request.messages.len(),
+        stream = is_stream,
+        "incoming request"
+    );
 
-    // Run pipeline sequence
-    let mut ctx = WorkContext::default();
-    ctx.metadata
-        .insert("request".into(), MetadataValue::String(request_json));
-
-    let pipeline_result = match execute_pipeline_sequence(&pipelines, &pipeline_names, &mut ctx) {
-        Ok(result) => result,
-        Err(e) => {
-            let err =
-                normalize::error_response(&format!("pipeline error: {e}"), "server_error");
-            let err_str = serde_json::to_string(&err).unwrap_or_default();
-            let resp = format!(
-                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{CORS_HEADERS}Connection: close\r\n\r\n{err_str}",
-                err_str.len()
-            );
-            stream
-                .write_all(resp.as_bytes())
-                .await
-                .map_err(|e| format!("write: {e}"))?;
-            stats.errors.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
+    // Determine which pipelines to run for this route.
+    // Priority: routes entry > direct model access > "local" route fallback.
+    let route = routes.get(&model_name).cloned();
+    let pipeline_result = if let Some(ref r) = route {
+        // Route found — run its pipeline sequence
+        let pipeline_names = r.pipelines.clone();
+        tracing::debug!(target: "router.server",
+            model = %model_name,
+            group = ?r.group,
+            pipeline_names = ?pipeline_names,
+            "route found, running pipeline"
+        );
+        let mut ctx = WorkContext::default();
+        ctx.metadata.insert("request".into(), MetadataValue::String(request_json));
+        match execute_pipeline_sequence(&pipelines, &pipeline_names, &mut ctx) {
+            Ok(r) => r,
+            Err(e) => {
+                let err = normalize::error_response(&format!("pipeline error: {e}"), "server_error");
+                let err_str = serde_json::to_string(&err).unwrap_or_default();
+                let resp = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{CORS_HEADERS}Connection: close\r\n\r\n{err_str}",
+                    err_str.len()
+                );
+                stream.write_all(resp.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
+                stats.errors.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+        }
+    } else if let Some(model_entry) = models.get(&model_name) {
+        // Model is not a routed pipeline — direct access, skip pipeline
+        tracing::info!(target: "router.server",
+            model = %model_name,
+            endpoint = %model_entry.endpoint,
+            "direct model access — bypassing pipeline"
+        );
+        let rt = crate::pipeline::RoutingTarget {
+            url: model_entry.endpoint.clone(),
+            model: model_entry.name.clone().unwrap_or_else(|| model_name.clone()),
+            group: None,
+            target_name: Some(model_name.clone()),
+            params: model_entry.params.clone(),
+            filter_thinking: model_entry.filter_thinking,
+            retry_count: model_entry.retry_count,
+            retry_base_interval_s: model_entry.retry_base_interval_s,
+        };
+        crate::pipeline::PipelineResult {
+            decisions: vec![],
+            final_response: None,
+            rejected: false,
+            reject_reason: None,
+            routing_target: Some(rt),
+            classifier_response: None,
+        }
+    } else {
+        // Not found in routes or models — fall back to "local" route
+        let fallback_route = routes.get("local").cloned();
+        let pipeline_names = fallback_route
+            .as_ref()
+            .map_or_else(|| vec!["default".into()], |r| r.pipelines.clone());
+        tracing::info!(target: "router.server",
+            model = %model_name,
+            pipeline_names = ?pipeline_names,
+            "model not found in routes or models — falling back to local route"
+        );
+        let mut ctx = WorkContext::default();
+        ctx.metadata.insert("request".into(), MetadataValue::String(request_json));
+        match execute_pipeline_sequence(&pipelines, &pipeline_names, &mut ctx) {
+            Ok(r) => r,
+            Err(e) => {
+                let err = normalize::error_response(&format!("pipeline error: {e}"), "server_error");
+                let err_str = serde_json::to_string(&err).unwrap_or_default();
+                let resp = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{CORS_HEADERS}Connection: close\r\n\r\n{err_str}",
+                    err_str.len()
+                );
+                stream.write_all(resp.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
+                stats.errors.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
         }
     };
 
@@ -516,6 +594,11 @@ async fn handle_connection(
 
     // Build response
     if let Some(ref resp_str) = pipeline_result.classifier_response {
+        tracing::info!(target: "router.server",
+            model = %model_name,
+            response_len = resp_str.len(),
+            "responding with classifier direct response"
+        );
         let completion = RouterResponse {
             id: String::new(),
             object: "chat.completion".into(),
@@ -538,13 +621,30 @@ async fn handle_connection(
         };
         write_completion_response(&mut stream, &completion, is_stream).await?;
     } else if let Some(ref rt) = pipeline_result.routing_target {
+        tracing::info!(target: "router.server",
+            model = %model_name,
+            target_url = %rt.url,
+            target_model = %rt.model,
+            target_route = ?rt.target_name,
+            "dispatch to routing target"
+        );
+
         // Mock mode: validate routing, then dispatch
         if let Some(ref mock) = mock_dispatch {
             if let Some(entry) = mock.lookup(&user_message) {
                 mock.validate_route(entry, Some(rt));
+                tracing::debug!(target: "router.server",
+                    model = %model_name,
+                    transcript_found = true,
+                    model_excepted = mock.is_model_excepted(&rt.model),
+                    "mock dispatch lookup"
+                );
 
                 if mock.is_model_excepted(&rt.model) || mock.is_model_excepted(&model_name) {
-                    // Excepted model — real LLM call (still validates routing)
+                    tracing::info!(target: "router.server",
+                        model = %rt.model,
+                        "excepted model — real LLM call"
+                    );
                     let url = build_dispatch_url(&rt.url);
                     let mut completion = dispatch_to_llm(
                         &url,
@@ -563,11 +663,19 @@ async fn handle_connection(
                     completion.model = model_name.clone();
                     write_completion_response(&mut stream, &completion, is_stream).await?;
                 } else {
+                    tracing::info!(target: "router.server",
+                        model = %model_name,
+                        "mock canned response"
+                    );
                     let completion = mock.dispatch_response(entry, &model_name);
                     write_completion_response(&mut stream, &completion, is_stream).await?;
                 }
             } else {
-                // No transcript entry for this message — use real dispatch as fallback
+                tracing::debug!(target: "router.server",
+                    model = %model_name,
+                    transcript_found = false,
+                    "no transcript entry — real dispatch fallback"
+                );
                 let url = build_dispatch_url(&rt.url);
                 let mut completion = dispatch_to_llm(
                     &url,
@@ -588,6 +696,12 @@ async fn handle_connection(
             }
         } else {
             // Real dispatch
+            tracing::info!(target: "router.server",
+                model = %rt.model,
+                url = %rt.url,
+                retry = rt.retry_count,
+                "real dispatch"
+            );
             let url = build_dispatch_url(&rt.url);
             let mut completion = dispatch_to_llm(
                 &url,
@@ -607,6 +721,11 @@ async fn handle_connection(
             write_completion_response(&mut stream, &completion, is_stream).await?;
         }
     } else if let Some(ref url) = classifier_url {
+        tracing::info!(target: "router.server",
+            model = %model_name,
+            fallback_url = %url,
+            "no routing target — dispatching to classifier fallback"
+        );
         let mut completion = dispatch_to_llm(
             url, &router_request, &model_name, None, false, 0, 1,
         )
@@ -618,6 +737,10 @@ async fn handle_connection(
         completion.model = model_name.clone();
         write_completion_response(&mut stream, &completion, is_stream).await?;
     } else {
+        tracing::warn!(target: "router.server",
+            model = %model_name,
+            "no routing target, no classifier response, no classifier url — returning fallback"
+        );
         let completion = fallback_completion(&model_name);
         write_completion_response(&mut stream, &completion, is_stream).await?;
     }
@@ -711,6 +834,14 @@ async fn dispatch_to_llm(
 ) -> Result<RouterResponse, String> {
     let client = reqwest::Client::new();
     let url = build_dispatch_url(endpoint_url);
+
+    tracing::info!(target: "router.dispatch",
+        url = %url,
+        model = %model_name,
+        retry_count = retry_count,
+        message_count = request.messages.len(),
+        "dispatching to LLM"
+    );
 
     let messages: Vec<serde_json::Value> = request
         .messages

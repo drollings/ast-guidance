@@ -112,6 +112,15 @@ impl WorkUnit for RouterStage {
     fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
         let routing_decision = self.make_routing_decision();
 
+        tracing::info!(target: "router.pipeline.stage5",
+            policy = ?self.routing_policy,
+            destination = ?routing_decision.destination,
+            transform = ?routing_decision.transform,
+            confidence = %routing_decision.confidence,
+            reason = %routing_decision.reason,
+            "router decision"
+        );
+
         WorkOutput::typed(
             "routed",
             &StageDecision {
