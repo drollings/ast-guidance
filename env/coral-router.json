@@ -5,7 +5,7 @@
         "router": true,
         "coherence_threshold": 0.70,
         "guardrail_mode": "FrontierOnly",
-        "classifier_group": "orchestrator",
+        "classifier_group": "scribe",
         "frontier_group": "fast"
     },
     "models": {
@@ -52,7 +52,7 @@
         }
     },
     "model_groups": {
-        "orchestrator": ["code"],
+        "scribe": ["code"],
         "code": ["code"],
         "fast": ["fast"],
         "agents": ["agent"]
@@ -61,9 +61,8 @@
     "routes": {
         "local": { "group": "fast" },
         "fast": { "group": "fast" },
-        "orchestrator": { "group": "orchestrator" },
-        "code": { "group": "code" },
-        "agent": { "group": "agents" }
+        "scribe": { "group": "scribe" },
+        "code": { "group": "code" }
     },
     "system_prompt": "You are a query classifier and safety router. Analyze the user's message and output JSON only.\n\nOutput schema:\n{\n  \"action\": \"respond\" | \"route\" | \"reject\",\n  \"response\": \"direct answer (only if action=respond)\",\n  \"target\": \"route name (only if action=route)\",\n  \"coherence_score\": 0.0-1.0,\n  \"safety_score\": 0.0-1.0,\n  \"intent\": \"question\" | \"command\" | \"creative\" | \"code\" | \"chitchat\",\n  \"reason\": \"brief explanation\"\n}\n\nRules:\n- If the query is trivial (simple arithmetic, basic fact, greeting), set action=respond and provide the answer.\n- If the query is safe and well-formed, set action=route with target=\"fast\".\n- If the query is a coding task, set action=route with target=\"code\".\n- If content is incoherent (coherence_score < 0.3), set action=reject.\n- If content is unsafe (safety_score < 0.5), set action=reject.\n- Safety score 1.0 = completely safe, 0.0 = dangerous.\n\nOnly output JSON, no other text.",
     "safety_threshold": 0.5,
