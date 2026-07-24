@@ -160,7 +160,16 @@ router-start: $(CORAL_ROUTER_BIN) ## Build (if needed) and start coral-router on
 	done
 
 .PHONY: router-mock
-router-mock: router-start $(ROUTER_MOCK_TEST_SCRIPT) ## Start coral-router, then run curl smoke-test suite (leaves server running)
+router-mock: $(CORAL_ROUTER_BIN) $(ROUTER_MOCK_TEST_SCRIPT) ## Build, start with mock backend, run curl smoke-tests (leaves server running)
+	$(Q)pkill coral-router 2>/dev/null || true
+	$(Q)sleep 0.5
+	$(Q)nohup target/debug/coral-router -c env/coral-router.json --mock env/mock-transcripts.json > /tmp/coral-router.out 2>&1 &
+	$(Q)for i in $$(seq 1 10); do \
+		if curl -s -m 1 http://127.0.0.1:8081/health > /dev/null 2>&1; then \
+			echo "coral-router started (attempt $$i)"; break; \
+		fi; \
+		echo "Waiting for coral-router..."; sleep 1; \
+	done
 	$(Q)bash $(ROUTER_MOCK_TEST_SCRIPT)
 
 # ── Standard Targets ──────────────────────────────────────────────────────────

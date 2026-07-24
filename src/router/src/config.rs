@@ -264,10 +264,26 @@ impl RoutingConfig {
             .get(route_name)
             .or_else(|| self.routes.get(&self.default_route));
 
-        let Some(route_ref) = route_ref else {
-            tracing::warn!(target: "router.config", route = %route_name, default = %self.default_route, "no route found");
-            return None;
+        let route_ref = match route_ref {
+            Some(r) => Some(r),
+            None => {
+                return self.models.get(route_name).map(|entry| {
+                    let name = entry.name.clone().unwrap_or_else(|| route_name.to_string());
+                    tracing::info!(target: "router.config", route = %route_name, model = %name,
+                        "route resolved as direct model"
+                    );
+                    (entry, name)
+                }).or_else(|| {
+                    tracing::warn!(target: "router.config", route = %route_name,
+                        default = %self.default_route,
+                        "no route or model found for target"
+                    );
+                    None
+                });
+            }
         };
+
+        let route_ref = route_ref?;
 
         let model_names = self.model_groups.get(route_ref.group.as_str());
         let Some(model_names) = model_names else {

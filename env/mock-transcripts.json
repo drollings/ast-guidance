@@ -35,5 +35,19 @@
         "expected_route": "fast",
         "dispatch_response": "fn fibonacci(n: u32) -> u64 { ... }",
         "rejected": false
+    },
+    {
+        "user_message": "What color is the sky?",
+        "classifier_response": "{\"action\":\"route\",\"target\":\"fast\",\"coherence_score\":0.95,\"safety_score\":0.9,\"intent\":\"question\",\"reason\":\"factual query about natural phenomena\"}",
+        "expected_route": "fast",
+        "dispatch_response": "The sky appears blue during the day due to Rayleigh scattering.",
+        "rejected": false
+    },
+    {
+        "user_message": "hi",
+        "classifier_response": "{\"action\":\"route\",\"target\":\"fast\",\"coherence_score\":0.95,\"safety_score\":0.9,\"intent\":\"chitchat\",\"reason\":\"simple greeting\"}",
+        "expected_route": "fast",
+        "dispatch_response": "Hello! How can I help you today?",
+        "rejected": false
     }
 ]
