@@ -22,7 +22,7 @@
             "idle_timeout_ms": 2000,
             "stream": true,
             "filter_thinking": true,
-            "retry_count": 2,
+            "retry_count": 1,
             "retry_base_interval_s": 1,
             "params": {
                 "num_ctx": 32768,
@@ -42,7 +42,7 @@
             "idle_timeout_ms": 10000,
             "stream": true,
             "filter_thinking": false,
-            "retry_count": 1,
+            "retry_count": 0,
             "retry_base_interval_s": 2,
             "params": {
                 "num_ctx": 131072,
@@ -61,7 +61,7 @@
             "idle_timeout_ms": 10000,
             "stream": true,
             "filter_thinking": true,
-            "retry_count": 3,
+            "retry_count": 0,
             "retry_base_interval_s": 2,
             "params": {
                 "num_ctx": 65536

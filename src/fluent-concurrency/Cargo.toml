@@ -17,6 +17,8 @@ common-core = { path = "../common-core", features = ["sqlite"] }
 rusqlite = { workspace = true }
 fastrand = { workspace = true }
 internment = { workspace = true, features = ["arc", "serde"] }
+futures-util = { workspace = true }
+bytes = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

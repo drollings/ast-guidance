@@ -61,6 +61,9 @@ impl ClassifierStage {
             "filter_thinking": model.filter_thinking,
             "retry_count": model.retry_count,
             "retry_base_interval_s": model.retry_base_interval_s,
+            "stream": model.stream,
+            "idle_timeout_ms": model.idle_timeout_ms,
+            "total_timeout_ms": model.total_timeout_ms,
         })
     }
 }

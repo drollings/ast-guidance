@@ -30,10 +30,31 @@ pub struct RoutingTarget {
     /// Base interval between retries in seconds.
     #[serde(default = "default_retry_interval")]
     pub retry_base_interval_s: u64,
+    /// Whether the backend model supports streaming.
+    #[serde(default = "default_true")]
+    pub stream: bool,
+    /// Maximum idle time between stream chunks in milliseconds.
+    #[serde(default = "default_idle_timeout_ms")]
+    pub idle_timeout_ms: u64,
+    /// Maximum total time for the entire request in milliseconds.
+    #[serde(default = "default_total_timeout_ms")]
+    pub total_timeout_ms: u64,
 }
 
 fn default_retry_interval() -> u64 {
     1
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_idle_timeout_ms() -> u64 {
+    10_000
+}
+
+fn default_total_timeout_ms() -> u64 {
+    120_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,6 +226,18 @@ impl WorkUnit for PipelineOrchestrator {
                                             .get("retry_base_interval_s")
                                             .and_then(serde_json::Value::as_u64)
                                             .unwrap_or(1),
+                                        stream: rt
+                                            .get("stream")
+                                            .and_then(serde_json::Value::as_bool)
+                                            .unwrap_or(false),
+                                        idle_timeout_ms: rt
+                                            .get("idle_timeout_ms")
+                                            .and_then(serde_json::Value::as_u64)
+                                            .unwrap_or(10_000),
+                                        total_timeout_ms: rt
+                                            .get("total_timeout_ms")
+                                            .and_then(serde_json::Value::as_u64)
+                                            .unwrap_or(120_000),
                                     });
                                 }
                             }

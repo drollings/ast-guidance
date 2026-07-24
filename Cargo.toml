@@ -67,7 +67,13 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 
 # HTTP
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio", "server", "http1"] }
+http-body-util = { version = "0.1", features = ["channel"] }
+http = "1"
+bytes = "1"
+futures-util = "0.3"
 
 
 # Testing

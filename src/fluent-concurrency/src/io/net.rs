@@ -1,9 +1,11 @@
-//! Capability-gated network I/O (TCP connect, HTTP GET/POST).
+//! Capability-gated network I/O (TCP connect, HTTP GET/POST, streaming).
 
 use std::time::Duration;
 
+use bytes::Bytes;
 use common_core::error::IoError;
 use fluent_wvr::Capability;
+use futures_util::stream::{Stream, StreamExt};
 use tokio::net::{TcpStream, ToSocketAddrs};
 
 use crate::io::check_capability;
@@ -101,5 +103,61 @@ impl NetCapability {
             .map_err(std::io::Error::other)?;
         let response_body = response.text().await.map_err(std::io::Error::other)?;
         Ok(response_body)
+    }
+
+    /// POST a JSON body and return a streaming `Stream<Item = Result<Bytes, IoError>>`
+    /// of response body chunks. Use this when the caller wants incremental
+    /// delivery (e.g. SSE forwarding) rather than buffering the entire response.
+    ///
+    /// The capability is checked once, before the request is dispatched. The
+    /// returned stream surfaces transport errors from `reqwest` as `IoError`
+    /// items; the caller is responsible for parsing and idle-timeout
+    /// enforcement, because those are domain-specific.
+    pub async fn http_post_json_stream(
+        &self,
+        url: &str,
+        body: &str,
+    ) -> Result<impl Stream<Item = Result<Bytes, IoError>> + Send + 'static, IoError> {
+        check_capability(self)?;
+        let response = self
+            .client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(std::io::Error::other)?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(IoError(std::io::Error::other(format!(
+                "HTTP {status} from {url}"
+            ))));        }
+
+        let mapped = response
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(|e| std::io::Error::other(e).into()));
+        Ok(mapped)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn net_config_defaults() {
+        let cfg = NetConfig::default();
+        assert_eq!(cfg.max_idle_per_host, 4);
+        assert_eq!(cfg.idle_timeout, Duration::from_secs(30));
+        assert_eq!(cfg.connect_timeout, Duration::from_secs(10));
+        assert_eq!(cfg.request_timeout, Duration::from_secs(30));
+        assert!(cfg.user_agent.is_none());
+    }
+
+    #[test]
+    fn net_capability_default_via_default_trait() {
+        let _cap = NetCapability::default();
+        let _cap2 = NetCapability::new();
     }
 }

@@ -21,7 +21,14 @@ tracing-appender = "0.2"
 lru = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
+futures-util = { workspace = true }
 time = { workspace = true }
+fastrand = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
