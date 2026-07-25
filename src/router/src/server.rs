@@ -17,6 +17,7 @@ use tokio::net::TcpListener;
 
 use crate::config::{ModelEntry, RouteRef, ServerConfig};
 use crate::normalize;
+use crate::streaming::strip_thinking_blocks;
 use crate::pipeline::PipelineOrchestrator;
 use crate::streaming::StreamingHandler;
 use crate::testing::mock::MockDispatchContext;
@@ -555,6 +556,7 @@ async fn dispatch_real(
             }
         }
     } else {
+        let filter_thinking = rt.filter_thinking;
         let completion = dispatch_to_llm_buffered(
             http_client,
             &url,
@@ -565,6 +567,16 @@ async fn dispatch_real(
             rt.retry_base_interval_s,
         )
         .await
+        .map(|mut c| {
+            if filter_thinking {
+                for choice in &mut c.choices {
+                    if let crate::types::RouterMessageContent::Text(ref mut text) = choice.message.content {
+                        *text = strip_thinking_blocks(text);
+                    }
+                }
+            }
+            c
+        })
         .unwrap_or_else(|e| {
             tracing::warn!(target: "router.server", error = %e, "dispatch failed, using fallback");
             fallback_completion(model_name)
@@ -875,7 +887,7 @@ async fn stream_dispatch_inner(
                             let _ = tx.send_data(Bytes::from(handler.format_done())).await;
 
                             let raw_content = handler.accumulated_content();
-                            if raw_content.contains("<thinking>") {
+                            if raw_content.contains("<thinking>") || raw_content.contains(" thinking") {
                                 let filtered_len = handler.filtered_content().len();
                                 tracing::debug!(target: "router.dispatch",
                                     raw_len = raw_content.len(),
