@@ -533,12 +533,12 @@ async fn dispatch_real(
             &url,
             router_request,
             &rt.model,
-            model_name,
             rt.params.as_ref(),
             rt.retry_count,
             rt.retry_base_interval_s,
             rt.idle_timeout_ms,
             rt.total_timeout_ms,
+            rt.filter_thinking,
         )
         {
             Ok(body) => {
@@ -567,20 +567,22 @@ async fn dispatch_real(
             rt.retry_base_interval_s,
         )
         .await
-        .map(|mut c| {
-            if filter_thinking {
-                for choice in &mut c.choices {
-                    if let crate::types::RouterMessageContent::Text(ref mut text) = choice.message.content {
-                        *text = strip_thinking_blocks(text);
+        .map_or_else(
+            |e| {
+                tracing::warn!(target: "router.server", error = %e, "dispatch failed, using fallback");
+                fallback_completion(model_name)
+            },
+            |mut c| {
+                if filter_thinking {
+                    for choice in &mut c.choices {
+                        if let crate::types::RouterMessageContent::Text(ref mut text) = choice.message.content {
+                            *text = strip_thinking_blocks(text);
+                        }
                     }
                 }
-            }
-            c
-        })
-        .unwrap_or_else(|e| {
-            tracing::warn!(target: "router.server", error = %e, "dispatch failed, using fallback");
-            fallback_completion(model_name)
-        });
+                c
+            },
+        );
         Ok(completion_to_response(&completion, model_name, false, Some(model_name)))
     }
 }
@@ -703,12 +705,12 @@ fn dispatch_to_llm_streaming(
     endpoint_url: &str,
     request: &RouterRequest,
     model_name: &str,
-    response_model: &str,
     params: Option<&serde_json::Value>,
     retry_count: u32,
     retry_base_interval_s: u64,
     idle_timeout_ms: u64,
     total_timeout_ms: u64,
+    filter_thinking: bool,
 ) -> Result<http_body_util::channel::Channel<Bytes, Infallible>, String> {
     let messages = normalize::messages_to_json(request);
 
@@ -745,14 +747,15 @@ fn dispatch_to_llm_streaming(
 
     let url = endpoint_url.to_string();
     let model = model_name.to_string();
-    let resp_model = response_model.to_string();
     let client = http_client.clone();
 
     tokio::spawn(async move {
+        let mut handler = StreamingHandler::new(&request_id, format!("{model}#stream"))
+            .with_filter_thinking(filter_thinking);
         if let Err(e) = stream_dispatch_inner(
-            &client, &url, &body, &model, &request_id, &resp_model,
+            &client, &url, &body, &model,
             retry_count, retry_base_interval_s,
-            idle_timeout_ms, total_timeout_ms, &mut tx,
+            idle_timeout_ms, total_timeout_ms, &mut tx, &mut handler,
         )
         .await
         {
@@ -768,13 +771,12 @@ async fn stream_dispatch_inner(
     url: &str,
     body: &serde_json::Value,
     model_name: &str,
-    request_id: &str,
-    response_model: &str,
     retry_count: u32,
     retry_base_interval_s: u64,
     idle_timeout_ms: u64,
     total_timeout_ms: u64,
     tx: &mut http_body_util::channel::Sender<Bytes>,
+    handler: &mut StreamingHandler,
 ) -> Result<(), String> {
     let max_attempts = (retry_count + 1).max(1);
     let idle_dur = Duration::from_millis(idle_timeout_ms);
@@ -819,7 +821,6 @@ async fn stream_dispatch_inner(
 
     let mut response_stream = stream;
 
-    let mut handler = StreamingHandler::new(request_id, format!("{response_model}#stream"));
     let mut line_buf = Vec::new();
     let mut sent_first_chunk = false;
 
@@ -883,7 +884,10 @@ async fn stream_dispatch_inner(
                             .and_then(|v| v.as_str());
 
                         if let Some(fr) = finish_reason {
-                            let _ = tx.send_data(Bytes::from(handler.format_chunk(delta, Some(fr)))).await;
+                            let chunk_str = handler.format_chunk(delta, Some(fr));
+                            if !chunk_str.is_empty() {
+                                let _ = tx.send_data(Bytes::from(chunk_str)).await;
+                            }
                             let _ = tx.send_data(Bytes::from(handler.format_done())).await;
 
                             let raw_content = handler.accumulated_content();
@@ -898,10 +902,11 @@ async fn stream_dispatch_inner(
                             return Ok(());
                         }
 
-                        sent_first_chunk = true;
-                        let _ = tx
-                            .send_data(Bytes::from(handler.format_chunk(delta, None)))
-                            .await;
+                        let chunk_str = handler.format_chunk(delta, None);
+                        if !chunk_str.is_empty() {
+                            sent_first_chunk = true;
+                            let _ = tx.send_data(Bytes::from(chunk_str)).await;
+                        }
                     }
                 }
             }

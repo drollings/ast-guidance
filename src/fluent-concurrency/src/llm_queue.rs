@@ -73,6 +73,11 @@ pub struct LlmConfig {
     pub think: Option<bool>,
     #[builder(default = 2000)]
     pub timeout_ms: u64,
+    /// Arbitrary JSON body parameters merged into every chat completion
+    /// request (e.g. `num_ctx`, `temperature`, `stop`).  The keys `"model"`,
+    /// `"messages"`, and `"stream"` are ignored if present since those are
+    /// set explicitly by the chat completion logic.
+    pub extra_body_params: Option<serde_json::Value>,
     #[builder(default)]
     pub debug: bool,
     #[builder(default)]

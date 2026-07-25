@@ -10,35 +10,14 @@
         }
     },
     "models": {
-        "classifier": {
-            "endpoint": "http://localhost:8080/v1/chat/completions",
-            "name": "liquidai/lfm2.5-350m",
-            "intelligence": 2,
-            "cost_input": 0.000001,
-            "cost_output": 0.000006,
-            "cost_cached_read": 0.0000004,
-            "speed": 10,
-            "total_timeout_ms": 40000,
-            "idle_timeout_ms": 8000,
-            "stream": true,
-            "filter_thinking": false,
-            "retry_count": 1,
-            "retry_base_interval_s": 1,
-            "params": {
-                "num_ctx": 32768,
-                "max_tokens": 8192,
-                "parallel": 3,
-                "sleep_idle_seconds": 7200
-            }
-        },
-        "thinkfast": {
+        "fast": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
             "name": "unsloth/lfm2.5-1.2b-thinking",
             "intelligence": 2,
             "cost_input": 0.000001,
             "cost_output": 0.000006,
             "cost_cached_read": 0.0000004,
-            "speed": 10,
+            "speed": 8,
             "total_timeout_ms": 40000,
             "idle_timeout_ms": 8000,
             "stream": true,
@@ -47,15 +26,15 @@
             "retry_base_interval_s": 1,
             "params": {
                 "num_ctx": 32768,
-                "max_tokens": 8192,
+                "max_tokens": 2048,
                 "parallel": 3,
-                "sleep_idle_seconds": 7200
+                "sleep_idle_seconds": 3600
             }
         },
-        "code": {
+        "ledger": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
-            "name": "code",
-            "intelligence": 6,
+            "name": "empero-ai/qwythos-9b-v2",
+            "intelligence": 3,
             "cost_input": 0.000003,
             "cost_output": 0.000018,
             "cost_cached_read": 0.0000012,
@@ -63,24 +42,66 @@
             "total_timeout_ms": 120000,
             "idle_timeout_ms": 10000,
             "stream": true,
-            "filter_thinking": false,
+            "filter_thinking": true,
             "retry_count": 0,
             "retry_base_interval_s": 2,
             "params": {
-                "num_ctx": 131072,
+                "num_ctx": 262144,
+                "temperature": 0.6
+            }
+        },
+        "translation": {
+            "endpoint": "http://localhost:8080/v1/chat/completions",
+            "name": "unsloth/hy-mt2-7b",
+            "intelligence": 3,
+            "cost_input": 0.000003,
+            "cost_output": 0.000018,
+            "cost_cached_read": 0.0000012,
+            "speed": 5,
+            "total_timeout_ms": 120000,
+            "idle_timeout_ms": 10000,
+            "stream": true,
+            "filter_thinking": true,
+            "retry_count": 0,
+            "retry_base_interval_s": 2,
+            "params": {
+                "num_ctx": 32768,
+                "temperature": 0.6
+            }
+        },
+        "code": {
+            "endpoint": "http://localhost:8080/v1/chat/completions",
+            "name": "empero-ai/qwythos-9b-v2",
+            "intelligence": 3,
+            "cost_input": 0.000003,
+            "cost_output": 0.000018,
+            "cost_cached_read": 0.0000012,
+            "speed": 5,
+            "total_timeout_ms": 120000,
+            "idle_timeout_ms": 10000,
+            "stream": true,
+            "filter_thinking": true,
+            "retry_count": 0,
+            "retry_base_interval_s": 2,
+            "params": {
+                "num_ctx": 65536,
                 "temperature": 0.6
             }
         }
     },
     "model_groups": {
-        "classifier": ["classifier"],
+        "classifier": ["fast"],
+        "question": ["fast"],
+        "command": ["fast"],
         "code": ["code"],
-        "agents": ["agent"]
+        "chitchat": ["code"],
+        "psychology": ["code"],
+        "translation": ["code"]
     },
     "routes": {
         "local": { "group": "classifier", "pipelines": ["default"] }
     },
-    "system_prompt": "You are a query classifier and safety router. Analyze the user's message and output JSON only.\n\nOutput schema:\n{\n  \"action\": \"respond\" | \"route\" | \"reject\",\n  \"response\": \"direct answer (only if action=respond)\",\n  \"target\": \"route name (only if action=route)\",\n  \"coherence_score\": 0.0-1.0,\n  \"safety_score\": 0.0-1.0,\n  \"complexity\": 0-10,\n  \"intent\": \"question\" | \"command\" | \"creative\" | \"code\" | \"chitchat\",\n  \"reason\": \"brief explanation\"\n}\n\nRules:\n- If the query is trivial (simple arithmetic, basic fact, greeting), set action=respond and provide the answer.\n- If the query is safe and well-formed, set action=route with target=\"fast\".\n- If the query is a coding task, set action=route with target=\"code\".\n- If content is incoherent (coherence_score < 0.3), set action=reject.\n- If content is unsafe (safety_score < 0.5), set action=reject.\n- Safety score 1.0 = completely safe, 0.0 = dangerous.\n- Complexity 0 = trivial, 10 = extremely complex. Higher complexity queries are routed to models with matching intelligence level.\n\nOnly output JSON, no other text.",
+    "system_prompt": "You are a query classifier and safety router. Analyze the user's message and output JSON only.\n\nOutput schema:\n{\n  \"action\": \"respond\" | \"route\" | \"reject\",\n  \"response\": \"direct answer (only if action=respond)\",\n  \"target\": \"route name (only if action=route)\",\n  \"coherence_score\": 0.0-1.0,\n  \"safety_score\": 0.0-1.0,\n  \"complexity\": 0-10,\n  \"intent\": \"question\" | \"command\" | \"creative\" | \"code\" | \"chitchat\" | \"psychology\" | \"translation\",\n  \"reason\": \"brief explanation\"\n}\n\nRules:\n- If the query is trivial (simple arithmetic, basic fact, greeting), set action=respond and provide the answer.\n- If the query is safe and well-formed, set action=route with target=\"local\".\n- If the query is a coding task, set action=route with target=\"code\".\n- If content is incoherent (coherence_score < 0.3), set action=reject.\n- If content is unsafe (safety_score < 0.3), set action=reject.\n- Safety score 1.0 = completely safe, 0.0 = dangerous.\n- Complexity 0 = trivial, 10 = extremely complex. Higher complexity queries are routed to models with matching intelligence level.\n\nOnly output JSON, no other text.",
     "classifier_model": "fast",
     "safety_threshold": 0.5,
     "default_route": "local",
@@ -90,9 +111,9 @@
     },
     "logging": {
         "log_dir": "logs",
-        "max_file_size_mb": 100,
-        "max_age_days": 7,
-        "max_files": 10,
+        "max_file_size_mb": 10,
+        "max_age_days": 3,
+        "max_files": 4,
         "json_format": false,
         "console_output": true
     }

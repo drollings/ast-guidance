@@ -175,7 +175,7 @@ router-mock: $(CORAL_ROUTER_BIN) $(ROUTER_MOCK_TEST_SCRIPT) ## Build, start with
 		fi; \
 		echo "Waiting for coral-router..."; sleep 1; \
 	done
-	$(Q)bash $(ROUTER_MOCK_TEST_SCRIPT)
+	$(Q)ROUTER_BASE_URL=http://127.0.0.1:8078 bash $(ROUTER_MOCK_TEST_SCRIPT)
 	$(Q)killall coral-router 2>/dev/null || true
 
 # ── Standard Targets ──────────────────────────────────────────────────────────

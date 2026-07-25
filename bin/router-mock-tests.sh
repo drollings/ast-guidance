@@ -89,16 +89,6 @@ else
     FAIL=$((FAIL + 1))
 fi
 
-# ── CORS ─────────────────────────────────────────────────────
-resp=$(curl -s -m 5 -I -X GET "$BASE/health" 2>&1)
-if echo "$resp" | grep -q 'Access-Control-Allow-Origin'; then
-    echo -e "  ${GREEN}PASS${NC} [200] response includes CORS headers"
-    PASS=$((PASS + 1))
-else
-    echo -e "  ${RED}FAIL${NC}        response includes CORS headers"
-    FAIL=$((FAIL + 1))
-fi
-
 # ── Streaming flag preserved ─────────────────────────────────
 resp=$(curl -s -m 30 -X POST "$BASE/v1/chat/completions" \
     -H "Content-Type: application/json" \

@@ -220,6 +220,7 @@ mod tests {
             model: "test-model".into(),
             think: None,
             timeout_ms: 5000,
+            extra_body_params: None,
             debug: false,
             show_prompts: false,
         }

@@ -7,24 +7,61 @@ use crate::types::RouterChoice;
 /// OpenAI-compatible streaming delta chunks.
 pub struct StreamingHandler {
     buffer: String,
+    filtered_buffer: String,
     chunk_index: u32,
     request_id: String,
     model: String,
+    filter_thinking: bool,
+    /// When filter_thinking is true, tracks content inside an unclosed
+    /// thinking block across chunks so partial think tags are never
+    /// leaked to the client.
+    in_think_block: bool,
+    think_pending: String,
 }
 
 impl StreamingHandler {
     pub fn new(request_id: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             buffer: String::new(),
+            filtered_buffer: String::new(),
             chunk_index: 0,
             request_id: request_id.into(),
             model: model.into(),
+            filter_thinking: false,
+            in_think_block: false,
+            think_pending: String::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_filter_thinking(mut self, enabled: bool) -> Self {
+        self.filter_thinking = enabled;
+        self
     }
 
     /// Format a single delta chunk as an SSE `data:` line.
     /// Returns the SSE-formatted string including `\n\n` terminator.
+    /// When `filter_thinking` is true, thinking blocks are stripped from
+    /// the delta before emission, correctly handling blocks that span
+    /// multiple chunks.
     pub fn format_chunk(&mut self, delta: &str, finish_reason: Option<&str>) -> String {
+        self.buffer.push_str(delta);
+
+        let content_to_send = if self.filter_thinking {
+            self.filter_think_block(delta)
+        } else {
+            self.chunk_index += 1;
+            delta.to_string()
+        };
+
+        if content_to_send.is_empty() && finish_reason.is_none() {
+            // Entire chunk was inside a think block — emit nothing
+            // (unless there's a finish_reason that needs to be sent).
+            return String::new();
+        }
+
+        self.filtered_buffer.push_str(&content_to_send);
+
         let chunk = serde_json::json!({
             "id": self.request_id,
             "object": "chat.completion.chunk",
@@ -36,16 +73,72 @@ impl StreamingHandler {
             "choices": [{
                 "index": 0,
                 "delta": {
-                    "content": delta
+                    "content": content_to_send
                 },
                 "finish_reason": finish_reason,
             }],
         });
 
-        self.buffer.push_str(delta);
-        self.chunk_index += 1;
-
         format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap_or_default())
+    }
+
+    /// Filter thinking blocks from a delta, handling cross-chunk blocks.
+    /// Returns the text to emit (empty if entirely inside a think block).
+    fn filter_think_block(&mut self, delta: &str) -> String {
+        const OPEN_TAGS: &[&str] = &["<think>", "<thinking>"];
+        const CLOSE_TAGS: &[&str] = &["</think>", "</thinking>"];
+
+        let mut output = String::new();
+        let mut remaining = delta;
+
+        loop {
+            if self.in_think_block {
+                // Check for any closing tag in remaining
+                let mut earliest_close: Option<(usize, &str)> = None;
+                for ct in CLOSE_TAGS {
+                    if let Some(pos) = remaining.find(ct) {
+                        if earliest_close.is_none_or(|(e, _)| pos < e) {
+                            earliest_close = Some((pos, ct));
+                        }
+                    }
+                }
+
+                if let Some((pos, ct)) = earliest_close {
+                    // Close the think block — emit nothing for its content
+                    self.in_think_block = false;
+                    self.think_pending.clear();
+                    remaining = &remaining[pos + ct.len()..];
+                    continue;
+                }
+                // Still inside the block — accumulate and discard
+                self.think_pending.push_str(remaining);
+                self.chunk_index += 1;
+                return output;
+            }
+
+            // Not inside a think block — scan for opening tags
+            let mut earliest_open: Option<(usize, &str)> = None;
+            for ot in OPEN_TAGS {
+                if let Some(pos) = remaining.find(ot) {
+                    if earliest_open.is_none_or(|(e, _)| pos < e) {
+                        earliest_open = Some((pos, ot));
+                    }
+                }
+            }
+
+            if let Some((pos, ot)) = earliest_open {
+                output.push_str(&remaining[..pos]);
+                self.in_think_block = true;
+                self.think_pending.clear();
+                remaining = &remaining[pos + ot.len()..];
+                continue;
+            }
+
+            // No think tags — emit remaining text
+            output.push_str(remaining);
+            self.chunk_index += 1;
+            return output;
+        }
     }
 
     /// Format a single choice as an SSE delta chunk.
@@ -67,12 +160,19 @@ impl StreamingHandler {
         self.chunk_index
     }
 
+    /// Raw accumulated content as received from the LLM (including any
+    /// thinking blocks).
     pub fn accumulated_content(&self) -> &str {
         &self.buffer
     }
 
+    /// Accumulated content with thinking blocks stripped.
     pub fn filtered_content(&self) -> String {
-        strip_thinking_blocks(&self.buffer)
+        if self.filter_thinking {
+            self.filtered_buffer.clone()
+        } else {
+            strip_thinking_blocks(&self.buffer)
+        }
     }
 }
 
@@ -101,15 +201,14 @@ fn strip_tag_pairs(
 
         for &(start_mark, end_mark) in pairs {
             if let Some(start) = find_subseq(bytes, pos, start_mark) {
-                if earliest.map_or(true, |e| start < e) {
+                if earliest.is_none_or(|e| start < e) {
                     earliest = Some(start);
                     matched_pair = Some((start_mark, end_mark));
                 }
             }
         }
 
-        match matched_pair {
-            Some((start_mark, end_mark)) => {
+        if let Some((start_mark, end_mark)) = matched_pair {
                 let start = earliest.unwrap();
                 result.push_str(&text[pos..start]);
                 let after_start = start + start_mark.len();
@@ -118,11 +217,9 @@ fn strip_tag_pairs(
                 } else {
                     return result;
                 }
-            }
-            None => {
-                result.push_str(&text[pos..]);
-                return result;
-            }
+        } else {
+            result.push_str(&text[pos..]);
+            return result;
         }
     }
 
@@ -138,8 +235,7 @@ fn strip_plain_thinking(text: &str) -> String {
     let bytes = text.as_bytes();
 
     while pos < bytes.len() {
-        match find_subseq(bytes, pos, b" thinking") {
-            Some(start) => {
+        if let Some(start) = find_subseq(bytes, pos, b" thinking") {
                 let after_start = start + 9;
                 match find_subseq(bytes, after_start, b" response") {
                     Some(end) if end + 9 >= bytes.len()
@@ -151,11 +247,9 @@ fn strip_plain_thinking(text: &str) -> String {
                     }
                     _ => return result,
                 }
-            }
-            None => {
-                result.push_str(&text[pos..]);
-                return result;
-            }
+        } else {
+            result.push_str(&text[pos..]);
+            return result;
         }
     }
 
@@ -166,6 +260,7 @@ fn strip_plain_thinking(text: &str) -> String {
 /// - `<think>...</think>` (Ollama-style XML tags)
 /// - `<thinking>...</thinking>` (Claude, Gemini, some local models)
 /// - ` thinking ...  response\n` (DeepSeek R1, unsloth thinking)
+///
 /// Tags can appear anywhere in the content and blocks may be unclosed.
 pub fn strip_thinking_blocks(text: &str) -> String {
     let tagged = strip_tag_pairs(text, THINKING_PAIRS);

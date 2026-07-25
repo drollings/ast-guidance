@@ -12,7 +12,7 @@ This is a rust monorepo with multiple projects and shared infrastructure.  coral
 1. BUILD:       make router          # builds coral-router binary
                 make router-start    # builds + starts server on :8081
 
-2. TEST:        make router-test     # 181 unit/golden/e2e tests (kills server)
+2. TEST:        make router-test     # 204 unit/golden/e2e tests (kills server)
 
 3. SMOKE:       make router-mock     # 18 curl smoke tests against live server
                 curl -s http://127.0.0.1:8081/health
@@ -30,7 +30,7 @@ This is a rust monorepo with multiple projects and shared infrastructure.  coral
 |---|---|
 | `make router`       | Build coral-router |
 | `make router-start` | Build + start server (kills old first) |
-| `make router-test`  | Kill server + run 181 unit tests + --help dry-run |
+| `make router-test`  | Kill server + run 204 unit tests + --help dry-run |
 | `make router-mock`  | Depends on router-start, runs 18 curl smoke tests, leaves server running |
 
 
@@ -216,3 +216,33 @@ graphs, task-supervision cancellation trees — MUST compose
 reference integration is `fluent-concurrency`'s `Zone`
 (`src/fluent-concurrency/src/zone.rs`), which replaced three hand-rolled
 `HashMap`s with a single `DependencyGraph<ArcIntern<str>>`.
+
+---
+
+### `filter_thinking` — Think-block filtering contract
+
+Every LLM call (classifier, frontier dispatch buffered, frontier dispatch
+streaming) MUST respect `filter_thinking: bool` from the model config in
+`env/coral-router.json`.  The contract has two parts:
+
+1. **Request body**: The classifier HTTP request body (built by
+   `chat_complete_http_inner_async` in `src/llm/src/client.rs`) MUST include
+   `chat_template_kwargs: {"enable_thinking": false}` as a default so the model
+   does not emit `<think>...</think>` blocks in its response.  Model-level
+   `params` from `ModelEntry` are merged via `extra_body_params` so they can
+   override this default.  The `LlmConfig.think` flag (boolean) is the final
+   override — when `Some(true)` it enables thinking regardless of defaults.
+
+2. **Response filtering**:
+   - **Buffered dispatch** (`dispatch_to_llm_buffered` in `server.rs`): apply
+     `strip_thinking_blocks()` after receiving the full response when
+     `filter_thinking` is true.
+   - **Streaming dispatch** (`dispatch_to_llm_streaming` / `stream_dispatch_inner`
+     in `server.rs`): pass `filter_thinking` to `StreamingHandler` via
+     `with_filter_thinking()`.  The handler tracks think-block open/close tags
+     across chunks so partial tags are never leaked to the client.
+
+When modifying any LLM call path, verify that `ModelEntry.params` from the
+config are forwarded through `LlmConfig.extra_body_params` (for the classifier
+path) or `RoutingTarget.params` (for the frontier dispatch path), and that
+`filter_thinking` is propagated to the response handler.

@@ -129,6 +129,7 @@ impl LlmClient {
                     &self.model,
                     self.config.think,
                     self.config.timeout_ms,
+                    self.config.extra_body_params.as_ref(),
                     self.config.debug,
                     self.config.show_prompts,
                 )
@@ -162,12 +163,16 @@ impl ChatBackend for LlmClient {
 
 /// Async chat completion HTTP call. Honors `LlmConfig::timeout_ms` via
 /// `tokio::time::timeout` on the whole request/response.
+///
+/// `extra_body_params` are merged into the HTTP request body to supply
+/// model-level inference parameters (e.g. `num_ctx`, `temperature`).
 pub async fn chat_complete_http_async(
     api_base: &str,
     messages: &[ChatMessage],
     model: &str,
     think: Option<bool>,
     timeout_ms: u64,
+    extra_body_params: Option<&serde_json::Value>,
     debug: bool,
     show_prompts: bool,
 ) -> Result<String, LlmError> {
@@ -183,6 +188,7 @@ pub async fn chat_complete_http_async(
         model,
         think,
         timeout_ms,
+        extra_body_params,
         debug,
         show_prompts,
     )
@@ -201,12 +207,13 @@ pub fn chat_complete_http(
     messages: &[ChatMessage],
     model: &str,
     think: Option<bool>,
+    extra_body_params: Option<&serde_json::Value>,
     debug: bool,
     show_prompts: bool,
 ) -> Result<String, LlmError> {
     // timeout_ms=0 disables the timeout to preserve the original behavior
     // of the sync `chat_complete_http` (which had no timeout).
-    let fut = chat_complete_http_async(api_base, messages, model, think, 0, debug, show_prompts);
+    let fut = chat_complete_http_async(api_base, messages, model, think, 0, extra_body_params, debug, show_prompts);
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => handle.block_on(fut),
         Err(_) => fallback_runtime().block_on(fut),
@@ -215,22 +222,40 @@ pub fn chat_complete_http(
 
 /// Inner async request — returns `Ok(content)` or `Ok("")` on empty.
 /// Never returns reasoning_content as the answer.
+///
+/// `extra_body_params` are merged into the JSON body after the built-in
+/// fields but before stream/think overrides, so they can supply model-level
+/// defaults (e.g. `num_ctx`, `temperature`, `max_tokens`) that are then
+/// superseded by call-specific overrides.
 async fn chat_complete_http_inner_async(
     url: &str,
     messages: &[ChatMessage],
     model: &str,
     think: Option<bool>,
     timeout_ms: u64,
+    extra_body_params: Option<&serde_json::Value>,
     debug: bool,
     show_prompts: bool,
 ) -> Result<String, LlmError> {
     let mut body = serde_json::json!({
         "model": model,
         "messages": messages,
-        "max_tokens": 1024u32,
         "stream": false,
         "chat_template_kwargs": {"enable_thinking": false},
     });
+
+    // Merge model-level params (can override defaults above, e.g. when
+    // `extra_body_params` contains `chat_template_kwags`).
+    if let Some(params) = extra_body_params {
+        if let Some(obj) = params.as_object() {
+            for (k, v) in obj {
+                if k != "model" && k != "messages" && k != "stream" {
+                    body[k] = v.clone();
+                }
+            }
+        }
+    }
+    // think flag from LlmConfig overrides everything.
     if think == Some(true) {
         body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": true});
     }

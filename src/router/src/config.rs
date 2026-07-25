@@ -411,7 +411,8 @@ impl RouterConfig {
                 let classifier_config = LlmConfig::new()
                     .api_url(entry.endpoint.clone())
                     .model(model_name_for_llm.to_string())
-                    .timeout_ms(5000)
+                    .timeout_ms(entry.total_timeout_ms)
+                    .maybe_extra_body_params(entry.params.clone())
                     .build();
                 Arc::new(LlmClient::with_config(classifier_config))
             };

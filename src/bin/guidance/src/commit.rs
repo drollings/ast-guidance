@@ -315,7 +315,7 @@ pub fn generate_commit_message(
 
     // Use the direct HTTP path — avoids LlmClient's DefaultQueue which creates
     // a nested tokio runtime that panics when called from #[tokio::main].
-    let raw = guidance_llm::chat_complete_http(api_url, &messages, model, None, debug, false)?;
+    let raw = guidance_llm::chat_complete_http(api_url, &messages, model, None, None, debug, false)?;
 
     // Parse bullet lines from the response — strip prefix, then re-add
     // uniformly so the output is consistent regardless of what the LLM used.

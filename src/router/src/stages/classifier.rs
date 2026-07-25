@@ -84,10 +84,19 @@ impl WorkUnit for ClassifierStage {
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
         let input = extract_user_message(ctx)?;
 
+        let system_prompt = ctx
+            .metadata
+            .get("classifier_system_prompt")
+            .and_then(|v| match v {
+                MetadataValue::String(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .unwrap_or(&self.routing_config.system_prompt);
+
         let messages = vec![
             ChatMessage {
                 role: "system".into(),
-                content: self.routing_config.system_prompt.clone(),
+                content: system_prompt.to_string(),
             },
             ChatMessage {
                 role: "user".into(),

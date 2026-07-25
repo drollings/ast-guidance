@@ -24,6 +24,8 @@ pub mod types;
 pub mod session;
 pub mod config;
 pub mod pipeline;
+pub mod pipeline_graph;
+pub mod workflow_config;
 pub mod stages;
 pub mod transforms;
 pub mod dispatch;

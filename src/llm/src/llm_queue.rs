@@ -47,6 +47,7 @@ pub fn default_handler(
         let model = task.config.model.clone();
         let think = task.config.think;
         let timeout_ms = task.config.timeout_ms;
+        let extra_body_params = task.config.extra_body_params;
         let debug = task.config.debug;
         let show_prompts = task.config.show_prompts;
         let messages = task.messages;
@@ -57,6 +58,7 @@ pub fn default_handler(
                 &model,
                 think,
                 timeout_ms,
+                extra_body_params.as_ref(),
                 debug,
                 show_prompts,
             )
