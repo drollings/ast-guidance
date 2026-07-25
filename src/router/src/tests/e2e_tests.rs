@@ -68,7 +68,7 @@ fn default_provider() -> TranscriptProvider {
 fn make_test_config() -> RouterConfig {
     match serde_json::from_str::<RouterConfig>(r#"{
         "pipelines": {"default": {"deterministic_prefilter": true, "classifier": true}},
-        "models": {"fast": {"endpoint": "http://localhost:8080/v1/chat/completions", "name": "fast", "intelligence": 1, "cost_input": 0.000001, "cost_output": 0.000006, "cost_cached_read": 0.0000004, "speed": 10, "total_timeout_ms": 5000, "idle_timeout_ms": 2000, "stream": false, "filter_thinking": false, "retry_count": 0, "retry_base_interval_s": 1}},
+        "models": {"fast": {"endpoint": "http://upstream.test:8080/v1/chat/completions", "name": "fast", "intelligence": 1, "cost_input": 0.000001, "cost_output": 0.000006, "cost_cached_read": 0.0000004, "speed": 10, "total_timeout_ms": 5000, "idle_timeout_ms": 2000, "stream": false, "filter_thinking": false, "retry_count": 0, "retry_base_interval_s": 1}},
         "model_groups": {"fast": ["fast"]},
         "routes": {"fast": {"group": "fast", "pipelines": ["default"]}},
         "default_route": "fast"

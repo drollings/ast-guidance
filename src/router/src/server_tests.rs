@@ -29,7 +29,7 @@ mod server_tests {
     #[test]
     fn server_config_defaults() {
         let config = ServerConfig::default();
-        assert_eq!(config.bind_addr, "127.0.0.1:8080");
+        assert!(config.bind_addr.is_empty(), "bind_addr must be provided by config or CLI, not hardcoded");
         assert_eq!(config.max_payload, 1_048_576);
     }
 }

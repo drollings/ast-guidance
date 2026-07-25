@@ -912,8 +912,8 @@ mod tests {
     #[test]
     fn adapter_field_override_set_then_get() {
         let host = AdapterHost::new("inner");
-        let mut adapter = ComponentAdapter::new(Arc::new(host)).with_field_override("port", "8080");
-        assert_eq!(adapter.get_field("port").unwrap(), "8080");
+        let mut adapter = ComponentAdapter::new(Arc::new(host)).with_field_override("port", "8079");
+        assert_eq!(adapter.get_field("port").unwrap(), "8079");
         adapter.set_field("port", "9090").unwrap();
         assert_eq!(adapter.get_field("port").unwrap(), "9090");
     }
@@ -951,14 +951,14 @@ mod tests {
         let host = AdapterHost::new("inner");
         let adapter = ComponentAdapter::new(Arc::new(host))
             .with_name_override("renamed")
-            .with_field_override("port", "8080");
+            .with_field_override("port", "8079");
         let schema = adapter.describe();
         assert_eq!(schema["name"], "renamed");
         assert_eq!(schema["adapted"], true);
         let overrides = schema["field_overrides"].as_array().unwrap();
         assert_eq!(overrides.len(), 1);
         assert_eq!(overrides[0][0], "port");
-        assert_eq!(overrides[0][1], "8080");
+        assert_eq!(overrides[0][1], "8079");
     }
 
     #[test]
@@ -1127,7 +1127,7 @@ mod tests {
 
     #[test]
     fn adapter_set_field_propagates_constraint_error() {
-        let host = ConstrainedHost { port: 8080 };
+        let host = ConstrainedHost { port: 8079 };
         let mut adapter = ComponentAdapter::new(Arc::new(host));
         // Valid value — should succeed and store override.
         adapter.set_field("port", "512").unwrap();
@@ -1146,7 +1146,7 @@ mod tests {
 
     #[test]
     fn adapter_set_field_propagates_parse_error() {
-        let host = ConstrainedHost { port: 8080 };
+        let host = ConstrainedHost { port: 8079 };
         let mut adapter = ComponentAdapter::new(Arc::new(host));
         let err = adapter.set_field("port", "not_a_number").unwrap_err();
         match err {
@@ -1176,7 +1176,7 @@ mod tests {
 
     #[test]
     fn component_adapter_clone() {
-        let host = ConstrainedHost { port: 8080 };
+        let host = ConstrainedHost { port: 8079 };
         let adapter = ComponentAdapter::new(Arc::new(host)).with_name_override("cloned-name");
         let cloned = adapter.clone();
         assert_eq!(cloned.name_override.as_deref(), Some("cloned-name"));
@@ -1184,14 +1184,14 @@ mod tests {
 
     #[test]
     fn adapter_get_field_falls_back_to_inner() {
-        let host = ConstrainedHost { port: 8080 };
+        let host = ConstrainedHost { port: 8079 };
         let adapter = ComponentAdapter::new(Arc::new(host));
-        assert_eq!(adapter.get_field("port").unwrap(), "8080");
+        assert_eq!(adapter.get_field("port").unwrap(), "8079");
     }
 
     #[test]
     fn adapter_override_takes_priority_over_inner() {
-        let host = ConstrainedHost { port: 8080 };
+        let host = ConstrainedHost { port: 8079 };
         let adapter = ComponentAdapter::new(Arc::new(host)).with_field_override("port", "9090");
         assert_eq!(adapter.get_field("port").unwrap(), "9090");
     }
@@ -1238,10 +1238,10 @@ mod tests {
 
     #[test]
     fn adapter_clear_field_overrides_reverts_to_inner() {
-        let host = ConstrainedHost { port: 8080 };
+        let host = ConstrainedHost { port: 8079 };
         let mut adapter = ComponentAdapter::new(Arc::new(host)).with_field_override("port", "9090");
         assert_eq!(adapter.get_field("port").unwrap(), "9090");
         adapter.clear_field_overrides();
-        assert_eq!(adapter.get_field("port").unwrap(), "8080");
+        assert_eq!(adapter.get_field("port").unwrap(), "8079");
     }
 }

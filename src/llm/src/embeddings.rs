@@ -781,7 +781,7 @@ mod tests {
     #[test]
     fn factory_custom_prefix() {
         let p = create_embedding_provider(
-            "custom:http://localhost:8080",
+            "custom:http://upstream.test:8080",
             None,
             None,
             Some("sk-test"),

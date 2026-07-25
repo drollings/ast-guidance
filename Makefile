@@ -19,6 +19,11 @@ SHELL := /bin/bash
 
 TARGET_BIN  := guidance
 CORAL_ROUTER_BIN := target/debug/coral-router
+CORAL_ROUTER_CONFIG := env/coral-router.json
+# Extract bind address from the config file (source of truth).
+CORAL_ROUTER_BIND_ADDR := $(shell python3 -c "import json; print(json.load(open('$(CORAL_ROUTER_CONFIG)'))['server']['bind_addr'])" 2>/dev/null)
+CORAL_ROUTER_HEALTH_URL := http://$(CORAL_ROUTER_BIND_ADDR)/health
+CORAL_ROUTER_MOCK_HEALTH_URL := http://127.0.0.1:8078/health
 CONFIG      := .guidance/guidance-config.json
 INSTALLDIR  := $(HOME)/.local/bin
 
@@ -148,12 +153,12 @@ router-test: $(CORAL_ROUTER_BIN) ## Run all router unit, golden, and e2e mock te
 ROUTER_MOCK_TEST_SCRIPT := bin/router-mock-tests.sh
 
 .PHONY: router-start
-router-start: $(CORAL_ROUTER_BIN) ## Build (if needed) and start coral-router on :8081
-	$(Q)pkill coral-router 2>/dev/null || true
+router-start: $(CORAL_ROUTER_BIN) ## Build (if needed) and start coral-router
+	$(Q)killall coral-router 2>/dev/null || true
 	$(Q)sleep 0.5
-	$(Q)nohup target/debug/coral-router -c env/coral-router.json > /tmp/coral-router.out 2>&1 &
+	$(Q)nohup target/debug/coral-router -c $(CORAL_ROUTER_CONFIG) > /tmp/coral-router.out 2>&1 &
 	$(Q)for i in $$(seq 1 10); do \
-		if curl -s -m 1 http://127.0.0.1:8081/health > /dev/null 2>&1; then \
+		if curl -s -m 1 $(CORAL_ROUTER_HEALTH_URL) > /dev/null 2>&1; then \
 			echo "coral-router started (attempt $$i)"; break; \
 		fi; \
 		echo "Waiting for coral-router..."; sleep 1; \
@@ -163,14 +168,15 @@ router-start: $(CORAL_ROUTER_BIN) ## Build (if needed) and start coral-router on
 router-mock: $(CORAL_ROUTER_BIN) $(ROUTER_MOCK_TEST_SCRIPT) ## Build, start with mock backend, run curl smoke-tests (leaves server running)
 	$(Q)pkill coral-router 2>/dev/null || true
 	$(Q)sleep 0.5
-	$(Q)nohup target/debug/coral-router -c env/coral-router.json --mock env/mock-transcripts.json > /tmp/coral-router.out 2>&1 &
-	$(Q)for i in $$(seq 1 10); do \
-		if curl -s -m 1 http://127.0.0.1:8081/health > /dev/null 2>&1; then \
+	$(Q)nohup target/debug/coral-router -c $(CORAL_ROUTER_CONFIG) --host 127.0.0.1 --port 8078 --mock env/mock-transcripts.json > /tmp/coral-router.out 2>&1 &
+	$(Q)for i in $$(seq 1 5); do \
+		if curl -s -m 1 $(CORAL_ROUTER_MOCK_HEALTH_URL); then \
 			echo "coral-router started (attempt $$i)"; break; \
 		fi; \
 		echo "Waiting for coral-router..."; sleep 1; \
 	done
 	$(Q)bash $(ROUTER_MOCK_TEST_SCRIPT)
+	$(Q)killall coral-router 2>/dev/null || true
 
 # ── Standard Targets ──────────────────────────────────────────────────────────
 

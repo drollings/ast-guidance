@@ -173,7 +173,7 @@ impl_component!(ConstrainedConfig);
 #[test]
 fn test_derive_field_access_constraint_valid() {
     let mut cfg = ConstrainedConfig {
-        port: 8080,
+        port: 8079,
         retries: 3,
         host: "localhost".into(),
     };
@@ -186,7 +186,7 @@ fn test_derive_field_access_constraint_valid() {
 #[test]
 fn test_derive_field_access_constraint_below_min() {
     let mut cfg = ConstrainedConfig {
-        port: 8080,
+        port: 8079,
         retries: 3,
         host: "localhost".into(),
     };
@@ -202,7 +202,7 @@ fn test_derive_field_access_constraint_below_min() {
 #[test]
 fn test_derive_field_access_constraint_above_max() {
     let mut cfg = ConstrainedConfig {
-        port: 8080,
+        port: 8079,
         retries: 3,
         host: "localhost".into(),
     };
@@ -218,7 +218,7 @@ fn test_derive_field_access_constraint_above_max() {
 #[test]
 fn test_derive_field_access_constraint_zero_min() {
     let mut cfg = ConstrainedConfig {
-        port: 8080,
+        port: 8079,
         retries: 3,
         host: "localhost".into(),
     };
@@ -229,7 +229,7 @@ fn test_derive_field_access_constraint_zero_min() {
 #[test]
 fn test_derive_describable_with_constraints() {
     let cfg = ConstrainedConfig {
-        port: 8080,
+        port: 8079,
         retries: 3,
         host: "localhost".into(),
     };
@@ -244,7 +244,7 @@ fn test_derive_describable_with_constraints() {
 #[test]
 fn test_schema_provider() {
     let cfg = ConstrainedConfig {
-        port: 8080,
+        port: 8079,
         retries: 3,
         host: "localhost".into(),
     };
@@ -266,7 +266,7 @@ fn test_schema_provider() {
 #[test]
 fn test_derive_component_blanket_impl() {
     let cfg = ConstrainedConfig {
-        port: 8080,
+        port: 8079,
         retries: 3,
         host: "localhost".into(),
     };

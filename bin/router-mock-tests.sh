@@ -1,7 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE="http://127.0.0.1:8081"
+# Resolve the router URL from the config file (source of truth).
+# Override with ROUTER_BASE_URL env var if set.
+CONFIG_FILE="${1:-env/coral-router.json}"
+if [ -n "${ROUTER_BASE_URL:-}" ]; then
+    BASE="$ROUTER_BASE_URL"
+elif [ -f "$CONFIG_FILE" ]; then
+    BIND_ADDR=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['server']['bind_addr'])" 2>/dev/null || echo "127.0.0.1:8079")
+    BASE="http://$BIND_ADDR"
+else
+    BASE="http://127.0.0.1:8079"
+fi
+
 PASS=0
 FAIL=0
 RED='\033[0;31m'
@@ -78,7 +89,6 @@ else
     FAIL=$((FAIL + 1))
 fi
 
-# ── CORS ─────────────────────────────────────────────────────
 # ── CORS ─────────────────────────────────────────────────────
 resp=$(curl -s -m 5 -I -X GET "$BASE/health" 2>&1)
 if echo "$resp" | grep -q 'Access-Control-Allow-Origin'; then

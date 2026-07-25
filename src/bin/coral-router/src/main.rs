@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use clap::Parser;
 use common_core::config::load_json_or_default;
-use fluent_router::config::RouterConfig;
+use fluent_router::config::{
+    validate_no_self_routing, RouterConfig,
+};
 use fluent_router::logging::init_router_logging;
 use fluent_router::server::RouterServer;
 use fluent_router::testing::{
@@ -17,6 +19,19 @@ struct Args {
     /// Path to the router configuration JSON file.
     #[arg(short, long, default_value = "coral-router.json")]
     config: String,
+
+    /// Override the server bind host (takes priority over config file).
+    #[arg(long)]
+    host: Option<String>,
+
+    /// Override the server bind port (takes priority over config file).
+    #[arg(long)]
+    port: Option<u16>,
+
+    /// Override the mock dispatch base URL (takes priority over config file).
+    /// Only relevant when --mock is also set.
+    #[arg(long)]
+    mock_base_url: Option<String>,
 
     /// Run in mock mode with a transcript file (bypasses the mock.transcript_path
     /// in config if set).
@@ -34,7 +49,56 @@ struct Args {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    let config: RouterConfig = load_json_or_default(args.config.as_ref());
+    let mut config: RouterConfig = load_json_or_default(args.config.as_ref());
+
+    // CLI overrides take priority over config file
+    let bind_addr = match (args.host.as_deref(), args.port) {
+        (Some(host), Some(port)) => format!("{host}:{port}"),
+        (Some(host), None) => {
+            // Preserve port from config or use default-implied
+            let existing_port = config
+                .server
+                .bind_addr
+                .rsplit(':')
+                .next()
+                .and_then(|p| p.parse::<u16>().ok());
+            match existing_port {
+                Some(p) => format!("{host}:{p}"),
+                None => return Err("--host requires --port or a port in config server.bind_addr".into()),
+            }
+        }
+        (None, Some(port)) => {
+            let existing_host = config
+                .server
+                .bind_addr
+                .rsplit(':')
+                .next()
+                .map(|p| {
+                    let host_part = &config.server.bind_addr[..config.server.bind_addr.len() - p.len() - 1];
+                    if host_part.is_empty() { "0.0.0.0" } else { host_part }
+                })
+                .unwrap_or("0.0.0.0");
+            format!("{existing_host}:{port}")
+        }
+        (None, None) => config.server.bind_addr.clone(),
+    };
+    config.server.bind_addr = bind_addr;
+
+    // Apply mock base URL override
+    if let Some(ref url) = args.mock_base_url {
+        config.mock.get_or_insert_with(|| fluent_router::config::MockConfig {
+            transcript_path: String::new(),
+            fail_on_unexpected: true,
+            base_url: url.clone(),
+        }).base_url = url.clone();
+    }
+
+    // Validate no model endpoint points to the router's own address
+    if let Err(e) = validate_no_self_routing(&config.server.bind_addr, &config.models) {
+        tracing::error!(target: "coral-router", error = %e, "self-routing validation failed");
+        eprintln!("FATAL: {e}");
+        std::process::exit(1);
+    }
 
     init_router_logging(&config.logging)?;
 

@@ -216,7 +216,7 @@ mod tests {
 
     fn test_llm_config() -> LlmConfig {
         LlmConfig {
-            api_url: "http://localhost:8080/v1/chat/completions".into(),
+            api_url: "http://router.test:0000/v1/chat/completions".into(),
             model: "test-model".into(),
             think: None,
             timeout_ms: 5000,

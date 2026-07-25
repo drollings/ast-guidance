@@ -155,7 +155,7 @@ use crate::work::WorkContext;
 /// impl_component!(MyUnit);
 ///
 /// // MyUnit is now a Component — can be wrapped in Arc<dyn Component>.
-/// let _comp: std::sync::Arc<dyn Component> = std::sync::Arc::new(MyUnit { port: 8080 });
+/// let _comp: std::sync::Arc<dyn Component> = std::sync::Arc::new(MyUnit { port: 8079 });
 /// ```
 pub trait Component: FieldAccess + Describable + WorkUnit + Send + Sync {
     fn as_any(&self) -> &dyn Any;

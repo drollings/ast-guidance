@@ -314,10 +314,10 @@ mod tests {
     #[test]
     fn test_wasm_component_describe() {
         let mut comp = WasmComponent::new("desc_test", Box::new(MockPlugin));
-        comp.set_field("port", "8080").unwrap();
+        comp.set_field("port", "8079").unwrap();
         let desc = comp.describe();
         assert_eq!(desc["name"], "desc_test");
-        assert_eq!(desc["config"]["port"], "8080");
+        assert_eq!(desc["config"]["port"], "8079");
     }
 
     #[test]

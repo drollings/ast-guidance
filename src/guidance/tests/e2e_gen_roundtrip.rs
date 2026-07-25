@@ -11,7 +11,7 @@ pub fn greet(name: []const u8) []const u8 {
 }
 
 pub const Config = struct {
-    port: u16 = 8080,
+    port: u16 = 8079,
     host: []const u8 = "localhost",
 };
 "#;
