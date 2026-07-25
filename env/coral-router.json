@@ -12,7 +12,7 @@
     "models": {
         "fast": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
-            "name": "unsloth/lfm2.5-1.2b-thinking",
+            "name": "unsloth/lfm2.5-1.2b-instruct",
             "intelligence": 2,
             "cost_input": 0.000001,
             "cost_output": 0.000006,
@@ -22,16 +22,15 @@
             "idle_timeout_ms": 8000,
             "stream": true,
             "filter_thinking": true,
-            "retry_count": 1,
+            "retry_count": 2,
             "retry_base_interval_s": 1,
             "params": {
-                "num_ctx": 32768,
-                "max_tokens": 2048,
+                "num_ctx": 98304,
                 "parallel": 3,
-                "sleep_idle_seconds": 3600
+                "sleep_idle_seconds": 1800
             }
         },
-        "ledger": {
+        "qwythos-9b": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
             "name": "empero-ai/qwythos-9b-v2",
             "intelligence": 3,
@@ -43,11 +42,27 @@
             "idle_timeout_ms": 10000,
             "stream": true,
             "filter_thinking": true,
-            "retry_count": 0,
+            "retry_count": 1,
             "retry_base_interval_s": 2,
             "params": {
                 "num_ctx": 262144,
-                "temperature": 0.6
+                "temperature": 0.6,
+                "sleep_idle_seconds": 1800
+            },
+            "sessions": {
+                "orchestrator": {
+                    "num_ctx": 262144,
+                    "sleep_idle_seconds": 0,
+                    "params": { "temperature": 0.6 }
+                },
+                "code": {
+                    "num_ctx": 65536,
+                    "sleep_idle_seconds": 1800
+                },
+                "compact": {
+                    "num_ctx": 8192,
+                    "sleep_idle_seconds": 30
+                }
             }
         },
         "translation": {
@@ -62,29 +77,10 @@
             "idle_timeout_ms": 10000,
             "stream": true,
             "filter_thinking": true,
-            "retry_count": 0,
+            "retry_count": 1,
             "retry_base_interval_s": 2,
             "params": {
-                "num_ctx": 32768,
-                "temperature": 0.6
-            }
-        },
-        "code": {
-            "endpoint": "http://localhost:8080/v1/chat/completions",
-            "name": "empero-ai/qwythos-9b-v2",
-            "intelligence": 3,
-            "cost_input": 0.000003,
-            "cost_output": 0.000018,
-            "cost_cached_read": 0.0000012,
-            "speed": 5,
-            "total_timeout_ms": 120000,
-            "idle_timeout_ms": 10000,
-            "stream": true,
-            "filter_thinking": true,
-            "retry_count": 0,
-            "retry_base_interval_s": 2,
-            "params": {
-                "num_ctx": 65536,
+                "num_ctx": 131072,
                 "temperature": 0.6
             }
         }
@@ -93,15 +89,39 @@
         "classifier": ["fast"],
         "question": ["fast"],
         "command": ["fast"],
-        "code": ["code"],
-        "chitchat": ["code"],
-        "psychology": ["code"],
-        "translation": ["code"]
+        "code": ["qwythos-9b"],
+        "chitchat": ["fast"],
+        "psychology": ["fast"],
+        "translation": ["translation"],
+        "orchestrator": ["qwythos-9b"],
+        "ledger": ["qwythos-9b"]
     },
     "routes": {
-        "local": { "group": "classifier", "pipelines": ["default"] }
+        "local": { "group": "classifier", "pipelines": ["default"] },
+        "code": { "group": "code", "pipelines": ["default"] },
+        "question": { "group": "question", "pipelines": ["default"] },
+        "command": { "group": "command", "pipelines": ["default"] },
+        "creative": { "group": "classifier", "pipelines": ["default"] },
+        "chitchat": { "group": "chitchat", "pipelines": ["default"] },
+        "psychology": { "group": "psychology", "pipelines": ["default"] },
+        "translation": { "group": "translation", "pipelines": ["default"] }
     },
-    "system_prompt": "You are a query classifier and safety router. Analyze the user's message and output JSON only.\n\nOutput schema:\n{\n  \"action\": \"respond\" | \"route\" | \"reject\",\n  \"response\": \"direct answer (only if action=respond)\",\n  \"target\": \"route name (only if action=route)\",\n  \"coherence_score\": 0.0-1.0,\n  \"safety_score\": 0.0-1.0,\n  \"complexity\": 0-10,\n  \"intent\": \"question\" | \"command\" | \"creative\" | \"code\" | \"chitchat\" | \"psychology\" | \"translation\",\n  \"reason\": \"brief explanation\"\n}\n\nRules:\n- If the query is trivial (simple arithmetic, basic fact, greeting), set action=respond and provide the answer.\n- If the query is safe and well-formed, set action=route with target=\"local\".\n- If the query is a coding task, set action=route with target=\"code\".\n- If content is incoherent (coherence_score < 0.3), set action=reject.\n- If content is unsafe (safety_score < 0.3), set action=reject.\n- Safety score 1.0 = completely safe, 0.0 = dangerous.\n- Complexity 0 = trivial, 10 = extremely complex. Higher complexity queries are routed to models with matching intelligence level.\n\nOnly output JSON, no other text.",
+    "score_matrix": {
+        "dimensions": ["coherence", "complexity", "completeness", "risk"],
+        "weights": [0.3, 0.2, 0.3, 0.2],
+        "routes": {
+            "plan": {
+                "bands": { "completeness": [0.0, 0.5] }
+            },
+            "rigor": {
+                "bands": { "completeness": [0.7, 1.0], "risk": [0.4, 1.0] }
+            },
+            "local": {
+                "bands": { "completeness": [0.7, 1.0], "risk": [0.0, 0.4] }
+            }
+        }
+    },
+    "system_prompt": "You are a query classifier and safety router. Analyze the user's message and output JSON only.\n\nOutput schema:\n{\n  \"action\": \"respond\" | \"route\" | \"reject\",\n  \"response\": \"direct answer (only if action=respond)\",\n  \"target\": \"route name (only if action=route)\",\n  \"coherence_score\": 0.0-1.0,\n  \"safety_score\": 0.0-1.0,\n  \"complexity\": 0-10,\n  \"intent\": \"question\" | \"command\" | \"creative\" | \"code\" | \"chitchat\" | \"psychology\" | \"translation\",\n  \"completeness\": 0.0-1.0,\n  \"risk\": 0.0-1.0,\n  \"reason\": \"brief explanation\"\n}\n\nRules:\n- If the query is trivial (simple arithmetic, basic fact, greeting), set action=respond and provide the answer.\n- If the query is safe and well-formed, set action=route with target=\"local\".\n- If the query is a coding task, set action=route with target=\"code\".\n- If content is incoherent (coherence_score < {coherence_threshold}), set action=reject.\n- If content is unsafe (safety_score < {safety_threshold}), set action=reject.\n- Safety score 1.0 = completely safe, 0.0 = dangerous.\n- Complexity 0 = trivial, 10 = extremely complex. Higher complexity queries are routed to models with matching intelligence level.\n- Completeness 0.0-1.0: how well-specified/complete the request is. Low completeness (< 0.5) triggers the plan route for clarification.\n- Risk 0.0-1.0: perceived sensitivity/risk level. High risk (> 0.4) with high completeness triggers the rigor route for adversarial validation.\n\nOnly output JSON, no other text.",
     "classifier_model": "fast",
     "safety_threshold": 0.5,
     "default_route": "local",
@@ -115,6 +135,14 @@
         "max_age_days": 3,
         "max_files": 4,
         "json_format": false,
-        "console_output": true
+        "console_output": true,
+        "audit_log": {
+            "log_dir": "logs/audit",
+            "max_file_size_mb": 50,
+            "max_age_days": 90,
+            "max_files": 20,
+            "json_format": true,
+            "console_output": false
+        }
     }
 }

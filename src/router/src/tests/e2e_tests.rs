@@ -67,7 +67,7 @@ fn default_provider() -> TranscriptProvider {
 
 fn make_test_config() -> RouterConfig {
     match serde_json::from_str::<RouterConfig>(r#"{
-        "pipelines": {"default": {"deterministic_prefilter": true, "classifier": true}},
+        "pipelines": {"default": {"deterministic_prefilter": true, "classifier": true, "blacklist": "env/pii-patterns.json"}},
         "models": {"fast": {"endpoint": "http://upstream.test:8080/v1/chat/completions", "name": "fast", "intelligence": 1, "cost_input": 0.000001, "cost_output": 0.000006, "cost_cached_read": 0.0000004, "speed": 10, "total_timeout_ms": 5000, "idle_timeout_ms": 2000, "stream": false, "filter_thinking": false, "retry_count": 0, "retry_base_interval_s": 1}},
         "model_groups": {"fast": ["fast"]},
         "routes": {"fast": {"group": "fast", "pipelines": ["default"]}},
@@ -238,20 +238,14 @@ fn test_e2e_pii_flagging_detected() {
     let request = make_request("My email is user@example.com and SSN is 123-45-6789");
     let result = route(&pipeline, &request).expect("pipeline should complete");
 
-    assert!(result.rejected, "should be rejected for PII");
+    // PII patterns are scoped to frontier_bound; at stage 1 we don't know
+    // the destination, so PII passes through without flagging.
+    assert!(!result.rejected, "PII should not be rejected at stage 1");
 
     let stage1 = &result.decisions[0];
     assert_eq!(stage1.stage, PipelineStage::DeterministicPreFilter);
-    assert_eq!(stage1.verdict, StageVerdict::Rejected);
-
-    let pii_classes = stage1
-        .metadata
-        .get("pii_classes")
-        .and_then(|v| v.as_array())
-        .expect("should have pii_classes array");
-    let detected: Vec<&str> = pii_classes.iter().filter_map(|c| c.as_str()).collect();
-    assert!(detected.contains(&"email"), "email should be detected, got: {:?}", detected);
-    assert!(detected.contains(&"ssn"), "ssn should be detected, got: {:?}", detected);
+    assert_eq!(stage1.verdict, StageVerdict::Passed);
+    assert!(stage1.reason.contains("no command"), "should pass through: {}", stage1.reason);
 }
 
 #[test]
@@ -263,7 +257,7 @@ fn test_e2e_pii_not_flagged_for_clean_input() {
     let stage1 = &result.decisions[0];
     assert_eq!(stage1.stage, PipelineStage::DeterministicPreFilter);
     let reason = &stage1.reason;
-    assert!(reason.contains("no PII"), "should indicate no PII, got: {reason}");
+    assert!(reason.contains("no command") || reason.contains("no PII"), "should indicate no PII, got: {reason}");
 }
 
 // ── Streaming Response Support ──────────────────────────────────────────

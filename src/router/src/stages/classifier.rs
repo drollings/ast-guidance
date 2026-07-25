@@ -15,6 +15,7 @@ use guidance_llm::ChatMessage;
 
 use crate::config::{ClassifierOutput, RoutingConfig};
 use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
+use crate::score_matrix::ScoreMatrix;
 use crate::stages::common::extract_user_message;
 
 pub struct ClassifierStage {
@@ -22,6 +23,7 @@ pub struct ClassifierStage {
     client: Arc<dyn ChatBackend>,
     routing_config: RoutingConfig,
     coherence_threshold: f64,
+    score_matrix: Option<ScoreMatrix>,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
@@ -31,15 +33,23 @@ impl ClassifierStage {
         client: Arc<dyn ChatBackend>,
         routing_config: RoutingConfig,
         coherence_threshold: f64,
+        score_matrix: Option<ScoreMatrix>,
     ) -> Self {
         Self {
             name: ArcIntern::from("pipeline.stage2.classifier"),
             client,
             routing_config,
             coherence_threshold,
+            score_matrix,
             depends: vec![ArcIntern::from("pipeline.stage1.output")],
             provides: vec![ArcIntern::from("pipeline.stage2.output")],
         }
+    }
+
+    fn build_system_prompt(&self) -> String {
+        self.routing_config.system_prompt
+            .replace("{coherence_threshold}", &format!("{:.2}", self.coherence_threshold))
+            .replace("{safety_threshold}", &format!("{:.2}", self.routing_config.safety_threshold))
     }
 
     fn build_routing_target_json(
@@ -88,10 +98,10 @@ impl WorkUnit for ClassifierStage {
             .metadata
             .get("classifier_system_prompt")
             .and_then(|v| match v {
-                MetadataValue::String(s) => Some(s.as_str()),
+                MetadataValue::String(s) => Some(s.clone()),
                 _ => None,
             })
-            .unwrap_or(&self.routing_config.system_prompt);
+            .unwrap_or_else(|| self.build_system_prompt());
 
         let messages = vec![
             ChatMessage {
@@ -136,6 +146,8 @@ impl WorkUnit for ClassifierStage {
                             complexity: None,
                             intent: None,
                             reason: format!("parse error: {e}"),
+                            completeness: None,
+                            risk: None,
                         }, false)
                     }
                 }
@@ -151,6 +163,8 @@ impl WorkUnit for ClassifierStage {
                     complexity: None,
                     intent: None,
                     reason: format!("LLM error: {e}"),
+                    completeness: None,
+                    risk: None,
                 }, false)
             }
         };
@@ -239,15 +253,46 @@ impl WorkUnit for ClassifierStage {
             }
         };
 
+        // ── Score-matrix resolution (MOA_ROUTER_SPEC §2.2) ──
+        let scored_routes = self.score_matrix.as_ref().map(|sm| {
+            let scores = std::collections::HashMap::from([
+                ("coherence".into(), output.coherence_score),
+                ("complexity".into(), f64::from(output.complexity.unwrap_or(5)) / 10.0),
+                ("completeness".into(), output.completeness.unwrap_or(0.5)),
+                ("risk".into(), output.risk.unwrap_or(0.0)),
+            ]);
+            sm.resolve(&scores)
+        });
+
         let mut metadata = serde_json::json!({
             "coherence_score": output.coherence_score,
             "safety_score": output.safety_score,
             "complexity": output.complexity,
+            "completeness": output.completeness,
+            "risk": output.risk,
             "intent": output.intent,
             "action": output.action,
             "reason": output.reason,
             "fallback": !ok,
         });
+
+        if let Some(ref routes) = scored_routes {
+            if let Some(top) = routes.first() {
+                metadata["scored_route"] = serde_json::json!({
+                    "route": top.route_name,
+                    "score": top.weighted_score,
+                    "score_vector": top.score_vector.iter().map(|(d, s)| {
+                        serde_json::json!({"dimension": d, "score": s})
+                    }).collect::<Vec<_>>(),
+                });
+            }
+            metadata["scored_routes"] = serde_json::Value::Array(
+                routes.iter().map(|r| serde_json::json!({
+                    "route": r.route_name,
+                    "score": r.weighted_score,
+                })).collect(),
+            );
+        }
 
         if let Some(ref resp) = output.response {
             metadata["response"] = serde_json::Value::String(resp.clone());

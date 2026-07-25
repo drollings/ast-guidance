@@ -4,9 +4,69 @@ mod tests {
 
     use fluent_wvr::prelude::*;
 
+    use crate::config::{ConfidenceGate, FilterAction, FilterOutcome, FilterScope, PatternEntry, RejectPatterns};
     use crate::pipeline::PipelineOrchestrator;
     use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
     use crate::stages::deterministic::DeterministicPreFilter;
+
+    fn make_pii_filter() -> DeterministicPreFilter {
+        let patterns = RejectPatterns {
+            patterns: vec![
+                PatternEntry {
+                    name: "ssn".into(),
+                    outcome: FilterOutcome::OutputFilter,
+                    filter_action: Some(FilterAction::Redact),
+                    confidence_gate: ConfidenceGate::None,
+                    scope: vec![FilterScope::Any],
+                    http_code: 422,
+                    error_message: Some("SSN detected".into()),
+                    regexes: vec![r"\b\d{3}-\d{2}-\d{4}\b".into()],
+                },
+                PatternEntry {
+                    name: "card_number".into(),
+                    outcome: FilterOutcome::OutputFilter,
+                    filter_action: Some(FilterAction::Redact),
+                    confidence_gate: ConfidenceGate::LuhnValid,
+                    scope: vec![FilterScope::Any],
+                    http_code: 422,
+                    error_message: Some("Credit card detected".into()),
+                    regexes: vec![r"\b(?:\d[ -]*?){13,19}\b".into()],
+                },
+                PatternEntry {
+                    name: "email".into(),
+                    outcome: FilterOutcome::OutputFilter,
+                    filter_action: Some(FilterAction::Anonymize),
+                    confidence_gate: ConfidenceGate::None,
+                    scope: vec![FilterScope::Any],
+                    http_code: 422,
+                    error_message: Some("Email detected".into()),
+                    regexes: vec![r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b".into()],
+                },
+                PatternEntry {
+                    name: "phone".into(),
+                    outcome: FilterOutcome::OutputFilter,
+                    filter_action: Some(FilterAction::Anonymize),
+                    confidence_gate: ConfidenceGate::None,
+                    scope: vec![FilterScope::Any],
+                    http_code: 422,
+                    error_message: Some("Phone detected".into()),
+                    regexes: vec![r"\b(?:\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b".into()],
+                },
+                PatternEntry {
+                    name: "api_key".into(),
+                    outcome: FilterOutcome::HardReject,
+                    filter_action: None,
+                    confidence_gate: ConfidenceGate::None,
+                    scope: vec![FilterScope::Any],
+                    http_code: 422,
+                    error_message: Some("API key detected".into()),
+                    regexes: vec![r"(?i)(?:api[_-]?key|secret|token|password)\s*[:=]\s*[^\s]{8,}".into()],
+                },
+            ],
+            commands: None,
+        };
+        DeterministicPreFilter::from_config(&patterns)
+    }
 
     fn make_ctx(user_text: &str) -> WorkContext {
         let request_json = serde_json::json!({
@@ -103,70 +163,84 @@ mod tests {
 
     #[test]
     fn test_deterministic_pii_email_detected() {
-        let filter = DeterministicPreFilter::new();
+        let filter = make_pii_filter();
         let ctx = make_ctx("My email is user@example.com");
         let output = filter.execute(&ctx).expect("execute");
         let decision: StageDecision = output.data_as().expect("data_as");
-        assert_eq!(decision.verdict, StageVerdict::Rejected);
-        assert!(decision.reason.contains("email"));
-        let pii_classes = decision
+        assert_eq!(decision.verdict, StageVerdict::Passed);
+        assert_eq!(output.message, "output_filter_flagged");
+        let pii_filter = decision
             .metadata
-            .get("pii_classes")
-            .and_then(|v| v.as_array())
-            .expect("pii_classes array");
-        assert!(pii_classes.iter().any(|c| c.as_str() == Some("email")));
+            .get("pii_filter")
+            .expect("pii_filter metadata");
+        assert_eq!(pii_filter["pattern"], "email");
     }
 
     #[test]
     fn test_deterministic_pii_ssn_detected() {
-        let filter = DeterministicPreFilter::new();
+        let filter = make_pii_filter();
         let ctx = make_ctx("My SSN is 123-45-6789");
         let output = filter.execute(&ctx).expect("execute");
         let decision: StageDecision = output.data_as().expect("data_as");
-        assert_eq!(decision.verdict, StageVerdict::Rejected);
-        assert!(decision.reason.contains("ssn"));
+        assert_eq!(decision.verdict, StageVerdict::Passed);
+        let pii_filter = decision
+            .metadata
+            .get("pii_filter")
+            .expect("pii_filter metadata");
+        assert_eq!(pii_filter["pattern"], "ssn");
     }
 
     #[test]
     fn test_deterministic_pii_card_number_detected() {
-        let filter = DeterministicPreFilter::new();
+        let filter = make_pii_filter();
         let ctx = make_ctx("card: 4111-1111-1111-1111");
         let output = filter.execute(&ctx).expect("execute");
         let decision: StageDecision = output.data_as().expect("data_as");
-        let pii = decision
+        assert_eq!(decision.verdict, StageVerdict::Passed);
+        let pii_filter = decision
             .metadata
-            .get("pii_classes")
-            .and_then(|v| v.as_array())
-            .expect("pii_classes array");
-        assert!(pii.iter().any(|c| c.as_str() == Some("card_number")));
+            .get("pii_filter")
+            .expect("pii_filter metadata");
+        assert_eq!(pii_filter["pattern"], "card_number");
     }
 
     #[test]
     fn test_deterministic_pii_phone_detected() {
-        let filter = DeterministicPreFilter::new();
+        let filter = make_pii_filter();
         let ctx = make_ctx("Call me at (555) 123-4567");
         let output = filter.execute(&ctx).expect("execute");
         let decision: StageDecision = output.data_as().expect("data_as");
-        let pii = decision
+        assert_eq!(decision.verdict, StageVerdict::Passed);
+        let pii_filter = decision
             .metadata
-            .get("pii_classes")
-            .and_then(|v| v.as_array())
-            .expect("pii_classes array");
-        assert!(pii.iter().any(|c| c.as_str() == Some("phone")));
+            .get("pii_filter")
+            .expect("pii_filter metadata");
+        assert_eq!(pii_filter["pattern"], "phone");
     }
 
     #[test]
-    fn test_deterministic_multiple_pii_detected() {
-        let filter = DeterministicPreFilter::new();
+    fn test_deterministic_multiple_pii_first_match_wins() {
+        let filter = make_pii_filter();
         let ctx = make_ctx("My email is user@example.com and my SSN is 123-45-6789");
         let output = filter.execute(&ctx).expect("execute");
         let decision: StageDecision = output.data_as().expect("data_as");
-        let pii = decision
+        assert_eq!(decision.verdict, StageVerdict::Passed);
+        let pii_filter = decision
             .metadata
-            .get("pii_classes")
-            .and_then(|v| v.as_array())
-            .expect("pii_classes array");
-        assert!(pii.len() >= 2);
+            .get("pii_filter")
+            .expect("pii_filter metadata");
+        // First filter in insertion order that matches is "ssn" (position 0)
+        assert_eq!(pii_filter["pattern"], "ssn", "ssn filter is first in insertion order");
+    }
+
+    #[test]
+    fn test_deterministic_prose_with_api_key_rejected() {
+        let filter = make_pii_filter();
+        let ctx = make_ctx("My token=sk-abc123def456ghi789");
+        let output = filter.execute(&ctx).expect("execute");
+        let decision: StageDecision = output.data_as().expect("data_as");
+        assert_eq!(decision.verdict, StageVerdict::Rejected);
+        assert!(decision.reason.contains("api_key"));
     }
 
     // ── PipelineOrchestrator ─────────────────────────────────────────────────

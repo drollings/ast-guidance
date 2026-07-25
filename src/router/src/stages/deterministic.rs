@@ -1,13 +1,12 @@
-//! Stage 1: DeterministicPreFilter — regex-based blacklist and command dispatch.
-//! No model calls. Configurable via `RejectPatterns`.
-
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use fluent_wvr::prelude::*;
 use regex::Regex;
 
-use crate::config::{PatternEntry, RejectPatterns};
+use crate::filters::{DeterministicFilterEngine, FilterContext, FilterDecision};
+use crate::filters::regex_filter::RegexFilter;
+use crate::config::RejectPatterns;
 use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
 use crate::stages::common::extract_user_message;
 
@@ -19,22 +18,13 @@ type CommandHandler = Arc<dyn Fn(&[String]) -> Result<String, String> + Send + S
 pub struct DeterministicPreFilter {
     name: ArcIntern<str>,
     command_registry: HashMap<String, CommandHandler>,
-    patterns: Vec<CachedPatternEntry>,
+    filter_engine: DeterministicFilterEngine,
     commands_enabled: bool,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
 
-struct CachedPatternEntry {
-    name: String,
-    http_code: u16,
-    error_message: Option<String>,
-    patterns: Vec<Regex>,
-}
-
 impl DeterministicPreFilter {
-    /// Built-in command handlers that are always available
-    /// (help, stats, checkpoint).
     fn builtin_commands() -> HashMap<String, CommandHandler> {
         let mut cmds: HashMap<String, CommandHandler> = HashMap::new();
         cmds.insert(
@@ -59,33 +49,12 @@ impl DeterministicPreFilter {
     }
 
     pub fn new() -> Self {
-        let patterns: Vec<CachedPatternEntry> = vec![
-            ("ssn", vec![r"\b\d{3}-\d{2}-\d{4}\b"]),
-            ("card_number", vec![r"\b(?:\d[ -]*?){13,19}\b"]),
-            ("email", vec![r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"]),
-            ("phone", vec![r"\b(?:\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"]),
-        ]
-        .into_iter()
-        .map(|(name, regexes)| {
-            let re: Vec<Regex> = regexes
-                .iter()
-                .filter_map(|r| Regex::new(r).ok())
-                .collect();
-            CachedPatternEntry {
-                name: name.into(),
-                http_code: 400,
-                error_message: Some("Request contains sensitive personal information".into()),
-                patterns: re,
-            }
-        })
-        .collect();
-
         let command_registry = Self::builtin_commands();
 
         Self {
             name: ArcIntern::from("pipeline.stage1.deterministic"),
             command_registry,
-            patterns,
+            filter_engine: DeterministicFilterEngine::new(),
             commands_enabled: true,
             depends: vec![],
             provides: vec![ArcIntern::from("pipeline.stage1.output")],
@@ -93,24 +62,13 @@ impl DeterministicPreFilter {
     }
 
     pub fn from_config(config: &RejectPatterns) -> Self {
-        let mut patterns: Vec<CachedPatternEntry> = Vec::new();
+        let mut engine = DeterministicFilterEngine::new();
         for entry in &config.patterns {
-            let re: Vec<Regex> = entry
-                .regexes
-                .iter()
-                .filter_map(|r| Regex::new(r).ok())
-                .collect();
-            if !re.is_empty() {
-                patterns.push(CachedPatternEntry {
-                    name: entry.name.clone(),
-                    http_code: entry.http_code,
-                    error_message: entry.error_message.clone(),
-                    patterns: re,
-                });
+            if let Some(filter) = RegexFilter::from_entry(entry) {
+                engine.add_filter(Box::new(filter));
             }
         }
 
-        // Merge config-provided commands with built-in defaults
         let mut command_registry = Self::builtin_commands();
         if let Some(ref cmd) = config.commands {
             for (name, handler) in build_command_registry(&cmd.handlers) {
@@ -121,7 +79,7 @@ impl DeterministicPreFilter {
         Self {
             name: ArcIntern::from("pipeline.stage1.deterministic"),
             command_registry,
-            patterns,
+            filter_engine: engine,
             commands_enabled: true,
             depends: vec![],
             provides: vec![ArcIntern::from("pipeline.stage1.output")],
@@ -136,26 +94,6 @@ impl DeterministicPreFilter {
     ) -> Self {
         self.command_registry.insert(name.into(), handler);
         self.commands_enabled = true;
-        self
-    }
-
-    #[must_use]
-    pub fn with_blacklist(mut self, entries: Vec<PatternEntry>) -> Self {
-        for entry in entries {
-            let re: Vec<Regex> = entry
-                .regexes
-                .iter()
-                .filter_map(|r| Regex::new(r).ok())
-                .collect();
-            if !re.is_empty() {
-                self.patterns.push(CachedPatternEntry {
-                    name: entry.name,
-                    http_code: entry.http_code,
-                    error_message: entry.error_message,
-                    patterns: re,
-                });
-            }
-        }
         self
     }
 }
@@ -249,30 +187,26 @@ impl WorkUnit for DeterministicPreFilter {
                     }
                 }
 
-                let matched = self.patterns.iter().find(|entry| {
-                    entry.patterns.iter().any(|re| re.is_match(trimmed))
-                });
-
-                if let Some(entry) = matched {
-                    tracing::info!(target: "router.pipeline.stage1", pattern = %entry.name, "blacklist pattern matched");
-                    let msg = entry
-                        .error_message
-                        .clone()
-                        .unwrap_or_else(|| format!("blocked by '{}'", entry.name));
-                    return WorkOutput::typed(
-                        "rejected",
-                        &StageDecision {
-                            stage: PipelineStage::DeterministicPreFilter,
-                            verdict: StageVerdict::Rejected,
-                            score: Some(1.0),
-                            reason: format!("pattern match '{}': {msg}", entry.name),
-                            latency_ms: 0,
-                            metadata: serde_json::json!({
-                                "blacklist": entry.name,
-                                "http_code": entry.http_code
-                            }),
-                        },
-                    );
+                // Check filter engine for commands that matched pattern
+                let filter_ctx = FilterContext {
+                    user_message: trimmed.to_string(),
+                    is_frontier_bound: false,
+                };
+                if let Some(decision) = self.filter_engine.evaluate(&filter_ctx) {
+                    if let FilterDecision::HardReject { pattern, message } = decision {
+                        tracing::info!(target: "router.pipeline.stage1", pattern = %pattern, "hard reject on command");
+                        return WorkOutput::typed(
+                            "rejected",
+                            &StageDecision {
+                                stage: PipelineStage::DeterministicPreFilter,
+                                verdict: StageVerdict::Rejected,
+                                score: Some(1.0),
+                                reason: format!("pattern match '{pattern}': {message}"),
+                                latency_ms: 0,
+                                metadata: serde_json::json!({ "blacklist": pattern, "http_code": 422 }),
+                            },
+                        );
+                    }
                 }
 
                 tracing::info!(target: "router.pipeline.stage1", command = %cmd, "unknown command rejected");
@@ -290,26 +224,50 @@ impl WorkUnit for DeterministicPreFilter {
             }
         }
 
-        let mut pii_found: Vec<String> = Vec::new();
-        for entry in &self.patterns {
-            if entry.patterns.iter().any(|re| re.is_match(&input)) {
-                pii_found.push(entry.name.clone());
+        // Run filter engine on the input
+        let filter_ctx = FilterContext {
+            user_message: input.clone(),
+            is_frontier_bound: false,
+        };
+        if let Some(decision) = self.filter_engine.evaluate(&filter_ctx) {
+            match decision {
+                FilterDecision::HardReject { pattern, message } => {
+                    tracing::info!(target: "router.pipeline.stage1", pattern = %pattern, "hard reject");
+                    return WorkOutput::typed(
+                        "rejected",
+                        &StageDecision {
+                            stage: PipelineStage::DeterministicPreFilter,
+                            verdict: StageVerdict::Rejected,
+                            score: Some(1.0),
+                            reason: format!("pattern match '{pattern}': {message}"),
+                            latency_ms: 0,
+                            metadata: serde_json::json!({ "blacklist": pattern, "http_code": 422 }),
+                        },
+                    );
+                }
+                FilterDecision::OutputFilter { action, matched_pattern, codewords, matches } => {
+                    tracing::info!(target: "router.pipeline.stage1", pattern = %matched_pattern, action = ?action, match_count = matches.len(), "output_filter flagged");
+                    return WorkOutput::typed(
+                        "output_filter_flagged",
+                        &StageDecision {
+                            stage: PipelineStage::DeterministicPreFilter,
+                            verdict: StageVerdict::Passed,
+                            score: Some(1.0),
+                            reason: format!("PII flagged for output filtering: {matched_pattern}"),
+                            latency_ms: 0,
+                            metadata: serde_json::json!({
+                                "pii_filter": {
+                                    "pattern": matched_pattern,
+                                    "action": action,
+                                    "codewords": codewords,
+                                    "matches": matches,
+                                }
+                            }),
+                        },
+                    );
+                }
+                FilterDecision::SoftRedirect { .. } => {}
             }
-        }
-
-        if !pii_found.is_empty() {
-            tracing::info!(target: "router.pipeline.stage1", pii = ?pii_found, "PII detected, rejecting");
-            return WorkOutput::typed(
-                "rejected",
-                &StageDecision {
-                    stage: PipelineStage::DeterministicPreFilter,
-                    verdict: StageVerdict::Rejected,
-                    score: Some(1.0),
-                    reason: format!("blocked: patterns: {}", pii_found.join(", ")),
-                    latency_ms: 0,
-                    metadata: serde_json::json!({ "pii_classes": pii_found }),
-                },
-            );
         }
 
         tracing::debug!(target: "router.pipeline.stage1", "passed — no command, no PII");

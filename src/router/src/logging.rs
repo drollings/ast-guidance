@@ -7,6 +7,8 @@
 
 use std::path::PathBuf;
 
+use crate::config::AuditLogConfig;
+
 /// Configuration for router logging output.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LoggingConfig {
@@ -33,6 +35,10 @@ pub struct LoggingConfig {
     /// Also emit log records to stderr for development use.
     #[serde(default = "default_true")]
     pub console_output: bool,
+
+    /// Separate audit log stream with durable retention (MOA_ROUTER_SPEC §10).
+    #[serde(default)]
+    pub audit_log: Option<AuditLogConfig>,
 }
 
 impl Default for LoggingConfig {
@@ -44,6 +50,7 @@ impl Default for LoggingConfig {
             max_files: default_max_files(),
             json_format: false,
             console_output: true,
+            audit_log: None,
         }
     }
 }
@@ -64,9 +71,6 @@ pub fn init_router_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::er
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::Layer;
 
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
-
     std::fs::create_dir_all(&config.log_dir)
         .map_err(|e| format!("failed to create log directory '{}': {e}", config.log_dir.display()))?;
 
@@ -80,56 +84,126 @@ pub fn init_router_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::er
 
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
-    if config.json_format {
-        let file_layer = tracing_subscriber::fmt::layer()
-            .json()
-            .with_writer(non_blocking)
-            .with_filter(env_filter);
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
 
-        if config.console_output {
-            let console_layer = tracing_subscriber::fmt::layer()
-                .json()
-                .with_writer(std::io::stderr)
-                .with_filter(tracing_subscriber::filter::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::filter::EnvFilter::new("info")));
+    // ── Build audit layer (if configured) ─────────────────────────────
+    // The audit writer must outlive the process; use a thread-local
+    // approach: leak the guard so the non-blocking writer lives forever.
+    struct AuditResources {
+        _guard: tracing_appender::non_blocking::WorkerGuard,
+        appender: tracing_appender::non_blocking::NonBlocking,
+    }
 
-            tracing_subscriber::registry()
-                .with(file_layer)
-                .with(console_layer)
-                .init();
-        } else {
-            tracing_subscriber::registry()
-                .with(file_layer)
-                .init();
-        }
-    } else {
-        let file_layer = tracing_subscriber::fmt::layer()
-            .with_writer(non_blocking)
-            .with_filter(env_filter);
+    let audit_resources: Option<AuditResources> = config.audit_log.as_ref().map(|audit_cfg| {
+        std::fs::create_dir_all(&audit_cfg.log_dir)
+            .map_err(|e| format!("audit log dir '{}': {e}", audit_cfg.log_dir.display()))?;
 
-        if config.console_output {
-            let console_layer = tracing_subscriber::fmt::layer()
-                .with_writer(std::io::stderr)
-                .with_filter(tracing_subscriber::filter::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::filter::EnvFilter::new("info")));
+        let appender = tracing_appender::rolling::RollingFileAppender::builder()
+            .rotation(tracing_appender::rolling::Rotation::NEVER)
+            .filename_prefix("audit")
+            .filename_suffix("log")
+            .max_log_files(audit_cfg.max_files)
+            .build(&audit_cfg.log_dir)
+            .map_err(|e| format!("audit file appender: {e}"))?;
 
-            tracing_subscriber::registry()
-                .with(file_layer)
-                .with(console_layer)
-                .init();
-        } else {
-            tracing_subscriber::registry()
-                .with(file_layer)
-                .init();
+        let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+        Result::<_, Box<dyn std::error::Error>>::Ok(AuditResources { _guard: guard, appender: non_blocking })
+    }).transpose()?;
+
+    // ── Build per-branch subscribers ──────────────────────────────────
+    // Use a nested helper struct with a blanket impl to erase concrete types.
+    struct SubBuilder {
+        json: bool,
+        console: bool,
+        non_blocking: tracing_appender::non_blocking::NonBlocking,
+        guard: tracing_appender::non_blocking::WorkerGuard,
+        env_filter: EnvFilter,
+        audit: Option<AuditResources>,
+    }
+
+    impl SubBuilder {
+        fn build(self) {
+            let json = self.json;
+            let has_console = self.console;
+            let nb = self.non_blocking;
+            let env_filter = self.env_filter;
+
+            // Each arm has a unique concrete type. We match all combos.
+            match (json, has_console, self.audit.is_some()) {
+                (true, true, true) => {
+                    let audit = self.audit.unwrap();
+                    tracing_subscriber::registry()
+                        .with(tracing_subscriber::fmt::layer().json().with_writer(nb).with_filter(env_filter))
+                        .with(tracing_subscriber::fmt::layer().json().with_writer(std::io::stderr).with_filter(
+                            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))))
+                        .with(tracing_subscriber::fmt::layer().json().with_writer(audit.appender).with_filter(EnvFilter::new("router.audit=info")))
+                        .init();
+                }
+                (true, true, false) => {
+                    tracing_subscriber::registry()
+                        .with(tracing_subscriber::fmt::layer().json().with_writer(nb).with_filter(env_filter))
+                        .with(tracing_subscriber::fmt::layer().json().with_writer(std::io::stderr).with_filter(
+                            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))))
+                        .init();
+                }
+                (true, false, true) => {
+                    let audit = self.audit.unwrap();
+                    tracing_subscriber::registry()
+                        .with(tracing_subscriber::fmt::layer().json().with_writer(nb).with_filter(env_filter))
+                        .with(tracing_subscriber::fmt::layer().json().with_writer(audit.appender).with_filter(EnvFilter::new("router.audit=info")))
+                        .init();
+                }
+                (true, false, false) => {
+                    tracing_subscriber::registry()
+                        .with(tracing_subscriber::fmt::layer().json().with_writer(nb).with_filter(env_filter))
+                        .init();
+                }
+                (false, true, true) => {
+                    let audit = self.audit.unwrap();
+                    tracing_subscriber::registry()
+                        .with(tracing_subscriber::fmt::layer().with_writer(nb).with_filter(env_filter))
+                        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_filter(
+                            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))))
+                        .with(tracing_subscriber::fmt::layer().json().with_writer(audit.appender).with_filter(EnvFilter::new("router.audit=info")))
+                        .init();
+                }
+                (false, true, false) => {
+                    tracing_subscriber::registry()
+                        .with(tracing_subscriber::fmt::layer().with_writer(nb).with_filter(env_filter))
+                        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_filter(
+                            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))))
+                        .init();
+                }
+                (false, false, true) => {
+                    let audit = self.audit.unwrap();
+                    tracing_subscriber::registry()
+                        .with(tracing_subscriber::fmt::layer().with_writer(nb).with_filter(env_filter))
+                        .with(tracing_subscriber::fmt::layer().json().with_writer(audit.appender).with_filter(EnvFilter::new("router.audit=info")))
+                        .init();
+                }
+                (false, false, false) => {
+                    tracing_subscriber::registry()
+                        .with(tracing_subscriber::fmt::layer().with_writer(nb).with_filter(env_filter))
+                        .init();
+                }
+            }
+
+            std::mem::forget(self.guard);
         }
     }
 
-    // Leak the WorkerGuard so the non-blocking writer lives for the
-    // process lifetime. This is the standard pattern for daemon-style
-    // processes that never return from the logging initializer.
-    std::mem::forget(guard);
+    SubBuilder {
+        json: config.json_format,
+        console: config.console_output,
+        non_blocking,
+        guard,
+        env_filter,
+        audit: audit_resources,
+    }
+    .build();
 
-    tracing::info!(target: "router.logging", log_dir = %config.log_dir.display(), "router logging initialized");
+    tracing::info!(target: "router.logging", log_dir = %config.log_dir.display(), audit = config.audit_log.is_some(), "router logging initialized");
 
     Ok(())
 }

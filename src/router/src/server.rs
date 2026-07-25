@@ -16,6 +16,8 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
 use crate::config::{ModelEntry, RouteRef, ServerConfig};
+use crate::http_class::HttpClass;
+use crate::ledger::ContentNodeLedger;
 use crate::normalize;
 use crate::streaming::strip_thinking_blocks;
 use crate::pipeline::PipelineOrchestrator;
@@ -41,6 +43,7 @@ pub struct RouterServer {
     max_payload: usize,
     classifier_url: Option<String>,
     mock_dispatch: Option<Arc<MockDispatchContext>>,
+    ledger: Option<Arc<ContentNodeLedger>>,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
@@ -68,9 +71,16 @@ impl RouterServer {
             max_payload: config.max_payload,
             classifier_url,
             mock_dispatch: None,
+            ledger: None,
             depends: vec![],
             provides: vec![ArcIntern::from("http.endpoint")],
         }
+    }
+
+    #[must_use]
+    pub fn with_ledger(mut self, ledger: Arc<ContentNodeLedger>) -> Self {
+        self.ledger = Some(ledger);
+        self
     }
 
     #[must_use]
@@ -89,6 +99,7 @@ impl RouterServer {
             target: "router.server",
             bind_addr = %self.bind_addr,
             has_mock = self.mock_dispatch.is_some(),
+            has_ledger = self.ledger.is_some(),
             "serving HTTP"
         );
         run_http(
@@ -99,6 +110,7 @@ impl RouterServer {
             self.max_payload,
             self.classifier_url.clone(),
             self.mock_dispatch.clone(),
+            self.ledger.clone(),
         )
         .await
     }
@@ -125,12 +137,13 @@ impl WorkUnit for RouterServer {
         let max_payload = self.max_payload;
         let classifier_url = self.classifier_url.clone();
         let mock_dispatch = self.mock_dispatch.clone();
+        let ledger = self.ledger.clone();
 
         let rt = ctx.rt.clone();
 
         let _handle = rt.spawn(Box::pin(async move {
             if let Err(e) =
-                run_http(pipelines, routes, models, &bind_addr, max_payload, classifier_url, mock_dispatch)
+                run_http(pipelines, routes, models, &bind_addr, max_payload, classifier_url, mock_dispatch, ledger)
                     .await
             {
                 tracing::error!(target: "router.server", error = %e, "HTTP server error");
@@ -182,6 +195,7 @@ async fn run_http(
     max_payload: usize,
     classifier_url: Option<String>,
     mock_dispatch: Option<Arc<MockDispatchContext>>,
+    ledger: Option<Arc<ContentNodeLedger>>,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(bind_addr)
         .await
@@ -212,6 +226,7 @@ async fn run_http(
         let stats = stats.clone();
         let classifier_url = classifier_url.clone();
         let mock_dispatch = mock_dispatch.clone();
+        let ledger = ledger.clone();
         let http_client = http_client.clone();
 
         tokio::spawn(async move {
@@ -227,6 +242,7 @@ async fn run_http(
                     max_payload,
                     classifier_url.clone(),
                     mock_dispatch.clone(),
+                    ledger.clone(),
                     http_client.clone(),
                 )
             });
@@ -254,6 +270,7 @@ async fn handle_request(
     max_payload: usize,
     classifier_url: Option<String>,
     mock_dispatch: Option<Arc<MockDispatchContext>>,
+    ledger: Option<Arc<ContentNodeLedger>>,
     http_client: Arc<reqwest::Client>,
 ) -> Result<HyperResponse, Infallible> {
     let method = req.method().clone();
@@ -283,7 +300,7 @@ async fn handle_request(
         ("POST", "/v1/chat/completions") => {
             handle_chat_completion(
                 req, pipelines, routes, models, stats, max_payload,
-                classifier_url, mock_dispatch, http_client,
+                classifier_url, mock_dispatch, ledger, http_client,
             )
             .await
         }
@@ -307,6 +324,7 @@ async fn handle_chat_completion(
     max_payload: usize,
     classifier_url: Option<String>,
     mock_dispatch: Option<Arc<MockDispatchContext>>,
+    ledger: Option<Arc<ContentNodeLedger>>,
     http_client: Arc<reqwest::Client>,
 ) -> Result<HyperResponse, Infallible> {
     let body_bytes = match req.collect().await {
@@ -381,6 +399,19 @@ async fn handle_chat_completion(
 
     stats.requests.fetch_add(1, Ordering::Relaxed);
 
+    // ── Record request in ledger (LOD0) before any pipeline processing ──
+    let session_id = router_request.session_id.clone().unwrap_or_else(uuid_v4);
+    let request_id = uuid_v4();
+    let request_text = router_request
+        .messages
+        .iter()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.to_string_lossy())
+        .unwrap_or_default();
+    let ledger_node_id = ledger.as_ref().and_then(|l| {
+        l.record_request(&session_id, &request_id, &request_text).ok()
+    });
+
     let pipeline_result = resolve_pipeline(
         &model_name,
         &routes,
@@ -410,6 +441,13 @@ async fn handle_chat_completion(
             }
         }
 
+        // Record rejection in ledger
+        if let Some(node_id) = ledger_node_id {
+            if let Some(ref l) = ledger {
+                let _ = l.record_result(node_id, false, Some(0.0), reason);
+            }
+        }
+
         let error_output = format!("ERROR: {reason}");
         let completion = make_error_completion(&model_name, &error_output);
         return Ok(completion_to_response(&completion, &model_name, is_stream, None));
@@ -422,6 +460,12 @@ async fn handle_chat_completion(
             response_len = resp_str.len(),
             "responding with classifier direct response"
         );
+        // Record successful response in ledger
+        if let Some(node_id) = ledger_node_id {
+            if let Some(ref l) = ledger {
+                let _ = l.record_result(node_id, true, Some(1.0), resp_str);
+            }
+        }
         let completion = make_text_completion(&model_name, resp_str);
         return Ok(completion_to_response(&completion, &model_name, is_stream, None));
     }
@@ -435,6 +479,8 @@ async fn handle_chat_completion(
             mock_dispatch.as_ref(),
             &http_client,
             is_stream,
+            ledger_node_id,
+            ledger.as_ref(),
         )
         .await;
     }
@@ -468,6 +514,8 @@ async fn handle_chat_completion(
             mock_dispatch.as_ref(),
             &http_client,
             false,
+            ledger_node_id,
+            ledger.as_ref(),
         )
         .await;
     }
@@ -477,6 +525,12 @@ async fn handle_chat_completion(
         model = %model_name,
         "no routing target, no classifier response, no classifier url — returning fallback"
     );
+    // Record fallback in ledger
+    if let Some(node_id) = ledger_node_id {
+        if let Some(ref l) = ledger {
+            let _ = l.record_result(node_id, true, Some(0.5), "fallback response");
+        }
+    }
     let completion = fallback_completion(&model_name);
     Ok(completion_to_response(&completion, &model_name, is_stream, None))
 }
@@ -489,6 +543,8 @@ async fn handle_dispatch(
     mock_dispatch: Option<&Arc<MockDispatchContext>>,
     http_client: &reqwest::Client,
     is_stream: bool,
+    ledger_node_id: Option<fluent_types::NodeId>,
+    ledger: Option<&Arc<ContentNodeLedger>>,
 ) -> Result<HyperResponse, Infallible> {
     let target_streams = is_stream && rt.stream;
 
@@ -500,6 +556,11 @@ async fn handle_dispatch(
                 return dispatch_real(rt, router_request, model_name, http_client, target_streams).await;
             }
             tracing::info!(target: "router.server", model = %model_name, "mock canned response");
+            if let Some(node_id) = ledger_node_id {
+                if let Some(l) = ledger {
+                    let _ = l.record_result(node_id, true, Some(1.0), "mock response");
+                }
+            }
             let completion = mock.dispatch_response(entry, model_name);
             return Ok(completion_to_response(&completion, model_name, is_stream, None));
         }
@@ -797,19 +858,28 @@ async fn stream_dispatch_inner(
                     if status.is_success() {
                         return Ok(response);
                     }
+                    let class = HttpClass::from_status(status.as_u16());
+                    if class.is_retryable() && attempt + 1 < max_attempts {
+                        let status_err = format!("HTTP {status}");
+                        tracing::warn!(target: "router.dispatch", url = %url, attempt = attempt + 1, class = ?class, error = %status_err, "transient failure, retrying");
+                        let delay = retry_base_interval_s * 1000 * (1u64 << attempt);
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        continue;
+                    }
                     let status_err = format!("HTTP {status}");
-                    tracing::warn!(target: "router.dispatch", url = %url, attempt = attempt + 1, error = %status_err, "non-success status");
-                    last_err = status_err;
+                    tracing::error!(target: "router.dispatch", url = %url, attempt = attempt + 1, class = ?class, error = %status_err, "non-retryable failure");
+                    return Err(status_err);
                 }
                 Err(e) => {
                     last_err = format!("HTTP error: {e}");
-                    tracing::warn!(target: "router.dispatch", url = %url, attempt = attempt + 1, error = %last_err, "request failed");
+                    tracing::warn!(target: "router.dispatch", url = %url, attempt = attempt + 1, error = %last_err, "transport error, retrying");
+                    if attempt + 1 < max_attempts {
+                        let delay = retry_base_interval_s * 1000 * (1u64 << attempt);
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        continue;
+                    }
+                    return Err(last_err);
                 }
-            }
-
-            if attempt + 1 < max_attempts {
-                let delay = retry_base_interval_s * 1000 * (1u64 << attempt);
-                tokio::time::sleep(Duration::from_millis(delay)).await;
             }
         }
 
@@ -984,16 +1054,28 @@ async fn dispatch_to_llm_buffered(
                         .map_err(|e| format!("response JSON parse: {e}"))?;
                     return Ok(parse_openai_response(&json, model_name));
                 }
+                let class = HttpClass::from_status(status.as_u16());
+                if class.is_retryable() && attempt + 1 < max_attempts {
+                    last_err = format!("HTTP {status}");
+                    tracing::warn!(target: "router.dispatch", url = %url, attempt = attempt + 1, class = ?class, error = %last_err, "transient failure, retrying");
+                    let delay = retry_base_interval_s * 1000 * (1u64 << attempt);
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    continue;
+                }
                 last_err = format!("HTTP {status}");
+                tracing::error!(target: "router.dispatch", url = %url, attempt = attempt + 1, class = ?class, error = %last_err, "non-retryable failure");
+                break;
             }
             Err(e) => {
                 last_err = format!("HTTP error: {e}");
+                tracing::warn!(target: "router.dispatch", url = %url, attempt = attempt + 1, error = %last_err, "transport error, retrying");
+                if attempt + 1 < max_attempts {
+                    let delay = retry_base_interval_s * 1000 * (1u64 << attempt);
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    continue;
+                }
+                break;
             }
-        }
-
-        if attempt + 1 < max_attempts {
-            let delay = retry_base_interval_s * 1000 * (1u64 << attempt);
-            tokio::time::sleep(Duration::from_millis(delay)).await;
         }
     }
 

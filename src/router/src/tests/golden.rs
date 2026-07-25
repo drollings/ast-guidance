@@ -31,7 +31,7 @@ fn default_provider() -> TranscriptProvider {
 
 fn make_test_config() -> RouterConfig {
     match serde_json::from_str::<RouterConfig>(r#"{
-        "pipelines": {"default": {"deterministic_prefilter": true, "classifier": true}},
+        "pipelines": {"default": {"deterministic_prefilter": true, "classifier": true, "blacklist": "env/pii-patterns.json"}},
         "models": {"fast": {"endpoint": "http://upstream.test:8080/v1/chat/completions", "name": "fast", "intelligence": 1, "cost_input": 0.000001, "cost_output": 0.000006, "cost_cached_read": 0.0000004, "speed": 10, "total_timeout_ms": 5000, "idle_timeout_ms": 2000, "stream": false, "filter_thinking": false, "retry_count": 0, "retry_base_interval_s": 1}},
         "model_groups": {"fast": ["fast"]},
         "routes": {"fast": {"group": "fast", "pipelines": ["default"]}},
@@ -123,32 +123,32 @@ const PII_CASES: &[GoldenCase] = &[
     GoldenCase {
         name: "ssn_present",
         input: "My SSN is 123-45-6789.",
-        expected_reject_stage: Some(PipelineStage::DeterministicPreFilter),
-        expected_pii: &["ssn"],
+        expected_reject_stage: None, // PII flagged at frontier boundary, not stage 1
+        expected_pii: &[],
     },
     GoldenCase {
         name: "email_present",
         input: "Contact me at user@example.com.",
-        expected_reject_stage: Some(PipelineStage::DeterministicPreFilter),
-        expected_pii: &["email"],
+        expected_reject_stage: None,
+        expected_pii: &[],
     },
     GoldenCase {
         name: "card_number_present",
         input: "My card is 4111-1111-1111-1111.",
-        expected_reject_stage: Some(PipelineStage::DeterministicPreFilter),
-        expected_pii: &["card_number"],
+        expected_reject_stage: None,
+        expected_pii: &[],
     },
     GoldenCase {
         name: "phone_present",
         input: "Call me at (555) 123-4567.",
-        expected_reject_stage: Some(PipelineStage::DeterministicPreFilter),
-        expected_pii: &["phone"],
+        expected_reject_stage: None,
+        expected_pii: &[],
     },
     GoldenCase {
         name: "multiple_pii",
         input: "Email: user@example.com, SSN: 123-45-6789, phone: 555-123-4567.",
-        expected_reject_stage: Some(PipelineStage::DeterministicPreFilter),
-        expected_pii: &["email", "ssn", "phone"],
+        expected_reject_stage: None,
+        expected_pii: &[],
     },
     GoldenCase {
         name: "no_pii",
@@ -230,21 +230,20 @@ fn run_golden_cases(cases: &[GoldenCase], provider: TranscriptProvider) {
             if let Ok(pipeline_result) = &result {
                 for decision in &pipeline_result.decisions {
                     if decision.stage == PipelineStage::DeterministicPreFilter {
-                        let pii = decision
+                        let detected: Vec<&str> = decision
                             .metadata
-                            .get("pii_classes")
-                            .and_then(|v| v.as_array())
-                            .map(|arr| {
-                                arr.iter().filter_map(|c| c.as_str()).collect::<Vec<_>>()
-                            })
+                            .get("pii_filter")
+                            .and_then(|v| v.get("pattern"))
+                            .and_then(|v| v.as_str())
+                            .map(|p| vec![p])
                             .unwrap_or_default();
                         for expected in case.expected_pii {
                             assert!(
-                                pii.contains(expected),
+                                detected.contains(expected),
                                 "case '{}': expected PII class '{}' to be detected, got: {:?}",
                                 case.name,
                                 expected,
-                                pii
+                                detected
                             );
                         }
                     }

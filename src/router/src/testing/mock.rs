@@ -39,6 +39,8 @@ impl TranscriptProvider {
             complexity: None,
             intent: Some("question".into()),
             reason: "well-formed factual query".into(),
+            completeness: None,
+            risk: None,
         })
         .unwrap_or_default()
     }

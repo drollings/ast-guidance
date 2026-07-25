@@ -1,7 +1,7 @@
 //! Router configuration types — deserialized from JSON via `common_core::config`.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use common_core::config::load_json_or_default;
@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::logging::LoggingConfig;
 use crate::pipeline::PipelineOrchestrator;
+use crate::score_matrix::ScoreMatrix;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
@@ -123,6 +124,11 @@ pub struct PipelineParams {
     /// file are used as a blacklist (matches are rejected).
     #[serde(default)]
     pub blacklist: Option<String>,
+    /// Score-matrix routing configuration (MOA_ROUTER_SPEC §2.2).
+    /// When set, the classifier uses the weighted score matrix to resolve
+    /// routing decisions (plan/rigor/local) instead of single-threshold logic.
+    #[serde(default)]
+    pub score_matrix: Option<ScoreMatrix>,
 }
 
 impl Default for PipelineParams {
@@ -134,6 +140,7 @@ impl Default for PipelineParams {
             coherence_threshold: default_coherence_threshold(),
             classifier_model: None,
             blacklist: None,
+            score_matrix: None,
         }
     }
 }
@@ -166,6 +173,26 @@ pub struct ModelEntry {
     /// (e.g. stop, num_ctx, repeat_penalty, top_k, top_p, n_gpu_layers, etc.).
     #[serde(default)]
     pub params: Option<serde_json::Value>,
+    /// Named session profiles for this model (e.g. "orchestrator", "code", "compact").
+    /// Each profile overrides base params with session-specific settings.
+    #[serde(default)]
+    pub sessions: Option<HashMap<String, SessionProfile>>,
+}
+
+/// Session-specific parameter overrides for a model entry.
+/// When a routing decision resolves to a named session profile,
+/// the profile's values override the model's base `params`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionProfile {
+    /// Context window size for this session profile (tokens).
+    pub num_ctx: u64,
+    /// Seconds of inactivity before the model is unloaded.
+    /// 0 = never sleep (always resident).
+    #[serde(default)]
+    pub sleep_idle_seconds: Option<u64>,
+    /// Additional session-specific params merged over the model's base params.
+    #[serde(default)]
+    pub params: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +215,92 @@ pub enum EvictionPolicy {
     Hybrid,
 }
 
+// ── Audit log config ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditLogConfig {
+    #[serde(default = "default_audit_log_dir")]
+    pub log_dir: PathBuf,
+    #[serde(default = "default_audit_file_size_mb")]
+    pub max_file_size_mb: u64,
+    #[serde(default = "default_audit_age_days")]
+    pub max_age_days: u64,
+    #[serde(default = "default_audit_max_files")]
+    pub max_files: usize,
+    #[serde(default)]
+    pub json_format: bool,
+    #[serde(default)]
+    pub console_output: bool,
+}
+
+fn default_audit_log_dir() -> PathBuf {
+    PathBuf::from("/tmp/coral-router-audit-logs")
+}
+
+const fn default_audit_file_size_mb() -> u64 {
+    50
+}
+
+const fn default_audit_age_days() -> u64 {
+    90
+}
+
+const fn default_audit_max_files() -> usize {
+    20
+}
+
+impl Default for AuditLogConfig {
+    fn default() -> Self {
+        Self {
+            log_dir: default_audit_log_dir(),
+            max_file_size_mb: default_audit_file_size_mb(),
+            max_age_days: default_audit_age_days(),
+            max_files: default_audit_max_files(),
+            json_format: true,
+            console_output: false,
+        }
+    }
+}
+
+// ── Filter types (MOA_ROUTER_SPEC §2) ─────────────────────────────────
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterOutcome {
+    #[default]
+    HardReject,
+    SoftRedirect,
+    OutputFilter,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterAction {
+    Redact,
+    Anonymize,
+    Omit,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfidenceGate {
+    #[serde(rename = "luhn_valid")]
+    LuhnValid,
+    #[default]
+    #[serde(rename = "none")]
+    None,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterScope {
+    #[default]
+    #[serde(rename = "any")]
+    Any,
+    #[serde(rename = "frontier_bound")]
+    FrontierBound,
+}
+
 // ── Reject Patterns ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -204,6 +317,14 @@ pub struct RejectPatterns {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PatternEntry {
     pub name: String,
+    #[serde(default)]
+    pub outcome: FilterOutcome,
+    #[serde(default)]
+    pub filter_action: Option<FilterAction>,
+    #[serde(default)]
+    pub confidence_gate: ConfidenceGate,
+    #[serde(default)]
+    pub scope: Vec<FilterScope>,
     pub http_code: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
@@ -236,6 +357,14 @@ pub struct ClassifierOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intent: Option<String>,
     pub reason: String,
+    /// How complete/well-specified the request is (0.0–1.0). Low values
+    /// trigger the `plan` route for clarification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completeness: Option<f64>,
+    /// Perceived risk/sensitivity score (0.0–1.0). High values trigger
+    /// the `rigor` route for adversarial validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<f64>,
 }
 
 // ── Resolved routing target ─────────────────────────────────────────────
@@ -248,6 +377,10 @@ pub struct RoutingConfig {
     pub system_prompt: String,
     pub safety_threshold: f64,
     pub default_route: String,
+    /// Score-matrix routing configuration. When set, routing decisions use
+    /// weighted scoring across coherence/complexity/completeness/risk dimensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_matrix: Option<ScoreMatrix>,
 }
 
 impl RoutingConfig {
@@ -348,6 +481,7 @@ impl RouterConfig {
             system_prompt: self.system_prompt.clone(),
             safety_threshold: self.safety_threshold,
             default_route: self.default_route.clone(),
+            score_matrix: None,
         }
     }
 
@@ -421,6 +555,7 @@ impl RouterConfig {
                     client,
                     routing_config,
                     params.coherence_threshold,
+                    params.score_matrix.clone(),
                 ),
             ));
         } else if classifier_backend.is_some() {
@@ -641,6 +776,7 @@ mod tests {
             retry_count: 0,
             retry_base_interval_s: 1,
             params: None,
+            sessions: None,
         });
         assert!(validate_no_self_routing("0.0.0.0:8079", &models).is_ok());
     }
@@ -663,6 +799,7 @@ mod tests {
             retry_count: 0,
             retry_base_interval_s: 1,
             params: None,
+            sessions: None,
         });
         let err = validate_no_self_routing("127.0.0.1:8079", &models)
             .expect_err("should reject self-routing model");
@@ -687,6 +824,7 @@ mod tests {
             retry_count: 0,
             retry_base_interval_s: 1,
             params: None,
+            sessions: None,
         });
         let err = validate_no_self_routing("127.0.0.1:8079", &models)
             .expect_err("should reject self-routing model");
@@ -711,6 +849,7 @@ mod tests {
             retry_count: 0,
             retry_base_interval_s: 1,
             params: None,
+            sessions: None,
         });
         // Different port (8080 vs 8079) should be OK
         assert!(validate_no_self_routing("127.0.0.1:8079", &models).is_ok());

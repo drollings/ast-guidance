@@ -1,3 +1,4 @@
+pub mod codeword_anonymize;
 pub mod none;
 pub mod pii_anonymize;
 pub mod decompose_hypothetical;
