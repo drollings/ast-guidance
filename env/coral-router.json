@@ -30,6 +30,26 @@
                 "sleep_idle_seconds": 1800
             }
         },
+        "fastmoe": {
+            "endpoint": "http://localhost:8080/v1/chat/completions",
+            "name": "unsloth/lfm2.5-8b-a1b",
+            "intelligence": 2,
+            "cost_input": 0.000001,
+            "cost_output": 0.000006,
+            "cost_cached_read": 0.0000004,
+            "speed": 8,
+            "total_timeout_ms": 40000,
+            "idle_timeout_ms": 8000,
+            "stream": true,
+            "filter_thinking": true,
+            "retry_count": 2,
+            "retry_base_interval_s": 1,
+            "params": {
+                "num_ctx": 98304,
+                "parallel": 3,
+                "sleep_idle_seconds": 1800
+            }
+        },
         "qwythos-9b": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
             "name": "empero-ai/qwythos-9b-v2",

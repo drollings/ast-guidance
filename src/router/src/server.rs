@@ -5,10 +5,8 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
-use common_core::drain_sse_lines;
 use common_core::hash::uuid_v4;
 use common_core::now_secs;
 use common_core::ResponseCache;
@@ -18,12 +16,12 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
 use crate::config::{ModelEntry, RouteRef, ServerConfig};
-use crate::dispatch::frontier::{DispatchBackend, OpenAiBackend};
 use crate::ledger::ContentNodeLedger;
 use crate::normalize;
+use crate::dispatch::backend::ChatBackend;
 use crate::streaming::strip_thinking_blocks;
-use crate::pipeline::PipelineOrchestrator;
 use crate::streaming::StreamingHandler;
+use crate::pipeline::PipelineOrchestrator;
 use crate::testing::mock::MockDispatchContext;
 use crate::types::{RouterMessage, RouterMessageContent, RouterRequest, RouterResponse, Usage};
 
@@ -693,24 +691,31 @@ async fn dispatch_real(
     stream: bool,
     cache: Option<&Arc<ResponseCache>>,
 ) -> Result<HyperResponse, Infallible> {
-    let url = build_dispatch_url(&rt.url);
+    use crate::dispatch::backend::{OpenAiChatBackend, RetryChatBackend};
+
+    let base: Arc<dyn ChatBackend> =
+        Arc::new(OpenAiChatBackend::new(http_client.clone(), &rt.url));
+
+    let backend: Arc<dyn ChatBackend> = if rt.retry_count > 0 {
+        Arc::new(RetryChatBackend::new(base, rt.retry_count, rt.retry_base_interval_s))
+    } else {
+        base
+    };
 
     if stream {
-        match dispatch_to_llm_streaming(
-            http_client,
-            &url,
-            router_request,
-            &rt.model,
-            rt.params.as_ref(),
-            rt.retry_count,
-            rt.retry_base_interval_s,
-            rt.idle_timeout_ms,
-            rt.total_timeout_ms,
-            rt.filter_thinking,
-        )
+        match backend
+            .stream_complete(
+                router_request.clone(),
+                rt.model.clone(),
+                rt.params.clone(),
+                rt.idle_timeout_ms,
+                rt.total_timeout_ms,
+                rt.filter_thinking,
+            )
+            .await
         {
             Ok(body) => {
-                let mut resp = HyperResponse::new(body.boxed_unsync());
+                let mut resp = HyperResponse::new(body.body.boxed_unsync());
                 *resp.status_mut() = hyper::StatusCode::OK;
                 resp.headers_mut()
                     .insert(hyper::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
@@ -725,16 +730,13 @@ async fn dispatch_real(
         }
     } else {
         let filter_thinking = rt.filter_thinking;
-        let completion = match dispatch_to_llm_buffered(
-            http_client,
-            &url,
-            router_request,
-            &rt.model,
-            rt.params.as_ref(),
-            rt.retry_count,
-            rt.retry_base_interval_s,
-        )
-        .await
+        let completion = match backend
+            .complete(
+                router_request.clone(),
+                rt.model.clone(),
+                rt.params.clone(),
+            )
+            .await
         {
             Ok(mut c) => {
                 if let Some(cache) = cache {
@@ -864,284 +866,6 @@ fn resolve_pipeline(
     });
     final_result.decisions = all_decisions;
     final_result
-}
-
-fn build_dispatch_url(endpoint_url: &str) -> String {
-    if endpoint_url.ends_with("/chat/completions") {
-        endpoint_url.to_string()
-    } else {
-        format!("{}/chat/completions", endpoint_url.trim_end_matches('/'))
-    }
-}
-
-fn dispatch_to_llm_streaming(
-    http_client: &reqwest::Client,
-    endpoint_url: &str,
-    request: &RouterRequest,
-    model_name: &str,
-    params: Option<&serde_json::Value>,
-    retry_count: u32,
-    retry_base_interval_s: u64,
-    idle_timeout_ms: u64,
-    total_timeout_ms: u64,
-    filter_thinking: bool,
-) -> Result<http_body_util::channel::Channel<Bytes, Infallible>, String> {
-    let messages = normalize::messages_to_json(request);
-
-    let mut body = serde_json::json!({
-        "model": model_name,
-        "messages": messages,
-        "stream": true,
-    });
-
-    if let Some(p) = params {
-        if let Some(obj) = p.as_object() {
-            for (k, v) in obj {
-                if k != "stream" {
-                    body[k] = v.clone();
-                }
-            }
-        }
-    }
-
-    if !body.as_object().is_some_and(|o| o.contains_key("temperature")) {
-        if let Some(temp) = request.temperature {
-            body["temperature"] =
-                serde_json::Value::Number(serde_json::Number::from_f64(temp).ok_or("invalid temperature")?);
-        }
-    }
-    if !body.as_object().is_some_and(|o| o.contains_key("max_tokens")) {
-        if let Some(max_tokens) = request.max_tokens {
-            body["max_tokens"] = serde_json::Value::Number(max_tokens.into());
-        }
-    }
-
-    let request_id = uuid_v4();
-    let (mut tx, rx_body) = http_body_util::channel::Channel::<Bytes>::new(32);
-
-    let url = endpoint_url.to_string();
-    let model = model_name.to_string();
-    let client = http_client.clone();
-
-    tokio::spawn(async move {
-        let mut handler = StreamingHandler::new(&request_id, format!("{model}#stream"))
-            .with_filter_thinking(filter_thinking);
-        if let Err(e) = stream_dispatch_inner(
-            &client, &url, &body, &model,
-            retry_count, retry_base_interval_s,
-            idle_timeout_ms, total_timeout_ms, &mut tx, &mut handler,
-        )
-        .await
-        {
-            tracing::warn!(target: "router.dispatch", error = %e, "stream dispatch ended with error");
-        }
-    });
-
-    Ok(rx_body)
-}
-
-async fn stream_dispatch_inner(
-    http_client: &reqwest::Client,
-    url: &str,
-    body: &serde_json::Value,
-    model_name: &str,
-    retry_count: u32,
-    retry_base_interval_s: u64,
-    idle_timeout_ms: u64,
-    total_timeout_ms: u64,
-    tx: &mut http_body_util::channel::Sender<Bytes>,
-    handler: &mut StreamingHandler,
-) -> Result<(), String> {
-    let idle_dur = Duration::from_millis(idle_timeout_ms);
-    let total_dur = Duration::from_millis(total_timeout_ms);
-
-    let response = tokio::time::timeout(
-        total_dur,
-        crate::dispatch::retry::retry_http_request(
-            http_client,
-            url,
-            body,
-            retry_count,
-            retry_base_interval_s,
-        ),
-    )
-    .await
-    .map_err(|_| "total timeout exceeded".to_string())?
-    .map_err(|e| format!("dispatch failed: {e}"))?;
-
-    if !response.status().is_success() {
-        return Err(format!("HTTP {}", response.status()));
-    }
-
-    let mut response_stream = response;
-
-    let mut buf = Vec::new();
-    let mut sent_first_chunk = false;
-
-    loop {
-        let chunk_result = tokio::time::timeout(idle_dur, response_stream.chunk()).await;
-
-        let chunk = match chunk_result {
-            Ok(Ok(Some(bytes))) => bytes,
-            Ok(Ok(None)) => break,
-            Ok(Err(e)) => {
-                let err = format!("upstream stream error: {e}");
-                tracing::warn!(target: "router.dispatch", error = %err, "stream read error");
-                if sent_first_chunk {
-                    let _ = tx.send_data(Bytes::from(handler.format_done())).await;
-                }
-                return Err(err);
-            }
-            Err(_) => {
-                let err = format!("idle timeout after {idle_timeout_ms}ms");
-                tracing::warn!(target: "router.dispatch", model = %model_name, error = %err, "idle timeout");
-                if sent_first_chunk {
-                    let _ = tx.send_data(Bytes::from(handler.format_done())).await;
-                }
-                return Err(err);
-            }
-        };
-
-        for line in drain_sse_lines(&mut buf, &chunk) {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            if trimmed == "data: [DONE]" {
-                let _ = tx.send_data(Bytes::from(handler.format_done())).await;
-                return Ok(());
-            }
-
-            if let Some(data) = trimmed.strip_prefix("data: ") {
-                if let Ok(chunk_json) = serde_json::from_str::<serde_json::Value>(data) {
-                    let empty = vec![];
-                    let choices = chunk_json
-                        .get("choices")
-                        .and_then(|v| v.as_array())
-                        .unwrap_or(&empty);
-
-                    if let Some(choice) = choices.first() {
-                        let delta = choice
-                            .get("delta")
-                            .and_then(|d| d.get("content"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-
-                        let finish_reason = choice
-                            .get("finish_reason")
-                            .and_then(|v| v.as_str());
-
-                        if let Some(fr) = finish_reason {
-                            let chunk_str = handler.format_chunk(delta, Some(fr));
-                            if !chunk_str.is_empty() {
-                                let _ = tx.send_data(Bytes::from(chunk_str)).await;
-                            }
-                            let _ = tx.send_data(Bytes::from(handler.format_done())).await;
-
-                            let raw_content = handler.accumulated_content();
-                            if raw_content.contains("<thinking>") || raw_content.contains(" thinking") {
-                                let filtered_len = handler.filtered_content().len();
-                                tracing::debug!(target: "router.dispatch",
-                                    raw_len = raw_content.len(),
-                                    filtered_len = filtered_len,
-                                    "stream complete — thinking blocks stripped from context"
-                                );
-                            }
-                            return Ok(());
-                        }
-
-                        let chunk_str = handler.format_chunk(delta, None);
-                        if !chunk_str.is_empty() {
-                            sent_first_chunk = true;
-                            let _ = tx.send_data(Bytes::from(chunk_str)).await;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if sent_first_chunk {
-        let _ = tx.send_data(Bytes::from(handler.format_done())).await;
-    }
-    Ok(())
-}
-
-async fn dispatch_to_llm_buffered(
-    http_client: &reqwest::Client,
-    endpoint_url: &str,
-    request: &RouterRequest,
-    model_name: &str,
-    params: Option<&serde_json::Value>,
-    retry_count: u32,
-    retry_base_interval_s: u64,
-) -> Result<RouterResponse, String> {
-    let url = build_dispatch_url(endpoint_url);
-
-    tracing::info!(
-        target: "router.dispatch",
-        url = %url,
-        model = %model_name,
-        retry_count = retry_count,
-        message_count = request.messages.len(),
-        "dispatching to LLM (buffered)"
-    );
-
-    let messages = normalize::messages_to_json(request);
-
-    let mut body = serde_json::json!({
-        "model": model_name,
-        "messages": messages,
-    });
-
-    if let Some(p) = params {
-        if let Some(obj) = p.as_object() {
-            for (k, v) in obj {
-                if k != "stream" {
-                    body[k] = v.clone();
-                }
-            }
-        }
-    }
-
-    if !body.as_object().is_some_and(|o| o.contains_key("temperature")) {
-        if let Some(temp) = request.temperature {
-            body["temperature"] =
-                serde_json::Value::Number(serde_json::Number::from_f64(temp).ok_or("invalid temperature")?);
-        }
-    }
-    if !body.as_object().is_some_and(|o| o.contains_key("max_tokens")) {
-        if let Some(max_tokens) = request.max_tokens {
-            body["max_tokens"] = serde_json::Value::Number(max_tokens.into());
-        }
-    }
-
-    let response = crate::dispatch::retry::retry_http_request(
-        http_client,
-        &url,
-        &body,
-        retry_count,
-        retry_base_interval_s,
-    )
-    .await?;
-
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!("HTTP {status}"));
-    }
-
-    let json: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("response JSON parse: {e}"))?;
-    let mut response = OpenAiBackend::new(&url, None)
-        .parse_response(&json)
-        .map_err(|e| format!("parse: {e}"))?;
-    if response.model == "unknown" && model_name != "unknown" {
-        response.model = model_name.to_string();
-    }
-    Ok(response)
 }
 
 fn fallback_completion(model_name: &str) -> RouterResponse {

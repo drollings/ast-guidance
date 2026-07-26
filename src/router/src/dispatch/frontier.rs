@@ -9,6 +9,12 @@ use crate::types::{
     RouterChoice, RouterMessage, RouterMessageContent, RouterRequest, RouterResponse, Usage,
 };
 
+impl DispatchError {
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, DispatchError::Http(_) | DispatchError::RateLimited)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum DispatchError {
     #[error("unsupported provider: {0}")]
