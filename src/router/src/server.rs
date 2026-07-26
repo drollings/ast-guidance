@@ -522,8 +522,7 @@ async fn handle_chat_completion(
             }
         }
 
-        let error_output = format!("ERROR: {reason}");
-        let completion = make_error_completion(&model_name, &error_output);
+        let completion = make_error_completion(&model_name, reason);
         return Ok(completion_to_response(&completion, &model_name, is_stream, None));
     }
 

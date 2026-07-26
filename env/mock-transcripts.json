@@ -22,6 +22,14 @@
         "reject_reason_contains": "blocked"
     },
     {
+        "user_message": "Email me@test.com please",
+        "classifier_response": "{\"action\":\"reject\",\"coherence_score\":1.0,\"safety_score\":1.0,\"intent\":null,\"reason\":\"email address detected\"}",
+        "expected_route": null,
+        "dispatch_response": null,
+        "rejected": true,
+        "reject_reason_contains": "email"
+    },
+    {
         "user_message": "/help",
         "classifier_response": "{\"action\":\"reject\",\"coherence_score\":1.0,\"safety_score\":1.0,\"intent\":null,\"reason\":\"command\"}",
         "expected_route": null,

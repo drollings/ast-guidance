@@ -52,10 +52,14 @@ impl TransformStrategy for SecretMask {
         let mut transformed = request.clone();
 
         for message in &mut transformed.messages {
-            let text = match &message.content {
-                RouterMessageContent::Text(s) => s.clone(),
+            let text_ref = match &message.content {
+                RouterMessageContent::Text(s) => s,
                 RouterMessageContent::Parts(_) => continue,
             };
+            if !SECRET_RE.is_match(text_ref) {
+                continue;
+            }
+            let text = text_ref.clone();
 
             let masked = SECRET_RE.replace_all(&text, |caps: &regex::Captures| {
                 if let Some(m) = caps.name("bearer") {

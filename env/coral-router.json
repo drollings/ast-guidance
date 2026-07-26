@@ -10,7 +10,7 @@
         }
     },
     "models": {
-        "fast": {
+        "tiny": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
             "name": "unsloth/lfm2.5-1.2b-instruct",
             "intelligence": 2,
@@ -30,9 +30,9 @@
                 "sleep_idle_seconds": 1800
             }
         },
-        "fastmoe": {
+        "fast": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
-            "name": "unsloth/lfm2.5-8b-a1b",
+            "fast": "unsloth/lfm2.5-8b-a1b",
             "intelligence": 2,
             "cost_input": 0.000001,
             "cost_output": 0.000006,

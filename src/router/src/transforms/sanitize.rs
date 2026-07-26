@@ -1,3 +1,5 @@
+use std::str::Chars;
+
 use crate::transforms::{TransformError, TransformStrategy};
 use crate::types::{RouterMessageContent, RouterRequest};
 
@@ -21,7 +23,7 @@ impl TransformStrategy for Sanitize {
                 RouterMessageContent::Parts(_) => continue,
             };
 
-            let cleaned = strip_ansi(&text);
+            let cleaned: String = AnsiStripper::new(&text).collect();
             let cleaned = filter_unsafe_chars(&cleaned);
 
             if cleaned != text {
@@ -60,39 +62,64 @@ fn is_safe_char(c: char) -> bool {
     )
 }
 
-fn strip_ansi(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    #[allow(clippy::while_let_loop)]
-    loop {
-        match chars.next() {
-            None => break,
-            Some('\u{1B}') => {
-                if let Some(&'[') = chars.peek() {
-                    chars.next(); // consume '['
-                    loop {
-                        match chars.peek() {
-                            Some(&p) if ('\u{0030}'..='\u{003F}').contains(&p)
-                                || ('\u{0020}'..='\u{002F}').contains(&p) =>
-                            {
-                                chars.next();
-                            }
-                            _ => break,
-                        }
-                    }
-                    if let Some(&f) = chars.peek() {
-                        if ('\u{0040}'..='\u{007E}').contains(&f) {
-                            chars.next();
-                        }
-                    }
-                } else {
-                    result.push('\u{1B}');
-                }
-            }
-            Some(c) => result.push(c),
+struct AnsiStripper<'a> {
+    chars: Chars<'a>,
+}
+
+impl<'a> AnsiStripper<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            chars: text.chars(),
         }
     }
-    result
+}
+
+impl Iterator for AnsiStripper<'_> {
+    type Item = char;
+
+    fn next(&mut self) -> Option<char> {
+        let c = self.chars.next()?;
+        if c == '\u{1B}' {
+            // Check for '[' following ESC — that starts a CSI sequence
+            if let Some('[') = self.chars.clone().next() {
+                self.chars.next(); // consume '['
+                skip_csi_params(&mut self.chars);
+                skip_csi_final(&mut self.chars);
+                // Recurse to get the next visible character
+                self.next()
+            } else {
+                // Lone ESC, not part of a CSI sequence
+                Some('\u{1B}')
+            }
+        } else {
+            Some(c)
+        }
+    }
+}
+
+fn skip_csi_params(chars: &mut Chars<'_>) {
+    // Skip parameter bytes (0x30-0x3F) and intermediate bytes (0x20-0x2F)
+    loop {
+        let mut peek = chars.clone();
+        match peek.next() {
+            Some(p) if ('\u{0030}'..='\u{003F}').contains(&p)
+                || ('\u{0020}'..='\u{002F}').contains(&p) =>
+            {
+                chars.next();
+            }
+            _ => break,
+        }
+    }
+}
+
+fn skip_csi_final(chars: &mut Chars<'_>) {
+    // Skip the final byte (0x40-0x7E) if present
+    let mut peek = chars.clone();
+    if let Some(f) = peek.next() {
+        if ('\u{0040}'..='\u{007E}').contains(&f) {
+            chars.next();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -124,6 +151,52 @@ mod tests {
     fn text_of(result: &RouterRequest) -> String {
         result.messages[0].content.to_string_lossy()
     }
+
+    // ── AnsiStripper unit tests ──────────────────────────────────────
+
+    #[test]
+    fn ansi_stripper_passthrough_plain_text() {
+        let result: String = AnsiStripper::new("hello world").collect();
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn ansi_stripper_removes_sgr_color() {
+        let result: String = AnsiStripper::new("\u{1B}[31mRED\u{1B}[0m").collect();
+        assert_eq!(result, "RED");
+    }
+
+    #[test]
+    fn ansi_stripper_removes_256_color() {
+        let result: String = AnsiStripper::new("\u{1B}[38;5;196mbright").collect();
+        assert_eq!(result, "bright");
+    }
+
+    #[test]
+    fn ansi_stripper_removes_rgb_color() {
+        let result: String = AnsiStripper::new("\u{1B}[38;2;255;0;0mRGB red").collect();
+        assert_eq!(result, "RGB red");
+    }
+
+    #[test]
+    fn ansi_stripper_lone_esc_preserved() {
+        let result: String = AnsiStripper::new("a\u{1B}x").collect();
+        assert_eq!(result, "a\u{1B}x");
+    }
+
+    #[test]
+    fn ansi_stripper_cjk_preserved() {
+        let result: String = AnsiStripper::new("こんにちは").collect();
+        assert_eq!(result, "こんにちは");
+    }
+
+    #[test]
+    fn ansi_stripper_empty_input() {
+        let result: String = AnsiStripper::new("").collect();
+        assert_eq!(result, "");
+    }
+
+    // ── Transform integration tests ──────────────────────────────────
 
     #[test]
     fn bidi_override_removed() {
