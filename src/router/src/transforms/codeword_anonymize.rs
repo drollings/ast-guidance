@@ -38,6 +38,7 @@ impl CodewordAnonymizer {
         }
     }
 
+    #[must_use]
     pub fn with_skip_reverse(mut self) -> Self {
         self.skip_reverse = true;
         self

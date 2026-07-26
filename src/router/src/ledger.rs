@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use common_core::sqlite::open_wal;
 use fluent_types::NodeId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -38,7 +39,8 @@ pub struct ContentNodeLedger {
 
 impl ContentNodeLedger {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, LedgerError> {
-        let db = rusqlite::Connection::open(path.into())
+        let db_path = path.into();
+        let db = open_wal(&db_path)
             .map_err(|e| LedgerError::Db(e.to_string()))?;
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS ledger (

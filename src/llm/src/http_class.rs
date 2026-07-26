@@ -1,25 +1,28 @@
-/// HTTP status classification for retry decisions — MOA_ROUTER_SPEC §3.
+/// HTTP status classification for LLM API retry decisions.
+///
+/// Consumed by `LlmClient` to produce the correct `LlmError` variant, and by
+/// callers that talk directly to LLM endpoints via raw `reqwest` (e.g. the
+/// coral-router dispatch path) for their own retry loops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpClass {
-    /// 422 Unprocessable Entity — filter/policy rejection. Never retried.
+    /// 400-405, 410, 413-414, 422 — permanent rejection. Never retried.
     HardReject,
-    /// 503 Service Unavailable — transient. Eligible for retry_count/backoff.
+    /// 429, 500, 502-504 — transient. Eligible for backoff + retry.
     TransientFailure,
-    /// 409 Conflict — internal escalation signal. Not retried.
+    /// 409 Conflict — internal escalation signal (routers / multi-hop).
+    /// Not retried.
     EscalationRequired,
-    /// Provider's own 4xx/5xx — passthrough. Treated as non-retryable unless
-    /// the provider code indicates transient (e.g., 429 Rate Limit).
+    /// Unknown 5xx or non-LLM status (including 200). Treat as
+    /// non-retryable unless the caller knows better.
     UpstreamFailure,
 }
 
 impl HttpClass {
     pub fn from_status(status: u16) -> Self {
         match status {
-            422 => Self::HardReject,
             409 => Self::EscalationRequired,
-            429 => Self::TransientFailure,
-            500 | 502 | 503 | 504 => Self::TransientFailure,
-            400 | 401 | 403 | 404 | 405 | 410 | 413 | 414 => Self::HardReject,
+            429 | 500 | 502 | 503 | 504 => Self::TransientFailure,
+            400 | 401 | 403 | 404 | 405 | 410 | 413 | 414 | 422 => Self::HardReject,
             _ if status >= 500 => Self::UpstreamFailure,
             _ => Self::UpstreamFailure,
         }
@@ -54,18 +57,16 @@ mod tests {
 
     #[test]
     fn server_errors_are_transient() {
-        assert_eq!(HttpClass::from_status(500), HttpClass::TransientFailure);
-        assert_eq!(HttpClass::from_status(502), HttpClass::TransientFailure);
-        assert_eq!(HttpClass::from_status(503), HttpClass::TransientFailure);
-        assert_eq!(HttpClass::from_status(504), HttpClass::TransientFailure);
+        for status in [500, 502, 503, 504] {
+            assert_eq!(HttpClass::from_status(status), HttpClass::TransientFailure);
+        }
     }
 
     #[test]
     fn client_errors_are_hard_reject() {
-        assert_eq!(HttpClass::from_status(400), HttpClass::HardReject);
-        assert_eq!(HttpClass::from_status(401), HttpClass::HardReject);
-        assert_eq!(HttpClass::from_status(403), HttpClass::HardReject);
-        assert_eq!(HttpClass::from_status(404), HttpClass::HardReject);
+        for status in [400, 401, 403, 404] {
+            assert_eq!(HttpClass::from_status(status), HttpClass::HardReject);
+        }
     }
 
     #[test]

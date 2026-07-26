@@ -8,6 +8,7 @@ pub mod context_packer;
 pub mod decomposer;
 pub mod embeddings;
 pub mod error;
+pub mod http_class;
 pub mod llm_queue;
 pub mod url;
 
@@ -30,3 +31,4 @@ pub use embeddings::{
     OllamaEmbedding, OpenAiEmbedding,
 };
 pub use error::EmbedError;
+pub use http_class::HttpClass;

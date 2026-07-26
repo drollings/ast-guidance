@@ -44,6 +44,11 @@ pub struct RouterConfig {
     /// provider instead of real LLM calls, and validates routing decisions.
     #[serde(default)]
     pub mock: Option<MockConfig>,
+    /// Score-matrix routing configuration. When set, routing decisions use
+    /// weighted scoring across coherence/complexity/completeness/risk dimensions.
+    /// Overridable per-pipeline via `PipelineParams::score_matrix`.
+    #[serde(default)]
+    pub score_matrix: Option<ScoreMatrix>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +83,7 @@ impl Default for RouterConfig {
             logging: LoggingConfig::default(),
             classifier_model: None,
             mock: None,
+            score_matrix: None,
         }
     }
 }
@@ -481,7 +487,7 @@ impl RouterConfig {
             system_prompt: self.system_prompt.clone(),
             safety_threshold: self.safety_threshold,
             default_route: self.default_route.clone(),
-            score_matrix: None,
+            score_matrix: self.score_matrix.clone(),
         }
     }
 

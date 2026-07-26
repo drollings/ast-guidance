@@ -56,6 +56,15 @@ pub enum LlmError {
     RateLimited,
 }
 
+impl LlmError {
+    /// Returns `true` for error variants that indicate a transient condition the
+    /// caller *may* wish to retry (transport failures, rate limiting). API
+    /// rejections and empty responses are treated as permanent.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Http(_) | Self::RateLimited)
+    }
+}
+
 /// A single chat message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
 pub struct ChatMessage {

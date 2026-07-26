@@ -358,6 +358,26 @@ pub fn skill_name_from_ref(ref_path: &str) -> String {
     }
 }
 
+/// Deferred-UTF-8-decode SSE line drainer.
+///
+/// Appends `chunk` to `buffer`, drains every complete newline-terminated line,
+/// decodes it via `String::from_utf8_lossy`, trims trailing whitespace, and
+/// returns the lines.  Any unterminated tail is left in `buffer` for the next
+/// call.
+///
+/// Because `\n` (0x0A) is never a UTF-8 lead or continuation byte, splitting on
+/// it cannot cut a codepoint, so every drained line is a whole number of
+/// codepoints and decodes losslessly — safe for CJK, emoji, etc.
+pub fn drain_sse_lines(buffer: &mut Vec<u8>, chunk: &[u8]) -> Vec<String> {
+    buffer.extend_from_slice(chunk);
+    let mut lines = Vec::new();
+    while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+        let line: Vec<u8> = buffer.drain(..=pos).collect();
+        lines.push(String::from_utf8_lossy(&line).trim_end().to_string());
+    }
+    lines
+}
+
 /// Find the first occurrence of a byte subsequence in a slice starting from `start`.
 pub fn find_subseq(haystack: &[u8], start: usize, needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
@@ -372,6 +392,40 @@ pub fn find_subseq(haystack: &[u8], start: usize, needle: &[u8]) -> Option<usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drain_sse_lines_cjk_split_across_chunks() {
+        let mut buf = Vec::new();
+        // "data: 안녕\n" — Korean "annyeong" — UTF-8: EC 95 88 EB 85 95
+        // Split at byte 7, which falls inside the "안" character (EC 95 88).
+        let chunk1 = b"data: \xEC\x95";
+        let chunk2 = b"\x88\xEB\x85\x95\n";
+        let lines = drain_sse_lines(&mut buf, chunk1);
+        assert!(lines.is_empty(), "no complete line yet");
+        let lines = drain_sse_lines(&mut buf, chunk2);
+        assert_eq!(lines.len(), 1);
+        let decoded = &lines[0];
+        assert!(
+            !decoded.contains('\u{FFFD}'),
+            "got replacement character in: {decoded:?}"
+        );
+        assert!(decoded.contains("안녕"), "expected 안녕, got: {decoded:?}");
+        assert!(buf.is_empty(), "buffer should be drained");
+    }
+
+    #[test]
+    fn drain_sse_lines_partial_tail_reassembly() {
+        let mut buf = Vec::new();
+        let lines1 = drain_sse_lines(&mut buf, b"event: ping\r\ndata: {}\npartial");
+        assert_eq!(lines1.len(), 2);
+        assert_eq!(lines1[0], "event: ping");
+        assert_eq!(lines1[1], "data: {}");
+        assert_eq!(&buf, b"partial", "tail should remain in buffer");
+        let lines2 = drain_sse_lines(&mut buf, b" tail\n");
+        assert_eq!(lines2.len(), 1);
+        assert_eq!(lines2[0], "partial tail");
+        assert!(buf.is_empty(), "buffer should be drained");
+    }
 
     #[test]
     fn contains_ignore_case_basic() {

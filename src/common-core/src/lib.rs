@@ -14,8 +14,10 @@
 //! strings, formatting, metrics, drift, interner, watchdogs).
 //!
 //! See `ROADMAP_20260625_CONSOLIDATE.md` for the full consolidation plan.
-
 pub mod cache;
+
+pub use cache::{CachedResponse, ResponseCache};
+
 pub mod config;
 pub mod constants;
 pub mod drift;
@@ -72,9 +74,10 @@ pub use sqlite::{
 };
 pub use string::{
     contains_any, contains_any_word, contains_ident_word, contains_ignore_case, contains_word,
-    find_subseq, first_comment_line, first_sentence, has_extension, is_noisy_comment, is_path_token,
-    is_test_path, looks_like_identifier, lower_into, skill_name_from_ref, slugify,
-    strip_boilerplate, strip_nl_prefix, trim_left, trim_right, truncate_at_sentence, STOP_WORDS,
+    drain_sse_lines, find_subseq, first_comment_line, first_sentence, has_extension,
+    is_noisy_comment, is_path_token, is_test_path, looks_like_identifier, lower_into,
+    skill_name_from_ref, slugify, strip_boilerplate, strip_nl_prefix, trim_left, trim_right,
+    truncate_at_sentence, STOP_WORDS,
 };
 pub use time::now_secs;
 pub use tokens::{estimate_tokens, estimate_tokens_with, TokenBudget, DEFAULT_CHARS_PER_TOKEN};

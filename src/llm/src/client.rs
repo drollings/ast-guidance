@@ -4,6 +4,8 @@ use common_core::http::shared_http_client;
 
 use fluent_concurrency::llm_queue::{ChatMessage, LlmConfig, LlmError, LlmRequestQueue};
 
+use crate::http_class::HttpClass;
+
 /// Trait for chat backends — sends messages and returns a response string.
 ///
 /// Implemented by `LlmClient` (production) and test stubs.
@@ -284,6 +286,14 @@ async fn chat_complete_http_inner_async(
             .send()
             .await
             .map_err(|e| LlmError::Http(e.to_string()))?;
+        if !response.status().is_success() {
+            let class = HttpClass::from_status(response.status().as_u16());
+            return Err(if class.is_retryable() {
+                LlmError::RateLimited
+            } else {
+                LlmError::Api(format!("HTTP {}", response.status()))
+            });
+        }
         response
             .text()
             .await

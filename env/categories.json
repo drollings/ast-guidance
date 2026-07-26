@@ -1,0 +1,36 @@
+{
+  "patterns": [
+    {
+      "name": "prose",
+      "http_code": 400,
+      "error_message": "Not a prose model",
+      "strings": [
+        "you are a poet",
+        "you are a writer",
+        "you are a chatbot",
+        "you are a novelist",
+        "tell me a story",
+        "write a poem",
+        "write paragraphs of prose",
+        "write a vivid detail",
+        "write conversationally"
+      ]
+    },
+    {
+      "name": "code",
+      "http_code": 400,
+      "error_message": "Not a prose model",
+      "strings": [
+        "you are a software engineer",
+        "you are a software engineer specialized in Rust",
+        "you are a software engineer specialized in Python",
+        "you are an expert software engineer",
+        "you are a software developer",
+        "you are a software architect",
+        "you are a site reliability engineer",
+        "you are a Linux expert",
+        "Output a bash command"
+      ]
+    }
+  ]
+}

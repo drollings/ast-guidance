@@ -8,15 +8,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use common_core::drain_sse_lines;
 use common_core::hash::uuid_v4;
 use common_core::now_secs;
+use common_core::ResponseCache;
 use fluent_wvr::prelude::*;
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
 use crate::config::{ModelEntry, RouteRef, ServerConfig};
-use crate::http_class::HttpClass;
+use crate::dispatch::frontier::{DispatchBackend, OpenAiBackend};
 use crate::ledger::ContentNodeLedger;
 use crate::normalize;
 use crate::streaming::strip_thinking_blocks;
@@ -44,6 +46,7 @@ pub struct RouterServer {
     classifier_url: Option<String>,
     mock_dispatch: Option<Arc<MockDispatchContext>>,
     ledger: Option<Arc<ContentNodeLedger>>,
+    cache: Option<Arc<ResponseCache>>,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
@@ -52,6 +55,8 @@ struct ServerStats {
     requests: AtomicU64,
     errors: AtomicU64,
     rejections: AtomicU64,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
 }
 
 impl RouterServer {
@@ -72,6 +77,7 @@ impl RouterServer {
             classifier_url,
             mock_dispatch: None,
             ledger: None,
+            cache: None,
             depends: vec![],
             provides: vec![ArcIntern::from("http.endpoint")],
         }
@@ -80,6 +86,12 @@ impl RouterServer {
     #[must_use]
     pub fn with_ledger(mut self, ledger: Arc<ContentNodeLedger>) -> Self {
         self.ledger = Some(ledger);
+        self
+    }
+
+    #[must_use]
+    pub fn with_cache(mut self, cache: Arc<ResponseCache>) -> Self {
+        self.cache = Some(cache);
         self
     }
 
@@ -100,6 +112,7 @@ impl RouterServer {
             bind_addr = %self.bind_addr,
             has_mock = self.mock_dispatch.is_some(),
             has_ledger = self.ledger.is_some(),
+            has_cache = self.cache.is_some(),
             "serving HTTP"
         );
         run_http(
@@ -111,6 +124,7 @@ impl RouterServer {
             self.classifier_url.clone(),
             self.mock_dispatch.clone(),
             self.ledger.clone(),
+            self.cache.clone(),
         )
         .await
     }
@@ -138,12 +152,13 @@ impl WorkUnit for RouterServer {
         let classifier_url = self.classifier_url.clone();
         let mock_dispatch = self.mock_dispatch.clone();
         let ledger = self.ledger.clone();
+        let cache = self.cache.clone();
 
         let rt = ctx.rt.clone();
 
         let _handle = rt.spawn(Box::pin(async move {
             if let Err(e) =
-                run_http(pipelines, routes, models, &bind_addr, max_payload, classifier_url, mock_dispatch, ledger)
+                run_http(pipelines, routes, models, &bind_addr, max_payload, classifier_url, mock_dispatch, ledger, cache)
                     .await
             {
                 tracing::error!(target: "router.server", error = %e, "HTTP server error");
@@ -196,6 +211,7 @@ async fn run_http(
     classifier_url: Option<String>,
     mock_dispatch: Option<Arc<MockDispatchContext>>,
     ledger: Option<Arc<ContentNodeLedger>>,
+    cache: Option<Arc<ResponseCache>>,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(bind_addr)
         .await
@@ -207,6 +223,8 @@ async fn run_http(
         requests: AtomicU64::new(0),
         errors: AtomicU64::new(0),
         rejections: AtomicU64::new(0),
+        cache_hits: AtomicU64::new(0),
+        cache_misses: AtomicU64::new(0),
     });
 
     let http_client = Arc::new(reqwest::Client::new());
@@ -227,6 +245,7 @@ async fn run_http(
         let classifier_url = classifier_url.clone();
         let mock_dispatch = mock_dispatch.clone();
         let ledger = ledger.clone();
+        let cache = cache.clone();
         let http_client = http_client.clone();
 
         tokio::spawn(async move {
@@ -243,6 +262,7 @@ async fn run_http(
                     classifier_url.clone(),
                     mock_dispatch.clone(),
                     ledger.clone(),
+                    cache.clone(),
                     http_client.clone(),
                 )
             });
@@ -271,6 +291,7 @@ async fn handle_request(
     classifier_url: Option<String>,
     mock_dispatch: Option<Arc<MockDispatchContext>>,
     ledger: Option<Arc<ContentNodeLedger>>,
+    cache: Option<Arc<ResponseCache>>,
     http_client: Arc<reqwest::Client>,
 ) -> Result<HyperResponse, Infallible> {
     let method = req.method().clone();
@@ -285,7 +306,11 @@ async fn handle_request(
             stats.requests.fetch_add(1, Ordering::Relaxed);
             Ok(json_response(
                 hyper::StatusCode::OK,
-                &serde_json::json!({"status": "ok"}),
+                &serde_json::json!({
+                    "status": "ok",
+                    "cache_hits": stats.cache_hits.load(Ordering::Relaxed),
+                    "cache_misses": stats.cache_misses.load(Ordering::Relaxed),
+                }),
             ))
         }
         ("GET", "/stats") => {
@@ -294,25 +319,75 @@ async fn handle_request(
                 "requests": stats.requests.load(Ordering::Relaxed),
                 "errors": stats.errors.load(Ordering::Relaxed),
                 "rejections": stats.rejections.load(Ordering::Relaxed),
+                "cache_hits": stats.cache_hits.load(Ordering::Relaxed),
+                "cache_misses": stats.cache_misses.load(Ordering::Relaxed),
             });
             Ok(json_response(hyper::StatusCode::OK, &body))
+        }
+        ("POST", "/admin/cache/invalidate") => {
+            if !is_local_request(&req) {
+                return Ok(forbidden_response());
+            }
+            if let Some(ref cache) = cache {
+                cache.invalidate_all();
+                stats.requests.fetch_add(1, Ordering::Relaxed);
+                Ok(json_response(hyper::StatusCode::OK, &serde_json::json!({"status": "ok"})))
+            } else {
+                Ok(json_response(hyper::StatusCode::OK, &serde_json::json!({"status": "no_cache"})))
+            }
         }
         ("POST", "/v1/chat/completions") => {
             handle_chat_completion(
                 req, pipelines, routes, models, stats, max_payload,
-                classifier_url, mock_dispatch, ledger, http_client,
+                classifier_url, mock_dispatch, ledger, cache, http_client,
             )
             .await
         }
         _ => {
-            let code = if path == "/v1/chat/completions" {
-                hyper::StatusCode::METHOD_NOT_ALLOWED
+            // Check for DELETE /admin/cache/{key}
+            if method == "DELETE" && path.starts_with("/admin/cache/") {
+                if !is_local_request(&req) {
+                    return Ok(forbidden_response());
+                }
+                let key = &path["/admin/cache/".len()..];
+                if key.is_empty() {
+                    return Ok(error_response(hyper::StatusCode::BAD_REQUEST, "missing cache key"));
+                }
+                if let Some(ref cache_backend) = cache {
+                    cache_backend.invalidate_key_raw(key);
+                    stats.requests.fetch_add(1, Ordering::Relaxed);
+                    Ok(json_response(hyper::StatusCode::OK, &serde_json::json!({"status": "deleted"})))
+                } else {
+                    Ok(json_response(hyper::StatusCode::OK, &serde_json::json!({"status": "no_cache"})))
+                }
             } else {
-                hyper::StatusCode::NOT_FOUND
-            };
-            Ok(empty_response(code))
+                let code = if path == "/v1/chat/completions" {
+                    hyper::StatusCode::METHOD_NOT_ALLOWED
+                } else {
+                    hyper::StatusCode::NOT_FOUND
+                };
+                Ok(empty_response(code))
+            }
         }
     }
+}
+
+fn is_local_request(req: &hyper::Request<hyper::body::Incoming>) -> bool {
+    req.headers()
+        .get(hyper::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host.eq_ignore_ascii_case("127.0.0.1")
+                || host.eq_ignore_ascii_case("::1")
+                || host.starts_with("localhost:")
+                || host.starts_with("127.0.0.1:")
+                || host.starts_with("[::1]:")
+        })
+}
+
+fn forbidden_response() -> HyperResponse {
+    error_response(hyper::StatusCode::FORBIDDEN, "admin endpoints are localhost-only")
 }
 
 async fn handle_chat_completion(
@@ -325,6 +400,7 @@ async fn handle_chat_completion(
     classifier_url: Option<String>,
     mock_dispatch: Option<Arc<MockDispatchContext>>,
     ledger: Option<Arc<ContentNodeLedger>>,
+    cache: Option<Arc<ResponseCache>>,
     http_client: Arc<reqwest::Client>,
 ) -> Result<HyperResponse, Infallible> {
     let body_bytes = match req.collect().await {
@@ -481,6 +557,8 @@ async fn handle_chat_completion(
             is_stream,
             ledger_node_id,
             ledger.as_ref(),
+            cache.as_ref(),
+            stats.as_ref(),
         )
         .await;
     }
@@ -516,6 +594,8 @@ async fn handle_chat_completion(
             false,
             ledger_node_id,
             ledger.as_ref(),
+            cache.as_ref(),
+            stats.as_ref(),
         )
         .await;
     }
@@ -545,15 +625,41 @@ async fn handle_dispatch(
     is_stream: bool,
     ledger_node_id: Option<fluent_types::NodeId>,
     ledger: Option<&Arc<ContentNodeLedger>>,
+    cache: Option<&Arc<ResponseCache>>,
+    stats: &ServerStats,
 ) -> Result<HyperResponse, Infallible> {
     let target_streams = is_stream && rt.stream;
+
+    // ── Response cache check (buffered only) ─────────────────────
+    if !target_streams {
+        if let Some(cache_backend) = cache {
+            let request_json = serde_json::to_string(router_request).unwrap_or_default();
+            if let Some(cached) = cache_backend.get(&rt.model, &request_json) {
+                stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(target: "router.dispatch", model = %rt.model, "cache hit");
+                let Ok(mut response) = serde_json::from_value::<RouterResponse>(cached.response_json) else {
+                    stats.cache_misses.fetch_add(1, Ordering::Relaxed);
+                    return dispatch_real(rt, router_request, model_name, http_client, target_streams, cache).await;
+                };
+                if rt.filter_thinking {
+                    for choice in &mut response.choices {
+                        if let crate::types::RouterMessageContent::Text(ref mut text) = choice.message.content {
+                            *text = strip_thinking_blocks(text);
+                        }
+                    }
+                }
+                return Ok(completion_to_response(&response, model_name, false, Some(&response.model)));
+            }
+            stats.cache_misses.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     if let Some(mock) = mock_dispatch {
         if let Some(entry) = mock.lookup(user_text) {
             mock.validate_route(entry, Some(rt));
             if mock.is_model_excepted(&rt.model) || mock.is_model_excepted(model_name) {
                 tracing::info!(target: "router.server", model = %rt.model, "excepted model — real LLM call");
-                return dispatch_real(rt, router_request, model_name, http_client, target_streams).await;
+                return dispatch_real(rt, router_request, model_name, http_client, target_streams, cache).await;
             }
             tracing::info!(target: "router.server", model = %model_name, "mock canned response");
             if let Some(node_id) = ledger_node_id {
@@ -576,7 +682,7 @@ async fn handle_dispatch(
         "real dispatch"
     );
 
-    dispatch_real(rt, router_request, model_name, http_client, target_streams).await
+    dispatch_real(rt, router_request, model_name, http_client, target_streams, cache).await
 }
 
 async fn dispatch_real(
@@ -585,6 +691,7 @@ async fn dispatch_real(
     model_name: &str,
     http_client: &reqwest::Client,
     stream: bool,
+    cache: Option<&Arc<ResponseCache>>,
 ) -> Result<HyperResponse, Infallible> {
     let url = build_dispatch_url(&rt.url);
 
@@ -618,7 +725,7 @@ async fn dispatch_real(
         }
     } else {
         let filter_thinking = rt.filter_thinking;
-        let completion = dispatch_to_llm_buffered(
+        let completion = match dispatch_to_llm_buffered(
             http_client,
             &url,
             router_request,
@@ -628,12 +735,14 @@ async fn dispatch_real(
             rt.retry_base_interval_s,
         )
         .await
-        .map_or_else(
-            |e| {
-                tracing::warn!(target: "router.server", error = %e, "dispatch failed, using fallback");
-                fallback_completion(model_name)
-            },
-            |mut c| {
+        {
+            Ok(mut c) => {
+                if let Some(cache) = cache {
+                    let request_json = serde_json::to_string(router_request).unwrap_or_default();
+                    if let Ok(response_json) = serde_json::to_value(&c) {
+                        cache.set(&rt.model, &request_json, response_json);
+                    }
+                }
                 if filter_thinking {
                     for choice in &mut c.choices {
                         if let crate::types::RouterMessageContent::Text(ref mut text) = choice.message.content {
@@ -642,8 +751,12 @@ async fn dispatch_real(
                     }
                 }
                 c
-            },
-        );
+            }
+            Err(e) => {
+                tracing::warn!(target: "router.server", error = %e, "dispatch failed, using fallback");
+                fallback_completion(model_name)
+            }
+        };
         Ok(completion_to_response(&completion, model_name, false, Some(model_name)))
     }
 }
@@ -839,59 +952,30 @@ async fn stream_dispatch_inner(
     tx: &mut http_body_util::channel::Sender<Bytes>,
     handler: &mut StreamingHandler,
 ) -> Result<(), String> {
-    let max_attempts = (retry_count + 1).max(1);
     let idle_dur = Duration::from_millis(idle_timeout_ms);
     let total_dur = Duration::from_millis(total_timeout_ms);
 
-    let stream = tokio::time::timeout(total_dur, async move {
-        let mut last_err = String::new();
-
-        for attempt in 0..max_attempts {
-            let req = http_client
-                .post(url)
-                .header("Content-Type", "application/json")
-                .body(body.to_string());
-
-            match req.send().await {
-                Ok(response) => {
-                    let status = response.status();
-                    if status.is_success() {
-                        return Ok(response);
-                    }
-                    let class = HttpClass::from_status(status.as_u16());
-                    if class.is_retryable() && attempt + 1 < max_attempts {
-                        let status_err = format!("HTTP {status}");
-                        tracing::warn!(target: "router.dispatch", url = %url, attempt = attempt + 1, class = ?class, error = %status_err, "transient failure, retrying");
-                        let delay = retry_base_interval_s * 1000 * (1u64 << attempt);
-                        tokio::time::sleep(Duration::from_millis(delay)).await;
-                        continue;
-                    }
-                    let status_err = format!("HTTP {status}");
-                    tracing::error!(target: "router.dispatch", url = %url, attempt = attempt + 1, class = ?class, error = %status_err, "non-retryable failure");
-                    return Err(status_err);
-                }
-                Err(e) => {
-                    last_err = format!("HTTP error: {e}");
-                    tracing::warn!(target: "router.dispatch", url = %url, attempt = attempt + 1, error = %last_err, "transport error, retrying");
-                    if attempt + 1 < max_attempts {
-                        let delay = retry_base_interval_s * 1000 * (1u64 << attempt);
-                        tokio::time::sleep(Duration::from_millis(delay)).await;
-                        continue;
-                    }
-                    return Err(last_err);
-                }
-            }
-        }
-
-        Err(last_err)
-    })
+    let response = tokio::time::timeout(
+        total_dur,
+        crate::dispatch::retry::retry_http_request(
+            http_client,
+            url,
+            body,
+            retry_count,
+            retry_base_interval_s,
+        ),
+    )
     .await
     .map_err(|_| "total timeout exceeded".to_string())?
-    .map_err(|e| format!("dispatch failed after {max_attempts} attempts: {e}"))?;
+    .map_err(|e| format!("dispatch failed: {e}"))?;
 
-    let mut response_stream = stream;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status()));
+    }
 
-    let mut line_buf = Vec::new();
+    let mut response_stream = response;
+
+    let mut buf = Vec::new();
     let mut sent_first_chunk = false;
 
     loop {
@@ -918,12 +1002,7 @@ async fn stream_dispatch_inner(
             }
         };
 
-        line_buf.extend_from_slice(&chunk);
-
-        while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
-            let line = String::from_utf8_lossy(&line_buf[..pos]).to_string();
-            line_buf.drain(..=pos);
-
+        for line in drain_sse_lines(&mut buf, &chunk) {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -1038,105 +1117,31 @@ async fn dispatch_to_llm_buffered(
         }
     }
 
-    let max_attempts = (retry_count + 1).max(1);
-    let mut last_err = String::new();
+    let response = crate::dispatch::retry::retry_http_request(
+        http_client,
+        &url,
+        &body,
+        retry_count,
+        retry_base_interval_s,
+    )
+    .await?;
 
-    for attempt in 0..max_attempts {
-        let result = http_client.post(&url).json(&body).send().await;
-
-        match result {
-            Ok(response) => {
-                let status = response.status();
-                if status.is_success() {
-                    let json: serde_json::Value = response
-                        .json()
-                        .await
-                        .map_err(|e| format!("response JSON parse: {e}"))?;
-                    return Ok(parse_openai_response(&json, model_name));
-                }
-                let class = HttpClass::from_status(status.as_u16());
-                if class.is_retryable() && attempt + 1 < max_attempts {
-                    last_err = format!("HTTP {status}");
-                    tracing::warn!(target: "router.dispatch", url = %url, attempt = attempt + 1, class = ?class, error = %last_err, "transient failure, retrying");
-                    let delay = retry_base_interval_s * 1000 * (1u64 << attempt);
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
-                    continue;
-                }
-                last_err = format!("HTTP {status}");
-                tracing::error!(target: "router.dispatch", url = %url, attempt = attempt + 1, class = ?class, error = %last_err, "non-retryable failure");
-                break;
-            }
-            Err(e) => {
-                last_err = format!("HTTP error: {e}");
-                tracing::warn!(target: "router.dispatch", url = %url, attempt = attempt + 1, error = %last_err, "transport error, retrying");
-                if attempt + 1 < max_attempts {
-                    let delay = retry_base_interval_s * 1000 * (1u64 << attempt);
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
-                    continue;
-                }
-                break;
-            }
-        }
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {status}"));
     }
 
-    Err(format!(
-        "dispatch failed after {max_attempts} attempts: {last_err}"
-    ))
-}
-
-fn parse_openai_response(json: &serde_json::Value, fallback_model: &str) -> RouterResponse {
-    let id = json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let model = json
-        .get("model")
-        .and_then(|v| v.as_str())
-        .unwrap_or(fallback_model)
-        .to_string();
-    let created = json.get("created").and_then(serde_json::Value::as_u64).unwrap_or(0);
-
-    let choices: Vec<crate::types::RouterChoice> = json
-        .get("choices")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|c| {
-                    let index = c.get("index").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32;
-                    let finish = c
-                        .get("finish_reason")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("stop")
-                        .to_string();
-                    let msg = c.get("message")?;
-                    let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("assistant").to_string();
-                    let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    Some(crate::types::RouterChoice {
-                        index,
-                        message: RouterMessage {
-                            role,
-                            content: RouterMessageContent::Text(content),
-                            tool_calls: None,
-                            tool_call_id: None,
-                        },
-                        finish_reason: finish,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let usage = json.get("usage").map_or(Usage::default(), |u| Usage {
-        prompt_tokens: u.get("prompt_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32,
-        completion_tokens: u.get("completion_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32,
-        total_tokens: u.get("total_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32,
-    });
-
-    RouterResponse {
-        id,
-        object: "chat.completion".into(),
-        created,
-        model,
-        choices,
-        usage,
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("response JSON parse: {e}"))?;
+    let mut response = OpenAiBackend::new(&url, None)
+        .parse_response(&json)
+        .map_err(|e| format!("parse: {e}"))?;
+    if response.model == "unknown" && model_name != "unknown" {
+        response.model = model_name.to_string();
     }
+    Ok(response)
 }
 
 fn fallback_completion(model_name: &str) -> RouterResponse {

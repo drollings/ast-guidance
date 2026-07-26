@@ -36,6 +36,7 @@ impl PlanRoute {
         }
     }
 
+    #[must_use]
     pub fn with_index(mut self, index: crate::hnsw::HnswIndexHandle) -> Self {
         self.workflow_index = Some(index);
         self

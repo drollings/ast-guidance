@@ -112,96 +112,95 @@ pub fn init_router_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::er
     }).transpose()?;
 
     // ── Build per-branch subscribers ──────────────────────────────────
-    // Use a nested helper struct with a blanket impl to erase concrete types.
-    struct SubBuilder {
-        json: bool,
-        console: bool,
-        non_blocking: tracing_appender::non_blocking::NonBlocking,
-        guard: tracing_appender::non_blocking::WorkerGuard,
-        env_filter: EnvFilter,
-        audit: Option<AuditResources>,
-    }
+    // tracing_subscriber's `.with()` changes the concrete type per layer,
+    // requiring a match over optional layer combinations. Helper functions
+    // and a macro keep the arms compact while respecting the type system.
+    //
+    // `Layer` trait is imported at the top of this function via
+    // `use tracing_subscriber::Layer;`
 
-    impl SubBuilder {
-        fn build(self) {
-            let json = self.json;
-            let has_console = self.console;
-            let nb = self.non_blocking;
-            let env_filter = self.env_filter;
-
-            // Each arm has a unique concrete type. We match all combos.
-            match (json, has_console, self.audit.is_some()) {
-                (true, true, true) => {
-                    let audit = self.audit.unwrap();
-                    tracing_subscriber::registry()
-                        .with(tracing_subscriber::fmt::layer().json().with_writer(nb).with_filter(env_filter))
-                        .with(tracing_subscriber::fmt::layer().json().with_writer(std::io::stderr).with_filter(
-                            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))))
-                        .with(tracing_subscriber::fmt::layer().json().with_writer(audit.appender).with_filter(EnvFilter::new("router.audit=info")))
-                        .init();
-                }
-                (true, true, false) => {
-                    tracing_subscriber::registry()
-                        .with(tracing_subscriber::fmt::layer().json().with_writer(nb).with_filter(env_filter))
-                        .with(tracing_subscriber::fmt::layer().json().with_writer(std::io::stderr).with_filter(
-                            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))))
-                        .init();
-                }
-                (true, false, true) => {
-                    let audit = self.audit.unwrap();
-                    tracing_subscriber::registry()
-                        .with(tracing_subscriber::fmt::layer().json().with_writer(nb).with_filter(env_filter))
-                        .with(tracing_subscriber::fmt::layer().json().with_writer(audit.appender).with_filter(EnvFilter::new("router.audit=info")))
-                        .init();
-                }
-                (true, false, false) => {
-                    tracing_subscriber::registry()
-                        .with(tracing_subscriber::fmt::layer().json().with_writer(nb).with_filter(env_filter))
-                        .init();
-                }
-                (false, true, true) => {
-                    let audit = self.audit.unwrap();
-                    tracing_subscriber::registry()
-                        .with(tracing_subscriber::fmt::layer().with_writer(nb).with_filter(env_filter))
-                        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_filter(
-                            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))))
-                        .with(tracing_subscriber::fmt::layer().json().with_writer(audit.appender).with_filter(EnvFilter::new("router.audit=info")))
-                        .init();
-                }
-                (false, true, false) => {
-                    tracing_subscriber::registry()
-                        .with(tracing_subscriber::fmt::layer().with_writer(nb).with_filter(env_filter))
-                        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_filter(
-                            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))))
-                        .init();
-                }
-                (false, false, true) => {
-                    let audit = self.audit.unwrap();
-                    tracing_subscriber::registry()
-                        .with(tracing_subscriber::fmt::layer().with_writer(nb).with_filter(env_filter))
-                        .with(tracing_subscriber::fmt::layer().json().with_writer(audit.appender).with_filter(EnvFilter::new("router.audit=info")))
-                        .init();
-                }
-                (false, false, false) => {
-                    tracing_subscriber::registry()
-                        .with(tracing_subscriber::fmt::layer().with_writer(nb).with_filter(env_filter))
-                        .init();
-                }
-            }
-
-            std::mem::forget(self.guard);
+    /// Build a console (stderr) log layer with optional JSON formatting.
+    fn console_layer<S>(json: bool) -> Box<dyn Layer<S> + Send + Sync>
+    where
+        S: SubscriberExt + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("info"));
+        if json {
+            tracing_subscriber::fmt::layer().json()
+                .with_writer(std::io::stderr)
+                .with_filter(filter)
+                .boxed()
+        } else {
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(filter)
+                .boxed()
         }
     }
 
-    SubBuilder {
-        json: config.json_format,
-        console: config.console_output,
-        non_blocking,
-        guard,
-        env_filter,
-        audit: audit_resources,
+    /// Build an audit log layer (always JSON-formatted).
+    fn audit_layer<S>(writer: tracing_appender::non_blocking::NonBlocking) -> Box<dyn Layer<S> + Send + Sync>
+    where
+        S: SubscriberExt + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        tracing_subscriber::fmt::layer().json()
+            .with_writer(writer)
+            .with_filter(EnvFilter::new("router.audit=info"))
+            .boxed()
     }
-    .build();
+
+    macro_rules! init_registry {
+        ($file_layer:expr, $has_console:expr, $audit:expr $(,)?) => {{
+            let file = $file_layer;
+            let console = $has_console;
+            let audit = $audit;
+
+            match (console, audit.is_some()) {
+                (true, true) => {
+                    tracing_subscriber::registry()
+                        .with(file)
+                        .with(console_layer(config.json_format))
+                        .with(audit_layer(audit.unwrap()))
+                        .init();
+                }
+                (true, false) => {
+                    tracing_subscriber::registry()
+                        .with(file)
+                        .with(console_layer(config.json_format))
+                        .init();
+                }
+                (false, true) => {
+                    tracing_subscriber::registry()
+                        .with(file)
+                        .with(audit_layer(audit.unwrap()))
+                        .init();
+                }
+                (false, false) => {
+                    tracing_subscriber::registry()
+                        .with(file)
+                        .init();
+                }
+            }
+        }};
+    }
+
+    let audit_writer: Option<tracing_appender::non_blocking::NonBlocking> =
+        audit_resources.map(|r| r.appender);
+
+    if config.json_format {
+        let file_layer = tracing_subscriber::fmt::layer().json()
+            .with_writer(non_blocking)
+            .with_filter(env_filter);
+        init_registry!(file_layer, config.console_output, audit_writer);
+    } else {
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_writer(non_blocking)
+            .with_filter(env_filter);
+        init_registry!(file_layer, config.console_output, audit_writer);
+    }
+
+    std::mem::forget(guard);
 
     tracing::info!(target: "router.logging", log_dir = %config.log_dir.display(), audit = config.audit_log.is_some(), "router logging initialized");
 

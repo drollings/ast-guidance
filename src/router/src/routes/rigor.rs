@@ -1,10 +1,15 @@
-use std::sync::Arc;
-
-use crate::kv_cache::KvCacheManager;
-use crate::orchestrator::OrchestratorSession;
+/// Context passed to the rigor route's execute method. Contains the minimal
+/// information needed for the 3-pass blue/red/judge protocol.
+#[derive(Debug, Clone)]
+pub struct RigorContext {
+    pub user_message: String,
+    pub session_id: String,
+    pub model_endpoint: String,
+}
 
 pub struct RigorRoute {
-    kv_cache: Option<Arc<KvCacheManager>>,
+    /// Whether to support KV-cache checkpoint/rewind for dead-end recovery.
+    pub kv_cache_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -38,12 +43,12 @@ impl Default for RigorRoute {
 impl RigorRoute {
     #[must_use]
     pub fn new() -> Self {
-        Self { kv_cache: None }
+        Self { kv_cache_enabled: false }
     }
 
     #[must_use]
-    pub fn with_kv_cache(mut self, cache: Arc<KvCacheManager>) -> Self {
-        self.kv_cache = Some(cache);
+    pub fn with_kv_cache(mut self) -> Self {
+        self.kv_cache_enabled = true;
         self
     }
 
@@ -54,11 +59,7 @@ impl RigorRoute {
     /// 4. Judge: score blue vs red, produce verdict
     /// 5. If judge confidence low → frontier escalation (§8.4)
     /// 6. If red team wins materially → interview user
-    pub fn execute(
-        &self,
-        _session: &OrchestratorSession,
-        _user_message: &str,
-    ) -> Result<RigoResult, RigorError> {
+    pub fn execute(&self, _ctx: &RigorContext) -> Result<RigoResult, RigorError> {
         Err(RigorError::NotImplemented)
     }
 }

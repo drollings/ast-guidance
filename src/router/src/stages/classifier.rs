@@ -106,7 +106,7 @@ impl WorkUnit for ClassifierStage {
         let messages = vec![
             ChatMessage {
                 role: "system".into(),
-                content: system_prompt.to_string(),
+                content: system_prompt.clone(),
             },
             ChatMessage {
                 role: "user".into(),
@@ -203,6 +203,31 @@ impl WorkUnit for ClassifierStage {
         }
 
         let action = output.action.as_str();
+
+        if action == "reject" {
+            tracing::info!(target: "router.pipeline.stage2",
+                reason = %output.reason,
+                "classifier rejected request"
+            );
+            return WorkOutput::typed(
+                "rejected",
+                &StageDecision {
+                    stage: PipelineStage::Classifier,
+                    verdict: StageVerdict::Rejected,
+                    score: Some(output.coherence_score),
+                    reason: format!("blocked: {}", output.reason),
+                    latency_ms: 0,
+                    metadata: serde_json::json!({
+                        "coherence_score": output.coherence_score,
+                        "safety_score": output.safety_score,
+                        "intent": output.intent,
+                        "action": output.action,
+                        "reason": output.reason,
+                    }),
+                },
+            );
+        }
+
         let min_complexity = output.complexity;
         let resolved_route = output.target.as_deref().unwrap_or(&self.routing_config.default_route);
         let routing_target = match action {

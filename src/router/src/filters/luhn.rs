@@ -1,7 +1,7 @@
 pub fn luhn_valid(input: &str) -> bool {
     let digits: Vec<u32> = input
         .chars()
-        .filter(|c| c.is_ascii_digit())
+        .filter(char::is_ascii_digit)
         .filter_map(|c| c.to_digit(10))
         .collect();
     if digits.len() < 13 || digits.len() > 19 {

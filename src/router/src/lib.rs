@@ -1,16 +1,4 @@
 //! LLM Router & Agent Orchestration Framework
-#![allow(
-    clippy::collapsible_match,
-    clippy::default_constructed_unit_structs,
-    clippy::implicit_clone,
-    clippy::match_same_arms,
-    clippy::module_name_repetitions,
-    clippy::redundant_closure_for_method_calls,
-    clippy::return_self_not_must_use,
-    clippy::unnecessary_wraps,
-)]
-
-
 //!
 //! See `ROADMAP_20260722_CORAL_ROUTER.md` for the full architecture.
 //!
@@ -55,7 +43,6 @@ pub mod indexer;
 pub mod filters;
 pub mod frontier;
 pub mod hnsw;
-pub mod http_class;
 pub mod ledger;
 pub mod logging;
 pub mod metrics;
