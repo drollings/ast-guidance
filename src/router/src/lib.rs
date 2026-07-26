@@ -46,6 +46,7 @@ pub mod hnsw;
 pub mod ledger;
 pub mod logging;
 pub mod metrics;
+pub mod telemetry;
 pub mod routes;
 pub mod score_matrix;
 

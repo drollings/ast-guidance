@@ -80,7 +80,12 @@ pub use string::{
     truncate_at_sentence, STOP_WORDS,
 };
 pub use time::now_secs;
-pub use tokens::{estimate_tokens, estimate_tokens_with, TokenBudget, DEFAULT_CHARS_PER_TOKEN};
+pub use tokens::{
+    estimate_tokens, estimate_tokens_floor, estimate_tokens_with, chunk_document, AtomicTokenBudget,
+    ChunkConfig, TokenBudget,
+};
+#[allow(deprecated)]
+pub use tokens::DEFAULT_CHARS_PER_TOKEN;
 pub use walk::{collect_extensions, should_skip_dir, walk_files, SOURCE_EXTENSIONS};
 pub use watchdog::{
     BudgetWatchdog, RepetitionWatchdog, WallClockWatchdog, WatchdogEvent, WatchdogEventType,

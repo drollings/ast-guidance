@@ -3,6 +3,8 @@ pub mod none;
 pub mod pii_anonymize;
 pub mod decompose_hypothetical;
 pub mod decompose_subtasks;
+pub mod sanitize;
+pub mod secret_mask;
 
 #[cfg(test)]
 mod tests;

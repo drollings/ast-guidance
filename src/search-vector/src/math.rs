@@ -2,19 +2,19 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
     }
-    let mut dot = 0.0;
-    let mut na = 0.0;
-    let mut nb = 0.0;
+    let mut dot = 0.0_f64;
+    let mut na = 0.0_f64;
+    let mut nb = 0.0_f64;
     for (x, y) in a.iter().zip(b.iter()) {
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
+        dot += f64::from(x * y);
+        na += f64::from(x * x);
+        nb += f64::from(y * y);
     }
     let mag = na.sqrt() * nb.sqrt();
     if mag == 0.0 {
         0.0
     } else {
-        dot / mag
+        (dot / mag) as f32
     }
 }
 
@@ -226,5 +226,49 @@ mod tests {
         let query = vec![1.0, 0.0];
         let results: Vec<(u32, f32)> = knn_brute_force(&query, std::iter::empty(), 5);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn cosine_similarity_preserves_ranking_in_high_dimensions() {
+        let dim = 512;
+        let base: f32 = 1.0 / (dim as f32).sqrt(); // unit-length-ish
+        let mut q = vec![base; dim];
+        let a = vec![base; dim];
+        let mut b = vec![base; dim];
+        // Slightly perturb q and b so they are close but distinguishable
+        q[0] = base + 0.002;
+        b[0] = base - 0.002;
+        let sim_qa = cosine_similarity(&q, &a);
+        let sim_qb = cosine_similarity(&q, &b);
+        // a is closer to q than b because q[0] and a[0] are both base+0.002
+        // while b[0] = base-0.002
+        assert!(
+            sim_qa > sim_qb,
+            "cosine(q,a)={sim_qa} should be > cosine(q,b)={sim_qb}"
+        );
+    }
+
+    #[test]
+    fn cosine_similarity_f64_accumulation_precision() {
+        let dim = 384;
+        let mut q = Vec::with_capacity(dim);
+        let mut a = Vec::with_capacity(dim);
+        let mut b = Vec::with_capacity(dim);
+        for i in 0..dim {
+            let val = (i as f32 + 1.0) * 0.001;
+            q.push(val);
+            a.push(val);
+            if i < dim - 1 {
+                b.push(val);
+            } else {
+                b.push(val * 0.99);
+            }
+        }
+        let sim_qa = cosine_similarity(&q, &a);
+        let sim_qb = cosine_similarity(&q, &b);
+        assert!(
+            sim_qa > sim_qb,
+            "cosine(q,a)={sim_qa:.10} should be > cosine(q,b)={sim_qb:.10}"
+        );
     }
 }

@@ -13,7 +13,7 @@ pub fn select_lod(page_context: &str, token_budget: usize) -> (usize, &'static s
     // Levels 0–4 map to indices 0–4; skip level 5 (alias of full text).
     let limit = 5.min(slices.len());
     for (level, slice) in slices.iter().take(limit).enumerate() {
-        if estimate_tokens(slice) <= token_budget {
+        if estimate_tokens(slice) <= token_budget as u64 {
             return (level, LOD_LABELS[level]);
         }
     }
@@ -33,7 +33,7 @@ pub fn chunk_page_context(page_context: &str, token_budget: usize) -> String {
     // Find best level (0–4).
     let limit = 5.min(slices.len());
     for slice in slices.iter().take(limit) {
-        if estimate_tokens(slice) <= token_budget {
+        if estimate_tokens(slice) <= token_budget as u64 {
             return slice.clone();
         }
     }

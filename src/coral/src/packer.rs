@@ -1,4 +1,4 @@
-use common_core::tokens::{estimate_tokens, DEFAULT_CHARS_PER_TOKEN};
+use common_core::tokens::estimate_tokens;
 use common_core::tokens::TokenBudget;
 use fluent_types::{ContextNode, NodeId};
 use thiserror::Error;
@@ -30,13 +30,13 @@ impl ContextPacker {
     pub fn new(token_budget: usize) -> Self {
         Self {
             budget: TokenBudget(token_budget),
-            chars_per_token: DEFAULT_CHARS_PER_TOKEN,
+            chars_per_token: 4,
         }
     }
 
     /// Estimate token count from text length.
     pub fn estimate_tokens(text: &str) -> usize {
-        estimate_tokens(text)
+        estimate_tokens(text) as usize
     }
 
     /// Select the appropriate LOD level based on graph distance.
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn test_estimate_tokens() {
-        assert_eq!(ContextPacker::estimate_tokens("hello"), 2);
+        assert_eq!(ContextPacker::estimate_tokens("hello"), 1);
         assert_eq!(ContextPacker::estimate_tokens(""), 0);
         assert_eq!(ContextPacker::estimate_tokens(&"a".repeat(12)), 3);
     }

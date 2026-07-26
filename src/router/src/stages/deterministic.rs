@@ -5,6 +5,7 @@ use fluent_wvr::prelude::*;
 use regex::Regex;
 
 use crate::filters::{DeterministicFilterEngine, FilterContext, FilterDecision};
+use crate::filters::injection_detect::InjectionDetectFilter;
 use crate::filters::regex_filter::RegexFilter;
 use crate::config::RejectPatterns;
 use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
@@ -125,6 +126,7 @@ impl DeterministicPreFilter {
                 engine.add_filter(Box::new(filter));
             }
         }
+        engine.add_filter(Box::new(InjectionDetectFilter::new(0.30)));
         engine
     }
 

@@ -1,3 +1,4 @@
+pub mod injection_detect;
 pub mod regex_filter;
 pub mod luhn;
 

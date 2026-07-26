@@ -42,8 +42,8 @@ pub fn build_field_prompt(
     let profile_json = serde_json::to_string_pretty(profile).unwrap_or_else(|_| "{}".into());
 
     // Compute token budget: max_tokens minus profile and system prompt overhead.
-    let system_tokens = estimate_tokens(&system);
-    let profile_tokens = estimate_tokens(&profile_json);
+    let system_tokens = estimate_tokens(&system) as usize;
+    let profile_tokens = estimate_tokens(&profile_json) as usize;
     let token_budget = DEFAULT_MAX_TOKENS
         .saturating_sub(profile_tokens)
         .saturating_sub(system_tokens);
