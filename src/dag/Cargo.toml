@@ -10,6 +10,7 @@ fluent-wvr = { path = "../fluent-wvr" }
 bitvec = { workspace = true }
 internment = { workspace = true, features = ["arc"] }
 thiserror = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 bon = { workspace = true }

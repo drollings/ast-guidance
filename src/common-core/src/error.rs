@@ -39,6 +39,11 @@ pub enum ResolverError {
     TargetNotFound(String),
     #[error("missing dependency: {0}")]
     MissingDependency(String),
+    #[error("ambiguous dependency: '{name}' could be provided by {}", candidates.join(", "))]
+    AmbiguousDependency {
+        name: String,
+        candidates: Vec<String>,
+    },
     #[error("execution failed: {0}")]
     ExecutionFailed(String),
 }

@@ -1,0 +1,14 @@
+[package]
+name = "yamake-coral"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fluent-dag = { path = "../../dag" }
+common-core = { path = "../../common-core" }
+fluent-types = { path = "../../types" }
+clap = { workspace = true, features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bitvec = { workspace = true }
+internment = { workspace = true, features = ["arc"] }

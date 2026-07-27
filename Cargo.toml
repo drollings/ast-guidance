@@ -24,6 +24,7 @@ members = [
     "src/job-copilot",
     "src/bin/job-copilot-daemon",
     "src/bin/coral-router",
+    "src/bin/yamake-coral",
 ]
 
 [workspace.package]
