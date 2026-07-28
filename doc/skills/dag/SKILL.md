@@ -79,7 +79,9 @@ for node in graph.topo_sort()? {
 | Module | Purpose | Path |
 |--------|---------|------|
 | `executor` | Executes a sequence of targets through the graph | `src/dag/src/executor.rs` |
-| `resolver` | Resolves abstract dependencies to concrete targets | `src/dag/src/resolver.rs` |
+| `resolver` | Resolves abstract dependencies to concrete targets; `ProviderSelection::{All, NarrowOne}` policy | `src/dag/src/resolver.rs` |
+| `closure` | Shared transitive-closure primitive (DFS over depends edges) — `pub(crate)` | `src/dag/src/closure.rs` |
+| `narrowing` | Narrowing rules + canonical error constructors — `pub(crate)` | `src/dag/src/narrowing.rs` |
 | `work_unit` | CommandUnit — shell command wrapper implementing `Component` | `src/dag/src/work_unit.rs` |
 | `target` | Target registry — register and retrieve typed build targets | `src/dag/src/target.rs` |
 | `middleware` | TimingMiddleware, RetryMiddleware, MiddlewareChain | `src/dag/src/middleware.rs` |

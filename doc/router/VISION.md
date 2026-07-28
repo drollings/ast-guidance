@@ -1,8 +1,6 @@
 # Coral Router — Vision
 
-*Supersedes `VISION.md` and `VISION_20260725.md`. Detailed design lives in
-`MOA_ROUTER_SPEC.md`; execution status is tracked against the current
-roadmap. This document is the stable, high-level briefing — read it first,
+*This document is the stable, high-level briefing — read it first,
 then the spec for mechanism, then the roadmap for what's actually landed
 versus still a stub.*
 

@@ -1,8 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use crate::closure::{self, ClosureCtx};
+use crate::narrowing;
 use crate::target::TargetRegistry;
-use bitvec::vec::BitVec;
 use common_core::error::ResolverError;
+use common_core::interner::CapabilityRegistry;
 use fluent_types::TargetType;
 
 #[derive(Debug, Clone)]
@@ -18,6 +20,19 @@ impl ExecutionPlan {
     pub fn is_empty(&self) -> bool {
         self.order.is_empty()
     }
+}
+
+/// Provider-selection policy for the resolver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderSelection {
+    /// Classic include-all semantics: every provider produces a distinct
+    /// artifact. Correct for build graphs where multiple providers for the
+    /// same capability should all be included.
+    All,
+    /// Yamake capability-graph semantics: apply narrowing rules to pick
+    /// exactly one provider per contested capability. Report structured
+    /// ambiguity when narrowing fails.
+    NarrowOne,
 }
 
 /// Resolves target dependencies into an execution order using Kahn's algorithm.
@@ -36,7 +51,9 @@ impl ExecutionPlan {
 /// ```
 pub struct DependencyResolver<'a> {
     registry: &'a TargetRegistry,
-    pub(crate) strict: bool,
+    strict: bool,
+    caps: Option<&'a CapabilityRegistry>,
+    selection: ProviderSelection,
 }
 
 impl<'a> DependencyResolver<'a> {
@@ -44,65 +61,274 @@ impl<'a> DependencyResolver<'a> {
         Self {
             registry,
             strict: true,
+            caps: None,
+            selection: ProviderSelection::All,
         }
     }
+
+    pub fn with_narrowing(
+        registry: &'a TargetRegistry,
+        caps: &'a CapabilityRegistry,
+    ) -> Self {
+        Self {
+            registry,
+            strict: true,
+            caps: Some(caps),
+            selection: ProviderSelection::NarrowOne,
+        }
+    }
+
     #[must_use]
     pub fn with_strict(mut self, strict: bool) -> Self {
         self.strict = strict;
         self
     }
 
+    #[must_use]
+    pub fn with_selection(mut self, sel: ProviderSelection) -> Self {
+        self.selection = sel;
+        self
+    }
+
     pub fn resolve(&self, target_names: &[&str]) -> Result<ExecutionPlan, ResolverError> {
-        let mut needed: HashMap<usize, usize> = HashMap::new();
-        let mut stack: Vec<usize> = Vec::new();
-        for name in target_names {
-            let target = self
-                .registry
-                .get(name)
-                .ok_or_else(|| ResolverError::TargetNotFound(name.to_string()))?;
-            stack.push(target.id as usize);
+        if target_names.is_empty() {
+            return Ok(ExecutionPlan {
+                order: Vec::new(),
+                target_names: Vec::new(),
+            });
         }
-        while let Some(bit_idx) = stack.pop() {
-            if needed.contains_key(&bit_idx) {
-                continue;
-            }
-            let target =
+
+        let seed_bits: Result<Vec<usize>, ResolverError> = target_names
+            .iter()
+            .map(|name| {
                 self.registry
-                    .get_by_bit_index(bit_idx)
-                    .ok_or(ResolverError::TargetNotFound(format!(
-                        "bit_index {bit_idx}"
-                    )))?;
-            needed.insert(bit_idx, bit_idx);
-            for cap_idx in target.depends.iter_ones() {
-                let providers = self.registry.get_providers(cap_idx);
-                if providers.is_empty() && self.strict {
-                    return Err(ResolverError::MissingDependency(format!(
-                        "no provider for capability {cap_idx} required by '{}'",
-                        target.name
-                    )));
+                    .get(name)
+                    .map(|t| t.id as usize)
+                    .ok_or_else(|| ResolverError::TargetNotFound(name.to_string()))
+            })
+            .collect();
+        let seed_bits = seed_bits?;
+
+        match self.selection {
+            ProviderSelection::All => self.resolve_all(seed_bits),
+            ProviderSelection::NarrowOne => {
+                let caps = self.caps.ok_or_else(|| {
+                    ResolverError::MissingDependency(
+                        "NarrowOne requires a CapabilityRegistry".into(),
+                    )
+                })?;
+                self.resolve_narrow_one(&seed_bits, target_names, caps)
+            }
+        }
+    }
+
+    fn resolve_all(&self, seed_bits: Vec<usize>) -> Result<ExecutionPlan, ResolverError> {
+        let ctx = ClosureCtx {
+            registry: self.registry,
+            caps: None,
+            strict: self.strict,
+        };
+        let needed = closure::transitive_closure(&ctx, seed_bits, None, None)?;
+        self.plan_from_set(&needed)
+    }
+
+    fn resolve_narrow_one(
+        &self,
+        seed_bits: &[usize],
+        target_names: &[&str],
+        caps: &'a CapabilityRegistry,
+    ) -> Result<ExecutionPlan, ResolverError> {
+        let ctx = ClosureCtx {
+            registry: self.registry,
+            caps: Some(caps),
+            strict: self.strict,
+        };
+
+        let has_abstract_seed = target_names.iter().any(|name| {
+            self.registry
+                .get(name)
+                .is_some_and(|t| t.target_type == TargetType::Abstract)
+        });
+
+        // Step 2: compute full closure to check for multi-provider caps
+        let closure_set =
+            closure::transitive_closure(&ctx, seed_bits.iter().copied(), None, None)?;
+
+        let mut multi_provider_cap = false;
+        for &bit in &closure_set {
+            if let Some(target) = self.registry.get_by_bit_index(bit) {
+                for cap in target.depends.iter_ones() {
+                    if self.registry.get_providers(cap).len() > 1 {
+                        multi_provider_cap = true;
+                        break;
+                    }
                 }
-                for provider in providers {
-                    let provider_bit_idx = provider.id as usize;
-                    if !needed.contains_key(&provider_bit_idx) {
-                        stack.push(provider_bit_idx);
+            }
+            if multi_provider_cap {
+                break;
+            }
+        }
+
+        // Fast path: no ambiguity at all → delegate to All (zero narrowing overhead)
+        if !has_abstract_seed && !multi_provider_cap {
+            return self.resolve_all(seed_bits.to_vec());
+        }
+
+        let mut resolved_set: HashSet<usize> = seed_bits.iter().copied().collect();
+        let mut rejected: HashSet<usize> = HashSet::new();
+        let mut narrowed_caps: HashSet<usize> = HashSet::new();
+        let mut changed = true;
+
+        // Step 4: NarrowOne fixpoint loop
+        while changed {
+            changed = false;
+            let full_provides = compute_full_provides(self.registry, &resolved_set);
+
+            let snapshot: Vec<usize> = resolved_set.iter().copied().collect();
+
+            for &bit_idx in &snapshot {
+                let target = self.registry.get_by_bit_index(bit_idx).ok_or_else(|| {
+                    ResolverError::TargetNotFound(format!("bit_index {bit_idx}"))
+                })?;
+
+                let is_abstract = target.target_type == TargetType::Abstract;
+                let deps_satisfied = target.depends.not_any()
+                    || target
+                        .depends
+                        .iter_ones()
+                        .all(|c| full_provides.contains(&c));
+
+                if !deps_satisfied {
+                    for cap_idx in target.depends.iter_ones() {
+                        if narrowed_caps.contains(&cap_idx) || full_provides.contains(&cap_idx) {
+                            continue;
+                        }
+                        let providers = self.registry.get_providers(cap_idx);
+                        if providers.is_empty() {
+                            if let Some(cap_name) = caps.get_name(cap_idx) {
+                                if let Some(implicit) = self.registry.get(&cap_name) {
+                                    if resolved_set.insert(implicit.id as usize) {
+                                        changed = true;
+                                    }
+                                    continue;
+                                }
+                            }
+                            if self.strict {
+                                return Err(narrowing::missing_provider_error(
+                                    Some(caps),
+                                    cap_idx,
+                                    &target.name,
+                                ));
+                            }
+                            continue;
+                        }
+                        if providers.len() == 1 {
+                            if resolved_set.insert(providers[0].id as usize) {
+                                changed = true;
+                            }
+                            continue;
+                        }
+                        narrowed_caps.insert(cap_idx);
+                        let narrowed =
+                            narrowing::narrow_providers(providers.clone(), &full_provides);
+                        match narrowed.len() {
+                            0 => {
+                                return Err(narrowing::missing_provider_error(
+                                    Some(caps),
+                                    cap_idx,
+                                    &target.name,
+                                ));
+                            }
+                            1 => {
+                                if resolved_set.insert(narrowed[0].id as usize) {
+                                    changed = true;
+                                }
+                                for candidate in providers {
+                                    if candidate.id != narrowed[0].id {
+                                        rejected.insert(candidate.id as usize);
+                                    }
+                                }
+                            }
+                            _ => {
+                                return Err(narrowing::ambiguous_error(
+                                    Some(caps),
+                                    cap_idx,
+                                    &narrowed,
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                // Abstract self-provision branch
+                if is_abstract || target.depends.not_any() {
+                    let cap_idx = caps.get_index(&target.name);
+                    if let Some(ci) = cap_idx {
+                        if narrowed_caps.contains(&ci) {
+                            continue;
+                        }
+                        let providers = self.registry.get_providers(ci);
+                        if providers.len() > 1 {
+                            narrowed_caps.insert(ci);
+                            let narrowed =
+                                narrowing::narrow_providers(providers.clone(), &full_provides);
+                            match narrowed.len() {
+                                1 => {
+                                    if resolved_set.insert(narrowed[0].id as usize) {
+                                        changed = true;
+                                    }
+                                    for candidate in providers {
+                                        if candidate.id != narrowed[0].id {
+                                            rejected.insert(candidate.id as usize);
+                                        }
+                                    }
+                                }
+                                0 => {}
+                                _ => {
+                                    return Err(narrowing::ambiguous_error(
+                                        Some(caps),
+                                        ci,
+                                        &narrowed,
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-        let mut in_degree: HashMap<usize, usize> = needed.keys().map(|&k| (k, 0)).collect();
+
+        // Step 5: Final expansion with satisfied + rejected guards (M2.4 fix)
+        let full_provides = compute_full_provides(self.registry, &resolved_set);
+        let final_expansion = closure::transitive_closure(
+            &ctx,
+            resolved_set.iter().copied(),
+            Some(&full_provides),
+            Some(&rejected),
+        )?;
+        let mut combined: HashSet<usize> = resolved_set;
+        combined.extend(final_expansion);
+
+        // Step 6: Kahn's topological sort — use the combined set directly
+        // (no re-expansion: narrowing decisions must be preserved).
+        self.plan_from_set(&combined)
+    }
+
+    fn plan_from_set(&self, needed: &HashSet<usize>) -> Result<ExecutionPlan, ResolverError> {
+        let mut in_degree: HashMap<usize, usize> = needed.iter().map(|&k| (k, 0)).collect();
         let mut adj: HashMap<usize, Vec<usize>> = HashMap::new();
-        for &bit_idx in needed.keys() {
-            let target =
-                self.registry
-                    .get_by_bit_index(bit_idx)
-                    .ok_or(ResolverError::TargetNotFound(format!(
-                        "bit_index {bit_idx}"
-                    )))?;
+        for &bit_idx in needed {
+            let target = self
+                .registry
+                .get_by_bit_index(bit_idx)
+                .ok_or(ResolverError::TargetNotFound(format!(
+                    "bit_index {bit_idx}"
+                )))?;
             for cap_idx in target.depends.iter_ones() {
                 let providers = self.registry.get_providers(cap_idx);
                 for provider in providers {
                     let provider_bit_idx = provider.id as usize;
-                    if needed.contains_key(&provider_bit_idx) && provider_bit_idx != bit_idx {
+                    if needed.contains(&provider_bit_idx) && provider_bit_idx != bit_idx {
                         adj.entry(provider_bit_idx).or_default().push(bit_idx);
                         *in_degree.get_mut(&bit_idx).unwrap() += 1;
                     }
@@ -150,42 +376,25 @@ impl<'a> DependencyResolver<'a> {
         })
     }
 
-    pub fn resolve_abstract_dependencies(
-        &self,
-        target_names: &[&str],
-        provided: &BitVec,
-    ) -> Result<ExecutionPlan, ResolverError> {
-        let mut combined: Vec<String> = target_names.iter().map(ToString::to_string).collect();
-        for name in target_names {
-            let target = self
-                .registry
-                .get(name)
-                .ok_or_else(|| ResolverError::TargetNotFound(name.to_string()))?;
-            if target.target_type == TargetType::Abstract {
-                let required = &target.depends;
-                let missing: BitVec = required.clone() & !provided.clone();
-                if missing.not_any() {
-                    continue;
-                }
-                for cap_idx in missing.iter_ones() {
-                    for provider in self.registry.get_providers(cap_idx) {
-                        let pname = provider.name.to_string();
-                        if !combined.contains(&pname) {
-                            combined.push(pname);
-                        }
-                    }
-                }
+}
+
+fn compute_full_provides(registry: &TargetRegistry, target_set: &HashSet<usize>) -> HashSet<usize> {
+    let mut provides: HashSet<usize> = HashSet::new();
+    for &bit_idx in target_set {
+        if let Some(target) = registry.get_by_bit_index(bit_idx) {
+            for cap in target.provides.iter_ones() {
+                provides.insert(cap);
             }
         }
-        let names: Vec<&str> = combined.iter().map(String::as_str).collect();
-        self.resolve(&names)
     }
+    provides
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::target::{Target, TargetRegistry};
+    use bitvec::vec::BitVec;
     use fluent_types::{ExecutorKind, TargetType};
     use internment::ArcIntern;
     use std::time::Instant;
@@ -208,6 +417,37 @@ mod tests {
             reg.register(t).unwrap();
         }
         reg
+    }
+
+    fn register_targets(
+        reg: &mut TargetRegistry,
+        caps: &CapabilityRegistry,
+        entries: &[(i64, &str, TargetType, &[&str], &[&str], bool)],
+    ) {
+        for &(id, name, ttype, depends, provides, essential) in entries {
+            let d: BitVec = if depends.is_empty() {
+                BitVec::new()
+            } else {
+                caps.to_bitvec(depends)
+            };
+            let p: BitVec = if provides.is_empty() {
+                BitVec::new()
+            } else {
+                caps.to_bitvec(provides)
+            };
+            reg.register(
+                Target::new()
+                    .id(id)
+                    .name(name.into())
+                    .target_type(ttype)
+                    .executor(ExecutorKind::Native)
+                    .depends(d)
+                    .provides(p)
+                    .essential(essential)
+                    .build(),
+            )
+            .unwrap();
+        }
     }
 
     #[test]
@@ -332,48 +572,212 @@ mod tests {
     }
 
     #[test]
-    fn test_abstract_dependency_resolution() {
+    fn test_narrow_one_empty_input() {
+        let reg = TargetRegistry::new();
+        let caps = CapabilityRegistry::new();
+        let resolver = DependencyResolver::with_narrowing(&reg, &caps);
+        let plan = resolver.resolve(&[]).expect("empty input");
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn test_narrow_one_strict_missing_provider() {
         let mut reg = TargetRegistry::new();
-        reg.register(
-            Target::new()
-                .id(0)
-                .name("build".into())
-                .target_type(TargetType::Abstract)
-                .executor(ExecutorKind::Native)
-                .depends(make_bitset(&[0, 1]))
-                .provides(make_bitset(&[2]))
-                .build(),
-        )
-        .unwrap();
-        reg.register(
-            Target::new()
-                .id(1)
-                .name("zig_compile".into())
-                .target_type(TargetType::File)
-                .executor(ExecutorKind::Native)
-                .depends(BitVec::new())
-                .provides(make_bitset(&[0]))
-                .build(),
-        )
-        .unwrap();
-        reg.register(
-            Target::new()
-                .id(2)
-                .name("zig_link".into())
-                .target_type(TargetType::File)
-                .executor(ExecutorKind::Native)
-                .depends(make_bitset(&[0]))
-                .provides(make_bitset(&[1]))
-                .build(),
-        )
-        .unwrap();
-        let mut provided = BitVec::new();
-        provided.resize(3, false);
-        let resolver = DependencyResolver::new(&reg);
+        let caps = CapabilityRegistry::new();
+        register_targets(
+            &mut reg,
+            &caps,
+            &[(0, "consumer", TargetType::File, &["nonexistent"], &[], false)],
+        );
+        let resolver = DependencyResolver::with_narrowing(&reg, &caps).with_strict(true);
+        let err = resolver.resolve(&["consumer"]).unwrap_err();
+        assert!(matches!(err, ResolverError::MissingDependency(_)));
+    }
+
+    #[test]
+    fn test_narrow_one_disambiguate_single_animal_provider() {
+        let mut reg = TargetRegistry::new();
+        let caps = CapabilityRegistry::new();
+        for (i, (name, provides, deps)) in [
+            ("bee", vec!["insect", "color_vision"], vec![]),
+            ("insect", vec!["animal"], vec![]),
+            ("jellyfish", vec!["animal"], vec![]),
+            ("consumer", vec![], vec!["animal"]),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let deps_bits: BitVec = if deps.is_empty() {
+                BitVec::new()
+            } else {
+                caps.to_bitvec(deps)
+            };
+            let provides_bits: BitVec = if provides.is_empty() {
+                BitVec::new()
+            } else {
+                caps.to_bitvec(provides)
+            };
+            reg.register(
+                Target::new()
+                    .id(i as i64)
+                    .name((*name).into())
+                    .target_type(if provides.is_empty() {
+                        TargetType::File
+                    } else {
+                        TargetType::Abstract
+                    })
+                    .executor(ExecutorKind::Native)
+                    .depends(deps_bits)
+                    .provides(provides_bits)
+                    .build(),
+            )
+            .unwrap();
+        }
+        let resolver = DependencyResolver::with_narrowing(&reg, &caps).with_strict(false);
+        let result = resolver.resolve(&["consumer"]);
+        match result {
+            Err(ResolverError::AmbiguousDependency { name, candidates }) => {
+                assert_eq!(name, "animal");
+                assert_eq!(candidates.len(), 2);
+            }
+            other => panic!("expected AmbiguousDependency, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_narrow_one_disambiguate_with_locality_preference() {
+        let mut reg = TargetRegistry::new();
+        let caps = CapabilityRegistry::new();
+
+        let entries: &[(i64, &str, TargetType, &[&str], &[&str], bool)] = &[
+            (0, "bee",           TargetType::File,     &[],                         &["insect", "color_vision"], false),
+            (1, "stoat",         TargetType::File,     &[],                         &["mammal"],                false),
+            (2, "insect",        TargetType::Abstract, &[],                         &["animal", "cognitive"],   false),
+            (3, "mammal",        TargetType::Abstract, &[],                         &["animal", "cognitive"],   false),
+            (4, "color_vision",  TargetType::Abstract, &[],                         &["vision"],                false),
+            (5, "confuse_bee",   TargetType::File,     &["insect", "color_vision"], &["confuse", "agency"],     false),
+            (6, "stun_stoat",    TargetType::File,     &["mammal"],                 &["confuse", "agency"],     false),
+            (7, "confuse",       TargetType::Abstract, &[],                         &[],                        true),
+            (8, "animal",        TargetType::Abstract, &[],                         &[],                        true),
+            (9, "cognitive",     TargetType::Abstract, &[],                         &[],                        false),
+            (10, "vision",       TargetType::Abstract, &[],                         &[],                        false),
+        ];
+
+        register_targets(&mut reg, &caps, entries);
+
+        let resolver = DependencyResolver::with_narrowing(&reg, &caps).with_strict(false);
+
+        let plan_bee = resolver.resolve(&["confuse", "bee"]).expect("confuse bee");
+        assert!(plan_bee.target_names.contains(&"bee".to_string()));
+        assert!(
+            plan_bee.target_names.contains(&"confuse_bee".to_string()),
+            "should select confuse_bee over stun_stoat for bee input: {:?}",
+            plan_bee.target_names
+        );
+        assert!(
+            !plan_bee.target_names.contains(&"stun_stoat".to_string()),
+            "stun_stoat should not be selected for bee input"
+        );
+
+        let plan_stoat = resolver.resolve(&["confuse", "stoat"]).expect("confuse stoat");
+        assert!(plan_stoat.target_names.contains(&"stoat".to_string()));
+        assert!(
+            plan_stoat.target_names.contains(&"stun_stoat".to_string()),
+            "should select stun_stoat for stoat input: {:?}",
+            plan_stoat.target_names
+        );
+        assert!(
+            !plan_stoat.target_names.contains(&"confuse_bee".to_string()),
+            "confuse_bee should not be selected for stoat input"
+        );
+    }
+
+    #[test]
+    fn test_narrow_one_ambiguity_reported_when_multiple_providers() {
+        let mut reg = TargetRegistry::new();
+        let caps = CapabilityRegistry::new();
+
+        register_targets(
+            &mut reg,
+            &caps,
+            &[
+                (0, "consumer",   TargetType::File,     &["animal"],   &[],       false),
+                (1, "provider_a", TargetType::Abstract, &[],           &["animal"], false),
+                (2, "provider_b", TargetType::Abstract, &[],           &["animal"], false),
+            ],
+        );
+
+        let resolver = DependencyResolver::with_narrowing(&reg, &caps).with_strict(false);
+        let result = resolver.resolve(&["consumer"]);
+        match result {
+            Err(ResolverError::AmbiguousDependency { name, candidates }) => {
+                assert_eq!(name, "animal");
+                assert_eq!(candidates.len(), 2);
+                assert!(candidates.contains(&"provider_a".to_string()));
+                assert!(candidates.contains(&"provider_b".to_string()));
+            }
+            Ok(plan) => {
+                panic!("expected AmbiguousDependency, got Ok with: {:?}", plan.target_names);
+            }
+            Err(other) => panic!("expected AmbiguousDependency, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_narrow_one_loser_not_readded_by_final_expansion() {
+        let mut reg = TargetRegistry::new();
+        let caps = CapabilityRegistry::new();
+        register_targets(
+            &mut reg,
+            &caps,
+            &[
+                (0, "bee", TargetType::File, &[], &["insect", "color_vision"], false),
+                (1, "stoat", TargetType::File, &[], &["mammal"], false),
+                (2, "confuse_bee", TargetType::File, &["insect", "color_vision"], &["confuse"], false),
+                (3, "stun_stoat", TargetType::File, &["mammal"], &["confuse"], false),
+                (4, "confuse", TargetType::Abstract, &[], &[], true),
+                (5, "rate_confusion", TargetType::File, &["confuse"], &["rated"], false),
+            ],
+        );
+        let resolver = DependencyResolver::with_narrowing(&reg, &caps).with_strict(false);
         let plan = resolver
-            .resolve_abstract_dependencies(&["build"], &provided)
-            .expect("resolve abstract");
-        assert!(plan.len() >= 2);
+            .resolve(&["confuse", "bee", "rate_confusion"])
+            .expect("resolve");
+        assert!(plan.target_names.contains(&"confuse_bee".to_string()));
+        assert!(
+            !plan.target_names.contains(&"stun_stoat".to_string()),
+            "narrowing loser stun_stoat was re-added: {:?}",
+            plan.target_names
+        );
+    }
+
+    #[test]
+    fn test_narrow_one_loser_re_enters_via_different_cap() {
+        let mut reg = TargetRegistry::new();
+        let caps = CapabilityRegistry::new();
+        register_targets(
+            &mut reg,
+            &caps,
+            &[
+                (0, "bee", TargetType::File, &[], &["insect", "color_vision"], false),
+                (1, "stoat", TargetType::File, &[], &["mammal"], false),
+                (2, "confuse_bee", TargetType::File, &["insect", "color_vision"], &["confuse"], false),
+                (3, "stun_stoat", TargetType::File, &["mammal"], &["confuse", "stun_grenade"], false),
+                (4, "confuse", TargetType::Abstract, &[], &[], true),
+                (5, "rate_confusion", TargetType::File, &["confuse"], &["rated"], false),
+                (6, "grenade_user", TargetType::File, &["stun_grenade"], &[], false),
+            ],
+        );
+        let resolver = DependencyResolver::with_narrowing(&reg, &caps).with_strict(false);
+        let plan = resolver
+            .resolve(&["confuse", "bee", "rate_confusion", "grenade_user"])
+            .expect("resolve");
+        assert!(plan.target_names.contains(&"confuse_bee".to_string()));
+        assert!(
+            plan.target_names.contains(&"stun_stoat".to_string()),
+            "stun_stoat should re-enter via its uncontested 'stun_grenade' cap: {:?}",
+            plan.target_names
+        );
     }
 
     #[test]
@@ -689,76 +1093,6 @@ mod tests {
     }
 
     #[test]
-    fn test_abstract_resolution_with_multiple_providers() {
-        let mut reg = TargetRegistry::new();
-        reg.register(
-            Target::new()
-                .id(0)
-                .name("build".into())
-                .target_type(TargetType::Abstract)
-                .executor(ExecutorKind::Native)
-                .depends(make_bitset(&[0, 1]))
-                .provides(make_bitset(&[2]))
-                .essential(true)
-                .build(),
-        )
-        .unwrap();
-        reg.register(
-            Target::new()
-                .id(1)
-                .name("rust_compile".into())
-                .target_type(TargetType::File)
-                .executor(ExecutorKind::Native)
-                .depends(BitVec::new())
-                .provides(make_bitset(&[0]))
-                .build(),
-        )
-        .unwrap();
-        reg.register(
-            Target::new()
-                .id(2)
-                .name("zig_compile".into())
-                .target_type(TargetType::File)
-                .executor(ExecutorKind::Native)
-                .depends(BitVec::new())
-                .provides(make_bitset(&[0]))
-                .build(),
-        )
-        .unwrap();
-        reg.register(
-            Target::new()
-                .id(3)
-                .name("rust_link".into())
-                .target_type(TargetType::File)
-                .executor(ExecutorKind::Native)
-                .depends(make_bitset(&[0]))
-                .provides(make_bitset(&[1]))
-                .build(),
-        )
-        .unwrap();
-        reg.register(
-            Target::new()
-                .id(4)
-                .name("zig_link".into())
-                .target_type(TargetType::File)
-                .executor(ExecutorKind::Native)
-                .depends(make_bitset(&[0]))
-                .provides(make_bitset(&[1]))
-                .build(),
-        )
-        .unwrap();
-        let mut provided = BitVec::new();
-        provided.resize(5, false);
-        let resolver = DependencyResolver::new(&reg);
-        let plan = resolver
-            .resolve_abstract_dependencies(&["build"], &provided)
-            .expect("multi-provider abstract resolve");
-        assert!(plan.order.contains(&0));
-        assert!(plan.order.contains(&1) || plan.order.contains(&2));
-        assert!(plan.order.contains(&3) || plan.order.contains(&4));
-    }
-
-    #[test]
     fn test_resolve_strict_missing_dependency_errors() {
         let targets = vec![
             Target::new()
@@ -837,52 +1171,4 @@ mod tests {
         assert_eq!(plan.order.len(), 4);
     }
 
-    #[test]
-    fn test_resolve_abstract_excludes_non_essential() {
-        let mut reg = TargetRegistry::new();
-        reg.register(
-            Target::new()
-                .id(0)
-                .name("essential_root".into())
-                .target_type(TargetType::Abstract)
-                .executor(ExecutorKind::Native)
-                .depends(make_bitset(&[0]))
-                .provides(make_bitset(&[1]))
-                .essential(true)
-                .build(),
-        )
-        .unwrap();
-        reg.register(
-            Target::new()
-                .id(1)
-                .name("non_essential_provider".into())
-                .target_type(TargetType::File)
-                .executor(ExecutorKind::Native)
-                .depends(BitVec::new())
-                .provides(make_bitset(&[0]))
-                .essential(false)
-                .build(),
-        )
-        .unwrap();
-        reg.register(
-            Target::new()
-                .id(2)
-                .name("essential_provider".into())
-                .target_type(TargetType::File)
-                .executor(ExecutorKind::Native)
-                .depends(BitVec::new())
-                .provides(make_bitset(&[0]))
-                .essential(true)
-                .build(),
-        )
-        .unwrap();
-        let mut provided = BitVec::new();
-        provided.resize(3, false);
-        let resolver = DependencyResolver::new(&reg);
-        let plan = resolver
-            .resolve_abstract_dependencies(&["essential_root"], &provided)
-            .expect("essential abstract resolve");
-        assert!(plan.order.contains(&0));
-        assert!(plan.order.contains(&1) || plan.order.contains(&2));
-    }
 }

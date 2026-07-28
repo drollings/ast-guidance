@@ -2,8 +2,9 @@
 //! abstractions. Orchestrates dependency-driven workflow execution.
 
 pub mod adapter;
-pub mod ambiguous_resolver;
+pub(crate) mod closure;
 pub mod dep_graph;
+pub(crate) mod narrowing;
 pub mod error;
 pub mod executor;
 pub mod middleware;

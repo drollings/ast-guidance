@@ -2,7 +2,6 @@ use std::process;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
-use fluent_dag::ambiguous_resolver::AmbiguousDependencyResolver;
 use fluent_dag::resolver::DependencyResolver;
 use fluent_dag::yamake_loader::load_yamake_config;
 
@@ -96,7 +95,7 @@ fn main() {
                 });
             let (reg, caps) = load_yamake_config(&json);
             let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
-            let resolver = AmbiguousDependencyResolver::new(&reg, &caps).with_strict(!non_strict);
+            let resolver = DependencyResolver::with_narrowing(&reg, &caps).with_strict(!non_strict);
             let start = Instant::now();
             match resolver.resolve(&targets) {
                 Ok(plan) => {
@@ -134,7 +133,7 @@ fn main() {
             }
 
             println!("=== AmbiguousDependencyResolver ===");
-            let ambiguous = AmbiguousDependencyResolver::new(&reg, &caps).with_strict(!non_strict);
+            let ambiguous = DependencyResolver::with_narrowing(&reg, &caps).with_strict(!non_strict);
             let start = Instant::now();
             match ambiguous.resolve(&targets) {
                 Ok(plan) => {
@@ -190,7 +189,7 @@ fn main() {
                 print!("[{passed:>2}/{total:>2}] {label:45} ");
 
                 let classic = DependencyResolver::new(&reg).with_strict(false);
-                let ambiguous = AmbiguousDependencyResolver::new(&reg, &caps).with_strict(false);
+                let ambiguous = DependencyResolver::with_narrowing(&reg, &caps).with_strict(false);
 
                 let classic_result = classic.resolve(targets);
                 let ambiguous_result = ambiguous.resolve(targets);

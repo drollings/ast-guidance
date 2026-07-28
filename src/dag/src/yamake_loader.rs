@@ -89,7 +89,7 @@ mod tests {
 
     #[test]
     fn test_full_yamake_load() {
-        let json = include_str!("../../../yamake.json");
+        let json = include_str!("../../../data/yamake.json");
         let (reg, _caps) = load_yamake_config(json);
         assert!(reg.len() > 50);
     }
