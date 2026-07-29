@@ -1,5 +1,9 @@
 # Unified Dependency Resolver — From Build Graphs to LLM Workflow Orchestration
 
+> **API reference**: Concrete type signatures, construction examples, and
+> benchmarking tests live in `doc/skills/dag/SKILL.md`. This document describes
+> the abstract algorithm and design rationale.
+
 ## What Makes This Resolver Different
 
 Traditional dependency resolvers — the kind that powers `make`, `cargo`, or

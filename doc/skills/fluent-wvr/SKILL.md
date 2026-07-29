@@ -1082,10 +1082,15 @@ component-specific configuration or in the `data` payload of
 `Dependency(String)`, and `Timeout { duration_ms, unit }`.
 
 ```rust
+use bon::Builder;
+#[derive(Builder)]
+#[builder(start_fn = new)]
 pub struct CommandUnit {
-    name: ArcIntern<str>,
+    name: String,
     command: String,
+    #[builder(default)]
     depends: Vec<ArcIntern<str>>,
+    #[builder(default)]
     provides: Vec<ArcIntern<str>>,
 }
 
@@ -1094,19 +1099,27 @@ impl WorkUnit for CommandUnit {
     fn depends(&self) -> &[ArcIntern<str>] { &self.depends }
     fn provides(&self) -> &[ArcIntern<str>] { &self.provides }
 
-    fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-        // Run in a worker thread — never block the executor directly.
-        let output = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&self.command)
-            .output()
-            .map_err(|e| WorkError::Execution(e.to_string()))?;
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        Ok(if output.status.success() {
-            WorkOutput::ok(stdout)
+    fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+        if ctx.dry_run {
+            return Ok(WorkOutput::ok(format!(
+                "[DRY-RUN] would execute: {}", self.command
+            )));
+        }
+        if self.command.is_empty() {
+            return Ok(WorkOutput::ok(format!("no-op: {}", self.name)));
+        }
+        let output = common_core::shell::run_shell_capture(&self.command)
+            .map_err(|e| WorkError::Execution(format!("command failed: {e}")))?;
+        if output.success {
+            Ok(WorkOutput::ok_with_data(
+                format!("{} completed", self.name),
+                serde_json::json!({"stdout": output.stdout}),
+            ))
         } else {
-            WorkOutput::fail(stdout)
-        })
+            Err(WorkError::Execution(format!(
+                "{} failed: {}", self.name, output.stderr
+            )))
+        }
     }
 }
 impl FieldAccess for CommandUnit { /* …see derive in §4… */ }

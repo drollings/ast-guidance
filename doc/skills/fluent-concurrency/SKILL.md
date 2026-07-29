@@ -20,13 +20,13 @@ This document specifies `fluent-concurrency`, a thin, safe, composable extension
 
 ## 3. Core Primitives
 
-The crate exports the following modules from `src/lib.rs:3-13`:
+The crate exports the following modules from `src/lib.rs:3-15`:
 
 ```text
-capability  flow  io  llm_queue  pool  queue  reserve  router  runtime  scope  zone
+affinity  capability  flow  io  llm_queue  pool  queue  reserve  router  runtime  scope  thread_resource  zone
 ```
 
-Each is described below. The 9 spec primitives are in §3.1–§3.9; the bonus primitives (`ResultPool`, `PriorityResultPool`, `Reserve`, `LlmRequestQueue`) are in §3.10.
+Each is described below. The spec primitives are in §3.1–§3.9; the bonus primitives (`AffinityScheduler`, `ResultPool`, `PriorityResultPool`, `LlmRequestQueue`, `Reserve`, `thread_local_resource!`) are in §3.10.
 
 ### 3.1 `Capability` — Bounded Resource Access
 
@@ -307,6 +307,10 @@ pub enum LlmError { Api(String), Http(String), NoResponse, RateLimited }
 ```
 
 **`Reserve`** (`reserve.rs:7-94`) — RAII permit on a shared `Arc<AtomicUsize>`. `try_acquire(counter) -> Option<Self>` atomically decrements and returns the permit, or `None` if already at zero. `commit(self)` consumes the permit permanently; otherwise `Drop` returns it to the counter. This is a lower-level primitive than `Limiter`: it does not own the counter (the caller supplies it), and it does not run a closure. Use `Limiter` for "run this with a permit" and `Reserve` for "acquire now, release later" patterns. The crate's own tests are the only in-tree consumer today.
+
+**`AffinityScheduler<T, R, E>`** (`affinity.rs:58-166`) — wraps `PriorityResultPool` with session-aware priority boosting and starvation aging. Tracks which session is currently "affine" and gives its tasks a priority bonus (`AgingConfig::affinity_bonus`, default +10). Starved tasks (different session) periodically increase in base priority at `AgingConfig::aging_rate` (default +2 per 5s tick) up to `AgingConfig::max_priority` (default 100). `set_affinity(Option<String>)` switches the active session. `submit(task, base_priority)` computes the effective priority and delegates to the pool. Designed for multi-session agent dispatch where context-switching between sessions should be minimized.
+
+**`thread_local_resource!`** (`thread_resource.rs:37-45`) — macro that declares a thread-local `RefCell<Option<T>>` backed by `Default`. The `with_tlr(&STATIC, |res| ...)` accessor takes-or-defaults, calls the closure, and stores the value back after the closure returns. This is the canonical mechanism for per-thread pooled resources (e.g., AST parsers, string builders) that benefit from reuse across calls without allocating each time.
 
 ## 4. Control Plane / Data Plane Integration (Fluent WVR)
 
