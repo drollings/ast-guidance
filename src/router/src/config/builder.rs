@@ -99,6 +99,7 @@ impl RouterConfig {
 
         if params.classifier {
             let routing_config = self.routing_config();
+            let classifier_intel = classifier_intelligence(self, params);
             let client: Arc<dyn ChatBackend> = if let Some(backend) = classifier_backend {
                 tracing::info!(target: "router.config", pipeline = %name, backend = "mock/transcript", "classifier using injected backend");
                 backend
@@ -113,6 +114,7 @@ impl RouterConfig {
                     routing_config,
                     params.coherence_threshold,
                     params.score_matrix.clone(),
+                    classifier_intel,
                 ),
             ));
         } else if classifier_backend.is_some() {
@@ -157,6 +159,33 @@ impl RouterConfig {
     }
 }
 
+/// Resolve the classifier model key from config, following the priority:
+/// 1. Pipeline-level `classifier_model`
+/// 2. Root-level `classifier_model`
+/// 3. First model in the `fast` model group
+fn resolve_classifier_model_key<'a>(
+    config: &'a RouterConfig,
+    params: &'a PipelineParams,
+) -> Option<&'a str> {
+    params
+        .classifier_model
+        .as_deref()
+        .or(config.classifier_model.as_deref())
+        .or_else(|| {
+            config.model_groups
+                .get("fast")
+                .and_then(|names| names.first())
+                .map(String::as_str)
+        })
+}
+
+/// Return the classifier model's intelligence rating, or 0 if not found.
+fn classifier_intelligence(config: &RouterConfig, params: &PipelineParams) -> u8 {
+    resolve_classifier_model_key(config, params)
+        .and_then(|k| config.models.get(k))
+        .map_or(0, |m| m.intelligence)
+}
+
 /// Build a classifier LLM client from the model config.
 ///
 /// # DIP note
@@ -167,26 +196,11 @@ impl RouterConfig {
 /// the factory can inject it without touching pipeline code.
 fn build_classifier_client(
     config: &RouterConfig,
-    name: &str,
+    _name: &str,
     params: &PipelineParams,
 ) -> Option<Arc<dyn ChatBackend>> {
-    let classifier_key = params
-        .classifier_model
-        .as_ref()
-        .or(config.classifier_model.as_ref())
-        .or_else(|| {
-            config.model_groups
-                .get("fast")
-                .and_then(|names| names.first())
-        });
-    let classifier_entry = classifier_key.and_then(|k| config.models.get(k));
-    let (entry, model_key) = if let Some(e) = classifier_entry {
-        let key = classifier_key.unwrap();
-        (e, key.as_str())
-    } else {
-        tracing::error!(target: "router.config", pipeline = %name, pipeline_model = ?params.classifier_model, root_model = ?config.classifier_model, "no classifier model found in config");
-        return None;
-    };
+    let model_key = resolve_classifier_model_key(config, params)?;
+    let entry = config.models.get(model_key)?;
     let model_name_for_llm = entry.name.as_deref().unwrap_or(model_key);
     let classifier_config = LlmConfig::new()
         .api_url(entry.endpoint.clone())

@@ -232,20 +232,76 @@ fn check_thresholds(
     })
 }
 
+/// Normalize non-standard `action` / `intent` values that look like route names.
+///
+/// The classifier LLM often identifies the correct intent (e.g. `"intent": "code"`)
+/// but sets the wrong action (e.g. `"action": "respond"` or `"action": "code"`).
+///
+/// Override rules (applied in order):
+///
+/// 1. If `action` is `respond` AND `intent` is a known route AND the query
+///    complexity exceeds the classifier's intelligence, promote to `route` with
+///    `target=intent` — the classifier is not capable enough for this query.
+/// 2. If `action` is a non-standard value that is a known route name, treat it
+///    as `route` with that target.
+fn normalize_classifier_action<'a>(
+    action: &'a str,
+    target: Option<&'a str>,
+    intent: Option<&'a str>,
+    complexity: Option<u8>,
+    classifier_intelligence: u8,
+    routes: &std::collections::HashMap<String, crate::config::RouteRef>,
+) -> (&'a str, Option<&'a str>) {
+    // Intent-driven override: promote respond → route when the query exceeds
+    // the classifier's capability, even if the LLM thought it could handle it.
+    if let Some(intent_route) = intent {
+        let intent_is_route = routes.contains_key(intent_route) || intent_route == "local";
+        let target_matches = target.is_none_or(|t| t == intent_route || t.is_empty());
+        let exceeds_capability = complexity.is_none_or(|c| c > classifier_intelligence);
+        if intent_is_route && target_matches && action != "reject" && exceeds_capability {
+            return ("route", Some(intent_route));
+        }
+    }
+
+    let is_standard = action == "route" || action == "respond" || action == "reject";
+    if is_standard {
+        return (action, target);
+    }
+    // Non-standard action: if it's a route name, treat it as route + target
+    if routes.contains_key(action) || action == "local" {
+        return ("route", Some(action));
+    }
+    // If target is missing and action isn't a route, set target to action anyway
+    // so the downstream "unknown action" log is accurate
+    if target.is_none() && routes.contains_key("local") {
+        return (action, Some("local"));
+    }
+    (action, target)
+}
+
 fn resolve_routing_target(
     action: &str,
     output: &ClassifierOutput,
     routing_config: &RoutingConfig,
+    classifier_intelligence: u8,
 ) -> Option<serde_json::Value> {
     let min_complexity = output.complexity;
-    let resolved_route = output.target.as_deref().unwrap_or(&routing_config.default_route);
+    let (normalized_action, normalized_target) = normalize_classifier_action(
+        action,
+        output.target.as_deref(),
+        output.intent.as_deref(),
+        output.complexity,
+        classifier_intelligence,
+        &routing_config.routes,
+    );
+    let resolved_route = normalized_target.unwrap_or(&routing_config.default_route);
 
-    if action == "respond" {
+    if normalized_action == "respond" {
         tracing::info!(target: "router.pipeline.stage2", "direct response — no dispatch");
         return None;
     }
 
-    let route = if action == "route" {
+    let route = if normalized_action == "route" {
         resolved_route
     } else {
         tracing::warn!(target: "router.pipeline.stage2", action = %action, fallback_route = %routing_config.default_route, "unknown action, falling back to default route");
@@ -316,6 +372,7 @@ pub struct ClassifierStage {
     routing_config: RoutingConfig,
     coherence_threshold: f64,
     score_matrix: Option<ScoreMatrix>,
+    classifier_intelligence: u8,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
@@ -326,6 +383,7 @@ impl ClassifierStage {
         routing_config: RoutingConfig,
         coherence_threshold: f64,
         score_matrix: Option<ScoreMatrix>,
+        classifier_intelligence: u8,
     ) -> Self {
         Self {
             name: ArcIntern::from("pipeline.stage2.classifier"),
@@ -333,6 +391,7 @@ impl ClassifierStage {
             routing_config,
             coherence_threshold,
             score_matrix,
+            classifier_intelligence,
             depends: vec![ArcIntern::from("pipeline.stage1.output")],
             provides: vec![ArcIntern::from("pipeline.stage2.output")],
         }
@@ -375,6 +434,7 @@ impl ClassifierStage {
 
         let coherence = format!("{:.2}", self.coherence_threshold);
         let safety = format!("{:.2}", self.routing_config.safety_threshold);
+        let intel = self.classifier_intelligence;
         let _ = write!(
             prompt,
             "Output schema:\n\
@@ -390,9 +450,9 @@ impl ClassifierStage {
             \x20 \"risk\": 0.0-1.0,\n\
             \x20 \"reason\": \"brief explanation\"\n\
             }}\n\n\
-            Rules:\n\
-            - If the query is trivial (simple arithmetic, basic fact, greeting), set action=respond and provide the answer.\n\
-            - If the query matches an available route, set action=route with target set to the matching route name.\n\
+            Response rules:\n\
+            - If complexity <= {intel} (your intelligence level), set action=respond and answer directly.\n\
+            - If complexity > {intel}, the query needs a more capable model: set action=route with target set to the matching route name. Code requests ALWAYS go to the \"code\" route. Translation requests ALWAYS go to the \"translation\" route.\n\
             - If content is incoherent (coherence_score < {coherence}), set action=reject.\n\
             - If content is unsafe (safety_score < {safety}), set action=reject.\n\
             - Safety score 1.0 = completely safe, 0.0 = dangerous.\n\
@@ -456,7 +516,7 @@ impl WorkUnit for ClassifierStage {
                     completeness: None,
                     risk: None,
                 };
-                let fallback_rt = resolve_routing_target(&output.action, &output, &self.routing_config);
+                let fallback_rt = resolve_routing_target(&output.action, &output, &self.routing_config, self.classifier_intelligence);
                 return Self::build_decision(&output, fallback_rt.as_ref(), false, self.score_matrix.as_ref());
             }
         };
@@ -485,7 +545,7 @@ impl WorkUnit for ClassifierStage {
             return WorkOutput::typed("rejected", &decision);
         }
 
-        let routing_target = resolve_routing_target(&output.action, &output, &self.routing_config);
+        let routing_target = resolve_routing_target(&output.action, &output, &self.routing_config, self.classifier_intelligence);
 
         Self::build_decision(&output, routing_target.as_ref(), ok, self.score_matrix.as_ref())
     }
@@ -538,11 +598,13 @@ impl ClassifierStage {
             );
         }
 
-        if let Some(ref resp) = output.response {
-            metadata["response"] = serde_json::Value::String(resp.clone());
-        }
         if let Some(rt) = routing_target {
+            // When we have a routing target, the response is from a misbehaving
+            // LLM that output both action=respond + code.  Don't store it as a
+            // classifier response — the handler will dispatch instead.
             metadata["routing_target"] = rt.clone();
+        } else if let Some(ref resp) = output.response {
+            metadata["response"] = serde_json::Value::String(resp.clone());
         }
 
         WorkOutput::typed(
