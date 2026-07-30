@@ -90,7 +90,10 @@ src/
 ```
 
 Cross-crate conventions are enforced through `common-core` (the zero-domain crate)
-and a `fluent-wvr-testutil` crate for shared test infrastructure.
+and Fluent WVR patterns that supplement Traits with run-time polymorphism and reflection, 
+single sources of truth, and support for run-time IPC with WASM sandboxes.  Where you have
+configurable components and control panes, this allows object-oriented and Entity Component 
+System behaviors.
 
 ### Key capabilities
 
