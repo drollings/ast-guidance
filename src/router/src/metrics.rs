@@ -222,7 +222,10 @@ impl RouterMetrics {
 
     /// Snapshot stage verdict counts (non-atomic read of all counters).
     pub fn snapshot_stage_verdicts(&self) -> HashMap<(PipelineStage, StageVerdict), u64> {
-        let map = self.stage_verdicts.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = self
+            .stage_verdicts
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.iter()
             .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
             .collect()
@@ -230,7 +233,10 @@ impl RouterMetrics {
 
     /// Snapshot watchdog event counts.
     pub fn snapshot_watchdog_events(&self) -> HashMap<WatchdogEventType, u64> {
-        let map = self.watchdog_events.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = self
+            .watchdog_events
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.iter()
             .map(|(k, v)| (*k, v.load(Ordering::Relaxed)))
             .collect()
@@ -238,7 +244,10 @@ impl RouterMetrics {
 
     /// Snapshot error counts. Keys are the stable string labels of `FailureClass`.
     pub fn snapshot_errors(&self) -> HashMap<String, u64> {
-        let map = self.error_counts.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = self
+            .error_counts
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.iter()
             .map(|(k, v)| (k.label().to_string(), v.load(Ordering::Relaxed)))
             .collect()
@@ -291,42 +300,66 @@ mod tests {
 
     #[test]
     fn classify_type_error() {
-        assert_eq!(classify_error("type error: expected i32, found String"), FailureClass::Internal);
+        assert_eq!(
+            classify_error("type error: expected i32, found String"),
+            FailureClass::Internal
+        );
     }
 
     #[test]
     fn classify_syntax_error() {
-        assert_eq!(classify_error("syntax error near unexpected token"), FailureClass::Internal);
+        assert_eq!(
+            classify_error("syntax error near unexpected token"),
+            FailureClass::Internal
+        );
     }
 
     #[test]
     fn classify_test_failure() {
-        assert_eq!(classify_error("test failed: assertion failed at line 42"), FailureClass::Internal);
+        assert_eq!(
+            classify_error("test failed: assertion failed at line 42"),
+            FailureClass::Internal
+        );
     }
 
     #[test]
     fn classify_build_failure() {
-        assert_eq!(classify_error("build failed: compilation error"), FailureClass::Internal);
+        assert_eq!(
+            classify_error("build failed: compilation error"),
+            FailureClass::Internal
+        );
     }
 
     #[test]
     fn classify_permission_denied() {
-        assert_eq!(classify_error("permission denied: cannot open file"), FailureClass::Storage);
+        assert_eq!(
+            classify_error("permission denied: cannot open file"),
+            FailureClass::Storage
+        );
     }
 
     #[test]
     fn classify_timeout() {
-        assert_eq!(classify_error("timeout: request took too long"), FailureClass::Timeout);
+        assert_eq!(
+            classify_error("timeout: request took too long"),
+            FailureClass::Timeout
+        );
     }
 
     #[test]
     fn classify_not_found() {
-        assert_eq!(classify_error("not found: resource does not exist"), FailureClass::InputValidation);
+        assert_eq!(
+            classify_error("not found: resource does not exist"),
+            FailureClass::InputValidation
+        );
     }
 
     #[test]
     fn classify_runtime_error() {
-        assert_eq!(classify_error("runtime error: segmentation fault"), FailureClass::Internal);
+        assert_eq!(
+            classify_error("runtime error: segmentation fault"),
+            FailureClass::Internal
+        );
     }
 
     #[test]
@@ -336,22 +369,34 @@ mod tests {
 
     #[test]
     fn classify_compiler_diagnostic_code() {
-        assert_eq!(classify_error("[E0425] cannot find value `x` in this scope"), FailureClass::Internal);
+        assert_eq!(
+            classify_error("[E0425] cannot find value `x` in this scope"),
+            FailureClass::Internal
+        );
     }
 
     #[test]
     fn classify_rate_limit_429() {
-        assert_eq!(classify_error("429 Too Many Requests"), FailureClass::RateLimit);
+        assert_eq!(
+            classify_error("429 Too Many Requests"),
+            FailureClass::RateLimit
+        );
     }
 
     #[test]
     fn classify_auth_401() {
-        assert_eq!(classify_error("401 Unauthorized"), FailureClass::Authentication);
+        assert_eq!(
+            classify_error("401 Unauthorized"),
+            FailureClass::Authentication
+        );
     }
 
     #[test]
     fn classify_network_refused() {
-        assert_eq!(classify_error("connection refused (os error 111)"), FailureClass::Network);
+        assert_eq!(
+            classify_error("connection refused (os error 111)"),
+            FailureClass::Network
+        );
     }
 
     #[test]
@@ -423,7 +468,10 @@ mod tests {
         m.record_model_latency("llama3.1:8b", 100);
         m.record_model_latency("llama3.1:8b", 200);
 
-        let map = m.model_latency.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = m
+            .model_latency
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let hist = map.get("llama3.1:8b").unwrap();
         assert_eq!(hist.count(), 2);
         assert_eq!(hist.sum_ms(), 300);
@@ -435,7 +483,10 @@ mod tests {
         m.record_agent_latency("agent-code-review", 50);
         m.record_agent_latency("agent-code-review", 150);
 
-        let map = m.agent_latency.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = m
+            .agent_latency
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let hist = map.get("agent-code-review").unwrap();
         assert_eq!(hist.count(), 2);
         assert_eq!(hist.sum_ms(), 200);

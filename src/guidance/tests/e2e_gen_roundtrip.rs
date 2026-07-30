@@ -1,7 +1,7 @@
+use fluent_types::MemberType;
 use fluent_wvr_testutil::tempdir;
 use guidance_core::sync::json_store;
 use guidance_core::sync_engine::SyncEngine;
-use fluent_types::MemberType;
 
 const FIXTURE_ZIG: &str = r#"/// Sample Zig file for AST parsing tests
 const std = @import("std");

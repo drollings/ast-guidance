@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use crate::runtime::test::TestRuntime;
 use crate::runtime::tokio::TokioRuntime;
-use fluent_wvr::Runtime;
 use fluent_wvr::prelude::*;
+use fluent_wvr::Runtime;
 use fluent_wvr_testutil::{impl_component_for_test, StubComponent};
 use internment::ArcIntern;
 
@@ -23,9 +23,9 @@ impl Capability for TestCapB {
     }
 }
 
+mod e2e;
 mod m1;
 mod m2;
 mod m3;
 mod m4;
 mod m5;
-mod e2e;

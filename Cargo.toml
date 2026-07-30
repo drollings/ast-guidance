@@ -21,8 +21,6 @@ members = [
     "src/wasm_ipc",
     "src/memory-plugin",
     "src/router",
-    "src/job-copilot",
-    "src/bin/job-copilot-daemon",
     "src/bin/coral-router",
     "src/bin/yamake-coral",
 ]

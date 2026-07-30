@@ -102,12 +102,7 @@ impl<K: Eq + Hash + Clone> DependencyGraph<K> {
     ///
     /// Returns `Err(GraphError::DuplicateNode)` if `node` is already
     /// registered.
-    pub fn register(
-        &mut self,
-        node: &K,
-        deps: &[K],
-        provides: &[K],
-    ) -> Result<(), GraphError>
+    pub fn register(&mut self, node: &K, deps: &[K], provides: &[K]) -> Result<(), GraphError>
     where
         K: std::fmt::Debug,
     {
@@ -345,11 +340,7 @@ impl<K: Eq + Hash + Clone> DependencyGraph<K> {
 
         // Run Kahn on just the closure subset, preserving insertion order
         // from `self.nodes` for determinism.
-        let subset: Vec<&K> = self
-            .nodes
-            .iter()
-            .filter(|n| closure.contains(n))
-            .collect();
+        let subset: Vec<&K> = self.nodes.iter().filter(|n| closure.contains(n)).collect();
         self.topo_sort_inner(&subset)
     }
 
@@ -543,11 +534,18 @@ mod tests {
         // second edge to "link" found it already in `active_path` and
         // logged a false "dependency cycle detected" warning.
         let mut g: DependencyGraph<&str> = DependencyGraph::new();
-        g.register(&"compile", &[], &["object", "debug_symbols"]).unwrap();
-        g.register(&"link", &["object", "debug_symbols"], &[]).unwrap();
+        g.register(&"compile", &[], &["object", "debug_symbols"])
+            .unwrap();
+        g.register(&"link", &["object", "debug_symbols"], &[])
+            .unwrap();
 
         let deps = g.dependents_of(&"compile");
-        assert_eq!(deps.len(), 1, "link should appear exactly once, got: {:?}", deps);
+        assert_eq!(
+            deps.len(),
+            1,
+            "link should appear exactly once, got: {:?}",
+            deps
+        );
         assert!(deps.contains(&"link"));
     }
 
@@ -557,7 +555,8 @@ mod tests {
         // registered node — it's an unsatisfiable dependency.
         let mut g: DependencyGraph<&str> = DependencyGraph::new();
         g.register(&"compile", &[], &["object"]).unwrap();
-        g.register(&"link", &["object", "debug_symbols"], &[]).unwrap();
+        g.register(&"link", &["object", "debug_symbols"], &[])
+            .unwrap();
 
         let unresolved = g.unresolved_deps();
         assert_eq!(unresolved, vec!["debug_symbols"]);

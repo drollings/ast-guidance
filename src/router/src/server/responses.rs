@@ -16,7 +16,10 @@ pub type HyperResponse = hyper::Response<ResponseBody>;
 const CORS_HEADERS: &[(&str, &str)] = &[
     ("access-control-allow-origin", "*"),
     ("access-control-allow-methods", "POST, GET, OPTIONS"),
-    ("access-control-allow-headers", "Content-Type, Authorization"),
+    (
+        "access-control-allow-headers",
+        "Content-Type, Authorization",
+    ),
 ];
 
 pub struct ServerStats {
@@ -84,8 +87,10 @@ pub fn completion_to_response(
     *resp.status_mut() = hyper::StatusCode::OK;
     resp.headers_mut()
         .insert(hyper::header::CONTENT_TYPE, content_type.parse().unwrap());
-    resp.headers_mut()
-        .insert(hyper::header::CONTENT_LENGTH, len.to_string().parse().unwrap());
+    resp.headers_mut().insert(
+        hyper::header::CONTENT_LENGTH,
+        len.to_string().parse().unwrap(),
+    );
     add_cors_headers(resp.headers_mut());
     resp
 }
@@ -96,10 +101,14 @@ pub fn json_response(status: hyper::StatusCode, value: &serde_json::Value) -> Hy
     let full = Full::new(Bytes::from(body_str));
     let mut resp = HyperResponse::new(full.boxed_unsync());
     *resp.status_mut() = status;
-    resp.headers_mut()
-        .insert(hyper::header::CONTENT_TYPE, "application/json".parse().unwrap());
-    resp.headers_mut()
-        .insert(hyper::header::CONTENT_LENGTH, len.to_string().parse().unwrap());
+    resp.headers_mut().insert(
+        hyper::header::CONTENT_TYPE,
+        "application/json".parse().unwrap(),
+    );
+    resp.headers_mut().insert(
+        hyper::header::CONTENT_LENGTH,
+        len.to_string().parse().unwrap(),
+    );
     add_cors_headers(resp.headers_mut());
     resp
 }
@@ -118,7 +127,10 @@ pub fn empty_response(status: hyper::StatusCode) -> HyperResponse {
 }
 
 pub fn forbidden_response() -> HyperResponse {
-    error_response(hyper::StatusCode::FORBIDDEN, "admin endpoints are localhost-only")
+    error_response(
+        hyper::StatusCode::FORBIDDEN,
+        "admin endpoints are localhost-only",
+    )
 }
 
 pub fn fallback_completion(model_name: &str) -> RouterResponse {

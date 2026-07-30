@@ -9,8 +9,8 @@
 //! - `mcp` — JSON-RPC 2.0 server (Model Context Protocol) over STDIO
 //! - `wasm_runtime` — WASM plugin bridge implementing `WorkUnit` + `Component`
 
-pub mod cache_l1;
 pub mod cache;
+pub mod cache_l1;
 pub mod cache_router;
 pub mod db;
 pub mod error;

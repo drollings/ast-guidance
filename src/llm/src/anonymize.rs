@@ -1,7 +1,7 @@
 pub fn anonymize(text: &str) -> String {
     use crate::pii_patterns::{
-        API_KEY_RE, AWS_KEY_RE, BEARER_RE, CREDIT_CARD_RE, EMAIL_RE, GENERIC_API_KEY_RE,
-        IPV4_RE, IPV6_RE, NINO_UK_RE, PHONE_US_RE, SIN_CA_RE, SSN_US_RE,
+        API_KEY_RE, AWS_KEY_RE, BEARER_RE, CREDIT_CARD_RE, EMAIL_RE, GENERIC_API_KEY_RE, IPV4_RE,
+        IPV6_RE, NINO_UK_RE, PHONE_US_RE, SIN_CA_RE, SSN_US_RE,
     };
 
     let text = EMAIL_RE.replace_all(text, "[EMAIL]");

@@ -14,7 +14,11 @@ pub fn luhn_valid(input: &str) -> bool {
         .map(|(i, &d)| {
             if i % 2 == 1 {
                 let n = d * 2;
-                if n > 9 { n - 9 } else { n }
+                if n > 9 {
+                    n - 9
+                } else {
+                    n
+                }
             } else {
                 d
             }

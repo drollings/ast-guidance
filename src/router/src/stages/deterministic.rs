@@ -4,10 +4,10 @@ use std::sync::{Arc, LazyLock};
 use fluent_wvr::prelude::*;
 use regex::Regex;
 
-use crate::filters::{DeterministicFilterEngine, FilterContext, FilterDecision};
+use crate::config::RejectPatterns;
 use crate::filters::injection_detect::InjectionDetectFilter;
 use crate::filters::regex_filter::RegexFilter;
-use crate::config::RejectPatterns;
+use crate::filters::{DeterministicFilterEngine, FilterContext, FilterDecision};
 use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
 use crate::stages::common::extract_user_message;
 
@@ -67,10 +67,8 @@ impl DeterministicPreFilter {
         use crate::config::{PatternEntry, RejectPatterns};
 
         let pii_patterns = guidance_llm::pii_patterns::pii_patterns();
-        let pii_map: std::collections::HashMap<&str, &str> = pii_patterns
-            .iter()
-            .map(|p| (p.name, p.regex))
-            .collect();
+        let pii_map: std::collections::HashMap<&str, &str> =
+            pii_patterns.iter().map(|p| (p.name, p.regex)).collect();
         fn pii_regex<'a>(map: &'a HashMap<&str, &str>, key: &str, fallback: &'a str) -> String {
             map.get(key).copied().unwrap_or(fallback).to_string()
         }
@@ -105,7 +103,11 @@ impl DeterministicPreFilter {
                 scope: vec![crate::config::FilterScope::Any],
                 http_code: 422,
                 error_message: Some("Email detected".into()),
-                regexes: vec![pii_regex(map, "email", r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")],
+                regexes: vec![pii_regex(
+                    map,
+                    "email",
+                    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+                )],
             },
             PatternEntry {
                 name: "phone".into(),
@@ -115,7 +117,11 @@ impl DeterministicPreFilter {
                 scope: vec![crate::config::FilterScope::Any],
                 http_code: 422,
                 error_message: Some("Phone number detected".into()),
-                regexes: vec![pii_regex(map, "phone", r"\b(?:\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b")],
+                regexes: vec![pii_regex(
+                    map,
+                    "phone",
+                    r"\b(?:\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b",
+                )],
             },
             PatternEntry {
                 name: "api_key".into(),
@@ -125,11 +131,18 @@ impl DeterministicPreFilter {
                 scope: vec![crate::config::FilterScope::Any],
                 http_code: 422,
                 error_message: Some("API key detected".into()),
-                regexes: vec![pii_regex(map, "api_key", r"(?i)(?:api[_-]?key|secret|token|password)\s*[:=]\s*[^\s]{8,}")],
+                regexes: vec![pii_regex(
+                    map,
+                    "api_key",
+                    r"(?i)(?:api[_-]?key|secret|token|password)\s*[:=]\s*[^\s]{8,}",
+                )],
             },
         ];
 
-        let builtin = RejectPatterns { patterns, commands: None };
+        let builtin = RejectPatterns {
+            patterns,
+            commands: None,
+        };
         let mut engine = DeterministicFilterEngine::new();
         for entry in &builtin.patterns {
             if let Some(filter) = RegexFilter::from_entry(entry) {
@@ -166,11 +179,7 @@ impl DeterministicPreFilter {
     }
 
     #[must_use]
-    pub fn with_command(
-        mut self,
-        name: impl Into<String>,
-        handler: CommandHandler,
-    ) -> Self {
+    pub fn with_command(mut self, name: impl Into<String>, handler: CommandHandler) -> Self {
         self.command_registry.insert(name.into(), handler);
         self.commands_enabled = true;
         self
@@ -271,7 +280,9 @@ impl WorkUnit for DeterministicPreFilter {
                     user_message: trimmed.to_string(),
                     is_frontier_bound: false,
                 };
-                if let Some(FilterDecision::HardReject { pattern, message }) = self.filter_engine.evaluate(&filter_ctx) {
+                if let Some(FilterDecision::HardReject { pattern, message }) =
+                    self.filter_engine.evaluate(&filter_ctx)
+                {
                     tracing::info!(target: "router.pipeline.stage1", pattern = %pattern, "hard reject on command");
                     return WorkOutput::typed(
                         "rejected",
@@ -322,7 +333,12 @@ impl WorkUnit for DeterministicPreFilter {
                         },
                     );
                 }
-                FilterDecision::OutputFilter { action, matched_pattern, codewords, matches } => {
+                FilterDecision::OutputFilter {
+                    action,
+                    matched_pattern,
+                    codewords,
+                    matches,
+                } => {
                     tracing::info!(target: "router.pipeline.stage1", pattern = %matched_pattern, action = ?action, match_count = matches.len(), "output_filter flagged");
                     return WorkOutput::typed(
                         "output_filter_flagged",

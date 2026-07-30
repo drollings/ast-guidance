@@ -19,46 +19,46 @@
 //! - `scheduler` — `AffinityScheduler`, `ScheduledTask`, `AgingConfig`
 //! - `dag_session` — `DependencySession`, `SessionStep`, `StepResult`, `DagError`
 
-pub mod pipeline_types;
-pub mod types;
-pub mod session;
-pub mod config;
-pub mod pipeline;
-pub mod pipeline_graph;
-pub mod workflow_config;
-pub mod stages;
-pub mod transforms;
-pub mod dispatch;
 pub mod agent;
-pub mod orchestrator;
 pub mod compaction;
-pub mod kv_cache;
-pub mod summarization;
-pub mod scheduler;
+pub mod config;
 pub mod dag_session;
-pub mod normalize;
-pub mod streaming;
-pub mod server;
-pub mod indexer;
+pub mod dispatch;
 pub mod filters;
 pub mod frontier;
 pub mod hnsw;
+pub mod indexer;
+pub mod kv_cache;
 pub mod ledger;
 pub mod logging;
 pub mod metrics;
-pub mod telemetry;
+pub mod normalize;
+pub mod orchestrator;
+pub mod pipeline;
+pub mod pipeline_graph;
+pub mod pipeline_types;
 pub mod routes;
+pub mod scheduler;
 pub mod score_matrix;
+pub mod server;
+pub mod session;
+pub mod stages;
+pub mod streaming;
+pub mod summarization;
+pub mod telemetry;
+pub mod transforms;
+pub mod types;
+pub mod workflow_config;
 
 /// Testing utilities — available in all build profiles for use by
 /// downstream crates' test code (e.g., E2E tests in coral-context).
 pub mod testing;
 
 #[cfg(test)]
-pub(crate) mod test_stubs;
+mod server_tests;
 #[cfg(test)]
 mod stage_tests;
 #[cfg(test)]
-mod tests;
+pub(crate) mod test_stubs;
 #[cfg(test)]
-mod server_tests;
+mod tests;

@@ -51,15 +51,16 @@ fn default_provider() -> TranscriptProvider {
     TranscriptProvider::new(HashMap::new())
 }
 
-
 fn make_test_config() -> RouterConfig {
-    match serde_json::from_str::<RouterConfig>(r#"{
+    match serde_json::from_str::<RouterConfig>(
+        r#"{
         "pipelines": {"default": {"deterministic_prefilter": true, "classifier": true, "blacklist": "env/pii-patterns.json"}},
         "models": {"fast": {"endpoint": "http://upstream.test:8080/v1/chat/completions", "name": "fast", "intelligence": 1, "cost_input": 0.000001, "cost_output": 0.000006, "cost_cached_read": 0.0000004, "speed": 10, "total_timeout_ms": 5000, "idle_timeout_ms": 2000, "stream": false, "filter_thinking": false, "retry_count": 0, "retry_base_interval_s": 1}},
         "model_groups": {"fast": ["fast"]},
         "routes": {"fast": {"group": "fast", "pipelines": ["default"]}},
         "default_route": "fast"
-    }"#) {
+    }"#,
+    ) {
         Ok(c) => c,
         Err(e) => panic!("invalid test config: {e}"),
     }
@@ -232,7 +233,11 @@ fn test_e2e_pii_flagging_detected() {
     let stage1 = &result.decisions[0];
     assert_eq!(stage1.stage, PipelineStage::DeterministicPreFilter);
     assert_eq!(stage1.verdict, StageVerdict::Passed);
-    assert!(stage1.reason.contains("no command"), "should pass through: {}", stage1.reason);
+    assert!(
+        stage1.reason.contains("no command"),
+        "should pass through: {}",
+        stage1.reason
+    );
 }
 
 #[test]
@@ -244,7 +249,10 @@ fn test_e2e_pii_not_flagged_for_clean_input() {
     let stage1 = &result.decisions[0];
     assert_eq!(stage1.stage, PipelineStage::DeterministicPreFilter);
     let reason = &stage1.reason;
-    assert!(reason.contains("no command") || reason.contains("no PII"), "should indicate no PII, got: {reason}");
+    assert!(
+        reason.contains("no command") || reason.contains("no PII"),
+        "should indicate no PII, got: {reason}"
+    );
 }
 
 // ── Streaming Response Support ──────────────────────────────────────────
@@ -266,7 +274,10 @@ fn test_e2e_routing_decision_included() {
     let request = make_request("Help me debug Rust code");
     let result = route(&pipeline, &request).expect("pipeline should complete");
 
-    let classifier_decision = result.decisions.last().expect("should have classifier decision");
+    let classifier_decision = result
+        .decisions
+        .last()
+        .expect("should have classifier decision");
     assert!(classifier_decision.stage == PipelineStage::Classifier);
     assert_eq!(classifier_decision.verdict, StageVerdict::Passed);
 
@@ -314,7 +325,10 @@ fn test_e2e_missing_user_message_handled() {
         tool_call_id: None,
     }]);
     let result = route(&pipeline, &request);
-    assert!(result.is_err(), "missing user message should produce an error");
+    assert!(
+        result.is_err(),
+        "missing user message should produce an error"
+    );
 }
 
 // ── Full Pipeline with Custom Fixtures ──────────────────────────────────
@@ -326,19 +340,19 @@ fn test_e2e_custom_fixtures_produce_expected_results() {
         "bad input that should be rejected".into(),
         classify_output("reject", 0.2, 0.9, "mock rejection: low quality"),
     );
-    entries.insert(
-        "good quality input".into(),
-        classify_with_target("fast"),
-    );
+    entries.insert("good quality input".into(), classify_with_target("fast"));
 
     let pipeline = make_pipeline(TranscriptProvider::new(entries));
 
-    let bad_result = route(&pipeline, &make_request("bad input that should be rejected"))
-        .expect("pipeline should handle rejection");
+    let bad_result = route(
+        &pipeline,
+        &make_request("bad input that should be rejected"),
+    )
+    .expect("pipeline should handle rejection");
     assert!(bad_result.rejected, "bad input should be rejected");
 
-    let good_result = route(&pipeline, &make_request("good quality input"))
-        .expect("pipeline should complete");
+    let good_result =
+        route(&pipeline, &make_request("good quality input")).expect("pipeline should complete");
     assert!(!good_result.rejected, "good input should not be rejected");
 }
 
@@ -389,10 +403,7 @@ async fn test_e2e_dag_session_checkpoint_rewind() {
         .complete_step("step3", ok("Implementation complete"))
         .expect("complete step3");
 
-    session
-        .rewind_to_checkpoint("step3")
-        .await
-        .expect("rewind");
+    session.rewind_to_checkpoint("step3").await.expect("rewind");
 
     assert_eq!(
         session.get_step("step3").map(|s| s.status),

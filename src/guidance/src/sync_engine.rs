@@ -138,7 +138,8 @@ impl SyncEngine {
             guidance_dir: self.guidance_dir.clone(),
         };
 
-        let mut pipeline = Self::build_pipeline(self.enhancer.as_ref(), &mut self.ast_parser, config.db_sync);
+        let mut pipeline =
+            Self::build_pipeline(self.enhancer.as_ref(), &mut self.ast_parser, config.db_sync);
         pipeline.run(&mut ctx)?;
 
         Ok(ctx.doc)
@@ -153,10 +154,7 @@ impl SyncEngine {
             .step(move |ctx: &mut SyncContext| {
                 if let Some(enhancer) = enhancer {
                     if let Err(e) = enhance_doc(enhancer, &mut ctx.doc, &ctx.source) {
-                        tracing::warn!(
-                            "LLM enhancement failed for {:?}: {e}",
-                            ctx.source_path
-                        );
+                        tracing::warn!("LLM enhancement failed for {:?}: {e}", ctx.source_path);
                     }
                 }
                 Ok(())
@@ -167,9 +165,7 @@ impl SyncEngine {
                 Ok(())
             })
             .step(move |ctx: &mut SyncContext| {
-                if let Err(e) =
-                    comments::sync_comments(&ctx.source_path, &ctx.doc, ast_parser)
-                {
+                if let Err(e) = comments::sync_comments(&ctx.source_path, &ctx.doc, ast_parser) {
                     tracing::warn!("comment sync failed for {:?}: {e}", ctx.source_path);
                 }
                 Ok(())

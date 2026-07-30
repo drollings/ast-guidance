@@ -89,7 +89,8 @@ pub struct StubComponent {
     pub fail: bool,
     pub panic: bool,
     pub max_retries: u32,
-    pub execute_fn: Option<Arc<dyn Fn(&WorkContext) -> Result<WorkOutput, WorkError> + Send + Sync>>,
+    pub execute_fn:
+        Option<Arc<dyn Fn(&WorkContext) -> Result<WorkOutput, WorkError> + Send + Sync>>,
 }
 
 impl StubComponent {

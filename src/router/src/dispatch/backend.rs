@@ -3,11 +3,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::dispatch::frontier::DispatchBackend;
 use bytes::Bytes;
 use common_core::drain_sse_lines;
 use common_core::hash::uuid_v4;
 use guidance_llm::HttpClass;
-use crate::dispatch::frontier::DispatchBackend;
 use serde_json::Value;
 
 use crate::dispatch::frontier::{DispatchError, OpenAiBackend};
@@ -55,7 +55,12 @@ pub trait ChatBackend: Send + Sync {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn build_chat_body(request: &RouterRequest, model: &str, params: Option<&Value>, stream: bool) -> Value {
+fn build_chat_body(
+    request: &RouterRequest,
+    model: &str,
+    params: Option<&Value>,
+    stream: bool,
+) -> Value {
     let messages = normalize::messages_to_json(request);
     let mut body = serde_json::json!({"model": model, "messages": messages});
     if stream {
@@ -70,14 +75,20 @@ fn build_chat_body(request: &RouterRequest, model: &str, params: Option<&Value>,
             }
         }
     }
-    if !body.as_object().is_some_and(|o| o.contains_key("temperature")) {
+    if !body
+        .as_object()
+        .is_some_and(|o| o.contains_key("temperature"))
+    {
         if let Some(temp) = request.temperature {
             if let Some(n) = serde_json::Number::from_f64(temp) {
                 body["temperature"] = Value::Number(n);
             }
         }
     }
-    if !body.as_object().is_some_and(|o| o.contains_key("max_tokens")) {
+    if !body
+        .as_object()
+        .is_some_and(|o| o.contains_key("max_tokens"))
+    {
         if let Some(max_tokens) = request.max_tokens {
             body["max_tokens"] = Value::Number(serde_json::Number::from(max_tokens));
         }
@@ -104,7 +115,10 @@ pub struct OpenAiChatBackend {
 
 impl OpenAiChatBackend {
     pub fn new(client: reqwest::Client, endpoint_url: impl Into<String>) -> Self {
-        Self { client, endpoint_url: endpoint_url.into() }
+        Self {
+            client,
+            endpoint_url: endpoint_url.into(),
+        }
     }
 }
 
@@ -172,7 +186,9 @@ impl ChatBackend for OpenAiChatBackend {
                 client.post(&url).json(&body).send(),
             )
             .await
-            .map_err(|_| DispatchError::Http("total timeout exceeded for stream connection".into()))?
+            .map_err(|_| {
+                DispatchError::Http("total timeout exceeded for stream connection".into())
+            })?
             .map_err(|e| DispatchError::Http(e.to_string()))?;
 
             let status = response.status();
@@ -189,8 +205,8 @@ impl ChatBackend for OpenAiChatBackend {
             let idle_dur = Duration::from_millis(idle_timeout_ms);
 
             tokio::spawn(async move {
-                let mut handler =
-                    StreamingHandler::new(&request_id, &model_for_task).with_filter_thinking(filter_thinking);
+                let mut handler = StreamingHandler::new(&request_id, &model_for_task)
+                    .with_filter_thinking(filter_thinking);
                 let mut buf = Vec::new();
                 let mut sent_first_chunk = false;
 
@@ -216,22 +232,36 @@ impl ChatBackend for OpenAiChatBackend {
 
                     for line in drain_sse_lines(&mut buf, &chunk) {
                         let trimmed = line.trim();
-                        if trimmed.is_empty() { continue; }
+                        if trimmed.is_empty() {
+                            continue;
+                        }
                         if trimmed == "data: [DONE]" {
                             let _ = tx.send_data(Bytes::from(handler.format_done())).await;
                             return;
                         }
                         if let Some(data) = trimmed.strip_prefix("data: ") {
                             if let Ok(chunk_json) = serde_json::from_str::<Value>(data) {
-                                let choices = chunk_json.get("choices").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                                let choices = chunk_json
+                                    .get("choices")
+                                    .and_then(|v| v.as_array())
+                                    .cloned()
+                                    .unwrap_or_default();
                                 if let Some(choice) = choices.first() {
-                                    let delta = choice.get("delta").and_then(|d| d.get("content")).and_then(|v| v.as_str()).unwrap_or("");
-                                    let finish_reason = choice.get("finish_reason").and_then(|v| v.as_str());
+                                    let delta = choice
+                                        .get("delta")
+                                        .and_then(|d| d.get("content"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let finish_reason =
+                                        choice.get("finish_reason").and_then(|v| v.as_str());
 
                                     if let Some(fr) = finish_reason {
                                         let s = handler.format_chunk(delta, Some(fr));
-                                        if !s.is_empty() { let _ = tx.send_data(Bytes::from(s)).await; }
-                                        let _ = tx.send_data(Bytes::from(handler.format_done())).await;
+                                        if !s.is_empty() {
+                                            let _ = tx.send_data(Bytes::from(s)).await;
+                                        }
+                                        let _ =
+                                            tx.send_data(Bytes::from(handler.format_done())).await;
                                         return;
                                     }
                                     let s = handler.format_chunk(delta, None);
@@ -266,7 +296,11 @@ pub struct RetryChatBackend {
 
 impl RetryChatBackend {
     pub fn new(inner: Arc<dyn ChatBackend>, retry_count: u32, retry_base_interval_s: u64) -> Self {
-        Self { inner, retry_count, retry_base_interval_s }
+        Self {
+            inner,
+            retry_count,
+            retry_base_interval_s,
+        }
     }
 }
 
@@ -284,11 +318,17 @@ impl ChatBackend for RetryChatBackend {
         Box::pin(async move {
             let mut last_err = DispatchError::Http("no attempt made".into());
             for attempt in 0..max_attempts {
-                match inner.complete(request.clone(), model.clone(), params.clone()).await {
+                match inner
+                    .complete(request.clone(), model.clone(), params.clone())
+                    .await
+                {
                     Ok(resp) => return Ok(resp),
                     Err(e) if e.is_retryable() && attempt + 1 < max_attempts => {
                         last_err = e;
-                        tokio::time::sleep(Duration::from_millis(retry_base * 1000 * (1u64 << attempt))).await;
+                        tokio::time::sleep(Duration::from_millis(
+                            retry_base * 1000 * (1u64 << attempt),
+                        ))
+                        .await;
                     }
                     Err(e) => return Err(e),
                 }
@@ -316,8 +356,12 @@ impl ChatBackend for RetryChatBackend {
                 let result = tokio::time::timeout(
                     Duration::from_millis(total_timeout_ms),
                     inner.stream_complete(
-                        request.clone(), model.clone(), params.clone(),
-                        idle_timeout_ms, total_timeout_ms, filter_thinking,
+                        request.clone(),
+                        model.clone(),
+                        params.clone(),
+                        idle_timeout_ms,
+                        total_timeout_ms,
+                        filter_thinking,
                     ),
                 )
                 .await;
@@ -326,12 +370,18 @@ impl ChatBackend for RetryChatBackend {
                     Ok(Ok(stream)) => return Ok(stream),
                     Ok(Err(e)) if e.is_retryable() && attempt + 1 < max_attempts => {
                         last_err = e;
-                        tokio::time::sleep(Duration::from_millis(retry_base * 1000 * (1u64 << attempt))).await;
+                        tokio::time::sleep(Duration::from_millis(
+                            retry_base * 1000 * (1u64 << attempt),
+                        ))
+                        .await;
                     }
                     Ok(Err(e)) => return Err(e),
                     Err(_) if attempt + 1 < max_attempts => {
                         last_err = DispatchError::Http("total timeout".into());
-                        tokio::time::sleep(Duration::from_millis(retry_base * 1000 * (1u64 << attempt))).await;
+                        tokio::time::sleep(Duration::from_millis(
+                            retry_base * 1000 * (1u64 << attempt),
+                        ))
+                        .await;
                     }
                     Err(_) => return Err(DispatchError::Http("total timeout exhausted".into())),
                 }
@@ -367,7 +417,10 @@ impl ChatBackend for FallbackChatBackend {
         Box::pin(async move {
             let mut last_err = DispatchError::AllBackendsFailed;
             for backend in &backends {
-                match backend.complete(request.clone(), model.clone(), params.clone()).await {
+                match backend
+                    .complete(request.clone(), model.clone(), params.clone())
+                    .await
+                {
                     Ok(resp) => return Ok(resp),
                     Err(e) => {
                         if let DispatchError::Http(ref msg) = e {
@@ -400,11 +453,16 @@ impl ChatBackend for FallbackChatBackend {
         Box::pin(async move {
             let mut last_err = DispatchError::AllBackendsFailed;
             for backend in &backends {
-                match backend.stream_complete(
-                    request.clone(), model.clone(), params.clone(),
-                    idle_timeout_ms, total_timeout_ms, filter_thinking,
-                )
-                .await
+                match backend
+                    .stream_complete(
+                        request.clone(),
+                        model.clone(),
+                        params.clone(),
+                        idle_timeout_ms,
+                        total_timeout_ms,
+                        filter_thinking,
+                    )
+                    .await
                 {
                     Ok(stream) => return Ok(stream),
                     Err(e) => {
@@ -462,7 +520,9 @@ mod tests {
 
     impl StubBackend {
         fn new(responses: Vec<Result<RouterResponse, DispatchError>>) -> Arc<dyn ChatBackend> {
-            Arc::new(StubBackend { responses: std::sync::Mutex::new(responses) })
+            Arc::new(StubBackend {
+                responses: std::sync::Mutex::new(responses),
+            })
         }
     }
 
@@ -493,7 +553,10 @@ mod tests {
                 match result {
                     Ok(_) => {
                         let (_, rx) = http_body_util::channel::Channel::new(32);
-                        Ok(StreamResult { model: "test".into(), body: rx })
+                        Ok(StreamResult {
+                            model: "test".into(),
+                            body: rx,
+                        })
                     }
                     Err(e) => Err(e),
                 }
@@ -520,30 +583,34 @@ mod tests {
     async fn retry_success_on_first_attempt() {
         let inner = StubBackend::new(vec![Ok(dummy_response())]);
         let backend = RetryChatBackend::new(inner, 2, 1);
-        let result = backend.complete(make_test_request("hi"), "m".into(), None).await;
+        let result = backend
+            .complete(make_test_request("hi"), "m".into(), None)
+            .await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn retry_on_transient_then_succeed() {
-        let inner = StubBackend::new(vec![
-            Err(DispatchError::RateLimited),
-            Ok(dummy_response()),
-        ]);
+        let inner = StubBackend::new(vec![Err(DispatchError::RateLimited), Ok(dummy_response())]);
         let backend = RetryChatBackend::new(inner, 2, 1);
-        let result = backend.complete(make_test_request("hi"), "m".into(), None).await;
+        let result = backend
+            .complete(make_test_request("hi"), "m".into(), None)
+            .await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn retry_short_circuit_on_non_retryable() {
-        let inner = StubBackend::new(vec![
-            Err(DispatchError::ResponseParse("bad json".into())),
-        ]);
+        let inner = StubBackend::new(vec![Err(DispatchError::ResponseParse("bad json".into()))]);
         let backend = RetryChatBackend::new(inner, 2, 1);
-        let result = backend.complete(make_test_request("hi"), "m".into(), None).await;
+        let result = backend
+            .complete(make_test_request("hi"), "m".into(), None)
+            .await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), DispatchError::ResponseParse(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            DispatchError::ResponseParse(_)
+        ));
     }
 
     #[tokio::test]
@@ -553,7 +620,9 @@ mod tests {
             Err(DispatchError::RateLimited),
         ]);
         let backend = RetryChatBackend::new(inner, 1, 1);
-        let result = backend.complete(make_test_request("hi"), "m".into(), None).await;
+        let result = backend
+            .complete(make_test_request("hi"), "m".into(), None)
+            .await;
         assert!(result.is_err());
     }
 
@@ -566,7 +635,9 @@ mod tests {
         let b1 = StubBackend::new(vec![Ok(dummy_response())]);
         let b2 = StubBackend::new(vec![Ok(dummy_response())]);
         let backend = FallbackChatBackend::new(vec![b1, b2]);
-        let result = backend.complete(make_test_request("hi"), "m".into(), None).await;
+        let result = backend
+            .complete(make_test_request("hi"), "m".into(), None)
+            .await;
         assert!(result.is_ok());
     }
 
@@ -575,7 +646,9 @@ mod tests {
         let b1 = StubBackend::new(vec![Err(DispatchError::RateLimited)]);
         let b2 = StubBackend::new(vec![Ok(dummy_response())]);
         let backend = FallbackChatBackend::new(vec![b1, b2]);
-        let result = backend.complete(make_test_request("hi"), "m".into(), None).await;
+        let result = backend
+            .complete(make_test_request("hi"), "m".into(), None)
+            .await;
         assert!(result.is_ok());
     }
 
@@ -584,7 +657,9 @@ mod tests {
         let b1 = StubBackend::new(vec![Err(DispatchError::Http("HTTP 400".into()))]);
         let b2 = StubBackend::new(vec![Ok(dummy_response())]);
         let backend = FallbackChatBackend::new(vec![b1, b2]);
-        let result = backend.complete(make_test_request("hi"), "m".into(), None).await;
+        let result = backend
+            .complete(make_test_request("hi"), "m".into(), None)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("400"));
     }
@@ -594,20 +669,26 @@ mod tests {
         let b1 = StubBackend::new(vec![Err(DispatchError::Http("HTTP 503".into()))]);
         let b2 = StubBackend::new(vec![Err(DispatchError::Http("HTTP 502".into()))]);
         let backend = FallbackChatBackend::new(vec![b1, b2]);
-        let result = backend.complete(make_test_request("hi"), "m".into(), None).await;
+        let result = backend
+            .complete(make_test_request("hi"), "m".into(), None)
+            .await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), DispatchError::Http(_)));
     }
 
     #[tokio::test]
     async fn retry_stream_transient_then_succeed() {
-        let inner = StubBackend::new(vec![
-            Err(DispatchError::RateLimited),
-            Ok(dummy_response()),
-        ]);
+        let inner = StubBackend::new(vec![Err(DispatchError::RateLimited), Ok(dummy_response())]);
         let backend = RetryChatBackend::new(inner, 2, 1);
         let result = backend
-            .stream_complete(make_test_request("hi"), "m".into(), None, 5000, 30000, false)
+            .stream_complete(
+                make_test_request("hi"),
+                "m".into(),
+                None,
+                5000,
+                30000,
+                false,
+            )
             .await;
         assert!(result.is_ok());
     }

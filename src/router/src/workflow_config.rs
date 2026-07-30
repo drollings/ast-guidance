@@ -266,7 +266,9 @@ mod tests {
         assert_eq!(def.stages.len(), 2);
         // Verify the switch stage
         match &def.stages[1] {
-            WorkflowStage::Switch { field, branches, .. } => {
+            WorkflowStage::Switch {
+                field, branches, ..
+            } => {
                 assert_eq!(field, "intent");
                 assert_eq!(branches.len(), 2);
                 assert!(branches.contains_key("code"));
@@ -347,7 +349,12 @@ mod tests {
         let cfg: WorkflowConfig = serde_json::from_str(json).unwrap();
         let def = cfg.default_workflow().unwrap();
         match &def.stages[0] {
-            WorkflowStage::RangeSwitch { field, ranges, default, .. } => {
+            WorkflowStage::RangeSwitch {
+                field,
+                ranges,
+                default,
+                ..
+            } => {
                 assert_eq!(field, "complexity");
                 assert_eq!(ranges.len(), 2);
                 assert!(default.is_some());

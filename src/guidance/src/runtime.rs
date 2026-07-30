@@ -5,8 +5,8 @@ use fluent_concurrency::pool::{global_pool_config, ResultPool};
 use fluent_concurrency::runtime::tokio::TokioRuntime;
 use fluent_concurrency::thread_resource::with_tlr;
 use fluent_concurrency::zone::{Zone, ZoneConfig};
-use fluent_wvr::Runtime;
 use fluent_wvr::prelude::*;
+use fluent_wvr::Runtime;
 
 use crate::ast_parser::AstParser;
 use crate::sync_engine::{GenConfig, SyncEngine, SyncEngineError};
@@ -41,8 +41,11 @@ pub static AST_POOL: LazyLock<Arc<ResultPool<AstGenPayload, GuidanceDoc, SyncEng
             |job: AstGenPayload| async move {
                 tokio::task::spawn_blocking(move || {
                     with_tlr(&PARSER, |parser| {
-                        let mut engine =
-                            SyncEngine::with_parser(job.guidance_dir, job.source_dir, std::mem::take(parser));
+                        let mut engine = SyncEngine::with_parser(
+                            job.guidance_dir,
+                            job.source_dir,
+                            std::mem::take(parser),
+                        );
                         let r = engine.gen_with_config(&job.source_path, &job.config);
                         *parser = engine.ast_parser;
                         r
@@ -55,22 +58,21 @@ pub static AST_POOL: LazyLock<Arc<ResultPool<AstGenPayload, GuidanceDoc, SyncEng
     });
 
 /// Shared database sync pool — serializes writes to avoid SQLite contention.
-pub static DB_POOL: LazyLock<Arc<ResultPool<DbSyncPayload, usize, String>>> =
-    LazyLock::new(|| {
-        Arc::new(ResultPool::new(
-            Arc::new(TokioRuntime),
-            1,
-            100,
-            |job: DbSyncPayload| async move {
-                tokio::task::spawn_blocking(move || {
-                    let db = GuidanceDb::open(&job.db_path).map_err(|e| e.to_string())?;
-                    db.sync_from_dir(&job.json_dir).map_err(|e| e.to_string())
-                })
-                .await
-                .unwrap_or_else(|e| Err(e.to_string()))
-            },
-        ))
-    });
+pub static DB_POOL: LazyLock<Arc<ResultPool<DbSyncPayload, usize, String>>> = LazyLock::new(|| {
+    Arc::new(ResultPool::new(
+        Arc::new(TokioRuntime),
+        1,
+        100,
+        |job: DbSyncPayload| async move {
+            tokio::task::spawn_blocking(move || {
+                let db = GuidanceDb::open(&job.db_path).map_err(|e| e.to_string())?;
+                db.sync_from_dir(&job.json_dir).map_err(|e| e.to_string())
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()))
+        },
+    ))
+});
 
 /// Create a Zone that provides structured concurrency, failure containment,
 /// and dependency tracking for a batch of AST generation tasks.

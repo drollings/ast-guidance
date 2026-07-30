@@ -71,8 +71,12 @@ pub fn init_router_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::er
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::Layer;
 
-    std::fs::create_dir_all(&config.log_dir)
-        .map_err(|e| format!("failed to create log directory '{}': {e}", config.log_dir.display()))?;
+    std::fs::create_dir_all(&config.log_dir).map_err(|e| {
+        format!(
+            "failed to create log directory '{}': {e}",
+            config.log_dir.display()
+        )
+    })?;
 
     let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
         .rotation(tracing_appender::rolling::Rotation::NEVER)
@@ -84,8 +88,7 @@ pub fn init_router_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::er
 
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // ── Build audit layer (if configured) ─────────────────────────────
     // The audit writer must outlive the process; use a thread-local
@@ -95,21 +98,28 @@ pub fn init_router_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::er
         appender: tracing_appender::non_blocking::NonBlocking,
     }
 
-    let audit_resources: Option<AuditResources> = config.audit_log.as_ref().map(|audit_cfg| {
-        std::fs::create_dir_all(&audit_cfg.log_dir)
-            .map_err(|e| format!("audit log dir '{}': {e}", audit_cfg.log_dir.display()))?;
+    let audit_resources: Option<AuditResources> = config
+        .audit_log
+        .as_ref()
+        .map(|audit_cfg| {
+            std::fs::create_dir_all(&audit_cfg.log_dir)
+                .map_err(|e| format!("audit log dir '{}': {e}", audit_cfg.log_dir.display()))?;
 
-        let appender = tracing_appender::rolling::RollingFileAppender::builder()
-            .rotation(tracing_appender::rolling::Rotation::NEVER)
-            .filename_prefix("audit")
-            .filename_suffix("log")
-            .max_log_files(audit_cfg.max_files)
-            .build(&audit_cfg.log_dir)
-            .map_err(|e| format!("audit file appender: {e}"))?;
+            let appender = tracing_appender::rolling::RollingFileAppender::builder()
+                .rotation(tracing_appender::rolling::Rotation::NEVER)
+                .filename_prefix("audit")
+                .filename_suffix("log")
+                .max_log_files(audit_cfg.max_files)
+                .build(&audit_cfg.log_dir)
+                .map_err(|e| format!("audit file appender: {e}"))?;
 
-        let (non_blocking, guard) = tracing_appender::non_blocking(appender);
-        Result::<_, Box<dyn std::error::Error>>::Ok(AuditResources { _guard: guard, appender: non_blocking })
-    }).transpose()?;
+            let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+            Result::<_, Box<dyn std::error::Error>>::Ok(AuditResources {
+                _guard: guard,
+                appender: non_blocking,
+            })
+        })
+        .transpose()?;
 
     // ── Build per-branch subscribers ──────────────────────────────────
     // tracing_subscriber's `.with()` changes the concrete type per layer,
@@ -124,10 +134,10 @@ pub fn init_router_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::er
     where
         S: SubscriberExt + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
     {
-        let filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("info"));
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
         if json {
-            tracing_subscriber::fmt::layer().json()
+            tracing_subscriber::fmt::layer()
+                .json()
                 .with_writer(std::io::stderr)
                 .with_filter(filter)
                 .boxed()
@@ -140,11 +150,14 @@ pub fn init_router_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::er
     }
 
     /// Build an audit log layer (always JSON-formatted).
-    fn audit_layer<S>(writer: tracing_appender::non_blocking::NonBlocking) -> Box<dyn Layer<S> + Send + Sync>
+    fn audit_layer<S>(
+        writer: tracing_appender::non_blocking::NonBlocking,
+    ) -> Box<dyn Layer<S> + Send + Sync>
     where
         S: SubscriberExt + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
     {
-        tracing_subscriber::fmt::layer().json()
+        tracing_subscriber::fmt::layer()
+            .json()
             .with_writer(writer)
             .with_filter(EnvFilter::new("router.audit=info"))
             .boxed()
@@ -177,9 +190,7 @@ pub fn init_router_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::er
                         .init();
                 }
                 (false, false) => {
-                    tracing_subscriber::registry()
-                        .with(file)
-                        .init();
+                    tracing_subscriber::registry().with(file).init();
                 }
             }
         }};
@@ -189,7 +200,8 @@ pub fn init_router_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::er
         audit_resources.map(|r| r.appender);
 
     if config.json_format {
-        let file_layer = tracing_subscriber::fmt::layer().json()
+        let file_layer = tracing_subscriber::fmt::layer()
+            .json()
             .with_writer(non_blocking)
             .with_filter(env_filter);
         init_registry!(file_layer, config.console_output, audit_writer);

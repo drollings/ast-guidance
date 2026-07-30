@@ -10,8 +10,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use fluent_dag::dep_graph::DependencyGraph;
-use fluent_wvr::Runtime;
 use fluent_wvr::prelude::*;
+use fluent_wvr::Runtime;
 use internment::ArcIntern;
 use thiserror::Error;
 use tokio::task::JoinSet;
@@ -145,10 +145,7 @@ impl Zone {
     /// has already been registered. If you intentionally want to replace an
     /// existing task, use `register_or_replace` (not yet implemented — file
     /// a feature request if you need it).
-    pub fn register(
-        &mut self,
-        unit: Arc<dyn Component>,
-    ) -> Result<&mut Self, ZoneError> {
+    pub fn register(&mut self, unit: Arc<dyn Component>) -> Result<&mut Self, ZoneError> {
         let ctx = WorkContext::for_unit_in_zone(&self.runtime, &self.caps, |_| {});
         self.register_with_context(unit, ctx)
     }

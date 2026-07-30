@@ -43,6 +43,7 @@ use fluent_concurrency::llm_queue::LlmQueueConfig;
 use fluent_concurrency::pool::Limiter;
 use fluent_concurrency::scope::Scope;
 use fluent_concurrency::tokio_runtime;
+use fluent_types::{GuidanceDoc, MemberType, StageKind};
 use guidance_core::ast_parser;
 use guidance_core::config::ProjectConfig;
 use guidance_core::query::synthesize::Stage;
@@ -52,7 +53,6 @@ use guidance_llm::llm_queue::build_default_queue;
 use guidance_llm::{strip_think_block, ChatMessage, LlmClient, LlmConfig, LlmRequestQueue};
 use search_vector::db::SearchResult;
 use search_vector::GuidanceDb;
-use fluent_types::{GuidanceDoc, MemberType, StageKind};
 use thiserror::Error;
 
 const BENCHMARK_FILE: &str = "benchmarks.md";

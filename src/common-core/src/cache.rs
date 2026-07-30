@@ -187,9 +187,7 @@ mod tests {
 
     // ─── ResponseCache tests ────────────────────────────────────────────
 
-    fn make_cache(
-        store: Arc<Mutex<HashMap<String, CachedResponse>>>,
-    ) -> ResponseCache {
+    fn make_cache(store: Arc<Mutex<HashMap<String, CachedResponse>>>) -> ResponseCache {
         let s_check = Arc::clone(&store);
         let s_store = Arc::clone(&store);
         let s_clear = Arc::clone(&store);
@@ -198,7 +196,10 @@ mod tests {
             None,
             move |key: &str| s_check.lock().unwrap().get(key).cloned(),
             move |key: &str, value: &CachedResponse| {
-                s_store.lock().unwrap().insert(key.to_string(), value.clone());
+                s_store
+                    .lock()
+                    .unwrap()
+                    .insert(key.to_string(), value.clone());
             },
         )
         .with_delete(move |key: &str| {
@@ -218,7 +219,11 @@ mod tests {
         // Cache miss on first call
         assert!(cache.get("gpt-4", request_json).is_none());
         // Set a response
-        cache.set("gpt-4", request_json, serde_json::json!({"choices": [{"message": {"content": "hello"}}]}));
+        cache.set(
+            "gpt-4",
+            request_json,
+            serde_json::json!({"choices": [{"message": {"content": "hello"}}]}),
+        );
         // Cache hit on second call
         let hit = cache.get("gpt-4", request_json);
         assert!(hit.is_some(), "expected cache hit");
@@ -251,11 +256,18 @@ mod tests {
             Some(std::time::Duration::from_secs(0)),
             move |key: &str| s_check.lock().unwrap().get(key).cloned(),
             move |key: &str, value: &CachedResponse| {
-                s_store.lock().unwrap().insert(key.to_string(), value.clone());
+                s_store
+                    .lock()
+                    .unwrap()
+                    .insert(key.to_string(), value.clone());
             },
         );
         let request_json = r#"{"model":"test"}"#;
-        cache.set("gpt-4", request_json, serde_json::json!({"result": "stale"}));
+        cache.set(
+            "gpt-4",
+            request_json,
+            serde_json::json!({"result": "stale"}),
+        );
         // Should be expired because TTL is 0
         assert!(cache.get("gpt-4", request_json).is_none());
     }

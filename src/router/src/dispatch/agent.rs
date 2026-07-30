@@ -42,7 +42,11 @@ impl AgentDispatcher {
     }
 
     fn notify_kv_cache_restore(&self, identity: &AgentIdentity) -> bool {
-        if let Some(snapshot) = self.kv_cache.get(&identity.model, identity.adapter.as_deref(), &identity.session_id) {
+        if let Some(snapshot) = self.kv_cache.get(
+            &identity.model,
+            identity.adapter.as_deref(),
+            &identity.session_id,
+        ) {
             tracing::info!(
                 "restored KV cache for model={} adapter={:?} session={} ({} tokens)",
                 snapshot.model,
@@ -76,10 +80,7 @@ impl AgentDispatcher {
         self.kv_cache.put(snapshot);
     }
 
-    fn build_agent_request(
-        destination: &RoutingDestination,
-        request: &RouterRequest,
-    ) -> AgentTask {
+    fn build_agent_request(destination: &RoutingDestination, request: &RouterRequest) -> AgentTask {
         let (model, adapter, session_id) = match destination {
             RoutingDestination::LocalAgent {
                 model,

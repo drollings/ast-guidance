@@ -33,12 +33,12 @@ pub(crate) fn transitive_closure(
         if visited.contains(&bit_idx) {
             continue;
         }
-        let target = ctx
-            .registry
-            .get_by_bit_index(bit_idx)
-            .ok_or(ResolverError::TargetNotFound(format!(
-                "bit_index {bit_idx}"
-            )))?;
+        let target =
+            ctx.registry
+                .get_by_bit_index(bit_idx)
+                .ok_or(ResolverError::TargetNotFound(format!(
+                    "bit_index {bit_idx}"
+                )))?;
 
         visited.insert(bit_idx);
 
@@ -64,7 +64,9 @@ pub(crate) fn transitive_closure(
                 }
                 if ctx.strict {
                     return Err(narrowing::missing_provider_error(
-                        ctx.caps, cap_idx, &target.name,
+                        ctx.caps,
+                        cap_idx,
+                        &target.name,
                     ));
                 }
                 continue;

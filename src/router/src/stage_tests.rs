@@ -4,7 +4,9 @@ mod tests {
 
     use fluent_wvr::prelude::*;
 
-    use crate::config::{ConfidenceGate, FilterAction, FilterOutcome, FilterScope, PatternEntry, RejectPatterns};
+    use crate::config::{
+        ConfidenceGate, FilterAction, FilterOutcome, FilterScope, PatternEntry, RejectPatterns,
+    };
     use crate::pipeline::PipelineOrchestrator;
     use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
     use crate::stages::deterministic::DeterministicPreFilter;
@@ -50,7 +52,9 @@ mod tests {
                     scope: vec![FilterScope::Any],
                     http_code: 422,
                     error_message: Some("Phone detected".into()),
-                    regexes: vec![r"\b(?:\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b".into()],
+                    regexes: vec![
+                        r"\b(?:\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b".into(),
+                    ],
                 },
                 PatternEntry {
                     name: "api_key".into(),
@@ -60,7 +64,9 @@ mod tests {
                     scope: vec![FilterScope::Any],
                     http_code: 422,
                     error_message: Some("API key detected".into()),
-                    regexes: vec![r"(?i)(?:api[_-]?key|secret|token|password)\s*[:=]\s*[^\s]{8,}".into()],
+                    regexes: vec![
+                        r"(?i)(?:api[_-]?key|secret|token|password)\s*[:=]\s*[^\s]{8,}".into(),
+                    ],
                 },
             ],
             commands: None,
@@ -230,7 +236,10 @@ mod tests {
             .get("pii_filter")
             .expect("pii_filter metadata");
         // First filter in insertion order that matches is "ssn" (position 0)
-        assert_eq!(pii_filter["pattern"], "ssn", "ssn filter is first in insertion order");
+        assert_eq!(
+            pii_filter["pattern"], "ssn",
+            "ssn filter is first in insertion order"
+        );
     }
 
     #[test]
@@ -250,8 +259,7 @@ mod tests {
         let orchestrator = PipelineOrchestrator::new(vec![]);
         let ctx = WorkContext::default();
         let output = orchestrator.execute(&ctx).expect("execute");
-        let result: crate::pipeline::PipelineResult =
-            output.data_as().expect("data_as");
+        let result: crate::pipeline::PipelineResult = output.data_as().expect("data_as");
         assert!(!result.rejected);
         assert_eq!(result.decisions.len(), 0);
     }
@@ -262,8 +270,7 @@ mod tests {
         let orchestrator = PipelineOrchestrator::new(vec![stage]);
         let ctx = make_ctx("What is Rust?");
         let output = orchestrator.execute(&ctx).expect("execute");
-        let result: crate::pipeline::PipelineResult =
-            output.data_as().expect("data_as");
+        let result: crate::pipeline::PipelineResult = output.data_as().expect("data_as");
         assert!(!result.rejected);
         assert_eq!(result.decisions.len(), 1);
         assert_eq!(result.decisions[0].verdict, StageVerdict::Passed);
@@ -275,8 +282,7 @@ mod tests {
         let orchestrator = PipelineOrchestrator::new(vec![stage]);
         let ctx = make_ctx("/help");
         let output = orchestrator.execute(&ctx).expect("execute");
-        let result: crate::pipeline::PipelineResult =
-            output.data_as().expect("data_as");
+        let result: crate::pipeline::PipelineResult = output.data_as().expect("data_as");
         assert!(result.rejected);
         assert_eq!(result.decisions.len(), 1);
         assert_eq!(result.decisions[0].verdict, StageVerdict::Rejected);
@@ -292,18 +298,13 @@ mod tests {
     fn test_pipeline_orchestrator_provides() {
         let orchestrator = PipelineOrchestrator::new(vec![]);
         assert_eq!(orchestrator.provides().len(), 1);
-        assert_eq!(
-            &*orchestrator.provides()[0],
-            "pipeline.result"
-        );
+        assert_eq!(&*orchestrator.provides()[0], "pipeline.result");
     }
 
     #[test]
     fn test_pipeline_orchestrator_builder() {
         let stage = Arc::new(DeterministicPreFilter::new());
-        let orchestrator = PipelineOrchestrator::builder()
-            .push(stage)
-            .build();
+        let orchestrator = PipelineOrchestrator::builder().push(stage).build();
         assert_eq!(orchestrator.name(), "pipeline.orchestrator");
     }
 

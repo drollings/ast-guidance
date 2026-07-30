@@ -5,8 +5,8 @@ use content_node::doc_node::DocumentContentNode;
 use content_node::file_node::FileContentNode;
 use content_node::node::{ContentNode, LodLevel};
 use content_node::source_node::SourceCodeContentNode;
-use guidance_core::sync::json_store::load_guidance;
 use fluent_types::{FileType, GuidanceDoc};
+use guidance_core::sync::json_store::load_guidance;
 use ptree::{PrintConfig, TreeBuilder};
 
 const HEADER: &str = r#"# AST-Guidance Project Structure

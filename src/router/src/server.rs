@@ -1,9 +1,9 @@
 //! HTTP server exposing the router pipeline as an OpenAI-compatible endpoint.
 //! Uses hyper for HTTP with SSE streaming support via http-body-util::channel.
 
+pub mod dispatch;
 pub mod handler;
 pub mod responses;
-pub mod dispatch;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -103,9 +103,15 @@ impl RouterServer {
 }
 
 impl WorkUnit for RouterServer {
-    fn name(&self) -> &str { &self.name }
-    fn depends(&self) -> &[ArcIntern<str>] { &self.depends }
-    fn provides(&self) -> &[ArcIntern<str>] { &self.provides }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn depends(&self) -> &[ArcIntern<str>] {
+        &self.depends
+    }
+    fn provides(&self) -> &[ArcIntern<str>] {
+        &self.provides
+    }
 
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
         let pipelines = Arc::new(self.pipelines.clone());
@@ -120,26 +126,44 @@ impl WorkUnit for RouterServer {
         let rt = ctx.rt.clone();
 
         let _handle = rt.spawn(Box::pin(async move {
-            if let Err(e) =
-                run_http(pipelines, routes, models, &bind_addr, max_payload,
-                         classifier_url, mock_dispatch, ledger, cache).await
+            if let Err(e) = run_http(
+                pipelines,
+                routes,
+                models,
+                &bind_addr,
+                max_payload,
+                classifier_url,
+                mock_dispatch,
+                ledger,
+                cache,
+            )
+            .await
             {
                 tracing::error!(target: "router.server", error = %e, "HTTP server error");
             }
         }));
 
-        Ok(WorkOutput::ok(format!("HTTP server bound to {}", self.bind_addr)))
+        Ok(WorkOutput::ok(format!(
+            "HTTP server bound to {}",
+            self.bind_addr
+        )))
     }
 }
 
 impl FieldAccess for RouterServer {
     fn set_field(&mut self, _name: &str, _value: &str) -> Result<(), FieldError> {
-        Err(FieldError::NotFound("RouterServer has no configurable fields".into()))
+        Err(FieldError::NotFound(
+            "RouterServer has no configurable fields".into(),
+        ))
     }
     fn get_field(&self, _name: &str) -> Result<String, FieldError> {
-        Err(FieldError::NotFound("RouterServer has no configurable fields".into()))
+        Err(FieldError::NotFound(
+            "RouterServer has no configurable fields".into(),
+        ))
     }
-    fn field_names(&self) -> &'static [&'static str] { &[] }
+    fn field_names(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 impl Describable for RouterServer {
@@ -196,15 +220,23 @@ async fn run_http(
             let io = TokioIo::new(stream);
             let service = hyper::service::service_fn(move |req| {
                 handler::handle_request(
-                    req, pipelines.clone(), routes.clone(), models.clone(),
-                    stats.clone(), max_payload, classifier_url.clone(),
-                    mock_dispatch.clone(), ledger.clone(), cache.clone(),
+                    req,
+                    pipelines.clone(),
+                    routes.clone(),
+                    models.clone(),
+                    stats.clone(),
+                    max_payload,
+                    classifier_url.clone(),
+                    mock_dispatch.clone(),
+                    ledger.clone(),
+                    cache.clone(),
                     http_client.clone(),
                 )
             });
 
             if let Err(e) = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service).await
+                .serve_connection(io, service)
+                .await
             {
                 if !e.to_string().contains("connection closed")
                     && !e.to_string().contains("shutdown")

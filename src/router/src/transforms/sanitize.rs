@@ -36,9 +36,7 @@ impl TransformStrategy for Sanitize {
 }
 
 fn filter_unsafe_chars(text: &str) -> String {
-    text.chars()
-        .filter(|&c| is_safe_char(c))
-        .collect()
+    text.chars().filter(|&c| is_safe_char(c)).collect()
 }
 
 fn is_safe_char(c: char) -> bool {
@@ -102,8 +100,9 @@ fn skip_csi_params(chars: &mut Chars<'_>) {
     loop {
         let mut peek = chars.clone();
         match peek.next() {
-            Some(p) if ('\u{0030}'..='\u{003F}').contains(&p)
-                || ('\u{0020}'..='\u{002F}').contains(&p) =>
+            Some(p)
+                if ('\u{0030}'..='\u{003F}').contains(&p)
+                    || ('\u{0020}'..='\u{002F}').contains(&p) =>
             {
                 chars.next();
             }

@@ -4,10 +4,10 @@
 pub mod adapter;
 pub(crate) mod closure;
 pub mod dep_graph;
-pub(crate) mod narrowing;
 pub mod error;
 pub mod executor;
 pub mod middleware;
+pub(crate) mod narrowing;
 pub mod resolver;
 pub mod target;
 pub mod type_inference;

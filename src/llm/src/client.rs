@@ -215,7 +215,16 @@ pub fn chat_complete_http(
 ) -> Result<String, LlmError> {
     // timeout_ms=0 disables the timeout to preserve the original behavior
     // of the sync `chat_complete_http` (which had no timeout).
-    let fut = chat_complete_http_async(api_base, messages, model, think, 0, extra_body_params, debug, show_prompts);
+    let fut = chat_complete_http_async(
+        api_base,
+        messages,
+        model,
+        think,
+        0,
+        extra_body_params,
+        debug,
+        show_prompts,
+    );
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => handle.block_on(fut),
         Err(_) => fallback_runtime().block_on(fut),

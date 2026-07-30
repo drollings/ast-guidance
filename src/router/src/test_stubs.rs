@@ -134,7 +134,10 @@ impl WorkUnit for FailingStage {
                     stage: PipelineStage::Classifier,
                     verdict: StageVerdict::Passed,
                     score: Some(1.0),
-                    reason: format!("parse error: attempt would be {} more failures", *remaining + 1),
+                    reason: format!(
+                        "parse error: attempt would be {} more failures",
+                        *remaining + 1
+                    ),
                     latency_ms: 0,
                     metadata: serde_json::json!({"fallback": true}),
                 },
@@ -157,10 +160,14 @@ impl WorkUnit for FailingStage {
 
 impl FieldAccess for FailingStage {
     fn set_field(&mut self, _name: &str, _value: &str) -> Result<(), FieldError> {
-        Err(FieldError::NotFound("FailingStage has no configurable fields".into()))
+        Err(FieldError::NotFound(
+            "FailingStage has no configurable fields".into(),
+        ))
     }
     fn get_field(&self, _name: &str) -> Result<String, FieldError> {
-        Err(FieldError::NotFound("FailingStage has no configurable fields".into()))
+        Err(FieldError::NotFound(
+            "FailingStage has no configurable fields".into(),
+        ))
     }
     fn field_names(&self) -> &'static [&'static str] {
         &[]

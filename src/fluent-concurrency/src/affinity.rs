@@ -106,18 +106,30 @@ where
 
     /// Set the current affinity session.
     pub fn set_affinity(&self, identity: Option<String>) {
-        let mut aff = self.current_affinity.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut aff = self
+            .current_affinity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *aff = identity;
     }
 
     /// Get the current affinity session.
     pub fn current_affinity(&self) -> Option<String> {
-        self.current_affinity.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        self.current_affinity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn compute_priority(&self, identity: &str, base_priority: i32) -> i32 {
-        let affinity = self.current_affinity.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut priorities = self.base_priorities.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let affinity = self
+            .current_affinity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut priorities = self
+            .base_priorities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let effective_base = priorities.get(identity).copied().unwrap_or(base_priority);
         priorities.insert(identity.to_string(), effective_base);
@@ -131,7 +143,10 @@ where
 
     fn maybe_age(&self) {
         let should_age = {
-            let last = self.last_aging.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let last = self
+                .last_aging
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             last.elapsed() >= self.aging.aging_interval
         };
 
@@ -141,10 +156,20 @@ where
     }
 
     fn age_priorities(&self) {
-        let mut priorities = self.base_priorities.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut last = self.last_aging.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut priorities = self
+            .base_priorities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut last = self
+            .last_aging
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let affinity = self.current_affinity.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let affinity = self
+            .current_affinity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         for (identity, prio) in priorities.iter_mut() {
             if Some(identity.as_str()) != affinity.as_deref() {
                 *prio = (*prio + self.aging.aging_rate).min(self.aging.max_priority);
@@ -241,13 +266,12 @@ mod tests {
             move |_identity: String| async move { Ok::<String, String>("done".into()) },
         ));
 
-        let scheduler = AffinityScheduler::new(Arc::clone(&p))
-            .with_aging(AgingConfig {
-                affinity_bonus: 10,
-                aging_interval: Duration::ZERO,
-                aging_rate: 5,
-                max_priority: 100,
-            });
+        let scheduler = AffinityScheduler::new(Arc::clone(&p)).with_aging(AgingConfig {
+            affinity_bonus: 10,
+            aging_interval: Duration::ZERO,
+            aging_rate: 5,
+            max_priority: 100,
+        });
 
         scheduler.set_affinity(Some("session-a".into()));
 
@@ -260,7 +284,10 @@ mod tests {
 
         scheduler.age_now();
 
-        let prios = scheduler.base_priorities.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prios = scheduler
+            .base_priorities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(prios.get("session-b"), Some(&5));
     }
 

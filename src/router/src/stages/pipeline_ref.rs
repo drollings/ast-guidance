@@ -127,14 +127,15 @@ impl_component!(PipelineRefStage);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_stubs;
     use crate::pipeline::PipelineOrchestrator;
+    use crate::test_stubs;
 
     #[test]
     fn pipeline_ref_resolves_and_delegates() {
-        let target = PipelineOrchestrator::new(vec![Arc::new(
-            test_stubs::SimplePassStage::new("inner", "produced by inner"),
-        )]);
+        let target = PipelineOrchestrator::new(vec![Arc::new(test_stubs::SimplePassStage::new(
+            "inner",
+            "produced by inner",
+        ))]);
         let target_arc: Arc<dyn Component> = Arc::new(target);
 
         let mut registry: HashMap<String, Arc<dyn Component>> = HashMap::new();

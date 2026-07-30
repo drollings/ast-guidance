@@ -29,15 +29,16 @@ fn default_provider() -> TranscriptProvider {
     TranscriptProvider::new(std::collections::HashMap::new())
 }
 
-
 fn make_test_config() -> RouterConfig {
-    match serde_json::from_str::<RouterConfig>(r#"{
+    match serde_json::from_str::<RouterConfig>(
+        r#"{
         "pipelines": {"default": {"deterministic_prefilter": true, "classifier": true, "blacklist": "env/pii-patterns.json"}},
         "models": {"fast": {"endpoint": "http://upstream.test:8080/v1/chat/completions", "name": "fast", "intelligence": 1, "cost_input": 0.000001, "cost_output": 0.000006, "cost_cached_read": 0.0000004, "speed": 10, "total_timeout_ms": 5000, "idle_timeout_ms": 2000, "stream": false, "filter_thinking": false, "retry_count": 0, "retry_base_interval_s": 1}},
         "model_groups": {"fast": ["fast"]},
         "routes": {"fast": {"group": "fast", "pipelines": ["default"]}},
         "default_route": "fast"
-    }"#) {
+    }"#,
+    ) {
         Ok(c) => c,
         Err(e) => panic!("invalid test config: {e}"),
     }
@@ -57,13 +58,19 @@ fn make_request(text: &str) -> RouterRequest {
     req
 }
 
-fn route(pipeline: &PipelineOrchestrator, request: &RouterRequest) -> Result<PipelineResult, WorkError> {
+fn route(
+    pipeline: &PipelineOrchestrator,
+    request: &RouterRequest,
+) -> Result<PipelineResult, WorkError> {
     let request_json = serde_json::to_string(request)
         .map_err(|e| WorkError::Execution(format!("serialization error: {e}")))?;
     let mut ctx = WorkContext::default();
-    ctx.metadata.insert("request".into(), MetadataValue::String(request_json));
+    ctx.metadata
+        .insert("request".into(), MetadataValue::String(request_json));
     let output = pipeline.execute(&ctx)?;
-    output.data_take().map_err(|e| WorkError::Execution(e.to_string()))
+    output
+        .data_take()
+        .map_err(|e| WorkError::Execution(e.to_string()))
 }
 
 const INTENT_CASES: &[GoldenCase] = &[
@@ -184,8 +191,7 @@ fn run_golden_cases(cases: &[GoldenCase], provider: TranscriptProvider) {
                     assert!(
                         !pipeline_result.rejected,
                         "case '{}' should not be rejected, but was rejected with: {:?}",
-                        case.name,
-                        pipeline_result.reject_reason
+                        case.name, pipeline_result.reject_reason
                     );
                 }
             }
@@ -282,7 +288,10 @@ fn golden_unknown_command_is_rejected() {
     let result = route(&pipeline, &request).expect("pipeline should handle unknown cmd");
     assert!(result.rejected, "unknown command should be rejected");
     assert!(
-        result.reject_reason.unwrap_or_default().contains("unknown command"),
+        result
+            .reject_reason
+            .unwrap_or_default()
+            .contains("unknown command"),
         "reject reason should mention unknown command"
     );
 }

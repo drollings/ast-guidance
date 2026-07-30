@@ -1,9 +1,9 @@
-pub mod schema;
-pub mod nodes;
 pub mod edges;
-pub mod hnsw;
 pub mod embeddings;
+pub mod hnsw;
 pub mod kv_cache;
+pub mod nodes;
+pub mod schema;
 
 use std::mem::size_of;
 use std::path::Path;

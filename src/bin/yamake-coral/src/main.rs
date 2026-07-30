@@ -6,7 +6,10 @@ use fluent_dag::resolver::DependencyResolver;
 use fluent_dag::yamake_loader::load_yamake_config;
 
 #[derive(Parser)]
-#[command(name = "yamake-coral", about = "Yamake dependency resolver — Kahn's + disambiguation")]
+#[command(
+    name = "yamake-coral",
+    about = "Yamake dependency resolver — Kahn's + disambiguation"
+)]
 struct Args {
     #[command(subcommand)]
     command: Command,
@@ -65,12 +68,15 @@ fn main() {
     let args = Args::parse();
 
     match args.command {
-        Command::Classic { config, targets, non_strict } => {
-            let json = std::fs::read_to_string(&config)
-                .unwrap_or_else(|e| {
-                    eprintln!("error reading {config}: {e}");
-                    process::exit(1);
-                });
+        Command::Classic {
+            config,
+            targets,
+            non_strict,
+        } => {
+            let json = std::fs::read_to_string(&config).unwrap_or_else(|e| {
+                eprintln!("error reading {config}: {e}");
+                process::exit(1);
+            });
             let (reg, _caps) = load_yamake_config(&json);
             let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
             let resolver = DependencyResolver::new(&reg).with_strict(!non_strict);
@@ -78,7 +84,11 @@ fn main() {
             match resolver.resolve(&targets) {
                 Ok(plan) => {
                     let elapsed = start.elapsed();
-                    println!("classic resolve: {} targets in {:?}", plan.order.len(), elapsed);
+                    println!(
+                        "classic resolve: {} targets in {:?}",
+                        plan.order.len(),
+                        elapsed
+                    );
                     println!("order: {:?}", plan.target_names);
                 }
                 Err(e) => {
@@ -87,12 +97,15 @@ fn main() {
                 }
             }
         }
-        Command::Ambiguous { config, targets, non_strict } => {
-            let json = std::fs::read_to_string(&config)
-                .unwrap_or_else(|e| {
-                    eprintln!("error reading {config}: {e}");
-                    process::exit(1);
-                });
+        Command::Ambiguous {
+            config,
+            targets,
+            non_strict,
+        } => {
+            let json = std::fs::read_to_string(&config).unwrap_or_else(|e| {
+                eprintln!("error reading {config}: {e}");
+                process::exit(1);
+            });
             let (reg, caps) = load_yamake_config(&json);
             let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
             let resolver = DependencyResolver::with_narrowing(&reg, &caps).with_strict(!non_strict);
@@ -100,7 +113,11 @@ fn main() {
             match resolver.resolve(&targets) {
                 Ok(plan) => {
                     let elapsed = start.elapsed();
-                    println!("ambiguous resolve: {} targets in {:?}", plan.order.len(), elapsed);
+                    println!(
+                        "ambiguous resolve: {} targets in {:?}",
+                        plan.order.len(),
+                        elapsed
+                    );
                     println!("order: {:?}", plan.target_names);
                 }
                 Err(e) => {
@@ -109,12 +126,15 @@ fn main() {
                 }
             }
         }
-        Command::Compare { config, targets, non_strict } => {
-            let json = std::fs::read_to_string(&config)
-                .unwrap_or_else(|e| {
-                    eprintln!("error reading {config}: {e}");
-                    process::exit(1);
-                });
+        Command::Compare {
+            config,
+            targets,
+            non_strict,
+        } => {
+            let json = std::fs::read_to_string(&config).unwrap_or_else(|e| {
+                eprintln!("error reading {config}: {e}");
+                process::exit(1);
+            });
             let (reg, caps) = load_yamake_config(&json);
             let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
 
@@ -133,7 +153,8 @@ fn main() {
             }
 
             println!("=== AmbiguousDependencyResolver ===");
-            let ambiguous = DependencyResolver::with_narrowing(&reg, &caps).with_strict(!non_strict);
+            let ambiguous =
+                DependencyResolver::with_narrowing(&reg, &caps).with_strict(!non_strict);
             let start = Instant::now();
             match ambiguous.resolve(&targets) {
                 Ok(plan) => {
@@ -147,11 +168,10 @@ fn main() {
             }
         }
         Command::Test { config } => {
-            let json = std::fs::read_to_string(&config)
-                .unwrap_or_else(|e| {
-                    eprintln!("error reading {config}: {e}");
-                    process::exit(1);
-                });
+            let json = std::fs::read_to_string(&config).unwrap_or_else(|e| {
+                eprintln!("error reading {config}: {e}");
+                process::exit(1);
+            });
             let (reg, caps) = load_yamake_config(&json);
 
             println!("=== yamake-coral test battery ===\n");
@@ -160,24 +180,48 @@ fn main() {
                 ("just animal", vec!["animal"], Some("classic")),
                 ("just confuse", vec!["confuse"], Some("classic")),
                 ("confuse + bee", vec!["confuse", "bee"], Some("ambiguous")),
-                ("confuse + stoat", vec!["confuse", "stoat"], Some("ambiguous")),
+                (
+                    "confuse + stoat",
+                    vec!["confuse", "stoat"],
+                    Some("ambiguous"),
+                ),
                 ("confuse + cat", vec!["confuse", "cat"], Some("ambiguous")),
                 ("confuse + puma", vec!["confuse", "puma"], Some("ambiguous")),
-                ("confuse + gazelle", vec!["confuse", "gazelle"], Some("ambiguous")),
+                (
+                    "confuse + gazelle",
+                    vec!["confuse", "gazelle"],
+                    Some("ambiguous"),
+                ),
                 ("confuse + vole", vec!["confuse", "vole"], Some("ambiguous")),
-                ("confuse + wildebeest", vec!["confuse", "wildebeest"], Some("ambiguous")),
+                (
+                    "confuse + wildebeest",
+                    vec!["confuse", "wildebeest"],
+                    Some("ambiguous"),
+                ),
                 ("bee + stoat", vec!["bee", "stoat"], None),
                 ("confuse_a_cat", vec!["confuse_a_cat"], Some("classic")),
                 ("distract_a_bee", vec!["distract_a_bee"], Some("classic")),
                 ("stun_a_stoat", vec!["stun_a_stoat"], Some("classic")),
                 ("puzzle_a_puma", vec!["puzzle_a_puma"], Some("classic")),
-                ("startle_a_thompsons_gazelle", vec!["startle_a_thompsons_gazelle"], Some("classic")),
+                (
+                    "startle_a_thompsons_gazelle",
+                    vec!["startle_a_thompsons_gazelle"],
+                    Some("classic"),
+                ),
                 ("amaze_a_vole", vec!["amaze_a_vole"], Some("classic")),
                 ("bewilderbeest", vec!["bewilderbeest"], Some("classic")),
                 ("default build", vec!["default"], Some("classic")),
-                ("deep chain: confuse_a_cat", vec!["confuse_a_cat"], Some("classic")),
+                (
+                    "deep chain: confuse_a_cat",
+                    vec!["confuse_a_cat"],
+                    Some("classic"),
+                ),
                 ("abstract resolve: agency", vec!["agency"], Some("abstract")),
-                ("abstract resolve: cognitive", vec!["cognitive"], Some("abstract")),
+                (
+                    "abstract resolve: cognitive",
+                    vec!["cognitive"],
+                    Some("abstract"),
+                ),
             ];
 
             let mut passed = 0;
@@ -206,23 +250,37 @@ fn main() {
                     let expected = expected_resolver.unwrap_or("any");
                     match (expected, &classic_result, &ambiguous_result) {
                         ("classic", Ok(cp), Ok(ap)) => {
-                            let overlap: usize = cp.target_names.iter()
+                            let overlap: usize = cp
+                                .target_names
+                                .iter()
                                 .filter(|n| ap.target_names.contains(n))
                                 .count();
-                            let classic_pct = if cp.target_names.is_empty() { 0.0 } else {
+                            let classic_pct = if cp.target_names.is_empty() {
+                                0.0
+                            } else {
                                 overlap as f64 / cp.target_names.len() as f64 * 100.0
                             };
-                            let ambig_pct = if ap.target_names.is_empty() { 0.0 } else {
+                            let ambig_pct = if ap.target_names.is_empty() {
+                                0.0
+                            } else {
                                 overlap as f64 / ap.target_names.len() as f64 * 100.0
                             };
                             println!("OK  classic={} ambig={} overlap={overlap} ({classic_pct:.0}%/{ambig_pct:.0}%)",
                                 cp.target_names.len(), ap.target_names.len());
                         }
                         ("ambiguous", _, Ok(ap)) => {
-                            println!("OK  ambiguous={} targets: {:?}", ap.target_names.len(), &ap.target_names[..ap.target_names.len().min(6)]);
+                            println!(
+                                "OK  ambiguous={} targets: {:?}",
+                                ap.target_names.len(),
+                                &ap.target_names[..ap.target_names.len().min(6)]
+                            );
                         }
                         ("abstract", Ok(cp), _) => {
-                            println!("OK  classic={} targets: {:?}", cp.target_names.len(), &cp.target_names[..cp.target_names.len().min(6)]);
+                            println!(
+                                "OK  classic={} targets: {:?}",
+                                cp.target_names.len(),
+                                &cp.target_names[..cp.target_names.len().min(6)]
+                            );
                         }
                         _ => {
                             println!("OK");
@@ -232,13 +290,24 @@ fn main() {
                 } else {
                     match expected_resolver {
                         Some("ambiguous") if ambiguous_result.is_err() => {
-                            println!("OK  (expected ambiguity: {})", ambiguous_result.unwrap_err());
+                            println!(
+                                "OK  (expected ambiguity: {})",
+                                ambiguous_result.unwrap_err()
+                            );
                             passed += 1;
                         }
                         _ => {
-                            println!("FAIL classic={:?} ambiguous={:?}",
-                                classic_result.as_ref().map(|p| p.target_names.len()).map_err(|e| e.to_string()),
-                                ambiguous_result.as_ref().map(|p| p.target_names.len()).map_err(|e| e.to_string()));
+                            println!(
+                                "FAIL classic={:?} ambiguous={:?}",
+                                classic_result
+                                    .as_ref()
+                                    .map(|p| p.target_names.len())
+                                    .map_err(|e| e.to_string()),
+                                ambiguous_result
+                                    .as_ref()
+                                    .map(|p| p.target_names.len())
+                                    .map_err(|e| e.to_string())
+                            );
                             failed += 1;
                         }
                     }

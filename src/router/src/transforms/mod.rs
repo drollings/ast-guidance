@@ -1,8 +1,8 @@
 pub mod codeword_anonymize;
-pub mod none;
-pub mod pii_anonymize;
 pub mod decompose_hypothetical;
 pub mod decompose_subtasks;
+pub mod none;
+pub mod pii_anonymize;
 pub mod sanitize;
 pub mod secret_mask;
 

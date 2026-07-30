@@ -61,9 +61,7 @@ pub enum FeatureName {
 #[serde(tag = "type")]
 pub enum TelemetryEvent {
     /// A tool was invoked.
-    ToolInvoked {
-        tool: ToolName,
-    },
+    ToolInvoked { tool: ToolName },
     /// A tool completed, with duration and outcome.
     ToolCompleted {
         tool: ToolName,
@@ -71,9 +69,7 @@ pub enum TelemetryEvent {
         success: bool,
     },
     /// A routing decision was made, with provider category only.
-    Routing {
-        category: ProviderCategory,
-    },
+    Routing { category: ProviderCategory },
     /// An error occurred, with failure class.
     Error {
         class: FailureClass,
@@ -81,9 +77,7 @@ pub enum TelemetryEvent {
         message: Option<String>,
     },
     /// A feature was used.
-    FeatureUsed {
-        feature: FeatureName,
-    },
+    FeatureUsed { feature: FeatureName },
 }
 
 // ── TelemetrySink ──────────────────────────────────────────────────────

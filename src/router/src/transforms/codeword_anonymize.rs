@@ -111,11 +111,7 @@ impl CodewordAnonymizer {
 
     /// Perform consistent substitution using regex matches.
     /// Matches are sorted rightmost-first to preserve indices during replacement.
-    fn apply_substitution(
-        &self,
-        text: &str,
-        matches: &[MatchEntry],
-    ) -> String {
+    fn apply_substitution(&self, text: &str, matches: &[MatchEntry]) -> String {
         let mut result = text.to_string();
         let mut dedup: HashMap<String, String> = HashMap::new();
 
@@ -133,7 +129,8 @@ impl CodewordAnonymizer {
         {
             let mut map = self.mapping.lock().unwrap();
             for (_, _, ref codeword, ref original) in &substitutions {
-                map.entry(codeword.clone()).or_insert_with(|| original.clone());
+                map.entry(codeword.clone())
+                    .or_insert_with(|| original.clone());
             }
         }
 
@@ -187,10 +184,9 @@ impl TransformStrategy for CodewordAnonymizer {
                 .iter()
                 .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
                 .collect();
-            transformed.metadata.insert(
-                "codeword_map".into(),
-                serde_json::Value::Object(map_obj),
-            );
+            transformed
+                .metadata
+                .insert("codeword_map".into(), serde_json::Value::Object(map_obj));
         }
 
         Ok(transformed)

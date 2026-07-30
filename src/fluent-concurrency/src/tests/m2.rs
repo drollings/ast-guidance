@@ -359,7 +359,8 @@ async fn test_zone_real_panic() {
     let mut zone = Zone::new(runtime, caps);
 
     zone.register(Arc::new(StubComponent::ok("good"))).unwrap();
-    zone.register(Arc::new(StubComponent::panic("panic"))).unwrap();
+    zone.register(Arc::new(StubComponent::panic("panic")))
+        .unwrap();
     let summary: ZoneSummary = (&mut zone).await;
     assert_eq!(summary.completed.len(), 1);
     assert_eq!(summary.panicked.len(), 1);
@@ -442,10 +443,8 @@ async fn test_zone_transitive_cancellation() {
     let caps = CapabilitySet::new();
     let mut zone = Zone::new(runtime, caps);
 
-    zone.register(Arc::new(
-        StubComponent::fail("A").with_provides("a_out"),
-    ))
-    .unwrap();
+    zone.register(Arc::new(StubComponent::fail("A").with_provides("a_out")))
+        .unwrap();
     zone.register_with_context(
         Arc::new(
             StubComponent::fail("B")
@@ -526,7 +525,8 @@ async fn test_zone_budget_exhaustion() {
     let mut zone = Zone::new(runtime, caps);
 
     for i in 0..250 {
-        zone.register(Arc::new(StubComponent::ok(&format!("fast_{i}")))).unwrap();
+        zone.register(Arc::new(StubComponent::ok(&format!("fast_{i}"))))
+            .unwrap();
     }
 
     let summary: ZoneSummary = (&mut zone).await;
@@ -582,8 +582,10 @@ async fn test_zone_failed_vs_panic_distinct() {
     let caps = CapabilitySet::new();
     let mut zone = Zone::new(runtime, caps);
 
-    zone.register(Arc::new(StubComponent::fail("fail_task"))).unwrap();
-    zone.register(Arc::new(StubComponent::panic("panic_task"))).unwrap();
+    zone.register(Arc::new(StubComponent::fail("fail_task")))
+        .unwrap();
+    zone.register(Arc::new(StubComponent::panic("panic_task")))
+        .unwrap();
 
     let summary: ZoneSummary = (&mut zone).await;
     assert_eq!(summary.completed.len(), 0);

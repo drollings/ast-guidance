@@ -74,25 +74,15 @@ impl PipelineGraph {
 
         for stage in &stages {
             let stage_name = stage.name().to_string();
-            let deps: Vec<String> = stage
-                .depends()
-                .iter()
-                .map(ToString::to_string)
-                .collect();
-            let provides: Vec<String> = stage
-                .provides()
-                .iter()
-                .map(ToString::to_string)
-                .collect();
+            let deps: Vec<String> = stage.depends().iter().map(ToString::to_string).collect();
+            let provides: Vec<String> = stage.provides().iter().map(ToString::to_string).collect();
 
             dep_graph
                 .register(&stage_name, &deps, &provides)
                 .map_err(|e| match e {
-                    GraphError::DuplicateNode(_) => {
-                        GraphError::DuplicateNode(format!(
-                            "pipeline graph: duplicate stage name: {stage_name}"
-                        ))
-                    }
+                    GraphError::DuplicateNode(_) => GraphError::DuplicateNode(format!(
+                        "pipeline graph: duplicate stage name: {stage_name}"
+                    )),
                     other => other,
                 })?;
         }
@@ -164,8 +154,10 @@ impl PipelineGraph {
         accumulated_metadata: &HashMap<String, MetadataValue>,
     ) -> WorkContext {
         let mut ctx = base.clone();
-        ctx.metadata
-            .insert("request".into(), MetadataValue::String(current_request.to_string()));
+        ctx.metadata.insert(
+            "request".into(),
+            MetadataValue::String(current_request.to_string()),
+        );
         // Copy accumulated decision fields so SwitchStage can read them.
         for (k, v) in accumulated_metadata {
             ctx.metadata.insert(k.clone(), v.clone());
@@ -210,8 +202,7 @@ impl WorkUnit for PipelineGraph {
 
         for &stage_idx in &self.stage_order {
             let stage = &self.stages[stage_idx];
-            let stage_ctx =
-                Self::build_stage_context(ctx, &current_request, &accumulated_metadata);
+            let stage_ctx = Self::build_stage_context(ctx, &current_request, &accumulated_metadata);
             let start = Instant::now();
             let stage_name_human = stage.name().to_string();
 
@@ -268,10 +259,8 @@ impl WorkUnit for PipelineGraph {
                     match verdict {
                         StageVerdict::Passed | StageVerdict::Skipped => {
                             if stage_name == PipelineStage::Classifier {
-                                if let Some(resp) = decision
-                                    .metadata
-                                    .get("response")
-                                    .and_then(|v| v.as_str())
+                                if let Some(resp) =
+                                    decision.metadata.get("response").and_then(|v| v.as_str())
                                 {
                                     tracing::info!(
                                         target: "router.pipeline_graph",
@@ -286,9 +275,7 @@ impl WorkUnit for PipelineGraph {
                             }
                         }
                         StageVerdict::Rerouted => {
-                            if let Some(rewritten) =
-                                decision.metadata.get("rewritten_request")
-                            {
+                            if let Some(rewritten) = decision.metadata.get("rewritten_request") {
                                 if let Some(s) = rewritten.as_str() {
                                     tracing::info!(
                                         target: "router.pipeline_graph",
@@ -436,11 +423,7 @@ mod tests {
     use crate::test_stubs::SimplePassStage;
 
     /// Create a stage with custom dependency declarations.
-    fn make_dep_stage(
-        name: &str,
-        dep: Option<&str>,
-        prov: Option<&str>,
-    ) -> Arc<dyn Component> {
+    fn make_dep_stage(name: &str, dep: Option<&str>, prov: Option<&str>) -> Arc<dyn Component> {
         let mut stub = fluent_wvr_testutil::StubComponent::new(name);
         if let Some(d) = dep {
             stub = stub.with_dep(d);
@@ -457,8 +440,7 @@ mod tests {
         let b = make_dep_stage("b", Some("x"), Some("y"));
         let c = make_dep_stage("c", Some("y"), None);
 
-        let graph = PipelineGraph::new(vec![b.clone(), c.clone(), a.clone()])
-            .expect("build graph");
+        let graph = PipelineGraph::new(vec![b.clone(), c.clone(), a.clone()]).expect("build graph");
 
         // a must execute before b, b before c
         let names: Vec<&str> = graph
@@ -480,10 +462,7 @@ mod tests {
         let b = make_dep_stage("b", Some("a_provides"), Some("b_provides"));
 
         let result = PipelineGraph::new(vec![a, b]);
-        assert!(
-            result.is_err(),
-            "cycle should be detected and rejected"
-        );
+        assert!(result.is_err(), "cycle should be detected and rejected");
     }
 
     #[test]
@@ -492,10 +471,7 @@ mod tests {
         let b = make_dep_stage("dup", None, None);
 
         let result = PipelineGraph::new(vec![a, b]);
-        assert!(
-            result.is_err(),
-            "duplicate stage names should error"
-        );
+        assert!(result.is_err(), "duplicate stage names should error");
     }
 
     #[test]

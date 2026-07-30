@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
+use fluent_types::ContentNode;
+use fluent_types::NodeId;
+use fluent_types::LOD_COUNT;
 use guidance_rdf::normalize::hash_blank_node;
 use guidance_rdf::normalize::hash_iri;
 use guidance_rdf::parser::Term;
 use guidance_rdf::parser::Triple;
-use fluent_types::ContentNode;
-use fluent_types::NodeId;
-use fluent_types::LOD_COUNT;
 use thiserror::Error;
 
 use crate::yago;

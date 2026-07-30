@@ -81,10 +81,9 @@ impl TransformStrategy for DecomposeToSubtasks {
         };
 
         transformed.messages = vec![system_msg, subtask_msg];
-        transformed.metadata.insert(
-            "subtasks".into(),
-            subtasks_json,
-        );
+        transformed
+            .metadata
+            .insert("subtasks".into(), subtasks_json);
         transformed.metadata.insert(
             "transform".into(),
             serde_json::json!("decompose_to_subtasks"),

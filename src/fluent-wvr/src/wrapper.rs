@@ -492,10 +492,7 @@ impl<'a, T: 'a, E> Pipeline<'a, T, E> {
     }
 
     #[must_use]
-    pub fn step(
-        mut self,
-        f: impl FnMut(&mut T) -> Result<(), E> + Send + Sync + 'a,
-    ) -> Self {
+    pub fn step(mut self, f: impl FnMut(&mut T) -> Result<(), E> + Send + Sync + 'a) -> Self {
         self.steps.push(Step::Required(Box::new(f)));
         self
     }

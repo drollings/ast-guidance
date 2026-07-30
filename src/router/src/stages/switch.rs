@@ -91,8 +91,7 @@ impl SwitchStage {
     /// Use `"*"` as the key for a wildcard catch-all.
     #[must_use]
     pub fn branch(mut self, value: impl Into<String>, pipeline: PipelineOrchestrator) -> Self {
-        self.branches
-            .insert(value.into(), Arc::new(pipeline));
+        self.branches.insert(value.into(), Arc::new(pipeline));
         self
     }
 
@@ -106,15 +105,14 @@ impl SwitchStage {
     /// Read the switch field value from WorkContext metadata.
     /// Returns the string representation (Number → decimal, Bool → "true"/"false").
     fn read_field(&self, ctx: &WorkContext) -> Option<String> {
-        ctx.metadata.get(&self.field_key).and_then(metadata_value_to_string)
+        ctx.metadata
+            .get(&self.field_key)
+            .and_then(metadata_value_to_string)
     }
 
     /// Select the matching sub-pipeline.  Resolution order:
     /// exact → wildcard → default → error.
-    fn select_pipeline(
-        &self,
-        value: &str,
-    ) -> Result<&Arc<PipelineOrchestrator>, WorkError> {
+    fn select_pipeline(&self, value: &str) -> Result<&Arc<PipelineOrchestrator>, WorkError> {
         if let Some(p) = self.branches.get(value) {
             return Ok(p);
         }
@@ -246,11 +244,10 @@ pub(crate) fn promote_decision_metadata(
 fn json_to_metadata_value(v: &serde_json::Value) -> Option<MetadataValue> {
     match v {
         serde_json::Value::String(s) => Some(MetadataValue::String(s.clone())),
-        serde_json::Value::Number(n) => {
-            n.as_i64()
-                .map(MetadataValue::Number)
-                .or_else(|| n.as_f64().map(MetadataValue::Float))
-        }
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .map(MetadataValue::Number)
+            .or_else(|| n.as_f64().map(MetadataValue::Float)),
         serde_json::Value::Bool(b) => Some(MetadataValue::Bool(*b)),
         serde_json::Value::Null => Some(MetadataValue::Null),
         _ => None,
@@ -357,7 +354,10 @@ mod tests {
         });
         promote_decision_metadata(&mut target, "classifier", &metadata);
 
-        assert_eq!(target.get("intent"), Some(&MetadataValue::String("code".into())));
+        assert_eq!(
+            target.get("intent"),
+            Some(&MetadataValue::String("code".into()))
+        );
         assert_eq!(target.get("complexity"), Some(&MetadataValue::Number(5)));
         assert_eq!(
             target.get("classifier.intent"),

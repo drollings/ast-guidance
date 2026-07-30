@@ -463,7 +463,10 @@ where
                 loop {
                     // Drain everything currently queued.
                     loop {
-                        let wrapped = { let mut pq = q.lock().await; pq.pop() };
+                        let wrapped = {
+                            let mut pq = q.lock().await;
+                            pq.pop()
+                        };
                         match wrapped {
                             Some(w) => {
                                 let result = h(w.job).await;

@@ -317,8 +317,8 @@ pub fn save_guidance(path: &Path, doc: &GuidanceDoc) -> Result<(), JsonError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluent_wvr_testutil::tempdir;
     use fluent_types::{GuidanceDoc, Member, MemberType, Meta};
+    use fluent_wvr_testutil::tempdir;
 
     fn make_test_member(name: &str, sig: &str, hash: &str, comment: Option<&str>) -> Member {
         Member {

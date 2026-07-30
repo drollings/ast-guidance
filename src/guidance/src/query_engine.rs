@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use guidance_project_knowledge::word_index::WordIndex;
 use fluent_types::GuidanceDoc;
+use guidance_project_knowledge::word_index::WordIndex;
 use thiserror::Error;
 
 use crate::ast_parser;
@@ -406,9 +406,9 @@ fn resolve_stage_lines(stages: &mut [Stage], parser: &mut ast_parser::AstParser)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluent_types::{GuidanceDoc, Member, MemberType, Meta};
     use fluent_wvr_testutil::tempdir;
     use guidance_project_knowledge::word_index::WordIndex;
-    use fluent_types::{GuidanceDoc, Member, MemberType, Meta};
 
     fn make_test_doc() -> GuidanceDoc {
         GuidanceDoc {

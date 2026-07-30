@@ -36,11 +36,7 @@ pub struct RetryClassifier {
 }
 
 impl RetryClassifier {
-    pub fn new(
-        inner: Arc<dyn Component>,
-        max_retries: usize,
-        retry_prompts: Vec<String>,
-    ) -> Self {
+    pub fn new(inner: Arc<dyn Component>, max_retries: usize, retry_prompts: Vec<String>) -> Self {
         Self {
             name: ArcIntern::from(format!("pipeline.stage2.retry({})", inner.name())),
             inner,
@@ -260,7 +256,11 @@ mod tests {
             "failing_classifier",
             2, // fail twice, then succeed
         ));
-        let retry = RetryClassifier::new(inner, 2, vec!["retry prompt 1".into(), "retry prompt 2".into()]);
+        let retry = RetryClassifier::new(
+            inner,
+            2,
+            vec!["retry prompt 1".into(), "retry prompt 2".into()],
+        );
 
         let ctx = WorkContext::default();
         let _ = retry.execute(&ctx);

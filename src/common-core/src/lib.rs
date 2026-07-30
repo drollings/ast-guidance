@@ -45,7 +45,8 @@ pub mod watchdog;
 
 pub use config::{load_json, load_json_or_default};
 pub use constants::{
-    default_true, HnswParams, MAX_EMBEDDING_DIMENSIONS, MAX_FILE_SIZE, MAX_JSON_DEPTH, MAX_VALUE_LEN,
+    default_true, HnswParams, MAX_EMBEDDING_DIMENSIONS, MAX_FILE_SIZE, MAX_JSON_DEPTH,
+    MAX_VALUE_LEN,
 };
 pub use drift::BitSetDrift;
 #[cfg(feature = "sqlite")]
@@ -80,12 +81,12 @@ pub use string::{
     truncate_at_sentence, STOP_WORDS,
 };
 pub use time::now_secs;
-pub use tokens::{
-    estimate_tokens, estimate_tokens_floor, estimate_tokens_with, chunk_document, AtomicTokenBudget,
-    ChunkConfig, TokenBudget,
-};
 #[allow(deprecated)]
 pub use tokens::DEFAULT_CHARS_PER_TOKEN;
+pub use tokens::{
+    chunk_document, estimate_tokens, estimate_tokens_floor, estimate_tokens_with,
+    AtomicTokenBudget, ChunkConfig, TokenBudget,
+};
 pub use walk::{collect_extensions, should_skip_dir, walk_files, SOURCE_EXTENSIONS};
 pub use watchdog::{
     BudgetWatchdog, RepetitionWatchdog, WallClockWatchdog, WatchdogEvent, WatchdogEventType,
@@ -117,6 +118,9 @@ mod tests {
     #[test]
     fn now_secs_returns_nonzero_after_2020() {
         let s = crate::now_secs();
-        assert!(s > 1_577_836_800, "now_secs returned {s}, expected > 2020-01-01");
+        assert!(
+            s > 1_577_836_800,
+            "now_secs returned {s}, expected > 2020-01-01"
+        );
     }
 }

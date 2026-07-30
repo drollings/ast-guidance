@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use std::collections::HashMap;
 
+use fluent_types::ContentNode;
+use fluent_types::NodeId;
 use guidance_ontology::mapper::PendingNode;
 use guidance_ontology::yago;
 use search_vector::error::DbError;
-use fluent_types::ContentNode;
-use fluent_types::NodeId;
 use thiserror::Error;
 
 use crate::db::Library;

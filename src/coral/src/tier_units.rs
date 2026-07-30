@@ -6,8 +6,8 @@ use guidance_llm::decomposer::Decomposer;
 use guidance_llm::LlmConfig;
 use internment::ArcIntern;
 
-use crate::cache_l1::{CacheTier, RoutingResult};
 use crate::cache::reactor::QueueReactor;
+use crate::cache_l1::{CacheTier, RoutingResult};
 use crate::cache_router::ParallelRouter;
 use crate::db::Library;
 use crate::wasm_runtime::PluginPool;

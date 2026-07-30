@@ -54,7 +54,11 @@ impl ChatBackend for TranscriptProvider {
             .find(|m| m.role == "user")
             .and_then(|m| {
                 let content = m.content.trim();
-                if content.is_empty() { None } else { Some(content) }
+                if content.is_empty() {
+                    None
+                } else {
+                    Some(content)
+                }
             })
             .unwrap_or("");
 
@@ -95,9 +99,7 @@ pub fn load_transcript_file(
     Ok(serde_json::from_str(&content)?)
 }
 
-pub fn transcript_provider_from_entries(
-    entries: &[MockTranscriptEntry],
-) -> TranscriptProvider {
+pub fn transcript_provider_from_entries(entries: &[MockTranscriptEntry]) -> TranscriptProvider {
     let map: HashMap<String, String> = entries
         .iter()
         .map(|e| (e.user_message.clone(), e.classifier_response.clone()))
@@ -113,10 +115,7 @@ pub struct MockDispatchContext {
 }
 
 impl MockDispatchContext {
-    pub fn new(
-        transcripts: Vec<MockTranscriptEntry>,
-        except_models: Vec<String>,
-    ) -> Self {
+    pub fn new(transcripts: Vec<MockTranscriptEntry>, except_models: Vec<String>) -> Self {
         Self {
             transcripts: Arc::new(transcripts),
             failures: std::sync::Mutex::new(Vec::new()),
@@ -136,7 +135,8 @@ impl MockDispatchContext {
     }
 
     pub fn lookup(&self, user_message: &str) -> Option<&MockTranscriptEntry> {
-        let result = self.transcripts
+        let result = self
+            .transcripts
             .iter()
             .find(|t| t.user_message == user_message);
         tracing::debug!(target: "router.mock",
@@ -147,14 +147,15 @@ impl MockDispatchContext {
         result
     }
 
-    pub fn validate_route(&self, entry: &MockTranscriptEntry, routing_target: Option<&RoutingTarget>) {
+    pub fn validate_route(
+        &self,
+        entry: &MockTranscriptEntry,
+        routing_target: Option<&RoutingTarget>,
+    ) {
         let result = match (&entry.expected_route, routing_target) {
             (None, None) => Ok(()),
             (Some(expected), Some(actual)) => {
-                let actual_route = actual
-                    .target_name
-                    .as_deref()
-                    .unwrap_or(&actual.model);
+                let actual_route = actual.target_name.as_deref().unwrap_or(&actual.model);
                 if actual_route == expected {
                     Ok(())
                 } else {
@@ -169,10 +170,7 @@ impl MockDispatchContext {
                 entry.user_message, expected
             )),
             (None, Some(actual)) => {
-                let actual_route = actual
-                    .target_name
-                    .as_deref()
-                    .unwrap_or(&actual.model);
+                let actual_route = actual.target_name.as_deref().unwrap_or(&actual.model);
                 Err(format!(
                     "route mismatch for '{}': expected no route, but got '{}' (model={})",
                     entry.user_message, actual_route, actual.model
@@ -181,7 +179,10 @@ impl MockDispatchContext {
         };
 
         if let Err(msg) = result {
-            self.failures.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(msg);
+            self.failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(msg);
         }
     }
 

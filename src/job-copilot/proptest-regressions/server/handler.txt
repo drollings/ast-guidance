@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc f417fd799eccf2aec32ad6961503690a5030e2ce66fc63dcf8544d9dc16e10db # shrinks to first_name = "aa", last_name = "aa", email_user = "aa", email_domain = "aaa.com", phone = "0000000000", url_path = "qggig/eeaba"

@@ -40,8 +40,7 @@ pub struct ContentNodeLedger {
 impl ContentNodeLedger {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, LedgerError> {
         let db_path = path.into();
-        let db = open_wal(&db_path)
-            .map_err(|e| LedgerError::Db(e.to_string()))?;
+        let db = open_wal(&db_path).map_err(|e| LedgerError::Db(e.to_string()))?;
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS ledger (
                 node_id INTEGER PRIMARY KEY,

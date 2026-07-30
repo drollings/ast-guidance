@@ -130,7 +130,10 @@ mod tests {
         let req = make_request("Use key sk-abc123def456ghijklmnopqrstuvwxyz");
         let result = m.transform(&req, &[]).unwrap();
         let output = text_of(&result);
-        assert!(!output.contains("sk-abc123def456ghijklmnopqrstuvwxyz"), "got: {output}");
+        assert!(
+            !output.contains("sk-abc123def456ghijklmnopqrstuvwxyz"),
+            "got: {output}"
+        );
     }
 
     #[test]
@@ -179,17 +182,30 @@ mod tests {
         let req = make_request("BEARER token123");
         let result = m.transform(&req, &[]).unwrap();
         let output = text_of(&result);
-        assert!(output.to_lowercase().contains("bearer ****"), "got: {output}");
+        assert!(
+            output.to_lowercase().contains("bearer ****"),
+            "got: {output}"
+        );
     }
 
     #[test]
     fn all_key_names_handled() {
         let m = SecretMask;
-        for name in &["apikey", "access_token", "private_key", "token", "key", "secret"] {
+        for name in &[
+            "apikey",
+            "access_token",
+            "private_key",
+            "token",
+            "key",
+            "secret",
+        ] {
             let req = make_request(&format!("{name}=value123"));
             let result = m.transform(&req, &[]).unwrap();
             let output = text_of(&result);
-            assert!(!output.contains("value123"), "{name} value not masked: {output}");
+            assert!(
+                !output.contains("value123"),
+                "{name} value not masked: {output}"
+            );
         }
     }
 }

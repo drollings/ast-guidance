@@ -68,8 +68,7 @@ async fn test_worker_pool_shutdown() {
     let pool = WorkerPool::new(crate::tokio_runtime(), 2, 10, move |job: i32| {
         let c = Arc::clone(&c);
         async move {
-            tokio::time::sleep(Duration::from_millis(10 * u64::try_from(job).unwrap()))
-                .await;
+            tokio::time::sleep(Duration::from_millis(10 * u64::try_from(job).unwrap())).await;
             c.fetch_add(1, Ordering::SeqCst);
         }
     });

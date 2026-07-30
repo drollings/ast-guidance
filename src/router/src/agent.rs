@@ -131,11 +131,7 @@ pub struct AgentRegistry {
 
 impl AgentRegistry {
     /// Creates a new registry with the given runtime and pool sizing.
-    pub fn new(
-        runtime: Arc<dyn Runtime>,
-        worker_count: usize,
-        queue_capacity: usize,
-    ) -> Self {
+    pub fn new(runtime: Arc<dyn Runtime>, worker_count: usize, queue_capacity: usize) -> Self {
         Self {
             pools: HashMap::new(),
             adapters: HashMap::new(),
@@ -155,12 +151,14 @@ impl AgentRegistry {
 
     /// Look up a pre-loaded adapter.
     pub fn get_adapter(&self, base_model: &str, adapter_name: &str) -> Option<&AdapterHandle> {
-        self.adapters.get(&(base_model.to_string(), adapter_name.to_string()))
+        self.adapters
+            .get(&(base_model.to_string(), adapter_name.to_string()))
     }
 
     /// Returns true if the adapter is resident.
     pub fn is_adapter_loaded(&self, base_model: &str, adapter_name: &str) -> bool {
-        self.adapters.contains_key(&(base_model.to_string(), adapter_name.to_string()))
+        self.adapters
+            .contains_key(&(base_model.to_string(), adapter_name.to_string()))
     }
 
     /// Register or replace an agent pool for the given identity.
@@ -200,27 +198,22 @@ impl AgentRegistry {
         identity: &AgentIdentity,
         task: AgentTask,
     ) -> Result<String, AgentError> {
-        let pool = self
-            .pools
-            .get(identity)
-            .ok_or_else(|| AgentError::ModelNotFound(format!(
+        let pool = self.pools.get(identity).ok_or_else(|| {
+            AgentError::ModelNotFound(format!(
                 "no agent pool for model={} adapter={:?} session={}",
-                identity.model,
-                identity.adapter,
-                identity.session_id,
-            )))?;
+                identity.model, identity.adapter, identity.session_id,
+            ))
+        })?;
 
-        pool.submit(task)
-            .await
-            .map_err(|e| match e {
-                fluent_concurrency::pool::ResultPoolError::Inner(inner) => inner,
-                fluent_concurrency::pool::ResultPoolError::Pool(p) => {
-                    AgentError::Execution(p.to_string())
-                }
-                fluent_concurrency::pool::ResultPoolError::Canceled => {
-                    AgentError::Execution("pool canceled".into())
-                }
-            })
+        pool.submit(task).await.map_err(|e| match e {
+            fluent_concurrency::pool::ResultPoolError::Inner(inner) => inner,
+            fluent_concurrency::pool::ResultPoolError::Pool(p) => {
+                AgentError::Execution(p.to_string())
+            }
+            fluent_concurrency::pool::ResultPoolError::Canceled => {
+                AgentError::Execution("pool canceled".into())
+            }
+        })
     }
 
     /// Returns a reference to the runtime used by this registry.
@@ -231,11 +224,7 @@ impl AgentRegistry {
 
 impl Default for AgentRegistry {
     fn default() -> Self {
-        Self::new(
-            fluent_concurrency::tokio_runtime(),
-            4,
-            64,
-        )
+        Self::new(fluent_concurrency::tokio_runtime(), 4, 64)
     }
 }
 
@@ -261,11 +250,8 @@ mod tests {
     #[test]
     fn test_adapter_registration() {
         let (workers, queue_cap) = global_pool_config(2, 8);
-        let mut registry = AgentRegistry::new(
-            fluent_concurrency::tokio_runtime(),
-            workers,
-            queue_cap,
-        );
+        let mut registry =
+            AgentRegistry::new(fluent_concurrency::tokio_runtime(), workers, queue_cap);
 
         registry.register_adapter(AdapterHandle::new(
             "lora-v1",
@@ -280,11 +266,8 @@ mod tests {
     #[tokio::test]
     async fn test_agent_registration_and_submit() {
         let (workers, queue_cap) = global_pool_config(2, 8);
-        let mut registry = AgentRegistry::new(
-            fluent_concurrency::tokio_runtime(),
-            workers,
-            queue_cap,
-        );
+        let mut registry =
+            AgentRegistry::new(fluent_concurrency::tokio_runtime(), workers, queue_cap);
 
         let identity = AgentIdentity::new("llama3", "sess-1");
         registry.register_agent(identity.clone(), mock_handler);
@@ -304,11 +287,7 @@ mod tests {
     #[tokio::test]
     async fn test_missing_agent_errors() {
         let (workers, queue_cap) = global_pool_config(2, 8);
-        let registry = AgentRegistry::new(
-            fluent_concurrency::tokio_runtime(),
-            workers,
-            queue_cap,
-        );
+        let registry = AgentRegistry::new(fluent_concurrency::tokio_runtime(), workers, queue_cap);
 
         let identity = AgentIdentity::new("nonexistent", "sess-1");
         let task = AgentTask {

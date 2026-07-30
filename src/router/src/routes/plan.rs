@@ -42,11 +42,7 @@ impl PlanRoute {
         self
     }
 
-    pub fn register_template(
-        &mut self,
-        task_class: impl Into<String>,
-        workflow: WorkflowConfig,
-    ) {
+    pub fn register_template(&mut self, task_class: impl Into<String>, workflow: WorkflowConfig) {
         self.templates.insert(task_class.into(), workflow);
     }
 

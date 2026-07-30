@@ -45,11 +45,7 @@ impl TransformStrategy for PiiAnonymize {
     }
 }
 
-fn build_anonymize_map(
-    original: &str,
-    anonymized: &str,
-    map: &mut HashMap<String, String>,
-) {
+fn build_anonymize_map(original: &str, anonymized: &str, map: &mut HashMap<String, String>) {
     let mut counts: HashMap<&str, usize> = HashMap::new();
     let orig_bytes = original.as_bytes();
     let anon_bytes = anonymized.as_bytes();

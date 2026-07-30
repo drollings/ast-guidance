@@ -84,7 +84,7 @@ mod tests {
 
         let result = load_json_or_default::<TestConfig>(&path);
         assert_eq!(result.name, "default"); // falls back
-        // Warning should have been printed to stderr; structural test only.
+                                            // Warning should have been printed to stderr; structural test only.
     }
 
     #[test]

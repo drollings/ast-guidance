@@ -66,10 +66,7 @@ impl<'a> DependencyResolver<'a> {
         }
     }
 
-    pub fn with_narrowing(
-        registry: &'a TargetRegistry,
-        caps: &'a CapabilityRegistry,
-    ) -> Self {
+    pub fn with_narrowing(registry: &'a TargetRegistry, caps: &'a CapabilityRegistry) -> Self {
         Self {
             registry,
             strict: true,
@@ -151,8 +148,7 @@ impl<'a> DependencyResolver<'a> {
         });
 
         // Step 2: compute full closure to check for multi-provider caps
-        let closure_set =
-            closure::transitive_closure(&ctx, seed_bits.iter().copied(), None, None)?;
+        let closure_set = closure::transitive_closure(&ctx, seed_bits.iter().copied(), None, None)?;
 
         let mut multi_provider_cap = false;
         for &bit in &closure_set {
@@ -187,9 +183,10 @@ impl<'a> DependencyResolver<'a> {
             let snapshot: Vec<usize> = resolved_set.iter().copied().collect();
 
             for &bit_idx in &snapshot {
-                let target = self.registry.get_by_bit_index(bit_idx).ok_or_else(|| {
-                    ResolverError::TargetNotFound(format!("bit_index {bit_idx}"))
-                })?;
+                let target = self
+                    .registry
+                    .get_by_bit_index(bit_idx)
+                    .ok_or_else(|| ResolverError::TargetNotFound(format!("bit_index {bit_idx}")))?;
 
                 let is_abstract = target.target_type == TargetType::Abstract;
                 let deps_satisfied = target.depends.not_any()
@@ -318,12 +315,12 @@ impl<'a> DependencyResolver<'a> {
         let mut in_degree: HashMap<usize, usize> = needed.iter().map(|&k| (k, 0)).collect();
         let mut adj: HashMap<usize, Vec<usize>> = HashMap::new();
         for &bit_idx in needed {
-            let target = self
-                .registry
-                .get_by_bit_index(bit_idx)
-                .ok_or(ResolverError::TargetNotFound(format!(
-                    "bit_index {bit_idx}"
-                )))?;
+            let target =
+                self.registry
+                    .get_by_bit_index(bit_idx)
+                    .ok_or(ResolverError::TargetNotFound(format!(
+                        "bit_index {bit_idx}"
+                    )))?;
             for cap_idx in target.depends.iter_ones() {
                 let providers = self.registry.get_providers(cap_idx);
                 for provider in providers {
@@ -375,7 +372,6 @@ impl<'a> DependencyResolver<'a> {
             target_names,
         })
     }
-
 }
 
 fn compute_full_provides(registry: &TargetRegistry, target_set: &HashSet<usize>) -> HashSet<usize> {
@@ -587,7 +583,14 @@ mod tests {
         register_targets(
             &mut reg,
             &caps,
-            &[(0, "consumer", TargetType::File, &["nonexistent"], &[], false)],
+            &[(
+                0,
+                "consumer",
+                TargetType::File,
+                &["nonexistent"],
+                &[],
+                false,
+            )],
         );
         let resolver = DependencyResolver::with_narrowing(&reg, &caps).with_strict(true);
         let err = resolver.resolve(&["consumer"]).unwrap_err();
@@ -650,17 +653,59 @@ mod tests {
         let caps = CapabilityRegistry::new();
 
         let entries: &[(i64, &str, TargetType, &[&str], &[&str], bool)] = &[
-            (0, "bee",           TargetType::File,     &[],                         &["insect", "color_vision"], false),
-            (1, "stoat",         TargetType::File,     &[],                         &["mammal"],                false),
-            (2, "insect",        TargetType::Abstract, &[],                         &["animal", "cognitive"],   false),
-            (3, "mammal",        TargetType::Abstract, &[],                         &["animal", "cognitive"],   false),
-            (4, "color_vision",  TargetType::Abstract, &[],                         &["vision"],                false),
-            (5, "confuse_bee",   TargetType::File,     &["insect", "color_vision"], &["confuse", "agency"],     false),
-            (6, "stun_stoat",    TargetType::File,     &["mammal"],                 &["confuse", "agency"],     false),
-            (7, "confuse",       TargetType::Abstract, &[],                         &[],                        true),
-            (8, "animal",        TargetType::Abstract, &[],                         &[],                        true),
-            (9, "cognitive",     TargetType::Abstract, &[],                         &[],                        false),
-            (10, "vision",       TargetType::Abstract, &[],                         &[],                        false),
+            (
+                0,
+                "bee",
+                TargetType::File,
+                &[],
+                &["insect", "color_vision"],
+                false,
+            ),
+            (1, "stoat", TargetType::File, &[], &["mammal"], false),
+            (
+                2,
+                "insect",
+                TargetType::Abstract,
+                &[],
+                &["animal", "cognitive"],
+                false,
+            ),
+            (
+                3,
+                "mammal",
+                TargetType::Abstract,
+                &[],
+                &["animal", "cognitive"],
+                false,
+            ),
+            (
+                4,
+                "color_vision",
+                TargetType::Abstract,
+                &[],
+                &["vision"],
+                false,
+            ),
+            (
+                5,
+                "confuse_bee",
+                TargetType::File,
+                &["insect", "color_vision"],
+                &["confuse", "agency"],
+                false,
+            ),
+            (
+                6,
+                "stun_stoat",
+                TargetType::File,
+                &["mammal"],
+                &["confuse", "agency"],
+                false,
+            ),
+            (7, "confuse", TargetType::Abstract, &[], &[], true),
+            (8, "animal", TargetType::Abstract, &[], &[], true),
+            (9, "cognitive", TargetType::Abstract, &[], &[], false),
+            (10, "vision", TargetType::Abstract, &[], &[], false),
         ];
 
         register_targets(&mut reg, &caps, entries);
@@ -679,7 +724,9 @@ mod tests {
             "stun_stoat should not be selected for bee input"
         );
 
-        let plan_stoat = resolver.resolve(&["confuse", "stoat"]).expect("confuse stoat");
+        let plan_stoat = resolver
+            .resolve(&["confuse", "stoat"])
+            .expect("confuse stoat");
         assert!(plan_stoat.target_names.contains(&"stoat".to_string()));
         assert!(
             plan_stoat.target_names.contains(&"stun_stoat".to_string()),
@@ -701,9 +748,23 @@ mod tests {
             &mut reg,
             &caps,
             &[
-                (0, "consumer",   TargetType::File,     &["animal"],   &[],       false),
-                (1, "provider_a", TargetType::Abstract, &[],           &["animal"], false),
-                (2, "provider_b", TargetType::Abstract, &[],           &["animal"], false),
+                (0, "consumer", TargetType::File, &["animal"], &[], false),
+                (
+                    1,
+                    "provider_a",
+                    TargetType::Abstract,
+                    &[],
+                    &["animal"],
+                    false,
+                ),
+                (
+                    2,
+                    "provider_b",
+                    TargetType::Abstract,
+                    &[],
+                    &["animal"],
+                    false,
+                ),
             ],
         );
 
@@ -717,7 +778,10 @@ mod tests {
                 assert!(candidates.contains(&"provider_b".to_string()));
             }
             Ok(plan) => {
-                panic!("expected AmbiguousDependency, got Ok with: {:?}", plan.target_names);
+                panic!(
+                    "expected AmbiguousDependency, got Ok with: {:?}",
+                    plan.target_names
+                );
             }
             Err(other) => panic!("expected AmbiguousDependency, got: {other:?}"),
         }
@@ -731,12 +795,40 @@ mod tests {
             &mut reg,
             &caps,
             &[
-                (0, "bee", TargetType::File, &[], &["insect", "color_vision"], false),
+                (
+                    0,
+                    "bee",
+                    TargetType::File,
+                    &[],
+                    &["insect", "color_vision"],
+                    false,
+                ),
                 (1, "stoat", TargetType::File, &[], &["mammal"], false),
-                (2, "confuse_bee", TargetType::File, &["insect", "color_vision"], &["confuse"], false),
-                (3, "stun_stoat", TargetType::File, &["mammal"], &["confuse"], false),
+                (
+                    2,
+                    "confuse_bee",
+                    TargetType::File,
+                    &["insect", "color_vision"],
+                    &["confuse"],
+                    false,
+                ),
+                (
+                    3,
+                    "stun_stoat",
+                    TargetType::File,
+                    &["mammal"],
+                    &["confuse"],
+                    false,
+                ),
                 (4, "confuse", TargetType::Abstract, &[], &[], true),
-                (5, "rate_confusion", TargetType::File, &["confuse"], &["rated"], false),
+                (
+                    5,
+                    "rate_confusion",
+                    TargetType::File,
+                    &["confuse"],
+                    &["rated"],
+                    false,
+                ),
             ],
         );
         let resolver = DependencyResolver::with_narrowing(&reg, &caps).with_strict(false);
@@ -759,13 +851,48 @@ mod tests {
             &mut reg,
             &caps,
             &[
-                (0, "bee", TargetType::File, &[], &["insect", "color_vision"], false),
+                (
+                    0,
+                    "bee",
+                    TargetType::File,
+                    &[],
+                    &["insect", "color_vision"],
+                    false,
+                ),
                 (1, "stoat", TargetType::File, &[], &["mammal"], false),
-                (2, "confuse_bee", TargetType::File, &["insect", "color_vision"], &["confuse"], false),
-                (3, "stun_stoat", TargetType::File, &["mammal"], &["confuse", "stun_grenade"], false),
+                (
+                    2,
+                    "confuse_bee",
+                    TargetType::File,
+                    &["insect", "color_vision"],
+                    &["confuse"],
+                    false,
+                ),
+                (
+                    3,
+                    "stun_stoat",
+                    TargetType::File,
+                    &["mammal"],
+                    &["confuse", "stun_grenade"],
+                    false,
+                ),
                 (4, "confuse", TargetType::Abstract, &[], &[], true),
-                (5, "rate_confusion", TargetType::File, &["confuse"], &["rated"], false),
-                (6, "grenade_user", TargetType::File, &["stun_grenade"], &[], false),
+                (
+                    5,
+                    "rate_confusion",
+                    TargetType::File,
+                    &["confuse"],
+                    &["rated"],
+                    false,
+                ),
+                (
+                    6,
+                    "grenade_user",
+                    TargetType::File,
+                    &["stun_grenade"],
+                    &[],
+                    false,
+                ),
             ],
         );
         let resolver = DependencyResolver::with_narrowing(&reg, &caps).with_strict(false);
@@ -897,30 +1024,38 @@ mod tests {
         ];
         let reg = make_registry(targets);
         let resolver = DependencyResolver::new(&reg);
-        let plan = resolver.resolve(&["consumer"]).expect("multi-provider resolve");
+        let plan = resolver
+            .resolve(&["consumer"])
+            .expect("multi-provider resolve");
         assert_eq!(plan.order.len(), 3);
         assert!(plan.order.contains(&0));
         assert!(plan.order.contains(&1));
         assert!(plan.order.contains(&2));
-        assert!(plan.order.iter().position(|&i| i == 1).unwrap() < plan.order.iter().position(|&i| i == 0).unwrap());
-        assert!(plan.order.iter().position(|&i| i == 2).unwrap() < plan.order.iter().position(|&i| i == 0).unwrap());
+        assert!(
+            plan.order.iter().position(|&i| i == 1).unwrap()
+                < plan.order.iter().position(|&i| i == 0).unwrap()
+        );
+        assert!(
+            plan.order.iter().position(|&i| i == 2).unwrap()
+                < plan.order.iter().position(|&i| i == 0).unwrap()
+        );
     }
 
     #[test]
     fn test_self_providing_chain() {
-        let targets = vec![
-            Target::new()
-                .id(0)
-                .name("self_provider".into())
-                .target_type(TargetType::File)
-                .executor(ExecutorKind::Native)
-                .depends(make_bitset(&[0]))
-                .provides(make_bitset(&[0]))
-                .build(),
-        ];
+        let targets = vec![Target::new()
+            .id(0)
+            .name("self_provider".into())
+            .target_type(TargetType::File)
+            .executor(ExecutorKind::Native)
+            .depends(make_bitset(&[0]))
+            .provides(make_bitset(&[0]))
+            .build()];
         let reg = make_registry(targets);
         let resolver = DependencyResolver::new(&reg);
-        let plan = resolver.resolve(&["self_provider"]).expect("self-provide resolve");
+        let plan = resolver
+            .resolve(&["self_provider"])
+            .expect("self-provide resolve");
         assert_eq!(plan.order, vec![0]);
     }
 
@@ -928,7 +1063,9 @@ mod tests {
     fn test_empty_resolve() {
         let reg = TargetRegistry::new();
         let resolver = DependencyResolver::new(&reg);
-        let plan = resolver.resolve(&[]).expect("empty resolve on empty registry");
+        let plan = resolver
+            .resolve(&[])
+            .expect("empty resolve on empty registry");
         assert!(plan.is_empty());
     }
 
@@ -993,7 +1130,11 @@ mod tests {
             "[perf] breadth_first_fan_out: {fan_out} leaves, {}us total, {per_node_us:.1}us/node",
             elapsed.as_micros()
         );
-        assert!(elapsed.as_millis() < 200, "fan-out perf degraded: {}ms", elapsed.as_millis());
+        assert!(
+            elapsed.as_millis() < 200,
+            "fan-out perf degraded: {}ms",
+            elapsed.as_millis()
+        );
     }
 
     #[test]
@@ -1032,7 +1173,11 @@ mod tests {
             elapsed.as_micros() as f64 / n as f64,
         );
         assert_eq!(plan.order.len(), n);
-        assert!(elapsed.as_millis() < 100, "large DAG perf degraded: {}ms", elapsed.as_millis());
+        assert!(
+            elapsed.as_millis() < 100,
+            "large DAG perf degraded: {}ms",
+            elapsed.as_millis()
+        );
     }
 
     #[test]
@@ -1089,21 +1234,23 @@ mod tests {
             plan.order.len(),
         );
         assert!(plan.order.len() >= height * 2);
-        assert!(elapsed.as_millis() < 200, "deep diamond perf degraded: {}ms", elapsed.as_millis());
+        assert!(
+            elapsed.as_millis() < 200,
+            "deep diamond perf degraded: {}ms",
+            elapsed.as_millis()
+        );
     }
 
     #[test]
     fn test_resolve_strict_missing_dependency_errors() {
-        let targets = vec![
-            Target::new()
-                .id(0)
-                .name("consumer".into())
-                .target_type(TargetType::File)
-                .executor(ExecutorKind::Native)
-                .depends(make_bitset(&[99]))
-                .provides(BitVec::new())
-                .build(),
-        ];
+        let targets = vec![Target::new()
+            .id(0)
+            .name("consumer".into())
+            .target_type(TargetType::File)
+            .executor(ExecutorKind::Native)
+            .depends(make_bitset(&[99]))
+            .provides(BitVec::new())
+            .build()];
         let reg = make_registry(targets);
         let resolver = DependencyResolver::new(&reg).with_strict(true);
         let err = resolver.resolve(&["consumer"]).unwrap_err();
@@ -1112,19 +1259,19 @@ mod tests {
 
     #[test]
     fn test_resolve_non_strict_skips_missing() {
-        let targets = vec![
-            Target::new()
-                .id(0)
-                .name("consumer".into())
-                .target_type(TargetType::File)
-                .executor(ExecutorKind::Native)
-                .depends(make_bitset(&[99]))
-                .provides(BitVec::new())
-                .build(),
-        ];
+        let targets = vec![Target::new()
+            .id(0)
+            .name("consumer".into())
+            .target_type(TargetType::File)
+            .executor(ExecutorKind::Native)
+            .depends(make_bitset(&[99]))
+            .provides(BitVec::new())
+            .build()];
         let reg = make_registry(targets);
         let resolver = DependencyResolver::new(&reg).with_strict(false);
-        let plan = resolver.resolve(&["consumer"]).expect("non-strict missing dep");
+        let plan = resolver
+            .resolve(&["consumer"])
+            .expect("non-strict missing dep");
         assert_eq!(plan.order, vec![0]);
     }
 
@@ -1170,5 +1317,4 @@ mod tests {
         assert_eq!(plan.order[0], 0);
         assert_eq!(plan.order.len(), 4);
     }
-
 }

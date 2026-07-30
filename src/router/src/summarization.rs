@@ -94,9 +94,7 @@ impl WorkUnit for ResultScorer {
         let response = get_metadata_string(ctx, "response")
             .ok_or_else(|| WorkError::Execution("missing response in context metadata".into()))?;
 
-        let prompt = format!(
-            "User query: {query}\n\nAssistant response:\n{response}",
-        );
+        let prompt = format!("User query: {query}\n\nAssistant response:\n{response}",);
 
         let messages = vec![
             ChatMessage {

@@ -45,10 +45,11 @@ impl RoutingConfig {
             .get(route_name)
             .or_else(|| self.routes.get(&self.default_route));
 
-        let route_ref = match route_ref {
-            Some(r) => Some(r),
-            None => {
-                return self.models.get(route_name).map(|entry| {
+        let route_ref =
+            match route_ref {
+                Some(r) => Some(r),
+                None => {
+                    return self.models.get(route_name).map(|entry| {
                     let name = entry.name.clone().unwrap_or_else(|| route_name.to_string());
                     tracing::info!(target: "router.config", route = %route_name, model = %name,
                         "route resolved as direct model"
@@ -61,8 +62,8 @@ impl RoutingConfig {
                     );
                     None
                 });
-            }
-        };
+                }
+            };
 
         let route_ref = route_ref?;
 
@@ -83,9 +84,7 @@ impl RoutingConfig {
         let candidates: Vec<(&String, &ModelEntry)> = model_names
             .iter()
             .filter_map(|n| self.models.get(n).map(|m| (n, m)))
-            .filter(|(_, m)| {
-                m.intelligence >= min_complexity.unwrap_or(0)
-            })
+            .filter(|(_, m)| m.intelligence >= min_complexity.unwrap_or(0))
             .collect();
 
         if candidates.is_empty() {
@@ -104,13 +103,11 @@ impl RoutingConfig {
                     (entry, name)
                 })
         } else {
-            let (entry_key, entry) = candidates
-                .into_iter()
-                .min_by(|(_, a), (_, b)| {
-                    (a.cost_input + a.cost_output)
-                        .partial_cmp(&(b.cost_input + b.cost_output))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })?;
+            let (entry_key, entry) = candidates.into_iter().min_by(|(_, a), (_, b)| {
+                (a.cost_input + a.cost_output)
+                    .partial_cmp(&(b.cost_input + b.cost_output))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })?;
             let name = entry.name.clone().unwrap_or_else(|| entry_key.clone());
             tracing::info!(target: "router.config", route = %route_name, model = %name, "route resolved");
             Some((entry, name))

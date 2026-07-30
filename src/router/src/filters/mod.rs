@@ -1,6 +1,6 @@
 pub mod injection_detect;
-pub mod regex_filter;
 pub mod luhn;
+pub mod regex_filter;
 
 use std::collections::HashMap;
 
@@ -30,8 +30,14 @@ pub enum FilterKind {
 /// Filter outcomes per MOA_ROUTER_SPEC §2 table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilterDecision {
-    HardReject { pattern: String, message: String },
-    SoftRedirect { route: String, reason: String },
+    HardReject {
+        pattern: String,
+        message: String,
+    },
+    SoftRedirect {
+        route: String,
+        reason: String,
+    },
     OutputFilter {
         action: FilterAction,
         matched_pattern: String,

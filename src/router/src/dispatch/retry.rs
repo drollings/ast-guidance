@@ -102,7 +102,10 @@ mod tests {
                 }
             });
 
-            TestServer { addr, stop_tx: Some(stop_tx) }
+            TestServer {
+                addr,
+                stop_tx: Some(stop_tx),
+            }
         }
 
         fn url(&self) -> String {
@@ -122,7 +125,8 @@ mod tests {
     async fn success_on_first_attempt() {
         let server = TestServer::new(vec![http::StatusCode::OK]).await;
         let client = reqwest::Client::new();
-        let result = retry_http_request(&client, &server.url(), &json!({"model": "test"}), 2, 1).await;
+        let result =
+            retry_http_request(&client, &server.url(), &json!({"model": "test"}), 2, 1).await;
         assert!(result.is_ok());
         assert!(result.unwrap().status().is_success());
     }
@@ -135,7 +139,8 @@ mod tests {
         ])
         .await;
         let client = reqwest::Client::new();
-        let result = retry_http_request(&client, &server.url(), &json!({"model": "test"}), 2, 1).await;
+        let result =
+            retry_http_request(&client, &server.url(), &json!({"model": "test"}), 2, 1).await;
         assert!(result.is_ok());
         assert!(result.unwrap().status().is_success());
     }
@@ -144,7 +149,8 @@ mod tests {
     async fn short_circuit_on_400() {
         let server = TestServer::new(vec![http::StatusCode::BAD_REQUEST]).await;
         let client = reqwest::Client::new();
-        let result = retry_http_request(&client, &server.url(), &json!({"model": "test"}), 2, 1).await;
+        let result =
+            retry_http_request(&client, &server.url(), &json!({"model": "test"}), 2, 1).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().status(), http::StatusCode::BAD_REQUEST);
     }
@@ -158,10 +164,14 @@ mod tests {
         ])
         .await;
         let client = reqwest::Client::new();
-        let result = retry_http_request(&client, &server.url(), &json!({"model": "test"}), 1, 1).await;
+        let result =
+            retry_http_request(&client, &server.url(), &json!({"model": "test"}), 1, 1).await;
         assert!(result.is_err());
         let msg = result.unwrap_err();
-        assert!(msg.contains("failed after"), "expected 'failed after', got: {msg}");
+        assert!(
+            msg.contains("failed after"),
+            "expected 'failed after', got: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -180,6 +190,9 @@ mod tests {
         )
         .await;
         let msg = result.unwrap_err();
-        assert!(msg.contains("failed after"), "expected 'failed after', got: {msg}");
+        assert!(
+            msg.contains("failed after"),
+            "expected 'failed after', got: {msg}"
+        );
     }
 }

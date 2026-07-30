@@ -4,9 +4,7 @@
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::types::{
-    RouterMessage, RouterMessageContent, RouterRequest, RouterResponse, Usage,
-};
+use crate::types::{RouterMessage, RouterMessageContent, RouterRequest, RouterResponse, Usage};
 
 #[derive(Debug, Error)]
 pub enum NormalizeError {
@@ -53,8 +51,8 @@ struct OpenAiMessage {
 
 /// Normalize an OpenAI-compatible chat completion request JSON into a RouterRequest.
 pub fn normalize_request(body: serde_json::Value) -> Result<RouterRequest, NormalizeError> {
-    let raw: OpenAiChatRequest = serde_json::from_value(body)
-        .map_err(|e| NormalizeError::Parse(e.to_string()))?;
+    let raw: OpenAiChatRequest =
+        serde_json::from_value(body).map_err(|e| NormalizeError::Parse(e.to_string()))?;
 
     if raw.messages.is_empty() {
         return Err(NormalizeError::MissingField("messages".into()));
@@ -69,7 +67,10 @@ pub fn normalize_request(body: serde_json::Value) -> Result<RouterRequest, Norma
                 .tool_calls
                 .map(|tc| {
                     tc.into_iter()
-                        .map(|v| serde_json::from_value(v).map_err(|e| NormalizeError::Parse(e.to_string())))
+                        .map(|v| {
+                            serde_json::from_value(v)
+                                .map_err(|e| NormalizeError::Parse(e.to_string()))
+                        })
                         .collect()
                 })
                 .transpose()?;
@@ -86,7 +87,9 @@ pub fn normalize_request(body: serde_json::Value) -> Result<RouterRequest, Norma
         .tools
         .map(|t| {
             t.into_iter()
-                .map(|v| serde_json::from_value(v).map_err(|e| NormalizeError::Parse(e.to_string())))
+                .map(|v| {
+                    serde_json::from_value(v).map_err(|e| NormalizeError::Parse(e.to_string()))
+                })
                 .collect()
         })
         .transpose()?;
@@ -106,12 +109,14 @@ pub fn normalize_request(body: serde_json::Value) -> Result<RouterRequest, Norma
     })
 }
 
-fn normalize_message_content(raw: serde_json::Value) -> Result<RouterMessageContent, NormalizeError> {
+fn normalize_message_content(
+    raw: serde_json::Value,
+) -> Result<RouterMessageContent, NormalizeError> {
     match raw {
         serde_json::Value::String(s) => Ok(RouterMessageContent::Text(s)),
         serde_json::Value::Array(_) => {
-            let parts = serde_json::from_value(raw)
-                .map_err(|e| NormalizeError::Parse(e.to_string()))?;
+            let parts =
+                serde_json::from_value(raw).map_err(|e| NormalizeError::Parse(e.to_string()))?;
             Ok(RouterMessageContent::Parts(parts))
         }
         serde_json::Value::Null => Ok(RouterMessageContent::Text(String::new())),

@@ -23,13 +23,18 @@ mod server_tests {
         let config = ServerConfig::default();
         let server = RouterServer::new(pipelines, routes, models, &config, None);
         assert_eq!(server.name(), "router.server");
-        assert!(server.provides().contains(&ArcIntern::from("http.endpoint")));
+        assert!(server
+            .provides()
+            .contains(&ArcIntern::from("http.endpoint")));
     }
 
     #[test]
     fn server_config_defaults() {
         let config = ServerConfig::default();
-        assert!(config.bind_addr.is_empty(), "bind_addr must be provided by config or CLI, not hardcoded");
+        assert!(
+            config.bind_addr.is_empty(),
+            "bind_addr must be provided by config or CLI, not hardcoded"
+        );
         assert_eq!(config.max_payload, 1_048_576);
     }
 }

@@ -95,10 +95,7 @@ mod tests {
         let request = make_request("Call me at 555-123-4567.");
         let result = transform.transform(&request, &[]).unwrap();
         let output = result.messages[0].content.to_string_lossy();
-        assert!(
-            !output.contains("555-123-4567"),
-            "phone should be redacted"
-        );
+        assert!(!output.contains("555-123-4567"), "phone should be redacted");
     }
 
     #[test]
@@ -229,17 +226,11 @@ mod tests {
             user_content.contains("Research"),
             "should contain first subtask"
         );
-        assert!(
-            user_content.contains("Test"),
-            "should contain last subtask"
-        );
+        assert!(user_content.contains("Test"), "should contain last subtask");
 
         // Should have subtasks in metadata
         let subtasks_val = result.metadata.get("subtasks").unwrap();
-        assert_eq!(
-            subtasks_val["count"].as_u64().unwrap(),
-            3
-        );
+        assert_eq!(subtasks_val["count"].as_u64().unwrap(), 3);
     }
 
     #[test]

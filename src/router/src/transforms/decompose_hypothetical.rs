@@ -61,9 +61,10 @@ impl TransformStrategy for DecomposeToAnonymizedHypothetical {
             transformed.messages = vec![sys, hyp];
         }
 
-        transformed
-            .metadata
-            .insert("transform".into(), serde_json::json!("decompose_to_anonymized_hypothetical"));
+        transformed.metadata.insert(
+            "transform".into(),
+            serde_json::json!("decompose_to_anonymized_hypothetical"),
+        );
 
         Ok(transformed)
     }

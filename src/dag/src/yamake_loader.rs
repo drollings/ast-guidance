@@ -30,18 +30,21 @@ pub fn load_yamake_config(json: &str) -> (TargetRegistry, CapabilityRegistry) {
     let mut reg = TargetRegistry::new();
 
     for td in &config.targets {
-        for name in td.depends.iter().chain(td.provides.iter()).chain(std::iter::once(&td.name)) {
+        for name in td
+            .depends
+            .iter()
+            .chain(td.provides.iter())
+            .chain(std::iter::once(&td.name))
+        {
             caps.intern(name);
         }
     }
 
     for td in &config.targets {
-        let depends: BitVec = caps.to_bitvec(
-            &td.depends.iter().map(String::as_str).collect::<Vec<_>>(),
-        );
-        let provides: BitVec = caps.to_bitvec(
-            &td.provides.iter().map(String::as_str).collect::<Vec<_>>(),
-        );
+        let depends: BitVec =
+            caps.to_bitvec(&td.depends.iter().map(String::as_str).collect::<Vec<_>>());
+        let provides: BitVec =
+            caps.to_bitvec(&td.provides.iter().map(String::as_str).collect::<Vec<_>>());
 
         // Concrete targets (File/Phony) implicitly provide their own name,
         // matching yamake-old.py semantics where depends reference Target
@@ -77,7 +80,8 @@ pub fn load_yamake_config(json: &str) -> (TargetRegistry, CapabilityRegistry) {
             .provides(combined_provides)
             .essential(td.essential)
             .build();
-        reg.register(target).expect("duplicate target in yamake.json");
+        reg.register(target)
+            .expect("duplicate target in yamake.json");
     }
 
     (reg, caps)

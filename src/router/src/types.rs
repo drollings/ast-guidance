@@ -57,16 +57,14 @@ impl RouterMessageContent {
     pub fn to_string_lossy(&self) -> String {
         match self {
             Self::Text(s) => s.clone(),
-            Self::Parts(parts) => {
-                parts
-                    .iter()
-                    .filter_map(|p| match p {
-                        ContentPart::Text { text } => Some(text.as_str()),
-                        ContentPart::ImageUrl { .. } => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            }
+            Self::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    ContentPart::ImageUrl { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
         }
     }
 }

@@ -154,7 +154,10 @@ impl RepetitionWatchdog {
     }
 
     pub fn check(&self, item: &str) -> Option<WatchdogEvent> {
-        let mut buffer = self.buffer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut buffer = self
+            .buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         buffer.push_back(item.to_string());
         if buffer.len() > self.window {
             buffer.pop_front();
@@ -174,7 +177,10 @@ impl RepetitionWatchdog {
     }
 
     pub fn reset(&self) {
-        self.buffer.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        self.buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 }
 
@@ -352,15 +358,24 @@ mod tests {
     #[test]
     fn test_watchdog_event_type_from_event() {
         assert_eq!(
-            WatchdogEventType::from(&WatchdogEvent::BudgetExceeded { limit: 1, actual: 2 }),
+            WatchdogEventType::from(&WatchdogEvent::BudgetExceeded {
+                limit: 1,
+                actual: 2
+            }),
             WatchdogEventType::BudgetExceeded
         );
         assert_eq!(
-            WatchdogEventType::from(&WatchdogEvent::WallClock { deadline_secs: 1, elapsed_secs: 2 }),
+            WatchdogEventType::from(&WatchdogEvent::WallClock {
+                deadline_secs: 1,
+                elapsed_secs: 2
+            }),
             WatchdogEventType::WallClock
         );
         assert_eq!(
-            WatchdogEventType::from(&WatchdogEvent::Repetition { threshold: 1, consecutive: 2 }),
+            WatchdogEventType::from(&WatchdogEvent::Repetition {
+                threshold: 1,
+                consecutive: 2
+            }),
             WatchdogEventType::Repetition
         );
     }

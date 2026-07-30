@@ -240,7 +240,11 @@ async fn test_e2e_cycle_resiliency() {
     let summary: ZoneSummary = (&mut zone).await;
     // A fails immediately with Execution error, B is a dependent in a cycle.
     // The cycle should be detected and B should be cancelled.
-    assert_eq!(summary.failed.len(), 1, "A should fail with Execution error");
+    assert_eq!(
+        summary.failed.len(),
+        1,
+        "A should fail with Execution error"
+    );
     assert_eq!(
         summary.cancelled.len(),
         1,

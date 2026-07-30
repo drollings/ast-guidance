@@ -132,7 +132,8 @@ impl NetCapability {
         if !status.is_success() {
             return Err(IoError(std::io::Error::other(format!(
                 "HTTP {status} from {url}"
-            ))));        }
+            ))));
+        }
 
         let mapped = response
             .bytes_stream()

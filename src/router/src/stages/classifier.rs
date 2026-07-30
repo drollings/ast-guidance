@@ -33,11 +33,7 @@ fn sanitize_classifier_json(mut v: serde_json::Value) -> serde_json::Value {
     };
 
     /// Ensure a floating-point field exists; coerce from string if needed.
-    fn ensure_float(
-        obj: &mut serde_json::Map<String, serde_json::Value>,
-        key: &str,
-        default: f64,
-    ) {
+    fn ensure_float(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str, default: f64) {
         match obj.get(key) {
             None => {
                 let n = serde_json::Number::from_f64(default)
@@ -56,22 +52,25 @@ fn sanitize_classifier_json(mut v: serde_json::Value) -> serde_json::Value {
     }
 
     /// Ensure an unsigned-integer field exists; coerce from float or string.
-    fn ensure_u8(
-        obj: &mut serde_json::Map<String, serde_json::Value>,
-        key: &str,
-        default: u8,
-    ) {
+    fn ensure_u8(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str, default: u8) {
         match obj.get(key) {
             None => {
-                obj.insert(key.into(), serde_json::Value::Number(serde_json::Number::from(default)));
+                obj.insert(
+                    key.into(),
+                    serde_json::Value::Number(serde_json::Number::from(default)),
+                );
             }
             Some(serde_json::Value::Number(n)) => {
                 // serde_json::Number can be float or integer; extract as u8
                 if let Some(i) = n.as_u64() {
-                    obj[key] = serde_json::Value::Number(serde_json::Number::from(i.min(u64::from(u8::MAX)) as u8));
+                    obj[key] = serde_json::Value::Number(serde_json::Number::from(
+                        i.min(u64::from(u8::MAX)) as u8,
+                    ));
                 } else if let Some(f) = n.as_f64() {
                     let i = f.round() as u64;
-                    obj[key] = serde_json::Value::Number(serde_json::Number::from(i.min(u64::from(u8::MAX)) as u8));
+                    obj[key] = serde_json::Value::Number(serde_json::Number::from(
+                        i.min(u64::from(u8::MAX)) as u8,
+                    ));
                 }
             }
             Some(serde_json::Value::String(s)) => {
@@ -109,10 +108,17 @@ fn sanitize_classifier_json(mut v: serde_json::Value) -> serde_json::Value {
     // promote the value to target.
     if let Some(serde_json::Value::String(action)) = obj.get("action") {
         let action_lower = action.to_lowercase();
-        let is_standard = action_lower == "route" || action_lower == "respond" || action_lower == "reject";
-        let target_missing = obj.get("target").and_then(|t| t.as_str()).is_none_or(str::is_empty);
+        let is_standard =
+            action_lower == "route" || action_lower == "respond" || action_lower == "reject";
+        let target_missing = obj
+            .get("target")
+            .and_then(|t| t.as_str())
+            .is_none_or(str::is_empty);
         if !is_standard && target_missing {
-            obj.insert("target".into(), serde_json::Value::String(action_lower.clone()));
+            obj.insert(
+                "target".into(),
+                serde_json::Value::String(action_lower.clone()),
+            );
             obj.insert("action".into(), serde_json::Value::String("route".into()));
         }
     }
@@ -160,7 +166,10 @@ fn parse_classifier_response(response: &str, default_route: &str) -> (Classifier
         Ok(o) => {
             // If the LLM set action=route but omitted target, use default
             let output = ClassifierOutput {
-                target: o.target.clone().or_else(|| o.action.as_str().eq("route").then(|| default_route.into())),
+                target: o
+                    .target
+                    .clone()
+                    .or_else(|| o.action.as_str().eq("route").then(|| default_route.into())),
                 ..o
             };
             (output, false) // false = sanitized, not pristine
@@ -317,7 +326,13 @@ fn resolve_routing_target(
             group = ?routing_config.routes.get(route).map(|r| &r.group),
             "routing target resolved"
         );
-        Some(build_routing_target_value(route, model, model_name, routing_config, min_complexity))
+        Some(build_routing_target_value(
+            route,
+            model,
+            model_name,
+            routing_config,
+            min_complexity,
+        ))
     } else {
         tracing::warn!(target: "router.pipeline.stage2", route = %route, "resolve_route returned None — no dispatch target");
         None
@@ -401,9 +416,17 @@ impl ClassifierStage {
         let mut prompt = String::new();
 
         // Preamble from config — variable substitution still applies
-        let preamble = self.routing_config.system_prompt
-            .replace("{coherence_threshold}", &format!("{:.2}", self.coherence_threshold))
-            .replace("{safety_threshold}", &format!("{:.2}", self.routing_config.safety_threshold));
+        let preamble = self
+            .routing_config
+            .system_prompt
+            .replace(
+                "{coherence_threshold}",
+                &format!("{:.2}", self.coherence_threshold),
+            )
+            .replace(
+                "{safety_threshold}",
+                &format!("{:.2}", self.routing_config.safety_threshold),
+            );
         if !preamble.is_empty() {
             let _ = writeln!(prompt, "{preamble}\n");
         }
@@ -423,9 +446,7 @@ impl ClassifierStage {
         prompt.push('\n');
 
         // Output schema — derived from ClassifierOutput
-        let intent_values: Vec<String> = route_names.iter()
-            .map(|n| format!("\"{n}\""))
-            .collect();
+        let intent_values: Vec<String> = route_names.iter().map(|n| format!("\"{n}\"")).collect();
         let intent_enum = if intent_values.is_empty() {
             String::from("\"question\" | \"command\" | \"code\"")
         } else {
@@ -516,14 +537,28 @@ impl WorkUnit for ClassifierStage {
                     completeness: None,
                     risk: None,
                 };
-                let fallback_rt = resolve_routing_target(&output.action, &output, &self.routing_config, self.classifier_intelligence);
-                return Self::build_decision(&output, fallback_rt.as_ref(), false, self.score_matrix.as_ref());
+                let fallback_rt = resolve_routing_target(
+                    &output.action,
+                    &output,
+                    &self.routing_config,
+                    self.classifier_intelligence,
+                );
+                return Self::build_decision(
+                    &output,
+                    fallback_rt.as_ref(),
+                    false,
+                    self.score_matrix.as_ref(),
+                );
             }
         };
 
-    let (output, ok) = parse_classifier_response(&response, &self.routing_config.default_route);
+        let (output, ok) = parse_classifier_response(&response, &self.routing_config.default_route);
 
-        if let Some(decision) = check_thresholds(&output, self.coherence_threshold, self.routing_config.safety_threshold) {
+        if let Some(decision) = check_thresholds(
+            &output,
+            self.coherence_threshold,
+            self.routing_config.safety_threshold,
+        ) {
             return WorkOutput::typed("rejected", &decision);
         }
 
@@ -545,9 +580,19 @@ impl WorkUnit for ClassifierStage {
             return WorkOutput::typed("rejected", &decision);
         }
 
-        let routing_target = resolve_routing_target(&output.action, &output, &self.routing_config, self.classifier_intelligence);
+        let routing_target = resolve_routing_target(
+            &output.action,
+            &output,
+            &self.routing_config,
+            self.classifier_intelligence,
+        );
 
-        Self::build_decision(&output, routing_target.as_ref(), ok, self.score_matrix.as_ref())
+        Self::build_decision(
+            &output,
+            routing_target.as_ref(),
+            ok,
+            self.score_matrix.as_ref(),
+        )
     }
 }
 
@@ -561,8 +606,14 @@ impl ClassifierStage {
         let scored_routes = score_matrix.map(|sm| {
             let scores = std::collections::HashMap::from([
                 ("coherence".into(), output.coherence_score),
-                ("complexity".into(), f64::from(output.complexity.unwrap_or(DEFAULT_COMPLEXITY)) / COMPLEXITY_SCALE),
-                ("completeness".into(), output.completeness.unwrap_or(DEFAULT_COMPLETENESS)),
+                (
+                    "complexity".into(),
+                    f64::from(output.complexity.unwrap_or(DEFAULT_COMPLEXITY)) / COMPLEXITY_SCALE,
+                ),
+                (
+                    "completeness".into(),
+                    output.completeness.unwrap_or(DEFAULT_COMPLETENESS),
+                ),
                 ("risk".into(), output.risk.unwrap_or(0.0)),
             ]);
             sm.resolve(&scores)
@@ -591,10 +642,15 @@ impl ClassifierStage {
                 });
             }
             metadata["scored_routes"] = serde_json::Value::Array(
-                routes.iter().map(|r| serde_json::json!({
-                    "route": r.route_name,
-                    "score": r.weighted_score,
-                })).collect(),
+                routes
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "route": r.route_name,
+                            "score": r.weighted_score,
+                        })
+                    })
+                    .collect(),
             );
         }
 

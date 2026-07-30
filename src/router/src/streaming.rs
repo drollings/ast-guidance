@@ -79,7 +79,10 @@ impl StreamingHandler {
             }],
         });
 
-        format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap_or_default())
+        format!(
+            "data: {}\n\n",
+            serde_json::to_string(&chunk).unwrap_or_default()
+        )
     }
 
     /// Filter thinking blocks from a delta, handling cross-chunk blocks.
@@ -179,8 +182,8 @@ impl StreamingHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{RouterChoice, RouterMessage, RouterMessageContent};
     use common_core::string::strip_thinking_blocks;
-    use crate::types::{RouterMessage, RouterMessageContent, RouterChoice};
 
     #[test]
     fn format_single_chunk() {
@@ -314,10 +317,7 @@ mod tests {
             strip_thinking_blocks("before \x3cthink\x3ereason\x3c/think\x3e after"),
             "before  after"
         );
-        assert_eq!(
-            strip_thinking_blocks("\x3cthink\x3eunclosed"),
-            ""
-        );
+        assert_eq!(strip_thinking_blocks("\x3cthink\x3eunclosed"), "");
         assert_eq!(
             strip_thinking_blocks("A\x3cthink\x3eB\x3c/think\x3eC\x3cthink\x3eD\x3c/think\x3eE"),
             "ACE"
@@ -336,7 +336,9 @@ mod tests {
     #[test]
     fn strip_thinking_blocks_multiple_formats() {
         assert_eq!(
-            strip_thinking_blocks("\x3cthink\x3eollama\x3c/think\x3eplain\x3cthinking\x3exml\x3c/thinking\x3eend"),
+            strip_thinking_blocks(
+                "\x3cthink\x3eollama\x3c/think\x3eplain\x3cthinking\x3exml\x3c/thinking\x3eend"
+            ),
             "plainend"
         );
     }
@@ -351,11 +353,11 @@ mod tests {
             strip_thinking_blocks("Hello  thinking let me think response\n result"),
             "Hello  result"
         );
+        assert_eq!(strip_thinking_blocks(" thinking unclosed"), "");
         assert_eq!(
-            strip_thinking_blocks(" thinking unclosed"),
-            ""
+            strip_thinking_blocks("normal text response here"),
+            "normal text response here"
         );
-        assert_eq!(strip_thinking_blocks("normal text response here"), "normal text response here");
         assert_eq!(
             strip_thinking_blocks(" thinking a response\nB thinking c response\nD"),
             "BD"

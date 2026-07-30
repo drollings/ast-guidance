@@ -11,11 +11,11 @@ use crate::ledger::ContentNodeLedger;
 use crate::pipeline::RoutingTarget;
 use crate::server::responses::completion_to_response;
 use crate::server::responses::fallback_completion;
-use crate::server::responses::ServerStats;
 use crate::server::responses::HyperResponse;
-use common_core::string::strip_thinking_blocks;
+use crate::server::responses::ServerStats;
 use crate::testing::mock::MockDispatchContext;
 use crate::types::{RouterMessageContent, RouterRequest, RouterResponse};
+use common_core::string::strip_thinking_blocks;
 
 pub async fn handle_dispatch(
     rt: &RoutingTarget,
@@ -36,12 +36,25 @@ pub async fn handle_dispatch(
         if let Some(cache_backend) = cache {
             let request_json = serde_json::to_string(router_request).unwrap_or_default();
             if let Some(cached) = cache_backend.get(&rt.model, &request_json) {
-                stats.cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                stats
+                    .cache_hits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::debug!(target: "router.dispatch", model = %rt.model, "cache hit");
-                let Ok(mut response) = serde_json::from_value::<RouterResponse>(cached.response_json)
+                let Ok(mut response) =
+                    serde_json::from_value::<RouterResponse>(cached.response_json)
                 else {
-                    stats.cache_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return dispatch_real(rt, router_request, model_name, http_client, target_streams, cache).await;
+                    stats
+                        .cache_misses
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return dispatch_real(
+                        rt,
+                        router_request,
+                        model_name,
+                        http_client,
+                        target_streams,
+                        cache,
+                    )
+                    .await;
                 };
                 if rt.filter_thinking {
                     for choice in &mut response.choices {
@@ -50,9 +63,16 @@ pub async fn handle_dispatch(
                         }
                     }
                 }
-                return Ok(completion_to_response(&response, model_name, false, Some(&response.model)));
+                return Ok(completion_to_response(
+                    &response,
+                    model_name,
+                    false,
+                    Some(&response.model),
+                ));
             }
-            stats.cache_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            stats
+                .cache_misses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -61,7 +81,15 @@ pub async fn handle_dispatch(
             mock.validate_route(entry, Some(rt));
             if mock.is_model_excepted(&rt.model) || mock.is_model_excepted(model_name) {
                 tracing::info!(target: "router.server", model = %rt.model, "excepted model — real LLM call");
-                return dispatch_real(rt, router_request, model_name, http_client, target_streams, cache).await;
+                return dispatch_real(
+                    rt,
+                    router_request,
+                    model_name,
+                    http_client,
+                    target_streams,
+                    cache,
+                )
+                .await;
             }
             tracing::info!(target: "router.server", model = %model_name, "mock canned response");
             if let Some(node_id) = ledger_node_id {
@@ -70,7 +98,12 @@ pub async fn handle_dispatch(
                 }
             }
             let completion = mock.dispatch_response(entry, model_name);
-            return Ok(completion_to_response(&completion, model_name, is_stream, None));
+            return Ok(completion_to_response(
+                &completion,
+                model_name,
+                is_stream,
+                None,
+            ));
         }
         tracing::debug!(target: "router.server", model = %model_name, transcript_found = false, "no transcript entry — real dispatch fallback");
     }
@@ -84,7 +117,15 @@ pub async fn handle_dispatch(
         "real dispatch"
     );
 
-    dispatch_real(rt, router_request, model_name, http_client, target_streams, cache).await
+    dispatch_real(
+        rt,
+        router_request,
+        model_name,
+        http_client,
+        target_streams,
+        cache,
+    )
+    .await
 }
 
 /// Build a `ChatBackend` (optionally wrapped in `RetryChatBackend`) for a single
@@ -93,7 +134,11 @@ fn make_backend(http_client: &reqwest::Client, target: &RoutingTarget) -> Arc<dy
     let base: Arc<dyn ChatBackend> =
         Arc::new(OpenAiChatBackend::new(http_client.clone(), &target.url));
     if target.retry_count > 0 {
-        Arc::new(RetryChatBackend::new(base, target.retry_count, target.retry_base_interval_s))
+        Arc::new(RetryChatBackend::new(
+            base,
+            target.retry_count,
+            target.retry_base_interval_s,
+        ))
     } else {
         base
     }
@@ -124,8 +169,10 @@ async fn dispatch_to_single_target(
             .await?;
         let mut resp = hyper::Response::new(result.body.boxed_unsync());
         *resp.status_mut() = hyper::StatusCode::OK;
-        resp.headers_mut()
-            .insert(hyper::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+        resp.headers_mut().insert(
+            hyper::header::CONTENT_TYPE,
+            "text/event-stream".parse().unwrap(),
+        );
         crate::server::responses::add_cors_headers(resp.headers_mut());
         return Ok(resp);
     }
@@ -157,7 +204,12 @@ async fn dispatch_to_single_target(
         }
     }
 
-    Ok(completion_to_response(&completion, "", false, Some(&target.model)))
+    Ok(completion_to_response(
+        &completion,
+        "",
+        false,
+        Some(&target.model),
+    ))
 }
 
 pub async fn dispatch_real(
@@ -185,7 +237,9 @@ pub async fn dispatch_real(
             "dispatch attempt"
         );
 
-        match dispatch_to_single_target(target, router_request, http_client, stream, cache, i == 0).await {
+        match dispatch_to_single_target(target, router_request, http_client, stream, cache, i == 0)
+            .await
+        {
             Ok(resp) => {
                 return Ok(resp);
             }
@@ -215,5 +269,10 @@ pub async fn dispatch_real(
         "all dispatch targets failed, returning fallback response"
     );
     let completion = fallback_completion(model_name);
-    Ok(completion_to_response(&completion, model_name, stream, None))
+    Ok(completion_to_response(
+        &completion,
+        model_name,
+        stream,
+        None,
+    ))
 }

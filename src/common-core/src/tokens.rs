@@ -3,7 +3,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[deprecated(since = "0.2.0", note = "use `estimate_tokens` instead — the Unicode-script-aware estimator no longer uses a single ratio")]
+#[deprecated(
+    since = "0.2.0",
+    note = "use `estimate_tokens` instead — the Unicode-script-aware estimator no longer uses a single ratio"
+)]
 pub const DEFAULT_CHARS_PER_TOKEN: usize = 4;
 
 /// Estimate the token count of `text` using Unicode script density.
@@ -158,10 +161,11 @@ impl AtomicTokenBudget {
     ///
     /// The release is clamped so usage never goes below zero.
     pub fn release(&self, tokens: u64) {
-        self.used.fetch_update(Ordering::AcqRel, Ordering::Acquire, |u| {
-            Some(u.saturating_sub(tokens))
-        })
-        .ok();
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |u| {
+                Some(u.saturating_sub(tokens))
+            })
+            .ok();
     }
 
     /// Reset usage to zero.
@@ -320,10 +324,7 @@ fn split_into_sentences(text: &str) -> Vec<&str> {
     let chars: Vec<char> = text.chars().collect();
 
     for (idx, &ch) in chars.iter().enumerate() {
-        let is_terminal = matches!(
-            ch,
-            '.' | '!' | '?' | '\u{3002}' | '\u{FF01}' | '\u{FF1F}'
-        );
+        let is_terminal = matches!(ch, '.' | '!' | '?' | '\u{3002}' | '\u{FF01}' | '\u{FF1F}');
         let is_newline = ch == '\n';
 
         if is_terminal || is_newline {
@@ -417,7 +418,7 @@ mod tests {
     #[test]
     fn estimate_tokens_mixed() {
         let tokens = estimate_tokens("hello 世界 😀"); // 6 ASCII + 1 space + 2 CJK + 1 space + 1 emoji
-        // 6*0.25 + 0.1 + 2*0.67 + 0.1 + 1.0 = 1.5 + 0.1 + 1.34 + 0.1 + 1.0 = 4.04 → 4
+                                                       // 6*0.25 + 0.1 + 2*0.67 + 0.1 + 1.0 = 1.5 + 0.1 + 1.34 + 0.1 + 1.0 = 4.04 → 4
         assert!(tokens >= 3 && tokens <= 5, "got {tokens}");
     }
 
@@ -437,7 +438,10 @@ mod tests {
     fn estimate_tokens_floor_respects_minimum() {
         assert_eq!(estimate_tokens_floor("", 5), 5);
         assert_eq!(estimate_tokens_floor("hi", 10), 10);
-        assert_eq!(estimate_tokens_floor("this is a longer text", 3), estimate_tokens("this is a longer text"));
+        assert_eq!(
+            estimate_tokens_floor("this is a longer text", 3),
+            estimate_tokens("this is a longer text")
+        );
     }
 
     // ── 1.2 Atomic token budget ────────────────────────────────────
@@ -501,18 +505,25 @@ mod tests {
 
     #[test]
     fn chunk_empty() {
-        assert_eq!(chunk_document("", &ChunkConfig::default()), Vec::<String>::new());
+        assert_eq!(
+            chunk_document("", &ChunkConfig::default()),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
     fn chunk_whitespace_only() {
-        assert_eq!(chunk_document("   \n  ", &ChunkConfig::default()), Vec::<String>::new());
+        assert_eq!(
+            chunk_document("   \n  ", &ChunkConfig::default()),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
     fn chunk_latin_splits() {
         // Each sentence ~13 ASCII chars → ~3 tokens. With max=10, should fit 3 sentences.
-        let text = "First sentence here. Second sentence here. Third sentence here. Fourth sentence here.";
+        let text =
+            "First sentence here. Second sentence here. Third sentence here. Fourth sentence here.";
         let chunks = chunk_document(text, &ChunkConfig::new(10, 3));
         // Should produce at least 2 chunks
         assert!(chunks.len() >= 2, "got {} chunks", chunks.len());

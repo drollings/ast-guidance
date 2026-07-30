@@ -16,8 +16,8 @@ use crate::server::responses::empty_response;
 use crate::server::responses::error_response;
 use crate::server::responses::make_error_completion;
 use crate::server::responses::make_text_completion;
-use crate::server::responses::ServerStats;
 use crate::server::responses::HyperResponse;
+use crate::server::responses::ServerStats;
 use crate::testing::mock::MockDispatchContext;
 
 async fn handle_chat_completion(
@@ -69,7 +69,10 @@ async fn handle_chat_completion(
         Ok(r) => r,
         Err(e) => {
             stats.errors.fetch_add(1, Ordering::Relaxed);
-            return Ok(error_response(hyper::StatusCode::BAD_REQUEST, &e.to_string()));
+            return Ok(error_response(
+                hyper::StatusCode::BAD_REQUEST,
+                &e.to_string(),
+            ));
         }
     };
 
@@ -115,13 +118,8 @@ async fn handle_chat_completion(
             .ok()
     });
 
-    let pipeline_result = resolve_pipeline(
-        &model_name,
-        &routes,
-        &models,
-        &pipelines,
-        &request_json,
-    );
+    let pipeline_result =
+        resolve_pipeline(&model_name, &routes, &models, &pipelines, &request_json);
 
     let user_text = router_request
         .messages
@@ -151,7 +149,12 @@ async fn handle_chat_completion(
         }
 
         let completion = make_error_completion(&model_name, reason);
-        return Ok(completion_to_response(&completion, &model_name, is_stream, None));
+        return Ok(completion_to_response(
+            &completion,
+            &model_name,
+            is_stream,
+            None,
+        ));
     }
 
     if let Some(ref resp_str) = pipeline_result.classifier_response {
@@ -167,7 +170,12 @@ async fn handle_chat_completion(
             }
         }
         let completion = make_text_completion(&model_name, resp_str);
-        return Ok(completion_to_response(&completion, &model_name, is_stream, None));
+        return Ok(completion_to_response(
+            &completion,
+            &model_name,
+            is_stream,
+            None,
+        ));
     }
 
     if let Some(ref rt) = pipeline_result.routing_target {
@@ -235,7 +243,12 @@ async fn handle_chat_completion(
         }
     }
     let completion = crate::server::responses::fallback_completion(&model_name);
-    Ok(completion_to_response(&completion, &model_name, is_stream, None))
+    Ok(completion_to_response(
+        &completion,
+        &model_name,
+        is_stream,
+        None,
+    ))
 }
 
 #[allow(clippy::implicit_hasher)]
@@ -280,7 +293,10 @@ pub async fn handle_request(
                 "cache_hits": stats.cache_hits.load(Ordering::Relaxed),
                 "cache_misses": stats.cache_misses.load(Ordering::Relaxed),
             });
-            Ok(crate::server::responses::json_response(hyper::StatusCode::OK, &body))
+            Ok(crate::server::responses::json_response(
+                hyper::StatusCode::OK,
+                &body,
+            ))
         }
         ("POST", "/admin/cache/invalidate") => {
             if !is_local_request(&req) {
@@ -302,8 +318,17 @@ pub async fn handle_request(
         }
         ("POST", "/v1/chat/completions") => {
             handle_chat_completion(
-                req, pipelines, routes, models, stats, max_payload,
-                classifier_url, mock_dispatch, ledger, cache, http_client,
+                req,
+                pipelines,
+                routes,
+                models,
+                stats,
+                max_payload,
+                classifier_url,
+                mock_dispatch,
+                ledger,
+                cache,
+                http_client,
             )
             .await
         }
@@ -315,7 +340,8 @@ pub async fn handle_request(
                 let key = &path["/admin/cache/".len()..];
                 if key.is_empty() {
                     return Ok(crate::server::responses::error_response(
-                        hyper::StatusCode::BAD_REQUEST, "missing cache key",
+                        hyper::StatusCode::BAD_REQUEST,
+                        "missing cache key",
                     ));
                 }
                 if let Some(ref cache_backend) = cache {
@@ -364,8 +390,8 @@ fn resolve_pipeline(
     pipelines: &std::collections::HashMap<String, Arc<PipelineOrchestrator>>,
     request_json: &str,
 ) -> crate::pipeline::PipelineResult {
-    use fluent_wvr::prelude::*;
     use crate::pipeline::RoutingTarget;
+    use fluent_wvr::prelude::*;
 
     let route = routes.get(model_name).cloned();
 
@@ -374,7 +400,10 @@ fn resolve_pipeline(
     } else if let Some(model_entry) = models.get(model_name) {
         let rt = RoutingTarget {
             url: model_entry.endpoint.clone(),
-            model: model_entry.name.clone().unwrap_or_else(|| model_name.to_string()),
+            model: model_entry
+                .name
+                .clone()
+                .unwrap_or_else(|| model_name.to_string()),
             group: None,
             target_name: Some(model_name.to_string()),
             params: model_entry.params.clone(),
@@ -387,11 +416,16 @@ fn resolve_pipeline(
             fallbacks: vec![],
         };
         return crate::pipeline::PipelineResult {
-            decisions: vec![], final_response: None, rejected: false,
-            reject_reason: None, routing_target: Some(rt), classifier_response: None,
+            decisions: vec![],
+            final_response: None,
+            rejected: false,
+            reject_reason: None,
+            routing_target: Some(rt),
+            classifier_response: None,
         };
     } else {
-        routes.get("local")
+        routes
+            .get("local")
             .map_or_else(|| vec!["default".into()], |r| r.pipelines.clone())
     };
 
@@ -414,9 +448,12 @@ fn resolve_pipeline(
             Ok(o) => o,
             Err(e) => {
                 return crate::pipeline::PipelineResult {
-                    decisions: all_decisions, final_response: None, rejected: true,
+                    decisions: all_decisions,
+                    final_response: None,
+                    rejected: true,
                     reject_reason: Some(format!("pipeline '{name}' error: {e}")),
-                    routing_target: None, classifier_response: None,
+                    routing_target: None,
+                    classifier_response: None,
                 };
             }
         };
@@ -425,9 +462,12 @@ fn resolve_pipeline(
             Ok(r) => r,
             Err(e) => {
                 return crate::pipeline::PipelineResult {
-                    decisions: all_decisions, final_response: None, rejected: true,
+                    decisions: all_decisions,
+                    final_response: None,
+                    rejected: true,
                     reject_reason: Some(format!("pipeline '{name}' output decode: {e}")),
-                    routing_target: None, classifier_response: None,
+                    routing_target: None,
+                    classifier_response: None,
                 };
             }
         };
@@ -441,8 +481,12 @@ fn resolve_pipeline(
     }
 
     let mut final_result = last_result.unwrap_or(crate::pipeline::PipelineResult {
-        decisions: vec![], final_response: None, rejected: false,
-        reject_reason: None, routing_target: None, classifier_response: None,
+        decisions: vec![],
+        final_response: None,
+        rejected: false,
+        reject_reason: None,
+        routing_target: None,
+        classifier_response: None,
     });
     final_result.decisions = all_decisions;
     final_result

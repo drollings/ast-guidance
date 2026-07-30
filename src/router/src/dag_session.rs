@@ -10,8 +10,8 @@ use std::collections::{HashMap, HashSet};
 use fluent_dag::dep_graph::{DependencyGraph, GraphError};
 use serde::{Deserialize, Serialize};
 
+use crate::kv_cache::{KvCacheError, KvCacheManager};
 use crate::session::StepStatus;
-use crate::kv_cache::{KvCacheManager, KvCacheError};
 
 /// Errors produced by dependency-session operations.
 #[derive(Debug, thiserror::Error)]
@@ -151,11 +151,7 @@ impl DependencySession {
     ///
     /// If the result is not accepted or has an error, dependents are
     /// cancelled transitively via `DependencyGraph::dependents_of`.
-    pub fn complete_step(
-        &mut self,
-        step_id: &str,
-        result: StepResult,
-    ) -> Result<(), DagError> {
+    pub fn complete_step(&mut self, step_id: &str, result: StepResult) -> Result<(), DagError> {
         let should_cancel = !result.accepted || result.error.is_some();
 
         let is_checkpoint = {
@@ -248,10 +244,7 @@ impl DependencySession {
     /// for audit (it is not deleted). If a `KvCacheManager` is attached
     /// and a model name is provided, the KV cache snapshot is restored
     /// from the cold tier.
-    pub async fn rewind_to_checkpoint(
-        &mut self,
-        checkpoint_name: &str,
-    ) -> Result<(), DagError> {
+    pub async fn rewind_to_checkpoint(&mut self, checkpoint_name: &str) -> Result<(), DagError> {
         // Verify checkpoint exists.
         self.checkpoints
             .get(checkpoint_name)
@@ -288,12 +281,13 @@ impl DependencySession {
 
         // Restore KV cache snapshot from cold tier if a manager is attached.
         if let Some(ref kv) = self.kv_cache {
-            match kv.retrieve(
-                "unknown", // model not tracked in DependencySession — caller sets via metadata
-                None,
-                &self.session_id,
-            )
-            .await
+            match kv
+                .retrieve(
+                    "unknown", // model not tracked in DependencySession — caller sets via metadata
+                    None,
+                    &self.session_id,
+                )
+                .await
             {
                 Ok(snapshot) => {
                     tracing::info!(
@@ -339,9 +333,10 @@ impl DependencySession {
             .ok_or_else(|| DagError::StepNotFound(step_id.into()))?;
 
         if step.status != StepStatus::Pending {
-            return Err(DagError::StepAlreadyCompleted(
-                format!("step '{step_id}' is not Pending (current: {:?})", step.status),
-            ));
+            return Err(DagError::StepAlreadyCompleted(format!(
+                "step '{step_id}' is not Pending (current: {:?})",
+                step.status
+            )));
         }
 
         step.status = StepStatus::InProgress;
@@ -412,10 +407,7 @@ mod tests {
             .add_step(SessionStep::new("step-1", "First step"))
             .unwrap();
         session
-            .add_step(
-                SessionStep::new("step-2", "Second step")
-                    .with_depends(vec!["step-1".into()]),
-            )
+            .add_step(SessionStep::new("step-2", "Second step").with_depends(vec!["step-1".into()]))
             .unwrap();
 
         assert_eq!(session.step_count(), 2);
@@ -429,20 +421,19 @@ mod tests {
             .add_step(SessionStep::new("step-1", "First"))
             .unwrap();
         let result = session.add_step(SessionStep::new("step-1", "Duplicate"));
-        assert!(matches!(result, Err(DagError::Graph(GraphError::DuplicateNode(_)))));
+        assert!(matches!(
+            result,
+            Err(DagError::Graph(GraphError::DuplicateNode(_)))
+        ));
     }
 
     #[test]
     fn test_ready_nodes_basic_dependency() {
         let mut session = DependencySession::new("sess-1");
 
+        session.add_step(SessionStep::new("plan", "Plan")).unwrap();
         session
-            .add_step(SessionStep::new("plan", "Plan"))
-            .unwrap();
-        session
-            .add_step(
-                SessionStep::new("execute", "Execute").with_depends(vec!["plan".into()]),
-            )
+            .add_step(SessionStep::new("execute", "Execute").with_depends(vec!["plan".into()]))
             .unwrap();
 
         // Only "plan" should be ready (no dependencies)
@@ -450,7 +441,9 @@ mod tests {
         assert_eq!(ready, vec!["plan"]);
 
         // Complete "plan"
-        session.complete_step("plan", ok_result("plan done")).unwrap();
+        session
+            .complete_step("plan", ok_result("plan done"))
+            .unwrap();
 
         // Now "execute" should be ready
         let ready = session.next_ready();
@@ -461,18 +454,12 @@ mod tests {
     fn test_fail_cancels_dependents() {
         let mut session = DependencySession::new("sess-1");
 
+        session.add_step(SessionStep::new("a", "Step A")).unwrap();
         session
-            .add_step(SessionStep::new("a", "Step A"))
+            .add_step(SessionStep::new("b", "Step B").with_depends(vec!["a".into()]))
             .unwrap();
         session
-            .add_step(
-                SessionStep::new("b", "Step B").with_depends(vec!["a".into()]),
-            )
-            .unwrap();
-        session
-            .add_step(
-                SessionStep::new("c", "Step C").with_depends(vec!["b".into()]),
-            )
+            .add_step(SessionStep::new("c", "Step C").with_depends(vec!["b".into()]))
             .unwrap();
 
         // Complete "a" successfully
@@ -498,9 +485,7 @@ mod tests {
     #[test]
     fn test_complete_already_completed() {
         let mut session = DependencySession::new("sess-1");
-        session
-            .add_step(SessionStep::new("a", "Step A"))
-            .unwrap();
+        session.add_step(SessionStep::new("a", "Step A")).unwrap();
         session.complete_step("a", ok_result("done")).unwrap();
 
         let result = session.complete_step("a", ok_result("again"));
@@ -510,9 +495,7 @@ mod tests {
     #[test]
     fn test_start_step() {
         let mut session = DependencySession::new("sess-1");
-        session
-            .add_step(SessionStep::new("a", "Step A"))
-            .unwrap();
+        session.add_step(SessionStep::new("a", "Step A")).unwrap();
 
         session.start_step("a").unwrap();
         let step = session.get_step("a").unwrap();
@@ -529,9 +512,7 @@ mod tests {
     #[test]
     fn test_start_step_not_pending() {
         let mut session = DependencySession::new("sess-1");
-        session
-            .add_step(SessionStep::new("a", "Step A"))
-            .unwrap();
+        session.add_step(SessionStep::new("a", "Step A")).unwrap();
         session.complete_step("a", ok_result("done")).unwrap();
 
         let result = session.start_step("a");
@@ -542,14 +523,10 @@ mod tests {
     fn test_checkpoint_listing() {
         let mut session = DependencySession::new("sess-1");
         session
-            .add_step(
-                SessionStep::new("a", "Step A").with_checkpoint(),
-            )
+            .add_step(SessionStep::new("a", "Step A").with_checkpoint())
             .unwrap();
         session
-            .add_step(
-                SessionStep::new("b", "Step B").with_checkpoint(),
-            )
+            .add_step(SessionStep::new("b", "Step B").with_checkpoint())
             .unwrap();
 
         let cps = session.checkpoints();
@@ -563,19 +540,13 @@ mod tests {
         let mut session = DependencySession::new("sess-1");
 
         session
-            .add_step(
-                SessionStep::new("a", "Step A").with_checkpoint(),
-            )
+            .add_step(SessionStep::new("a", "Step A").with_checkpoint())
             .unwrap();
         session
-            .add_step(
-                SessionStep::new("b", "Step B").with_depends(vec!["a".into()]),
-            )
+            .add_step(SessionStep::new("b", "Step B").with_depends(vec!["a".into()]))
             .unwrap();
         session
-            .add_step(
-                SessionStep::new("c", "Step C").with_depends(vec!["b".into()]),
-            )
+            .add_step(SessionStep::new("c", "Step C").with_depends(vec!["b".into()]))
             .unwrap();
 
         // Complete a and reach checkpoint
@@ -590,19 +561,10 @@ mod tests {
         session.rewind_to_checkpoint("a").await.unwrap();
 
         // "a" is reset, "b" is reset
-        assert_eq!(
-            session.get_step("a").unwrap().status,
-            StepStatus::Pending
-        );
-        assert_eq!(
-            session.get_step("b").unwrap().status,
-            StepStatus::Pending
-        );
+        assert_eq!(session.get_step("a").unwrap().status, StepStatus::Pending);
+        assert_eq!(session.get_step("b").unwrap().status, StepStatus::Pending);
         // "c" was never completed, stays Pending
-        assert_eq!(
-            session.get_step("c").unwrap().status,
-            StepStatus::Pending
-        );
+        assert_eq!(session.get_step("c").unwrap().status, StepStatus::Pending);
         assert_eq!(session.completed_count(), 0);
     }
 
@@ -617,13 +579,9 @@ mod tests {
     fn test_is_ready() {
         let mut session = DependencySession::new("sess-1");
 
+        session.add_step(SessionStep::new("a", "Step A")).unwrap();
         session
-            .add_step(SessionStep::new("a", "Step A"))
-            .unwrap();
-        session
-            .add_step(
-                SessionStep::new("b", "Step B").with_depends(vec!["a".into()]),
-            )
+            .add_step(SessionStep::new("b", "Step B").with_depends(vec!["a".into()]))
             .unwrap();
 
         assert!(session.is_ready("a"));
@@ -643,12 +601,8 @@ mod tests {
     fn test_independent_steps_ready_together() {
         let mut session = DependencySession::new("sess-1");
 
-        session
-            .add_step(SessionStep::new("a", "Step A"))
-            .unwrap();
-        session
-            .add_step(SessionStep::new("b", "Step B"))
-            .unwrap();
+        session.add_step(SessionStep::new("a", "Step A")).unwrap();
+        session.add_step(SessionStep::new("b", "Step B")).unwrap();
 
         let ready = session.next_ready();
         assert_eq!(ready.len(), 2);
@@ -661,18 +615,12 @@ mod tests {
         // DependencyGraph::dependents_of handles cycles gracefully
         let mut session = DependencySession::new("sess-1");
 
+        session.add_step(SessionStep::new("a", "Step A")).unwrap();
         session
-            .add_step(SessionStep::new("a", "Step A"))
+            .add_step(SessionStep::new("b", "Step B").with_depends(vec!["a".into(), "c".into()]))
             .unwrap();
         session
-            .add_step(
-                SessionStep::new("b", "Step B").with_depends(vec!["a".into(), "c".into()]),
-            )
-            .unwrap();
-        session
-            .add_step(
-                SessionStep::new("c", "Step C").with_depends(vec!["b".into()]),
-            )
+            .add_step(SessionStep::new("c", "Step C").with_depends(vec!["b".into()]))
             .unwrap();
 
         // This should not panic — DependencyGraph handles cycles
@@ -685,13 +633,9 @@ mod tests {
     fn test_unresolved_deps() {
         let mut session = DependencySession::new("sess-1");
 
+        session.add_step(SessionStep::new("a", "Step A")).unwrap();
         session
-            .add_step(SessionStep::new("a", "Step A"))
-            .unwrap();
-        session
-            .add_step(
-                SessionStep::new("b", "Step B").with_depends(vec!["missing".into()]),
-            )
+            .add_step(SessionStep::new("b", "Step B").with_depends(vec!["missing".into()]))
             .unwrap();
 
         let unresolved = session.unresolved_deps();
@@ -703,12 +647,12 @@ mod tests {
         let mut session = DependencySession::new("sess-1");
 
         session
-            .add_step(
-                SessionStep::new("a", "Step A").with_checkpoint(),
-            )
+            .add_step(SessionStep::new("a", "Step A").with_checkpoint())
             .unwrap();
 
-        session.complete_step("a", ok_result("important result")).unwrap();
+        session
+            .complete_step("a", ok_result("important result"))
+            .unwrap();
         session.rewind_to_checkpoint("a").await.unwrap();
 
         let step = session.get_step("a").unwrap();

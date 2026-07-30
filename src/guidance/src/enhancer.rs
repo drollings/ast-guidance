@@ -1,6 +1,6 @@
+use fluent_types::GuidanceDoc;
 use guidance_llm::client::LlmClient;
 use guidance_llm::ChatMessage;
-use fluent_types::GuidanceDoc;
 use thiserror::Error;
 
 #[derive(Error, Debug)]

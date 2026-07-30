@@ -8,11 +8,13 @@ use crate::target::Target;
 type Stage = (&'static str, fn(&Target, &HashSet<usize>) -> bool);
 
 const STAGES: &[Stage] = &[
-    ("essential",  |t, _fp| t.essential),
-    ("strict_sat", |t, fp| t.depends.not_any()
-        || t.depends.iter_ones().all(|c| fp.contains(&c))),
-    ("locality",   |t, fp| !t.depends.not_any()
-        && t.depends.iter_ones().any(|c| fp.contains(&c))),
+    ("essential", |t, _fp| t.essential),
+    ("strict_sat", |t, fp| {
+        t.depends.not_any() || t.depends.iter_ones().all(|c| fp.contains(&c))
+    }),
+    ("locality", |t, fp| {
+        !t.depends.not_any() && t.depends.iter_ones().any(|c| fp.contains(&c))
+    }),
 ];
 
 /// Narrow providers for a capability using the yamake-old.py narrowing

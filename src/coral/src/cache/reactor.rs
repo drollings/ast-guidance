@@ -5,9 +5,9 @@ use crate::wasm_runtime::WasmRuntime;
 use bon::Builder;
 use common_core::hash::content_hash_with_model;
 use common_core::metrics::LatencyHistogram;
+use fluent_types::{ContentNode, NodeId, WasmTool};
 use guidance_llm::decomposer::Decomposer;
 use guidance_llm::LlmConfig;
-use fluent_types::{ContentNode, NodeId, WasmTool};
 
 use crate::cache_l1::{CacheTier, L1Cache, RoutingResult};
 use crate::cache_router::ParallelRouter;

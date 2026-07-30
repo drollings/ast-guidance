@@ -249,9 +249,9 @@ pub fn strip_html(s: &str) -> String {
 // ── Thinking block stripping ──────────────────────────────────────────
 
 const THINKING_PAIRS: &[(&[u8], &[u8])] = &[
-    (b"\x3cthink\x3e", b"\x3c/think\x3e"),       // Ollama: <think>...</think>
+    (b"\x3cthink\x3e", b"\x3c/think\x3e"), // Ollama: <think>...</think>
     (b"\x3cthinking\x3e", b"\x3c/thinking\x3e"), // Claude/Gemini: <thinking>...</thinking>
-    (b"[THINK]", b"[/THINK]"),                     // Bracket format
+    (b"[THINK]", b"[/THINK]"),             // Bracket format
 ];
 
 /// Strip content between start and end markers. Returns the text with content
@@ -305,12 +305,14 @@ fn strip_plain_thinking(text: &str) -> String {
         if let Some(start) = find_subseq(bytes, pos, b" thinking") {
             let after_start = start + 9;
             match find_subseq(bytes, after_start, b" response") {
-                Some(end) if end + 9 >= bytes.len()
-                    || bytes[end + 9] == b'\n' =>
-                {
+                Some(end) if end + 9 >= bytes.len() || bytes[end + 9] == b'\n' => {
                     result.push_str(&text[pos..start]);
                     let after_end = end + 9;
-                    pos = if after_end < bytes.len() { after_end + 1 } else { after_end };
+                    pos = if after_end < bytes.len() {
+                        after_end + 1
+                    } else {
+                        after_end
+                    };
                 }
                 _ => return result,
             }
@@ -815,10 +817,7 @@ mod tests {
 
     #[test]
     fn first_sentence_with_question() {
-        assert_eq!(
-            first_sentence("What is this? More text."),
-            "What is this?"
-        );
+        assert_eq!(first_sentence("What is this? More text."), "What is this?");
     }
 
     #[test]

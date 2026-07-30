@@ -74,7 +74,10 @@ impl Filter for RegexFilter {
         match self.outcome {
             FilterOutcome::HardReject => {
                 // First matching regex → hard reject
-                let matched = self.regexes.iter().find(|re| re.is_match(&ctx.user_message))?;
+                let matched = self
+                    .regexes
+                    .iter()
+                    .find(|re| re.is_match(&ctx.user_message))?;
                 let m = matched.find(&ctx.user_message)?;
 
                 if let ConfidenceGate::LuhnValid = self.confidence_gate {

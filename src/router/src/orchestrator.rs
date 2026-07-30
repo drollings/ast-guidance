@@ -80,10 +80,7 @@ impl OrchestratorSession {
 
     /// Set a custom compaction strategy (defaults to `RecencyCompaction`).
     #[must_use]
-    pub fn with_compaction(
-        mut self,
-        strategy: Box<dyn CompactionStrategy>,
-    ) -> Self {
+    pub fn with_compaction(mut self, strategy: Box<dyn CompactionStrategy>) -> Self {
         self.compaction_strategy = strategy;
         self
     }
@@ -96,10 +93,7 @@ impl OrchestratorSession {
     }
 
     /// Add a user message node. Returns the created `ContentNode`.
-    pub fn add_user_message(
-        &mut self,
-        _content: &str,
-    ) -> Result<ContentNode, OrchestratorError> {
+    pub fn add_user_message(&mut self, _content: &str) -> Result<ContentNode, OrchestratorError> {
         let node = ContentNode {
             id: Some(NodeId::from_int(self.turn_index as i64)),
             name: format!("user-msg-{}", self.turn_index).into(),
@@ -204,13 +198,12 @@ impl OrchestratorSession {
             .iter()
             .find(|c| c.name == checkpoint_name)
             .ok_or_else(|| {
-                OrchestratorError::Checkpoint(format!(
-                    "checkpoint not found: {checkpoint_name}"
-                ))
+                OrchestratorError::Checkpoint(format!("checkpoint not found: {checkpoint_name}"))
             })?;
 
         let target_turn = cp.turn_index;
-        self.nodes.retain(|n| n.turn_index.unwrap_or(0) < target_turn);
+        self.nodes
+            .retain(|n| n.turn_index.unwrap_or(0) < target_turn);
         self.turn_index = target_turn;
         self.checkpoints.retain(|c| c.turn_index <= target_turn);
         Ok(())
@@ -263,8 +256,7 @@ mod tests {
 
     #[test]
     fn test_add_user_message_increments_turn() {
-        let mut session =
-            OrchestratorSession::new("sess-1", "test-model", test_client(), None);
+        let mut session = OrchestratorSession::new("sess-1", "test-model", test_client(), None);
         assert_eq!(session.turn_index(), 0);
 
         let node = session.add_user_message("hello").unwrap();
@@ -276,8 +268,7 @@ mod tests {
 
     #[test]
     fn test_accepted_nodes_in_context() {
-        let mut session =
-            OrchestratorSession::new("sess-1", "test-model", test_client(), None);
+        let mut session = OrchestratorSession::new("sess-1", "test-model", test_client(), None);
 
         session.add_user_message("query").unwrap();
         session
@@ -293,8 +284,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_and_rewind() {
-        let mut session =
-            OrchestratorSession::new("sess-1", "test-model", test_client(), None);
+        let mut session = OrchestratorSession::new("sess-1", "test-model", test_client(), None);
 
         session.add_user_message("turn 1").unwrap();
         session.checkpoint("after-turn-1").unwrap();
@@ -310,16 +300,14 @@ mod tests {
 
     #[test]
     fn test_rewind_missing_checkpoint() {
-        let mut session =
-            OrchestratorSession::new("sess-1", "test-model", test_client(), None);
+        let mut session = OrchestratorSession::new("sess-1", "test-model", test_client(), None);
         let result = session.rewind("nonexistent");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_checkpoint_names() {
-        let mut session =
-            OrchestratorSession::new("sess-1", "test-model", test_client(), None);
+        let mut session = OrchestratorSession::new("sess-1", "test-model", test_client(), None);
 
         session.checkpoint("cp1").unwrap();
         session.checkpoint("cp2").unwrap();
@@ -331,8 +319,7 @@ mod tests {
     #[test]
     fn test_compact_applies_lods() {
         let mut session =
-            OrchestratorSession::new("sess-1", "test-model", test_client(), None)
-                .with_max_nodes(4);
+            OrchestratorSession::new("sess-1", "test-model", test_client(), None).with_max_nodes(4);
 
         for i in 0..5 {
             session.add_user_message(&format!("msg {i}")).unwrap();
@@ -340,7 +327,11 @@ mod tests {
 
         session.compact();
 
-        let lods: Vec<u8> = session.nodes().iter().filter_map(|n| n.active_lod).collect();
+        let lods: Vec<u8> = session
+            .nodes()
+            .iter()
+            .filter_map(|n| n.active_lod)
+            .collect();
         assert_eq!(lods.len(), 5);
         // oldest nodes should have higher LOD level (less detail)
         assert!(lods[0] > 0, "oldest node should be compacted");

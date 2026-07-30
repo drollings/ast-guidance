@@ -94,8 +94,16 @@ impl DispatchBackend for OpenAiBackend {
     }
 
     fn parse_response(&self, body: &Value) -> Result<RouterResponse, DispatchError> {
-        let id = body.get("id").and_then(Value::as_str).unwrap_or("unknown").to_string();
-        let model = body.get("model").and_then(Value::as_str).unwrap_or("unknown").to_string();
+        let id = body
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
         let created = body.get("created").and_then(Value::as_u64).unwrap_or(0);
 
         let choices = body
@@ -111,8 +119,16 @@ impl DispatchBackend for OpenAiBackend {
                             .unwrap_or("stop")
                             .to_string();
                         let msg = c.get("message")?;
-                        let role = msg.get("role").and_then(Value::as_str).unwrap_or("assistant").to_string();
-                        let content = msg.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+                        let role = msg
+                            .get("role")
+                            .and_then(Value::as_str)
+                            .unwrap_or("assistant")
+                            .to_string();
+                        let content = msg
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
                         Some(RouterChoice {
                             index,
                             message: RouterMessage {
@@ -129,10 +145,17 @@ impl DispatchBackend for OpenAiBackend {
             .unwrap_or_default();
 
         let usage = body.get("usage").map_or(
-            Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+            Usage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+            },
             |u| Usage {
                 prompt_tokens: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
-                completion_tokens: u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+                completion_tokens: u
+                    .get("completion_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u32,
                 total_tokens: u.get("total_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
             },
         );
@@ -148,16 +171,20 @@ impl DispatchBackend for OpenAiBackend {
     }
 
     fn parse_stream_event(&self, event: &[u8]) -> Result<StreamEvent, DispatchError> {
-        let text =
-            std::str::from_utf8(event).map_err(|e| DispatchError::StreamParse(format!("invalid UTF-8 in stream: {e}")))?;
+        let text = std::str::from_utf8(event)
+            .map_err(|e| DispatchError::StreamParse(format!("invalid UTF-8 in stream: {e}")))?;
 
         if text == "[DONE]" {
             return Ok(StreamEvent::Done);
         }
 
-        let v: Value = serde_json::from_str(text).map_err(|e| DispatchError::StreamParse(e.to_string()))?;
+        let v: Value =
+            serde_json::from_str(text).map_err(|e| DispatchError::StreamParse(e.to_string()))?;
         let empty_choices = vec![];
-        let choices = v.get("choices").and_then(|v| v.as_array()).unwrap_or(&empty_choices);
+        let choices = v
+            .get("choices")
+            .and_then(|v| v.as_array())
+            .unwrap_or(&empty_choices);
 
         if let Some(choice) = choices.first() {
             let delta = choice
@@ -166,10 +193,18 @@ impl DispatchBackend for OpenAiBackend {
                 .and_then(|c| c.as_str())
                 .unwrap_or("")
                 .to_string();
-            let finish_reason = choice.get("finish_reason").and_then(Value::as_str).map(ToString::to_string);
-            Ok(StreamEvent::Chunk { delta, finish_reason })
+            let finish_reason = choice
+                .get("finish_reason")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            Ok(StreamEvent::Chunk {
+                delta,
+                finish_reason,
+            })
         } else {
-            Err(DispatchError::StreamParse("no choices in stream event".into()))
+            Err(DispatchError::StreamParse(
+                "no choices in stream event".into(),
+            ))
         }
     }
 }
@@ -195,9 +230,12 @@ impl DispatchBackend for AnthropicBackend {
                 role => {
                     let content = match &msg.content {
                         RouterMessageContent::Text(s) => Value::String(s.clone()),
-                        RouterMessageContent::Parts(parts) => {
-                            Value::Array(parts.iter().map(|p| serde_json::to_value(p).unwrap()).collect())
-                        }
+                        RouterMessageContent::Parts(parts) => Value::Array(
+                            parts
+                                .iter()
+                                .map(|p| serde_json::to_value(p).unwrap())
+                                .collect(),
+                        ),
                     };
                     let mut m = serde_json::json!({ "role": role, "content": content });
                     if let Some(ref id) = msg.tool_call_id {
@@ -225,8 +263,16 @@ impl DispatchBackend for AnthropicBackend {
     }
 
     fn parse_response(&self, body: &Value) -> Result<RouterResponse, DispatchError> {
-        let id = body.get("id").and_then(Value::as_str).unwrap_or("unknown").to_string();
-        let model = body.get("model").and_then(Value::as_str).unwrap_or("unknown").to_string();
+        let id = body
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
         let created = body.get("created").and_then(Value::as_u64).unwrap_or(0);
 
         let content = body
@@ -273,20 +319,30 @@ impl DispatchBackend for AnthropicBackend {
     }
 
     fn parse_stream_event(&self, event: &[u8]) -> Result<StreamEvent, DispatchError> {
-        let text =
-            std::str::from_utf8(event).map_err(|e| DispatchError::StreamParse(format!("invalid UTF-8 in stream: {e}")))?;
+        let text = std::str::from_utf8(event)
+            .map_err(|e| DispatchError::StreamParse(format!("invalid UTF-8 in stream: {e}")))?;
 
         if text.starts_with("event: message_stop") || text.contains("[DONE]") {
             return Ok(StreamEvent::Done);
         }
 
         if let Some(data) = text.strip_prefix("data: ") {
-            let v: Value =
-                serde_json::from_str(data).map_err(|e| DispatchError::StreamParse(e.to_string()))?;
-            if let Some(delta) = v.get("delta").and_then(|d| d.get("text")).and_then(|t| t.as_str()) {
-                Ok(StreamEvent::Chunk { delta: delta.to_string(), finish_reason: None })
+            let v: Value = serde_json::from_str(data)
+                .map_err(|e| DispatchError::StreamParse(e.to_string()))?;
+            if let Some(delta) = v
+                .get("delta")
+                .and_then(|d| d.get("text"))
+                .and_then(|t| t.as_str())
+            {
+                Ok(StreamEvent::Chunk {
+                    delta: delta.to_string(),
+                    finish_reason: None,
+                })
             } else {
-                Ok(StreamEvent::Chunk { delta: String::new(), finish_reason: Some("stop".into()) })
+                Ok(StreamEvent::Chunk {
+                    delta: String::new(),
+                    finish_reason: Some("stop".into()),
+                })
             }
         } else {
             Err(DispatchError::StreamParse("unexpected SSE format".into()))
@@ -301,7 +357,11 @@ pub struct OpenAiCompatBackend {
 }
 
 impl OpenAiCompatBackend {
-    pub fn new(api_base: impl Into<String>, api_key: Option<String>, provider_label: impl Into<String>) -> Self {
+    pub fn new(
+        api_base: impl Into<String>,
+        api_key: Option<String>,
+        provider_label: impl Into<String>,
+    ) -> Self {
         Self {
             api_base: api_base.into(),
             api_key,
@@ -357,10 +417,8 @@ impl LlmDispatcher {
         backend: Arc<dyn DispatchBackend>,
         api_key: Option<String>,
     ) {
-        self.providers.insert(
-            name.into(),
-            ProviderConfig { backend, api_key },
-        );
+        self.providers
+            .insert(name.into(), ProviderConfig { backend, api_key });
     }
 
     pub fn get_backend(&self, name: &str) -> Option<&Arc<dyn DispatchBackend>> {
@@ -436,14 +494,20 @@ mod tests {
     fn parse_response_missing_model_defaults_to_unknown() {
         let json = json!({"id": "chatcmpl-123", "choices": [], "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}});
         let resp = default_openai().parse_response(&json).unwrap();
-        assert_eq!(resp.model, "unknown", "missing model should default to 'unknown'");
+        assert_eq!(
+            resp.model, "unknown",
+            "missing model should default to 'unknown'"
+        );
     }
 
     #[test]
     fn parse_response_missing_choices_defaults_to_empty() {
         let json = json!({"id": "chatcmpl-123", "model": "gpt-4"});
         let resp = default_openai().parse_response(&json).unwrap();
-        assert!(resp.choices.is_empty(), "missing choices should default to empty vec");
+        assert!(
+            resp.choices.is_empty(),
+            "missing choices should default to empty vec"
+        );
     }
 
     #[test]

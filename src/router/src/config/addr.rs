@@ -26,10 +26,14 @@ pub fn parse_bind_addr(addr: &str) -> Result<(&str, u16), String> {
     }
     // Handle IPv6: [::1]:port
     if addr.starts_with('[') {
-        let close_bracket = addr.rfind(']').ok_or_else(|| "unclosed '[' in bind_addr".to_string())?;
+        let close_bracket = addr
+            .rfind(']')
+            .ok_or_else(|| "unclosed '[' in bind_addr".to_string())?;
         let host = &addr[1..close_bracket];
         let rest = addr[close_bracket + 1..].trim_start_matches(':');
-        let port: u16 = rest.parse().map_err(|e| format!("invalid port in bind_addr '{addr}': {e}"))?;
+        let port: u16 = rest
+            .parse()
+            .map_err(|e| format!("invalid port in bind_addr '{addr}': {e}"))?;
         return Ok((host, port));
     }
     if let Some(colon_pos) = addr.rfind(':') {
@@ -39,7 +43,9 @@ pub fn parse_bind_addr(addr: &str) -> Result<(&str, u16), String> {
             .map_err(|e| format!("invalid port in bind_addr '{addr}': {e}"))?;
         Ok((host, port))
     } else {
-        Err(format!("bind_addr '{addr}' missing port (expected host:port)"))
+        Err(format!(
+            "bind_addr '{addr}' missing port (expected host:port)"
+        ))
     }
 }
 
@@ -143,71 +149,83 @@ mod tests {
     #[test]
     fn validate_ok_when_models_point_upstream() {
         let mut models = HashMap::new();
-        models.insert("fast".into(), ModelEntry {
-            endpoint: "http://upstream.test:8080/v1/chat/completions".into(),
-            name: Some("fast".into()),
-            intelligence: 1,
-            cost_input: 0.0,
-            cost_output: 0.0,
-            cost_cached_read: 0.0,
-            speed: 10,
-            total_timeout_ms: 5000,
-            idle_timeout_ms: 2000,
-            stream: false,
-            filter_thinking: false,
-            retry_count: 0,
-            retry_base_interval_s: 1,
-            params: None,
-            sessions: None,
-        });
+        models.insert(
+            "fast".into(),
+            ModelEntry {
+                endpoint: "http://upstream.test:8080/v1/chat/completions".into(),
+                name: Some("fast".into()),
+                intelligence: 1,
+                cost_input: 0.0,
+                cost_output: 0.0,
+                cost_cached_read: 0.0,
+                speed: 10,
+                total_timeout_ms: 5000,
+                idle_timeout_ms: 2000,
+                stream: false,
+                filter_thinking: false,
+                retry_count: 0,
+                retry_base_interval_s: 1,
+                params: None,
+                sessions: None,
+            },
+        );
         assert!(validate_no_self_routing("0.0.0.0:8079", &models).is_ok());
     }
 
     #[test]
     fn validate_rejects_self_loop_localhost() {
         let mut models = HashMap::new();
-        models.insert("fast".into(), ModelEntry {
-            endpoint: "http://localhost:8079/v1/chat/completions".into(),
-            name: Some("fast".into()),
-            intelligence: 1,
-            cost_input: 0.0,
-            cost_output: 0.0,
-            cost_cached_read: 0.0,
-            speed: 10,
-            total_timeout_ms: 5000,
-            idle_timeout_ms: 2000,
-            stream: false,
-            filter_thinking: false,
-            retry_count: 0,
-            retry_base_interval_s: 1,
-            params: None,
-            sessions: None,
-        });
+        models.insert(
+            "fast".into(),
+            ModelEntry {
+                endpoint: "http://localhost:8079/v1/chat/completions".into(),
+                name: Some("fast".into()),
+                intelligence: 1,
+                cost_input: 0.0,
+                cost_output: 0.0,
+                cost_cached_read: 0.0,
+                speed: 10,
+                total_timeout_ms: 5000,
+                idle_timeout_ms: 2000,
+                stream: false,
+                filter_thinking: false,
+                retry_count: 0,
+                retry_base_interval_s: 1,
+                params: None,
+                sessions: None,
+            },
+        );
         let err = validate_no_self_routing("127.0.0.1:8079", &models)
             .expect_err("should reject self-routing model");
-        assert!(err.contains("routing loop"), "error should mention routing loop: {err}");
+        assert!(
+            err.contains("routing loop"),
+            "error should mention routing loop: {err}"
+        );
     }
 
     #[test]
     fn validate_rejects_self_loop_exact_match() {
         let mut models = HashMap::new();
-        models.insert("fast".into(), ModelEntry {
-            endpoint: "http://127.0.0.1:8079/v1/chat/completions".into(),
-            name: Some("fast".into()),
-            intelligence: 1,
-            cost_input: 0.0,
-            cost_output: 0.0,
-            cost_cached_read: 0.0,
-            speed: 10,
-            total_timeout_ms: 5000,
-            idle_timeout_ms: 2000,
-            stream: false,
-            filter_thinking: false,
-            retry_count: 0,
-            retry_base_interval_s: 1,
-            params: None,
-            sessions: None,
-        });
+        models.insert(
+            "fast".into(),
+            ModelEntry {
+                endpoint: "http://127.0.0.1:8079/v1/chat/completions".into(),
+                name: Some("fast".into()),
+                intelligence: 1,
+                cost_input: 0.0,
+                cost_output: 0.0,
+                cost_cached_read: 0.0,
+                speed: 10,
+                total_timeout_ms: 5000,
+                idle_timeout_ms: 2000,
+                stream: false,
+                filter_thinking: false,
+                retry_count: 0,
+                retry_base_interval_s: 1,
+                params: None,
+                sessions: None,
+            },
+        );
         let err = validate_no_self_routing("127.0.0.1:8079", &models)
             .expect_err("should reject self-routing model");
         assert!(err.contains("routing loop"));
@@ -216,23 +234,26 @@ mod tests {
     #[test]
     fn validate_rejects_when_port_differs_but_host_is_same() {
         let mut models = HashMap::new();
-        models.insert("fast".into(), ModelEntry {
-            endpoint: "http://127.0.0.1:8080/v1/chat/completions".into(),
-            name: Some("fast".into()),
-            intelligence: 1,
-            cost_input: 0.0,
-            cost_output: 0.0,
-            cost_cached_read: 0.0,
-            speed: 10,
-            total_timeout_ms: 5000,
-            idle_timeout_ms: 2000,
-            stream: false,
-            filter_thinking: false,
-            retry_count: 0,
-            retry_base_interval_s: 1,
-            params: None,
-            sessions: None,
-        });
+        models.insert(
+            "fast".into(),
+            ModelEntry {
+                endpoint: "http://127.0.0.1:8080/v1/chat/completions".into(),
+                name: Some("fast".into()),
+                intelligence: 1,
+                cost_input: 0.0,
+                cost_output: 0.0,
+                cost_cached_read: 0.0,
+                speed: 10,
+                total_timeout_ms: 5000,
+                idle_timeout_ms: 2000,
+                stream: false,
+                filter_thinking: false,
+                retry_count: 0,
+                retry_base_interval_s: 1,
+                params: None,
+                sessions: None,
+            },
+        );
         // Different port (8080 vs 8079) should be OK
         assert!(validate_no_self_routing("127.0.0.1:8079", &models).is_ok());
     }

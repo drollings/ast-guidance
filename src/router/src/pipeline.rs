@@ -102,8 +102,10 @@ impl PipelineOrchestrator {
         _decisions: &[StageDecision],
     ) -> WorkContext {
         let mut ctx = base.clone();
-        ctx.metadata
-            .insert("request".into(), MetadataValue::String(current_request.to_string()));
+        ctx.metadata.insert(
+            "request".into(),
+            MetadataValue::String(current_request.to_string()),
+        );
         ctx
     }
 
@@ -235,8 +237,7 @@ impl WorkUnit for PipelineOrchestrator {
 
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
         let mut decisions: Vec<StageDecision> = Vec::new();
-        let mut current_request =
-            get_metadata_string(ctx, "request").unwrap_or_default();
+        let mut current_request = get_metadata_string(ctx, "request").unwrap_or_default();
         let mut routing_target: Option<RoutingTarget> = None;
         let mut classifier_response: Option<String> = None;
 
@@ -258,7 +259,11 @@ impl WorkUnit for PipelineOrchestrator {
                     let stage_name = decision.stage;
 
                     let fallback = stage_name == PipelineStage::Classifier
-                        && decision.metadata.get("fallback").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                        && decision
+                            .metadata
+                            .get("fallback")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
                     tracing::info!(target: "router.pipeline",
                         stage = ?stage_name,
                         verdict = ?verdict,

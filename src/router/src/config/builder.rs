@@ -108,15 +108,13 @@ impl RouterConfig {
                 tracing::info!(target: "router.config", pipeline = %name, "classifier using real LLM client");
                 client
             };
-            stages.push(Arc::new(
-                crate::stages::classifier::ClassifierStage::new(
-                    client,
-                    routing_config,
-                    params.coherence_threshold,
-                    params.score_matrix.clone(),
-                    classifier_intel,
-                ),
-            ));
+            stages.push(Arc::new(crate::stages::classifier::ClassifierStage::new(
+                client,
+                routing_config,
+                params.coherence_threshold,
+                params.score_matrix.clone(),
+                classifier_intel,
+            )));
         } else if classifier_backend.is_some() {
             tracing::warn!(
                 target: "router.config",
@@ -172,7 +170,8 @@ fn resolve_classifier_model_key<'a>(
         .as_deref()
         .or(config.classifier_model.as_deref())
         .or_else(|| {
-            config.model_groups
+            config
+                .model_groups
                 .get("fast")
                 .and_then(|names| names.first())
                 .map(String::as_str)

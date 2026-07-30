@@ -273,5 +273,3 @@ impl super::Library {
         Ok(merged.into_iter().take(k).map(|(_, hit)| hit).collect())
     }
 }
-
-

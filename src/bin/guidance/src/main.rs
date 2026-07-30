@@ -4,9 +4,9 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use common_core::ensure_dir_or_panic;
 use common_core::shell::run_command;
+use fluent_concurrency::pool::ResultPoolError;
 use guidance_core::config;
 use guidance_core::memory::MemoryBridge;
-use fluent_concurrency::pool::ResultPoolError;
 use guidance_core::runtime;
 use guidance_core::sync::json_store::walk_guidance_docs;
 use guidance_core::sync_engine::SyncEngine;
@@ -215,7 +215,7 @@ async fn main() {
     }
 
     // Observes total command time. Per-unit observation is wired via
-    // `Instrumented::with_metrics` in the job-copilot handler (M5.1). The
+    // `Instrumented::with_metrics` in the browser-copilot handler. The
     // histogram here captures the outer command dispatch duration.
     let cmd_histogram = std::sync::Arc::new(common_core::LatencyHistogram::new());
     let cmd_start = std::time::Instant::now();

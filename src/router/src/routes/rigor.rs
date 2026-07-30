@@ -43,7 +43,9 @@ impl Default for RigorRoute {
 impl RigorRoute {
     #[must_use]
     pub fn new() -> Self {
-        Self { kv_cache_enabled: false }
+        Self {
+            kv_cache_enabled: false,
+        }
     }
 
     #[must_use]

@@ -3,9 +3,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use common_core::config::load_json_or_default;
-use fluent_router::config::{
-    validate_no_self_routing, RouterConfig,
-};
+use fluent_router::config::{validate_no_self_routing, RouterConfig};
 use fluent_router::logging::init_router_logging;
 use fluent_router::server::RouterServer;
 use fluent_router::testing::{
@@ -14,7 +12,10 @@ use fluent_router::testing::{
 use guidance_llm::client::ChatBackend;
 
 #[derive(Parser)]
-#[command(name = "coral-router", about = "LLM Router & Agent Orchestration Server")]
+#[command(
+    name = "coral-router",
+    about = "LLM Router & Agent Orchestration Server"
+)]
 struct Args {
     /// Path to the router configuration JSON file.
     #[arg(short, long, default_value = "coral-router.json")]
@@ -64,7 +65,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|p| p.parse::<u16>().ok());
             match existing_port {
                 Some(p) => format!("{host}:{p}"),
-                None => return Err("--host requires --port or a port in config server.bind_addr".into()),
+                None => {
+                    return Err(
+                        "--host requires --port or a port in config server.bind_addr".into(),
+                    )
+                }
             }
         }
         (None, Some(port)) => {
@@ -74,8 +79,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .rsplit(':')
                 .next()
                 .map(|p| {
-                    let host_part = &config.server.bind_addr[..config.server.bind_addr.len() - p.len() - 1];
-                    if host_part.is_empty() { "0.0.0.0" } else { host_part }
+                    let host_part =
+                        &config.server.bind_addr[..config.server.bind_addr.len() - p.len() - 1];
+                    if host_part.is_empty() {
+                        "0.0.0.0"
+                    } else {
+                        host_part
+                    }
                 })
                 .unwrap_or("0.0.0.0");
             format!("{existing_host}:{port}")
@@ -86,11 +96,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Apply mock base URL override
     if let Some(ref url) = args.mock_base_url {
-        config.mock.get_or_insert_with(|| fluent_router::config::MockConfig {
-            transcript_path: String::new(),
-            fail_on_unexpected: true,
-            base_url: url.clone(),
-        }).base_url = url.clone();
+        config
+            .mock
+            .get_or_insert_with(|| fluent_router::config::MockConfig {
+                transcript_path: String::new(),
+                fail_on_unexpected: true,
+                base_url: url.clone(),
+            })
+            .base_url = url.clone();
     }
 
     // Validate no model endpoint points to the router's own address
@@ -116,10 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(target: "coral-router", transcript = %path, mock_except = ?args.mock_except, "mock mode enabled");
 
         let entries = load_transcript_file(path)?;
-        let dispatch_ctx = MockDispatchContext::new(
-            entries,
-            args.mock_except.clone(),
-        );
+        let dispatch_ctx = MockDispatchContext::new(entries, args.mock_except.clone());
 
         let classifier_model_name = config.classifier_model.as_deref().unwrap_or("fast");
         let classifier_is_excepted = mock_except_models.contains(classifier_model_name);
@@ -129,8 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!(target: "coral-router", "classifier model is excepted — building with real LLM backend");
             config.build_all_pipelines_with_backend(None::<&Arc<dyn ChatBackend>>)
         } else {
-            let provider =
-                transcript_provider_from_entries(dispatch_ctx.transcripts());
+            let provider = transcript_provider_from_entries(dispatch_ctx.transcripts());
             let provider: Arc<dyn ChatBackend> = Arc::new(provider);
             config.build_all_pipelines_with_backend(Some(&provider))
         };
@@ -178,8 +187,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod config_tests {
-    use std::collections::HashMap;
     use serde::Deserialize;
+    use std::collections::HashMap;
 
     #[derive(Debug, Deserialize)]
     struct TestModelEntry {
