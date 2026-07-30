@@ -1,4 +1,4 @@
-# Fluent Monorepo - foundations for Coral Context, Fluent Concurrency
+# Fluent Monorepo - a high-speed agentic backbone
 
 This is a Rust monorepo, built as an integrated incubator of unified projects sharing a
 common infrastructure and enforced design patterns that build a dynamic, efficient runtime 
