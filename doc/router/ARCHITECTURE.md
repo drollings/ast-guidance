@@ -6,7 +6,7 @@ The source code may be referenced at `./src/router/src/`.
 
 ## Overview
 
-Coral Router exposes a single OpenAI-compatible HTTP endpoint (`POST /v1/chat/completions` on `:8081`) that runs every incoming request through a two-stage pipeline before dispatching to a model. The pipeline is built from `Arc<dyn Component>` units (the Fluent WVR uniform interface) and the server itself is also a `WorkUnit` — everything is composable.
+Coral Router exposes a single OpenAI-compatible HTTP endpoint (`POST /v1/chat/completions` on `:8079`) that runs every incoming request through a two-stage pipeline before dispatching to a model. The pipeline is built from `Arc<dyn Component>` units (the Fluent WVR uniform interface) and the server itself is also a `WorkUnit` — everything is composable.
 
 The architecture follows the MOA Router Specification (`MOA_ROUTER_SPEC.md`) and the design principles in `VISION.md`: deterministic before probabilistic, cheap before expensive, condensed context via a ledger, and frontier as a bounded, audited exception.
 

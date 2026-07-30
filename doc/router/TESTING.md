@@ -134,7 +134,7 @@ cargo run -p coral-router -- --config env/coral-router.json
 ### Sending test requests
 
 ```sh
-curl -s -X POST http://127.0.0.1:8081/v1/chat/completions \
+curl -s -X POST http://127.0.0.1:8079/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"fast","messages":[{"role":"user","content":"What is 2+2?"}]}'
 # → {"choices":[{"message":{"content":"2 + 2 = 4",...}}],...}

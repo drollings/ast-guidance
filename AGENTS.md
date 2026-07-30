@@ -2,7 +2,7 @@
 
 **Context**: coral-router is a Rust-native LLM request router with a 5-stage
 pipeline (deterministic pre-filter → quality gate → planning refinement →
-guardrail check → router) exposed as an OpenAI-compatible HTTP API on :8081.
+guardrail check → router) exposed as an OpenAI-compatible HTTP API on :8079.
 It dispatches to a configurable frontier LLM after the pipeline completes.
 
 This is a rust monorepo with multiple projects and shared infrastructure.  coral-router the priority.
@@ -10,13 +10,13 @@ This is a rust monorepo with multiple projects and shared infrastructure.  coral
 ## Build-Test Loop
 
 1. BUILD:       make router          # builds coral-router binary
-                make router-start    # builds + starts server on :8081
+                make router-start    # builds + starts server on :8079
 
 2. TEST:        make router-test     # 204 unit/golden/e2e tests (kills server)
 
 3. SMOKE:       make router-mock     # 18 curl smoke tests against live server
-                curl -s http://127.0.0.1:8081/health
-                curl -s -X POST http://127.0.0.1:8081/v1/chat/completions \
+                curl -s http://127.0.0.1:8079/health
+                curl -s -X POST http://127.0.0.1:8079/v1/chat/completions \
                   -H "Content-Type: application/json" \
                   -d '{"model":"fast","messages":{"role":"user","content":"What is 2+2?"}}'
 
