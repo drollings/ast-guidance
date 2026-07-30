@@ -1,7 +1,7 @@
 use common_core::hash::fnv1a64;
+use common_core::time::now_secs;
 use rusqlite::{params, Connection};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug)]
 pub struct Entry {
@@ -67,13 +67,6 @@ impl QueryCache {
         format!("{hash:016x}")
     }
 
-    fn now_secs() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-    }
-
     pub fn get(&self, query: &str) -> rusqlite::Result<Option<Entry>> {
         let key = Self::query_key(query);
         let mut stmt = self.db.prepare(
@@ -89,7 +82,7 @@ impl QueryCache {
         });
         match result {
             Ok(entry) => {
-                let now = Self::now_secs();
+                let now = now_secs();
                 // TTL=0 means always expired; otherwise check timestamp
                 if entry.ttl_seconds == 0 || now > entry.timestamp + entry.ttl_seconds {
                     // Expired — remove it
@@ -106,7 +99,7 @@ impl QueryCache {
 
     pub fn put(&self, query: &str, result: &str) -> rusqlite::Result<()> {
         let key = Self::query_key(query);
-        let now = Self::now_secs();
+        let now = now_secs();
         self.db.execute(
             "INSERT OR REPLACE INTO query_cache (key, result_json, timestamp, ttl_seconds) VALUES (?1, ?2, ?3, ?4)",
             params![key, result, now, self.default_ttl_seconds],
@@ -120,7 +113,7 @@ impl QueryCache {
 
     /// Remove all expired entries (TTL=0 or timestamp+ttl < now).
     pub fn evict_expired(&self) -> rusqlite::Result<usize> {
-        let now = Self::now_secs();
+        let now = now_secs();
         let count = self.db.execute(
             "DELETE FROM query_cache WHERE ttl_seconds = 0 OR ?1 > timestamp + ttl_seconds",
             params![now],
@@ -156,7 +149,7 @@ impl QueryCache {
             .db
             .query_row("SELECT COUNT(*) FROM query_cache", [], |row| row.get(0))?;
         let expired: usize = {
-            let now = Self::now_secs();
+            let now = now_secs();
             self.db.query_row(
                 "SELECT COUNT(*) FROM query_cache WHERE ?1 > timestamp + ttl_seconds",
                 params![now],

@@ -2,10 +2,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use common_core::jsonrpc::{JsonRpcError, JsonRpcHandler, JsonRpcRequest, JsonRpcResponse};
-use fluent_types::ContextNode;
+use fluent_types::ContentNode;
 use thiserror::Error;
 
-use crate::cache_reactor::QueueReactor;
+use crate::cache::reactor::QueueReactor;
 use crate::db::Library;
 
 pub const MAX_MCP_REQUEST_SIZE: usize = 10 * 1024 * 1024;
@@ -102,7 +102,7 @@ impl McpServer {
     }
 
     fn handle_coral_insert(&self, request: &JsonRpcRequest) -> JsonRpcResponse {
-        let node: ContextNode = match request
+        let node: ContentNode = match request
             .params
             .as_ref()
             .map(|p| serde_json::from_value(p.clone()))
@@ -331,7 +331,7 @@ mod tests {
 
     #[test]
     fn test_coral_stats_with_reactor() {
-        use crate::cache_reactor::{QueueReactor, QueueReactorCreateArgs};
+        use crate::cache::{QueueReactor, QueueReactorCreateArgs};
         use std::sync::Arc;
 
         let lib = Arc::new(Library::open_in_memory().expect("db"));

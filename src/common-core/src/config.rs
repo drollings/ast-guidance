@@ -10,9 +10,24 @@ use crate::error::IoError;
 /// missing or cannot be read.
 ///
 /// This is the "load-or-default" pattern: read, parse, and on any failure
-/// return the type's default.
+/// return the type's default.  When the file **exists but deserialization
+/// fails**, a warning is emitted to stderr so that silent config skew
+/// (e.g. forward-looking JSON fields that don't match current Rust types)
+/// does not go unnoticed.
 pub fn load_json_or_default<T: DeserializeOwned + Default>(path: &Path) -> T {
-    load_json(path).unwrap_or_default()
+    match load_json(path) {
+        Ok(t) => t,
+        Err(e) => {
+            if path.exists() {
+                eprintln!(
+                    "WARNING: config file '{}' exists but failed to parse: {}. Falling back to default.",
+                    path.display(),
+                    e
+                );
+            }
+            T::default()
+        }
+    }
 }
 
 /// Load a JSON config file strictly — errors on missing file, invalid JSON,
@@ -59,6 +74,17 @@ mod tests {
 
         let result = load_json_or_default::<TestConfig>(&path);
         assert_eq!(result.name, "default");
+    }
+
+    #[test]
+    fn load_json_or_default_warns_on_malformed_existing_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        fs::write(&path, r#"{"name": 42}"#).unwrap(); // wrong type for "name"
+
+        let result = load_json_or_default::<TestConfig>(&path);
+        assert_eq!(result.name, "default"); // falls back
+        // Warning should have been printed to stderr; structural test only.
     }
 
     #[test]

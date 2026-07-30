@@ -8,7 +8,6 @@ fluent-wvr = { path = "../fluent-wvr" }
 fluent-concurrency = { path = "../fluent-concurrency" }
 common-core = { path = "../common-core", features = ["sqlite"] }
 fluent-types = { path = "../types" }
-fluent-router = { path = "../router" }
 search-vector = { path = "../search-vector" }
 guidance-llm = { path = "../llm" }
 guidance-ontology = { path = "../ontology" }

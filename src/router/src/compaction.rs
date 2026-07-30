@@ -2,7 +2,7 @@
 //! to stay within context budget. The interface is a trait so smarter policies
 //! can be plugged in later.
 
-use crate::session::SessionNode;
+use fluent_types::ContentNode;
 
 /// Given a session's nodes, return the LOD level each node should be at.
 /// Lower LOD = less detail retained. Higher LOD = more compacted.
@@ -10,7 +10,7 @@ use crate::session::SessionNode;
 pub trait CompactionStrategy: Send + Sync {
     /// Returns LOD levels for each node. The returned `Vec` must have
     /// the same length as `nodes`.
-    fn select_lod(&self, nodes: &[SessionNode], max_nodes: usize) -> Vec<u8>;
+    fn select_lod(&self, nodes: &[ContentNode], max_nodes: usize) -> Vec<u8>;
 }
 
 /// Simple recency-based compaction: recent nodes keep high detail,
@@ -18,7 +18,7 @@ pub trait CompactionStrategy: Send + Sync {
 pub struct RecencyCompaction;
 
 impl CompactionStrategy for RecencyCompaction {
-    fn select_lod(&self, nodes: &[SessionNode], max_nodes: usize) -> Vec<u8> {
+    fn select_lod(&self, nodes: &[ContentNode], max_nodes: usize) -> Vec<u8> {
         let n = nodes.len();
         let mut lods = vec![0u8; n];
 
@@ -27,7 +27,7 @@ impl CompactionStrategy for RecencyCompaction {
             return lods;
         }
 
-        // Recent nodes keep high detail (LOD 0–1), older nodes drop.
+        // Recent nodes keep high detail (LOD 0-1), older nodes drop.
         for (i, lod) in lods.iter_mut().enumerate() {
             let position_from_end = n - i;
             if position_from_end <= max_nodes / 4 {
@@ -50,7 +50,7 @@ impl CompactionStrategy for RecencyCompaction {
 pub struct NoopCompaction;
 
 impl CompactionStrategy for NoopCompaction {
-    fn select_lod(&self, nodes: &[SessionNode], _max_nodes: usize) -> Vec<u8> {
+    fn select_lod(&self, nodes: &[ContentNode], _max_nodes: usize) -> Vec<u8> {
         vec![0u8; nodes.len()]
     }
 }
@@ -60,18 +60,27 @@ mod tests {
     use super::*;
     use fluent_types::NodeId;
 
-    fn make_nodes(count: usize) -> Vec<SessionNode> {
+    fn make_nodes(count: usize) -> Vec<ContentNode> {
         (0..count)
-            .map(|i| SessionNode {
-                node_id: NodeId::from_int(i as i64),
-                role: "user".into(),
-                turn_index: i as u64,
-                accepted: true,
+            .map(|i| ContentNode {
+                id: Some(NodeId::from_int(i as i64)),
+                name: format!("node-{i}").into(),
+                source: "test".into(),
+                lod: vec![],
+                embedding: None,
+                capabilities: None,
+                session_id: None,
+                request_id: None,
+                role: Some("user".into()),
+                turn_index: Some(i as u64),
+                accepted: Some(true),
                 acceptance_score: None,
-                active_lod: 0,
+                active_lod: Some(0),
                 parent_id: None,
                 step_id: None,
                 step_status: None,
+                metadata: None,
+                created_at: None,
             })
             .collect()
     }
@@ -87,15 +96,6 @@ mod tests {
     fn test_recency_compaction_over_max() {
         let nodes = make_nodes(8);
         let lods = RecencyCompaction.select_lod(&nodes, 4);
-        // 8 nodes, max=4:
-        // i=0 (pos 8): 8<=3? no, 8<=4? no, 8<=6? no -> lod 3 (oldest)
-        // i=1 (pos 7): 7<=3? no, 7<=4? no, 7<=6? no -> lod 3
-        // i=2 (pos 6): 6<=3? no, 6<=4? no, 6<=6? yes -> lod 2
-        // i=3 (pos 5): 5<=3? no, 5<=4? no, 5<=6? yes -> lod 2
-        // i=4 (pos 4): 4<=3? no, 4<=4? yes -> lod 1
-        // i=5 (pos 3): 3<=3? yes -> lod 0
-        // i=6 (pos 2): 2<=3? yes -> lod 0
-        // i=7 (pos 1): 1<=3? yes -> lod 0
         assert_eq!(lods[0], 3);
         assert_eq!(lods[1], 3);
         assert_eq!(lods[7], 0);

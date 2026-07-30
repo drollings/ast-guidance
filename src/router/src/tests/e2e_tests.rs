@@ -12,29 +12,16 @@ use crate::pipeline::{PipelineOrchestrator, PipelineResult};
 use crate::pipeline_types::{PipelineStage, StageVerdict};
 use crate::session::StepStatus;
 use crate::testing::mock::TranscriptProvider;
+use crate::testing::test_request;
 use crate::types::{RouterMessage, RouterMessageContent, RouterRequest};
 use fluent_wvr::prelude::*;
 use guidance_llm::client::ChatBackend;
 
 fn make_request(text: &str) -> RouterRequest {
-    RouterRequest {
-        model: "orchestrator:llama3.1".into(),
-        messages: vec![RouterMessage {
-            role: "user".into(),
-            content: RouterMessageContent::Text(text.into()),
-            tool_calls: None,
-            tool_call_id: None,
-        }],
-        temperature: None,
-        max_tokens: None,
-        stream: None,
-        tools: None,
-        tool_choice: None,
-        session_id: Some("e2e-test-session".into()),
-        agent_id: None,
-        adapter: None,
-        metadata: Default::default(),
-    }
+    let mut req = test_request(text);
+    req.model = "orchestrator:llama3.1".into();
+    req.session_id = Some("e2e-test-session".into());
+    req
 }
 
 fn classify_output(action: &str, coherence: f64, safety: f64, reason: &str) -> String {

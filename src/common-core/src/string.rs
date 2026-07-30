@@ -124,8 +124,10 @@ pub fn lower_into<'a>(dst: &'a mut [u8], src: &[u8]) -> &'a [u8] {
 }
 
 /// Lightweight HTML tag stripper — no regex dependency. Strips `<script>`,
-/// `<style>`, and all other tags, decodes common entities, and collapses
-/// whitespace. Suitable for untrusted text going to an LLM or field validator.
+/// `<style>`, and all other tags, decodes common entities, replaces
+/// block-level tags (`<br>`, `</p>`, `</div>`, `</li>`, `</tr>`) with
+/// newlines, and collapses whitespace.
+/// Suitable for untrusted text going to an LLM or field validator.
 pub fn strip_html(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut in_script = false;
@@ -134,7 +136,6 @@ pub fn strip_html(s: &str) -> String {
 
     while let Some((i, c)) = chars.next() {
         if c == '<' {
-            // Peek ahead to detect tag name
             let rest = &s[i + 1..];
             let tag_start = rest.trim_start();
             let lower: String = tag_start
@@ -143,6 +144,45 @@ pub fn strip_html(s: &str) -> String {
                 .collect();
             let lower = lower.to_ascii_lowercase();
 
+            // Check for closing tags first — in_script/in_style flags block the
+            // normal tag handler, so we must detect </script>/</style> here.
+            if in_script && lower.is_empty() {
+                if let Some(past_slash) = tag_start.strip_prefix('/') {
+                    let rest_name: String = past_slash
+                        .chars()
+                        .take_while(|ch| ch.is_alphanumeric())
+                        .collect();
+                    if rest_name.eq_ignore_ascii_case("script") {
+                        in_script = false;
+                        while let Some(&(_, ch)) = chars.peek() {
+                            chars.next();
+                            if ch == '>' {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+            if in_style && lower.is_empty() {
+                if let Some(past_slash) = tag_start.strip_prefix('/') {
+                    let rest_name: String = past_slash
+                        .chars()
+                        .take_while(|ch| ch.is_alphanumeric())
+                        .collect();
+                    if rest_name.eq_ignore_ascii_case("style") {
+                        in_style = false;
+                        while let Some(&(_, ch)) = chars.peek() {
+                            chars.next();
+                            if ch == '>' {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+
             if lower.starts_with("script") {
                 in_script = true;
                 continue;
@@ -150,6 +190,20 @@ pub fn strip_html(s: &str) -> String {
             if lower.starts_with("style") {
                 in_style = true;
                 continue;
+            }
+            // Check for block-level break tags and replace with newline.
+            if lower.is_empty() {
+                if let Some(past_slash) = tag_start.strip_prefix('/') {
+                    let closing_name: String = past_slash
+                        .chars()
+                        .take_while(|ch| ch.is_alphanumeric())
+                        .collect();
+                    if matches!(closing_name.as_str(), "br" | "p" | "div" | "li" | "tr") {
+                        result.push('\n');
+                    }
+                }
+            } else if matches!(lower.as_str(), "br" | "p" | "div" | "li" | "tr") {
+                result.push('\n');
             }
             // Skip everything until '>'
             while let Some(&(_, ch)) = chars.peek() {
@@ -161,41 +215,7 @@ pub fn strip_html(s: &str) -> String {
             continue;
         }
 
-        if in_script {
-            if c == '<' {
-                // Check for </script>
-                let rest = &s[i + 1..];
-                if rest
-                    .trim_start()
-                    .to_ascii_lowercase()
-                    .starts_with("/script")
-                {
-                    in_script = false;
-                    // Skip until '>'
-                    while let Some(&(_, ch)) = chars.peek() {
-                        chars.next();
-                        if ch == '>' {
-                            break;
-                        }
-                    }
-                }
-            }
-            continue;
-        }
-
-        if in_style {
-            if c == '<' {
-                let rest = &s[i + 1..];
-                if rest.trim_start().to_ascii_lowercase().starts_with("/style") {
-                    in_style = false;
-                    while let Some(&(_, ch)) = chars.peek() {
-                        chars.next();
-                        if ch == '>' {
-                            break;
-                        }
-                    }
-                }
-            }
+        if in_script || in_style {
             continue;
         }
 
@@ -209,7 +229,7 @@ pub fn strip_html(s: &str) -> String {
     let result = result.replace("&quot;", "\"");
     let result = result.replace("&#39;", "'");
 
-    // Collapse whitespace
+    // Collapse whitespace (including newlines from block-tag substitution)
     let mut out = String::with_capacity(result.len());
     let mut prev_space = false;
     for c in result.chars() {
@@ -224,6 +244,103 @@ pub fn strip_html(s: &str) -> String {
         }
     }
     out.trim().to_string()
+}
+
+// ── Thinking block stripping ──────────────────────────────────────────
+
+const THINKING_PAIRS: &[(&[u8], &[u8])] = &[
+    (b"\x3cthink\x3e", b"\x3c/think\x3e"),       // Ollama: <think>...</think>
+    (b"\x3cthinking\x3e", b"\x3c/thinking\x3e"), // Claude/Gemini: <thinking>...</thinking>
+    (b"[THINK]", b"[/THINK]"),                     // Bracket format
+];
+
+/// Strip content between start and end markers. Returns the text with content
+/// between each matching pair removed. If a start marker is found without a
+/// matching end marker, everything from the start marker onward is stripped.
+fn strip_tag_pairs(text: &str, pairs: &[(&[u8], &[u8])]) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut pos = 0;
+    let bytes = text.as_bytes();
+
+    while pos < bytes.len() {
+        let mut earliest: Option<usize> = None;
+        let mut matched_pair: Option<(&[u8], &[u8])> = None;
+
+        for &(start_mark, end_mark) in pairs {
+            if let Some(start) = find_subseq(bytes, pos, start_mark) {
+                if earliest.is_none_or(|e| start < e) {
+                    earliest = Some(start);
+                    matched_pair = Some((start_mark, end_mark));
+                }
+            }
+        }
+
+        if let Some((start_mark, end_mark)) = matched_pair {
+            let start = earliest.unwrap();
+            result.push_str(&text[pos..start]);
+            let after_start = start + start_mark.len();
+            if let Some(end) = find_subseq(bytes, after_start, end_mark) {
+                pos = end + end_mark.len();
+            } else {
+                return result;
+            }
+        } else {
+            result.push_str(&text[pos..]);
+            return result;
+        }
+    }
+
+    result
+}
+
+/// Strip plain-text ` thinking ...  response\n` delimiters
+/// (DeepSeek R1, unsloth thinking). The end delimiter must be followed by a
+/// newline or end-of-string.
+fn strip_plain_thinking(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut pos = 0;
+    let bytes = text.as_bytes();
+
+    while pos < bytes.len() {
+        if let Some(start) = find_subseq(bytes, pos, b" thinking") {
+            let after_start = start + 9;
+            match find_subseq(bytes, after_start, b" response") {
+                Some(end) if end + 9 >= bytes.len()
+                    || bytes[end + 9] == b'\n' =>
+                {
+                    result.push_str(&text[pos..start]);
+                    let after_end = end + 9;
+                    pos = if after_end < bytes.len() { after_end + 1 } else { after_end };
+                }
+                _ => return result,
+            }
+        } else {
+            result.push_str(&text[pos..]);
+            return result;
+        }
+    }
+
+    result
+}
+
+/// Strip thinking blocks from the given text. Handles multiple formats:
+/// - `<think>...</think>` (Ollama-style XML tags)
+/// - `<thinking>...</thinking>` (Claude, Gemini, some local models)
+/// - ` thinking ...  response\n` (DeepSeek R1, unsloth thinking)
+///
+/// Tags can appear anywhere in the content and blocks may be unclosed.
+pub fn strip_thinking_blocks(text: &str) -> String {
+    let tagged = strip_tag_pairs(text, THINKING_PAIRS);
+    if tagged != text {
+        return tagged;
+    }
+    strip_plain_thinking(text)
+}
+
+/// Strip `<think>` and `[THINK]` tag pairs. Delegates to
+/// `strip_thinking_blocks` which handles all known thinking-block formats.
+pub fn strip_think_block(text: &str) -> String {
+    strip_thinking_blocks(text)
 }
 
 pub fn slugify(text: &str) -> String {

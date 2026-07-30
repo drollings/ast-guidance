@@ -85,31 +85,13 @@ impl TransformStrategy for SecretMask {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{RouterMessage, RouterRequest};
+    use crate::testing::{test_request, text_of};
+    use crate::types::RouterRequest;
 
     fn make_request(text: &str) -> RouterRequest {
-        RouterRequest {
-            model: "test".into(),
-            messages: vec![RouterMessage {
-                role: "user".into(),
-                content: RouterMessageContent::Text(text.into()),
-                tool_calls: None,
-                tool_call_id: None,
-            }],
-            temperature: None,
-            max_tokens: None,
-            stream: None,
-            tools: None,
-            tool_choice: None,
-            session_id: None,
-            agent_id: None,
-            adapter: None,
-            metadata: Default::default(),
-        }
-    }
-
-    fn text_of(result: &RouterRequest) -> String {
-        result.messages[0].content.to_string_lossy()
+        let mut req = test_request(text);
+        req.model = "test".into();
+        req
     }
 
     #[test]

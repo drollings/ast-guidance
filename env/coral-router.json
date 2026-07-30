@@ -4,7 +4,7 @@
             "deterministic_prefilter": true,
             "classifier": true,
             "router": true,
-            "coherence_threshold": 0.70,
+            "coherence_threshold": 0.7,
             "classifier_model": "fast",
             "blacklist": "env/pii-patterns.json"
         }
@@ -14,9 +14,9 @@
             "endpoint": "http://localhost:8080/v1/chat/completions",
             "name": "unsloth/lfm2.5-1.2b-instruct",
             "intelligence": 2,
-            "cost_input": 0.000001,
-            "cost_output": 0.000006,
-            "cost_cached_read": 0.0000004,
+            "cost_input": 1e-06,
+            "cost_output": 6e-06,
+            "cost_cached_read": 4e-07,
             "speed": 8,
             "total_timeout_ms": 40000,
             "idle_timeout_ms": 8000,
@@ -32,11 +32,11 @@
         },
         "fast": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
-            "fast": "unsloth/lfm2.5-8b-a1b",
+            "name": "unsloth/lfm2.5-8b-a1b",
             "intelligence": 2,
-            "cost_input": 0.000001,
-            "cost_output": 0.000006,
-            "cost_cached_read": 0.0000004,
+            "cost_input": 1e-06,
+            "cost_output": 6e-06,
+            "cost_cached_read": 4e-07,
             "speed": 8,
             "total_timeout_ms": 40000,
             "idle_timeout_ms": 8000,
@@ -54,9 +54,9 @@
             "endpoint": "http://localhost:8080/v1/chat/completions",
             "name": "empero-ai/qwythos-9b-v2",
             "intelligence": 3,
-            "cost_input": 0.000003,
-            "cost_output": 0.000018,
-            "cost_cached_read": 0.0000012,
+            "cost_input": 3e-06,
+            "cost_output": 1.8e-05,
+            "cost_cached_read": 1.2e-06,
             "speed": 5,
             "total_timeout_ms": 120000,
             "idle_timeout_ms": 10000,
@@ -74,7 +74,9 @@
                 "orchestrator": {
                     "num_ctx": 262144,
                     "sleep_idle_seconds": 0,
-                    "params": { "temperature": 0.6 }
+                    "params": {
+                        "temperature": 0.6
+                    }
                 },
                 "code": {
                     "num_ctx": 65536,
@@ -90,9 +92,9 @@
             "endpoint": "http://localhost:8080/v1/chat/completions",
             "name": "altworld/astrea-r8-chat-9b",
             "intelligence": 3,
-            "cost_input": 0.000003,
-            "cost_output": 0.000018,
-            "cost_cached_read": 0.0000012,
+            "cost_input": 3e-06,
+            "cost_output": 1.8e-05,
+            "cost_cached_read": 1.2e-06,
             "speed": 5,
             "total_timeout_ms": 120000,
             "idle_timeout_ms": 10000,
@@ -110,7 +112,9 @@
                 "prose": {
                     "num_ctx": 131072,
                     "sleep_idle_seconds": 0,
-                    "params": { "temperature": 0.7 }
+                    "params": {
+                        "temperature": 0.7
+                    }
                 }
             }
         },
@@ -118,9 +122,9 @@
             "endpoint": "http://localhost:8080/v1/chat/completions",
             "name": "unsloth/hy-mt2-7b",
             "intelligence": 3,
-            "cost_input": 0.000003,
-            "cost_output": 0.000018,
-            "cost_cached_read": 0.0000012,
+            "cost_input": 3e-06,
+            "cost_output": 1.8e-05,
+            "cost_cached_read": 1.2e-06,
             "speed": 5,
             "total_timeout_ms": 120000,
             "idle_timeout_ms": 10000,
@@ -134,45 +138,46 @@
             }
         }
     },
-    "model_groups": {
-        "classifier": ["fast"],
-        "question": ["fast"],
-        "command": ["fast"],
-        "code": ["qwythos-9b"],
-        "prose": ["prose"],
-        "psychology": ["fast"],
-        "translation": ["translation"],
-        "orchestrator": ["qwythos-9b"],
-        "ledger": ["qwythos-9b"]
-    },
     "routes": {
-        "local": { "group": "classifier", "pipelines": ["default"] },
-        "code": { "group": "code", "pipelines": ["default"] },
-        "question": { "group": "question", "pipelines": ["default"] },
-        "command": { "group": "command", "pipelines": ["default"] },
-        "creative": { "group": "prose", "pipelines": ["default"] },
-        "prose": { "group": "prose", "pipelines": ["default"] },
-        "chat": { "group": "prose", "pipelines": ["default"] },
-        "psychology": { "group": "psychology", "pipelines": ["default"] },
-        "translation": { "group": "translation", "pipelines": ["default"] }
-    },
-    "score_matrix": {
-        "dimensions": ["coherence", "complexity", "completeness", "risk"],
-        "weights": [0.3, 0.2, 0.3, 0.2],
-        "routes": {
-            "plan": {
-                "bands": { "completeness": [0.0, 0.5] }
-            },
-            "rigor": {
-                "bands": { "completeness": [0.7, 1.0], "risk": [0.4, 1.0] }
-            },
-            "local": {
-                "bands": { "completeness": [0.7, 1.0], "risk": [0.0, 0.4] }
-            }
+        "local": {
+            "group": "question",
+            "pipelines": ["default"]
+        },
+        "code": {
+            "group": "code",
+            "pipelines": ["default"]
         }
     },
-    "system_prompt": "You are a query classifier and safety router. Analyze the user's message and output JSON only.\n\nOutput schema:\n{\n  \"action\": \"respond\" | \"route\" | \"reject\",\n  \"response\": \"direct answer (only if action=respond)\",\n  \"target\": \"route name (only if action=route)\",\n  \"coherence_score\": 0.0-1.0,\n  \"safety_score\": 0.0-1.0,\n  \"complexity\": 0-10,\n  \"intent\": \"question\" | \"command\" | \"creative\" | \"code\" | \"prose\" | \"psychology\" | \"translation\",\n  \"completeness\": 0.0-1.0,\n  \"risk\": 0.0-1.0,\n  \"reason\": \"brief explanation\"\n}\n\nRules:\n- If the query is trivial (simple arithmetic, basic fact, greeting), set action=respond and provide the answer.\n- If the query is safe and well-formed, set action=route with target=\"local\".\n- If the query is a coding task, set action=route with target=\"code\".\n- If content is incoherent (coherence_score < {coherence_threshold}), set action=reject.\n- If content is unsafe (safety_score < {safety_threshold}), set action=reject.\n- Safety score 1.0 = completely safe, 0.0 = dangerous.\n- Complexity 0 = trivial, 10 = extremely complex. Higher complexity queries are routed to models with matching intelligence level.\n- Completeness 0.0-1.0: how well-specified/complete the request is. Low completeness (< 0.5) triggers the plan route for clarification.\n- Risk 0.0-1.0: perceived sensitivity/risk level. High risk (> 0.4) with high completeness triggers the rigor route for adversarial validation.\n\nOnly output JSON, no other text.",
-    "classifier_model": "fast",
+    "model_groups": {
+        "classifier": [
+            "fast"
+        ],
+        "question": [
+            "fast"
+        ],
+        "command": [
+            "fast"
+        ],
+        "code": [
+            "qwythos-9b"
+        ],
+        "chitchat": [
+            "fast"
+        ],
+        "psychology": [
+            "fast"
+        ],
+        "translation": [
+            "translation"
+        ],
+        "orchestrator": [
+            "qwythos-9b"
+        ],
+        "ledger": [
+            "qwythos-9b"
+        ]
+    },
+    "system_prompt": "You are a query classifier and safety router. Analyze the user's message and output JSON only.\n\nOutput schema:\n{\n  \"action\": \"respond\" | \"route\" | \"reject\",\n  \"response\": \"direct answer (only if action=respond)\",\n  \"target\": \"route name (only if action=route)\",\n  \"coherence_score\": 0.0-1.0,\n  \"safety_score\": 0.0-1.0,\n  \"complexity\": 0-10,\n  \"intent\": \"question\" | \"command\" | \"creative\" | \"code\" | \"chitchat\" | \"psychology\" | \"translation\",\n  \"completeness\": 0.0-1.0,\n  \"risk\": 0.0-1.0,\n  \"reason\": \"brief explanation\"\n}\n\nRules:\n- If the query is trivial (simple arithmetic, basic fact, greeting), set action=respond and provide the answer.\n- If the query is safe and well-formed, set action=route with target=\"local\".\n- If the query is a coding task, set action=route with target=\"code\".\n- If content is incoherent (coherence_score < {coherence_threshold}), set action=reject.\n- If content is unsafe (safety_score < {safety_threshold}), set action=reject.\n- Safety score 1.0 = completely safe, 0.0 = dangerous.\n- Complexity 0 = trivial, 10 = extremely complex. Higher complexity queries are routed to models with matching intelligence level.\n- Completeness 0.0-1.0: how well-specified/complete the request is. Low completeness (< 0.5) triggers the plan route for clarification.\n- Risk 0.0-1.0: perceived sensitivity/risk level. High risk (> 0.4) with high completeness triggers the rigor route for adversarial validation.\n\nOnly output JSON, no other text.",
     "safety_threshold": 0.5,
     "default_route": "local",
     "server": {

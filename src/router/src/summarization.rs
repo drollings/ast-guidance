@@ -3,12 +3,14 @@
 //! Provides `ResultScorer` (scores agent/frontier responses against rubric)
 //! and `Summarizer` (condenses full responses into compact form).
 //!
-//! Both use `ChatBackend` for testability — inject `StubChatBackend` in tests,
+//! Both accept `Arc<dyn ChatBackend>` — inject `StubChatBackend` in tests,
 //! `LlmClient` in production.
+
+use std::sync::Arc;
 
 use fluent_wvr::prelude::*;
 use guidance_llm::client::ChatBackend;
-use guidance_llm::{ChatMessage, LlmClient, LlmConfig, LlmError};
+use guidance_llm::{ChatMessage, LlmError};
 use serde::{Deserialize, Serialize};
 
 use crate::stages::common::{extract_user_message, get_metadata_string};
@@ -16,18 +18,11 @@ use crate::stages::common::{extract_user_message, get_metadata_string};
 /// A scored agent/frontier response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoredResult {
-    /// The full response content that was scored.
-    /// Has `#[serde(default)]` because the LLM judge JSON doesn't include it;
-    /// it is populated from context by `ResultScorer::execute`.
     #[serde(default)]
     pub content: String,
-    /// Quality score 0.0-1.0 from the LLM judge.
     pub score: f64,
-    /// Whether the response passed the acceptance threshold.
     pub accepted: bool,
-    /// Human-readable explanation of the score.
     pub reason: String,
-    /// Compact summary (single line for rejected, fuller for accepted).
     pub summary: String,
 }
 
@@ -40,34 +35,17 @@ pub struct ScoredResult {
 /// Output: `ScoredResult` in `WorkOutput.data`
 pub struct ResultScorer {
     name: ArcIntern<str>,
-    backend: Option<Box<dyn ChatBackend>>,
-    config: LlmConfig,
+    client: Arc<dyn ChatBackend>,
     acceptance_threshold: f64,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
 
 impl ResultScorer {
-    pub fn new(config: LlmConfig, acceptance_threshold: f64) -> Self {
+    pub fn new(client: Arc<dyn ChatBackend>, acceptance_threshold: f64) -> Self {
         Self {
             name: ArcIntern::from("pipeline.scorer"),
-            backend: None,
-            config,
-            acceptance_threshold,
-            depends: vec![ArcIntern::from("pipeline.stage5.output")],
-            provides: vec![ArcIntern::from("pipeline.scorer.output")],
-        }
-    }
-
-    pub fn with_chat_backend(
-        config: LlmConfig,
-        backend: Box<dyn ChatBackend>,
-        acceptance_threshold: f64,
-    ) -> Self {
-        Self {
-            name: ArcIntern::from("pipeline.scorer"),
-            backend: Some(backend),
-            config,
+            client,
             acceptance_threshold,
             depends: vec![ArcIntern::from("pipeline.stage5.output")],
             provides: vec![ArcIntern::from("pipeline.scorer.output")],
@@ -131,16 +109,10 @@ impl WorkUnit for ResultScorer {
             },
         ];
 
-        let response_text = if let Some(ref backend) = self.backend {
-            backend
-                .chat_complete(&messages)
-                .map_err(|e| WorkError::Execution(format!("scorer error: {e}")))?
-        } else {
-            let client = LlmClient::with_config(self.config.clone());
-            client
-                .chat_complete(&messages)
-                .map_err(|e| WorkError::Execution(format!("scorer error: {e}")))?
-        };
+        let response_text = self
+            .client
+            .chat_complete(&messages)
+            .map_err(|e| WorkError::Execution(format!("scorer error: {e}")))?;
 
         let mut scored: ScoredResult = serde_json::from_str(&response_text)
             .map_err(|e| WorkError::Execution(format!("scorer parse error: {e}")))?;
@@ -194,42 +166,23 @@ impl_component!(ResultScorer);
 /// Output: `{"summary": "..."}` in `WorkOutput.data`
 pub struct Summarizer {
     name: ArcIntern<str>,
-    backend: Option<Box<dyn ChatBackend>>,
-    config: LlmConfig,
+    client: Arc<dyn ChatBackend>,
     max_summary_tokens: u32,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
 
 impl Summarizer {
-    pub fn new(config: LlmConfig, max_summary_tokens: u32) -> Self {
+    pub fn new(client: Arc<dyn ChatBackend>, max_summary_tokens: u32) -> Self {
         Self {
             name: ArcIntern::from("pipeline.summarizer"),
-            backend: None,
-            config,
+            client,
             max_summary_tokens,
             depends: vec![ArcIntern::from("pipeline.scorer.output")],
             provides: vec![ArcIntern::from("pipeline.summarizer.output")],
         }
     }
 
-    pub fn with_chat_backend(
-        config: LlmConfig,
-        backend: Box<dyn ChatBackend>,
-        max_summary_tokens: u32,
-    ) -> Self {
-        Self {
-            name: ArcIntern::from("pipeline.summarizer"),
-            backend: Some(backend),
-            config,
-            max_summary_tokens,
-            depends: vec![ArcIntern::from("pipeline.scorer.output")],
-            provides: vec![ArcIntern::from("pipeline.summarizer.output")],
-        }
-    }
-
-    /// Summarize text directly — bypasses WorkUnit dispatch.
-    /// Useful when the text is already in-hand.
     pub fn summarize_text(&self, text: &str) -> Result<String, LlmError> {
         let messages = vec![
             ChatMessage {
@@ -247,12 +200,7 @@ impl Summarizer {
             },
         ];
 
-        if let Some(ref backend) = self.backend {
-            backend.chat_complete(&messages)
-        } else {
-            let client = LlmClient::with_config(self.config.clone());
-            client.chat_complete(&messages)
-        }
+        self.client.chat_complete(&messages)
     }
 }
 
@@ -291,16 +239,10 @@ impl WorkUnit for Summarizer {
             },
         ];
 
-        let summary = if let Some(ref backend) = self.backend {
-            backend
-                .chat_complete(&messages)
-                .map_err(|e| WorkError::Execution(format!("summarizer error: {e}")))?
-        } else {
-            let client = LlmClient::with_config(self.config.clone());
-            client
-                .chat_complete(&messages)
-                .map_err(|e| WorkError::Execution(format!("summarizer error: {e}")))?
-        };
+        let summary = self
+            .client
+            .chat_complete(&messages)
+            .map_err(|e| WorkError::Execution(format!("summarizer error: {e}")))?;
 
         WorkOutput::typed("summarized", &serde_json::json!({"summary": summary}))
     }
@@ -339,35 +281,30 @@ impl_component!(Summarizer);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_stubs::StubChatBackend;
+
+    fn test_client() -> Arc<dyn ChatBackend> {
+        Arc::new(StubChatBackend::always(
+            r#"{"score": 0.5, "accepted": false, "reason": "test", "summary": "test summary"}"#,
+        ))
+    }
 
     #[test]
     fn test_result_scorer_name() {
-        let config = LlmConfig::new()
-            .api_url("http://test".into())
-            .model("test-model".into())
-            .build();
-        let scorer = ResultScorer::new(config, 0.7);
+        let scorer = ResultScorer::new(test_client(), 0.7);
         assert_eq!(scorer.name(), "pipeline.scorer");
     }
 
     #[test]
     fn test_result_scorer_describable() {
-        let config = LlmConfig::new()
-            .api_url("http://test".into())
-            .model("test-model".into())
-            .build();
-        let scorer = ResultScorer::new(config, 0.7);
+        let scorer = ResultScorer::new(test_client(), 0.7);
         let desc = scorer.describe();
         assert_eq!(desc["type"], "object");
     }
 
     #[test]
     fn test_result_scorer_missing_response() {
-        let config = LlmConfig::new()
-            .api_url("http://test".into())
-            .model("test-model".into())
-            .build();
-        let scorer = ResultScorer::new(config, 0.7);
+        let scorer = ResultScorer::new(test_client(), 0.7);
         let ctx = WorkContext::default();
         let result = scorer.execute(&ctx);
         assert!(result.is_err());
@@ -375,32 +312,20 @@ mod tests {
 
     #[test]
     fn test_summarizer_name() {
-        let config = LlmConfig::new()
-            .api_url("http://test".into())
-            .model("test-model".into())
-            .build();
-        let summarizer = Summarizer::new(config, 50);
+        let summarizer = Summarizer::new(test_client(), 50);
         assert_eq!(summarizer.name(), "pipeline.summarizer");
     }
 
     #[test]
     fn test_summarizer_describable() {
-        let config = LlmConfig::new()
-            .api_url("http://test".into())
-            .model("test-model".into())
-            .build();
-        let summarizer = Summarizer::new(config, 50);
+        let summarizer = Summarizer::new(test_client(), 50);
         let desc = summarizer.describe();
         assert_eq!(desc["type"], "object");
     }
 
     #[test]
     fn test_summarizer_missing_content() {
-        let config = LlmConfig::new()
-            .api_url("http://test".into())
-            .model("test-model".into())
-            .build();
-        let summarizer = Summarizer::new(config, 50);
+        let summarizer = Summarizer::new(test_client(), 50);
         let ctx = WorkContext::default();
         let result = summarizer.execute(&ctx);
         assert!(result.is_err());

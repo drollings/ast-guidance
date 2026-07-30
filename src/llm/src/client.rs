@@ -347,34 +347,8 @@ pub fn model_name(model_ref: &str) -> &str {
 }
 
 /// Removes think-block tags from LLM output (e.g. `<think>reasoning</think>`).
-pub fn strip_think_block(text: &str) -> String {
-    let result = if let Some(start) = text.find("<think>") {
-        if let Some(end) = text[start + 7..].find("</think>") {
-            let after = start + 7 + end + 8;
-            if after >= text.len() {
-                String::new()
-            } else {
-                text[after..].trim_start().to_string()
-            }
-        } else {
-            text[..start].trim().to_string()
-        }
-    } else if let Some(start) = text.find("[THINK]") {
-        if let Some(end) = text[start + 7..].find("[/THINK]") {
-            let after = start + 7 + end + 8;
-            if after >= text.len() {
-                String::new()
-            } else {
-                text[after..].trim_start().to_string()
-            }
-        } else {
-            text[..start].trim().to_string()
-        }
-    } else {
-        text.to_string()
-    };
-    result
-}
+/// Delegates to the canonical implementation in `common_core::string`.
+pub use common_core::string::strip_think_block;
 
 /// Removes leading preamble lines from LLM output.
 pub fn strip_preamble(text: &str) -> &str {

@@ -171,108 +171,15 @@ impl StreamingHandler {
         if self.filter_thinking {
             self.filtered_buffer.clone()
         } else {
-            strip_thinking_blocks(&self.buffer)
+            common_core::string::strip_thinking_blocks(&self.buffer)
         }
     }
-}
-
-use common_core::string::find_subseq;
-
-/// Tag pair definitions for thinking blocks. Tried in order.
-const THINKING_PAIRS: &[(&[u8], &[u8])] = &[
-    (b"\x3cthink\x3e", b"\x3c/think\x3e"), // Ollama: <think>...</think>
-    (b"\x3cthinking\x3e", b"\x3c/thinking\x3e"), // Claude/Gemini: <thinking>...</thinking>
-];
-
-/// Strip content between start and end markers. Returns the text with content
-/// between each matching pair removed. If a start marker is found without a
-/// matching end marker, everything from the start marker onward is stripped.
-fn strip_tag_pairs(
-    text: &str,
-    pairs: &[(&[u8], &[u8])],
-) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut pos = 0;
-    let bytes = text.as_bytes();
-
-    while pos < bytes.len() {
-        let mut earliest: Option<usize> = None;
-        let mut matched_pair: Option<(&[u8], &[u8])> = None;
-
-        for &(start_mark, end_mark) in pairs {
-            if let Some(start) = find_subseq(bytes, pos, start_mark) {
-                if earliest.is_none_or(|e| start < e) {
-                    earliest = Some(start);
-                    matched_pair = Some((start_mark, end_mark));
-                }
-            }
-        }
-
-        if let Some((start_mark, end_mark)) = matched_pair {
-                let start = earliest.unwrap();
-                result.push_str(&text[pos..start]);
-                let after_start = start + start_mark.len();
-                if let Some(end) = find_subseq(bytes, after_start, end_mark) {
-                    pos = end + end_mark.len();
-                } else {
-                    return result;
-                }
-        } else {
-            result.push_str(&text[pos..]);
-            return result;
-        }
-    }
-
-    result
-}
-
-/// Strip ` thinking ...  response\n` plain-text delimiters
-/// (DeepSeek R1, unsloth thinking). The end delimiter must be followed by a
-/// newline or end-of-string.
-fn strip_plain_thinking(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut pos = 0;
-    let bytes = text.as_bytes();
-
-    while pos < bytes.len() {
-        if let Some(start) = find_subseq(bytes, pos, b" thinking") {
-                let after_start = start + 9;
-                match find_subseq(bytes, after_start, b" response") {
-                    Some(end) if end + 9 >= bytes.len()
-                        || bytes[end + 9] == b'\n' =>
-                    {
-                        result.push_str(&text[pos..start]);
-                        let after_end = end + 9;
-                        pos = if after_end < bytes.len() { after_end + 1 } else { after_end };
-                    }
-                    _ => return result,
-                }
-        } else {
-            result.push_str(&text[pos..]);
-            return result;
-        }
-    }
-
-    result
-}
-
-/// Strip thinking blocks from the given text. Handles multiple formats:
-/// - `<think>...</think>` (Ollama-style XML tags)
-/// - `<thinking>...</thinking>` (Claude, Gemini, some local models)
-/// - ` thinking ...  response\n` (DeepSeek R1, unsloth thinking)
-///
-/// Tags can appear anywhere in the content and blocks may be unclosed.
-pub fn strip_thinking_blocks(text: &str) -> String {
-    let tagged = strip_tag_pairs(text, THINKING_PAIRS);
-    if tagged != text {
-        return tagged;
-    }
-    strip_plain_thinking(text)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common_core::string::strip_thinking_blocks;
     use crate::types::{RouterMessage, RouterMessageContent, RouterChoice};
 
     #[test]

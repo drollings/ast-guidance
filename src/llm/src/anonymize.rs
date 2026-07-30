@@ -1,31 +1,9 @@
-use std::sync::LazyLock;
-
-use regex::Regex;
-
-static EMAIL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}").unwrap());
-static API_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(api[_-]?key|apikey|secret|token)\s*[=:]\s*[a-zA-Z0-9_-]{16,}").unwrap()
-});
-static IPV4_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b").unwrap());
-static PHONE_US_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b").unwrap());
-static CREDIT_CARD_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b").unwrap());
-static SSN_US_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap());
-static NINO_UK_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b[A-Z]{2}\d{6}[A-Z]\b").unwrap());
-static SIN_CA_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d{3}-\d{3}-\d{3}\b").unwrap());
-static BEARER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"Bearer\s+[A-Za-z0-9_\-]{8,}").unwrap());
-static AWS_KEY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bAKIA[0-9A-Z]{16}\b").unwrap());
-static GENERIC_API_KEY_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b[a-zA-Z0-9]{32,}\b").unwrap());
-static IPV6_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b").unwrap());
-
 pub fn anonymize(text: &str) -> String {
+    use crate::pii_patterns::{
+        API_KEY_RE, AWS_KEY_RE, BEARER_RE, CREDIT_CARD_RE, EMAIL_RE, GENERIC_API_KEY_RE,
+        IPV4_RE, IPV6_RE, NINO_UK_RE, PHONE_US_RE, SIN_CA_RE, SSN_US_RE,
+    };
+
     let text = EMAIL_RE.replace_all(text, "[EMAIL]");
     let text = CREDIT_CARD_RE.replace_all(&text, "[CREDIT_CARD]");
     let text = SSN_US_RE.replace_all(&text, "[SSN]");

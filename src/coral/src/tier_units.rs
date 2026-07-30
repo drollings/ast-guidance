@@ -7,7 +7,7 @@ use guidance_llm::LlmConfig;
 use internment::ArcIntern;
 
 use crate::cache_l1::{CacheTier, RoutingResult};
-use crate::cache_reactor::QueueReactor;
+use crate::cache::reactor::QueueReactor;
 use crate::cache_router::ParallelRouter;
 use crate::db::Library;
 use crate::wasm_runtime::PluginPool;
@@ -526,6 +526,16 @@ impl_component!(L5FrontierUnit);
 
 // ---------------------------------------------------------------------------
 // TierRegistry — sequential tier cascade
+//
+// No separate `TierRegistry` trait is needed. Each tier unit implements
+// `WorkUnit` (and `Component`), and its `provides()` returns a unique
+// identifier (`"coral.tier.l2"`, `"coral.tier.l3"`, etc.) that serves as
+// the tier-identification mechanism.  `TierRegistry` is simply a
+// `Vec<Arc<dyn Component>>` iterated in registration order — the first
+// tier that returns `Ok` wins.  Adding a new tier means implementing
+// `WorkUnit` + `Component` and pushing it into the registry; no additional
+// trait or dispatch table is needed because `fluent_wvr::Component` +
+// `TierRegistry` already provides the registry/execution abstraction.
 // ---------------------------------------------------------------------------
 
 pub struct TierRegistry {

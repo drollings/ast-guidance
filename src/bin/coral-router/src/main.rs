@@ -175,3 +175,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod config_tests {
+    use std::collections::HashMap;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct TestModelEntry {
+        pub endpoint: String,
+        #[serde(default)]
+        pub name: Option<String>,
+        pub intelligence: u8,
+        pub cost_input: f64,
+        pub cost_output: f64,
+        pub cost_cached_read: f64,
+        pub speed: u8,
+        #[serde(default)]
+        pub total_timeout_ms: u64,
+        #[serde(default)]
+        pub idle_timeout_ms: u64,
+        #[serde(default)]
+        pub stream: bool,
+        #[serde(default)]
+        pub filter_thinking: bool,
+        #[serde(default)]
+        pub retry_count: u32,
+        #[serde(default)]
+        pub retry_base_interval_s: u64,
+        #[serde(default)]
+        pub params: Option<serde_json::Value>,
+        #[serde(default)]
+        pub sessions: Option<HashMap<String, serde_json::Value>>,
+    }
+
+    #[test]
+    fn test_parse_config() {
+        let content = std::fs::read_to_string("env/coral-router.json").unwrap();
+        let c: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(c.get("server").and_then(|v| v.get("bind_addr")).is_some());
+        assert!(c.get("models").is_some());
+    }
+}

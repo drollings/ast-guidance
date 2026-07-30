@@ -65,61 +65,71 @@ impl DeterministicPreFilter {
 
     fn builtin_filters() -> DeterministicFilterEngine {
         use crate::config::{PatternEntry, RejectPatterns};
-        let builtin = RejectPatterns {
-            patterns: vec![
-                PatternEntry {
-                    name: "ssn".into(),
-                    outcome: crate::config::FilterOutcome::OutputFilter,
-                    filter_action: Some(crate::config::FilterAction::Redact),
-                    confidence_gate: crate::config::ConfidenceGate::None,
-                    scope: vec![crate::config::FilterScope::Any],
-                    http_code: 422,
-                    error_message: Some("SSN detected".into()),
-                    regexes: vec![r"\b\d{3}-\d{2}-\d{4}\b".into()],
-                },
-                PatternEntry {
-                    name: "card_number".into(),
-                    outcome: crate::config::FilterOutcome::OutputFilter,
-                    filter_action: Some(crate::config::FilterAction::Redact),
-                    confidence_gate: crate::config::ConfidenceGate::LuhnValid,
-                    scope: vec![crate::config::FilterScope::Any],
-                    http_code: 422,
-                    error_message: Some("Credit card number detected".into()),
-                    regexes: vec![r"\b(?:\d[ -]*?){13,19}\b".into()],
-                },
-                PatternEntry {
-                    name: "email".into(),
-                    outcome: crate::config::FilterOutcome::OutputFilter,
-                    filter_action: Some(crate::config::FilterAction::Anonymize),
-                    confidence_gate: crate::config::ConfidenceGate::None,
-                    scope: vec![crate::config::FilterScope::Any],
-                    http_code: 422,
-                    error_message: Some("Email detected".into()),
-                    regexes: vec![r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b".into()],
-                },
-                PatternEntry {
-                    name: "phone".into(),
-                    outcome: crate::config::FilterOutcome::OutputFilter,
-                    filter_action: Some(crate::config::FilterAction::Anonymize),
-                    confidence_gate: crate::config::ConfidenceGate::None,
-                    scope: vec![crate::config::FilterScope::Any],
-                    http_code: 422,
-                    error_message: Some("Phone number detected".into()),
-                    regexes: vec![r"\b(?:\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b".into()],
-                },
-                PatternEntry {
-                    name: "api_key".into(),
-                    outcome: crate::config::FilterOutcome::HardReject,
-                    filter_action: None,
-                    confidence_gate: crate::config::ConfidenceGate::None,
-                    scope: vec![crate::config::FilterScope::Any],
-                    http_code: 422,
-                    error_message: Some("API key detected".into()),
-                    regexes: vec![r"(?i)(?:api[_-]?key|secret|token|password)\s*[:=]\s*[^\s]{8,}".into()],
-                },
-            ],
-            commands: None,
-        };
+
+        let pii_patterns = guidance_llm::pii_patterns::pii_patterns();
+        let pii_map: std::collections::HashMap<&str, &str> = pii_patterns
+            .iter()
+            .map(|p| (p.name, p.regex))
+            .collect();
+        fn pii_regex<'a>(map: &'a HashMap<&str, &str>, key: &str, fallback: &'a str) -> String {
+            map.get(key).copied().unwrap_or(fallback).to_string()
+        }
+        let map = &pii_map;
+
+        let patterns = vec![
+            PatternEntry {
+                name: "ssn".into(),
+                outcome: crate::config::FilterOutcome::OutputFilter,
+                filter_action: Some(crate::config::FilterAction::Redact),
+                confidence_gate: crate::config::ConfidenceGate::None,
+                scope: vec![crate::config::FilterScope::Any],
+                http_code: 422,
+                error_message: Some("SSN detected".into()),
+                regexes: vec![pii_regex(map, "ssn", r"\b\d{3}-\d{2}-\d{4}\b")],
+            },
+            PatternEntry {
+                name: "card_number".into(),
+                outcome: crate::config::FilterOutcome::OutputFilter,
+                filter_action: Some(crate::config::FilterAction::Redact),
+                confidence_gate: crate::config::ConfidenceGate::LuhnValid,
+                scope: vec![crate::config::FilterScope::Any],
+                http_code: 422,
+                error_message: Some("Credit card number detected".into()),
+                regexes: vec![r"\b(?:\d[ -]*?){13,19}\b".into()],
+            },
+            PatternEntry {
+                name: "email".into(),
+                outcome: crate::config::FilterOutcome::OutputFilter,
+                filter_action: Some(crate::config::FilterAction::Anonymize),
+                confidence_gate: crate::config::ConfidenceGate::None,
+                scope: vec![crate::config::FilterScope::Any],
+                http_code: 422,
+                error_message: Some("Email detected".into()),
+                regexes: vec![pii_regex(map, "email", r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")],
+            },
+            PatternEntry {
+                name: "phone".into(),
+                outcome: crate::config::FilterOutcome::OutputFilter,
+                filter_action: Some(crate::config::FilterAction::Anonymize),
+                confidence_gate: crate::config::ConfidenceGate::None,
+                scope: vec![crate::config::FilterScope::Any],
+                http_code: 422,
+                error_message: Some("Phone number detected".into()),
+                regexes: vec![pii_regex(map, "phone", r"\b(?:\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b")],
+            },
+            PatternEntry {
+                name: "api_key".into(),
+                outcome: crate::config::FilterOutcome::HardReject,
+                filter_action: None,
+                confidence_gate: crate::config::ConfidenceGate::None,
+                scope: vec![crate::config::FilterScope::Any],
+                http_code: 422,
+                error_message: Some("API key detected".into()),
+                regexes: vec![pii_regex(map, "api_key", r"(?i)(?:api[_-]?key|secret|token|password)\s*[:=]\s*[^\s]{8,}")],
+            },
+        ];
+
+        let builtin = RejectPatterns { patterns, commands: None };
         let mut engine = DeterministicFilterEngine::new();
         for entry in &builtin.patterns {
             if let Some(filter) = RegexFilter::from_entry(entry) {

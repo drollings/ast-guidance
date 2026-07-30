@@ -119,7 +119,7 @@ Which consumers use which `fluent-concurrency` primitives:
 | `WorkerPool` | `fluent-concurrency` tests only | `src/fluent-concurrency/src/pool.rs` |
 | `Queue` | `fluent-concurrency` tests only | `src/fluent-concurrency/src/pool.rs` |
 | `Instrumented::with_metrics` | `bin/guidance` histogram | `src/bin/guidance/src/main.rs` |
-| `ComponentAdapter` | `coral` cache reactor | `src/coral/src/cache_reactor.rs` |
+| `ComponentAdapter` | `coral` cache reactor | `src/coral/src/cache/reactor.rs` |
 | `PartitionedRouter` | `job-copilot` dispatcher | `src/job-copilot/src/dispatcher/llm.rs` |
 | `Zone` | `fluent-concurrency` supervision | `src/fluent-concurrency/src/zone.rs` |
 | `DependencyGraph` | `Zone` cancellation, `DependencySession` | `src/dag/src/dep_graph.rs`, `src/router/src/dag_session.rs` |
@@ -199,7 +199,7 @@ histogram)` is the future-ready API for recording per-unit execution
 durations.  The in-tree consumer today is the CLI-level `cmd_histogram` in
 `src/bin/guidance/src/main.rs` (total command timing).  Candidate adoption
 sites are documented in the `with_metrics` doc comment (the L4 Semantic KNN
-dispatch in `coral::cache_reactor`, and the top-level dispatch in
+dispatch in `coral::cache::reactor`, and the top-level dispatch in
 `dag::executor`).  Adoption at any of those moves M12 from "test-only" to a
 real consumer wiring.
 

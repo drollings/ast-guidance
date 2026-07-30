@@ -14,7 +14,7 @@ pub const MAX_IPC_PAYLOAD_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 pub enum PayloadType {
     ExecutionRequest = 1,
     ExecutionResult = 2,
-    ContextNode = 3,
+    ContentNode = 3,
 }
 
 impl TryFrom<u32> for PayloadType {
@@ -23,7 +23,7 @@ impl TryFrom<u32> for PayloadType {
         match v {
             1 => Ok(Self::ExecutionRequest),
             2 => Ok(Self::ExecutionResult),
-            3 => Ok(Self::ContextNode),
+            3 => Ok(Self::ContentNode),
             _ => Err(IpcError::UnknownPayloadType(v)),
         }
     }
@@ -79,7 +79,7 @@ pub struct BinaryExecutionResult {
 
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
-pub struct BinaryContextNode {
+pub struct BinaryContentNode {
     pub header: BinaryHeader,
     pub id: i64,
     pub valid_from_ts: i64,
@@ -138,8 +138,8 @@ pub fn encode_result(result: &BinaryExecutionResult, output: &[u8]) -> Vec<u8> {
 }
 
 #[must_use]
-pub fn encode_context_node(node: &BinaryContextNode, lod_data: &[u8]) -> Vec<u8> {
-    let fixed_size = std::mem::size_of::<BinaryContextNode>();
+pub fn encode_content_node(node: &BinaryContentNode, lod_data: &[u8]) -> Vec<u8> {
+    let fixed_size = std::mem::size_of::<BinaryContentNode>();
     let mut buf = Vec::with_capacity(fixed_size + lod_data.len());
 
     buf.extend_from_slice(&node.header.magic);
@@ -378,7 +378,7 @@ mod tests {
             PayloadType::try_from(2).unwrap(),
             PayloadType::ExecutionResult
         );
-        assert_eq!(PayloadType::try_from(3).unwrap(), PayloadType::ContextNode);
+        assert_eq!(PayloadType::try_from(3).unwrap(), PayloadType::ContentNode);
         assert!(PayloadType::try_from(99).is_err());
     }
 

@@ -101,6 +101,87 @@ impl PipelineOrchestrator {
             .insert("request".into(), MetadataValue::String(current_request.to_string()));
         ctx
     }
+
+    fn handle_stage_verdict(
+        verdict: &StageVerdict,
+        stage_name: PipelineStage,
+        decision: &StageDecision,
+        current_request: &mut String,
+        routing_target: &mut Option<RoutingTarget>,
+        classifier_response: &mut Option<String>,
+    ) -> Option<Result<WorkOutput, WorkError>> {
+        match verdict {
+            StageVerdict::Passed | StageVerdict::Skipped => {
+                if stage_name == PipelineStage::Classifier {
+                    if let Some(resp) = classifier_response_from_decision(decision) {
+                        tracing::info!(target: "router.pipeline",
+                            response_len = resp.len(),
+                            "classifier direct response"
+                        );
+                        *classifier_response = Some(resp);
+                    }
+                    if let Some(rt) = extract_routing_target(&decision.metadata) {
+                        tracing::info!(target: "router.pipeline",
+                            target_route = %rt.target_name.as_deref().unwrap_or("?"),
+                            target_model = %rt.model,
+                            target_url = %rt.url,
+                            "classifier set routing target"
+                        );
+                        *routing_target = Some(rt);
+                    }
+                }
+                None
+            }
+            StageVerdict::Rerouted => {
+                if let Some(rewritten) = decision.metadata.get("rewritten_request") {
+                    if let Some(s) = rewritten.as_str() {
+                        tracing::info!(target: "router.pipeline",
+                            new_request_len = s.len(),
+                            "request rerouted"
+                        );
+                        *current_request = s.to_string();
+                    }
+                }
+                None
+            }
+            StageVerdict::Rejected => {
+                tracing::info!(target: "router.pipeline",
+                    stage = ?stage_name,
+                    reason = %decision.reason,
+                    "pipeline rejected request"
+                );
+                Some(WorkOutput::typed(
+                    "rejected",
+                    &PipelineResult {
+                        decisions: vec![decision.clone()],
+                        final_response: None,
+                        rejected: true,
+                        reject_reason: Some(decision.reason.clone()),
+                        routing_target: None,
+                        classifier_response: None,
+                    },
+                ))
+            }
+            StageVerdict::Error => {
+                tracing::error!(target: "router.pipeline",
+                    stage = ?stage_name,
+                    reason = %decision.reason,
+                    "stage error"
+                );
+                Some(WorkOutput::typed(
+                    "pipeline_error",
+                    &PipelineResult {
+                        decisions: vec![decision.clone()],
+                        final_response: None,
+                        rejected: true,
+                        reject_reason: Some(format!("stage error: {}", decision.reason)),
+                        routing_target: None,
+                        classifier_response: None,
+                    },
+                ))
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -119,6 +200,58 @@ impl PipelineOrchestratorBuilder {
     pub fn build(self) -> PipelineOrchestrator {
         PipelineOrchestrator::new(self.stages)
     }
+}
+
+fn extract_routing_target(metadata: &serde_json::Value) -> Option<RoutingTarget> {
+    let rt = metadata.get("routing_target")?;
+    let model = rt.get("model").and_then(|v| v.as_str()).unwrap_or("?");
+    let url = rt.get("url").and_then(|v| v.as_str()).unwrap_or("?");
+    Some(RoutingTarget {
+        url: url.into(),
+        model: model.into(),
+        group: rt
+            .get("group")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .filter(|s| !s.is_empty()),
+        target_name: rt
+            .get("target_name")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        params: rt.get("params").cloned().filter(|v| !v.is_null()),
+        filter_thinking: rt
+            .get("filter_thinking")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        retry_count: rt
+            .get("retry_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32,
+        retry_base_interval_s: rt
+            .get("retry_base_interval_s")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1),
+        stream: rt
+            .get("stream")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        idle_timeout_ms: rt
+            .get("idle_timeout_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(10_000),
+        total_timeout_ms: rt
+            .get("total_timeout_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(120_000),
+    })
+}
+
+fn classifier_response_from_decision(decision: &StageDecision) -> Option<String> {
+    decision
+        .metadata
+        .get("response")
+        .and_then(|v| v.as_str())
+        .map(String::from)
 }
 
 impl WorkUnit for PipelineOrchestrator {
@@ -172,121 +305,15 @@ impl WorkUnit for PipelineOrchestrator {
 
                     decisions.push(decision.clone());
 
-                    match verdict {
-                        StageVerdict::Passed | StageVerdict::Skipped => {
-                            if stage_name == PipelineStage::Classifier {
-                                if let Some(resp) = decision
-                                    .metadata
-                                    .get("response")
-                                    .and_then(|v| v.as_str())
-                                {
-                                    tracing::info!(target: "router.pipeline",
-                                        response_len = resp.len(),
-                                        "classifier direct response"
-                                    );
-                                    classifier_response = Some(resp.to_string());
-                                }
-                                if let Some(rt) = decision.metadata.get("routing_target") {
-                                    let model = rt.get("model").and_then(|v| v.as_str()).unwrap_or("?");
-                                    let target_name = rt.get("target_name").and_then(|v| v.as_str()).unwrap_or("?");
-                                    let url = rt.get("url").and_then(|v| v.as_str()).unwrap_or("?");
-                                    tracing::info!(target: "router.pipeline",
-                                        target_route = %target_name,
-                                        target_model = %model,
-                                        target_url = %url,
-                                        "classifier set routing target"
-                                    );
-                                    routing_target = Some(RoutingTarget {
-                                        url: url.into(),
-                                        model: model.into(),
-                                        group: rt
-                                            .get("group")
-                                            .and_then(|v| v.as_str())
-                                            .map(String::from)
-                                            .filter(|s| !s.is_empty()),
-                                        target_name: rt
-                                            .get("target_name")
-                                            .and_then(|v| v.as_str())
-                                            .map(String::from),
-                                        params: rt
-                                            .get("params")
-                                            .cloned()
-                                            .filter(|v| !v.is_null()),
-                                        filter_thinking: rt
-                                            .get("filter_thinking")
-                                            .and_then(serde_json::Value::as_bool)
-                                            .unwrap_or(false),
-                                        retry_count: rt
-                                            .get("retry_count")
-                                            .and_then(serde_json::Value::as_u64)
-                                            .unwrap_or(0) as u32,
-                                        retry_base_interval_s: rt
-                                            .get("retry_base_interval_s")
-                                            .and_then(serde_json::Value::as_u64)
-                                            .unwrap_or(1),
-                                        stream: rt
-                                            .get("stream")
-                                            .and_then(serde_json::Value::as_bool)
-                                            .unwrap_or(false),
-                                        idle_timeout_ms: rt
-                                            .get("idle_timeout_ms")
-                                            .and_then(serde_json::Value::as_u64)
-                                            .unwrap_or(10_000),
-                                        total_timeout_ms: rt
-                                            .get("total_timeout_ms")
-                                            .and_then(serde_json::Value::as_u64)
-                                            .unwrap_or(120_000),
-                                    });
-                                }
-                            }
-                        }
-                        StageVerdict::Rerouted => {
-                            if let Some(rewritten) = decision.metadata.get("rewritten_request") {
-                                if let Some(s) = rewritten.as_str() {
-                                    tracing::info!(target: "router.pipeline", new_request_len = s.len(), "request rerouted");
-                                    current_request = s.to_string();
-                                }
-                            }
-                        }
-                        StageVerdict::Rejected => {
-                            tracing::info!(target: "router.pipeline",
-                                stage = ?stage_name,
-                                reason = %decision.reason,
-                                "pipeline rejected request"
-                            );
-                            return WorkOutput::typed(
-                                "rejected",
-                                &PipelineResult {
-                                    decisions,
-                                    final_response: None,
-                                    rejected: true,
-                                    reject_reason: Some(decision.reason),
-                                    routing_target: None,
-                                    classifier_response: None,
-                                },
-                            );
-                        }
-                        StageVerdict::Error => {
-                            tracing::error!(target: "router.pipeline",
-                                stage = ?stage_name,
-                                reason = %decision.reason,
-                                "stage error"
-                            );
-                            return WorkOutput::typed(
-                                "pipeline_error",
-                                &PipelineResult {
-                                    decisions,
-                                    final_response: None,
-                                    rejected: true,
-                                    reject_reason: Some(format!(
-                                        "stage error: {}",
-                                        decision.reason
-                                    )),
-                                    routing_target: None,
-                                    classifier_response: None,
-                                },
-                            );
-                        }
+                    if let Some(early_return) = Self::handle_stage_verdict(
+                        &verdict,
+                        stage_name,
+                        &decision,
+                        &mut current_request,
+                        &mut routing_target,
+                        &mut classifier_response,
+                    ) {
+                        return early_return;
                     }
                 }
                 Err(e) => {

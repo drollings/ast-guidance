@@ -9,7 +9,8 @@
 
 use crate::pipeline_types::PipelineStage;
 use crate::testing::mock::TranscriptProvider;
-use crate::types::{RouterMessage, RouterMessageContent, RouterRequest};
+use crate::testing::test_request;
+use crate::types::RouterRequest;
 use std::sync::Arc;
 
 use crate::config::RouterConfig;
@@ -51,24 +52,9 @@ fn make_pipeline(provider: TranscriptProvider) -> PipelineOrchestrator {
 }
 
 fn make_request(text: &str) -> RouterRequest {
-    RouterRequest {
-        model: "test-model".into(),
-        messages: vec![RouterMessage {
-            role: "user".into(),
-            content: RouterMessageContent::Text(text.into()),
-            tool_calls: None,
-            tool_call_id: None,
-        }],
-        temperature: None,
-        max_tokens: None,
-        stream: None,
-        tools: None,
-        tool_choice: None,
-        session_id: Some("golden-test-session".into()),
-        agent_id: None,
-        adapter: None,
-        metadata: Default::default(),
-    }
+    let mut req = test_request(text);
+    req.session_id = Some("golden-test-session".into());
+    req
 }
 
 fn route(pipeline: &PipelineOrchestrator, request: &RouterRequest) -> Result<PipelineResult, WorkError> {

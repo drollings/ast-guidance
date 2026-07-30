@@ -91,7 +91,7 @@ impl ParallelRouter {
 
 #[cfg(test)]
 mod tests {
-    use fluent_types::ContextNode;
+    use fluent_types::ContentNode;
 
     use super::*;
     use crate::cache_l1::CacheTier;
@@ -102,13 +102,14 @@ mod tests {
     }
 
     fn insert_test_node(lib: &Arc<Library>, name: &str, source: &str) {
-        let node = ContextNode {
+        let node = ContentNode {
             id: None,
             name: name.into(),
             source: source.into(),
             lod: vec![],
             embedding: None,
             capabilities: None,
+            ..Default::default()
         };
         lib.insert_node(&node).expect("insert node");
     }
@@ -162,13 +163,14 @@ mod tests {
     fn test_route_with_embedding_hit() {
         let lib = Arc::new(Library::open_in_memory().expect("db"));
         let emb = vec![0.1, 0.2, 0.3, 0.4];
-        let node = ContextNode {
+        let node = ContentNode {
             id: None,
             name: "target_node".into(),
             source: "source".into(),
             lod: vec![],
             embedding: Some(emb.clone()),
             capabilities: None,
+            ..Default::default()
         };
         lib.insert_node(&node).expect("insert");
 

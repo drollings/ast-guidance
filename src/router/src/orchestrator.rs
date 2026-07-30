@@ -1,12 +1,16 @@
 //! Long-lived orchestrator session — manages session context as a list of
-//! `SessionNode`s, supports compaction, checkpointing, and rewind.
+//! `ContentNode`s, supports compaction, checkpointing, and rewind.
 
-use fluent_types::NodeId;
-use guidance_llm::{ChatMessage, LlmClient, LlmConfig};
+use fluent_types::{ContentNode, NodeId};
+use std::sync::Arc;
+
+use guidance_llm::client::ChatBackend;
+use guidance_llm::ChatMessage;
 use serde::{Deserialize, Serialize};
 
 use crate::compaction::{CompactionStrategy, RecencyCompaction};
-use crate::session::SessionNode;
+
+const DEFAULT_MAX_NODES: usize = 100;
 
 /// Errors produced by orchestrator session operations.
 #[derive(Debug, thiserror::Error)]
@@ -20,12 +24,12 @@ pub enum OrchestratorError {
 }
 
 /// Long-lived orchestrator session. Default context 131072, never evicted.
-/// Manages the session context as a list of `SessionNode`s.
+/// Manages the session context as a list of `ContentNode`s.
 pub struct OrchestratorSession {
     pub session_id: String,
     pub model: String,
-    nodes: Vec<SessionNode>,
-    llm_client: LlmClient,
+    nodes: Vec<ContentNode>,
+    llm_client: Arc<dyn ChatBackend>,
     compaction_strategy: Box<dyn CompactionStrategy>,
     max_nodes: usize,
     turn_index: u64,
@@ -41,18 +45,34 @@ struct Checkpoint {
 
 impl OrchestratorSession {
     /// Creates a new orchestrator session.
+    /// Uses `RecencyCompaction` when `compaction` is `None`.
     pub fn new(
         session_id: impl Into<String>,
         model: impl Into<String>,
-        llm_config: LlmConfig,
+        llm_client: Arc<dyn ChatBackend>,
+        compaction: Option<Box<dyn CompactionStrategy>>,
+    ) -> Self {
+        Self::with_compaction_strategy(
+            session_id,
+            model,
+            llm_client,
+            compaction.unwrap_or_else(|| Box::new(RecencyCompaction)),
+        )
+    }
+
+    pub fn with_compaction_strategy(
+        session_id: impl Into<String>,
+        model: impl Into<String>,
+        llm_client: Arc<dyn ChatBackend>,
+        strategy: Box<dyn CompactionStrategy>,
     ) -> Self {
         Self {
             session_id: session_id.into(),
             model: model.into(),
             nodes: Vec::new(),
-            llm_client: LlmClient::with_config(llm_config),
-            compaction_strategy: Box::new(RecencyCompaction),
-            max_nodes: 100,
+            llm_client,
+            compaction_strategy: strategy,
+            max_nodes: DEFAULT_MAX_NODES,
             turn_index: 0,
             checkpoints: Vec::new(),
         }
@@ -75,21 +95,30 @@ impl OrchestratorSession {
         self
     }
 
-    /// Add a user message node. Returns the created `SessionNode`.
+    /// Add a user message node. Returns the created `ContentNode`.
     pub fn add_user_message(
         &mut self,
         _content: &str,
-    ) -> Result<SessionNode, OrchestratorError> {
-        let node = SessionNode {
-            node_id: NodeId::from_int(self.turn_index as i64),
-            role: "user".into(),
-            turn_index: self.turn_index,
-            accepted: true,
+    ) -> Result<ContentNode, OrchestratorError> {
+        let node = ContentNode {
+            id: Some(NodeId::from_int(self.turn_index as i64)),
+            name: format!("user-msg-{}", self.turn_index).into(),
+            source: "session".into(),
+            lod: vec![],
+            embedding: None,
+            capabilities: None,
+            session_id: Some(self.session_id.clone()),
+            request_id: None,
+            role: Some("user".into()),
+            turn_index: Some(self.turn_index),
+            accepted: Some(true),
             acceptance_score: None,
-            active_lod: 0,
+            active_lod: Some(0),
             parent_id: None,
             step_id: None,
             step_status: None,
+            metadata: None,
+            created_at: None,
         };
         self.turn_index += 1;
         self.nodes.push(node.clone());
@@ -103,17 +132,26 @@ impl OrchestratorSession {
         _content: &str,
         accepted: bool,
         score: Option<f64>,
-    ) -> Result<SessionNode, OrchestratorError> {
-        let node = SessionNode {
-            node_id: NodeId::from_int(self.turn_index as i64),
-            role: "assistant".into(),
-            turn_index: self.turn_index,
-            accepted,
+    ) -> Result<ContentNode, OrchestratorError> {
+        let node = ContentNode {
+            id: Some(NodeId::from_int(self.turn_index as i64)),
+            name: format!("asst-msg-{}", self.turn_index).into(),
+            source: "session".into(),
+            lod: vec![],
+            embedding: None,
+            capabilities: None,
+            session_id: Some(self.session_id.clone()),
+            request_id: None,
+            role: Some("assistant".into()),
+            turn_index: Some(self.turn_index),
+            accepted: Some(accepted),
             acceptance_score: score,
-            active_lod: 0,
+            active_lod: Some(0),
             parent_id: None,
             step_id: None,
             step_status: None,
+            metadata: None,
+            created_at: None,
         };
         self.turn_index += 1;
         self.nodes.push(node.clone());
@@ -127,7 +165,7 @@ impl OrchestratorSession {
             .compaction_strategy
             .select_lod(&self.nodes, self.max_nodes);
         for (node, lod) in self.nodes.iter_mut().zip(lods) {
-            node.active_lod = lod;
+            node.active_lod = Some(lod);
         }
     }
 
@@ -136,17 +174,21 @@ impl OrchestratorSession {
     pub fn build_context(&self) -> Vec<ChatMessage> {
         self.nodes
             .iter()
-            .filter(|n| n.accepted)
+            .filter(|n| n.accepted.unwrap_or(true))
             .map(|n| ChatMessage {
-                role: n.role.clone(),
-                content: format!("[{}/LOD{}]", n.role, n.active_lod),
+                role: n.role.clone().unwrap_or_default(),
+                content: format!(
+                    "[{}/LOD{}]",
+                    n.role.as_deref().unwrap_or("?"),
+                    n.active_lod.unwrap_or(0)
+                ),
             })
             .collect()
     }
 
     /// Create a named checkpoint at the current turn index.
     pub fn checkpoint(&mut self, name: &str) -> Result<(), OrchestratorError> {
-        let last_node_id = self.nodes.last().map(|n| n.node_id);
+        let last_node_id = self.nodes.last().and_then(|n| n.id);
         self.checkpoints.push(Checkpoint {
             name: name.into(),
             node_id: last_node_id,
@@ -168,7 +210,7 @@ impl OrchestratorSession {
             })?;
 
         let target_turn = cp.turn_index;
-        self.nodes.retain(|n| n.turn_index < target_turn);
+        self.nodes.retain(|n| n.turn_index.unwrap_or(0) < target_turn);
         self.turn_index = target_turn;
         self.checkpoints.retain(|c| c.turn_index <= target_turn);
         Ok(())
@@ -190,7 +232,7 @@ impl OrchestratorSession {
     }
 
     /// Access the LLM client for orchestrator calls.
-    pub fn llm_client(&self) -> &LlmClient {
+    pub fn llm_client(&self) -> &Arc<dyn ChatBackend> {
         &self.llm_client
     }
 
@@ -205,7 +247,7 @@ impl OrchestratorSession {
     }
 
     /// Reference to the session nodes.
-    pub fn nodes(&self) -> &[SessionNode] {
+    pub fn nodes(&self) -> &[ContentNode] {
         &self.nodes
     }
 }
@@ -213,34 +255,29 @@ impl OrchestratorSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_stubs::StubChatBackend;
 
-    fn test_llm_config() -> LlmConfig {
-        LlmConfig {
-            api_url: "http://router.test:0000/v1/chat/completions".into(),
-            model: "test-model".into(),
-            think: None,
-            timeout_ms: 5000,
-            extra_body_params: None,
-            debug: false,
-            show_prompts: false,
-        }
+    fn test_client() -> Arc<dyn ChatBackend> {
+        Arc::new(StubChatBackend::always("test"))
     }
 
     #[test]
     fn test_add_user_message_increments_turn() {
-        let mut session = OrchestratorSession::new("sess-1", "test-model", test_llm_config());
+        let mut session =
+            OrchestratorSession::new("sess-1", "test-model", test_client(), None);
         assert_eq!(session.turn_index(), 0);
 
         let node = session.add_user_message("hello").unwrap();
-        assert_eq!(node.turn_index, 0);
-        assert_eq!(node.role, "user");
+        assert_eq!(node.turn_index, Some(0));
+        assert_eq!(node.role, Some("user".into()));
         assert_eq!(session.turn_index(), 1);
         assert_eq!(session.node_count(), 1);
     }
 
     #[test]
     fn test_accepted_nodes_in_context() {
-        let mut session = OrchestratorSession::new("sess-1", "test-model", test_llm_config());
+        let mut session =
+            OrchestratorSession::new("sess-1", "test-model", test_client(), None);
 
         session.add_user_message("query").unwrap();
         session
@@ -256,7 +293,8 @@ mod tests {
 
     #[test]
     fn test_checkpoint_and_rewind() {
-        let mut session = OrchestratorSession::new("sess-1", "test-model", test_llm_config());
+        let mut session =
+            OrchestratorSession::new("sess-1", "test-model", test_client(), None);
 
         session.add_user_message("turn 1").unwrap();
         session.checkpoint("after-turn-1").unwrap();
@@ -272,14 +310,16 @@ mod tests {
 
     #[test]
     fn test_rewind_missing_checkpoint() {
-        let mut session = OrchestratorSession::new("sess-1", "test-model", test_llm_config());
+        let mut session =
+            OrchestratorSession::new("sess-1", "test-model", test_client(), None);
         let result = session.rewind("nonexistent");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_checkpoint_names() {
-        let mut session = OrchestratorSession::new("sess-1", "test-model", test_llm_config());
+        let mut session =
+            OrchestratorSession::new("sess-1", "test-model", test_client(), None);
 
         session.checkpoint("cp1").unwrap();
         session.checkpoint("cp2").unwrap();
@@ -290,8 +330,9 @@ mod tests {
 
     #[test]
     fn test_compact_applies_lods() {
-        let mut session = OrchestratorSession::new("sess-1", "test-model", test_llm_config())
-            .with_max_nodes(4);
+        let mut session =
+            OrchestratorSession::new("sess-1", "test-model", test_client(), None)
+                .with_max_nodes(4);
 
         for i in 0..5 {
             session.add_user_message(&format!("msg {i}")).unwrap();
@@ -299,7 +340,7 @@ mod tests {
 
         session.compact();
 
-        let lods: Vec<u8> = session.nodes().iter().map(|n| n.active_lod).collect();
+        let lods: Vec<u8> = session.nodes().iter().filter_map(|n| n.active_lod).collect();
         assert_eq!(lods.len(), 5);
         // oldest nodes should have higher LOD level (less detail)
         assert!(lods[0] > 0, "oldest node should be compacted");

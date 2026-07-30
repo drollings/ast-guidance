@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use guidance_ontology::mapper::PendingNode;
 use guidance_ontology::yago;
 use search_vector::error::DbError;
-use fluent_types::ContextNode;
+use fluent_types::ContentNode;
 use fluent_types::NodeId;
 use thiserror::Error;
 
@@ -58,7 +58,7 @@ impl Default for IngestionConfig {
 
 pub struct BatchIngestor {
     library: Arc<Library>,
-    batch: Vec<ContextNode>,
+    batch: Vec<ContentNode>,
     batch_size: usize,
     config: IngestionConfig,
     stats: IngestStats,
@@ -86,7 +86,7 @@ impl BatchIngestor {
         }
     }
 
-    pub fn add(&mut self, node: ContextNode) -> Result<Option<NodeId>, IngestError> {
+    pub fn add(&mut self, node: ContentNode) -> Result<Option<NodeId>, IngestError> {
         let has_embedding = node.embedding.is_some();
         self.batch.push(node);
 
@@ -113,7 +113,7 @@ impl BatchIngestor {
                     continue;
                 }
             }
-            let cn = pn.to_context_node();
+            let cn = pn.to_content_node();
             added += 1;
             let has_embedding = cn.embedding.is_some();
             self.batch.push(cn);
@@ -201,7 +201,7 @@ impl BatchIngestor {
         // Build hash_id → node name map for edge resolution
         let mut id_to_name: HashMap<i64, String> = HashMap::new();
         for pn in &pending_nodes {
-            let cn = pn.to_context_node();
+            let cn = pn.to_content_node();
             let name = cn.name.to_string();
             if !name.is_empty() {
                 id_to_name.insert(pn.id, name);
@@ -254,8 +254,8 @@ impl TripleMapper {
         subject: &str,
         predicate: &str,
         object: &str,
-    ) -> (ContextNode, ContextNode) {
-        let sub = ContextNode {
+    ) -> (ContentNode, ContentNode) {
+        let sub = ContentNode {
             id: None,
             name: subject.into(),
             source: format!("{subject} {predicate} {object}"),
@@ -266,15 +266,17 @@ impl TripleMapper {
             ],
             embedding: None,
             capabilities: None,
+            ..Default::default()
         };
 
-        let obj = ContextNode {
+        let obj = ContentNode {
             id: None,
             name: object.into(),
             source: object.into(),
             lod: vec![object.into()],
             embedding: None,
             capabilities: None,
+            ..Default::default()
         };
 
         (sub, obj)
@@ -296,25 +298,27 @@ mod tests {
         let lib = Arc::new(Library::open_in_memory().expect("db"));
         let mut ingestor = BatchIngestor::new(Arc::clone(&lib), 100);
 
-        let node1 = ContextNode {
+        let node1 = ContentNode {
             id: None,
             name: "batched_1".into(),
             source: "source".into(),
             lod: vec![],
             embedding: None,
             capabilities: None,
+            ..Default::default()
         };
         let id = ingestor.add(node1).expect("add");
         assert!(id.is_none());
         assert_eq!(ingestor.pending_count(), 1);
 
-        let node2 = ContextNode {
+        let node2 = ContentNode {
             id: None,
             name: "batched_2".into(),
             source: "source".into(),
             lod: vec![],
             embedding: None,
             capabilities: None,
+            ..Default::default()
         };
         let id = ingestor.add(node2).expect("add");
         assert!(id.is_none());
@@ -332,13 +336,14 @@ mod tests {
         let lib = Arc::new(Library::open_in_memory().expect("db"));
         let mut ingestor = BatchIngestor::new(Arc::clone(&lib), 100);
 
-        let node = ContextNode {
+        let node = ContentNode {
             id: None,
             name: "embedded_node".into(),
             source: "source".into(),
             lod: vec![],
             embedding: Some(vec![0.1, 0.2, 0.3]),
             capabilities: None,
+            ..Default::default()
         };
         let id = ingestor.add(node).expect("add");
         assert!(id.is_none());
@@ -352,24 +357,26 @@ mod tests {
         let lib = Arc::new(Library::open_in_memory().expect("db"));
         let mut ingestor = BatchIngestor::new(Arc::clone(&lib), 2);
 
-        let node1 = ContextNode {
+        let node1 = ContentNode {
             id: None,
             name: "full_1".into(),
             source: "s".into(),
             lod: vec![],
             embedding: None,
             capabilities: None,
+            ..Default::default()
         };
         ingestor.add(node1).expect("add");
         assert_eq!(ingestor.pending_count(), 1);
 
-        let node2 = ContextNode {
+        let node2 = ContentNode {
             id: None,
             name: "full_2".into(),
             source: "s".into(),
             lod: vec![],
             embedding: None,
             capabilities: None,
+            ..Default::default()
         };
         ingestor.add(node2).expect("add");
         assert_eq!(ingestor.pending_count(), 0);

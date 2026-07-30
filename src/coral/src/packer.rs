@@ -1,6 +1,6 @@
 use common_core::tokens::estimate_tokens;
 use common_core::tokens::TokenBudget;
-use fluent_types::{ContextNode, NodeId};
+use fluent_types::{ContentNode, NodeId};
 use thiserror::Error;
 
 use crate::db::Library;
@@ -41,7 +41,7 @@ impl ContextPacker {
 
     /// Select the appropriate LOD level based on graph distance.
     /// Closer nodes get more detailed LOD (lower index).
-    pub fn select_lod_by_distance(_node: &ContextNode, graph_distance: f64, avg_degree: f64) -> u8 {
+    pub fn select_lod_by_distance(_node: &ContentNode, graph_distance: f64, avg_degree: f64) -> u8 {
         let effective_distance = graph_distance / (1.0 + avg_degree / (avg_degree + 1.0));
         if effective_distance < 1.0 {
             return 0;
@@ -62,7 +62,7 @@ impl ContextPacker {
     }
 
     /// Get the text at a given LOD level from a node.
-    pub fn get_lod_text(node: &ContextNode, level: u8) -> &str {
+    pub fn get_lod_text(node: &ContentNode, level: u8) -> &str {
         let idx = level as usize;
         if idx < node.lod.len() {
             node.lod[idx].as_str()
@@ -170,13 +170,14 @@ mod tests {
 
     #[test]
     fn test_select_lod_by_distance() {
-        let node = ContextNode {
+        let node = ContentNode {
             id: Some(NodeId(1)),
             name: "test".into(),
             source: String::new(),
             lod: vec!["detailed".into(), "summary".into(), "brief".into()],
             embedding: None,
             capabilities: None,
+            ..Default::default()
         };
         assert_eq!(ContextPacker::select_lod_by_distance(&node, 0.5, 2.0), 0);
         // effective = 1.5 / (1 + 2/3) = 1.5 / 1.667 ≈ 0.9 → lod 0
@@ -187,13 +188,14 @@ mod tests {
 
     #[test]
     fn test_get_lod_text() {
-        let node = ContextNode {
+        let node = ContentNode {
             id: Some(NodeId(1)),
             name: "test".into(),
             source: String::new(),
             lod: vec!["detail".into(), "summary".into()],
             embedding: None,
             capabilities: None,
+            ..Default::default()
         };
         assert_eq!(ContextPacker::get_lod_text(&node, 0), "detail");
         assert_eq!(ContextPacker::get_lod_text(&node, 1), "summary");
@@ -204,23 +206,25 @@ mod tests {
     #[test]
     fn test_pack_respects_budget() {
         let lib = Library::open_in_memory().expect("db");
-        let focus = ContextNode {
+        let focus = ContentNode {
             id: None,
             name: "focus".into(),
             source: String::new(),
             lod: vec!["focus detailed text".into()],
             embedding: None,
             capabilities: None,
+            ..Default::default()
         };
         let focus_id = lib.insert_node(&focus).expect("insert");
 
-        let child = ContextNode {
+        let child = ContentNode {
             id: None,
             name: "child".into(),
             source: String::new(),
             lod: vec!["child detailed content here".into()],
             embedding: None,
             capabilities: None,
+            ..Default::default()
         };
         let child_id = lib.insert_node(&child).expect("insert");
         lib.insert_edge(focus_id, child_id, "depends", 1.0)

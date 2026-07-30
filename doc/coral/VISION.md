@@ -47,8 +47,15 @@ The fundamental innovation: **cascading cache tiers** instead of prompt-based re
 - **L1 Memory**: LRU in-memory cache for hot queries (<1ms)
 - **L3 Graph**: SQLite keyword search + recursive CTE graph traversal (<10ms)
 - **L4 Semantic**: Brute-force KNN cosine similarity over embeddings (<50ms)
-- **L4.5 Decompose**: Local LLM decomposes complex queries into subtasks (200ms)
-- **L5 Frontier**: External LLM fallback for genuinely novel problems (500ms+)
+- **L4.5 Decompose**: Delegated to Coral Router — a local LLM decomposes complex
+  queries into subtasks. The cache reactor checks for cached decompositions
+  but the decision to decompose is a routing decision made by the Router's
+  escalation ladder. (200ms when no cached decomposition exists)
+- **L5 Frontier**: Delegated to Coral Router — external LLM dispatch
+  controlled by the Router's four-mode escalation ladder (filter →
+  question → team → turnover). The cache reactor records frontier results
+  as cached ContentNodes but never initiates a frontier call on its own.
+  (500ms+)
 
 ### Goal 2: Edge-First Efficiency
 
@@ -64,11 +71,11 @@ Every component is designed for resource-constrained environments:
 When deterministic paths fail, the system learns from the solution:
 
 ```
-Novel Query → L4.5 Decomposition → L5 Frontier LLM (if needed)
-                    ↓
-            Solution Cached as New Node
-                    ↓
-    Next Time: Deterministic Execution (< 50ms)
+Novel Query → Router Escalation Ladder → Router decomposes or engages frontier
+                                ↓
+                    Solution Cached as New Node
+                                ↓
+                Next Time: Deterministic Execution (< 50ms)
 ```
 
 The expensive probabilistic step becomes a **one-time cost**, not a recurring one.
@@ -121,7 +128,7 @@ The core storage layer — a single SQLite database replacing dual-engine archit
 - Embedding cache for repeated queries
 - Ontology type hierarchy with transitive `is_a` queries
 
-### Component 2: 6-Tier Cache Cascade (`cache_reactor.rs`, `cache_l1.rs`, `cache_router.rs`)
+### Component 2: 6-Tier Cache Cascade (`cache/reactor.rs`, `cache_l1.rs`, `cache_router.rs`)
 
 The intelligence layer that routes queries through progressively more expensive tiers:
 
@@ -164,14 +171,14 @@ The intelligence layer that routes queries through progressively more expensive 
 | L2 | WASM Workflow | WASM tool matching via `wasm_tools` table | <5ms | Tool-capable queries |
 | L3 | Graph | SQLite LIKE + recursive CTE traversal | <10ms | Structural queries |
 | L4 | Semantic | Brute-force KNN cosine similarity | <50ms | Semantic queries |
-| L4.5 | Decompose | Local LLM splits into subtasks, recurses | 200ms | Complex multi-step |
-| L5 | Frontier | External LLM (Ollama/OpenAI) | 500ms+ | Novel problems |
+| L4.5 | Decompose | Delegated to Coral Router's decomposer; cache checks for existing decompositions | 200ms | Complex multi-step |
+| L5 | Frontier | Delegated to Coral Router's escalation ladder; cache records results | 500ms+ | Novel problems |
 
 **Uniform dispatch** — each tier is an `Arc<dyn Component>` stored in a
 `TierRegistry`. The orchestrator never branches on tier type:
 
 ```rust
-// cache_reactor.rs — route_with_depth
+// cache/reactor.rs — route_with_depth
 match self.tier_registry.execute(query, depth) {
     Ok(result) => { /* persist + cache */ }
     Err(_) => { /* fall through to L4.5 decomposition */ }
@@ -191,7 +198,7 @@ JSON-RPC 2.0 server implementing the Model Context Protocol for AI agent integra
 | Method | Parameters | Behavior |
 |--------|-----------|----------|
 | `coral_query` | `{ "name": "..." }` | Node lookup by name |
-| `coral_insert` | Full `ContextNode` JSON | Insert a node, return `node_id` |
+| `coral_insert` | Full `ContentNode` JSON | Insert a node, return `node_id` |
 | `coral_traverse` | `{ "node_id": N, "max_depth": N }` | Graph traversal |
 
 **Transport**: STDIO (line-delimited JSON), max request size 10MB.
@@ -216,17 +223,25 @@ impl Describable for WasmComponent { ... }
 
 ### Component 5: Context Packing with LOD (`packer.rs`)
 
-Token-budget-aware context packing using Level of Detail:
+Token-budget-aware context packing using Level of Detail, storing and
+rendering the 6-tier LOD scheme defined by Coral Router:
 
 | LOD Level | Size | Use Case |
 |-----------|------|----------|
-| lod0 | Complete | Focal point of query |
-| lod1 | ~800 chars | Primary context |
-| lod2 | ~240 chars | Secondary context |
-| lod3 | ~80 chars | Distant references |
-| lod4 | ~10 chars | Peripheral mentions |
+| LOD0 | Complete | Authoritative source text — never derived, always preserved |
+| LOD1 | Compressed | Lossless-in-substance, no fixed bound |
+| LOD2 | ≤ 1000 chars | Short summary |
+| LOD3 | ≤ 280 chars | Compact summary |
+| LOD4 | ≤ 80 chars | Single line |
+| LOD5 | Brief label | Name / identifier, for listings and identification |
 
-**Algorithm**:
+**Storage**: LOD tiers are stored as `Vec<String>` on a `ContentNode`.
+LOD0 and LOD5 are guaranteed filled at node creation; LOD1–LOD4 are
+lazily computed, directly from LOD0 (never chained from a lower tier),
+cached on the node thereafter, and computed at most once globally.
+
+**Algorithm** (context packing for prompt assembly, distinct from the
+LOD computation policy which is owned by the Router):
 1. BFS from focus node up to depth 5
 2. Select LOD by effective graph distance (normalized by avg degree)
 3. First-Fit Decreasing bin-pack into token budget
@@ -253,18 +268,43 @@ File → Lexer → Parser → TripleMapper → PendingNode/PendingEdge
 
 ## Data Model
 
-### ContextNode
+### ContentNode (canonical storage type)
+
+The canonical type is `ContentNode` (defined in `guidance-types` as
+`fluent_types::ContentNode`), which unifies the durable storage fields
+formerly in `ContentNode` with session-scoped metadata from Coral Router's
+ledger:
 
 ```rust
-pub struct ContextNode {
-    pub id: NodeId,                    // i64, time-sortable
-    pub name: String,                  // unique identifier
-    pub source: String,                // source reference
-    pub lod: Vec<String>,              // Level of Detail pyramid (6 levels)
-    pub embedding: Option<Vec<f32>>,   // 768-1536 dimensions
-    pub capabilities: BitVec,          // capability bitmask
+pub struct ContentNode {
+    // ── Core fields (durable, used by coral) ──
+    pub id: Option<NodeId>,
+    pub name: SmolStr,
+    pub source: String,
+    pub lod: Vec<String>,              // 6-tier LOD pyramid (LOD0–LOD5)
+    pub embedding: Option<Vec<f32>>,
+    pub capabilities: Option<Vec<u8>>,
+    // ── Session fields (optional, used by router) ──
+    pub session_id: Option<String>,
+    pub role: Option<String>,
+    pub turn_index: Option<u64>,
+    pub accepted: Option<bool>,
+    pub acceptance_score: Option<f64>,
+    pub active_lod: Option<u8>,
+    pub parent_id: Option<NodeId>,
+    pub step_id: Option<String>,
+    pub step_status: Option<StepStatus>,
+    pub metadata: Option<serde_json::Value>,
+    pub created_at: Option<u64>,
+    // ... remaining session fields
 }
 ```
+
+Coral crate uses only the core fields; session fields are `None`. The
+SQLite table retains the name `context_nodes` for backward compatibility;
+the Rust type is `fluent_types::ContentNode`. This single type is the
+storage entity for both the SQLite graph database (coral) and the session
+ledger (router), replacing the former `ContentNode` / `SessionNode` split.
 
 ### Edge
 
@@ -287,6 +327,101 @@ pub struct ContextNode {
 | command | String | Shell command |
 
 ---
+
+## Integration with Coral Router: local model dispatch
+
+Coral Context's 6-tier cache cascade and Coral Router's classification tree
+are complementary, not overlapping. The cache cascade answers "has this exact
+query, or a near neighbor, been seen before?" The classification tree answers
+"which model is best suited to handle this query?" They compose as follows:
+
+```
+Request → Coral Router (classification tree)
+                │
+                ├─ pre_filters (regex/PII rejection)
+                ├─ classifier nodes (LLM picks domain → complexity → target)
+                └─ terminal node dispatch
+                        │
+                        ▼
+                Model resolution (cheapest model in group with sufficient intelligence)
+                        │
+                        ▼
+                Coral Context cache check (optional, before model inference)
+                        │
+                        ├─ L1 hit  → return cached result (< 1ms)
+                        ├─ L3 hit  → return graph-traversal result (< 10ms)
+                        ├─ L4 hit  → return semantic-match result (< 50ms)
+                        └─ miss    → invoke the routed model
+                                        │
+                                        ▼
+                                 Result cached as new ContentNode
+```
+
+The division of labor is clear:
+
+- **Coral Router owns the routing decision**: which model, which session
+  profile, whether to escalate to frontier or reject.
+- **Coral Context owns the cache decision**: whether the query (or a near
+  neighbor) has already been answered, and whether the prior answer is
+  still valid.
+
+They share `fluent_types::ContentNode` as the canonical type for both durable
+storage and session-scoped metadata — the former `ContentNode` / `ContentNode`
+split is eliminated.
+
+### Why the cache sits after routing, not before
+
+The classification tree can redirect or reject a query based on policy
+(PII, coherence, safety) regardless of whether a cached answer exists.
+A cached answer to "how do I make a bomb?" is still a policy rejection.
+Routing and caching are independent decisions, and routing must fire first
+because it enforces safety and domain gating that caching does not.
+
+The cache check is an optional optimization layer at dispatch time: a
+terminal node may reach for the cache before invoking the model, but it
+may not skip the classification tree to do so.
+
+### Workflow extraction: frontier-assisted solutions become DAG workflows
+
+When a `model_group` has `post_process.workflow_extraction: true` and a
+frontier-assisted solution succeeds (via any escalation mode), Coral Router
+decomposes the solution into a reusable DAG workflow stored in Coral Context:
+
+1. **Decomposition**: The full chain — `classifier decision → local model
+   attempts → escalation stage → frontier prompt → frontier response →
+   local assembly → final answer` — is split into discrete steps. Each
+   step that involved a specific model call or deterministic transform
+   becomes a `Target` node.
+
+2. **Dependency edges**: `depends` / `provides` edges capture the data-flow
+   structure. For example, a `team` mode escalation produces:
+   ```
+   classifier_vote_1 ─┐
+   classifier_vote_2 ─┼─→ draft_attempt ─→ judge_review ─→ frontier_prompt
+   classifier_vote_3 ─┘
+   ```
+   where `classifier_vote_N` nodes are parallel-slot classifier results that
+   feed into the draft model, whose output feeds the judge, whose output is
+   the frontier prompt.
+
+3. **Storage**: The `Target` DAG is persisted as `ContentNode` entries in
+   SQLite (`context_nodes` + `edges` tables), keyed by an embedding of the
+   original user query. The extraction process is idempotent — if a
+   sufficiently similar query already has a cached workflow, the new
+   solution updates or subsumes the existing one rather than creating a
+   duplicate.
+
+4. **Replay**: On a future query with a near-neighbor embedding (L4 semantic
+   cache hit), the cache reactor can replay the DAG steps deterministically.
+   Steps that involved frontier calls are flagged — if the local models have
+   improved since the workflow was stored (new local model versions, new
+   tools), the system can attempt local re-execution of those steps before
+   falling back to the stored frontier response.
+
+This closes the neurosymbolic learning loop described in Goal 3: the one-time
+expensive frontier call becomes a permanent, replayable local DAG. The cost
+of novel problems trends down over the life of the installation as the DAG
+store fills in.
 
 ## Integration with guidance
 
@@ -315,7 +450,7 @@ guidance explain "query"
 
 | Type | Defined In | Used By |
 |------|-----------|---------|
-| `ContextNode` | `guidance-types` | coral, guidance |
+| `ContentNode` | `guidance-types` | coral, router, guidance |
 | `NodeId` | `guidance-types` | coral, guidance |
 | `KnnHit` | `guidance-types` | coral, guidance |
 | `WasmTool` | `guidance-types` | coral |
@@ -339,6 +474,14 @@ guidance explain "query"
 9. **PII Anonymization**: Regex-based redaction for emails, credit cards, SSN, etc.
 10. **Hybrid Search**: Reciprocal Rank Fusion (k=60) for keyword + vector
 
+1. **SOLID Refactoring**: `db.rs` decomposed into `db/` (schema, nodes, edges, hnsw, embeddings, kv_cache);
+   `cache_reactor.rs` decomposed into `cache/` (reactor, stats) — Single Responsibility.
+4. **DRY Consolidation**: PII regexes centralized in `guidance_llm::pii_patterns`;
+   `strip_html` canonical in `common_core::string`;
+   think-block stripping canonical in `common_core::string`.
+5. **DIP Architecture**: `OrchestratorSession`, `ResultScorer`, `Summarizer`, `ClassifierStage`
+   all accept `Arc<dyn ChatBackend>` rather than constructing concrete `LlmClient`.
+
 ### In Progress
 
 1. **Async I/O**: Replacing synchronous SQLite calls with async-friendly patterns
@@ -349,7 +492,16 @@ guidance explain "query"
 
 ### Planned
 
-1. **HNSW Index**: Currently wired — `insert_node` (`db.rs:152`) calls `hnsw_insert` (`db.rs:167`) on every node with an embedding; brute-force KNN remains the primary query path. Upgrade to HNSW query when candidate count exceeds 100K.
+1. **HNSW Index**: The canonical HNSW implementation lives here, backed by
+   `common_core::sqlite::make_hnsw()`. Currently wired — `insert_node`
+   (`db.rs:152`) calls `hnsw_insert` (`db.rs:167`) on every node with an
+   embedding; brute-force KNN remains the primary query path. Upgrade to
+   HNSW query when candidate count exceeds 100K. Coral Router's indexed
+   collections (prior-workflow library, rubric/validated-answer cache,
+   blacklist-similarity index, and per-LOD-tier scene graphs) are scoped
+   views over this HNSW layer — they use the same `make_hnsw()` factory
+   but maintain separate index instances with distinct scope and error
+   tolerances.
 2. **Persistent L1 Cache**: Disk-backed LRU for warm starts
 3. **Graph Analytics**: PageRank, community detection for node importance
 
@@ -361,14 +513,14 @@ guidance explain "query"
 
 - **Memory**: 4-8 GB RAM
 - **Storage**: SQLite (WAL mode)
-- **Max Nodes**: ~100K ContextNodes
+- **Max Nodes**: ~100K ContentNodes
 - **Target Latency**: < 50ms deterministic
 
 ### Server Profile (Linux x86_64)
 
 - **Memory**: 16-64 GB RAM
 - **Storage**: SQLite (WAL mode, high concurrency)
-- **Max Nodes**: ~1M+ ContextNodes
+- **Max Nodes**: ~1M+ ContentNodes
 - **Target Latency**: < 20ms deterministic
 
 ---

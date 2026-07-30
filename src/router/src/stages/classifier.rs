@@ -18,6 +18,131 @@ use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
 use crate::score_matrix::ScoreMatrix;
 use crate::stages::common::extract_user_message;
 
+const DEFAULT_COMPLEXITY: u8 = 5;
+const COMPLEXITY_SCALE: f64 = 10.0;
+const DEFAULT_COMPLETENESS: f64 = 0.5;
+
+fn parse_classifier_response(response: &str, default_route: &str) -> (ClassifierOutput, bool) {
+    match serde_json::from_str::<ClassifierOutput>(response) {
+        Ok(o) => (o, true),
+        Err(e) => {
+            tracing::error!(target: "router.pipeline.stage2", error = %e, raw_response_len = response.len(), raw_response = %response, "classifier LLM response was not valid ClassifierOutput JSON — falling back to default route");
+            (
+                ClassifierOutput {
+                    action: "route".into(),
+                    response: None,
+                    target: Some(default_route.into()),
+                    coherence_score: 1.0,
+                    safety_score: 1.0,
+                    complexity: None,
+                    intent: None,
+                    reason: format!("parse error: {e}"),
+                    completeness: None,
+                    risk: None,
+                },
+                false,
+            )
+        }
+    }
+}
+
+fn check_thresholds(
+    output: &ClassifierOutput,
+    coherence_threshold: f64,
+    safety_threshold: f64,
+) -> Option<StageDecision> {
+    let coherence_ok = output.coherence_score >= coherence_threshold;
+    let safety_ok = output.safety_score >= safety_threshold;
+    if coherence_ok && safety_ok {
+        return None;
+    }
+    let reason = if coherence_ok {
+        format!(
+            "rejected: safety {:.2} below threshold {:.2}",
+            output.safety_score, safety_threshold
+        )
+    } else {
+        format!(
+            "rejected: coherence {:.2} below threshold {:.2}",
+            output.coherence_score, coherence_threshold
+        )
+    };
+    Some(StageDecision {
+        stage: PipelineStage::Classifier,
+        verdict: StageVerdict::Rejected,
+        score: Some(output.coherence_score),
+        reason,
+        latency_ms: 0,
+        metadata: serde_json::json!({
+            "coherence_score": output.coherence_score,
+            "safety_score": output.safety_score,
+            "intent": output.intent,
+            "action": output.action,
+        }),
+    })
+}
+
+fn resolve_routing_target(
+    action: &str,
+    output: &ClassifierOutput,
+    routing_config: &RoutingConfig,
+) -> Option<serde_json::Value> {
+    let min_complexity = output.complexity;
+    let resolved_route = output.target.as_deref().unwrap_or(&routing_config.default_route);
+
+    if action == "respond" {
+        tracing::info!(target: "router.pipeline.stage2", "direct response — no dispatch");
+        return None;
+    }
+
+    let route = if action == "route" {
+        resolved_route
+    } else {
+        tracing::warn!(target: "router.pipeline.stage2", action = %action, fallback_route = %routing_config.default_route, "unknown action, falling back to default route");
+        &routing_config.default_route
+    };
+
+    let resolved = routing_config.resolve_route(route, min_complexity);
+    if let Some((model, model_name)) = &resolved {
+        tracing::info!(target: "router.pipeline.stage2",
+            route = %route,
+            model = %model_name,
+            endpoint = %model.endpoint,
+            group = ?routing_config.routes.get(route).map(|r| &r.group),
+            "routing target resolved"
+        );
+        Some(build_routing_target_value(route, model, model_name, routing_config))
+    } else {
+        tracing::warn!(target: "router.pipeline.stage2", route = %route, "resolve_route returned None — no dispatch target");
+        None
+    }
+}
+
+fn build_routing_target_value(
+    route_name: &str,
+    model: &crate::config::ModelEntry,
+    model_name: &str,
+    routing_config: &RoutingConfig,
+) -> serde_json::Value {
+    serde_json::json!({
+        "url": model.endpoint,
+        "model": model_name,
+        "group": routing_config
+            .routes
+            .get(route_name)
+            .or_else(|| routing_config.routes.get(&routing_config.default_route))
+            .map_or("", |r| r.group.as_str()),
+        "target_name": route_name,
+        "params": model.params,
+        "filter_thinking": model.filter_thinking,
+        "retry_count": model.retry_count,
+        "retry_base_interval_s": model.retry_base_interval_s,
+        "stream": model.stream,
+        "idle_timeout_ms": model.idle_timeout_ms,
+        "total_timeout_ms": model.total_timeout_ms,
+    })
+}
+
 pub struct ClassifierStage {
     name: ArcIntern<str>,
     client: Arc<dyn ChatBackend>,
@@ -51,31 +176,6 @@ impl ClassifierStage {
             .replace("{coherence_threshold}", &format!("{:.2}", self.coherence_threshold))
             .replace("{safety_threshold}", &format!("{:.2}", self.routing_config.safety_threshold))
     }
-
-    fn build_routing_target_json(
-        &self,
-        route_name: &str,
-        model: &crate::config::ModelEntry,
-        model_name: &str,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "url": model.endpoint,
-            "model": model_name,
-            "group": self.routing_config
-                .routes
-                .get(route_name)
-                .or_else(|| self.routing_config.routes.get(&self.routing_config.default_route))
-                .map_or("", |r| r.group.as_str()),
-            "target_name": route_name,
-            "params": model.params,
-            "filter_thinking": model.filter_thinking,
-            "retry_count": model.retry_count,
-            "retry_base_interval_s": model.retry_base_interval_s,
-            "stream": model.stream,
-            "idle_timeout_ms": model.idle_timeout_ms,
-            "total_timeout_ms": model.total_timeout_ms,
-        })
-    }
 }
 
 impl WorkUnit for ClassifierStage {
@@ -106,55 +206,19 @@ impl WorkUnit for ClassifierStage {
         let messages = vec![
             ChatMessage {
                 role: "system".into(),
-                content: system_prompt.clone(),
+                content: system_prompt,
             },
             ChatMessage {
                 role: "user".into(),
-                content: input.clone(),
+                content: input,
             },
         ];
 
-        tracing::debug!(target: "router.pipeline.stage2", input_len = input.len(), "classifier stage");
-
-        let (output, ok) = match self.client.chat_complete(&messages) {
-            Ok(response) => {
-                tracing::debug!(target: "router.pipeline.stage2", raw_response_len = response.len(), raw_response = %response, "classifier LLM response received");
-                match serde_json::from_str::<ClassifierOutput>(&response) {
-                    Ok(o) => {
-                        tracing::info!(target: "router.pipeline.stage2",
-                            action = %o.action,
-                            target = ?o.target,
-                            response_direct = o.response.is_some(),
-                            coherence = %o.coherence_score,
-                            safety = %o.safety_score,
-                            complexity = ?o.complexity,
-                            intent = ?o.intent,
-                            reason = %o.reason,
-                            fallback = false,
-                            "classifier verdict"
-                        );
-                        (o, true)
-                    }
-                    Err(e) => {
-                        tracing::error!(target: "router.pipeline.stage2", error = %e, raw_response_len = response.len(), raw_response = %response, "classifier LLM response was not valid ClassifierOutput JSON — falling back to default route");
-                        (ClassifierOutput {
-                            action: "route".into(),
-                            response: None,
-                            target: Some(self.routing_config.default_route.clone()),
-                            coherence_score: 1.0,
-                            safety_score: 1.0,
-                            complexity: None,
-                            intent: None,
-                            reason: format!("parse error: {e}"),
-                            completeness: None,
-                            risk: None,
-                        }, false)
-                    }
-                }
-            }
+        let response = match self.client.chat_complete(&messages) {
+            Ok(r) => r,
             Err(e) => {
-                tracing::error!(target: "router.pipeline.stage2", error = %e, input_len = input.len(), "classifier LLM call failed — falling back to default route");
-                (ClassifierOutput {
+                tracing::error!(target: "router.pipeline.stage2", error = %e, "classifier LLM call failed");
+                let output = ClassifierOutput {
                     action: "route".into(),
                     response: None,
                     target: Some(self.routing_config.default_route.clone()),
@@ -165,125 +229,54 @@ impl WorkUnit for ClassifierStage {
                     reason: format!("LLM error: {e}"),
                     completeness: None,
                     risk: None,
-                }, false)
+                };
+                let fallback_rt = resolve_routing_target(&output.action, &output, &self.routing_config);
+                return Self::build_decision(&output, fallback_rt.as_ref(), false, self.score_matrix.as_ref());
             }
         };
 
-        let coherence_ok = output.coherence_score >= self.coherence_threshold;
-        let safety_ok = output.safety_score >= self.routing_config.safety_threshold;
+    let (output, ok) = parse_classifier_response(&response, &self.routing_config.default_route);
 
-        if !coherence_ok || !safety_ok {
-            let reason = if coherence_ok {
-                format!(
-                    "rejected: safety {:.2} below threshold {:.2}",
-                    output.safety_score, self.routing_config.safety_threshold
-                )
-            } else {
-                format!(
-                    "rejected: coherence {:.2} below threshold {:.2}",
-                    output.coherence_score, self.coherence_threshold
-                )
+        if let Some(decision) = check_thresholds(&output, self.coherence_threshold, self.routing_config.safety_threshold) {
+            return WorkOutput::typed("rejected", &decision);
+        }
+
+        if output.action == "reject" {
+            let decision = StageDecision {
+                stage: PipelineStage::Classifier,
+                verdict: StageVerdict::Rejected,
+                score: Some(output.coherence_score),
+                reason: format!("blocked: {}", output.reason),
+                latency_ms: 0,
+                metadata: serde_json::json!({
+                    "coherence_score": output.coherence_score,
+                    "safety_score": output.safety_score,
+                    "intent": output.intent,
+                    "action": output.action,
+                    "reason": output.reason,
+                }),
             };
-            return WorkOutput::typed(
-                "rejected",
-                &StageDecision {
-                    stage: PipelineStage::Classifier,
-                    verdict: StageVerdict::Rejected,
-                    score: Some(output.coherence_score),
-                    reason,
-                    latency_ms: 0,
-                    metadata: serde_json::json!({
-                        "coherence_score": output.coherence_score,
-                        "safety_score": output.safety_score,
-                        "intent": output.intent,
-                        "action": output.action,
-                    }),
-                },
-            );
+            return WorkOutput::typed("rejected", &decision);
         }
 
-        let action = output.action.as_str();
+        let routing_target = resolve_routing_target(&output.action, &output, &self.routing_config);
 
-        if action == "reject" {
-            tracing::info!(target: "router.pipeline.stage2",
-                reason = %output.reason,
-                "classifier rejected request"
-            );
-            return WorkOutput::typed(
-                "rejected",
-                &StageDecision {
-                    stage: PipelineStage::Classifier,
-                    verdict: StageVerdict::Rejected,
-                    score: Some(output.coherence_score),
-                    reason: format!("blocked: {}", output.reason),
-                    latency_ms: 0,
-                    metadata: serde_json::json!({
-                        "coherence_score": output.coherence_score,
-                        "safety_score": output.safety_score,
-                        "intent": output.intent,
-                        "action": output.action,
-                        "reason": output.reason,
-                    }),
-                },
-            );
-        }
+        Self::build_decision(&output, routing_target.as_ref(), ok, self.score_matrix.as_ref())
+    }
+}
 
-        let min_complexity = output.complexity;
-        let resolved_route = output.target.as_deref().unwrap_or(&self.routing_config.default_route);
-        let routing_target = match action {
-            "respond" => {
-                tracing::info!(target: "router.pipeline.stage2", "direct response — no dispatch");
-                None
-            }
-            "route" => {
-                let resolved = self.routing_config.resolve_route(resolved_route, min_complexity);
-                if let Some((model, model_name)) = &resolved {
-                    tracing::info!(target: "router.pipeline.stage2",
-                        route = %resolved_route,
-                        model = %model_name,
-                        endpoint = %model.endpoint,
-                        group = ?self.routing_config.routes.get(resolved_route).map(|r| &r.group),
-                        "routing target resolved"
-                    );
-                } else {
-                    tracing::warn!(target: "router.pipeline.stage2", route = %resolved_route, "resolve_route returned None — no dispatch target");
-                }
-                resolved.map(|(model, model_name)| {
-                    self.build_routing_target_json(
-                        resolved_route,
-                        model,
-                        &model_name,
-                    )
-                })
-            }
-            _ => {
-                let fallback_route = &self.routing_config.default_route;
-                tracing::warn!(target: "router.pipeline.stage2", action = %action, fallback_route = %fallback_route, "unknown action, falling back to default route");
-                let resolved = self.routing_config.resolve_route(fallback_route, min_complexity);
-                if let Some((model, model_name)) = &resolved {
-                    tracing::info!(target: "router.pipeline.stage2",
-                        route = %fallback_route,
-                        model = %model_name,
-                        endpoint = %model.endpoint,
-                        "fallback routing target"
-                    );
-                }
-                resolved.map(|(model, model_name)| {
-                    self.build_routing_target_json(
-                        fallback_route,
-                        model,
-                        &model_name,
-                    )
-                })
-            }
-        };
-
-        // ── Score-matrix resolution (MOA_ROUTER_SPEC §2.2) ──
-        let scored_routes = self.score_matrix.as_ref().map(|sm| {
+impl ClassifierStage {
+    fn build_decision(
+        output: &ClassifierOutput,
+        routing_target: Option<&serde_json::Value>,
+        ok: bool,
+        score_matrix: Option<&ScoreMatrix>,
+    ) -> Result<WorkOutput, WorkError> {
+        let scored_routes = score_matrix.map(|sm| {
             let scores = std::collections::HashMap::from([
                 ("coherence".into(), output.coherence_score),
-                ("complexity".into(), f64::from(output.complexity.unwrap_or(5)) / 10.0),
-                ("completeness".into(), output.completeness.unwrap_or(0.5)),
+                ("complexity".into(), f64::from(output.complexity.unwrap_or(DEFAULT_COMPLEXITY)) / COMPLEXITY_SCALE),
+                ("completeness".into(), output.completeness.unwrap_or(DEFAULT_COMPLETENESS)),
                 ("risk".into(), output.risk.unwrap_or(0.0)),
             ]);
             sm.resolve(&scores)
@@ -322,7 +315,7 @@ impl WorkUnit for ClassifierStage {
         if let Some(ref resp) = output.response {
             metadata["response"] = serde_json::Value::String(resp.clone());
         }
-        if let Some(ref rt) = routing_target {
+        if let Some(rt) = routing_target {
             metadata["routing_target"] = rt.clone();
         }
 
@@ -335,7 +328,7 @@ impl WorkUnit for ClassifierStage {
                 reason: format!(
                     "intent={}, action={}, coherence={:.2}",
                     output.intent.as_deref().unwrap_or("?"),
-                    action,
+                    output.action,
                     output.coherence_score
                 ),
                 latency_ms: 0,

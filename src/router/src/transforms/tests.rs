@@ -1,31 +1,15 @@
 #[cfg(test)]
 mod tests {
+    use crate::testing::test_request;
     use crate::transforms::decompose_hypothetical::DecomposeToAnonymizedHypothetical;
     use crate::transforms::decompose_subtasks::DecomposeToSubtasks;
     use crate::transforms::none::NoTransform;
     use crate::transforms::pii_anonymize::PiiAnonymize;
     use crate::transforms::TransformStrategy;
-    use crate::types::{RouterMessage, RouterMessageContent, RouterRequest};
+    use crate::types::RouterRequest;
 
     fn make_request(text: &str) -> RouterRequest {
-        RouterRequest {
-            model: "test-model".into(),
-            messages: vec![RouterMessage {
-                role: "user".into(),
-                content: RouterMessageContent::Text(text.into()),
-                tool_calls: None,
-                tool_call_id: None,
-            }],
-            temperature: None,
-            max_tokens: None,
-            stream: None,
-            tools: None,
-            tool_choice: None,
-            session_id: None,
-            agent_id: None,
-            adapter: None,
-            metadata: Default::default(),
-        }
+        test_request(text)
     }
 
     // ── M3.9: NoTransform ────────────────────────────────────────────────

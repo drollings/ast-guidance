@@ -7,7 +7,7 @@ use common_core::hash::content_hash_with_model;
 use common_core::metrics::LatencyHistogram;
 use guidance_llm::decomposer::Decomposer;
 use guidance_llm::LlmConfig;
-use fluent_types::{ContextNode, NodeId, WasmTool};
+use fluent_types::{ContentNode, NodeId, WasmTool};
 
 use crate::cache_l1::{CacheTier, L1Cache, RoutingResult};
 use crate::cache_router::ParallelRouter;
@@ -15,6 +15,8 @@ use crate::db::Library;
 use crate::tier_units::{L2WasmUnit, L3GraphUnit, L4SemanticUnit, L5FrontierUnit, TierRegistry};
 use crate::wasm_runtime::PluginPool;
 use fluent_wvr::prelude::*;
+
+use super::stats::CoralStats;
 
 #[derive(Builder)]
 pub struct QueueReactorCreateArgs {
@@ -83,8 +85,6 @@ impl QueueReactor {
             .map(|rt| Arc::new(PluginPool::new(Arc::clone(rt), args.max_plugins)));
 
         if let (Some(ref rt), Some(ref pool)) = (&args.wasm_runtime, &plugin_pool) {
-            // Register a placeholder L2 for each known tool found in the library.
-            // Tool lookup happens at execute time; the pool caches the loaded plugin.
             if let Ok(tools) = args.library.find_wasm_tools_by_capability("query") {
                 for tool in tools.into_iter().take(1) {
                     let unit = L2WasmUnit::new(
@@ -126,11 +126,6 @@ impl QueueReactor {
             tiers.push(Arc::new(wrapped));
             histograms.push(hist);
         }
-
-        // L4.5: Decomposition (only if decomposer is configured)
-        // NOTE: We cannot create L4_5DecomposeUnit here because it needs a Weak<QueueReactor>,
-        // which doesn't exist yet. We build the tier registry lazily in route_with_depth
-        // or restructure the construction. For now, register L4.5 via a separate path.
 
         // L5: Frontier LLM (only if frontier config is provided) — wrapped with metrics
         if let Some(ref frontier) = args.frontier_config {
@@ -244,13 +239,14 @@ impl QueueReactor {
         } else {
             format!("solution:{query}")
         };
-        let node = ContextNode {
+        let node = ContentNode {
             id: Some(NodeId::from_int(hash_id)),
             name: name.into(),
             source: query.to_string(),
             lod: vec![result.result.clone(), query.to_string()],
             embedding,
             capabilities: None,
+            ..Default::default()
         };
         self.library
             .insert_node(&node)
@@ -265,7 +261,6 @@ impl QueueReactor {
             .next()
     }
 
-    /// Aggregated histogram snapshot across all tier histograms.
     #[must_use]
     pub fn coral_stats(&self) -> CoralStats {
         let mut total_count = 0u64;
@@ -274,8 +269,6 @@ impl QueueReactor {
             total_count += h.count();
             total_sum_ms += h.sum_ms();
         }
-        // For p50/p99, use the first histogram as representative
-        // (in the future, per-tier breakdowns could be exposed)
         let p50 = self
             .histograms
             .first()
@@ -294,24 +287,12 @@ impl QueueReactor {
     }
 }
 
-/// Aggregated latency statistics for the coral cache tiers.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CoralStats {
-    pub tier_count: usize,
-    pub total_count: u64,
-    pub total_sum_ms: u64,
-    pub p50_ms: u64,
-    pub p99_ms: u64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_stubs::{StubChatBackend, StubDecomposer, StubEmbedder};
-    use fluent_types::ContextNode;
+    use fluent_types::ContentNode;
     use std::collections::HashMap;
-
-    // ---- Helpers ----
 
     fn make_reactor(lib: Arc<Library>) -> QueueReactor {
         let args = QueueReactorCreateArgs::builder().library(lib).build();
@@ -319,18 +300,17 @@ mod tests {
     }
 
     fn insert_node_with_embedding(lib: &Library, name: &str, embedding: Vec<f32>) {
-        let node = ContextNode {
+        let node = ContentNode {
             id: None,
             name: name.into(),
             source: format!("source for {name}"),
             lod: vec![format!("lod for {name}")],
             embedding: Some(embedding),
             capabilities: None,
+            ..Default::default()
         };
         lib.insert_node(&node).expect("insert node");
     }
-
-    // ---- L1 tests ----
 
     #[test]
     fn test_reactor_l1_hit() {
@@ -351,15 +331,15 @@ mod tests {
 
     #[test]
     fn test_reactor_l1_miss_falls_through_to_tiers() {
-        // M9.2: Replace tautology — verify L1 miss routes to L3 when data exists.
         let lib = Arc::new(Library::open_in_memory().expect("db"));
-        let node = ContextNode {
+        let node = ContentNode {
             id: None,
             name: "test_node".into(),
             source: "source".into(),
             lod: vec![],
             embedding: None,
             capabilities: None,
+            ..Default::default()
         };
         lib.insert_node(&node).expect("insert");
 
@@ -369,18 +349,17 @@ mod tests {
         assert!(result.result.contains("test_node"));
     }
 
-    // ---- L3 tests ----
-
     #[test]
     fn test_reactor_route_uses_l3_when_data_exists() {
         let lib = Arc::new(Library::open_in_memory().expect("db"));
-        let node = ContextNode {
+        let node = ContentNode {
             id: None,
             name: "zig_compiler".into(),
             source: "Zig compiler documentation".into(),
             lod: vec![],
             embedding: None,
             capabilities: None,
+            ..Default::default()
         };
         lib.insert_node(&node).expect("insert");
 
@@ -392,12 +371,8 @@ mod tests {
         assert!(result.result.contains("zig_compiler"));
     }
 
-    // ---- L4 tests ----
-
     #[test]
     fn test_reactor_l4_semantic_routing() {
-        // M9.3: Test L4 at the unit level — insert a node with a known
-        // embedding, call L4SemanticUnit::execute directly, assert L4 tier.
         let lib = Arc::new(Library::open_in_memory().expect("db"));
         let node_emb = vec![1.0, 0.0, 0.0, 0.0];
         insert_node_with_embedding(&lib, "embedded_node", node_emb);
@@ -412,8 +387,6 @@ mod tests {
         assert_eq!(output.message, "L4");
     }
 
-    // ---- L5 tests ----
-
     #[test]
     fn test_reactor_l5_frontier_not_configured() {
         let lib = Arc::new(Library::open_in_memory().expect("db"));
@@ -423,7 +396,6 @@ mod tests {
 
     #[test]
     fn test_reactor_l5_frontier_error_propagation() {
-        // M9.3: L5 stub returns Err → CacheError::FrontierError (not CacheMiss).
         let config = LlmConfig::new()
             .api_url("http://localhost:11434/v1".into())
             .model("test".into())
@@ -449,8 +421,6 @@ mod tests {
         }
     }
 
-    // ---- L4.5 tests ----
-
     #[test]
     fn test_reactor_l4_5_decompose_not_configured() {
         let lib = Arc::new(Library::open_in_memory().expect("db"));
@@ -460,18 +430,16 @@ mod tests {
 
     #[test]
     fn test_reactor_l4_5_decomposition() {
-        // M9.3: Test L4.5 at the unit level — configure a StubDecomposer,
-        // call L4_5DecomposeUnit::execute directly, assert L4.5 tier.
         let lib = Arc::new(Library::open_in_memory().expect("db"));
-        // Insert nodes that subtasks will find via L3 keyword search
         for name in &["subtask_alpha", "subtask_beta"] {
-            let node = ContextNode {
+            let node = ContentNode {
                 id: None,
                 name: (*name).into(),
                 source: format!("source for {name}"),
                 lod: vec![format!("result from {name}")],
                 embedding: None,
                 capabilities: None,
+                ..Default::default()
             };
             lib.insert_node(&node).expect("insert");
         }
@@ -484,7 +452,6 @@ mod tests {
         let decomposer: Box<dyn guidance_llm::decomposer::Decomposer> =
             Box::new(StubDecomposer::new(responses));
 
-        // Build a reactor just for the Weak ref (needed by L4_5DecomposeUnit)
         let args = QueueReactorCreateArgs::builder().library(lib).build();
         let reactor = Arc::new(QueueReactor::new(args));
 
@@ -496,7 +463,6 @@ mod tests {
             .insert("query".into(), "complex_parent_query".into());
         let output = unit.execute(&ctx).expect("L4.5 should succeed");
         assert_eq!(output.message, "L4.5");
-        // Verify subtask results are merged
         let data_str = output.data.to_string();
         assert!(
             data_str.contains("subtask_alpha"),
@@ -508,17 +474,11 @@ mod tests {
         );
     }
 
-    // ---- Recursion + L1 backfill test ----
-
     #[test]
     fn test_reactor_subtask_recursion_l1_backfill() {
-        // M9.2: Verify that subtask results are cached in L1 after decomposition.
-        // Test at the route_with_depth level: manually call decomposition by
-        // pre-seeding L1 with subtask results and verifying retrieval.
         let lib = Arc::new(Library::open_in_memory().expect("db"));
         let reactor = make_reactor(lib);
 
-        // Simulate what decomposition does: set L1 for subtask results
         let sub_x_result = Arc::new(RoutingResult {
             query: "sub_x".into(),
             result: "result_x".into(),
@@ -532,13 +492,11 @@ mod tests {
         reactor.set_l1("sub_x", &sub_x_result);
         reactor.set_l1("sub_y", &sub_y_result);
 
-        // Verify subtask results are retrievable from L1
         let from_x = reactor.l1_cache.get("sub_x").expect("sub_x in L1");
         assert_eq!(from_x.result, "result_x");
         let from_y = reactor.l1_cache.get("sub_y").expect("sub_y in L1");
         assert_eq!(from_y.result, "result_y");
 
-        // Simulate L4.5 merge: parent result combines subtask results
         let parent_result = Arc::new(RoutingResult {
             query: "parent_q".into(),
             result: "result_x\n---\nresult_y".into(),
@@ -546,13 +504,10 @@ mod tests {
         });
         reactor.set_l1("parent_q", &parent_result);
 
-        // Second route: parent should hit L1 (returns cached result as-is)
         let r = reactor.route("parent_q").expect("should hit L1");
         assert!(r.result.contains("result_x"));
         assert!(r.result.contains("result_y"));
     }
-
-    // ---- Persist solution tests ----
 
     #[test]
     fn test_reactor_persist_solution() {
@@ -573,18 +528,15 @@ mod tests {
             .persist_solution("test", &result, 0)
             .expect("persist should succeed");
 
-        // M9.2: Assert node exists via find_node_by_name
         let found_id = lib
             .find_node_by_name("solution:test")
             .expect("find")
             .expect("node exists");
         assert_eq!(found_id, node_id);
 
-        // M9.2: Assert embedding matches the stub embedder's output
         let node = lib.get_node(found_id).expect("get node").expect("node");
         let emb = node.embedding.expect("node should have embedding");
         assert_eq!(emb.len(), 4, "embedding should have 4 dimensions");
-        // StubEmbedder("test_result") produces [116/255, 101/255, ...]
         let expected = reactor
             .embedder
             .as_ref()
@@ -605,7 +557,6 @@ mod tests {
             tier: CacheTier::L3Graph,
         };
 
-        // depth=0 → "solution:subtask_q"
         reactor
             .persist_solution("subtask_q", &result, 0)
             .expect("persist");
@@ -614,7 +565,6 @@ mod tests {
             .expect("find")
             .expect("node exists at depth 0");
 
-        // depth=1 → "solution:subtask:subtask_q"
         let subtask_result = RoutingResult {
             query: "child_q".into(),
             result: "child_result".into(),
@@ -629,8 +579,6 @@ mod tests {
             .expect("node exists at depth 1");
         assert_ne!(node, subtask_node);
     }
-
-    // ---- Stats tests ----
 
     #[test]
     fn test_coral_stats_zero_before_any_route() {
@@ -647,13 +595,14 @@ mod tests {
     #[test]
     fn test_coral_stats_records_l3_hit() {
         let lib = Arc::new(Library::open_in_memory().expect("db"));
-        let node = ContextNode {
+        let node = ContentNode {
             id: None,
             name: "test_node".into(),
             source: "source".into(),
             lod: vec![],
             embedding: None,
             capabilities: None,
+            ..Default::default()
         };
         lib.insert_node(&node).expect("insert");
 
@@ -667,8 +616,6 @@ mod tests {
             stats.total_count
         );
     }
-
-    // ---- Subtask backfill test (M6.3) ----
 
     #[test]
     fn test_subtask_results_backfill_l1() {
@@ -701,8 +648,6 @@ mod tests {
         let from_cache = reactor.l1_cache.get("new_query").expect("should be cached");
         assert_eq!(from_cache.result, "new_result");
     }
-
-    // ---- Misc ----
 
     #[test]
     fn test_cache_tier_display() {

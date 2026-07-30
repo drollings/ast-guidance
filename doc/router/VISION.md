@@ -86,12 +86,203 @@ has already failed to resolve the request.
   style choice to debate. This applies to new ledger/Content Node work as
   much as to anything already shipped.
 
+## The Classification Tree: a self-updating routing config
+
+The central configuration structure for Coral Router is a **nested
+classification tree** — not a flat list of routes, a separate score matrix,
+and a hardcoded system prompt that drift apart as the deployment evolves.
+
+### Node types
+
+Every node in the tree is one of four types:
+
+| Type | Role | LLM call? |
+|------|------|-----------|
+| **`classifier`** | An LLM call that picks one child branch. The prompt is auto-generated from the children's descriptions. | Yes (small local model) |
+| **`terminal`** | A dispatch target. Resolves to a model from a named `model_group`, optionally with a specific `session` profile. | No — terminal is where the routed model takes over |
+| **`filter`** | A deterministic check (regex, prefix match, PII pattern). Produces `hard_reject`, `soft_redirect`, or `output_filter`. | No |
+| **`fallback`** | A child of a classifier node, used when the LLM picks no named child or the LLM call itself fails. | Only if the fallback is itself a classifier |
+
+### Prompt auto-construction
+
+A classifier node carries a `description` and a map of named `children`.
+From those children the system constructs the prompt body:
+
+```
+You are a {node.description}.
+
+Available routes:
+- {child_key}: {child.description}
+- {child_key}: {child.description}
+...
+
+You must output exactly one JSON object with:
+  "route": "<exactly one of: {comma-joined child keys}>"
+  "coherence": 0.0–1.0 (how well-formed and coherent the query is)
+  "safety": 0.0–1.0 (1.0 = completely safe, 0.0 = policy violation)
+  "complexity": 0–10 (0 = trivial, 10 = requires most capable model)
+  "reason": "brief explanation for the routing decision"
+```
+
+If a child key is added, removed, or its description changes, the prompt
+updates automatically. No manual prompt maintenance. No stale route names.
+
+### Three axes of routing
+
+1. **Domain** — the classifier's primary output: `"code"` vs `"prose"` vs
+   `"translation"`, etc. This is the first branch, matching the human
+   category the query falls into.
+
+2. **Coherence / Safety** — every classifier node enforces configurable
+   thresholds. A query below the coherence threshold is rejected
+   (nonsensical / adversarial input). A query below the safety threshold
+   is rejected (policy violation). These are the gating checks that
+   protect downstream models from garbage or harmful input.
+
+3. **Complexity** — each model carries an `intelligence` field (0–10).
+   When a terminal node dispatches to a `model_group`, the system picks
+   the cheapest model in that group whose `intelligence` meets or exceeds
+   the classifier's `complexity` score. If no model qualifies, it falls
+   back to the cheapest model in the group. This is a dispatch-time
+   filter, not a separate config section — complexity-driven model
+   selection is automatic for every terminal node.
+
+### Pre-filters: deterministic before probabilistic
+
+Before any node in the tree is evaluated, a `pre_filters` list runs. These
+are pure regex / prefix-match checks with no model in the loop:
+
+- **`hard_reject`** — ends the request immediately with an HTTP error code
+- **`soft_redirect`** — sends the request directly to a named branch,
+  skipping the classifier
+
+Pre-filters are the cheapest possible decision and protect the classifier
+from work it should never see (PII-bearing content, known-bad patterns).
+
+### Complexity-based branching (optional)
+
+Classifier nodes can also branch on complexity directly, for deployments
+that want explicit complexity bands rather than dispatch-time filtering:
+
+```
+root (classifier, model=fast)
+├── low_complexity → (terminal, group=fast)
+├── high_complexity → (terminal, group=code)
+```
+
+When a classifier has children, it asks the LLM to pick one. The children
+can represent any axis, including complexity. This gives the operator full
+control: domain-only, complexity-only, or both in a single tree.
+
+### Tree replaces flattened config
+
+The classification tree replaces four previously-separate config sections:
+
+| Old section | Replaced by |
+|-------------|-------------|
+| `pipelines` | Tree structure IS the pipeline — each classifier node is a stage |
+| `routes` | The children of each classifier node |
+| `system_prompt` | Auto-generated from the tree children + descriptions |
+| `score_matrix` | Coherence/safety thresholds at each classifier node + complexity-based model selection |
+
+`models`, `model_groups`, `server`, and `logging` are unchanged.
+
+## The Escalation Ladder: progressive frontier engagement
+
+When a terminal node dispatches to a `model_group` and every local model in
+that group's chain fails or times out, the system does not fail outright.
+Instead it escalates through a configurable **escalation ladder** — a fixed
+sequence of increasingly permissive frontier-engagement modes. Each mode is
+a discrete policy governing how much context, data, and agency the frontier
+model receives.
+
+### Why a ladder, not a single fallback
+
+Frontier models are expensive, external, and outside the local trust
+boundary. Straight turnover is the **most permissive** option — it gives the
+frontier everything. By ordering less-permissive modes first, the system
+only pays the cost and takes the risk of full context exposure when genuinely
+necessary. The ladder makes frontier calls progressively more expensive, not
+all-or-nothing.
+
+### The four modes
+
+| Stage | Mode | What the local system does | What the frontier sees | Frontier risk |
+|-------|------|---------------------------|----------------------|---------------|
+| 1 | **filter** | Deterministic PII/anonymization rules strip sensitive content from the query. The filtered query is sent as a one-shot prompt to frontier. | Filtered/de-identified text only | Low — no raw data crosses the boundary |
+| 2 | **question** | A `decomposer_model` (fast local LLM) breaks the problem into generic hypothetical questions. The frontier answers each independently. An `assembler_model` synthesizes the responses into the final answer. | Abstract hypotheticals with no personal data, no session context | Low — frontier sees constructed questions, not user data |
+| 3 | **team** | `classifier_parallel` instances of a `classifier_model` run in parallel slots and vote on approach. A `draft_model` attempts the easier sub-steps locally. A `judge_model` reviews the draft, identifies gaps, and crafts a precise frontier prompt containing only the unsolved sub-problem and the successful partial work. | A focused prompt with the unsolved gap and verified partial work | Medium — frontier sees partial solution structure |
+| 4 | **turnover** | Full context handoff. The frontier model receives the entire session ledger, all tool access, and continues autonomously. All subsequent messages in the session go through frontier. | The entire session — all context, tools, history | High — frontier has full agency and raw data |
+
+Each stage is tried in order. If the frontier rejects/errors, or the local
+assembler/judge rejects the frontier's output, the system escalates to the
+next stage. If all stages are exhausted without a successful response, the
+request fails with an escalation-exhausted error.
+
+### Parallel classifiers (team mode)
+
+The `team` mode uses `classifier_parallel` slots of the same `classifier_model`
+running in parallel via `ResultPool` — the same primitive used for
+continuous-batching LLM fan-out. Each slot receives the same query with a
+slightly varied temperature/seed, producing a set of votes. The vote
+distribution (e.g., "3/3 say decompose into sub-tasks X, Y, Z") feeds into
+the draft model's prompt as a structured signal. This avoids the config
+complexity of managing N different classifier models while still getting
+diversity through stochastic variation.
+
+### Local model chain (per group)
+
+Before escalation even begins, a `model_group` has an ordered `local` chain:
+
+```
+local:
+  1. qwythos-9b (session=code)     ← primary model for this domain
+  2. fast (session=compact)         ← fallback if primary is unavailable or overloaded
+```
+
+Dispatch tries each local entry in order. Only if all local entries fail
+(unreachable, timeout, incoherent output) does the escalation ladder engage.
+This means the frontier is never consulted when a local model can handle
+the query — even the "backup" local model gets a shot first.
+
+### Post-processing: audit + workflow extraction
+
+Every frontier interaction, in any escalation mode, writes a structured
+entry to the durable audit log recording:
+- Which escalation stage fired
+- What the local system sent to frontier
+- What the frontier returned
+- Whether the local assembler/judge accepted the result
+- Total cost incurred
+
+Per-group `post_process.workflow_extraction` controls whether successful
+frontier-aided solutions that are **not** already in the Coral Context cache
+get processed into reusable DAG workflows:
+
+1. The full `query → local_attempts → escalation_stage → frontier_call →
+   assembly` chain is decomposed into discrete steps.
+2. Each step becomes a `Target` node in a DAG, with `depends` / `provides`
+   edges capturing the dependency structure (e.g., "the frontier response
+   depends on the judge's crafted prompt").
+3. The workflow DAG is stored as `ContentNode` entries in Coral Context's
+   graph database, keyed by an embedding of the original query.
+4. When a future query has a near-neighbor embedding, the cache reactor
+   can replay the DAG steps — skipping the frontier call entirely when
+   the same decomposition structure applies.
+
+This is the "neurosymbolic learning loop": the frontier path becomes a
+one-time cost that amortizes across similar queries.
+
 ## The Ledger: Content Nodes and levels of detail
 
 Every paragraph, prompt, tool result, or intermediate artifact is stored as a
 **Content Node** — the game-engine concept of level-of-detail and scene graph
-applied to semantic text. A node is a lazily-computed, cached representation
-of a piece of content at six fixed tiers:
+applied to semantic text. A `ContentNode` is the canonical type (defined in
+`fluent_types`) that unifies durable storage fields with session-scoped
+metadata — no separate `ContextNode` / `SessionNode` split. The 6-tier LOD
+scheme is defined here (as routing policy); storage and rendering of
+individual tiers is delegated to Coral Context's `ContentNode` in
+`packer.rs`:
 
 | Tier | Description | Bound |
 |------|-------------|-------|
@@ -134,7 +325,7 @@ of them being duplicated or recomputed.
 
 This is deliberately a **separate concern** from the three library-scale
 HNSW indices — the prior-workflow library, the rubric/validated-answer
-cache, and the blacklist-adjacent similarity index. Those operate cross-session,
+cache, and the blacklist-similarity index. Those operate cross-session,
 over durable artifacts, and are kept as separate indices from each other
 because a false positive means something different, and costs something
 different, in each case (a workflow-library miss just falls back to planning
@@ -143,6 +334,12 @@ The ledger's per-level scene graphs are session-scoped, operate at a
 different granularity, and are not merged into the library-scale indices —
 five index concerns, kept apart, each with its own acceptable error rate and
 its own dirty/rebuild cadence.
+
+All five HNSW index instances (one per LOD tier, three library-scale) are
+built using the same `common_core::sqlite::make_hnsw()` factory and stored
+in Coral Context's SQLite database. Coral Context owns the HNSW
+implementation and storage layer; Coral Router owns the index scoping and
+the decision of which index to query for a given routing or cache operation.
 
 ## Shared Content Nodes and parallel ledgers
 
@@ -326,8 +523,18 @@ handled a given request, why, and what it cost.
   behind a secondary check.
 - An HTTP status taxonomy separating terminal rejection (never retried) from
   transient failure (retry-eligible) from internal escalation signals.
-- A unified, weighted score-matrix for routing decisions that need more than
-  a single threshold.
+- **Nested classification tree config** replacing the flattened
+  `pipelines` / `routes` / `system_prompt` / `score_matrix` quad with a
+  single self-describing tree. Each classifier node auto-generates its
+  prompt from its children; add a route to the config and it appears in
+  the prompt without manual editing.
+- **Escalation ladder** as a configurable per-group sequence of frontier
+  engagement modes (filter → question → team → turnover), tried in order
+  after all local models fail. Each mode is a progressively more permissive
+  policy for crossing the local-to-frontier boundary.
+- Prompt auto-construction from tree children: the system builds the
+  classifier system prompt at node evaluation time, listing only the
+  actual child routes and their descriptions.
 - Two-stream logging: routine operational logs on a short rotation, and a
   separate, durably-retained audit stream for every filter verdict, route
   decision, and (eventually) frontier call.
@@ -351,9 +558,11 @@ handled a given request, why, and what it cost.
   generation are still stubs.
 - The `rigor` route — types and structure exist; execution is not yet wired
   to live agents.
-- Four frontier involvement modes — enum and signature only, explicitly
-  deferred until local orchestrator/agent integration is mature enough to
-  support them.
+- Four frontier involvement modes — enum and signature only; escalation ladder
+  (filter/question/team/turnover) is designed and config-specified but not
+  yet wired to live dispatch. Per-mode local model roles (decomposer,
+  assembler, draft, judge) and parallel-classifier fan-out are specified in
+  config but not yet backed by `ResultPool` or `Zone` supervision.
 - Origin-typed Content Nodes and the dedicated `audit`/`concern` node
   convention.
 
@@ -369,23 +578,55 @@ handled a given request, why, and what it cost.
   fan-out is not yet the confirmed execution model for `ResultPool`-backed
   classifier calls.
 
+**SOLID/DRY refactoring (2026-07-29):**
+
+Core modules decomposed for Single Responsibility:
+
+- `router/src/config/` — builder.rs, filters.rs, routing.rs, addr.rs
+- `router/src/server/` — handler.rs, dispatch.rs, responses.rs
+- `coral/src/db/` — schema.rs, nodes.rs, edges.rs, hnsw.rs, embeddings.rs, kv_cache.rs
+- `coral/src/cache/` — reactor.rs, stats.rs
+
+Key architectural improvements:
+- `OrchestratorSession`, `ResultScorer`, `Summarizer` now accept `Arc<dyn ChatBackend>` (DIP)
+- `ClassifierStage` also takes `Arc<dyn ChatBackend>` (DIP)
+- PII regex patterns centralized in `guidance_llm::pii_patterns` (DRY)
+- Think-block stripping canonical in `common_core::string` (DRY)
+- `strip_html` canonical in `common_core::string` (DRY)
+- Pipeline verdict handling extracted to `handle_stage_verdict` (SRP)
+- Magic numbers replaced with named constants (Code Quality)
+
 ## Near-term direction
 
-- Finish landing the filter/HTTP/score-matrix/ledger infrastructure
+- Finish landing the filter/HTTP/classification-tree/ledger infrastructure
   currently in flight, closing the gap between the design spec and the
   running system.
-- Implement the six-tier LOD scheme with LOD0-anchored (never chained)
-  derivation, backed by interned shared strings.
-- Stand up the shared Content Node store and at least one parallel-ledger
-  consumer (e.g., a specialist agent's narrowed default-LOD view) to prove
-  out the reference-counting and caching model before generalizing it.
-- Implement filtered ledgers for the PII-anonymized frontier case first,
-  since it's both the highest-value and the simplest exclusion set to get
-  right.
-- Extend guardrail checks to the Content Node write path, not just frontier
-  egress.
-- Resolve model-config duplication so multiple named roles sharing one set
-  of weights are expressed as one resident model with session profiles.
+- Implement `model_group` local chain dispatch: try models in the `local`
+  list in order, with per-model session profile selection and timeout/
+  retry from the model's own config.
+- Implement the escalation ladder dispatch loop: after local chain
+  exhaustion, iterate escalation stages in order, with per-stage pre/post
+  hooks and escalation-exhausted error handling.
+- Wire the `filter` escalation mode: apply deterministic redaction rules
+  from the group config before sending to frontier; validate the response
+  is clean before returning to the user.
+- Wire the `question` escalation mode: decomposer model breaks query into
+  hypotheticals, frontier answers each, assembler model synthesizes.
+- Wire the `team` escalation mode: `ResultPool`-backed parallel classifier
+  fan-out, draft model for easy steps, judge model crafts the frontier
+  prompt from gaps.
+- Implement per-node prompt auto-construction: at node evaluation time,
+  build the classifier system prompt from the node's `description`, its
+  children's keys and descriptions, and the node's threshold values.
+- Support multi-level classification: a classifier node can route to another
+  classifier node, enabling domain → subdomain → terminal chains.
+- Implement complexity-based model selection at terminal dispatch: pick the
+  cheapest model in the group whose `intelligence` meets the classifier's
+  `complexity` score.
+- Implement `post_process.workflow_extraction`: decompose successful
+  frontier-assisted solutions into `Target` DAG nodes, store in Coral
+  Context as `ContentNode` entries with dependency edges, keyed by
+  embedding for future cache-reactor replay.
 
 ## Longer-term direction
 

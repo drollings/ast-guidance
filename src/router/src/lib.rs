@@ -5,7 +5,7 @@
 //! ## Modules
 //! - `pipeline_types` — `StageDecision`, `PipelineStage`, `StageVerdict`
 //! - `types` — `RouterRequest`, `RouterResponse`, `RouterMessage`, etc.
-//! - `session` — `SessionNode`, `StepStatus`
+//! - `session` — `StepStatus` re-exported from `fluent_types::ContentNode`
 //! - `config` — `RouterConfig` and all sub-config types
 //! - `pipeline` — `PipelineOrchestrator`, `PipelineResult`
 //! - `stages` — pipeline stage implementations (deterministic, classifier, router)

@@ -4,7 +4,7 @@ use guidance_rdf::normalize::hash_blank_node;
 use guidance_rdf::normalize::hash_iri;
 use guidance_rdf::parser::Term;
 use guidance_rdf::parser::Triple;
-use fluent_types::ContextNode;
+use fluent_types::ContentNode;
 use fluent_types::NodeId;
 use fluent_types::LOD_COUNT;
 use thiserror::Error;
@@ -36,13 +36,13 @@ impl PendingNode {
 }
 
 impl PendingNode {
-    pub fn to_context_node(&self) -> ContextNode {
+    pub fn to_content_node(&self) -> ContentNode {
         let lod: Vec<String> = self
             .lod
             .iter()
             .map(|v| String::from_utf8_lossy(v).to_string())
             .collect();
-        ContextNode {
+        ContentNode {
             id: Some(NodeId::from_int(self.id)),
             name: lod.get(4).cloned().unwrap_or_default().into(),
             source: lod
@@ -54,6 +54,7 @@ impl PendingNode {
             lod,
             embedding: None,
             capabilities: None,
+            ..Default::default()
         }
     }
 }

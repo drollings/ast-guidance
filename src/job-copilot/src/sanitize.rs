@@ -1,64 +1,9 @@
-use std::sync::OnceLock;
-
-use regex::Regex;
-
 use crate::schema::FieldDescription;
 
-fn re_script() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?is)<script[^>]*>.*?</script>").unwrap())
-}
-
-fn re_style() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?is)<style[^>]*>.*?</style>").unwrap())
-}
-
-fn re_breaks() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)<br\s*/?>|</p>|</div>|</li>|</tr>").unwrap())
-}
-
-fn re_tags() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"<[^>]+>").unwrap())
-}
-
-fn re_newlines() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\n+").unwrap())
-}
-
-fn re_ws() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"[ \t]+").unwrap())
-}
-
-/// Strip HTML tags and decode common entities. This is a lightweight heuristic
-/// parser — not a full HTML parser — suitable for untrusted text going to an LLM.
+/// Strip HTML tags, decode common entities, replace block-level tags with
+/// newlines, and collapse whitespace. Delegates to `common_core::string::strip_html`.
 pub fn strip_html(s: &str) -> String {
-    // Strip <script>...</script> and <style>...</style> blocks (case-insensitive)
-    let mut result = re_script().replace_all(s, "").to_string();
-    result = re_style().replace_all(&result, "").to_string();
-
-    // Replace block-closing tags with newlines
-    result = re_breaks().replace_all(&result, "\n").to_string();
-
-    // Strip all remaining tags
-    result = re_tags().replace_all(&result, "").to_string();
-
-    // Decode common HTML entities
-    result = result.replace("&amp;", "&");
-    result = result.replace("&lt;", "<");
-    result = result.replace("&gt;", ">");
-    result = result.replace("&quot;", "\"");
-    result = result.replace("&#39;", "'");
-
-    // Normalize newlines to spaces first, then collapse runs of whitespace
-    result = re_newlines().replace_all(&result, " ").to_string();
-    result = re_ws().replace_all(&result, " ").trim().to_string();
-
-    result
+    common_core::string::strip_html(s)
 }
 
 /// Return the longest prefix of `s` with at most `max_chars` characters.

@@ -10,6 +10,7 @@ pub mod embeddings;
 pub mod error;
 pub mod http_class;
 pub mod llm_queue;
+pub mod pii_patterns;
 pub mod url;
 
 // Re-export the LLM protocol + queue types from fluent-concurrency so

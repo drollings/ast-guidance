@@ -236,8 +236,19 @@ pub struct GuidanceDoc {
     pub capability_eval: Option<CapabilityEval>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContextNode {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContentNode {
+    // ── Core fields ──
     pub id: Option<NodeId>,
     pub name: SmolStr,
     pub source: String,
@@ -247,6 +258,37 @@ pub struct ContextNode {
     pub embedding: Option<Vec<f32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Vec<u8>>,
+    // ── Session fields ──
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance_score: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_lod: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<NodeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_status: Option<StepStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<u64>,
+}
+
+impl ContentNode {
+    pub fn content(&self) -> Option<&str> {
+        self.lod.first().map(String::as_str)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -486,16 +528,29 @@ mod tests {
         assert_eq!(json, "\"wasm\"");
     }
     #[test]
-    fn context_node_defaults() {
-        let node = ContextNode {
+    fn content_node_defaults() {
+        let node = ContentNode {
             id: None,
             name: SmolStr::new("root"),
             source: "full text".into(),
-            lod: vec![],
+            lod: vec!["hello".into()],
             embedding: None,
             capabilities: None,
+            session_id: None,
+            request_id: None,
+            role: None,
+            turn_index: None,
+            accepted: None,
+            acceptance_score: None,
+            active_lod: None,
+            parent_id: None,
+            step_id: None,
+            step_status: None,
+            metadata: None,
+            created_at: None,
         };
-        assert!(node.lod.is_empty());
+        assert_eq!(node.lod.len(), 1);
+        assert_eq!(node.content(), Some("hello"));
         assert!(node.embedding.is_none());
     }
     #[test]

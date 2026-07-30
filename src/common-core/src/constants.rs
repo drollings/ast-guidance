@@ -4,6 +4,8 @@ pub const MAX_VALUE_LEN: usize = 128;
 pub const MAX_FILE_SIZE: usize = 100 * 1024 * 1024;
 pub const MAX_JSON_DEPTH: usize = 100;
 pub const MAX_EMBEDDING_DIMENSIONS: usize = 4_096;
+/// Max characters of a log message body to include in tracing/error records.
+pub const MAX_LOG_MESSAGE_LEN: usize = 120;
 
 /// Serde default helper that returns `true`.
 pub const fn default_true() -> bool {
