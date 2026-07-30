@@ -1,9 +1,22 @@
-# The fluent monorepo
+# Fluent Monorepo - foundations for Coral Context, Fluent Concurrency
 
-A Rust monorepo of unified projects sharing a common infrastructure — composable
-crates, deterministic-first design, and a uniform component model.  Every crate
-in `src/` builds on the same foundation of proven design patterns, capability-gated
-concurrency, and type-safe runtime composition.
+This is a Rust monorepo, built as an integrated incubator of unified projects sharing a
+common infrastructure and enforced design patterns that build a dynamic, efficient runtime 
+and extreme agentic efficiency.  
+
+Coral Context and Coral Router are meant to make a deterministic-first backbone of agentic
+"mixture of agents" orchestration, continuous context management, a plugin-driven system
+for agentic memory, and an managed WASM sandbox for a large index of tools.
+
+Its concurrent operations are based on Fluent Concurrency, a lightweight layer of
+guardrails over tokio, hyper, and reqwest meant to make async I/O and inference for
+agentic LLM applications blazing fast and battle-tested.
+
+Its foundation is the Fluent WVR (WASM, vtables, reflection) set of design patterns,
+meant to maximize code reuse, composable primitives, deterministic-first design, and
+a uniform source of metadata and sanitized input constraints.  Every crate in `src/`
+builds on the same foundation of proven design patterns, capability-gated concurrency,
+and type-safe runtime composition.
 
 ## Quick start
 
