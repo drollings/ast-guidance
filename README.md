@@ -116,7 +116,7 @@ and a `fluent-wvr-testutil` crate for shared test infrastructure.
    LLM enhancement is additive, never authoritative
 2. **Cache over compute**: Every novel solution becomes a permanent cached node
 3. **Edge-deployable**: Single-process SQLite, no external services, targets
-   Raspberry Pi class hardware (<50MB binary, <500MB RAM)
+   Raspberry Pi class hardware
 4. **Capability-gated I/O**: All file/network/DB access requires explicit
    capability tokens — no ambient authority
 5. **Structured concurrency**: Every spawned task belongs to a Scope whose close
