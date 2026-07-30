@@ -6,6 +6,7 @@ use http_body_util::BodyExt;
 use crate::dispatch::backend::ChatBackend;
 use crate::dispatch::backend::OpenAiChatBackend;
 use crate::dispatch::backend::RetryChatBackend;
+use crate::dispatch::frontier::DispatchError;
 use crate::ledger::ContentNodeLedger;
 use crate::pipeline::RoutingTarget;
 use crate::server::responses::completion_to_response;
@@ -86,6 +87,79 @@ pub async fn handle_dispatch(
     dispatch_real(rt, router_request, model_name, http_client, target_streams, cache).await
 }
 
+/// Build a `ChatBackend` (optionally wrapped in `RetryChatBackend`) for a single
+/// routing target.
+fn make_backend(http_client: &reqwest::Client, target: &RoutingTarget) -> Arc<dyn ChatBackend> {
+    let base: Arc<dyn ChatBackend> =
+        Arc::new(OpenAiChatBackend::new(http_client.clone(), &target.url));
+    if target.retry_count > 0 {
+        Arc::new(RetryChatBackend::new(base, target.retry_count, target.retry_base_interval_s))
+    } else {
+        base
+    }
+}
+
+/// Try dispatching to a single target.  `is_primary` controls cache write.
+/// Returns `Ok(HyperResponse)` on success or `Err(DispatchError)` on failure.
+async fn dispatch_to_single_target(
+    target: &RoutingTarget,
+    router_request: &RouterRequest,
+    http_client: &reqwest::Client,
+    stream: bool,
+    cache: Option<&Arc<ResponseCache>>,
+    is_primary: bool,
+) -> Result<HyperResponse, DispatchError> {
+    let backend = make_backend(http_client, target);
+
+    if stream {
+        let result = backend
+            .stream_complete(
+                router_request.clone(),
+                target.model.clone(),
+                target.params.clone(),
+                target.idle_timeout_ms,
+                target.total_timeout_ms,
+                target.filter_thinking,
+            )
+            .await?;
+        let mut resp = hyper::Response::new(result.body.boxed_unsync());
+        *resp.status_mut() = hyper::StatusCode::OK;
+        resp.headers_mut()
+            .insert(hyper::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+        crate::server::responses::add_cors_headers(resp.headers_mut());
+        return Ok(resp);
+    }
+
+    let filter_thinking = target.filter_thinking;
+    let mut completion = backend
+        .complete(
+            router_request.clone(),
+            target.model.clone(),
+            target.params.clone(),
+        )
+        .await?;
+
+    if filter_thinking {
+        for choice in &mut completion.choices {
+            if let RouterMessageContent::Text(ref mut text) = choice.message.content {
+                *text = strip_thinking_blocks(text);
+            }
+        }
+    }
+
+    // Cache only the primary (first) target's response
+    if is_primary {
+        if let Some(cache_backend) = cache {
+            let request_json = serde_json::to_string(router_request).unwrap_or_default();
+            if let Ok(response_json) = serde_json::to_value(&completion) {
+                cache_backend.set(&target.model, &request_json, response_json);
+            }
+        }
+    }
+
+    Ok(completion_to_response(&completion, "", false, Some(&target.model)))
+}
+
 pub async fn dispatch_real(
     rt: &RoutingTarget,
     router_request: &RouterRequest,
@@ -94,72 +168,52 @@ pub async fn dispatch_real(
     stream: bool,
     cache: Option<&Arc<ResponseCache>>,
 ) -> Result<HyperResponse, std::convert::Infallible> {
-    let base: Arc<dyn ChatBackend> =
-        Arc::new(OpenAiChatBackend::new(http_client.clone(), &rt.url));
+    let all_targets = std::iter::once(rt)
+        .chain(rt.fallbacks.iter())
+        .collect::<Vec<_>>();
 
-    let backend: Arc<dyn ChatBackend> = if rt.retry_count > 0 {
-        Arc::new(RetryChatBackend::new(base, rt.retry_count, rt.retry_base_interval_s))
-    } else {
-        base
-    };
+    let mut last_error: Option<DispatchError> = None;
 
-    if stream {
-        match backend
-            .stream_complete(
-                router_request.clone(),
-                rt.model.clone(),
-                rt.params.clone(),
-                rt.idle_timeout_ms,
-                rt.total_timeout_ms,
-                rt.filter_thinking,
-            )
-            .await
-        {
-            Ok(body) => {
-                let mut resp = hyper::Response::new(body.body.boxed_unsync());
-                *resp.status_mut() = hyper::StatusCode::OK;
-                resp.headers_mut()
-                    .insert(hyper::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
-                crate::server::responses::add_cors_headers(resp.headers_mut());
-                Ok(resp)
+    for (i, target) in all_targets.iter().enumerate() {
+        tracing::info!(
+            target: "router.server",
+            attempt = i + 1,
+            total = all_targets.len(),
+            model = %target.model,
+            url = %target.url,
+            stream = stream,
+            "dispatch attempt"
+        );
+
+        match dispatch_to_single_target(target, router_request, http_client, stream, cache, i == 0).await {
+            Ok(resp) => {
+                return Ok(resp);
             }
             Err(e) => {
-                tracing::warn!(target: "router.server", error = %e, "streaming dispatch failed, using fallback");
-                let completion = fallback_completion(model_name);
-                Ok(completion_to_response(&completion, model_name, true, None))
+                let is_retryable = e.is_retryable();
+                tracing::warn!(
+                    target: "router.server",
+                    attempt = i + 1,
+                    model = %target.model,
+                    error = %e,
+                    retryable = is_retryable,
+                    remaining = all_targets.len() - i - 1,
+                    "dispatch attempt failed"
+                );
+                last_error = Some(e);
+                // Non-retryable errors (e.g. 400 Bad Request) short-circuit
+                if !is_retryable {
+                    break;
+                }
             }
         }
-    } else {
-        let filter_thinking = rt.filter_thinking;
-        let completion = match backend
-            .complete(
-                router_request.clone(),
-                rt.model.clone(),
-                rt.params.clone(),
-            )
-            .await
-        {
-            Ok(mut c) => {
-                if let Some(cache) = cache {
-                    let request_json = serde_json::to_string(router_request).unwrap_or_default();
-                    if let Ok(response_json) = serde_json::to_value(&c) {
-                        cache.set(&rt.model, &request_json, response_json);
-                    }
-                }
-                if filter_thinking {
-                    for choice in &mut c.choices {
-                        if let RouterMessageContent::Text(ref mut text) = choice.message.content {
-                            *text = strip_thinking_blocks(text);
-                        }
-                    }
-                }
-                c
-            }
-            Err(e) => {
-                tracing::warn!(target: "router.server", error = %e, "dispatch failed, using fallback");
-                fallback_completion(model_name)
-            }
-        };
-        Ok(completion_to_response(&completion, model_name, false, Some(model_name)))
     }
+
+    tracing::warn!(
+        target: "router.server",
+        error = ?last_error,
+        "all dispatch targets failed, returning fallback response"
+    );
+    let completion = fallback_completion(model_name);
+    Ok(completion_to_response(&completion, model_name, stream, None))
 }

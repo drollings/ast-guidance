@@ -206,6 +206,7 @@ async fn handle_chat_completion(
             stream: false,
             idle_timeout_ms: 30000,
             total_timeout_ms: 30000,
+            fallbacks: vec![],
         };
         return handle_dispatch(
             &rt_for_fallback,
@@ -383,6 +384,7 @@ fn resolve_pipeline(
             stream: model_entry.stream,
             idle_timeout_ms: model_entry.idle_timeout_ms,
             total_timeout_ms: model_entry.total_timeout_ms,
+            fallbacks: vec![],
         };
         return crate::pipeline::PipelineResult {
             decisions: vec![], final_response: None, rejected: false,

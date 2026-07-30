@@ -41,6 +41,11 @@ pub struct RoutingTarget {
     /// Maximum total time for the entire request in milliseconds.
     #[serde(default = "default_total_timeout_ms")]
     pub total_timeout_ms: u64,
+    /// Ordered fallback targets to try when the primary fails.
+    /// Populated at route-resolution time from all available models,
+    /// ordered by intelligence proximity to the request complexity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallbacks: Vec<RoutingTarget>,
 }
 
 fn default_retry_interval() -> u64 {
@@ -204,46 +209,7 @@ impl PipelineOrchestratorBuilder {
 
 fn extract_routing_target(metadata: &serde_json::Value) -> Option<RoutingTarget> {
     let rt = metadata.get("routing_target")?;
-    let model = rt.get("model").and_then(|v| v.as_str()).unwrap_or("?");
-    let url = rt.get("url").and_then(|v| v.as_str()).unwrap_or("?");
-    Some(RoutingTarget {
-        url: url.into(),
-        model: model.into(),
-        group: rt
-            .get("group")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .filter(|s| !s.is_empty()),
-        target_name: rt
-            .get("target_name")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        params: rt.get("params").cloned().filter(|v| !v.is_null()),
-        filter_thinking: rt
-            .get("filter_thinking")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        retry_count: rt
-            .get("retry_count")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0) as u32,
-        retry_base_interval_s: rt
-            .get("retry_base_interval_s")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(1),
-        stream: rt
-            .get("stream")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        idle_timeout_ms: rt
-            .get("idle_timeout_ms")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(10_000),
-        total_timeout_ms: rt
-            .get("total_timeout_ms")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(120_000),
-    })
+    serde_json::from_value(rt.clone()).ok()
 }
 
 fn classifier_response_from_decision(decision: &StageDecision) -> Option<String> {

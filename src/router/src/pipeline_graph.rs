@@ -391,46 +391,7 @@ impl WorkUnit for PipelineGraph {
 impl PipelineGraph {
     /// Parse a `RoutingTarget` from the classifier metadata JSON value.
     fn parse_routing_target(rt: &serde_json::Value) -> Option<RoutingTarget> {
-        let url = rt.get("url").and_then(serde_json::Value::as_str)?;
-        let model = rt.get("model").and_then(serde_json::Value::as_str)?;
-        Some(RoutingTarget {
-            url: url.into(),
-            model: model.into(),
-            group: rt
-                .get("group")
-                .and_then(serde_json::Value::as_str)
-                .map(String::from)
-                .filter(|s| !s.is_empty()),
-            target_name: rt
-                .get("target_name")
-                .and_then(serde_json::Value::as_str)
-                .map(String::from),
-            params: rt.get("params").cloned().filter(|v| !v.is_null()),
-            filter_thinking: rt
-                .get("filter_thinking")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
-            retry_count: rt
-                .get("retry_count")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0) as u32,
-            retry_base_interval_s: rt
-                .get("retry_base_interval_s")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(1),
-            stream: rt
-                .get("stream")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
-            idle_timeout_ms: rt
-                .get("idle_timeout_ms")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(10_000),
-            total_timeout_ms: rt
-                .get("total_timeout_ms")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(120_000),
-        })
+        serde_json::from_value(rt.clone()).ok()
     }
 }
 
