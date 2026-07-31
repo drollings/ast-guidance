@@ -3,7 +3,10 @@ use std::sync::Arc;
 
 use clap::Parser;
 use common_core::config::load_json_or_default;
-use fluent_router::config::{validate_no_self_routing, RouterConfig};
+use fluent_router::config::{
+    detect_unimplemented_features, log_unimplemented_features, validate_no_self_routing,
+    RouterConfig,
+};
 use fluent_router::logging::init_router_logging;
 use fluent_router::server::RouterServer;
 use fluent_router::testing::{
@@ -51,6 +54,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     let mut config: RouterConfig = load_json_or_default(args.config.as_ref());
+
+    // Config-selected-but-unimplemented surfaces must be loud at startup.
+    // The typed `RouterConfig` drops unknown keys, so check the raw JSON.
+    let raw_config = std::fs::read_to_string(&args.config)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    if let Some(raw) = raw_config {
+        log_unimplemented_features(&detect_unimplemented_features(&raw));
+    }
 
     // CLI overrides take priority over config file
     let bind_addr = match (args.host.as_deref(), args.port) {
@@ -220,7 +232,11 @@ mod config_tests {
 
     #[test]
     fn test_parse_config() {
-        let content = std::fs::read_to_string("env/coral-router.json").unwrap();
+        let config_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../env/coral-router.json"
+        );
+        let content = std::fs::read_to_string(config_path).unwrap();
         let c: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert!(c.get("server").and_then(|v| v.get("bind_addr")).is_some());
         assert!(c.get("models").is_some());

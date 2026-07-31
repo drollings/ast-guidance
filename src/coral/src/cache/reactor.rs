@@ -18,6 +18,35 @@ use fluent_wvr::prelude::*;
 
 use super::stats::CoralStats;
 
+/// Wrap a tier unit in the standard name-override + metrics adapter stack.
+fn wrap_tier(
+    unit: Arc<dyn Component>,
+    name: &'static str,
+    hist: Arc<LatencyHistogram>,
+) -> Arc<dyn Component> {
+    let adapted = ComponentAdapter::new(unit).with_name_override(name);
+    Arc::new(Instrumented::with_metrics(adapted, name, hist))
+}
+
+/// Weighted-percentile estimate across an aggregated bucket histogram.
+/// Mirrors `LatencyHistogram::estimate_percentile` but sums buckets across
+/// all histograms so p50/p99 reflect the whole cascade, not the first tier.
+fn aggregate_percentile(buckets: &[u64; common_core::metrics::BUCKET_COUNT], pct: f64) -> u64 {
+    let total: u64 = buckets.iter().sum();
+    if total == 0 {
+        return 0;
+    }
+    let target = (total as f64 * pct / 100.0) as u64;
+    let mut cumulative = 0u64;
+    for (i, &bound) in common_core::metrics::BUCKET_MS.iter().enumerate() {
+        cumulative += buckets[i];
+        if cumulative >= target {
+            return bound;
+        }
+    }
+    *common_core::metrics::BUCKET_MS.last().unwrap_or(&5000)
+}
+
 #[derive(Builder)]
 pub struct QueueReactorCreateArgs {
     pub library: Arc<Library>,
@@ -87,18 +116,14 @@ impl QueueReactor {
         if let (Some(ref rt), Some(ref pool)) = (&args.wasm_runtime, &plugin_pool) {
             if let Ok(tools) = args.library.find_wasm_tools_by_capability("query") {
                 for tool in tools.into_iter().take(1) {
+                    let hist = Arc::new(LatencyHistogram::new());
                     let unit = L2WasmUnit::new(
                         Arc::clone(rt),
                         tool,
                         Arc::clone(&args.library),
                         Arc::clone(pool),
                     );
-                    let hist = Arc::new(LatencyHistogram::new());
-                    let adapted =
-                        ComponentAdapter::new(Arc::new(unit)).with_name_override("coral.l2.wasm");
-                    let wrapped =
-                        Instrumented::with_metrics(adapted, "coral.l2.wasm", Arc::clone(&hist));
-                    tiers.push(Arc::new(wrapped));
+                    tiers.push(wrap_tier(Arc::new(unit), "coral.l2.wasm", Arc::clone(&hist)));
                     histograms.push(hist);
                 }
             }
@@ -108,10 +133,7 @@ impl QueueReactor {
         {
             let hist = Arc::new(LatencyHistogram::new());
             let unit = L3GraphUnit::new(Arc::clone(&router));
-            let adapted =
-                ComponentAdapter::new(Arc::new(unit)).with_name_override("coral.l3.graph");
-            let wrapped = Instrumented::with_metrics(adapted, "coral.l3.graph", Arc::clone(&hist));
-            tiers.push(Arc::new(wrapped));
+            tiers.push(wrap_tier(Arc::new(unit), "coral.l3.graph", Arc::clone(&hist)));
             histograms.push(hist);
         }
 
@@ -119,11 +141,7 @@ impl QueueReactor {
         if let Some(ref embedder) = args.embedder {
             let hist = Arc::new(LatencyHistogram::new());
             let unit = L4SemanticUnit::new(Arc::clone(&router), Arc::clone(embedder));
-            let adapted =
-                ComponentAdapter::new(Arc::new(unit)).with_name_override("coral.l4.semantic");
-            let wrapped =
-                Instrumented::with_metrics(adapted, "coral.l4.semantic", Arc::clone(&hist));
-            tiers.push(Arc::new(wrapped));
+            tiers.push(wrap_tier(Arc::new(unit), "coral.l4.semantic", Arc::clone(&hist)));
             histograms.push(hist);
         }
 
@@ -131,11 +149,7 @@ impl QueueReactor {
         if let Some(ref frontier) = args.frontier_config {
             let hist = Arc::new(LatencyHistogram::new());
             let unit = L5FrontierUnit::new(frontier.clone());
-            let adapted =
-                ComponentAdapter::new(Arc::new(unit)).with_name_override("coral.l5.frontier");
-            let wrapped =
-                Instrumented::with_metrics(adapted, "coral.l5.frontier", Arc::clone(&hist));
-            tiers.push(Arc::new(wrapped));
+            tiers.push(wrap_tier(Arc::new(unit), "coral.l5.frontier", Arc::clone(&hist)));
             histograms.push(hist);
         }
 
@@ -230,10 +244,19 @@ impl QueueReactor {
     ) -> Result<NodeId, CacheError> {
         let hash_bytes = content_hash_with_model(query, "solution");
         let hash_id = i64::from_le_bytes(hash_bytes[..8].try_into().unwrap());
-        let embedding = self
-            .embedder
-            .as_ref()
-            .and_then(|e| e.embed(&result.result).ok().filter(|v| !v.is_empty()));
+        // M9.2c: an embedder failure is now observable via `CacheError::Embedding`
+        // instead of being silently swallowed; a missing embedder (feature not
+        // configured) still persists the node without an embedding.
+        let embedding = match self.embedder.as_ref() {
+            Some(e) => match e.embed(&result.result) {
+                Ok(v) if !v.is_empty() => Some(v),
+                Ok(_) => None,
+                Err(e) => {
+                    return Err(CacheError::Embedding(format!("query={query}: {e}")));
+                }
+            },
+            None => None,
+        };
         let name = if depth > 0 {
             format!("solution:subtask:{query}")
         } else {
@@ -265,18 +288,18 @@ impl QueueReactor {
     pub fn coral_stats(&self) -> CoralStats {
         let mut total_count = 0u64;
         let mut total_sum_ms = 0u64;
+        let mut buckets = [0u64; common_core::metrics::BUCKET_COUNT];
         for h in &self.histograms {
             total_count += h.count();
             total_sum_ms += h.sum_ms();
+            for (i, b) in buckets.iter_mut().enumerate() {
+                *b += h.bucket(i);
+            }
         }
-        let p50 = self
-            .histograms
-            .first()
-            .map_or(0, |h| h.estimate_percentile(50.0));
-        let p99 = self
-            .histograms
-            .first()
-            .map_or(0, |h| h.estimate_percentile(99.0));
+        // M9.5: p50/p99 are aggregated across ALL tier histograms (weighted
+        // by count) instead of reflecting only the first tier.
+        let p50 = aggregate_percentile(&buckets, 50.0);
+        let p99 = aggregate_percentile(&buckets, 99.0);
         CoralStats {
             tier_count: self.histograms.len(),
             total_count,

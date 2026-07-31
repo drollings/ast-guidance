@@ -385,25 +385,36 @@ impl Limiter {
     /// Synchronous version of `run` for callers without an async context.
     /// Uses `Handle::block_on` if a tokio runtime is active, otherwise
     /// creates a dedicated current-thread runtime for the duration of the call.
+    ///
+    /// When invoked from *inside* a running multi-threaded tokio runtime (the
+    /// router's HTTP handler does this), the future is driven via
+    /// `tokio::task::block_in_place` so the worker thread is not starved —
+    /// the same canonical pattern as `guidance_llm::client::chat_complete`
+    /// (see `src/llm/src/client.rs`). A bare `Handle::block_on` would panic
+    /// with "Cannot start a runtime from within a runtime".
     pub fn run_sync<F, Fut, T>(&self, f: F) -> T
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = T>,
     {
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.block_on(async move {
-                let _permit = self.sem.acquire().await.expect("semaphore closed");
-                f().await
-            })
-        } else {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build runtime for Limiter::run_sync");
-            rt.block_on(async move {
-                let _permit = self.sem.acquire().await.expect("semaphore closed");
-                f().await
-            })
+        let block = async move {
+            let _permit = self.sem.acquire().await.expect("semaphore closed");
+            f().await
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle)
+                if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+            {
+                tokio::task::block_in_place(|| handle.block_on(block))
+            }
+            Ok(handle) => handle.block_on(block),
+            Err(_) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build runtime for Limiter::run_sync");
+                rt.block_on(block)
+            }
         }
     }
 }

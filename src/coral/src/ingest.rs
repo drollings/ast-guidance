@@ -213,6 +213,11 @@ impl BatchIngestor {
 
         self.flush()?;
 
+        // Resolve hash-based IDs to SQLite NodeIds via one batch query instead
+        // of a per-edge name lookup (M9.6: kills the N+1).
+        let names: Vec<&str> = id_to_name.values().map(String::as_str).collect();
+        let name_to_sql_id = self.library.find_node_ids_by_names(&names)?;
+
         // Insert edges: resolve hash-based IDs to SQLite NodeIds via node name lookup
         for edge in &pending_edges {
             let (Some(from_name), Some(to_name)) =
@@ -221,9 +226,9 @@ impl BatchIngestor {
                 self.stats.errors_skipped += 1;
                 continue;
             };
-            let (Ok(Some(from_sql_id)), Ok(Some(to_sql_id))) = (
-                self.library.find_node_by_name(from_name),
-                self.library.find_node_by_name(to_name),
+            let (Some(from_sql_id), Some(to_sql_id)) = (
+                name_to_sql_id.get(from_name).copied(),
+                name_to_sql_id.get(to_name).copied(),
             ) else {
                 self.stats.errors_skipped += 1;
                 continue;
@@ -238,54 +243,6 @@ impl BatchIngestor {
         }
 
         Ok(self.stats.clone())
-    }
-}
-
-// TODO(M6): remove — superseded by guidance_ontology::mapper::TripleMapper
-pub struct TripleMapper;
-
-impl TripleMapper {
-    pub fn new() -> Self {
-        Self
-    }
-
-    pub fn map_triple(
-        &self,
-        subject: &str,
-        predicate: &str,
-        object: &str,
-    ) -> (ContentNode, ContentNode) {
-        let sub = ContentNode {
-            id: None,
-            name: subject.into(),
-            source: format!("{subject} {predicate} {object}"),
-            lod: vec![
-                format!("{subject} {predicate} {object}"),
-                format!("{subject} -> {object}"),
-                subject.into(),
-            ],
-            embedding: None,
-            capabilities: None,
-            ..Default::default()
-        };
-
-        let obj = ContentNode {
-            id: None,
-            name: object.into(),
-            source: object.into(),
-            lod: vec![object.into()],
-            embedding: None,
-            capabilities: None,
-            ..Default::default()
-        };
-
-        (sub, obj)
-    }
-}
-
-impl Default for TripleMapper {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -383,14 +340,5 @@ mod tests {
 
         assert!(lib.find_node_by_name("full_1").unwrap().is_some());
         assert!(lib.find_node_by_name("full_2").unwrap().is_some());
-    }
-
-    #[test]
-    fn test_triple_mapper() {
-        let mapper = TripleMapper::new();
-        let (sub, obj) = mapper.map_triple("Zig", "is_a", "language");
-        assert_eq!(sub.name.as_str(), "Zig");
-        assert_eq!(obj.name.as_str(), "language");
-        assert_eq!(sub.lod.len(), 3);
     }
 }

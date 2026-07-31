@@ -40,14 +40,16 @@ pub struct L1Cache {
 
 impl L1Cache {
     pub fn new() -> Self {
-        Self::with_capacity(10_000)
+        Self::with_capacity(10_000).expect("default L1 capacity is non-zero")
     }
 
-    pub fn with_capacity(max_entries: usize) -> Self {
-        Self {
-            inner: Mutex::new(LruCache::new(NonZeroUsize::new(max_entries).unwrap())),
+    pub fn with_capacity(max_entries: usize) -> Result<Self, crate::error::CacheError> {
+        let capacity = NonZeroUsize::new(max_entries)
+            .ok_or(crate::error::CacheError::InvalidCapacity(max_entries))?;
+        Ok(Self {
+            inner: Mutex::new(LruCache::new(capacity)),
             max_entries,
-        }
+        })
     }
 
     pub fn get(&self, query: &str) -> Option<Arc<RoutingResult>> {
@@ -75,7 +77,7 @@ impl L1Cache {
 
 impl Default for L1Cache {
     fn default() -> Self {
-        Self::with_capacity(10_000)
+        Self::new()
     }
 }
 
@@ -119,7 +121,7 @@ mod tests {
 
     #[test]
     fn test_lru_eviction() {
-        let cache = L1Cache::with_capacity(2);
+        let cache = L1Cache::with_capacity(2).unwrap();
         cache.set("a".into(), make_result("a"));
         cache.set("b".into(), make_result("b"));
         cache.set("c".into(), make_result("c"));
@@ -130,7 +132,7 @@ mod tests {
 
     #[test]
     fn test_lru_renew_on_get() {
-        let cache = L1Cache::with_capacity(2);
+        let cache = L1Cache::with_capacity(2).unwrap();
         cache.set("a".into(), make_result("a"));
         cache.set("b".into(), make_result("b"));
         cache.get("a");
@@ -142,16 +144,21 @@ mod tests {
 
     #[test]
     fn test_max_entries() {
-        let cache = L1Cache::with_capacity(5);
+        let cache = L1Cache::with_capacity(5).unwrap();
         assert_eq!(cache.max_entries(), 5);
     }
 
     #[test]
     fn test_lru_capacity_bound() {
-        let cache = L1Cache::with_capacity(3);
+        let cache = L1Cache::with_capacity(3).unwrap();
         for i in 0..100 {
             cache.set(format!("key{i}"), make_result(&format!("key{i}")));
         }
         assert_eq!(cache.len(), 3);
+    }
+
+    #[test]
+    fn test_zero_capacity_errors() {
+        assert!(L1Cache::with_capacity(0).is_err());
     }
 }

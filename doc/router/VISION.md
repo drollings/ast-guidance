@@ -501,6 +501,11 @@ handled a given request, why, and what it cost.
 
 **Foundational and stable:**
 
+- The request pipeline is the 3-stage shape `DeterministicPreFilter →
+  Classifier → Router` (`PipelineStage` in `pipeline_types.rs`). The
+  classifier is a single LLM call that subsumes the former quality-gate,
+  planning-refinement, and guardrail stages; it returns a direct response, a
+  routing target, or a rejection.
 - Deterministic pre-filtering (regex-based rejection and PII detection) runs
   before any model is invoked.
 - A fast local classifier evaluates coherence, safety, and intent, and emits
@@ -528,10 +533,6 @@ handled a given request, why, and what it cost.
   single self-describing tree. Each classifier node auto-generates its
   prompt from its children; add a route to the config and it appears in
   the prompt without manual editing.
-- **Escalation ladder** as a configurable per-group sequence of frontier
-  engagement modes (filter → question → team → turnover), tried in order
-  after all local models fail. Each mode is a progressively more permissive
-  policy for crossing the local-to-frontier boundary.
 - Prompt auto-construction from tree children: the system builds the
   classifier system prompt at node evaluation time, listing only the
   actual child routes and their descriptions.
@@ -554,6 +555,12 @@ handled a given request, why, and what it cost.
 - Three separate library-scale HNSW indices (prior-workflow library,
   rubric/validated-answer cache, blacklist-adjacent similarity) —
   structurally scoped, not yet populated or wired into a request path.
+- **Escalation ladder** as a configurable per-group sequence of frontier
+  engagement modes (filter → question → team → turnover), tried in order
+  after all local models fail. Each mode is a progressively more permissive
+  policy for crossing the local-to-frontier boundary. Config-only today; the
+  binary emits a startup warning if an escalation ladder is configured (see
+  M5.3).
 - The `plan` route — module and types exist; gap-analysis and interview
   generation are still stubs.
 - The `rigor` route — types and structure exist; execution is not yet wired

@@ -32,18 +32,15 @@ fn extract_query(ctx: &WorkContext) -> Result<String, WorkError> {
         .ok_or_else(|| WorkError::Dependency("missing 'query' in WorkContext.metadata".into()))
 }
 
-fn make_output(result: &RoutingResult) -> WorkOutput {
-    WorkOutput::ok_with_data(
-        result.tier.to_string(),
-        serde_json::to_value(result).unwrap_or_default(),
-    )
+fn make_output(result: &RoutingResult) -> Result<WorkOutput, WorkError> {
+    WorkOutput::typed(result.tier.to_string(), result)
 }
 
 fn routing_to_work_result(
     result: Result<RoutingResult, crate::error::CacheError>,
 ) -> Result<WorkOutput, WorkError> {
     match result {
-        Ok(r) => Ok(make_output(&r)),
+        Ok(r) => make_output(&r),
         Err(e) => Err(WorkError::Execution(e.to_string())),
     }
 }
@@ -122,12 +119,12 @@ impl WorkUnit for L2WasmUnit {
                 .call(query.as_bytes())
                 .map_err(|e| WorkError::Execution(e.to_string()))?
         };
-        let result_str = String::from_utf8_lossy(&result_bytes).to_string();
-        Ok(make_output(&RoutingResult {
+        let result_str = String::from_utf8_lossy(&result_bytes);
+        make_output(&RoutingResult {
             query,
-            result: result_str,
+            result: result_str.into_owned(),
             tier: CacheTier::L2WasmWorkflow,
-        }))
+        })
     }
 }
 
@@ -385,11 +382,11 @@ impl WorkUnit for L4_5DecomposeUnit {
         if merged_result.is_empty() {
             return Err(WorkError::Execution("all subtasks returned empty".into()));
         }
-        Ok(make_output(&RoutingResult {
+        make_output(&RoutingResult {
             query,
             result: merged_result,
             tier: CacheTier::L4_5Decompose,
-        }))
+        })
     }
 }
 
@@ -488,11 +485,11 @@ impl WorkUnit for L5FrontierUnit {
         if is_malformed_response(&response) {
             return Err(WorkError::Execution("malformed response".into()));
         }
-        Ok(make_output(&RoutingResult {
+        make_output(&RoutingResult {
             query,
             result: response,
             tier: CacheTier::L5Frontier,
-        }))
+        })
     }
 }
 
@@ -567,7 +564,10 @@ impl TierRegistry {
         for tier in &self.tiers {
             match tier.execute(&ctx) {
                 Ok(output) => {
-                    return serde_json::from_value::<RoutingResult>(output.data)
+                    // M8.4: exactly one deserialize hop — the tier serialized
+                    // once via `WorkOutput::typed`, this consumes it back.
+                    return output
+                        .data_take::<RoutingResult>()
                         .map_err(|e| WorkError::Execution(e.to_string()));
                 }
                 Err(e) => {

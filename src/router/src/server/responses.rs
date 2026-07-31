@@ -52,7 +52,7 @@ pub fn add_cors_headers(headers: &mut HeaderMap) {
     for (name, value) in CORS_HEADERS {
         headers.insert(
             hyper::header::HeaderName::from_static(name),
-            value.parse().unwrap(),
+            hyper::header::HeaderValue::from_static(value),
         );
     }
 }
@@ -85,11 +85,13 @@ pub fn completion_to_response(
     let full = Full::new(Bytes::from(body_str));
     let mut resp = HyperResponse::new(full.boxed_unsync());
     *resp.status_mut() = hyper::StatusCode::OK;
-    resp.headers_mut()
-        .insert(hyper::header::CONTENT_TYPE, content_type.parse().unwrap());
+    resp.headers_mut().insert(
+        hyper::header::CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static(content_type),
+    );
     resp.headers_mut().insert(
         hyper::header::CONTENT_LENGTH,
-        len.to_string().parse().unwrap(),
+        hyper::header::HeaderValue::from(len as u64),
     );
     add_cors_headers(resp.headers_mut());
     resp
@@ -103,11 +105,11 @@ pub fn json_response(status: hyper::StatusCode, value: &serde_json::Value) -> Hy
     *resp.status_mut() = status;
     resp.headers_mut().insert(
         hyper::header::CONTENT_TYPE,
-        "application/json".parse().unwrap(),
+        hyper::header::HeaderValue::from_static("application/json"),
     );
     resp.headers_mut().insert(
         hyper::header::CONTENT_LENGTH,
-        len.to_string().parse().unwrap(),
+        hyper::header::HeaderValue::from(len as u64),
     );
     add_cors_headers(resp.headers_mut());
     resp

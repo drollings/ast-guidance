@@ -30,7 +30,12 @@ impl ScoreMatrix {
             let mut matches_all = true;
 
             for (i, dim) in self.dimensions.iter().enumerate() {
-                let score = scores.get(dim).copied().unwrap_or(0.0);
+                // Non-finite scores (NaN/±Inf from a malformed classifier
+                // response) carry no ranking signal — treat them as no-match
+                // (zero contribution) so they can never poison `total` and
+                // panic the sort below.
+                let raw_score = scores.get(dim).copied().unwrap_or(0.0);
+                let score = if raw_score.is_finite() { raw_score } else { 0.0 };
                 let weight = self.weights.get(i).copied().unwrap_or(0.0);
                 route_vector.push((dim.clone(), score));
 
@@ -52,7 +57,13 @@ impl ScoreMatrix {
             }
         }
 
-        results.sort_by(|a, b| b.weighted_score.partial_cmp(&a.weighted_score).unwrap());
+        // `total` is always finite after the per-score guard above; the
+        // fallback ordering also protects against a non-finite config weight.
+        results.sort_by(|a, b| {
+            b.weighted_score
+                .partial_cmp(&a.weighted_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results
     }
 }
@@ -148,5 +159,27 @@ mod tests {
         ]);
         let results = matrix.resolve(&scores);
         assert_eq!(results[0].route_name, "local");
+    }
+
+    #[test]
+    fn non_finite_scores_do_not_panic_and_treat_as_no_match() {
+        let matrix = ScoreMatrix::default();
+        // NaN coherence + Infinity completeness: both carry no signal and are
+        // treated as zero, so the ranking still resolves deterministically.
+        let scores = HashMap::from([
+            ("coherence".into(), f64::NAN),
+            ("complexity".into(), f64::INFINITY),
+            ("completeness".into(), 0.9),
+            ("risk".into(), 0.1),
+        ]);
+        let results = matrix.resolve(&scores);
+        assert!(!results.is_empty(), "routes should still resolve");
+        for r in &results {
+            assert!(
+                r.weighted_score.is_finite(),
+                "weighted score must stay finite, got {}",
+                r.weighted_score
+            );
+        }
     }
 }

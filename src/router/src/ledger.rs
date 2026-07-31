@@ -37,6 +37,12 @@ pub struct ContentNodeLedger {
     next_id: Mutex<i64>,
 }
 
+/// Poison-safe mutex lock: a panic while the mutex was held must not wedge
+/// the ledger permanently. Mirrors the pattern in `metrics.rs`.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl ContentNodeLedger {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, LedgerError> {
         let db_path = path.into();
@@ -72,11 +78,11 @@ impl ContentNodeLedger {
         request_id: &str,
         content: &str,
     ) -> Result<NodeId, LedgerError> {
-        let mut next = self.next_id.lock().unwrap();
+        let mut next = lock(&self.next_id);
         let id = NodeId::from_int(*next);
         *next += 1;
 
-        let db = self.db.lock().unwrap();
+        let db = lock(&self.db);
         db.execute(
             "INSERT INTO ledger (node_id, session_id, request_id, role, content)
              VALUES (?1, ?2, ?3, 'user', ?4)",
@@ -94,7 +100,7 @@ impl ContentNodeLedger {
         score: Option<f64>,
         content: &str,
     ) -> Result<(), LedgerError> {
-        let db = self.db.lock().unwrap();
+        let db = lock(&self.db);
         db.execute(
             "UPDATE ledger SET accepted = ?1, acceptance_score = ?2, content = ?3
              WHERE node_id = ?4",
@@ -110,7 +116,7 @@ impl ContentNodeLedger {
         summary: &str,
         lod: u8,
     ) -> Result<(), LedgerError> {
-        let db = self.db.lock().unwrap();
+        let db = lock(&self.db);
         db.execute(
             "UPDATE ledger SET content = ?1, active_lod = ?2 WHERE node_id = ?3",
             rusqlite::params![summary, lod, node_id.as_int()],
@@ -124,7 +130,7 @@ impl ContentNodeLedger {
         session_id: &str,
         limit: usize,
     ) -> Result<Vec<LedgerEntry>, LedgerError> {
-        let db = self.db.lock().unwrap();
+        let db = lock(&self.db);
         let mut stmt = db
             .prepare(
                 "SELECT node_id, session_id, request_id, role, content,
@@ -161,5 +167,49 @@ impl ContentNodeLedger {
             result.push(entry.map_err(|e| LedgerError::Db(e.to_string()))?);
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common_core::hash::uuid_v4;
+
+    fn temp_ledger() -> ContentNodeLedger {
+        let dir = std::env::temp_dir().join(format!("coral-router-ledger-{}", uuid_v4()));
+        let ledger = ContentNodeLedger::open(&dir).unwrap();
+        let _ = std::fs::remove_file(&dir);
+        ledger
+    }
+
+    #[test]
+    fn record_and_fetch_roundtrip() {
+        let ledger = temp_ledger();
+        let id = ledger
+            .record_request("sess-1", "req-1", "hello")
+            .unwrap();
+        ledger.record_result(id, true, Some(1.0), "reply").unwrap();
+        let entries = ledger.get_session_entries("sess-1", 10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "reply");
+        assert!(entries[0].accepted);
+    }
+
+    #[test]
+    fn poisoned_db_mutex_recovers() {
+        let ledger = temp_ledger();
+        // Poison the db mutex by panicking while it is held.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ledger.db.lock().unwrap();
+            panic!("simulated panic while holding db mutex");
+        }));
+        // Subsequent calls must still succeed via the poison-recovery helper.
+        let id = ledger
+            .record_request("sess-p", "req-p", "after-poison")
+            .unwrap();
+        ledger.record_result(id, false, Some(0.0), "recovered").unwrap();
+        let entries = ledger.get_session_entries("sess-p", 10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "recovered");
     }
 }

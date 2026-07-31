@@ -2,16 +2,14 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum CacheError {
-    #[error("library required but not configured")]
-    LibraryRequired,
-    #[error("embedder required but not configured")]
-    EmbedderRequired,
     #[error("cache miss")]
     Miss,
     #[error("frontier error: {0}")]
     FrontierError(String),
     #[error("persist failed: {0}")]
     PersistFailed(String),
+    #[error("invalid cache capacity: {0}")]
+    InvalidCapacity(usize),
     #[error("database error: {0}")]
     Database(#[from] common_core::error::SqliteError),
     #[error("embedding error: {0}")]
@@ -27,12 +25,6 @@ impl From<rusqlite::Error> for CacheError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cache_error_library_required() {
-        let err = CacheError::LibraryRequired;
-        assert_eq!(format!("{err}"), "library required but not configured");
-    }
 
     #[test]
     fn cache_error_frontier() {

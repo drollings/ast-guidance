@@ -131,6 +131,23 @@ fn limiter_run_sync_caps_concurrency() {
     assert_eq!(counter.load(Ordering::SeqCst), 0);
 }
 
+/// `Limiter::run_sync` called from *inside* a running multi-threaded tokio
+/// runtime must not panic with "Cannot start a runtime from within a runtime".
+/// This is the router HTTP handler's exact shape: the classifier runs through
+/// `run_sync` on a tokio worker thread. Regression for M7 (HTTP harness).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn limiter_run_sync_inside_multithread_runtime_no_panic() {
+    let limiter = Limiter::new(1);
+    let called = Arc::new(AtomicUsize::new(0));
+    let called_in_task = Arc::clone(&called);
+    // Called directly on a tokio worker thread — the router HTTP handler's
+    // exact shape. A bare `Handle::block_on` here would panic.
+    limiter.run_sync(move || async move {
+        called_in_task.fetch_add(1, Ordering::SeqCst);
+    });
+    assert_eq!(called.load(Ordering::SeqCst), 1);
+}
+
 #[test]
 fn test_priority_queue_fast_path() {
     let mut pq = PriorityQueue::new();

@@ -40,6 +40,14 @@ impl BatchEmbedding {
         let start = i * self.dims;
         &self.flat[start..start + self.dims]
     }
+
+    /// Checked accessor: returns `None` when `i` is out of bounds instead of
+    /// panicking. Prefer over `vector` for input-derived indices.
+    pub fn try_vector(&self, i: usize) -> Option<&[f32]> {
+        let start = i.checked_mul(self.dims)?;
+        let end = start.checked_add(self.dims)?;
+        self.flat.get(start..end)
+    }
 }
 
 #[async_trait]
@@ -197,11 +205,12 @@ impl<T: EmbeddingProvider> CachedEmbeddingProvider<T> {
     }
 
     pub fn new_with_limit(inner: T, limit: usize) -> Self {
+        let capacity = NonZeroUsize::new(limit)
+            .or_else(|| NonZeroUsize::new(DEFAULT_CACHE_LIMIT))
+            .unwrap_or(NonZeroUsize::MIN);
         Self {
             inner,
-            cache: Arc::new(Mutex::new(LruCache::new(
-                NonZeroUsize::new(limit).unwrap_or(NonZeroUsize::new(DEFAULT_CACHE_LIMIT).unwrap()),
-            ))),
+            cache: Arc::new(Mutex::new(LruCache::new(capacity))),
         }
     }
 
@@ -245,55 +254,16 @@ impl<T: EmbeddingProvider + Send + Sync + 'static> EmbeddingProvider
     }
 
     fn embed_batch(&self, texts: &[&str]) -> Result<BatchEmbedding, EmbeddingError> {
-        let dims = self.dimensions() as usize;
-        let mut flat = Vec::with_capacity(texts.len().saturating_mul(dims));
-        let mut uncached_texts: Vec<&str> = Vec::new();
-        let mut uncached_positions: Vec<usize> = Vec::new();
-        let mut results: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
-
-        for (i, text) in texts.iter().enumerate() {
-            if text.is_empty() {
-                results[i] = Some(Vec::new());
-                continue;
-            }
-            let key = self.cache_key(text);
-            if let Ok(mut map) = self.cache.lock() {
-                if let Some(cached) = map.get(&key) {
-                    results[i] = Some(cached.clone());
-                    continue;
-                }
-            }
-            uncached_texts.push(text);
-            uncached_positions.push(i);
+        // M8.5: the sync variant is a thin runtime shim over the single async
+        // core — the cache loop lives in exactly one place. Uses the canonical
+        // `block_in_place` / fallback-runtime pattern from `do_http_post`
+        // (which mirrors `client.rs::chat_complete`).
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(move || {
+                handle.block_on(self.embed_batch_async(texts))
+            }),
+            Err(_) => fallback_runtime().block_on(self.embed_batch_async(texts)),
         }
-
-        if !uncached_texts.is_empty() {
-            let batch = self.inner.embed_batch(&uncached_texts)?;
-            for (j, &pos) in uncached_positions.iter().enumerate() {
-                let vec = batch.vector(j).to_vec();
-                results[pos] = Some(vec.clone());
-                let key = self.cache_key(uncached_texts[j]);
-                if let Ok(mut map) = self.cache.lock() {
-                    map.put(key, vec);
-                }
-            }
-        }
-
-        for v in results.iter().flatten() {
-            flat.extend_from_slice(v);
-        }
-
-        let count = results.len();
-        let actual_dims = if count > 0 {
-            results[0].as_ref().map_or(0, Vec::len)
-        } else {
-            0
-        };
-        Ok(BatchEmbedding {
-            flat,
-            count,
-            dims: actual_dims,
-        })
     }
 
     async fn embed_async(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
@@ -343,12 +313,21 @@ impl<T: EmbeddingProvider + Send + Sync + 'static> EmbeddingProvider
         if !uncached_texts.is_empty() {
             let batch = self.inner.embed_batch_async(&uncached_texts).await?;
             for (j, &pos) in uncached_positions.iter().enumerate() {
-                let vec = batch.vector(j).to_vec();
-                results[pos] = Some(vec.clone());
+                let vec = batch
+                    .try_vector(j)
+                    .ok_or_else(|| {
+                        EmbeddingError::ParseError(format!(
+                            "batch returned fewer vectors than requested (requested {j})"
+                        ))
+                    })?
+                    .to_vec();
                 let key = self.cache_key(uncached_texts[j]);
+                // M8.8: move the fresh vector into the result slot; the cache
+                // receives a clone (the result slot must keep its value).
                 if let Ok(mut map) = self.cache.lock() {
-                    map.put(key, vec);
+                    map.put(key, vec.clone());
                 }
+                results[pos] = Some(vec);
             }
         }
 
@@ -506,19 +485,37 @@ async fn do_http_post_async(
         .map_err(|e| EmbeddingError::RequestFailed(e.to_string()))
 }
 
+/// Sync HTTP POST adapter for embedding calls.
+///
+/// Uses `tokio::task::block_in_place` when called from inside a tokio runtime
+/// (which the coral L4 tier does) so it does not panic with
+/// "Cannot start a runtime from within a runtime"; falls back to the
+/// process-wide runtime when no runtime is active. The `client.rs`
+/// `chat_complete` adapter owns the canonical pattern.
 fn do_http_post(
     url: &str,
     body: &serde_json::Value,
     auth_header: Option<&str>,
 ) -> Result<Vec<u8>, EmbeddingError> {
-    static RT: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(move || {
+            handle.block_on(do_http_post_async(url, body, auth_header))
+        }),
+        Err(_) => fallback_runtime().block_on(do_http_post_async(url, body, auth_header)),
+    }
+}
+
+/// Fallback runtime used when the sync adapter is called with no active tokio
+/// runtime (e.g. a plain `fn main()`). Mirrors `client.rs::fallback_runtime`.
+fn fallback_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
+            .worker_threads(2)
             .enable_all()
             .build()
-            .unwrap()
-    });
-    RT.block_on(do_http_post_async(url, body, auth_header))
+            .expect("failed to build fallback tokio runtime for embeddings")
+    })
 }
 
 fn parse_float_array(arr: &[serde_json::Value]) -> Result<Vec<f32>, EmbeddingError> {
@@ -605,7 +602,12 @@ pub fn parse_openai_batch_response(json: &[u8]) -> Result<BatchEmbedding, Embedd
 }
 
 fn validate_url(url: &str) -> Result<(), EmbeddingError> {
-    validate_https_or_local_http(url).map_err(|_| EmbeddingError::InvalidApiUrl)
+    use crate::url::UrlError;
+    validate_https_or_local_http(url).map_err(|e| match e {
+        UrlError::InvalidApiUrl => EmbeddingError::InvalidApiUrl,
+        UrlError::InsecureApiUrl => EmbeddingError::InsecureApiUrl,
+        UrlError::SsrfBlockedUrl => EmbeddingError::SsrfBlockedUrl,
+    })
 }
 
 pub fn create_embedding_provider(
@@ -697,6 +699,19 @@ mod tests {
     }
 
     #[test]
+    fn batch_embedding_try_vector_bounds() {
+        let batch = BatchEmbedding {
+            flat: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            count: 2,
+            dims: 3,
+        };
+        assert_eq!(batch.try_vector(0), Some(&[0.1, 0.2, 0.3][..]));
+        assert_eq!(batch.try_vector(1), Some(&[0.4, 0.5, 0.6][..]));
+        assert_eq!(batch.try_vector(2), None);
+        assert_eq!(batch.try_vector(100), None);
+    }
+
+    #[test]
     fn ollama_embedding_init() {
         let p = OllamaEmbedding::new(Some("llama3"), Some("http://localhost:11434"), 4096).unwrap();
         assert_eq!(p.name(), "ollama");
@@ -781,7 +796,7 @@ mod tests {
     #[test]
     fn factory_custom_prefix() {
         let p = create_embedding_provider(
-            "custom:http://upstream.test:8080",
+            "custom:https://upstream.test:8080",
             None,
             None,
             Some("sk-test"),
@@ -889,6 +904,40 @@ mod tests {
         let batch = p.embed_batch(&["a", "b"]).unwrap();
         assert_eq!(batch.count, 2);
         assert_eq!(batch.dims, 2);
+        mock.assert();
+    }
+
+    #[test]
+    fn do_http_post_outside_runtime_uses_fallback() {
+        // Plain #[test] thread has no active tokio runtime; do_http_post must
+        // fall back to the process-wide runtime instead of panicking.
+        let server = httpmock::MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/api/embed");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"embeddings": [[0.1, 0.2]]}"#);
+        });
+        let body = serde_json::json!({"model": "test", "input": ["x"]});
+        let bytes = do_http_post(&server.url("/api/embed"), &body, None).unwrap();
+        assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_ok());
+        mock.assert();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn do_http_post_inside_runtime_uses_block_in_place() {
+        // Inside a tokio runtime, do_http_post must use block_in_place, not
+        // construct a second runtime (which would panic).
+        let server = httpmock::MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/api/embed");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"embeddings": [[0.1, 0.2]]}"#);
+        });
+        let body = serde_json::json!({"model": "test", "input": ["x"]});
+        let bytes = do_http_post(&server.url("/api/embed"), &body, None).unwrap();
+        assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_ok());
         mock.assert();
     }
 

@@ -28,34 +28,71 @@ pub static GENERIC_API_KEY_RE: LazyLock<Regex> =
 pub static IPV6_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b").unwrap());
 
-/// Canonical regex pattern strings for PII detection. Used by the router's
-/// deterministic pre-filter to build `PatternEntry` values.
+/// Canonical PII detection patterns.
+///
+/// The compiled statics above are the single source of truth. This table is
+/// derived from them so the names and regex strings can never drift from the
+/// compiled patterns used by `anonymize`.
 pub struct PiiPattern {
     pub name: &'static str,
-    pub regex: &'static str,
+    pub regex: &'static LazyLock<Regex>,
 }
 
-pub fn pii_patterns() -> Vec<PiiPattern> {
-    vec![
+pub fn pii_patterns() -> &'static [PiiPattern] {
+    static PATTERNS: &[PiiPattern] = &[
         PiiPattern {
             name: "ssn",
-            regex: r"\b\d{3}-\d{2}-\d{4}\b",
+            regex: &SSN_US_RE,
         },
         PiiPattern {
             name: "card_number",
-            regex: r"\b(?:\d[ -]*?){13,19}\b",
+            regex: &CREDIT_CARD_RE,
         },
         PiiPattern {
             name: "email",
-            regex: r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+            regex: &EMAIL_RE,
         },
         PiiPattern {
             name: "phone",
-            regex: r"\b(?:\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b",
+            regex: &PHONE_US_RE,
         },
         PiiPattern {
             name: "api_key",
-            regex: r"(?i)(?:api[_-]?key|secret|token|password)\s*[:=]\s*[^\s]{8,}",
+            regex: &API_KEY_RE,
         },
-    ]
+    ];
+    PATTERNS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn patterns_table_has_expected_shape() {
+        let patterns = pii_patterns();
+        let names: Vec<&str> = patterns.iter().map(|p| p.name).collect();
+        assert_eq!(names, ["ssn", "card_number", "email", "phone", "api_key"]);
+        for p in patterns {
+            assert!(!p.regex.as_str().is_empty());
+            let compiled = Regex::new(p.regex.as_str()).expect("table regex compiles");
+            assert_eq!(compiled.as_str(), p.regex.as_str());
+        }
+    }
+
+    #[test]
+    fn patterns_table_matches_statics() {
+        let patterns = pii_patterns();
+        assert_eq!(patterns[0].regex.as_str(), SSN_US_RE.as_str());
+        assert_eq!(patterns[1].regex.as_str(), CREDIT_CARD_RE.as_str());
+        assert_eq!(patterns[2].regex.as_str(), EMAIL_RE.as_str());
+        assert_eq!(patterns[3].regex.as_str(), PHONE_US_RE.as_str());
+        assert_eq!(patterns[4].regex.as_str(), API_KEY_RE.as_str());
+    }
+
+    #[test]
+    fn ssn_pattern_matches() {
+        assert!(SSN_US_RE.is_match("123-45-6789"));
+        assert!(!SSN_US_RE.is_match("1234-56-789"));
+    }
 }

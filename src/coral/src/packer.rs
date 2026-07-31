@@ -1,9 +1,9 @@
-use common_core::tokens::estimate_tokens;
-use common_core::tokens::TokenBudget;
 use fluent_types::{ContentNode, NodeId};
 use thiserror::Error;
 
 use crate::db::Library;
+
+pub use guidance_llm::ContextPacker;
 
 #[derive(Error, Debug)]
 pub enum PackerError {
@@ -21,65 +21,37 @@ pub struct PackedNode {
     pub graph_distance: f64,
 }
 
-pub struct ContextPacker {
-    pub budget: TokenBudget,
-    pub chars_per_token: usize,
+/// Get the text at a given LOD level from a node. Node-specific helper kept
+/// coral-side; the shared LOD-selection and budget-fit logic lives in
+/// `guidance_llm::ContextPacker` (single `ContextPacker` per the roadmap).
+pub fn get_lod_text(node: &ContentNode, level: u8) -> &str {
+    let idx = level as usize;
+    if idx < node.lod.len() {
+        node.lod[idx].as_str()
+    } else if let Some(last) = node.lod.last() {
+        last.as_str()
+    } else {
+        node.name.as_str()
+    }
 }
 
-impl ContextPacker {
-    pub fn new(token_budget: usize) -> Self {
-        Self {
-            budget: TokenBudget(token_budget),
-            chars_per_token: 4,
-        }
-    }
-
-    /// Estimate token count from text length.
-    pub fn estimate_tokens(text: &str) -> usize {
-        estimate_tokens(text) as usize
-    }
-
-    /// Select the appropriate LOD level based on graph distance.
-    /// Closer nodes get more detailed LOD (lower index).
-    pub fn select_lod_by_distance(_node: &ContentNode, graph_distance: f64, avg_degree: f64) -> u8 {
-        let effective_distance = graph_distance / (1.0 + avg_degree / (avg_degree + 1.0));
-        if effective_distance < 1.0 {
-            return 0;
-        }
-        if effective_distance < 2.0 {
-            return 1;
-        }
-        if effective_distance < 3.0 {
-            return 2;
-        }
-        if effective_distance < 4.0 {
-            return 3;
-        }
-        if effective_distance < 5.0 {
-            return 4;
-        }
-        5
-    }
-
-    /// Get the text at a given LOD level from a node.
-    pub fn get_lod_text(node: &ContentNode, level: u8) -> &str {
-        let idx = level as usize;
-        if idx < node.lod.len() {
-            node.lod[idx].as_str()
-        } else if let Some(last) = node.lod.last() {
-            last.as_str()
-        } else {
-            node.name.as_str()
-        }
-    }
-
+/// Coral graph-packing extension over the shared `guidance_llm::ContextPacker`.
+pub trait ContextPackerExt {
     /// Pack context nodes around a focus node.
     ///
     /// 1. BFS from focus node up to depth 5
     /// 2. For each node, select LOD by effective distance
-    /// 3. FFD bin-pack into token budget
+    /// 3. FFD bin-pack into token budget (shared core in `guidance_llm`)
     /// 4. Return packed nodes with selected LOD text
-    pub fn pack(
+    fn pack(
+        &self,
+        focus_id: NodeId,
+        library: &Library,
+    ) -> Result<Vec<PackedNode>, PackerError>;
+}
+
+impl ContextPackerExt for ContextPacker {
+    fn pack(
         &self,
         focus_id: NodeId,
         library: &Library,
@@ -120,8 +92,8 @@ impl ContextPacker {
             }
             if let Ok(Some(node)) = library.get_node(gn.node_id) {
                 let lod_level =
-                    Self::select_lod_by_distance(&node, f64::from(gn.depth), avg_degree);
-                let text = Self::get_lod_text(&node, lod_level).to_string();
+                    ContextPacker::select_lod_by_distance(f64::from(gn.depth), avg_degree);
+                let text = get_lod_text(&node, lod_level).to_string();
                 candidates.push(PackedNode {
                     id: gn.node_id,
                     lod_level,
@@ -131,29 +103,14 @@ impl ContextPacker {
             }
         }
 
-        // 3. FFD bin-pack into token budget
-        let packed = self.ffd_pack(&candidates);
+        // 3. FFD bin-pack into token budget (shared core)
+        let items: Vec<(&str, &PackedNode)> = candidates
+            .iter()
+            .map(|c| (c.text.as_str(), c))
+            .collect();
+        let packed = self.ffd_pack(&items);
 
-        Ok(packed)
-    }
-
-    /// First-Fit Decreasing bin-packing into token budget.
-    fn ffd_pack(&self, candidates: &[PackedNode]) -> Vec<PackedNode> {
-        let mut sorted: Vec<&PackedNode> = candidates.iter().collect();
-        sorted.sort_by_key(|b| std::cmp::Reverse(b.text.len()));
-
-        let mut used_tokens = 0usize;
-        let mut packed = Vec::new();
-
-        for candidate in &sorted {
-            let tokens = Self::estimate_tokens(&candidate.text);
-            if used_tokens + tokens <= self.budget.0 {
-                packed.push((*candidate).clone());
-                used_tokens += tokens;
-            }
-        }
-
-        packed
+        Ok(packed.into_iter().cloned().collect())
     }
 }
 
@@ -162,28 +119,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_estimate_tokens() {
-        assert_eq!(ContextPacker::estimate_tokens("hello"), 1);
-        assert_eq!(ContextPacker::estimate_tokens(""), 0);
-        assert_eq!(ContextPacker::estimate_tokens(&"a".repeat(12)), 3);
-    }
-
-    #[test]
     fn test_select_lod_by_distance() {
-        let node = ContentNode {
-            id: Some(NodeId(1)),
-            name: "test".into(),
-            source: String::new(),
-            lod: vec!["detailed".into(), "summary".into(), "brief".into()],
-            embedding: None,
-            capabilities: None,
-            ..Default::default()
-        };
-        assert_eq!(ContextPacker::select_lod_by_distance(&node, 0.5, 2.0), 0);
+        assert_eq!(ContextPacker::select_lod_by_distance(0.5, 2.0), 0);
         // effective = 1.5 / (1 + 2/3) = 1.5 / 1.667 ≈ 0.9 → lod 0
-        assert_eq!(ContextPacker::select_lod_by_distance(&node, 1.5, 2.0), 0);
+        assert_eq!(ContextPacker::select_lod_by_distance(1.5, 2.0), 0);
         // effective = 5.0 / 1.667 ≈ 3.0 → lod 3
-        assert_eq!(ContextPacker::select_lod_by_distance(&node, 5.0, 2.0), 3);
+        assert_eq!(ContextPacker::select_lod_by_distance(5.0, 2.0), 3);
     }
 
     #[test]
@@ -197,10 +138,21 @@ mod tests {
             capabilities: None,
             ..Default::default()
         };
-        assert_eq!(ContextPacker::get_lod_text(&node, 0), "detail");
-        assert_eq!(ContextPacker::get_lod_text(&node, 1), "summary");
+        assert_eq!(get_lod_text(&node, 0), "detail");
+        assert_eq!(get_lod_text(&node, 1), "summary");
         // Out of range returns last
-        assert_eq!(ContextPacker::get_lod_text(&node, 5), "summary");
+        assert_eq!(get_lod_text(&node, 5), "summary");
+        // No LOD falls back to name
+        let bare = ContentNode {
+            id: Some(NodeId(2)),
+            name: "bare".into(),
+            source: String::new(),
+            lod: vec![],
+            embedding: None,
+            capabilities: None,
+            ..Default::default()
+        };
+        assert_eq!(get_lod_text(&bare, 0), "bare");
     }
 
     #[test]
@@ -263,9 +215,11 @@ mod tests {
                 graph_distance: 2.0,
             },
         ];
-        let packed = packer.ffd_pack(&candidates);
-        // Budget 10 chars = ~2 tokens per 4 chars = 5 tokens max
-        // "aaaa" = 1 token, "bb" = 1 token, "cc" = 1 token = ~3 tokens, all fit
+        let items: Vec<(&str, &PackedNode)> = candidates
+            .iter()
+            .map(|c| (c.text.as_str(), c))
+            .collect();
+        let packed = packer.ffd_pack(&items);
         assert_eq!(packed.len(), 3);
     }
 }

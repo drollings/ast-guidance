@@ -32,7 +32,7 @@ use fluent_dag::dep_graph::{DependencyGraph, GraphError};
 use fluent_wvr::prelude::*;
 
 use crate::pipeline::{PipelineResult, RoutingTarget};
-use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
+use crate::pipeline_types::{PipelineStage, StageDecision, StageMetadata, StageVerdict};
 use crate::stages::common::get_metadata_string;
 use crate::stages::switch::promote_decision_metadata;
 
@@ -256,12 +256,11 @@ impl WorkUnit for PipelineGraph {
                         &decision.metadata,
                     );
 
+                    let metadata = StageMetadata::from(decision.metadata.clone());
                     match verdict {
                         StageVerdict::Passed | StageVerdict::Skipped => {
                             if stage_name == PipelineStage::Classifier {
-                                if let Some(resp) =
-                                    decision.metadata.get("response").and_then(|v| v.as_str())
-                                {
+                                if let Some(resp) = metadata.response() {
                                     tracing::info!(
                                         target: "router.pipeline_graph",
                                         response_len = resp.len(),
@@ -269,21 +268,19 @@ impl WorkUnit for PipelineGraph {
                                     );
                                     classifier_response = Some(resp.to_string());
                                 }
-                                if let Some(rt) = decision.metadata.get("routing_target") {
-                                    routing_target = Self::parse_routing_target(rt);
+                                if let Some(rt) = metadata.routing_target() {
+                                    routing_target = Some(rt);
                                 }
                             }
                         }
                         StageVerdict::Rerouted => {
-                            if let Some(rewritten) = decision.metadata.get("rewritten_request") {
-                                if let Some(s) = rewritten.as_str() {
-                                    tracing::info!(
-                                        target: "router.pipeline_graph",
-                                        new_request_len = s.len(),
-                                        "request rerouted"
-                                    );
-                                    current_request = s.to_string();
-                                }
+                            if let Some(rewritten) = metadata.rewritten_request() {
+                                tracing::info!(
+                                    target: "router.pipeline_graph",
+                                    new_request_len = rewritten.len(),
+                                    "request rerouted"
+                                );
+                                current_request = rewritten.to_string();
                             }
                         }
                         StageVerdict::Rejected => {
@@ -372,13 +369,6 @@ impl WorkUnit for PipelineGraph {
                 classifier_response,
             },
         )
-    }
-}
-
-impl PipelineGraph {
-    /// Parse a `RoutingTarget` from the classifier metadata JSON value.
-    fn parse_routing_target(rt: &serde_json::Value) -> Option<RoutingTarget> {
-        serde_json::from_value(rt.clone()).ok()
     }
 }
 

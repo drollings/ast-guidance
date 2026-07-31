@@ -4,9 +4,13 @@ pub mod addr;
 pub mod builder;
 pub mod filters;
 pub mod routing;
+pub mod unimplemented;
 
 pub use self::addr::{hosts_equivalent, parse_bind_addr, validate_no_self_routing};
 pub use self::builder::PipelineParams;
+pub use self::unimplemented::{
+    detect_unimplemented_features, log_unimplemented_features, UnimplementedFeature,
+};
 pub use self::filters::{
     CommandConfig, ConfidenceGate, FilterAction, FilterOutcome, FilterScope, MockConfig,
     PatternEntry, RejectPatterns,

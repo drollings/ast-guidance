@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use common_core::constants::default_true;
 
-use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
+use crate::pipeline_types::{PipelineStage, StageDecision, StageMetadata, StageVerdict};
 use crate::stages::common::get_metadata_string;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,17 +117,18 @@ impl PipelineOrchestrator {
         routing_target: &mut Option<RoutingTarget>,
         classifier_response: &mut Option<String>,
     ) -> Option<Result<WorkOutput, WorkError>> {
+        let metadata = StageMetadata::from(decision.metadata.clone());
         match verdict {
             StageVerdict::Passed | StageVerdict::Skipped => {
                 if stage_name == PipelineStage::Classifier {
-                    if let Some(resp) = classifier_response_from_decision(decision) {
+                    if let Some(resp) = metadata.response() {
                         tracing::info!(target: "router.pipeline",
                             response_len = resp.len(),
                             "classifier direct response"
                         );
-                        *classifier_response = Some(resp);
+                        *classifier_response = Some(resp.to_string());
                     }
-                    if let Some(rt) = extract_routing_target(&decision.metadata) {
+                    if let Some(rt) = metadata.routing_target() {
                         tracing::info!(target: "router.pipeline",
                             target_route = %rt.target_name.as_deref().unwrap_or("?"),
                             target_model = %rt.model,
@@ -140,14 +141,12 @@ impl PipelineOrchestrator {
                 None
             }
             StageVerdict::Rerouted => {
-                if let Some(rewritten) = decision.metadata.get("rewritten_request") {
-                    if let Some(s) = rewritten.as_str() {
-                        tracing::info!(target: "router.pipeline",
-                            new_request_len = s.len(),
-                            "request rerouted"
-                        );
-                        *current_request = s.to_string();
-                    }
+                if let Some(rewritten) = metadata.rewritten_request() {
+                    tracing::info!(target: "router.pipeline",
+                        new_request_len = rewritten.len(),
+                        "request rerouted"
+                    );
+                    *current_request = rewritten.to_string();
                 }
                 None
             }
@@ -209,19 +208,6 @@ impl PipelineOrchestratorBuilder {
     }
 }
 
-fn extract_routing_target(metadata: &serde_json::Value) -> Option<RoutingTarget> {
-    let rt = metadata.get("routing_target")?;
-    serde_json::from_value(rt.clone()).ok()
-}
-
-fn classifier_response_from_decision(decision: &StageDecision) -> Option<String> {
-    decision
-        .metadata
-        .get("response")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-}
-
 impl WorkUnit for PipelineOrchestrator {
     fn name(&self) -> &str {
         &self.name
@@ -259,10 +245,8 @@ impl WorkUnit for PipelineOrchestrator {
                     let stage_name = decision.stage;
 
                     let fallback = stage_name == PipelineStage::Classifier
-                        && decision
-                            .metadata
-                            .get("fallback")
-                            .and_then(serde_json::Value::as_bool)
+                        && StageMetadata::from(decision.metadata.clone())
+                            .fallback()
                             .unwrap_or(false);
                     tracing::info!(target: "router.pipeline",
                         stage = ?stage_name,

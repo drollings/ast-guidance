@@ -1,9 +1,12 @@
 # Agent Bootloader — coral-router
 
-**Context**: coral-router is a Rust-native LLM request router with a 5-stage
-pipeline (deterministic pre-filter → quality gate → planning refinement →
-guardrail check → router) exposed as an OpenAI-compatible HTTP API on :8079.
-It dispatches to a configurable frontier LLM after the pipeline completes.
+**Context**: coral-router is a Rust-native LLM request router with a 3-stage
+pipeline (`DeterministicPreFilter → Classifier → Router`,
+see `src/router/src/pipeline_types.rs:48-53`) exposed as an OpenAI-compatible
+HTTP API on :8079. The classifier is a single LLM call that subsumes the
+former quality-gate, planning-refinement, and guardrail stages (see its doc
+comment in `stages/classifier.rs`). It dispatches to a configurable frontier
+LLM after the pipeline completes.
 
 This is a rust monorepo with multiple projects and shared infrastructure.  coral-router the priority.
 
@@ -12,7 +15,7 @@ This is a rust monorepo with multiple projects and shared infrastructure.  coral
 1. BUILD:       make router          # builds coral-router binary
                 make router-start    # builds + starts server on :8079
 
-2. TEST:        make router-test     # 204 unit/golden/e2e tests (kills server)
+2. TEST:        make router-test     # fluent-router unit/golden/e2e tests (kills server)
 
 3. SMOKE:       make router-mock     # 18 curl smoke tests against live server
                 curl -s http://127.0.0.1:8079/health
@@ -30,7 +33,7 @@ This is a rust monorepo with multiple projects and shared infrastructure.  coral
 |---|---|
 | `make router`       | Build coral-router |
 | `make router-start` | Build + start server (kills old first) |
-| `make router-test`  | Kill server + run 204 unit tests + --help dry-run |
+| `make router-test`  | Kill server + run fluent-router unit/golden/e2e tests + --help dry-run |
 | `make router-mock`  | Depends on router-start, runs 18 curl smoke tests, leaves server running |
 
 
@@ -78,16 +81,20 @@ src/
                        DependencySession (composes DependencyGraph), pipeline,
                        config, stages, transforms, dispatch, watchdog, server
     src/
-      pipeline.rs              PipelineOrchestrator — 5-stage sequential pipeline
+      pipeline.rs              PipelineOrchestrator — 3-stage sequential pipeline
       server.rs                HTTP server (+ frontier dispatch after pipeline)
       config.rs                RouterConfig deserialization + pipeline builder
       normalize.rs             Request/response normalization to OpenAI format
       stages/
         deterministic.rs       Stage 1: command dispatch, PII detection
-        quality_gate.rs        Stage 2: LLM quality classification
-        planning.rs            Stage 3: LLM planning/refinement
-        guardrail.rs           Stage 4: LLM guardrail/policy check
-        router.rs              Stage 5: routing policy decision
+        classifier.rs          Stage 2: single LLM call that subsumes the former
+                               quality-gate / planning-refinement / guardrail
+                               stages; emits direct response, routing target, or
+                               rejection
+        common.rs              Shared stage helpers (extract_user_message, …)
+        retry_classifier.rs    Retry-with-backoff wrapper over the classifier
+        switch.rs              Branching pipeline logic for conditional dispatch
+        pipeline_ref.rs        Re-usable named pipeline stage
       dispatch/
         frontier.rs            Frontier dispatcher (OpenAI/Anthropic backends)
         agent.rs               Agent dispatcher

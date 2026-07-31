@@ -8,7 +8,7 @@ use crate::config::RejectPatterns;
 use crate::filters::injection_detect::InjectionDetectFilter;
 use crate::filters::regex_filter::RegexFilter;
 use crate::filters::{DeterministicFilterEngine, FilterContext, FilterDecision};
-use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
+use crate::pipeline_types::{PiiVerdict, PipelineStage, StageDecision, StageMetadata, StageVerdict};
 use crate::stages::common::extract_user_message;
 
 static COMMAND_RE: LazyLock<Regex> =
@@ -67,8 +67,10 @@ impl DeterministicPreFilter {
         use crate::config::{PatternEntry, RejectPatterns};
 
         let pii_patterns = guidance_llm::pii_patterns::pii_patterns();
-        let pii_map: std::collections::HashMap<&str, &str> =
-            pii_patterns.iter().map(|p| (p.name, p.regex)).collect();
+        let pii_map: std::collections::HashMap<&str, &str> = pii_patterns
+            .iter()
+            .map(|p| (p.name, p.regex.as_str()))
+            .collect();
         fn pii_regex<'a>(map: &'a HashMap<&str, &str>, key: &str, fallback: &'a str) -> String {
             map.get(key).copied().unwrap_or(fallback).to_string()
         }
@@ -243,6 +245,9 @@ impl WorkUnit for DeterministicPreFilter {
                     match handler(&args) {
                         Ok(result) => {
                             tracing::info!(target: "router.pipeline.stage1", command = %cmd, "command dispatched");
+                            let mut metadata = StageMetadata::default();
+                            metadata.set_command_result(&result);
+                            metadata.insert("command", serde_json::Value::String(cmd.into()));
                             return WorkOutput::typed(
                                 "command_dispatched",
                                 &StageDecision {
@@ -251,10 +256,7 @@ impl WorkUnit for DeterministicPreFilter {
                                     score: Some(1.0),
                                     reason: format!("command '{cmd}' executed deterministically"),
                                     latency_ms: 0,
-                                    metadata: serde_json::json!({
-                                        "command_result": result,
-                                        "command": cmd
-                                    }),
+                                    metadata: metadata.into_value(),
                                 },
                             );
                         }
@@ -340,22 +342,23 @@ impl WorkUnit for DeterministicPreFilter {
                     matches,
                 } => {
                     tracing::info!(target: "router.pipeline.stage1", pattern = %matched_pattern, action = ?action, match_count = matches.len(), "output_filter flagged");
+                    let reason = format!("PII flagged for output filtering: {matched_pattern}");
+                    let mut metadata = StageMetadata::default();
+                    metadata.set_pii_filter(&PiiVerdict {
+                        pattern: matched_pattern,
+                        action,
+                        codewords,
+                        matches,
+                    });
                     return WorkOutput::typed(
                         "output_filter_flagged",
                         &StageDecision {
                             stage: PipelineStage::DeterministicPreFilter,
                             verdict: StageVerdict::Passed,
                             score: Some(1.0),
-                            reason: format!("PII flagged for output filtering: {matched_pattern}"),
+                            reason,
                             latency_ms: 0,
-                            metadata: serde_json::json!({
-                                "pii_filter": {
-                                    "pattern": matched_pattern,
-                                    "action": action,
-                                    "codewords": codewords,
-                                    "matches": matches,
-                                }
-                            }),
+                            metadata: metadata.into_value(),
                         },
                     );
                 }

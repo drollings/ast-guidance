@@ -25,7 +25,9 @@ pub struct LocalDecomposer {
 
 impl Decomposer for LocalDecomposer {
     fn decompose(&self, task: &str) -> Vec<String> {
-        self.decompose(task)
+        // Recursion guard: this calls the *inherent* method `decompose_into`
+        // (not `decompose`) so the trait dispatch cannot self-loop.
+        self.decompose_into(task)
     }
 }
 
@@ -39,7 +41,7 @@ impl LocalDecomposer {
         Self { config }
     }
 
-    pub fn decompose(&self, task: &str) -> Vec<String> {
+    pub fn decompose_into(&self, task: &str) -> Vec<String> {
         let client = LlmClient::with_config(self.config.llm.clone());
         let messages = vec![
             crate::ChatMessage {

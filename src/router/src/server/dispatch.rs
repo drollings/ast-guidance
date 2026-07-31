@@ -92,11 +92,14 @@ pub async fn handle_dispatch(
                 .await;
             }
             tracing::info!(target: "router.server", model = %model_name, "mock canned response");
-            if let Some(node_id) = ledger_node_id {
-                if let Some(l) = ledger {
-                    let _ = l.record_result(node_id, true, Some(1.0), "mock response");
-                }
-            }
+            crate::server::handler::record_ledger_result(
+                ledger,
+                ledger_node_id,
+                true,
+                Some(1.0),
+                "mock response".to_string(),
+            )
+            .await;
             let completion = mock.dispatch_response(entry, model_name);
             return Ok(completion_to_response(
                 &completion,
@@ -171,7 +174,7 @@ async fn dispatch_to_single_target(
         *resp.status_mut() = hyper::StatusCode::OK;
         resp.headers_mut().insert(
             hyper::header::CONTENT_TYPE,
-            "text/event-stream".parse().unwrap(),
+            hyper::header::HeaderValue::from_static("text/event-stream"),
         );
         crate::server::responses::add_cors_headers(resp.headers_mut());
         return Ok(resp);
@@ -183,6 +186,8 @@ async fn dispatch_to_single_target(
             router_request.clone(),
             target.model.clone(),
             target.params.clone(),
+            target.idle_timeout_ms,
+            target.total_timeout_ms,
         )
         .await?;
 

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use common_core::jsonrpc::{JsonRpcError, JsonRpcHandler, JsonRpcRequest, JsonRpcResponse};
 use fluent_types::ContentNode;
+use serde::Deserialize;
 use thiserror::Error;
 
 use crate::cache::reactor::QueueReactor;
@@ -102,11 +103,9 @@ impl McpServer {
     }
 
     fn handle_coral_insert(&self, request: &JsonRpcRequest) -> JsonRpcResponse {
-        let node: ContentNode = match request
-            .params
-            .as_ref()
-            .map(|p| serde_json::from_value(p.clone()))
-        {
+        // M8.8: deserialize from the borrowed `&Value` (Value implements
+        // `serde::Deserializer`) instead of cloning the params first.
+        let node: ContentNode = match request.params.as_ref().map(ContentNode::deserialize) {
             Some(Ok(n)) => n,
             Some(Err(e)) => {
                 return JsonRpcResponse {
@@ -214,6 +213,14 @@ impl McpServer {
 
 impl JsonRpcHandler for McpServer {
     fn handle_request(&self, raw: &str) -> Result<String, JsonRpcError> {
+        // M9.2b: bound the incoming request size so an oversized payload is
+        // rejected before JSON parsing.
+        if raw.len() > MAX_MCP_REQUEST_SIZE {
+            return Err(JsonRpcError {
+                code: -32600,
+                message: format!("request exceeds MAX_MCP_REQUEST_SIZE ({MAX_MCP_REQUEST_SIZE} bytes)"),
+            });
+        }
         let request: JsonRpcRequest = serde_json::from_str(raw)?;
         let response = self.dispatch(&request);
         Ok(serde_json::to_string(&response)?)

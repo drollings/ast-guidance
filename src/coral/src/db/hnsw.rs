@@ -1,6 +1,7 @@
+use std::collections::HashMap;
+
 use common_core::constants::HnswParams;
 use fluent_types::{KnnHit, NodeId};
-use rusqlite::params;
 use search_vector::math::try_bytes_to_vec;
 
 use super::LibraryError;
@@ -63,7 +64,36 @@ impl super::Library {
         let id_map = self.hnsw_id_map.lock().ok()?;
 
         let neighbours = hnsw.search(query_vec, k, k);
-        let conn = self.conn.lock().ok()?;
+
+        // M8.2: resolve every neighbour's name in a single parameterized
+        // `WHERE id IN (...)` query instead of one query per neighbour.
+        // Lock ordering is preserved: hnsw → id_map → conn (never inverted).
+        let mut node_ids: Vec<i64> = Vec::with_capacity(neighbours.len());
+        for n in &neighbours {
+            if n.d_id < id_map.len() {
+                node_ids.push(id_map[n.d_id]);
+            }
+        }
+        if node_ids.is_empty() {
+            return Some(Vec::new());
+        }
+
+        let name_by_id: HashMap<i64, String> = {
+            let conn = self.conn.lock().ok()?;
+            let placeholders = vec!["?"; node_ids.len()].join(",");
+            let sql = format!("SELECT id, name FROM context_nodes WHERE id IN ({placeholders})");
+            let mut stmt = conn.prepare(&sql).ok()?;
+            let mut rows = stmt
+                .query(rusqlite::params_from_iter(node_ids.iter().copied()))
+                .ok()?;
+            let mut map = HashMap::with_capacity(node_ids.len());
+            while let Some(row) = rows.next().ok()? {
+                let id: i64 = row.get(0).ok()?;
+                let name: String = row.get(1).ok()?;
+                map.insert(id, name);
+            }
+            map
+        };
 
         let mut results = Vec::with_capacity(neighbours.len());
         for n in &neighbours {
@@ -71,17 +101,14 @@ impl super::Library {
                 continue;
             }
             let node_id = id_map[n.d_id];
-            if let Ok(name) = conn.query_row(
-                "SELECT name FROM context_nodes WHERE id = ?1",
-                params![node_id],
-                |row| row.get::<_, String>(0),
-            ) {
-                results.push(KnnHit {
-                    node_id: NodeId::from_int(node_id),
-                    distance: n.distance,
-                    name: name.as_str().into(),
-                });
-            }
+            let Some(name) = name_by_id.get(&node_id) else {
+                continue;
+            };
+            results.push(KnnHit {
+                node_id: NodeId::from_int(node_id),
+                distance: n.distance,
+                name: name.as_str().into(),
+            });
         }
         Some(results)
     }

@@ -20,6 +20,47 @@ use crate::server::responses::HyperResponse;
 use crate::server::responses::ServerStats;
 use crate::testing::mock::MockDispatchContext;
 
+/// Best-effort ledger insert, moved off the async handler via
+/// `spawn_blocking` so sync rusqlite never runs on a tokio worker thread.
+///
+/// Both failure modes are swallowed by design: a panicked blocking task
+/// (`.ok()`) and a ledger error (`.flatten()`) degrade to "no ledger row",
+/// matching the documented best-effort logging contract.
+pub(crate) async fn record_ledger_request(
+    ledger: Option<&Arc<ContentNodeLedger>>,
+    session_id: String,
+    request_id: String,
+    request_text: String,
+) -> Option<fluent_types::NodeId> {
+    let l = Arc::clone(ledger?);
+    tokio::task::spawn_blocking(move || {
+        l.record_request(&session_id, &request_id, &request_text)
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+}
+
+/// Best-effort ledger update, off the async handler (see
+/// `record_ledger_request` for the swallow semantics).
+pub(crate) async fn record_ledger_result(
+    ledger: Option<&Arc<ContentNodeLedger>>,
+    node_id: Option<fluent_types::NodeId>,
+    accepted: bool,
+    score: Option<f64>,
+    content: String,
+) {
+    let (Some(l), Some(node_id)) = (ledger, node_id) else {
+        return;
+    };
+    let l = Arc::clone(l);
+    tokio::task::spawn_blocking(move || {
+        let _ = l.record_result(node_id, accepted, score, &content);
+    })
+    .await
+    .ok();
+}
+
 async fn handle_chat_completion(
     req: hyper::Request<hyper::body::Incoming>,
     pipelines: Arc<std::collections::HashMap<String, Arc<PipelineOrchestrator>>>,
@@ -83,14 +124,7 @@ async fn handle_chat_completion(
         .iter()
         .rev()
         .find(|m| m.role == "user")
-        .map(|m| {
-            let s = m.content.to_string_lossy();
-            if s.len() > 120 {
-                format!("{}...", &s[..120])
-            } else {
-                s
-            }
-        })
+        .map(|m| common_core::string::truncate_utf8(&m.content.to_string_lossy(), 120))
         .unwrap_or_default();
     let request_json = serde_json::to_string(&router_request).unwrap_or_default();
 
@@ -113,10 +147,13 @@ async fn handle_chat_completion(
         .find(|m| m.role == "user")
         .map(|m| m.content.to_string_lossy())
         .unwrap_or_default();
-    let ledger_node_id = ledger.as_ref().and_then(|l| {
-        l.record_request(&session_id, &request_id, &request_text)
-            .ok()
-    });
+    let ledger_node_id = record_ledger_request(
+        ledger.as_ref(),
+        session_id.clone(),
+        request_id.clone(),
+        request_text.clone(),
+    )
+    .await;
 
     let pipeline_result =
         resolve_pipeline(&model_name, &routes, &models, &pipelines, &request_json);
@@ -142,11 +179,14 @@ async fn handle_chat_completion(
             }
         }
 
-        if let Some(node_id) = ledger_node_id {
-            if let Some(ref l) = ledger {
-                let _ = l.record_result(node_id, false, Some(0.0), reason);
-            }
-        }
+        record_ledger_result(
+            ledger.as_ref(),
+            ledger_node_id,
+            false,
+            Some(0.0),
+            reason.to_string(),
+        )
+        .await;
 
         let completion = make_error_completion(&model_name, reason);
         return Ok(completion_to_response(
@@ -164,11 +204,14 @@ async fn handle_chat_completion(
             response_len = resp_str.len(),
             "responding with classifier direct response"
         );
-        if let Some(node_id) = ledger_node_id {
-            if let Some(ref l) = ledger {
-                let _ = l.record_result(node_id, true, Some(1.0), resp_str);
-            }
-        }
+        record_ledger_result(
+            ledger.as_ref(),
+            ledger_node_id,
+            true,
+            Some(1.0),
+            resp_str.clone(),
+        )
+        .await;
         let completion = make_text_completion(&model_name, resp_str);
         return Ok(completion_to_response(
             &completion,
@@ -237,11 +280,14 @@ async fn handle_chat_completion(
         model = %model_name,
         "no routing target, no classifier response, no classifier url — returning fallback"
     );
-    if let Some(node_id) = ledger_node_id {
-        if let Some(ref l) = ledger {
-            let _ = l.record_result(node_id, true, Some(0.5), "fallback response");
-        }
-    }
+    record_ledger_result(
+        ledger.as_ref(),
+        ledger_node_id,
+        true,
+        Some(0.5),
+        "fallback response".to_string(),
+    )
+    .await;
     let completion = crate::server::responses::fallback_completion(&model_name);
     Ok(completion_to_response(
         &completion,

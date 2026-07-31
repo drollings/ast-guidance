@@ -35,6 +35,8 @@ pub fn execute_frontier_mode(
     _mode: FrontierMode,
     _payload: &str,
     _model_endpoint: &str,
-) -> Result<FrontierResult, String> {
-    Err("Frontier mode execution not yet implemented — requires agent wiring".into())
+) -> Result<FrontierResult, crate::error::ServerError> {
+    Err(crate::error::ServerError::FrontierNotImplemented(
+        "frontier mode execution not yet implemented — requires agent wiring".into(),
+    ))
 }

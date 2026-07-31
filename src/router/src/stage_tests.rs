@@ -314,4 +314,94 @@ mod tests {
         let desc = filter.describe();
         assert_eq!(desc["type"], "object");
     }
+
+    // ── Stage 2: ClassifierStage concurrency limiter ────────────────────────
+
+    /// Backend that tracks the maximum number of concurrently executing
+    /// `chat_complete` calls, so a `Limiter`'s cap is observable.
+    struct TrackingBackend {
+        active: std::sync::atomic::AtomicUsize,
+        max_active: std::sync::atomic::AtomicUsize,
+    }
+
+    impl guidance_llm::client::ChatBackend for TrackingBackend {
+        fn chat_complete(
+            &self,
+            _messages: &[guidance_llm::ChatMessage],
+        ) -> Result<String, guidance_llm::LlmError> {
+            use std::sync::atomic::Ordering;
+            let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(serde_json::json!({
+                "action": "respond",
+                "coherence_score": 0.9,
+                "safety_score": 0.9,
+                "reason": "ok",
+                "intent": "question",
+                "response": "hello",
+            })
+            .to_string())
+        }
+    }
+
+    #[test]
+    fn classifier_limiter_serializes_concurrent_calls() {
+        use std::collections::HashMap;
+        use std::sync::atomic::Ordering;
+
+        use crate::config::RoutingConfig;
+        use crate::stages::classifier::ClassifierStage;
+
+        let backend = Arc::new(TrackingBackend {
+            active: std::sync::atomic::AtomicUsize::new(0),
+            max_active: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let tracking = Arc::clone(&backend);
+        let routing_config = RoutingConfig {
+            routes: HashMap::new(),
+            models: HashMap::new(),
+            model_groups: HashMap::new(),
+            system_prompt: String::new(),
+            safety_threshold: 0.5,
+            default_route: "fast".into(),
+            score_matrix: None,
+        };
+        let limiter = Arc::new(fluent_concurrency::pool::Limiter::new(1));
+        let stage = ClassifierStage::new(
+            backend as Arc<dyn guidance_llm::client::ChatBackend>,
+            routing_config,
+            0.7,
+            None,
+            1,
+            limiter,
+        );
+
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    let mut ctx = WorkContext::default();
+                    ctx.metadata.insert(
+                        "request".into(),
+                        MetadataValue::String(
+                            serde_json::json!({
+                                "model": "test",
+                                "messages": [{"role": "user", "content": "hello"}],
+                            })
+                            .to_string(),
+                        ),
+                    );
+                    let output = stage.execute(&ctx).expect("execute");
+                    let _decision: StageDecision = output.data_as().expect("data_as");
+                });
+            }
+        });
+
+        assert_eq!(
+            tracking.max_active.load(Ordering::SeqCst),
+            1,
+            "a Limiter::new(1) must serialize classifier calls"
+        );
+    }
 }

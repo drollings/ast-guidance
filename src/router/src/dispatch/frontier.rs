@@ -70,7 +70,8 @@ impl DispatchBackend for OpenAiBackend {
     }
 
     fn build_request(&self, request: &RouterRequest) -> Result<Value, DispatchError> {
-        let messages: Vec<Value> = crate::normalize::messages_to_json(request);
+        let messages: Vec<Value> = crate::normalize::messages_to_json(request)
+            .map_err(|e| DispatchError::RequestBuild(e.to_string()))?;
 
         let mut body = serde_json::json!({
             "model": request.model,

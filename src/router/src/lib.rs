@@ -24,6 +24,7 @@ pub mod compaction;
 pub mod config;
 pub mod dag_session;
 pub mod dispatch;
+pub mod error;
 pub mod filters;
 pub mod frontier;
 pub mod hnsw;
@@ -56,6 +57,8 @@ pub mod testing;
 
 #[cfg(test)]
 mod server_tests;
+#[cfg(test)]
+mod server_http_tests;
 #[cfg(test)]
 mod stage_tests;
 #[cfg(test)]

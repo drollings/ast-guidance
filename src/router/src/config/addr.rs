@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use super::ModelEntry;
+use crate::error::ServerError;
 
 /// Normalize a hostname to a canonical comparison form.
 /// Returns `true` if two hosts should be considered equivalent
@@ -19,33 +20,33 @@ pub fn hosts_equivalent(a: &str, b: &str) -> bool {
 }
 
 /// Parse a `host:port` string into its components.
-pub fn parse_bind_addr(addr: &str) -> Result<(&str, u16), String> {
+pub fn parse_bind_addr(addr: &str) -> Result<(&str, u16), ServerError> {
     let addr = addr.trim();
     if addr.is_empty() {
-        return Err("bind_addr is empty".into());
+        return Err(ServerError::Addr("bind_addr is empty".into()));
     }
     // Handle IPv6: [::1]:port
     if addr.starts_with('[') {
         let close_bracket = addr
             .rfind(']')
-            .ok_or_else(|| "unclosed '[' in bind_addr".to_string())?;
+            .ok_or_else(|| ServerError::Addr("unclosed '[' in bind_addr".into()))?;
         let host = &addr[1..close_bracket];
         let rest = addr[close_bracket + 1..].trim_start_matches(':');
         let port: u16 = rest
             .parse()
-            .map_err(|e| format!("invalid port in bind_addr '{addr}': {e}"))?;
+            .map_err(|e| ServerError::Addr(format!("invalid port in bind_addr '{addr}': {e}")))?;
         return Ok((host, port));
     }
     if let Some(colon_pos) = addr.rfind(':') {
         let host = &addr[..colon_pos];
         let port: u16 = addr[colon_pos + 1..]
             .parse()
-            .map_err(|e| format!("invalid port in bind_addr '{addr}': {e}"))?;
+            .map_err(|e| ServerError::Addr(format!("invalid port in bind_addr '{addr}': {e}")))?;
         Ok((host, port))
     } else {
-        Err(format!(
+        Err(ServerError::Addr(format!(
             "bind_addr '{addr}' missing port (expected host:port)"
-        ))
+        )))
     }
 }
 
@@ -55,9 +56,9 @@ pub fn parse_bind_addr(addr: &str) -> Result<(&str, u16), String> {
 pub fn validate_no_self_routing(
     bind_addr: &str,
     models: &HashMap<String, ModelEntry>,
-) -> Result<(), String> {
+) -> Result<(), ServerError> {
     if bind_addr.is_empty() {
-        return Err("server.bind_addr must be set".into());
+        return Err(ServerError::Addr("server.bind_addr must be set".into()));
     }
     let (my_host, my_port) = parse_bind_addr(bind_addr)?;
 
@@ -77,10 +78,10 @@ pub fn validate_no_self_routing(
         };
 
         if hosts_equivalent(host, my_host) && port == my_port {
-            return Err(format!(
+            return Err(ServerError::Addr(format!(
                 "model '{name}' endpoint ({}) points to the router's own bind address ({}) — would create a routing loop",
                 entry.endpoint, bind_addr
-            ));
+            )));
         }
     }
     Ok(())
@@ -198,7 +199,7 @@ mod tests {
         let err = validate_no_self_routing("127.0.0.1:8079", &models)
             .expect_err("should reject self-routing model");
         assert!(
-            err.contains("routing loop"),
+            err.to_string().contains("routing loop"),
             "error should mention routing loop: {err}"
         );
     }
@@ -228,7 +229,7 @@ mod tests {
         );
         let err = validate_no_self_routing("127.0.0.1:8079", &models)
             .expect_err("should reject self-routing model");
-        assert!(err.contains("routing loop"));
+        assert!(err.to_string().contains("routing loop"));
     }
 
     #[test]
@@ -262,6 +263,6 @@ mod tests {
     fn validate_empty_bind_addr_errors() {
         let models = HashMap::new();
         let err = validate_no_self_routing("", &models).expect_err("empty bind_addr should error");
-        assert!(err.contains("must be set"));
+        assert!(err.to_string().contains("must be set"));
     }
 }

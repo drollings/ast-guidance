@@ -376,6 +376,22 @@ pub fn truncate_at_sentence(text: &str, max_chars: usize) -> String {
     truncated.to_string()
 }
 
+/// Truncate to `max_bytes` at a UTF-8 char boundary, appending `…` if the
+/// input was truncated. Never panics on mid-character boundaries (unlike a
+/// raw `&s[..n]` byte slice) and never exceeds `max_bytes`.
+pub fn truncate_utf8(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = s[..end].to_string();
+    truncated.push('…');
+    truncated
+}
+
 /// Return the first sentence of `text` — trimmed text up to and including
 /// the first `.`, `!`, or `?`. If no sentence-ending punctuation is found,
 /// returns up to 120 characters.
@@ -612,6 +628,58 @@ mod tests {
     fn truncate_at_sentence_within_limit() {
         let text = "Short";
         assert_eq!(truncate_at_sentence(text, 100), "Short");
+    }
+
+    #[test]
+    fn truncate_utf8_empty_input() {
+        assert_eq!(truncate_utf8("", 120), "");
+    }
+
+    #[test]
+    fn truncate_utf8_shorter_than_cap() {
+        assert_eq!(truncate_utf8("hello", 120), "hello");
+    }
+
+    #[test]
+    fn truncate_utf8_boundary_exact_char() {
+        // 4 ASCII chars, cap exactly at a char boundary
+        assert_eq!(truncate_utf8("abcd", 4), "abcd");
+        // 5 ASCII chars capped at 4 → "abcd…"
+        assert_eq!(truncate_utf8("abcde", 4), "abcd…");
+    }
+
+    #[test]
+    fn truncate_utf8_mid_char_no_panic() {
+        // CJK chars are 3 bytes each; 10 chars = 30 bytes.
+        let s = "汉".repeat(10);
+        assert_eq!(s.len(), 30);
+        // cap at 29 bytes falls inside the 10th char (starts at byte 27)
+        let out = truncate_utf8(&s, 29);
+        assert!(out.starts_with(&"汉".repeat(9)));
+        assert!(out.ends_with('…'));
+        assert_eq!(out, format!("{}…", "汉".repeat(9)));
+        // cap at 28 also lands mid-char
+        let out = truncate_utf8(&s, 28);
+        assert!(out.starts_with(&"汉".repeat(9)));
+        assert!(out.ends_with('…'));
+        // cap at 30 lands exactly on a boundary → no truncation
+        assert_eq!(truncate_utf8(&s, 30), s);
+    }
+
+    #[test]
+    fn truncate_utf8_max_bytes_zero() {
+        assert_eq!(truncate_utf8("anything", 0), "…");
+        assert_eq!(truncate_utf8("", 0), "");
+    }
+
+    #[test]
+    fn truncate_utf8_never_exceeds_cap_before_ellipsis() {
+        let emoji = "🚀".repeat(50);
+        for cap in 0..emoji.len() {
+            let out = truncate_utf8(&emoji, cap);
+            let content = out.strip_suffix('…').unwrap_or(&out);
+            assert!(content.len() <= cap);
+        }
     }
 
     #[test]

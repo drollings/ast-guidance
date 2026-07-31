@@ -4,7 +4,7 @@ use fluent_types::{ContentNode, KnnHit, NodeId, WasmTool};
 use rusqlite::params;
 use search_vector::math::{knn_brute_force, try_bytes_to_vec, vec_to_bytes};
 
-use super::{blob_to_bitvec, LibraryError};
+use super::{blob_to_bitvec, LibraryError, MAX_KNN_CANDIDATES};
 
 impl super::Library {
     pub fn insert_node(&self, node: &ContentNode) -> Result<NodeId, LibraryError> {
@@ -38,6 +38,31 @@ impl super::Library {
             })
             .ok();
         Ok(result)
+    }
+
+    /// Resolve many names to their node ids in a single parameterized query
+    /// (avoids the per-name N+1 round-trip through the shared `conn` Mutex).
+    pub fn find_node_ids_by_names(
+        &self,
+        names: &[&str],
+    ) -> Result<HashMap<String, NodeId>, LibraryError> {
+        if names.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let placeholders = vec!["?"; names.len()].join(",");
+        let sql = format!("SELECT id, name FROM context_nodes WHERE name IN ({placeholders})");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(names.iter().copied()), |row| {
+            let id: i64 = row.get(0)?;
+            let name: String = row.get(1)?;
+            Ok((name, NodeId::from_int(id)))
+        })?;
+        let mut map = HashMap::with_capacity(names.len());
+        for (name, id) in rows.flatten() {
+            map.insert(name, id);
+        }
+        Ok(map)
     }
 
     pub fn get_node(&self, node_id: NodeId) -> Result<Option<ContentNode>, LibraryError> {
@@ -167,6 +192,16 @@ impl super::Library {
         Ok(results)
     }
 
+    pub fn embedded_node_count(&self) -> Result<i64, LibraryError> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM context_nodes WHERE embedding IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     pub fn knn_search(
         &self,
         query_vec: &[f32],
@@ -176,13 +211,27 @@ impl super::Library {
         if query_vec.is_empty() {
             return Ok(Vec::new());
         }
+        // M8.1: the row scan is hard-capped at MAX_KNN_CANDIDATES so a large
+        // table can never be fully scanned. When the embedded-node count
+        // exceeds the cap, the approximate HNSW index is the primary query
+        // path; only fall back to the capped brute-force scan when no HNSW
+        // index is available. Capability-filtered searches bypass the HNSW
+        // route because the index cannot apply the filter.
+        if capability_filter.is_none() && self.embedded_node_count()? > MAX_KNN_CANDIDATES as i64
+        {
+            if let Some(hits) = self.hnsw_search(query_vec, k) {
+                return Ok(hits);
+            }
+        }
         let conn = self.conn.lock().unwrap();
         let capabilities_col = if capability_filter.is_some() {
             ", capabilities"
         } else {
             ""
         };
-        let sql = format!("SELECT id, name, embedding{capabilities_col} FROM context_nodes WHERE embedding IS NOT NULL");
+        let sql = format!(
+            "SELECT id, name, embedding{capabilities_col} FROM context_nodes WHERE embedding IS NOT NULL LIMIT {MAX_KNN_CANDIDATES}"
+        );
         let mut stmt = conn.prepare(&sql)?;
 
         let rows = stmt.query_map([], move |row| {
@@ -237,15 +286,33 @@ impl super::Library {
         let keyword_results = self.keyword_search(query)?;
 
         let vector_results = if let Some(vec) = query_vec {
-            if let Some(hnsw_results) = self.hnsw_search(vec, k) {
-                if hnsw_results.len() >= k {
-                    hnsw_results
-                } else {
-                    self.knn_search(vec, k, None)?
+            // M8.3: merge (do not discard) partial HNSW hits with the
+            // brute-force hits, dedup by node id keeping the best score,
+            // then fill to `k`. The HNSW hits are never thrown away when the
+            // index recall is below `k`.
+            let mut merged: HashMap<i64, KnnHit> = HashMap::new();
+            if let Some(hnsw_hits) = self.hnsw_search(vec, k) {
+                for hit in hnsw_hits {
+                    merged.insert(hit.node_id.as_int(), hit);
                 }
-            } else {
-                self.knn_search(vec, k, None)?
             }
+            for hit in self.knn_search(vec, k, None)? {
+                let id = hit.node_id.as_int();
+                match merged.get(&id) {
+                    Some(existing) if existing.distance <= hit.distance => {}
+                    _ => {
+                        merged.insert(id, hit);
+                    }
+                }
+            }
+            let mut hits: Vec<KnnHit> = merged.into_values().collect();
+            hits.sort_by(|a, b| {
+                a.distance
+                    .partial_cmp(&b.distance)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            hits.truncate(k);
+            hits
         } else {
             Vec::new()
         };

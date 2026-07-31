@@ -7,9 +7,11 @@ pub mod responses;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use common_core::ResponseCache;
 use fluent_wvr::prelude::*;
+use tokio::net::TcpListener;
 
 use crate::config::{ModelEntry, RouteRef, ServerConfig};
 use crate::ledger::ContentNodeLedger;
@@ -78,7 +80,7 @@ impl RouterServer {
         self
     }
 
-    pub async fn serve(&self) -> Result<(), String> {
+    pub async fn serve(&self) -> Result<(), crate::error::ServerError> {
         tracing::info!(
             target: "router.server",
             bind_addr = %self.bind_addr,
@@ -184,18 +186,56 @@ async fn run_http(
     mock_dispatch: Option<Arc<MockDispatchContext>>,
     ledger: Option<Arc<ContentNodeLedger>>,
     cache: Option<Arc<ResponseCache>>,
-) -> Result<(), String> {
-    use hyper_util::rt::TokioIo;
-    use tokio::net::TcpListener;
-
+) -> Result<(), crate::error::ServerError> {
     let listener = TcpListener::bind(bind_addr)
         .await
-        .map_err(|e| format!("bind {bind_addr} failed: {e}"))?;
+        .map_err(|source| crate::error::ServerError::Bind {
+            addr: bind_addr.to_string(),
+            source,
+        })?;
 
     tracing::info!(target: "router.server", addr = %bind_addr, "HTTP server listening (hyper)");
 
+    serve_http(
+        listener,
+        pipelines,
+        routes,
+        models,
+        max_payload,
+        classifier_url,
+        mock_dispatch,
+        ledger,
+        cache,
+    )
+    .await
+}
+
+/// Accept loop over an already-bound listener. Public(crate) so integration
+/// tests can bind an ephemeral listener themselves (`127.0.0.1:0`) and drive
+/// a real server with no rebind race; production entry is `run_http`.
+pub(crate) async fn serve_http(
+    listener: TcpListener,
+    pipelines: Arc<HashMap<String, Arc<PipelineOrchestrator>>>,
+    routes: Arc<HashMap<String, RouteRef>>,
+    models: Arc<HashMap<String, ModelEntry>>,
+    max_payload: usize,
+    classifier_url: Option<String>,
+    mock_dispatch: Option<Arc<MockDispatchContext>>,
+    ledger: Option<Arc<ContentNodeLedger>>,
+    cache: Option<Arc<ResponseCache>>,
+) -> Result<(), crate::error::ServerError> {
+    use hyper_util::rt::TokioIo;
+
     let stats = Arc::new(responses::ServerStats::new());
-    let http_client = Arc::new(reqwest::Client::new());
+    // Connect-timeout only on the shared client: a full `.timeout()` would
+    // abort streaming bodies mid-read. Total/idle enforcement is per-request
+    // in the dispatch backends (see `ChatBackend::complete`).
+    let http_client = Arc::new(
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| crate::error::ServerError::Http(format!("HTTP client build failed: {e}")))?,
+    );
 
     loop {
         let (stream, _peer) = match listener.accept().await {

@@ -32,8 +32,23 @@ pub enum LibraryError {
     DuplicateNode(String),
 }
 
+fn is_unique_violation(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(ffi, _)
+            if ffi.code == rusqlite::ErrorCode::ConstraintViolation
+                // 2067 = SQLITE_CONSTRAINT_UNIQUE, 1555 = SQLITE_CONSTRAINT_PRIMARYKEY
+                && (ffi.extended_code == 2067 || ffi.extended_code == 1555)
+    )
+}
+
 impl From<rusqlite::Error> for LibraryError {
     fn from(e: rusqlite::Error) -> Self {
+        // M9.2d: surface a UNIQUE-constraint violation as the typed
+        // `DuplicateNode` variant instead of leaking the raw `SqliteError`.
+        if is_unique_violation(&e) {
+            return LibraryError::DuplicateNode(e.to_string());
+        }
         LibraryError::Sqlite(common_core::error::SqliteError(e))
     }
 }
@@ -416,5 +431,170 @@ mod tests {
             |row| row.get(0),
         ).expect("query");
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_duplicate_node_maps_to_typed_variant() {
+        let lib = Library::open_in_memory().expect("db");
+        let node = ContentNode {
+            id: None,
+            name: "dup_name".into(),
+            source: "a".into(),
+            lod: vec![],
+            embedding: None,
+            capabilities: None,
+            ..Default::default()
+        };
+        lib.insert_node(&node).expect("first insert");
+        let err = lib.insert_node(&node).expect_err("second insert must fail");
+        assert!(
+            matches!(err, LibraryError::DuplicateNode(_)),
+            "expected DuplicateNode, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_hybrid_search_merges_partial_hnsw_hits() {
+        let lib = Library::open_in_memory().expect("db");
+        for i in 0..5 {
+            let node = ContentNode {
+                id: None,
+                name: format!("hnsw_{i}").into(),
+                source: "s".into(),
+                lod: vec![],
+                embedding: Some(vec![i as f32, 1.0, 1.0, 1.0]),
+                capabilities: None,
+                ..Default::default()
+            };
+            lib.insert_node(&node).expect("insert into hnsw");
+        }
+        let batch_nodes: Vec<ContentNode> = (0..3)
+            .map(|i| ContentNode {
+                id: None,
+                name: format!("batch_{i}").into(),
+                source: "s".into(),
+                lod: vec![],
+                embedding: Some(vec![10.0 + i as f32, 1.0, 1.0, 1.0]),
+                capabilities: None,
+                ..Default::default()
+            })
+            .collect();
+        lib.insert_nodes_batch(&batch_nodes).expect("batch insert");
+        assert_eq!(lib.hnsw_len(), 5, "HNSW should only hold hydrated nodes");
+
+        let query: Vec<f32> = vec![0.0, 1.0, 1.0, 1.0];
+        let hits = lib.hybrid_search("q", Some(&query), 20).expect("hybrid");
+        let names: std::collections::HashSet<&str> = hits.iter().map(|h| h.name.as_str()).collect();
+        for i in 0..5 {
+            assert!(
+                names.contains(format!("hnsw_{i}").as_str()),
+                "merged result missing hnsw_{i}"
+            );
+        }
+        for i in 0..3 {
+            assert!(
+                names.contains(format!("batch_{i}").as_str()),
+                "merged result missing batch_{i}"
+            );
+        }
+        assert_eq!(hits.len(), names.len(), "merged result has duplicate ids");
+    }
+
+    #[test]
+    fn test_find_node_ids_by_names_batch_resolution() {
+        let lib = Library::open_in_memory().expect("db");
+        for name in ["alpha", "beta", "gamma"] {
+            let node = ContentNode {
+                id: None,
+                name: name.into(),
+                source: "s".into(),
+                lod: vec![],
+                embedding: None,
+                capabilities: None,
+                ..Default::default()
+            };
+            lib.insert_node(&node).expect("insert");
+        }
+        let map = lib
+            .find_node_ids_by_names(&["alpha", "gamma", "missing"])
+            .expect("batch resolve");
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key("alpha"));
+        assert!(map.contains_key("gamma"));
+        assert!(!map.contains_key("missing"));
+        let empty = lib.find_node_ids_by_names(&[]).expect("empty");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    #[ignore = "100K-node KNN benchmark — run explicitly: cargo test -p coral-context knn_search_100k_benchmark -- --ignored --nocapture"]
+    fn knn_search_100k_benchmark() {
+        use search_vector::math::knn_brute_force;
+        use std::time::Instant;
+
+        let lib = Library::open_in_memory().expect("db");
+        let dims = 16usize;
+        let count = MAX_KNN_CANDIDATES + 1; // one over the HNSW-route threshold
+        let nodes: Vec<ContentNode> = (0..count)
+            .map(|i| {
+                let emb: Vec<f32> = (0..dims)
+                    .map(|j| ((i.wrapping_mul(j.wrapping_add(1))) % 997) as f32 / 997.0)
+                    .collect();
+                ContentNode {
+                    id: None,
+                    name: format!("n{i:06}").into(),
+                    source: String::new(),
+                    lod: vec![],
+                    embedding: Some(emb),
+                    capabilities: None,
+                    ..Default::default()
+                }
+            })
+            .collect();
+
+        let start = Instant::now();
+        lib.insert_nodes_batch(&nodes).expect("insert");
+        let insert_elapsed = start.elapsed();
+        let start = Instant::now();
+        lib.rebuild_hnsw().expect("rebuild hnsw");
+        let rebuild_elapsed = start.elapsed();
+        assert_eq!(lib.hnsw_len(), count);
+
+        let query: Vec<f32> = (0..dims).map(|j| j as f32 / 8.0).collect();
+
+        // "before" (pre-M8.1): full-table scan — SELECT every embedding from
+        // SQLite, deserialize each blob, brute-force over all candidates.
+        let start = Instant::now();
+        {
+            let conn = lib.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT id, embedding FROM context_nodes WHERE embedding IS NOT NULL")
+                .expect("prepare");
+            let rows: Vec<(i64, Vec<u8>)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("query")
+                .flatten()
+                .collect();
+            drop(stmt);
+            drop(conn);
+            let candidates: Vec<(usize, Vec<f32>)> = rows
+                .into_iter()
+                .filter_map(|(i, b)| search_vector::math::try_bytes_to_vec(&b).map(|v| (i as usize, v)))
+                .collect();
+            let _legacy = knn_brute_force(&query, candidates.into_iter(), 10);
+        }
+        let legacy_elapsed = start.elapsed();
+
+        // "after" (M8.1): knn_search routes through HNSW above the cap.
+        let start = Instant::now();
+        let hnsw = lib.knn_search(&query, 10, None).expect("knn");
+        let hnsw_elapsed = start.elapsed();
+
+        eprintln!(
+            "[perf] knn_{count} insert={insert_elapsed:?} rebuild={rebuild_elapsed:?} legacy_full_scan={legacy_elapsed:?} hnsw_route={hnsw_elapsed:?} hnsw_top1={:?}",
+            hnsw.first().map(|h| h.distance),
+        );
+        assert!(!hnsw.is_empty(), "HNSW route must return hits");
+        assert!(hnsw.len() <= 10);
     }
 }

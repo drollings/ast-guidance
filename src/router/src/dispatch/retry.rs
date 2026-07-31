@@ -3,11 +3,13 @@ use std::time::Duration;
 
 use guidance_llm::HttpClass;
 
+use crate::error::ServerError;
+
 /// Sends `POST url` with `body` as JSON, retrying on transient failures.
 ///
 /// Returns `Ok(response)` on success (HTTP 2xx) or on a non-retryable HTTP
 /// status — the caller inspects the response status to distinguish.  Returns
-/// `Err(string)` when all retry attempts are exhausted on retryable errors
+/// `Err` when all retry attempts are exhausted on retryable errors
 /// (429, 5xx) or transport failures.
 pub async fn retry_http_request(
     client: &reqwest::Client,
@@ -15,7 +17,7 @@ pub async fn retry_http_request(
     body: &serde_json::Value,
     retry_count: u32,
     retry_base_interval_s: u64,
-) -> Result<reqwest::Response, String> {
+) -> Result<reqwest::Response, ServerError> {
     let max_attempts = (retry_count + 1).max(1);
     let mut last_err = String::new();
 
@@ -53,9 +55,9 @@ pub async fn retry_http_request(
         }
     }
 
-    Err(format!(
+    Err(ServerError::Http(format!(
         "dispatch failed after {max_attempts} attempts: {last_err}"
-    ))
+    )))
 }
 
 #[cfg(test)]
@@ -121,10 +123,16 @@ mod tests {
         }
     }
 
+    /// A shared client for the retry tests (reuse the connection pool rather
+    /// than constructing a fresh `reqwest::Client` per test).
+    fn test_client() -> reqwest::Client {
+        reqwest::Client::new()
+    }
+
     #[tokio::test]
     async fn success_on_first_attempt() {
         let server = TestServer::new(vec![http::StatusCode::OK]).await;
-        let client = reqwest::Client::new();
+        let client = test_client();
         let result =
             retry_http_request(&client, &server.url(), &json!({"model": "test"}), 2, 1).await;
         assert!(result.is_ok());
@@ -138,7 +146,7 @@ mod tests {
             http::StatusCode::OK,
         ])
         .await;
-        let client = reqwest::Client::new();
+        let client = test_client();
         let result =
             retry_http_request(&client, &server.url(), &json!({"model": "test"}), 2, 1).await;
         assert!(result.is_ok());
@@ -148,7 +156,7 @@ mod tests {
     #[tokio::test]
     async fn short_circuit_on_400() {
         let server = TestServer::new(vec![http::StatusCode::BAD_REQUEST]).await;
-        let client = reqwest::Client::new();
+        let client = test_client();
         let result =
             retry_http_request(&client, &server.url(), &json!({"model": "test"}), 2, 1).await;
         assert!(result.is_ok());
@@ -163,11 +171,11 @@ mod tests {
             http::StatusCode::INTERNAL_SERVER_ERROR,
         ])
         .await;
-        let client = reqwest::Client::new();
+        let client = test_client();
         let result =
             retry_http_request(&client, &server.url(), &json!({"model": "test"}), 1, 1).await;
         assert!(result.is_err());
-        let msg = result.unwrap_err();
+        let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("failed after"),
             "expected 'failed after', got: {msg}"
@@ -189,7 +197,7 @@ mod tests {
             1,
         )
         .await;
-        let msg = result.unwrap_err();
+        let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("failed after"),
             "expected 'failed after', got: {msg}"

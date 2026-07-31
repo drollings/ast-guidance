@@ -177,7 +177,9 @@ pub fn error_response(message: &str, error_type: &str) -> serde_json::Value {
 
 /// Convert RouterRequest messages into Vec<serde_json::Value> for dispatch.
 /// Used by both server.rs dispatch_to_llm and dispatch::frontier backends.
-pub fn messages_to_json(request: &RouterRequest) -> Vec<serde_json::Value> {
+pub fn messages_to_json(
+    request: &RouterRequest,
+) -> Result<Vec<serde_json::Value>, NormalizeError> {
     request
         .messages
         .iter()
@@ -187,18 +189,22 @@ pub fn messages_to_json(request: &RouterRequest) -> Vec<serde_json::Value> {
                 RouterMessageContent::Parts(parts) => serde_json::Value::Array(
                     parts
                         .iter()
-                        .map(|p| serde_json::to_value(p).unwrap())
-                        .collect(),
+                        .map(|p| {
+                            serde_json::to_value(p)
+                                .map_err(|e| NormalizeError::Parse(e.to_string()))
+                        })
+                        .collect::<Result<_, _>>()?,
                 ),
             };
             let mut msg = serde_json::json!({"role": m.role, "content": content});
             if let Some(ref tc) = m.tool_calls {
-                msg["tool_calls"] = serde_json::to_value(tc).unwrap();
+                msg["tool_calls"] = serde_json::to_value(tc)
+                    .map_err(|e| NormalizeError::Parse(e.to_string()))?;
             }
             if let Some(ref id) = m.tool_call_id {
                 msg["tool_call_id"] = serde_json::Value::String(id.clone());
             }
-            msg
+            Ok(msg)
         })
         .collect()
 }
@@ -225,7 +231,9 @@ pub fn rejection_response(_reason: &str, model: &str) -> RouterResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::RouterResponse;
+    use crate::types::{
+        ContentPart, FunctionCall, ImageUrl, RouterMessageContent, RouterResponse, ToolCall,
+    };
 
     #[test]
     fn normalize_simple_text_request() {
@@ -303,5 +311,73 @@ mod tests {
         let json = error_response("bad request", "invalid_request_error");
         assert_eq!(json["error"]["message"], "bad request");
         assert_eq!(json["error"]["type"], "invalid_request_error");
+    }
+
+    #[test]
+    fn messages_to_json_with_parts_and_tool_calls() {
+        let request = RouterRequest {
+            model: "test".into(),
+            messages: vec![RouterMessage {
+                role: "assistant".into(),
+                content: RouterMessageContent::Parts(vec![
+                    ContentPart::Text {
+                        text: "a part".into(),
+                    },
+                    ContentPart::ImageUrl {
+                        image_url: ImageUrl {
+                            url: "https://example.test/x.png".into(),
+                        },
+                    },
+                ]),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "lookup".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+                tool_call_id: None,
+            }],
+            temperature: None,
+            max_tokens: None,
+            stream: None,
+            tools: None,
+            tool_choice: None,
+            session_id: None,
+            agent_id: None,
+            adapter: None,
+            metadata: Default::default(),
+        };
+        let json = messages_to_json(&request).expect("messages serialize");
+        assert_eq!(json.len(), 1);
+        assert_eq!(json[0]["role"], "assistant");
+        assert_eq!(json[0]["content"][0]["type"], "text");
+        assert_eq!(json[0]["content"][1]["type"], "image_url");
+        assert!(json[0]["tool_calls"][0]["function"]["name"] == "lookup");
+    }
+
+    #[test]
+    fn messages_to_json_text_roundtrip() {
+        let request = RouterRequest {
+            model: "test".into(),
+            messages: vec![RouterMessage {
+                role: "user".into(),
+                content: RouterMessageContent::Text("hello".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            temperature: None,
+            max_tokens: None,
+            stream: None,
+            tools: None,
+            tool_choice: None,
+            session_id: None,
+            agent_id: None,
+            adapter: None,
+            metadata: Default::default(),
+        };
+        let json = messages_to_json(&request).expect("messages serialize");
+        assert_eq!(json[0]["content"], "hello");
     }
 }

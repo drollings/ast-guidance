@@ -38,6 +38,8 @@ pub trait ChatBackend: Send + Sync {
         request: RouterRequest,
         model: String,
         params: Option<Value>,
+        idle_timeout_ms: u64,
+        total_timeout_ms: u64,
     ) -> Pin<Box<dyn Future<Output = Result<RouterResponse, DispatchError>> + Send>>;
 
     fn stream_complete(
@@ -60,8 +62,9 @@ fn build_chat_body(
     model: &str,
     params: Option<&Value>,
     stream: bool,
-) -> Value {
-    let messages = normalize::messages_to_json(request);
+) -> Result<Value, DispatchError> {
+    let messages = normalize::messages_to_json(request)
+        .map_err(|e| DispatchError::RequestBuild(e.to_string()))?;
     let mut body = serde_json::json!({"model": model, "messages": messages});
     if stream {
         body["stream"] = Value::Bool(true);
@@ -93,7 +96,7 @@ fn build_chat_body(
             body["max_tokens"] = Value::Number(serde_json::Number::from(max_tokens));
         }
     }
-    body
+    Ok(body)
 }
 
 fn dispatch_url(endpoint_url: &str) -> String {
@@ -102,6 +105,20 @@ fn dispatch_url(endpoint_url: &str) -> String {
     } else {
         format!("{}/chat/completions", endpoint_url.trim_end_matches('/'))
     }
+}
+
+/// Wrap a fallible HTTP future in a timeout. Collapses the repeated
+/// `tokio::time::timeout(...)` + `map_err` shapes used by both the buffered
+/// and streaming dispatch paths; `label` distinguishes a total-budget expiry
+/// from an idle-stall expiry in the resulting `DispatchError::Http`.
+async fn with_total_timeout<T>(
+    ms: u64,
+    label: &str,
+    fut: impl Future<Output = Result<T, DispatchError>>,
+) -> Result<T, DispatchError> {
+    tokio::time::timeout(Duration::from_millis(ms), fut)
+        .await
+        .map_err(|_| DispatchError::Http(label.to_string()))?
 }
 
 // ---------------------------------------------------------------------------
@@ -128,18 +145,27 @@ impl ChatBackend for OpenAiChatBackend {
         request: RouterRequest,
         model: String,
         params: Option<Value>,
+        idle_timeout_ms: u64,
+        total_timeout_ms: u64,
     ) -> Pin<Box<dyn Future<Output = Result<RouterResponse, DispatchError>> + Send>> {
         let url = dispatch_url(&self.endpoint_url);
-        let body = build_chat_body(&request, &model, params.as_ref(), false);
         let client = self.client.clone();
 
         Box::pin(async move {
-            let response = client
-                .post(&url)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| DispatchError::Http(e.to_string()))?;
+            let body = build_chat_body(&request, &model, params.as_ref(), false)?;
+            let response = with_total_timeout(
+                total_timeout_ms,
+                "total timeout exceeded",
+                async {
+                    client
+                        .post(&url)
+                        .json(&body)
+                        .send()
+                        .await
+                        .map_err(|e| DispatchError::Http(e.to_string()))
+                },
+            )
+            .await?;
 
             let status = response.status();
             if !status.is_success() {
@@ -151,10 +177,17 @@ impl ChatBackend for OpenAiChatBackend {
                 };
             }
 
-            let json: Value = response
-                .json()
-                .await
-                .map_err(|e| DispatchError::ResponseParse(e.to_string()))?;
+            let json: Value = with_total_timeout(
+                idle_timeout_ms,
+                "idle timeout exceeded reading response body",
+                async {
+                    response
+                        .json()
+                        .await
+                        .map_err(|e| DispatchError::ResponseParse(e.to_string()))
+                },
+            )
+            .await?;
 
             let openai = OpenAiBackend::new(&url, None);
             let mut resp = openai.parse_response(&json)?;
@@ -175,21 +208,25 @@ impl ChatBackend for OpenAiChatBackend {
         filter_thinking: bool,
     ) -> Pin<Box<dyn Future<Output = Result<StreamResult, DispatchError>> + Send>> {
         let url = dispatch_url(&self.endpoint_url);
-        let body = build_chat_body(&request, &model, params.as_ref(), true);
         let client = self.client.clone();
         let model_for_task = model.clone();
         let request_id = uuid_v4();
 
         Box::pin(async move {
-            let mut response = tokio::time::timeout(
-                Duration::from_millis(total_timeout_ms),
-                client.post(&url).json(&body).send(),
+            let body = build_chat_body(&request, &model, params.as_ref(), true)?;
+            let mut response = with_total_timeout(
+                total_timeout_ms,
+                "total timeout exceeded for stream connection",
+                async {
+                    client
+                        .post(&url)
+                        .json(&body)
+                        .send()
+                        .await
+                        .map_err(|e| DispatchError::Http(e.to_string()))
+                },
             )
-            .await
-            .map_err(|_| {
-                DispatchError::Http("total timeout exceeded for stream connection".into())
-            })?
-            .map_err(|e| DispatchError::Http(e.to_string()))?;
+            .await?;
 
             let status = response.status();
             if !status.is_success() {
@@ -202,7 +239,6 @@ impl ChatBackend for OpenAiChatBackend {
             }
 
             let (mut tx, rx) = http_body_util::channel::Channel::new(32);
-            let idle_dur = Duration::from_millis(idle_timeout_ms);
 
             tokio::spawn(async move {
                 let mut handler = StreamingHandler::new(&request_id, &model_for_task)
@@ -211,18 +247,27 @@ impl ChatBackend for OpenAiChatBackend {
                 let mut sent_first_chunk = false;
 
                 loop {
-                    let chunk = match tokio::time::timeout(idle_dur, response.chunk()).await {
-                        Ok(Ok(Some(b))) => b,
-                        Ok(Ok(None)) => break,
-                        Ok(Err(e)) => {
-                            tracing::warn!(target: "router.dispatch", error = %e, "stream read error");
-                            if sent_first_chunk {
-                                let _ = tx.send_data(Bytes::from(handler.format_done())).await;
-                            }
-                            return;
-                        }
-                        Err(_) => {
-                            tracing::warn!(target: "router.dispatch", model = %model_for_task, "idle timeout");
+                    let chunk = match with_total_timeout(
+                        idle_timeout_ms,
+                        "idle timeout waiting for stream chunk",
+                        async {
+                            response
+                                .chunk()
+                                .await
+                                .map_err(|e| DispatchError::Http(e.to_string()))
+                        },
+                    )
+                    .await
+                    {
+                        Ok(Some(b)) => b,
+                        Ok(None) => break,
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "router.dispatch",
+                                model = %model_for_task,
+                                error = %e,
+                                "stream read error or idle timeout"
+                            );
                             if sent_first_chunk {
                                 let _ = tx.send_data(Bytes::from(handler.format_done())).await;
                             }
@@ -310,6 +355,8 @@ impl ChatBackend for RetryChatBackend {
         request: RouterRequest,
         model: String,
         params: Option<Value>,
+        idle_timeout_ms: u64,
+        total_timeout_ms: u64,
     ) -> Pin<Box<dyn Future<Output = Result<RouterResponse, DispatchError>> + Send>> {
         let inner = self.inner.clone();
         let max_attempts = (self.retry_count + 1).max(1);
@@ -319,7 +366,13 @@ impl ChatBackend for RetryChatBackend {
             let mut last_err = DispatchError::Http("no attempt made".into());
             for attempt in 0..max_attempts {
                 match inner
-                    .complete(request.clone(), model.clone(), params.clone())
+                    .complete(
+                        request.clone(),
+                        model.clone(),
+                        params.clone(),
+                        idle_timeout_ms,
+                        total_timeout_ms,
+                    )
                     .await
                 {
                     Ok(resp) => return Ok(resp),
@@ -411,6 +464,8 @@ impl ChatBackend for FallbackChatBackend {
         request: RouterRequest,
         model: String,
         params: Option<Value>,
+        idle_timeout_ms: u64,
+        total_timeout_ms: u64,
     ) -> Pin<Box<dyn Future<Output = Result<RouterResponse, DispatchError>> + Send>> {
         let backends = self.backends.clone();
 
@@ -418,7 +473,13 @@ impl ChatBackend for FallbackChatBackend {
             let mut last_err = DispatchError::AllBackendsFailed;
             for backend in &backends {
                 match backend
-                    .complete(request.clone(), model.clone(), params.clone())
+                    .complete(
+                        request.clone(),
+                        model.clone(),
+                        params.clone(),
+                        idle_timeout_ms,
+                        total_timeout_ms,
+                    )
                     .await
                 {
                     Ok(resp) => return Ok(resp),
@@ -532,7 +593,10 @@ mod tests {
             _request: RouterRequest,
             _model: String,
             _params: Option<Value>,
+            idle_timeout_ms: u64,
+            total_timeout_ms: u64,
         ) -> Pin<Box<dyn Future<Output = Result<RouterResponse, DispatchError>> + Send>> {
+            let _ = (idle_timeout_ms, total_timeout_ms);
             let mut guard = self.responses.lock().unwrap();
             let result = guard.remove(0);
             Box::pin(async move { result })
@@ -584,7 +648,7 @@ mod tests {
         let inner = StubBackend::new(vec![Ok(dummy_response())]);
         let backend = RetryChatBackend::new(inner, 2, 1);
         let result = backend
-            .complete(make_test_request("hi"), "m".into(), None)
+            .complete(make_test_request("hi"), "m".into(), None, 5000, 30000)
             .await;
         assert!(result.is_ok());
     }
@@ -594,7 +658,7 @@ mod tests {
         let inner = StubBackend::new(vec![Err(DispatchError::RateLimited), Ok(dummy_response())]);
         let backend = RetryChatBackend::new(inner, 2, 1);
         let result = backend
-            .complete(make_test_request("hi"), "m".into(), None)
+            .complete(make_test_request("hi"), "m".into(), None, 5000, 30000)
             .await;
         assert!(result.is_ok());
     }
@@ -604,7 +668,7 @@ mod tests {
         let inner = StubBackend::new(vec![Err(DispatchError::ResponseParse("bad json".into()))]);
         let backend = RetryChatBackend::new(inner, 2, 1);
         let result = backend
-            .complete(make_test_request("hi"), "m".into(), None)
+            .complete(make_test_request("hi"), "m".into(), None, 5000, 30000)
             .await;
         assert!(result.is_err());
         assert!(matches!(
@@ -621,7 +685,7 @@ mod tests {
         ]);
         let backend = RetryChatBackend::new(inner, 1, 1);
         let result = backend
-            .complete(make_test_request("hi"), "m".into(), None)
+            .complete(make_test_request("hi"), "m".into(), None, 5000, 30000)
             .await;
         assert!(result.is_err());
     }
@@ -636,7 +700,7 @@ mod tests {
         let b2 = StubBackend::new(vec![Ok(dummy_response())]);
         let backend = FallbackChatBackend::new(vec![b1, b2]);
         let result = backend
-            .complete(make_test_request("hi"), "m".into(), None)
+            .complete(make_test_request("hi"), "m".into(), None, 5000, 30000)
             .await;
         assert!(result.is_ok());
     }
@@ -647,7 +711,7 @@ mod tests {
         let b2 = StubBackend::new(vec![Ok(dummy_response())]);
         let backend = FallbackChatBackend::new(vec![b1, b2]);
         let result = backend
-            .complete(make_test_request("hi"), "m".into(), None)
+            .complete(make_test_request("hi"), "m".into(), None, 5000, 30000)
             .await;
         assert!(result.is_ok());
     }
@@ -658,7 +722,7 @@ mod tests {
         let b2 = StubBackend::new(vec![Ok(dummy_response())]);
         let backend = FallbackChatBackend::new(vec![b1, b2]);
         let result = backend
-            .complete(make_test_request("hi"), "m".into(), None)
+            .complete(make_test_request("hi"), "m".into(), None, 5000, 30000)
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("400"));
@@ -670,7 +734,7 @@ mod tests {
         let b2 = StubBackend::new(vec![Err(DispatchError::Http("HTTP 502".into()))]);
         let backend = FallbackChatBackend::new(vec![b1, b2]);
         let result = backend
-            .complete(make_test_request("hi"), "m".into(), None)
+            .complete(make_test_request("hi"), "m".into(), None, 5000, 30000)
             .await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), DispatchError::Http(_)));
@@ -691,5 +755,60 @@ mod tests {
             )
             .await;
         assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Timeout enforcement tests
+    // -----------------------------------------------------------------------
+
+    /// An upstream that accepts TCP connections but never responds. A buffered
+    /// dispatch against it must resolve with a timeout error, not hang forever.
+    #[tokio::test]
+    async fn complete_times_out_against_never_responding_upstream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let _server = tokio::spawn(async move {
+            // Hold every accepted connection open without responding so the
+            // peer's `send()` stalls until the total timeout fires.
+            let mut held = Vec::new();
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => held.push(stream),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let backend = OpenAiChatBackend::new(
+            reqwest::Client::new(),
+            format!("http://{addr}"),
+        );
+        let total_timeout_ms = 200;
+        let start = std::time::Instant::now();
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(total_timeout_ms + 2000),
+            backend.complete(
+                make_test_request("hi"),
+                "m".into(),
+                None,
+                total_timeout_ms,
+                total_timeout_ms,
+            ),
+        )
+        .await;
+
+        let elapsed = start.elapsed();
+        assert!(result.is_ok(), "complete() must not hang on a stalled upstream");
+        let err = result.unwrap().unwrap_err();
+        assert!(
+            matches!(&err, DispatchError::Http(msg) if msg.contains("timeout")),
+            "expected a timeout DispatchError, got: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(total_timeout_ms + 2000),
+            "complete() returned after {elapsed:?}, expected ~{total_timeout_ms}ms"
+        );
     }
 }

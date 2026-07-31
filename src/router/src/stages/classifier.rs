@@ -10,12 +10,13 @@
 use std::fmt::Write;
 use std::sync::Arc;
 
+use fluent_concurrency::pool::Limiter;
 use fluent_wvr::prelude::*;
 use guidance_llm::client::ChatBackend;
 use guidance_llm::ChatMessage;
 
 use crate::config::{ClassifierOutput, RoutingConfig};
-use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
+use crate::pipeline_types::{PipelineStage, StageDecision, StageMetadata, StageVerdict};
 use crate::score_matrix::ScoreMatrix;
 use crate::stages::common::extract_user_message;
 
@@ -388,6 +389,13 @@ pub struct ClassifierStage {
     coherence_threshold: f64,
     score_matrix: Option<ScoreMatrix>,
     classifier_intelligence: u8,
+    /// Bounds concurrent classifier LLM calls. Each sync `chat_complete` runs
+    /// through `run_sync`, which acquires a permit before invoking the backend.
+    ///
+    /// Long-term design (see `doc/router/VISION.md`) is a `ResultPool`-based
+    /// parallel classifier fan-out; this limiter only bounds the current sync
+    /// path so a burst cannot starve every tokio worker via `block_in_place`.
+    limiter: Arc<Limiter>,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
@@ -399,6 +407,7 @@ impl ClassifierStage {
         coherence_threshold: f64,
         score_matrix: Option<ScoreMatrix>,
         classifier_intelligence: u8,
+        limiter: Arc<Limiter>,
     ) -> Self {
         Self {
             name: ArcIntern::from("pipeline.stage2.classifier"),
@@ -407,6 +416,7 @@ impl ClassifierStage {
             coherence_threshold,
             score_matrix,
             classifier_intelligence,
+            limiter,
             depends: vec![ArcIntern::from("pipeline.stage1.output")],
             provides: vec![ArcIntern::from("pipeline.stage2.output")],
         }
@@ -521,7 +531,10 @@ impl WorkUnit for ClassifierStage {
             },
         ];
 
-        let response = match self.client.chat_complete(&messages) {
+        let response = match self
+            .limiter
+            .run_sync(|| async { self.client.chat_complete(&messages) })
+        {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(target: "router.pipeline.stage2", error = %e, "classifier LLM call failed");
@@ -619,7 +632,7 @@ impl ClassifierStage {
             sm.resolve(&scores)
         });
 
-        let mut metadata = serde_json::json!({
+        let mut metadata = StageMetadata::from(serde_json::json!({
             "coherence_score": output.coherence_score,
             "safety_score": output.safety_score,
             "complexity": output.complexity,
@@ -629,28 +642,34 @@ impl ClassifierStage {
             "action": output.action,
             "reason": output.reason,
             "fallback": !ok,
-        });
+        }));
 
         if let Some(ref routes) = scored_routes {
             if let Some(top) = routes.first() {
-                metadata["scored_route"] = serde_json::json!({
-                    "route": top.route_name,
-                    "score": top.weighted_score,
-                    "score_vector": top.score_vector.iter().map(|(d, s)| {
-                        serde_json::json!({"dimension": d, "score": s})
-                    }).collect::<Vec<_>>(),
-                });
+                metadata.insert(
+                    "scored_route",
+                    serde_json::json!({
+                        "route": top.route_name,
+                        "score": top.weighted_score,
+                        "score_vector": top.score_vector.iter().map(|(d, s)| {
+                            serde_json::json!({"dimension": d, "score": s})
+                        }).collect::<Vec<_>>(),
+                    }),
+                );
             }
-            metadata["scored_routes"] = serde_json::Value::Array(
-                routes
-                    .iter()
-                    .map(|r| {
-                        serde_json::json!({
-                            "route": r.route_name,
-                            "score": r.weighted_score,
+            metadata.insert(
+                "scored_routes",
+                serde_json::Value::Array(
+                    routes
+                        .iter()
+                        .map(|r| {
+                            serde_json::json!({
+                                "route": r.route_name,
+                                "score": r.weighted_score,
+                            })
                         })
-                    })
-                    .collect(),
+                        .collect(),
+                ),
             );
         }
 
@@ -658,9 +677,12 @@ impl ClassifierStage {
             // When we have a routing target, the response is from a misbehaving
             // LLM that output both action=respond + code.  Don't store it as a
             // classifier response — the handler will dispatch instead.
-            metadata["routing_target"] = rt.clone();
+            if let Ok(typed) = serde_json::from_value::<crate::pipeline::RoutingTarget>(rt.clone())
+            {
+                metadata.set_routing_target(&typed);
+            }
         } else if let Some(ref resp) = output.response {
-            metadata["response"] = serde_json::Value::String(resp.clone());
+            metadata.set_response(resp.clone());
         }
 
         WorkOutput::typed(
@@ -676,7 +698,7 @@ impl ClassifierStage {
                     output.coherence_score
                 ),
                 latency_ms: 0,
-                metadata,
+                metadata: metadata.into_value(),
             },
         )
     }
