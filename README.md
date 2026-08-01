@@ -18,6 +18,12 @@ a uniform source of metadata and sanitized input constraints.  Every crate in `s
 builds on the same foundation of proven design patterns, capability-gated concurrency,
 and type-safe runtime composition.
 
+Note:  This project's support for parallel inference is built around a branch of 
+llama.cpp that allows parallel context windows and window sizes upon requests via 
+HTTP parameters.  You can find that at:
+
+https://github.com/drollings/llama.cpp/tree/_gguf_tool_ctx
+
 ## Quick start
 
 ```bash
@@ -152,15 +158,45 @@ projects in Python, C++, and Zig, ported to Rust.
 
 ## License
 
-Dual-licensed under GNU LGPL v3.0 and a Commercial License.
+`fluent-monorepo` is **dual-licensed** under the terms of either:
 
-**GPLv3**: Free for open-source, hobby, and individual use. If you distribute
-software including this code, you must open-source it under GPLv3.
+1. **GNU Lesser General Public License v3.0 or later** (`LGPL-3.0-or-later`), OR
+2. **Commercial License**
 
-**Commercial License** required for:
-- Proprietary, closed-source products
-- Organizations with gross annual revenue exceeding $1,000,000 USD
-- More than one developer seat
-- Technical support, indemnification, or liability waivers
+You may select the license terms that best fit your project's compliance requirements.
 
-See `LICENSE`, `LICENSE-Contributor-Agreement`, and `LICENSE-Commercial-Requirement`.
+---
+
+### Option 1: Open Source Use (LGPLv3)
+
+You are free to use, modify, and distribute this software under the terms of the **GNU Lesser General Public License v3.0** (`LICENSE-LGPLv3`).
+
+* **Internal / Cloud SaaS Use:** You can freely use `fluent-monorepo` inside your organization or behind a network/SaaS boundary without triggering copyleft obligations.
+* **Open Source Projects:** You may freely include or link against `fluent-monorepo` in open-source applications.
+* **Rust Static Linking Notice:** Because Cargo compiles Rust dependencies directly into static application binaries, distributing a proprietary closed-source application that embeds `fluent-monorepo` under LGPLv3 requires you to either:
+  1. Open-source your application under a compatible license, **OR**
+  2. Provide object files (`.rlib`/`.o`) or source code sufficient to allow end users to re-link your application against modified versions of `fluent-monorepo` (per LGPLv3 Section 4).
+
+If your project cannot comply with LGPLv3 static-linking requirements or you do not wish to distribute object files for proprietary code, you must obtain a **Commercial License**.
+
+---
+
+### Option 2: Commercial License
+
+The **Commercial License** removes all LGPLv3 copyleft and re-linking obligations, allowing you to freely embed, statically link, and distribute `fluent-monorepo` within closed-source, proprietary products.
+
+A Commercial License is recommended for:
+* Closed-source commercial software products distributed to end users.
+* Enterprise deployments requiring formal SLA guarantees, dedicated technical support, indemnification, or liability waivers.
+* Teams requiring custom contributor agreements or tailored integration support.
+
+---
+
+### Third-Party Dependencies & Acknowledgments
+
+`fluent-monorepo` is built on top of the Rust open-source ecosystem and relies on third-party crates, including:
+
+* **Tokio** runtime and async primitives — licensed under the permissive [MIT License](https://github.com/tokio-rs/tokio/blob/master/LICENSE)
+* Additional ecosystem dependencies — licensed under permissive standard licenses (MIT, Apache-2.0, or BSD)
+
+Under the terms of these permissive upstream licenses, you remain fully compliant when linking them alongside `fluent-monorepo`. Complete license notices for all transitive dependencies are included in the source distribution and generated dependency manifests (`cargo-deny` audit reports).
