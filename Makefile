@@ -150,6 +150,16 @@ router-test: $(CORAL_ROUTER_BIN) ## Run all router unit, golden, and e2e mock te
 	$(Q)echo "Running coral-router dry-run (--help)"
 	$(Q)cargo run --bin coral-router -- --help > /dev/null && echo "All router tests passed." || echo "ERRROR: coral-router did NOT successfully run."
 
+.PHONY: router-test-all
+router-test-all: $(CORAL_ROUTER_BIN) ## Run all router tests + HNSW benchmarks (large, slow)
+	$(Q)pkill coral-router 2>/dev/null || true
+	$(Q)echo "Running fluent-router unit + e2e mock tests"
+	$(Q)cargo test -p fluent-router
+	$(Q)echo "Running coral-context tests with HNSW benchmarks"
+	$(Q)cargo test -p coral-context --features hnsw-bench -- --ignored --nocapture
+	$(Q)echo "Running coral-router dry-run (--help)"
+	$(Q)cargo run --bin coral-router -- --help > /dev/null && echo "All router tests passed." || echo "ERRROR: coral-router did NOT successfully run."
+
 ROUTER_MOCK_TEST_SCRIPT := bin/router-mock-tests.sh
 
 .PHONY: router-start

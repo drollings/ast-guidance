@@ -355,6 +355,7 @@ pub struct OpenAiCompatBackend {
     pub api_base: String,
     pub api_key: Option<String>,
     pub provider_label: String,
+    openai: OpenAiBackend,
 }
 
 impl OpenAiCompatBackend {
@@ -363,10 +364,14 @@ impl OpenAiCompatBackend {
         api_key: Option<String>,
         provider_label: impl Into<String>,
     ) -> Self {
+        let base: String = api_base.into();
+        let key = api_key;
+        let openai = OpenAiBackend::new(&base, key.clone());
         Self {
-            api_base: api_base.into(),
-            api_key,
+            api_base: base,
+            api_key: key,
             provider_label: provider_label.into(),
+            openai,
         }
     }
 }
@@ -377,18 +382,15 @@ impl DispatchBackend for OpenAiCompatBackend {
     }
 
     fn build_request(&self, request: &RouterRequest) -> Result<Value, DispatchError> {
-        let openai = OpenAiBackend::new(&self.api_base, self.api_key.clone());
-        openai.build_request(request)
+        self.openai.build_request(request)
     }
 
     fn parse_response(&self, body: &Value) -> Result<RouterResponse, DispatchError> {
-        let openai = OpenAiBackend::new(&self.api_base, self.api_key.clone());
-        openai.parse_response(body)
+        self.openai.parse_response(body)
     }
 
     fn parse_stream_event(&self, event: &[u8]) -> Result<StreamEvent, DispatchError> {
-        let openai = OpenAiBackend::new(&self.api_base, self.api_key.clone());
-        openai.parse_stream_event(event)
+        self.openai.parse_stream_event(event)
     }
 }
 

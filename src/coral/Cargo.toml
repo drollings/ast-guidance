@@ -3,6 +3,10 @@ name = "coral-context"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+hnsw-bench = []
+
 [dependencies]
 fluent-wvr = { path = "../fluent-wvr" }
 fluent-concurrency = { path = "../fluent-concurrency" }

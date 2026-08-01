@@ -527,7 +527,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "100K-node KNN benchmark — run explicitly: cargo test -p coral-context knn_search_100k_benchmark -- --ignored --nocapture"]
+    #[cfg(feature = "hnsw-bench")]
+    #[ignore = "100K-node KNN benchmark — run explicitly with --features hnsw-bench -- --ignored --nocapture"]
     fn knn_search_100k_benchmark() {
         use search_vector::math::knn_brute_force;
         use std::time::Instant;
