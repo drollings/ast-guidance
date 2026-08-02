@@ -5,7 +5,7 @@
             "classifier": true,
             "router": true,
             "coherence_threshold": 0.7,
-            "classifier_model": "fast",
+            "classifier_model": "tiny",
             "blacklist": "env/pii-patterns.json"
         }
     },
@@ -25,8 +25,8 @@
             "retry_count": 2,
             "retry_base_interval_s": 1,
             "params": {
-                "num_ctx": 98304,
-                "parallel": 3,
+                "num_ctx": 65536,
+                "parallel": 2,
                 "sleep_idle_seconds": 7200
             }
         },
@@ -50,10 +50,10 @@
                 "sleep_idle_seconds": 7200
             }
         },
-        "qwythos-9b": {
+        "mid": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
-            "name": "empero-ai/qwythos-9b-v2",
-            "intelligence": 4,
+            "name": "unsloth/qwen3.5-4b-mtp",
+            "intelligence": 3,
             "cost_input": 3e-06,
             "cost_output": 1.8e-05,
             "cost_cached_read": 1.2e-06,
@@ -81,6 +81,44 @@
                 "code": {
                     "num_ctx": 65536,
                     "sleep_idle_seconds": 600
+                },
+                "compact": {
+                    "num_ctx": 8192,
+                    "sleep_idle_seconds": 300
+                }
+            }
+        },
+        "heavy": {
+            "endpoint": "http://localhost:8080/v1/chat/completions",
+            "name": "vinpix/ternary-bonsai-27b-stock-mtp",
+            "intelligence": 6,
+            "cost_input": 3e-06,
+            "cost_output": 1.8e-05,
+            "cost_cached_read": 1.2e-06,
+            "speed": 5,
+            "total_timeout_ms": 240000,
+            "idle_timeout_ms": 15000,
+            "stream": true,
+            "filter_thinking": true,
+            "retry_count": 1,
+            "retry_base_interval_s": 2,
+            "params": {
+                "num_ctx": 131072,
+                "repeat_penalty": 1.05,
+                "temperature": 0.7,
+                "sleep_idle_seconds": 900
+            },
+            "sessions": {
+                "orchestrator": {
+                    "num_ctx": 131072,
+                    "sleep_idle_seconds": 0,
+                    "params": {
+                        "temperature": 0.7
+                    }
+                },
+                "code": {
+                    "num_ctx": 131072,
+                    "sleep_idle_seconds": 900
                 },
                 "compact": {
                     "num_ctx": 8192,
@@ -148,44 +186,44 @@
         "code": {
             "group": "code",
             "pipelines": ["default"],
-            "description": "Programming, coding, software development, debugging, and technical implementation"
+            "description": "Programming, software development, dev-ops, debugging, and technical implementation"
         },
         "translation": {
             "group": "translation",
             "pipelines": ["default"],
-            "description": "Language translation between different languages"
+            "description": "Translation between different languages"
         }
     },
     "model_groups": {
         "classifier": [
-            "fast"
+            "tiny"
         ],
         "question": [
-            "fast"
+            "mid"
         ],
         "command": [
-            "fast"
+            "mid"
         ],
         "code": [
-            "qwythos-9b"
+            "heavy"
         ],
         "chitchat": [
-            "fast"
+            "mid"
         ],
         "psychology": [
-            "fast"
+            "heavy"
         ],
         "translation": [
             "translation"
         ],
         "orchestrator": [
-            "qwythos-9b"
+            "mid"
         ],
         "ledger": [
-            "qwythos-9b"
+            "mid"
         ]
     },
-    "system_prompt": "You are a query classifier and safety router. Analyze the user's message and output JSON only.",
+    "system_prompt": "You are Coral, a query classifier and safety router based on LiquidAI's LFM2.5 LLM architecture. Analyze the user's message and output JSON only.",
     "safety_threshold": 0.5,
     "default_route": "local",
     "server": {

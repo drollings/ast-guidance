@@ -9,11 +9,14 @@
 
 use std::fmt::Write;
 use std::sync::Arc;
+use std::time::Instant;
 
 use fluent_concurrency::pool::Limiter;
 use fluent_wvr::prelude::*;
 use guidance_llm::client::ChatBackend;
 use guidance_llm::ChatMessage;
+
+use crate::metrics::classify_error;
 
 use crate::config::{ClassifierOutput, RoutingConfig};
 use crate::pipeline_types::{PipelineStage, StageDecision, StageMetadata, StageVerdict};
@@ -325,6 +328,11 @@ fn resolve_routing_target(
             model = %model_name,
             endpoint = %model.endpoint,
             group = ?routing_config.routes.get(route).map(|r| &r.group),
+            idle_timeout_ms = model.idle_timeout_ms,
+            total_timeout_ms = model.total_timeout_ms,
+            retry_count = model.retry_count,
+            stream = model.stream,
+            filter_thinking = model.filter_thinking,
             "routing target resolved"
         );
         Some(build_routing_target_value(
@@ -389,6 +397,11 @@ pub struct ClassifierStage {
     coherence_threshold: f64,
     score_matrix: Option<ScoreMatrix>,
     classifier_intelligence: u8,
+    /// Config key of the model the classifier dispatches to (e.g. "fast").
+    /// Logged as structured context on every classifier LLM call so the
+    /// inference sub-stage is attributable without re-deriving it from the
+    /// client.
+    classifier_model: String,
     /// Bounds concurrent classifier LLM calls. Each sync `chat_complete` runs
     /// through `run_sync`, which acquires a permit before invoking the backend.
     ///
@@ -407,6 +420,7 @@ impl ClassifierStage {
         coherence_threshold: f64,
         score_matrix: Option<ScoreMatrix>,
         classifier_intelligence: u8,
+        classifier_model: impl Into<String>,
         limiter: Arc<Limiter>,
     ) -> Self {
         Self {
@@ -416,6 +430,7 @@ impl ClassifierStage {
             coherence_threshold,
             score_matrix,
             classifier_intelligence,
+            classifier_model: classifier_model.into(),
             limiter,
             depends: vec![ArcIntern::from("pipeline.stage1.output")],
             provides: vec![ArcIntern::from("pipeline.stage2.output")],
@@ -531,13 +546,47 @@ impl WorkUnit for ClassifierStage {
             },
         ];
 
-        let response = match self
-            .limiter
-            .run_sync(|| async { self.client.chat_complete(&messages) })
-        {
+        tracing::info!(
+            target: "router.pipeline.stage2.classifier",
+            model = %self.classifier_model,
+            input_len = messages[1].content.len(),
+            system_prompt_len = messages[0].content.len(),
+            "classifier LLM request"
+        );
+
+        let call_start = Instant::now();
+        let mut llm_latency_ms = 0u64;
+        let response = self.limiter.run_sync(|| async {
+            let llm_start = Instant::now();
+            let result = self.client.chat_complete(&messages);
+            llm_latency_ms = llm_start.elapsed().as_millis() as u64;
+            if let Ok(s) = &result {
+                tracing::info!(
+                    target: "router.pipeline.stage2.classifier",
+                    model = %self.classifier_model,
+                    llm_latency_ms = llm_latency_ms,
+                    response_len = s.len(),
+                    "classifier LLM call succeeded"
+                );
+            }
+            result
+        });
+        let total_latency_ms = call_start.elapsed().as_millis() as u64;
+        let limiter_wait_ms = total_latency_ms.saturating_sub(llm_latency_ms);
+
+        let response = match response {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!(target: "router.pipeline.stage2", error = %e, "classifier LLM call failed");
+                let class = classify_error(&e.to_string());
+                tracing::error!(target: "router.pipeline.stage2.classifier",
+                    model = %self.classifier_model,
+                    error = %e,
+                    error_class = class.label(),
+                    retryable = e.is_retryable(),
+                    llm_latency_ms = llm_latency_ms,
+                    total_latency_ms = total_latency_ms,
+                    "classifier LLM call failed — falling back to default route"
+                );
                 let output = ClassifierOutput {
                     action: "route".into(),
                     response: None,
@@ -565,13 +614,42 @@ impl WorkUnit for ClassifierStage {
             }
         };
 
+        tracing::info!(
+            target: "router.pipeline.stage2.classifier",
+            model = %self.classifier_model,
+            total_latency_ms = total_latency_ms,
+            llm_latency_ms = llm_latency_ms,
+            limiter_wait_ms = limiter_wait_ms,
+            "classifier call complete"
+        );
+
         let (output, ok) = parse_classifier_response(&response, &self.routing_config.default_route);
+
+        if !ok {
+            tracing::warn!(
+                target: "router.pipeline.stage2.classifier",
+                model = %self.classifier_model,
+                raw_len = response.len(),
+                recovered_reason = %output.reason,
+                "classifier response recovered via sanitization/fallback"
+            );
+        }
 
         if let Some(decision) = check_thresholds(
             &output,
             self.coherence_threshold,
             self.routing_config.safety_threshold,
         ) {
+            tracing::info!(
+                target: "router.pipeline.stage2.classifier",
+                model = %self.classifier_model,
+                coherence_score = output.coherence_score,
+                safety_score = output.safety_score,
+                coherence_threshold = self.coherence_threshold,
+                safety_threshold = self.routing_config.safety_threshold,
+                reason = %decision.reason,
+                "classifier threshold rejection"
+            );
             return WorkOutput::typed("rejected", &decision);
         }
 

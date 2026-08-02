@@ -375,6 +375,7 @@ mod tests {
             0.7,
             None,
             1,
+            "fast",
             limiter,
         );
 

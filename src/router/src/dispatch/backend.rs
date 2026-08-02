@@ -1,9 +1,10 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::dispatch::frontier::DispatchBackend;
+use crate::metrics::classify_error;
 use bytes::Bytes;
 use common_core::drain_sse_lines;
 use common_core::hash::uuid_v4;
@@ -152,49 +153,84 @@ impl ChatBackend for OpenAiChatBackend {
         let client = self.client.clone();
 
         Box::pin(async move {
-            let body = build_chat_body(&request, &model, params.as_ref(), false)?;
-            let response = with_total_timeout(
-                total_timeout_ms,
-                "total timeout exceeded",
-                async {
-                    client
-                        .post(&url)
-                        .json(&body)
-                        .send()
-                        .await
-                        .map_err(|e| DispatchError::Http(e.to_string()))
-                },
-            )
-            .await?;
+            let start = Instant::now();
+            let log_model = model.clone();
+            let result: Result<RouterResponse, DispatchError> = async {
+                let body = build_chat_body(&request, &model, params.as_ref(), false)?;
+                let response = with_total_timeout(
+                    total_timeout_ms,
+                    "total timeout exceeded",
+                    async {
+                        client
+                            .post(&url)
+                            .json(&body)
+                            .send()
+                            .await
+                            .map_err(|e| DispatchError::Http(e.to_string()))
+                    },
+                )
+                .await?;
 
-            let status = response.status();
-            if !status.is_success() {
-                let class = HttpClass::from_status(status.as_u16());
-                return if class.is_retryable() {
-                    Err(DispatchError::RateLimited)
-                } else {
-                    Err(DispatchError::Http(format!("HTTP {status}")))
-                };
+                let status = response.status();
+                if !status.is_success() {
+                    let class = HttpClass::from_status(status.as_u16());
+                    return if class.is_retryable() {
+                        Err(DispatchError::RateLimited)
+                    } else {
+                        Err(DispatchError::Http(format!("HTTP {status}")))
+                    };
+                }
+
+                let json: Value = with_total_timeout(
+                    idle_timeout_ms,
+                    "idle timeout exceeded reading response body",
+                    async {
+                        response
+                            .json()
+                            .await
+                            .map_err(|e| DispatchError::ResponseParse(e.to_string()))
+                    },
+                )
+                .await?;
+
+                let openai = OpenAiBackend::new(&url, None);
+                let mut resp = openai.parse_response(&json)?;
+                if resp.model == "unknown" && model != "unknown" {
+                    resp.model = model;
+                }
+                Ok(resp)
             }
+            .await;
 
-            let json: Value = with_total_timeout(
-                idle_timeout_ms,
-                "idle timeout exceeded reading response body",
-                async {
-                    response
-                        .json()
-                        .await
-                        .map_err(|e| DispatchError::ResponseParse(e.to_string()))
-                },
-            )
-            .await?;
-
-            let openai = OpenAiBackend::new(&url, None);
-            let mut resp = openai.parse_response(&json)?;
-            if resp.model == "unknown" && model != "unknown" {
-                resp.model = model;
+            let latency_ms = start.elapsed().as_millis() as u64;
+            match &result {
+                Ok(resp) => {
+                    tracing::info!(
+                        target: "router.dispatch.backend",
+                        model = %log_model,
+                        url = %url,
+                        latency_ms = latency_ms,
+                        total_timeout_ms = total_timeout_ms,
+                        idle_timeout_ms = idle_timeout_ms,
+                        choices = resp.choices.len(),
+                        "chat completion ok"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "router.dispatch.backend",
+                        model = %log_model,
+                        url = %url,
+                        latency_ms = latency_ms,
+                        total_timeout_ms = total_timeout_ms,
+                        idle_timeout_ms = idle_timeout_ms,
+                        error = %e,
+                        error_class = classify_error(&e.to_string()).label(),
+                        "chat completion failed"
+                    );
+                }
             }
-            Ok(resp)
+            result
         })
     }
 
@@ -213,6 +249,7 @@ impl ChatBackend for OpenAiChatBackend {
         let request_id = uuid_v4();
 
         Box::pin(async move {
+            let stream_start = Instant::now();
             let body = build_chat_body(&request, &model, params.as_ref(), true)?;
             let mut response = with_total_timeout(
                 total_timeout_ms,
@@ -237,6 +274,16 @@ impl ChatBackend for OpenAiChatBackend {
                     Err(DispatchError::Http(format!("HTTP {status}")))
                 };
             }
+
+            tracing::info!(
+                target: "router.dispatch.backend",
+                model = %model,
+                url = %url,
+                connect_latency_ms = stream_start.elapsed().as_millis() as u64,
+                total_timeout_ms = total_timeout_ms,
+                idle_timeout_ms = idle_timeout_ms,
+                "stream connected"
+            );
 
             let (mut tx, rx) = http_body_util::channel::Channel::new(32);
 
@@ -266,6 +313,8 @@ impl ChatBackend for OpenAiChatBackend {
                                 target: "router.dispatch",
                                 model = %model_for_task,
                                 error = %e,
+                                error_class = classify_error(&e.to_string()).label(),
+                                idle_timeout_ms = idle_timeout_ms,
                                 "stream read error or idle timeout"
                             );
                             if sent_first_chunk {
@@ -311,7 +360,16 @@ impl ChatBackend for OpenAiChatBackend {
                                     }
                                     let s = handler.format_chunk(delta, None);
                                     if !s.is_empty() {
-                                        sent_first_chunk = true;
+                                        if !sent_first_chunk {
+                                            sent_first_chunk = true;
+                                            tracing::info!(
+                                                target: "router.dispatch.backend",
+                                                model = %model_for_task,
+                                                stream_ttfb_ms =
+                                                    stream_start.elapsed().as_millis() as u64,
+                                                "stream first chunk"
+                                            );
+                                        }
                                         let _ = tx.send_data(Bytes::from(s)).await;
                                     }
                                 }
@@ -378,10 +436,16 @@ impl ChatBackend for RetryChatBackend {
                     Ok(resp) => return Ok(resp),
                     Err(e) if e.is_retryable() && attempt + 1 < max_attempts => {
                         last_err = e;
-                        tokio::time::sleep(Duration::from_millis(
-                            retry_base * 1000 * (1u64 << attempt),
-                        ))
-                        .await;
+                        let delay = retry_base * 1000 * (1u64 << attempt);
+                        tracing::info!(
+                            target: "router.dispatch.retry",
+                            attempt = attempt + 1,
+                            max_attempts = max_attempts,
+                            delay_ms = delay,
+                            error = %last_err,
+                            "retrying chat completion after backoff"
+                        );
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
                     }
                     Err(e) => return Err(e),
                 }
@@ -423,18 +487,30 @@ impl ChatBackend for RetryChatBackend {
                     Ok(Ok(stream)) => return Ok(stream),
                     Ok(Err(e)) if e.is_retryable() && attempt + 1 < max_attempts => {
                         last_err = e;
-                        tokio::time::sleep(Duration::from_millis(
-                            retry_base * 1000 * (1u64 << attempt),
-                        ))
-                        .await;
+                        let delay = retry_base * 1000 * (1u64 << attempt);
+                        tracing::info!(
+                            target: "router.dispatch.retry",
+                            attempt = attempt + 1,
+                            max_attempts = max_attempts,
+                            delay_ms = delay,
+                            error = %last_err,
+                            "retrying stream chat completion after backoff"
+                        );
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
                     }
                     Ok(Err(e)) => return Err(e),
                     Err(_) if attempt + 1 < max_attempts => {
                         last_err = DispatchError::Http("total timeout".into());
-                        tokio::time::sleep(Duration::from_millis(
-                            retry_base * 1000 * (1u64 << attempt),
-                        ))
-                        .await;
+                        let delay = retry_base * 1000 * (1u64 << attempt);
+                        tracing::warn!(
+                            target: "router.dispatch.retry",
+                            attempt = attempt + 1,
+                            max_attempts = max_attempts,
+                            delay_ms = delay,
+                            total_timeout_ms = total_timeout_ms,
+                            "stream connection timed out — retrying after backoff"
+                        );
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
                     }
                     Err(_) => return Err(DispatchError::Http("total timeout exhausted".into())),
                 }

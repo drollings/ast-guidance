@@ -309,6 +309,15 @@ async fn chat_complete_http_inner_async(
             .map_err(|e| LlmError::Api(e.to_string()))
     };
 
+    let start = std::time::Instant::now();
+    tracing::debug!(
+        target: "llm.client",
+        model = %model,
+        url = %url,
+        timeout_ms = timeout_ms,
+        "chat completion request"
+    );
+
     let body_str = if timeout_ms == 0 {
         send_fut.await?
     } else {
@@ -316,12 +325,29 @@ async fn chat_complete_http_inner_async(
             Ok(Ok(s)) => s,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
+                tracing::warn!(
+                    target: "llm.client",
+                    model = %model,
+                    url = %url,
+                    timeout_ms = timeout_ms,
+                    latency_ms = start.elapsed().as_millis() as u64,
+                    "chat completion timed out"
+                );
                 return Err(LlmError::Http(format!(
                     "request timed out after {timeout_ms}ms"
                 )));
             }
         }
     };
+
+    tracing::debug!(
+        target: "llm.client",
+        model = %model,
+        url = %url,
+        latency_ms = start.elapsed().as_millis() as u64,
+        body_len = body_str.len(),
+        "chat completion response"
+    );
 
     let parsed: serde_json::Value =
         serde_json::from_str(&body_str).map_err(|e| LlmError::Api(e.to_string()))?;

@@ -111,6 +111,8 @@ impl RouterConfig {
         if params.classifier {
             let routing_config = self.routing_config();
             let classifier_intel = classifier_intelligence(self, params);
+            let classifier_model = resolve_classifier_model_key(self, params)
+                .map_or_else(|| "unknown".into(), str::to_string);
             let client: Arc<dyn ChatBackend> = if let Some(backend) = classifier_backend {
                 tracing::info!(target: "router.config", pipeline = %name, backend = "mock/transcript", "classifier using injected backend");
                 backend
@@ -130,6 +132,7 @@ impl RouterConfig {
                 params.coherence_threshold,
                 params.score_matrix.clone(),
                 classifier_intel,
+                classifier_model,
                 limiter,
             )));
         } else if classifier_backend.is_some() {

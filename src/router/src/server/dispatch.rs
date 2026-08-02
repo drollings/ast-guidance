@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use common_core::ResponseCache;
 use http_body_util::BodyExt;
@@ -117,6 +118,10 @@ pub async fn handle_dispatch(
         url = %rt.url,
         stream = target_streams,
         retry = rt.retry_count,
+        idle_timeout_ms = rt.idle_timeout_ms,
+        total_timeout_ms = rt.total_timeout_ms,
+        filter_thinking = rt.filter_thinking,
+        fallbacks = rt.fallbacks.len(),
         "real dispatch"
     );
 
@@ -239,9 +244,13 @@ pub async fn dispatch_real(
             model = %target.model,
             url = %target.url,
             stream = stream,
+            retry_count = target.retry_count,
+            idle_timeout_ms = target.idle_timeout_ms,
+            total_timeout_ms = target.total_timeout_ms,
             "dispatch attempt"
         );
 
+        let attempt_start = Instant::now();
         match dispatch_to_single_target(target, router_request, http_client, stream, cache, i == 0)
             .await
         {
@@ -249,13 +258,16 @@ pub async fn dispatch_real(
                 return Ok(resp);
             }
             Err(e) => {
+                let attempt_latency_ms = attempt_start.elapsed().as_millis() as u64;
                 let is_retryable = e.is_retryable();
                 tracing::warn!(
                     target: "router.server",
                     attempt = i + 1,
+                    total = all_targets.len(),
                     model = %target.model,
                     error = %e,
                     retryable = is_retryable,
+                    attempt_latency_ms = attempt_latency_ms,
                     remaining = all_targets.len() - i - 1,
                     "dispatch attempt failed"
                 );
