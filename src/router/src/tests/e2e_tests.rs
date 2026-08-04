@@ -160,7 +160,7 @@ fn test_e2e_garbage_rejected_by_classifier() {
         result
             .reject_reason
             .as_ref()
-            .map_or(false, |r| r.contains("coherence")),
+            .is_some_and(|r| r.contains("coherence")),
         "rejection reason should mention coherence, got: {:?}",
         result.reject_reason
     );
@@ -278,7 +278,7 @@ fn test_e2e_routing_decision_included() {
         .decisions
         .last()
         .expect("should have classifier decision");
-    assert!(classifier_decision.stage == PipelineStage::Classifier);
+    assert_eq!(classifier_decision.stage, PipelineStage::Classifier);
     assert_eq!(classifier_decision.verdict, StageVerdict::Passed);
 
     let routing_target = classifier_decision

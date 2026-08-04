@@ -8,7 +8,9 @@ use crate::config::RejectPatterns;
 use crate::filters::injection_detect::InjectionDetectFilter;
 use crate::filters::regex_filter::RegexFilter;
 use crate::filters::{DeterministicFilterEngine, FilterContext, FilterDecision};
-use crate::pipeline_types::{PiiVerdict, PipelineStage, StageDecision, StageMetadata, StageVerdict};
+use crate::pipeline_types::{
+    PiiVerdict, PipelineStage, StageDecision, StageMetadata, StageVerdict,
+};
 use crate::stages::common::extract_user_message;
 
 static COMMAND_RE: LazyLock<Regex> =

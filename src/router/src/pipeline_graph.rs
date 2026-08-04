@@ -498,8 +498,8 @@ mod tests {
     #[test]
     fn graph_stage_rejection_short_circuits() {
         let failing = Arc::new(fluent_wvr_testutil::StubComponent::fail("failing_stage"));
-        let _after = Arc::new(SimplePassStage::new("after_stage", "would run after"));
-        let graph = PipelineGraph::new(vec![failing, _after]).unwrap();
+        let after = Arc::new(SimplePassStage::new("after_stage", "would run after"));
+        let graph = PipelineGraph::new(vec![failing, after]).unwrap();
 
         let ctx = WorkContext::default();
         let err = graph.execute(&ctx).unwrap_err();

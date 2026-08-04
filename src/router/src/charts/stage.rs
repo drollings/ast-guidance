@@ -57,6 +57,11 @@ pub struct ChartPromptStage {
     /// Concrete asset names this stage provides (target `provides` + the
     /// self-provided target name, deduplicated).
     provides: Vec<ArcIntern<str>>,
+    /// Capability dep names this target consumes that the chart's own
+    /// targets provide in-graph (D1). The runtime re-bind must not
+    /// fail-closed on these — their input is an upstream target's
+    /// `stage.{id}.output`, not a context entity.
+    graph_satisfied: Vec<String>,
 }
 
 impl ChartPromptStage {
@@ -66,6 +71,8 @@ impl ChartPromptStage {
     /// asset). `depends` must be the concrete asset names the upstream
     /// targets provide so `PipelineGraph` topo-sorts correctly; `provides`
     /// must be the target's `provides` list plus the target name itself.
+    /// `graph_satisfied` must be the capability dep names this target reads
+    /// from in-graph upstream targets (see `compile_chart_stages`).
     pub fn new(
         client: Arc<dyn ChatBackend>,
         limiter: Arc<Limiter>,
@@ -76,6 +83,7 @@ impl ChartPromptStage {
         upstream_ids: Vec<String>,
         depends: Vec<ArcIntern<str>>,
         provides: Vec<ArcIntern<str>>,
+        graph_satisfied: Vec<String>,
     ) -> Self {
         Self {
             name: ArcIntern::from(target.into()),
@@ -87,6 +95,7 @@ impl ChartPromptStage {
             upstream_ids,
             depends,
             provides,
+            graph_satisfied,
         }
     }
 
@@ -121,11 +130,21 @@ impl WorkUnit for ChartPromptStage {
 
         // Compile (M5) already guarantees a fully-bound chart, but execution
         // re-binds in case the ctx entities differ from compile time. Failing
-        // closed here beats rendering a prompt with missing inputs.
-        if !bindings.unmatched.is_empty() {
+        // closed here beats rendering a prompt with missing inputs. A
+        // capability satisfied by an in-graph upstream is *not* a gap (D1) —
+        // its input arrives via `stage.{id}.output`, so only deps that still
+        // need runtime context after excluding graph-satisfied capabilities
+        // trigger the fail-closed path.
+        let unmatched: Vec<&str> = bindings
+            .unmatched
+            .iter()
+            .map(String::as_str)
+            .filter(|dep| !self.graph_satisfied.iter().any(|g| g == dep))
+            .collect();
+        if !unmatched.is_empty() {
             return Err(WorkError::Execution(format!(
-                "chart target '{}' has unmatched required deps: {:?}",
-                self.name, bindings.unmatched
+                "chart target '{}' has unmatched required deps: {unmatched:?}",
+                self.name
             )));
         }
         if !bindings.ambiguous.is_empty() {
@@ -159,8 +178,8 @@ impl WorkUnit for ChartPromptStage {
             chart: self.chart_name.clone(),
         };
 
-        let system_prompt = render(&self.template, &render_ctx)
-            .map_err(|e| WorkError::Execution(e.to_string()))?;
+        let system_prompt =
+            render(&self.template, &render_ctx).map_err(|e| WorkError::Execution(e.to_string()))?;
 
         let messages = vec![
             ChatMessage {
@@ -185,10 +204,7 @@ impl WorkUnit for ChartPromptStage {
             .limiter
             .run_sync(|| async { self.client.chat_complete(&messages) })
             .map_err(|e| {
-                WorkError::Execution(format!(
-                    "chart target '{}' LLM call failed: {e}",
-                    self.name
-                ))
+                WorkError::Execution(format!("chart target '{}' LLM call failed: {e}", self.name))
             })?;
 
         let output = parse_output(&response);
@@ -341,6 +357,7 @@ mod tests {
             upstream_ids,
             vec![],
             vec![ArcIntern::from("repro_plan"), ArcIntern::from("reproduce")],
+            vec![],
         )
     }
 
@@ -413,6 +430,7 @@ mod tests {
             vec!["reproduce".to_string()],
             vec![ArcIntern::from("repro_plan")],
             vec![ArcIntern::from("root_cause")],
+            vec!["repro_plan".to_string()],
         );
 
         let output = stage.execute(&ctx).unwrap();
@@ -452,6 +470,7 @@ mod tests {
             vec![],
             vec![],
             vec![ArcIntern::from("fix_plan")],
+            vec![],
         );
         let ctx = make_ctx("help", &[]);
         let err = stage.execute(&ctx).unwrap_err();
@@ -459,6 +478,64 @@ mod tests {
             err.to_string().contains("unmatched required deps"),
             "expected unmatched-deps error, got: {err}"
         );
+    }
+
+    #[test]
+    fn unmatched_capability_dep_fails_closed() {
+        // A capability dep with no in-graph provider and no matching entity
+        // at runtime fails closed (D1) — the stage must not render without
+        // the capability's input.
+        let backend = StubChatBackend::always(r#"{"x": 1}"#);
+        let stage = ChartPromptStage::new(
+            Arc::new(backend),
+            Arc::new(Limiter::new(4)),
+            "fix_plan",
+            "bug_triage",
+            "fix {{ request }}",
+            vec![DepSpec::Capability {
+                name: "external_data".into(),
+            }],
+            vec![],
+            vec![],
+            vec![ArcIntern::from("fix_plan")],
+            vec![],
+        );
+        let ctx = make_ctx("help", &[]);
+        let err = stage.execute(&ctx).unwrap_err();
+        assert!(
+            err.to_string().contains("unmatched required deps"),
+            "expected unmatched-deps error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn graph_satisfied_capability_does_not_fail_closed() {
+        // A capability dep satisfied by an in-graph upstream is bound by the
+        // graph, not by context entities — the runtime re-bind must not
+        // fail-closed on it even when no entity provides it (D1).
+        let backend = StubChatBackend::always(r#"{"plan": "minimal repro"}"#);
+        let stage = ChartPromptStage::new(
+            Arc::new(backend),
+            Arc::new(Limiter::new(4)),
+            "root_cause",
+            "bug_triage",
+            "Using the plan {{ upstream.reproduce.output }}, find the cause.",
+            vec![DepSpec::Capability {
+                name: "repro_plan".into(),
+            }],
+            vec!["reproduce".to_string()],
+            vec![ArcIntern::from("repro_plan")],
+            vec![ArcIntern::from("root_cause")],
+            vec!["repro_plan".to_string()],
+        );
+        let mut ctx = make_ctx("crash on startup", &[]);
+        ctx.metadata.insert(
+            "stage.reproduce.output".into(),
+            MetadataValue::String(serde_json::json!({"plan": "minimal repro"}).to_string()),
+        );
+        stage
+            .execute(&ctx)
+            .expect("graph-satisfied capability runs");
     }
 
     #[test]

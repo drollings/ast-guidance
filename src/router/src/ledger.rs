@@ -185,9 +185,7 @@ mod tests {
     #[test]
     fn record_and_fetch_roundtrip() {
         let ledger = temp_ledger();
-        let id = ledger
-            .record_request("sess-1", "req-1", "hello")
-            .unwrap();
+        let id = ledger.record_request("sess-1", "req-1", "hello").unwrap();
         ledger.record_result(id, true, Some(1.0), "reply").unwrap();
         let entries = ledger.get_session_entries("sess-1", 10).unwrap();
         assert_eq!(entries.len(), 1);
@@ -207,7 +205,9 @@ mod tests {
         let id = ledger
             .record_request("sess-p", "req-p", "after-poison")
             .unwrap();
-        ledger.record_result(id, false, Some(0.0), "recovered").unwrap();
+        ledger
+            .record_result(id, false, Some(0.0), "recovered")
+            .unwrap();
         let entries = ledger.get_session_entries("sess-p", 10).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].content, "recovered");

@@ -19,8 +19,8 @@ use guidance_llm::client::ChatBackend;
 use crate::charts::stage::ChartPromptStage;
 use crate::workflow_config::{WorkflowConfig, WorkflowDef, WorkflowStage};
 
-use super::binding::{bind_entities, Entity};
-use super::{ChartDef, ChartError, ChartRubric, DepSpec};
+use super::binding::{bind_entities, Bindings, Entity};
+use super::{ChartDef, ChartError, ChartRubric, ChartTarget, DepSpec};
 
 /// A compiled chart target: the executable stage plus the metadata the
 /// supervisor needs — the `essential` flag, the acceptance `rubric` (M9),
@@ -46,6 +46,92 @@ pub struct CompiledTarget {
     pub provides: Vec<String>,
 }
 
+/// Asset → provider target name map (DependencySession convention: every
+/// target self-provides its own name in addition to its explicit provides
+/// list).
+fn provider_of(chart: &ChartDef) -> HashMap<&str, &str> {
+    let mut provider_of: HashMap<&str, &str> = HashMap::new();
+    for target in &chart.targets {
+        provider_of.insert(target.name.as_str(), target.name.as_str());
+        for provides in &target.provides {
+            provider_of.insert(provides.as_str(), target.name.as_str());
+        }
+    }
+    provider_of
+}
+
+/// Resolve one target's `DepSpec`s against its bindings: returns the provider
+/// stage ids this target depends on (an empty vec when every dep is bound by
+/// a context entity), or a `ChartError::Compile` for an unsatisfiable dep.
+///
+/// This is the single shared decision procedure behind both `compile_chart`
+/// (which maps the providers to `WorkflowStage::ChartPrompt.depends_on`) and
+/// `compile_chart_stages` (which additionally interns them as `topo_depends`).
+/// The error branches are byte-for-byte the historical compile messages — the
+/// behavior contract is locked by the `both_compile_paths_agree` tests.
+fn resolve_target_deps(
+    target: &ChartTarget,
+    bindings: &Bindings,
+    provider_of: &HashMap<&str, &str>,
+    chart_name: &str,
+) -> Result<Vec<String>, ChartError> {
+    let mut provider_ids: Vec<String> = Vec::new();
+
+    for dep in &target.depends {
+        match dep {
+            DepSpec::Capability { name } => {
+                if let Some(provider) = provider_of.get(name.as_str()) {
+                    if *provider != target.name {
+                        provider_ids.push((*provider).to_string());
+                    }
+                } else if bindings.entity_map.contains_key(name) {
+                    // Satisfied by a bound entity at runtime.
+                } else if bindings.ambiguous.iter().any(|a| a.dep == *name) {
+                    return Err(ChartError::Compile {
+                        reason: format!(
+                            "chart '{}' not fully bound: capability '{}' for target '{}' \
+                             matches multiple entities (ambiguous)",
+                            chart_name, name, target.name
+                        ),
+                    });
+                } else {
+                    return Err(ChartError::Compile {
+                        reason: format!(
+                            "chart '{}' not fully bound: capability '{}' for target '{}' \
+                             is not provided by any target or bound entity",
+                            chart_name, name, target.name
+                        ),
+                    });
+                }
+            }
+            DepSpec::EntityMatch { name, required, .. } => {
+                if bindings.entity_map.contains_key(name) {
+                    // Satisfied by a bound entity; preamble injected at render.
+                } else if bindings.ambiguous.iter().any(|a| a.dep == *name) {
+                    return Err(ChartError::Compile {
+                        reason: format!(
+                            "chart '{}' not fully bound: entity dep '{}' for target '{}' \
+                             matches multiple entities (ambiguous)",
+                            chart_name, name, target.name
+                        ),
+                    });
+                } else if *required {
+                    return Err(ChartError::Compile {
+                        reason: format!(
+                            "chart '{}' not fully bound: required entity dep '{}' for \
+                             target '{}' matched no entity; run selection/interview first",
+                            chart_name, name, target.name
+                        ),
+                    });
+                }
+                // Optional entity dep with no match → render without it.
+            }
+        }
+    }
+
+    Ok(provider_ids)
+}
+
 /// Compile a chart into a `WorkflowConfig` for the given bound entities.
 ///
 /// Resolution rules per `DepSpec` (mirror the runtime semantics in
@@ -63,76 +149,12 @@ pub struct CompiledTarget {
 /// The returned `WorkflowConfig` has a single workflow keyed by the chart
 /// name; its `system_prompt` is unset (chart targets carry inline templates).
 pub fn compile_chart(chart: &ChartDef, entities: &[Entity]) -> Result<WorkflowConfig, ChartError> {
-    // Asset → provider target map (DependencySession convention: every target
-    // self-provides its own name in addition to its explicit provides list).
-    let mut provider_of: HashMap<&str, &str> = HashMap::new();
-    for target in &chart.targets {
-        provider_of.insert(target.name.as_str(), target.name.as_str());
-        for provides in &target.provides {
-            provider_of.insert(provides.as_str(), target.name.as_str());
-        }
-    }
+    let provider_of = provider_of(chart);
 
     let mut stages: Vec<WorkflowStage> = Vec::with_capacity(chart.targets.len());
     for target in &chart.targets {
         let bindings = bind_entities(&target.depends, entities);
-        let mut depends_on: Vec<String> = Vec::new();
-
-        for dep in &target.depends {
-            match dep {
-                DepSpec::Capability { name } => {
-                    if let Some(provider) = provider_of.get(name.as_str()) {
-                        if *provider != target.name {
-                            depends_on.push((*provider).to_string());
-                        }
-                    } else if bindings.entity_map.contains_key(name) {
-                        // Satisfied by a bound entity at runtime.
-                    } else if bindings.ambiguous.iter().any(|a| a.dep == *name) {
-                        return Err(ChartError::Compile {
-                            reason: format!(
-                                "chart '{}' not fully bound: capability '{}' for target '{}' \
-                                 matches multiple entities (ambiguous)",
-                                chart.name, name, target.name
-                            ),
-                        });
-                    } else {
-                        return Err(ChartError::Compile {
-                            reason: format!(
-                                "chart '{}' not fully bound: capability '{}' for target '{}' \
-                                 is not provided by any target or bound entity",
-                                chart.name, name, target.name
-                            ),
-                        });
-                    }
-                }
-                DepSpec::EntityMatch {
-                    name,
-                    required,
-                    ..
-                } => {
-                    if bindings.entity_map.contains_key(name) {
-                        // Satisfied by a bound entity; preamble injected at render.
-                    } else if bindings.ambiguous.iter().any(|a| a.dep == *name) {
-                        return Err(ChartError::Compile {
-                            reason: format!(
-                                "chart '{}' not fully bound: entity dep '{}' for target '{}' \
-                                 matches multiple entities (ambiguous)",
-                                chart.name, name, target.name
-                            ),
-                        });
-                    } else if *required {
-                        return Err(ChartError::Compile {
-                            reason: format!(
-                                "chart '{}' not fully bound: required entity dep '{}' for \
-                                 target '{}' matched no entity; run selection/interview first",
-                                chart.name, name, target.name
-                            ),
-                        });
-                    }
-                    // Optional entity dep with no match → render without it.
-                }
-            }
-        }
+        let depends_on = resolve_target_deps(target, &bindings, &provider_of, &chart.name)?;
 
         stages.push(WorkflowStage::ChartPrompt {
             id: target.name.clone(),
@@ -163,85 +185,25 @@ pub fn compile_chart(chart: &ChartDef, entities: &[Entity]) -> Result<WorkflowCo
 /// path (`ChartExecutionPlan::compile`) — DRY: the dependency-resolution
 /// rules live here once.
 ///
-/// The returned stages are *not* yet topologically ordered; use
-/// [`topo_order`] (canonical `DependencyGraph`) for the execution order.
+/// The second return value is the topological execution order (canonical
+/// `DependencyGraph` via [`topo_order`]), computed and validated here so
+/// callers never re-derive it — a broken graph fails before anything runs.
 pub fn compile_chart_stages(
     chart: &ChartDef,
     entities: &[Entity],
     backend: &Arc<dyn ChatBackend>,
     limiter: &Arc<Limiter>,
-) -> Result<Vec<CompiledTarget>, ChartError> {
-    // Asset → provider target map (DependencySession convention: every target
-    // self-provides its own name in addition to its explicit provides list).
-    let mut provider_of: HashMap<&str, &str> = HashMap::new();
-    for target in &chart.targets {
-        provider_of.insert(target.name.as_str(), target.name.as_str());
-        for provides in &target.provides {
-            provider_of.insert(provides.as_str(), target.name.as_str());
-        }
-    }
+) -> Result<(Vec<CompiledTarget>, Vec<String>), ChartError> {
+    let provider_of = provider_of(chart);
 
     let mut out: Vec<CompiledTarget> = Vec::with_capacity(chart.targets.len());
     for target in &chart.targets {
         let bindings = bind_entities(&target.depends, entities);
-        let mut upstream_ids: Vec<String> = Vec::new();
-        let mut topo_depends: Vec<fluent_wvr::ArcIntern<str>> = Vec::new();
-
-        for dep in &target.depends {
-            match dep {
-                DepSpec::Capability { name } => {
-                    if let Some(provider) = provider_of.get(name.as_str()) {
-                        if *provider != target.name {
-                            upstream_ids.push((*provider).to_string());
-                            topo_depends.push(fluent_wvr::ArcIntern::from(*provider));
-                        }
-                    } else if bindings.entity_map.contains_key(name) {
-                        // Bound at runtime; preamble injected by renderer.
-                    } else if bindings.ambiguous.iter().any(|a| a.dep == *name) {
-                        return Err(ChartError::Compile {
-                            reason: format!(
-                                "chart '{}' not fully bound: capability '{}' for target '{}' \
-                                 matches multiple entities (ambiguous)",
-                                chart.name, name, target.name
-                            ),
-                        });
-                    } else {
-                        return Err(ChartError::Compile {
-                            reason: format!(
-                                "chart '{}' not fully bound: capability '{}' for target '{}' \
-                                 is not provided by any target or bound entity",
-                                chart.name, name, target.name
-                            ),
-                        });
-                    }
-                }
-                DepSpec::EntityMatch {
-                    name,
-                    required,
-                    ..
-                } => {
-                    if bindings.entity_map.contains_key(name) {
-                        // Bound at runtime.
-                    } else if bindings.ambiguous.iter().any(|a| a.dep == *name) {
-                        return Err(ChartError::Compile {
-                            reason: format!(
-                                "chart '{}' not fully bound: entity dep '{}' for target '{}' \
-                                 matches multiple entities (ambiguous)",
-                                chart.name, name, target.name
-                            ),
-                        });
-                    } else if *required {
-                        return Err(ChartError::Compile {
-                            reason: format!(
-                                "chart '{}' not fully bound: required entity dep '{}' for \
-                                 target '{}' matched no entity; run selection/interview first",
-                                chart.name, name, target.name
-                            ),
-                        });
-                    }
-                }
-            }
-        }
+        let upstream_ids = resolve_target_deps(target, &bindings, &provider_of, &chart.name)?;
+        let topo_depends: Vec<fluent_wvr::ArcIntern<str>> = upstream_ids
+            .iter()
+            .map(|id| fluent_wvr::ArcIntern::from(id.as_str()))
+            .collect();
 
         // Target provides its explicit asset list + its own name.
         let mut topo_provides: Vec<fluent_wvr::ArcIntern<str>> = target
@@ -253,6 +215,27 @@ pub fn compile_chart_stages(
             topo_provides.push(fluent_wvr::ArcIntern::from(target.name.as_str()));
         }
 
+        // Capability asset names this target consumes that the chart's own
+        // targets provide in-graph (D1): the runtime re-bind in the stage
+        // must not fail-closed on these — their input is the upstream
+        // target's `stage.{id}.output`, not a context entity.
+        let graph_satisfied: Vec<String> = target
+            .depends
+            .iter()
+            .filter_map(|dep| match dep {
+                DepSpec::Capability { name }
+                    if {
+                        provider_of
+                            .get(name.as_str())
+                            .is_some_and(|p| *p != target.name)
+                    } =>
+                {
+                    Some(name.clone())
+                }
+                _ => None,
+            })
+            .collect();
+
         let stage: Arc<dyn Component> = Arc::new(ChartPromptStage::new(
             backend.clone(),
             limiter.clone(),
@@ -263,6 +246,7 @@ pub fn compile_chart_stages(
             upstream_ids.clone(),
             topo_depends,
             topo_provides,
+            graph_satisfied,
         ));
         out.push(CompiledTarget {
             stage,
@@ -276,10 +260,11 @@ pub fn compile_chart_stages(
 
     // Fail-fast verification before anything runs: the stage graph must be
     // acyclic and fully resolved (every upstream id is a self-provided node).
+    // The single topo pass both validates and yields the execution order —
+    // callers reuse it rather than re-sorting.
     let order = topo_order(&out)?;
-    let _ = order;
 
-    Ok(out)
+    Ok((out, order))
 }
 
 /// Topological execution order of a compiled target list, via the canonical
@@ -312,12 +297,7 @@ pub fn topo_order(targets: &[CompiledTarget]) -> Result<Vec<String>, ChartError>
 fn verify_stage_graph(stages: &[WorkflowStage]) -> Result<(), ChartError> {
     let mut graph: DependencyGraph<String> = DependencyGraph::new();
     for stage in stages {
-        let WorkflowStage::ChartPrompt {
-            id,
-            depends_on,
-            ..
-        } = stage
-        else {
+        let WorkflowStage::ChartPrompt { id, depends_on, .. } = stage else {
             continue;
         };
         graph
@@ -531,5 +511,106 @@ mod tests {
             matches!(&err, ChartError::Compile { reason } if reason.contains("cycle")),
             "expected cycle compile error, got: {err}"
         );
+    }
+
+    /// Locks the M3 DRY extraction: both `compile_chart` and
+    /// `compile_chart_stages` must reach the *same* compile decision for the
+    /// same chart+entities across all four outcome classes.
+    #[test]
+    fn both_compile_paths_agree() {
+        let chart: ChartDef = serde_json::from_str(
+            r#"{
+                "name": "parity",
+                "description": "parity",
+                "schema_version": 1,
+                "author_model": "human",
+                "targets": [
+                    { "name": "base", "provides": ["base_out"], "depends": [],
+                      "template": "base", "essential": true },
+                    { "name": "ext_fetcher", "provides": ["external_data"], "depends": [],
+                      "template": "ext", "essential": true },
+                    { "name": "t", "provides": ["t_out"], "depends": [
+                        { "kind": "capability", "name": "base_out" },
+                        { "kind": "capability", "name": "external_data" },
+                        { "kind": "entity_match", "name": "report",
+                          "description": "the report",
+                          "predicate": {
+                            "fields": [
+                              { "path": "title", "ty": "string", "required": true }
+                            ]
+                          },
+                          "required": true },
+                        { "kind": "entity_match", "name": "note",
+                          "description": "the note",
+                          "predicate": {
+                            "fields": [
+                              { "path": "note_title", "ty": "string", "required": true }
+                            ]
+                          },
+                          "required": false }
+                    ], "template": "t", "essential": true }
+                ]
+            }"#,
+        )
+        .expect("parity chart JSON");
+
+        let backend: Arc<dyn ChatBackend> =
+            Arc::new(crate::test_stubs::StubChatBackend::always("{}"));
+        let limiter = Arc::new(Limiter::new(4));
+
+        fn report(id: &str) -> Entity {
+            Entity {
+                id: id.into(),
+                kind: "report".into(),
+                value: serde_json::json!({"title": "T"}),
+            }
+        }
+        fn note(id: &str) -> Entity {
+            Entity {
+                id: id.into(),
+                kind: "note".into(),
+                value: serde_json::json!({"note_title": "N"}),
+            }
+        }
+
+        let cases: Vec<(&str, Vec<Entity>)> = vec![
+            ("fully-bound", vec![report("r1"), note("n1")]),
+            ("unmatched-required", vec![]),
+            ("ambiguous", vec![report("r1"), report("r2")]),
+            ("optional-dep-unbound", vec![report("r1")]),
+        ];
+
+        for (label, entities) in cases {
+            let via_stages = compile_chart_stages(&chart, &entities, &backend, &limiter)
+                .map(|(ts, _)| ts.into_iter().map(|t| t.upstream_ids).collect::<Vec<_>>());
+            let via_chart = compile_chart(&chart, &entities).map(|cfg| {
+                cfg.workflows["parity"]
+                    .stages
+                    .iter()
+                    .filter_map(|s| match s {
+                        WorkflowStage::ChartPrompt { depends_on, .. } => Some(depends_on.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            });
+            match (via_chart, via_stages) {
+                (Ok(depends_on), Ok(upstream_ids)) => {
+                    assert_eq!(
+                        depends_on, upstream_ids,
+                        "{label}: both paths compile to the same stage edges"
+                    );
+                }
+                (Err(a), Err(b)) => {
+                    let ChartError::Compile { reason: ra } = a else {
+                        panic!("{label}: non-Compile error {a:?}");
+                    };
+                    let ChartError::Compile { reason: rb } = b else {
+                        panic!("{label}: non-Compile error {b:?}");
+                    };
+                    assert_eq!(ra, rb, "{label}: both paths fail with the same reason");
+                }
+                (a, b) => panic!("{label}: compile decision diverges: {a:?} vs {b:?}"),
+            }
+        }
     }
 }

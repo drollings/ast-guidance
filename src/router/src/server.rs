@@ -207,12 +207,13 @@ async fn run_http(
     cache: Option<Arc<ResponseCache>>,
     plan_route: Option<Arc<PlanRoute>>,
 ) -> Result<(), crate::error::ServerError> {
-    let listener = TcpListener::bind(bind_addr)
-        .await
-        .map_err(|source| crate::error::ServerError::Bind {
-            addr: bind_addr.to_string(),
-            source,
-        })?;
+    let listener =
+        TcpListener::bind(bind_addr)
+            .await
+            .map_err(|source| crate::error::ServerError::Bind {
+                addr: bind_addr.to_string(),
+                source,
+            })?;
 
     tracing::info!(target: "router.server", addr = %bind_addr, "HTTP server listening (hyper)");
 
@@ -256,7 +257,9 @@ pub(crate) async fn serve_http(
         reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .build()
-            .map_err(|e| crate::error::ServerError::Http(format!("HTTP client build failed: {e}")))?,
+            .map_err(|e| {
+                crate::error::ServerError::Http(format!("HTTP client build failed: {e}"))
+            })?,
     );
 
     loop {

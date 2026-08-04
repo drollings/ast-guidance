@@ -33,12 +33,10 @@ pub(crate) async fn record_ledger_request(
     request_text: String,
 ) -> Option<fluent_types::NodeId> {
     let l = Arc::clone(ledger?);
-    tokio::task::spawn_blocking(move || {
-        l.record_request(&session_id, &request_id, &request_text)
-    })
-    .await
-    .ok()
-    .and_then(Result::ok)
+    tokio::task::spawn_blocking(move || l.record_request(&session_id, &request_id, &request_text))
+        .await
+        .ok()
+        .and_then(Result::ok)
 }
 
 /// Best-effort ledger update, off the async handler (see
@@ -367,7 +365,10 @@ async fn handle_plan_request(
                 .collect()
         })
         .unwrap_or_default();
-    let retry = body.get("retry").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let retry = body
+        .get("retry")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let prior_gaps: Vec<String> = body
         .get("gaps")
         .and_then(serde_json::Value::as_array)

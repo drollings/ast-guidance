@@ -59,13 +59,33 @@ pub struct AmbiguousDep {
 ///   deterministically — treated as no match (required → unmatched, M8 LLM
 ///   fallback engages).
 /// - `Capability { name }`: satisfied when an entity's `kind == name` or its
-///   `value.provides` array contains `name`; bound likewise.
+///   `value.provides` array contains `name`; a zero-match capability is
+///   pushed into `unmatched` (D1) so capability-gapped charts classify
+///   `Partial` instead of failing only at compile time.
+///
+/// This per-target form has no chart context, so it cannot know which
+/// capability assets the chart's own targets provide in-graph. Use
+/// [`bind_chart`] (which filters in-graph capabilities out of `unmatched`)
+/// for chart-level selection decisions.
 pub fn bind_entities(deps: &[DepSpec], entities: &[Entity]) -> Bindings {
+    bind_entities_impl(deps, entities, &HashSet::new())
+}
+
+/// Chart-aware binding: capability assets provided by the chart's own
+/// targets are bound by the graph (never a context-entity gap), so they are
+/// excluded from `unmatched` (D1). `EntityMatch` semantics are unchanged.
+fn bind_entities_impl(deps: &[DepSpec], entities: &[Entity], in_graph: &HashSet<&str>) -> Bindings {
     let mut bindings = Bindings::default();
 
     for dep in deps {
         match dep {
             DepSpec::Capability { name } => {
+                if in_graph.contains(name.as_str()) {
+                    // Satisfied by another chart target (its `provides` or
+                    // self-provided name); compile resolves the edge via
+                    // `provider_of`. Never an entity-binding gap.
+                    continue;
+                }
                 let matches: Vec<&Entity> = entities
                     .iter()
                     .filter(|e| {
@@ -78,7 +98,11 @@ pub fn bind_entities(deps: &[DepSpec], entities: &[Entity]) -> Bindings {
                                 })
                     })
                     .collect();
-                bind_matches(&mut bindings, dep.name(), matches.into_iter().cloned().collect());
+                bind_matches(
+                    &mut bindings,
+                    dep.name(),
+                    matches.into_iter().cloned().collect(),
+                );
             }
             DepSpec::EntityMatch {
                 name,
@@ -126,10 +150,17 @@ pub fn bind_entities(deps: &[DepSpec], entities: &[Entity]) -> Bindings {
 /// unioned, unmatched deps are deduplicated (in first-seen order), and
 /// ambiguous deps accumulate. Used by chart selection (M7) to decide whether
 /// a chosen chart is `Exact` or `Partial` (interview gaps).
+///
+/// Chart-aware (D1): a `Capability` dep that another chart target provides
+/// in-graph is bound by the graph, not by context entities — it is excluded
+/// from `unmatched`. Only capabilities with **no in-graph provider and no
+/// matching entity** surface as gaps, driving the M8 interview instead of an
+/// `Exact`-then-`ChartError::Compile`.
 pub fn bind_chart(chart: &super::ChartDef, entities: &[Entity]) -> Bindings {
     let mut agg = Bindings::default();
+    let in_graph = in_graph_assets(chart);
     for target in &chart.targets {
-        let per_target = bind_entities(&target.depends, entities);
+        let per_target = bind_entities_impl(&target.depends, entities, &in_graph);
         agg.satisfied.extend(per_target.satisfied);
         agg.entity_map.extend(per_target.entity_map);
         for dep in per_target.unmatched {
@@ -140,6 +171,20 @@ pub fn bind_chart(chart: &super::ChartDef, entities: &[Entity]) -> Bindings {
         agg.ambiguous.extend(per_target.ambiguous);
     }
     agg
+}
+
+/// The set of capability assets the chart's own targets provide in-graph:
+/// every target self-provides its name in addition to its explicit
+/// `provides` list (the DependencySession convention).
+fn in_graph_assets(chart: &super::ChartDef) -> HashSet<&str> {
+    let mut set = HashSet::new();
+    for target in &chart.targets {
+        set.insert(target.name.as_str());
+        for provides in &target.provides {
+            set.insert(provides.as_str());
+        }
+    }
+    set
 }
 
 /// Bind exactly one matched entity to a dep.
@@ -153,8 +198,15 @@ fn bind_one(bindings: &mut Bindings, dep: &str, entity: &Entity) {
 }
 
 /// Apply the shared 0/1/>1 semantics to a match list (used by Capability).
+///
+/// A zero-match `Capability` dep is pushed into `unmatched` (D1/option a):
+/// the chart then classifies `ChartFit::Partial { gaps }` (drives the M8
+/// interview) instead of `Exact`-then-`ChartError::Compile`, and `compile.rs`
+/// still treats an unbound capability as a hard error. `Capability` has no
+/// `required` field, so a zero-match capability is *always* unmatched.
 fn bind_matches(bindings: &mut Bindings, dep: &str, matches: Vec<Entity>) {
     if matches.is_empty() {
+        bindings.unmatched.push(dep.to_string());
         return;
     }
     if matches.len() == 1 {
@@ -186,9 +238,7 @@ pub fn evaluate_predicate(pred: &EntityPredicate, v: &serde_json::Value) -> bool
     if pred.any_of.is_empty() {
         return true;
     }
-    pred.any_of
-        .iter()
-        .any(|sub| evaluate_predicate(sub, v))
+    pred.any_of.iter().any(|sub| evaluate_predicate(sub, v))
 }
 
 /// Evaluate a single field rule against a value.
@@ -239,15 +289,8 @@ fn type_matches(ty: FieldType, v: &serde_json::Value) -> bool {
     match ty {
         FieldType::Any => true,
         FieldType::String => v.is_string(),
-        FieldType::Number => {
-            v.is_number()
-                || v.as_str()
-                    .is_some_and(|s| s.parse::<f64>().is_ok())
-        }
-        FieldType::Bool => {
-            v.is_boolean()
-                || matches!(v.as_str(), Some("true" | "false"))
-        }
+        FieldType::Number => v.is_number() || v.as_str().is_some_and(|s| s.parse::<f64>().is_ok()),
+        FieldType::Bool => v.is_boolean() || matches!(v.as_str(), Some("true" | "false")),
         FieldType::Array => v.is_array(),
     }
 }
@@ -354,7 +397,11 @@ mod tests {
             },
             true,
         );
-        let entities = vec![entity("issue-1", "report", serde_json::json!({"title": "Boom"}))];
+        let entities = vec![entity(
+            "issue-1",
+            "report",
+            serde_json::json!({"title": "Boom"}),
+        )];
         let b = bind_entities(&[dep], &entities);
         assert!(b.satisfied.contains("entity:report:issue-1"));
         assert!(b.unmatched.is_empty());
@@ -369,12 +416,14 @@ mod tests {
             Some(&serde_json::json!(7))
         );
         assert_eq!(
-            resolve_path(&serde_json::json!({"items": [{"name": "a"}, {"name": "b"}]}), "items[1].name"),
+            resolve_path(
+                &serde_json::json!({"items": [{"name": "a"}, {"name": "b"}]}),
+                "items[1].name"
+            ),
             Some(&serde_json::json!("b"))
         );
         assert_eq!(
-            resolve_path(&serde_json::json!({"x": 1}), ".")
-            .map(serde_json::Value::is_object),
+            resolve_path(&serde_json::json!({"x": 1}), ".").map(serde_json::Value::is_object),
             Some(true)
         );
         assert!(resolve_path(&serde_json::json!({"a": 1}), "a.b").is_none());
@@ -398,7 +447,11 @@ mod tests {
             true,
         );
         // Numeric string counts as Number.
-        let entities = vec![entity("svc", "service", serde_json::json!({"port": "8080"}))];
+        let entities = vec![entity(
+            "svc",
+            "service",
+            serde_json::json!({"port": "8080"}),
+        )];
         let b = bind_entities(&[dep], &entities);
         assert_eq!(b.unmatched.len(), 0, "numeric string must coerce to Number");
         assert_eq!(b.satisfied.len(), 1);
@@ -444,7 +497,11 @@ mod tests {
             true,
         );
         let entities = vec![
-            entity("u1", "user", serde_json::json!({"address": "a@example.com"})),
+            entity(
+                "u1",
+                "user",
+                serde_json::json!({"address": "a@example.com"}),
+            ),
             entity("u2", "user", serde_json::json!({"address": "b@other.org"})),
         ];
         let b = bind_entities(&[dep], &entities);
@@ -552,6 +609,58 @@ mod tests {
     }
 
     #[test]
+    fn zero_match_capability_is_unmatched() {
+        // D1: a capability dep with no matching entity surfaces as unmatched
+        // instead of silently binding to nothing.
+        let b = bind_entities(&[capability("spell_check")], &[]);
+        assert_eq!(b.unmatched, vec!["spell_check".to_string()]);
+        assert!(b.satisfied.is_empty());
+        assert!(b.ambiguous.is_empty());
+    }
+
+    #[test]
+    fn matched_capability_leaves_unmatched_empty() {
+        let entities = vec![entity(
+            "agent1",
+            "agent",
+            serde_json::json!({"provides": ["spell_check"]}),
+        )];
+        let b = bind_entities(&[capability("spell_check")], &entities);
+        assert!(b.unmatched.is_empty());
+        assert!(b.satisfied.contains("entity:agent:agent1"));
+    }
+
+    #[test]
+    fn bind_chart_filters_in_graph_capabilities_out_of_unmatched() {
+        // Chart-aware binding: a capability dep provided by another chart
+        // target in-graph is bound by the graph, not by context entities —
+        // it must not surface as a selection gap (D1).
+        let chart_json = r#"{
+            "name": "internal_chain",
+            "description": "in-graph capability chain",
+            "schema_version": 1,
+            "author_model": "human",
+            "targets": [
+                { "name": "a", "provides": ["a_out"], "depends": [],
+                  "template": "a {{ request }}", "essential": true },
+                { "name": "b", "provides": ["b_out"], "depends": [
+                    { "kind": "capability", "name": "a_out" }
+                  ], "template": "b {{ upstream.a.output }}", "essential": true },
+                { "name": "c", "provides": ["c_out"], "depends": [
+                    { "kind": "capability", "name": "b_out" },
+                    { "kind": "capability", "name": "external_data" }
+                  ], "template": "c {{ upstream.b.output }}", "essential": true }
+            ]
+        }"#;
+        let chart: super::super::ChartDef = serde_json::from_str(chart_json).unwrap();
+        // No entities at all: `a_out`/`b_out` are in-graph-provided and must
+        // be filtered out; `external_data` has no provider and no entity, so
+        // it remains the only gap.
+        let b = bind_chart(&chart, &[]);
+        assert_eq!(b.unmatched, vec!["external_data".to_string()]);
+    }
+
+    #[test]
     fn entity_match_without_predicate_unmatched_if_required() {
         let dep = DepSpec::EntityMatch {
             name: "who".into(),
@@ -607,7 +716,10 @@ mod tests {
         let v = serde_json::json!({"status": "blocked"});
         assert!(!evaluate_predicate(&pred, &v));
         assert!(evaluate_predicate(&pred2, &v));
-        assert!(!evaluate_predicate(&pred2, &serde_json::json!({"status": "open"})));
+        assert!(!evaluate_predicate(
+            &pred2,
+            &serde_json::json!({"status": "open"})
+        ));
     }
 
     #[test]
@@ -641,42 +753,61 @@ mod tests {
         // Target A provides "a_out" (satisfied by a bound entity's provides
         // array). B depends on capability "a_out" and provides "b_out".
         // C depends on capability "b_out" and on entity-match "report".
-        let deps_a = vec![];
-        let deps_b = vec![capability("a_out")];
-        let deps_c = vec![capability("b_out"), entity_match(
-            "report",
-            EntityPredicate {
-                fields: vec![FieldRule {
-                    path: "title".into(),
-                    ty: FieldType::String,
-                    required: true,
-                    min: None,
-                    max: None,
-                    pattern: None,
-                }],
-                any_of: vec![],
-            },
-            true,
-        )];
+        let deps_a = [];
+        let deps_b = [capability("a_out")];
+        let deps_c = vec![
+            capability("b_out"),
+            entity_match(
+                "report",
+                EntityPredicate {
+                    fields: vec![FieldRule {
+                        path: "title".into(),
+                        ty: FieldType::String,
+                        required: true,
+                        min: None,
+                        max: None,
+                        pattern: None,
+                    }],
+                    any_of: vec![],
+                },
+                true,
+            ),
+        ];
 
         // Bind target C's deps: b_out is not entity-satisfiable (it's a
         // chart-internal asset), report is.
         let entities = vec![entity("r1", "report", serde_json::json!({"title": "T"}))];
         let c_bindings = bind_entities(&deps_c, &entities);
         assert!(c_bindings.satisfied.contains("entity:report:r1"));
-        assert!(c_bindings.unmatched.is_empty(), "{:?}", c_bindings.unmatched);
+        // D1: the zero-match capability `b_out` is now self-described as
+        // unmatched at the per-target binding layer — the chart-level
+        // `bind_chart` filters in-graph-provided capabilities, but plain
+        // `bind_entities` has no chart context.
+        assert_eq!(c_bindings.unmatched, vec!["b_out".to_string()]);
 
         // Build the chart graph (node = target name; deps = capability dep
         // names; provides = provides list + self-name).
         let mut graph: DependencyGraph<String> = DependencyGraph::new();
         graph
-            .register(&"A".into(), &deps_a.iter().map(dep_name).collect::<Vec<_>>(), &["a_out".into(), "A".into()])
+            .register(
+                &"A".into(),
+                &deps_a.iter().map(dep_name).collect::<Vec<_>>(),
+                &["a_out".into(), "A".into()],
+            )
             .unwrap();
         graph
-            .register(&"B".into(), &deps_b.iter().map(dep_name).collect::<Vec<_>>(), &["b_out".into(), "B".into()])
+            .register(
+                &"B".into(),
+                &deps_b.iter().map(dep_name).collect::<Vec<_>>(),
+                &["b_out".into(), "B".into()],
+            )
             .unwrap();
         graph
-            .register(&"C".into(), &deps_c.iter().map(dep_name).collect::<Vec<_>>(), &["c_out".into(), "C".into()])
+            .register(
+                &"C".into(),
+                &deps_c.iter().map(dep_name).collect::<Vec<_>>(),
+                &["c_out".into(), "C".into()],
+            )
             .unwrap();
 
         let order = graph.topo_sort().unwrap();

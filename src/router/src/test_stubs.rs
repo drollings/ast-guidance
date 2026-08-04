@@ -25,7 +25,10 @@ impl StubChatBackend {
 
 impl ChatBackend for StubChatBackend {
     fn chat_complete(&self, _messages: &[ChatMessage]) -> Result<String, LlmError> {
-        let mut queue = self.responses.lock().unwrap_or_else(|e| e.into_inner());
+        let mut queue = self
+            .responses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         queue.pop_front().ok_or(LlmError::NoResponse)
     }
 }

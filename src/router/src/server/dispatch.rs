@@ -161,7 +161,27 @@ fn make_backend(http_client: &reqwest::Client, target: &RoutingTarget) -> Arc<dy
     }
 }
 
-/// Try dispatching to a single target.  `is_primary` controls cache write.
+/// Reconstruct the prompt actually sent to the model from the normalized
+/// request messages (M10a LOD0 fidelity).
+///
+/// The dispatch backend serializes exactly `request.messages` via
+/// `normalize::messages_to_json`, so this assembly — the role-prefixed text
+/// of every message, system first — is faithful to what the model received.
+/// This is the *reconstructed* prompt (the exact rendered JSON body is not
+/// recoverable at the call site); the choice is documented in
+/// `ROADMAP_20260804_M3_CHECKLIST.md`.
+fn render_prompt(router_request: &RouterRequest) -> String {
+    router_request
+        .messages
+        .iter()
+        .map(|m| format!("{}: {}", m.role, m.content.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Try dispatching to a single target.  `is_primary` controls cache write;
+/// `is_fallback` (an index > 0 in the dispatch chain) controls M10b
+/// extraction scope.
 /// Returns `Ok(HyperResponse)` on success or `Err(DispatchError)` on failure.
 async fn dispatch_to_single_target(
     target: &RoutingTarget,
@@ -170,6 +190,7 @@ async fn dispatch_to_single_target(
     stream: bool,
     cache: Option<&Arc<ResponseCache>>,
     is_primary: bool,
+    is_fallback: bool,
     user_text: &str,
     extractor: Option<Arc<WorkflowExtractor>>,
 ) -> Result<HyperResponse, DispatchError> {
@@ -227,13 +248,16 @@ async fn dispatch_to_single_target(
 
     // M10 learning loop: a successful buffered dispatch is a solved solution —
     // distill it into a draft chart (best-effort, never fails the request).
+    // M10a: record the *real* rendered prompt; M10b: the extractor gates on
+    // `is_fallback` + its configured mode (frontier-assisted by default).
     if let Some(extractor) = extractor {
         let answer = completion
             .choices
             .first()
             .map(|c| c.message.content.to_string_lossy())
             .unwrap_or_default();
-        extractor.record_success(user_text, &target.model, &answer);
+        let prompt = render_prompt(router_request);
+        extractor.record_success(user_text, &prompt, &target.model, &answer, is_fallback);
     }
 
     Ok(completion_to_response(
@@ -282,6 +306,7 @@ pub async fn dispatch_real(
             stream,
             cache,
             i == 0,
+            i > 0,
             user_text,
             extractor.clone(),
         )

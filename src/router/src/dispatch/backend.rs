@@ -157,19 +157,16 @@ impl ChatBackend for OpenAiChatBackend {
             let log_model = model.clone();
             let result: Result<RouterResponse, DispatchError> = async {
                 let body = build_chat_body(&request, &model, params.as_ref(), false)?;
-                let response = with_total_timeout(
-                    total_timeout_ms,
-                    "total timeout exceeded",
-                    async {
+                let response =
+                    with_total_timeout(total_timeout_ms, "total timeout exceeded", async {
                         client
                             .post(&url)
                             .json(&body)
                             .send()
                             .await
                             .map_err(|e| DispatchError::Http(e.to_string()))
-                    },
-                )
-                .await?;
+                    })
+                    .await?;
 
                 let status = response.status();
                 if !status.is_success() {
@@ -656,6 +653,9 @@ mod tests {
     }
 
     impl StubBackend {
+        // Returns a trait object, not Self — the retry decorator needs the
+        // erased backend. Scoped-allow: clippy's new_ret_no_self false positive.
+        #[allow(clippy::new_ret_no_self)]
         fn new(responses: Vec<Result<RouterResponse, DispatchError>>) -> Arc<dyn ChatBackend> {
             Arc::new(StubBackend {
                 responses: std::sync::Mutex::new(responses),
@@ -848,18 +848,12 @@ mod tests {
             // Hold every accepted connection open without responding so the
             // peer's `send()` stalls until the total timeout fires.
             let mut held = Vec::new();
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => held.push(stream),
-                    Err(_) => break,
-                }
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
             }
         });
 
-        let backend = OpenAiChatBackend::new(
-            reqwest::Client::new(),
-            format!("http://{addr}"),
-        );
+        let backend = OpenAiChatBackend::new(reqwest::Client::new(), format!("http://{addr}"));
         let total_timeout_ms = 200;
         let start = std::time::Instant::now();
 
@@ -876,7 +870,10 @@ mod tests {
         .await;
 
         let elapsed = start.elapsed();
-        assert!(result.is_ok(), "complete() must not hang on a stalled upstream");
+        assert!(
+            result.is_ok(),
+            "complete() must not hang on a stalled upstream"
+        );
         let err = result.unwrap().unwrap_err();
         assert!(
             matches!(&err, DispatchError::Http(msg) if msg.contains("timeout")),

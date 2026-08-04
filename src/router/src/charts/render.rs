@@ -236,7 +236,11 @@ mod tests {
                 },
             ],
         );
-        let out = render("{{ request }}\n{% for e in deps.files %}- {{ e.value.name }}\n{% endfor %}", &c).unwrap();
+        let out = render(
+            "{{ request }}\n{% for e in deps.files %}- {{ e.value.name }}\n{% endfor %}",
+            &c,
+        )
+        .unwrap();
         assert!(out.starts_with("hello world"));
         assert!(out.contains("- a.rs"));
         assert!(out.contains("- b.rs"));
@@ -268,7 +272,10 @@ mod tests {
             }],
         );
         let out = render("{% for e in deps.e %}{{ e.value }}{% endfor %}", &c).unwrap();
-        assert!(!out.contains("alert(1)"), "script must be neutralized: {out:?}");
+        assert!(
+            !out.contains("alert(1)"),
+            "script must be neutralized: {out:?}"
+        );
         // The zero-width escape is preserved as literal data (characters are
         // kept; only the template token is broken).
         assert!(out.contains('\u{200B}'));
@@ -286,8 +293,7 @@ mod tests {
         let c = ctx("x");
         // A template that repeats the request more times than the cap.
         let template = format!(
-            "{{% for i in range({} + 1) %}}{{ request }}{{% endfor %}}",
-            CHART_RENDERED_MAX_CHARS
+            "{{% for i in range({CHART_RENDERED_MAX_CHARS} + 1) %}}{{ request }}{{% endfor %}}"
         );
         let err = render(&template, &c).unwrap_err();
         assert!(matches!(err, ChartError::Render { .. }));

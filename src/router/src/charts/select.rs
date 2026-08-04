@@ -373,7 +373,9 @@ impl ChartSelector {
             let pick = self
                 .pick_ambiguous_candidate(amb)
                 .unwrap_or_else(|| deterministic_pick(&amb.candidates));
-            resolved.satisfied.insert(crate::charts::binding::asset_key(&pick));
+            resolved
+                .satisfied
+                .insert(crate::charts::binding::asset_key(&pick));
             resolved
                 .entity_map
                 .entry(amb.dep.clone())
@@ -409,11 +411,7 @@ impl ChartSelector {
         );
         let response = client.chat_complete(&messages).ok()?;
         let entity_id = parse_ambiguity_output(&response)?;
-        let picked = amb
-            .candidates
-            .iter()
-            .find(|e| e.id == entity_id)
-            .cloned();
+        let picked = amb.candidates.iter().find(|e| e.id == entity_id).cloned();
         if picked.is_none() {
             tracing::warn!(
                 target: "router.charts.select",
@@ -595,11 +593,7 @@ fn sanitize_adjudicator_output(value: &serde_json::Value) -> Option<AdjudicatorO
 /// Build the reranker system prompt from the candidate list. The reranker
 /// re-orders candidates by relevance (it does not pick a winner — that is the
 /// adjudicator's job), and its output is an array of candidate names.
-fn build_rerank_prompt(
-    request: &str,
-    candidates: &[(String, f64)],
-    store: &ChartStore,
-) -> String {
+fn build_rerank_prompt(request: &str, candidates: &[(String, f64)], store: &ChartStore) -> String {
     let mut prompt = String::new();
     let _ = writeln!(
         prompt,
@@ -649,9 +643,7 @@ fn parse_rerank_output(raw: &str) -> Option<Vec<String>> {
         Err(_) => extract_first_json_value(cleaned)?,
     };
     let names: Option<Vec<&str>> = match &value {
-        serde_json::Value::Array(arr) => {
-            Some(arr.iter().filter_map(|v| v.as_str()).collect())
-        }
+        serde_json::Value::Array(arr) => Some(arr.iter().filter_map(|v| v.as_str()).collect()),
         serde_json::Value::Object(obj) => obj
             .get("ranking")
             .and_then(|r| r.as_array())
@@ -688,7 +680,11 @@ fn build_ambiguity_prompt(amb: &AmbiguousDep) -> String {
     for (i, e) in amb.candidates.iter().enumerate() {
         let _ = writeln!(prompt, "{}. id: \"{}\"", i + 1, e.id);
         let _ = writeln!(prompt, "   kind: \"{}\"", e.kind);
-        let _ = writeln!(prompt, "   value: {}", serde_json::to_string(&e.value).unwrap_or_default());
+        let _ = writeln!(
+            prompt,
+            "   value: {}",
+            serde_json::to_string(&e.value).unwrap_or_default()
+        );
     }
     let _ = writeln!(prompt);
     let _ = writeln!(
@@ -696,7 +692,10 @@ fn build_ambiguity_prompt(amb: &AmbiguousDep) -> String {
         "Output ONLY this JSON object:\n{{\"entity_id\": \"<candidate id>\"}}"
     );
     let _ = writeln!(prompt, "Rules:");
-    let _ = writeln!(prompt, "- entity_id must be one of the candidate ids above.");
+    let _ = writeln!(
+        prompt,
+        "- entity_id must be one of the candidate ids above."
+    );
     let _ = writeln!(prompt, "- Only output the JSON object, no other text.");
     prompt
 }
@@ -726,6 +725,9 @@ fn parse_ambiguity_output(raw: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    // Tests compare reordered HNSW/reranker scores against literal
+    // thresholds — deliberate strict comparisons for exact-delta checks.
+    #![allow(clippy::float_cmp)]
     use super::*;
     use crate::charts::store::{chart_from_str, ChartStore};
     use crate::hnsw::HnswIndexHandle;
@@ -961,6 +963,69 @@ mod tests {
     }
 
     #[test]
+    fn entity_only_capability_dep_classifies_partial_not_exact() {
+        // D1: a chart whose capability dep has no in-graph provider and no
+        // matching entity classifies `Partial { gaps }` (drives the M8
+        // interview) instead of `Exact`-then-`ChartError::Compile`.
+        let tmp = TempDir::new().unwrap();
+        let index_path = tmp.path().join("workflow_library.sqlite");
+        // Same seed shape, but root_cause depends on a capability nothing
+        // provides in-graph (`external_data`) in addition to the report.
+        let gapped = r#"{
+            "name": "bug_triage",
+            "description": "Triage a bug report into reproduction, root cause, and fix plan",
+            "schema_version": 1,
+            "author_model": "human",
+            "targets": [
+                {
+                    "name": "reproduce",
+                    "provides": ["repro_plan"],
+                    "depends": [],
+                    "template": "reproduce {{ request }}",
+                    "essential": true
+                },
+                {
+                    "name": "root_cause",
+                    "provides": ["root_cause"],
+                    "depends": [
+                        { "kind": "capability", "name": "external_data" },
+                        { "kind": "entity_match", "name": "report",
+                          "description": "the bug report",
+                          "predicate": {
+                            "fields": [
+                                { "path": "title", "ty": "string", "required": true }
+                            ]
+                          },
+                          "required": true }
+                    ],
+                    "template": "cause {{ request }}",
+                    "essential": true
+                }
+            ]
+        }"#;
+        let store = store_with(&[gapped.to_string()], Some(&index_path));
+        let selector = selector(store, None, 0.0);
+        // No entities: neither `external_data` (no provider) nor `report`
+        // (no matching entity) is bound.
+        let m = selector
+            .select(
+                "Triage a bug report into reproduction, root cause, and fix plan",
+                &[],
+            )
+            .expect("selection");
+        assert_eq!(m.chart, "bug_triage");
+        match m.fit {
+            ChartFit::Partial { gaps } => {
+                assert!(
+                    gaps.iter().any(|g| g == "external_data"),
+                    "expected 'external_data' in gaps, got {gaps:?}"
+                );
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn adjudicator_mismatch_when_llm_rejects_candidates() {
         let tmp = TempDir::new().unwrap();
         let index_path = tmp.path().join("workflow_library.sqlite");
@@ -1030,7 +1095,10 @@ mod tests {
     fn parse_rerank_output_rejects_garbage() {
         assert!(parse_rerank_output("not json at all").is_none());
         assert!(parse_rerank_output(r#"{"chart": "bug_triage"}"#).is_none());
-        assert!(parse_rerank_output("[]").is_none(), "empty ranking is unusable");
+        assert!(
+            parse_rerank_output("[]").is_none(),
+            "empty ranking is unusable"
+        );
     }
 
     #[test]
@@ -1078,7 +1146,10 @@ mod tests {
         let reranker = StubChatBackend::always(r#"["not_a_real_chart"]"#);
         let sel = selector(store, None, 0.0).with_reranker(Arc::new(reranker));
         let reordered = sel.rerank("Draft a design doc", candidates.clone());
-        assert_eq!(reordered, candidates, "invalid names fall back to HNSW order");
+        assert_eq!(
+            reordered, candidates,
+            "invalid names fall back to HNSW order"
+        );
     }
 
     #[test]
@@ -1133,9 +1204,7 @@ mod tests {
         let picked = &bindings.entity_map["report"][0];
         assert_eq!(picked.id, "issue-43", "LLM pick wins");
         assert!(
-            bindings
-                .satisfied
-                .contains("entity:report:issue-43"),
+            bindings.satisfied.contains("entity:report:issue-43"),
             "picked entity is satisfied"
         );
     }

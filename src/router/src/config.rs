@@ -8,14 +8,14 @@ pub mod unimplemented;
 
 pub use self::addr::{hosts_equivalent, parse_bind_addr, validate_no_self_routing};
 pub use self::builder::PipelineParams;
-pub use self::unimplemented::{
-    detect_unimplemented_features, log_unimplemented_features, UnimplementedFeature,
-};
 pub use self::filters::{
     CommandConfig, ConfidenceGate, FilterAction, FilterOutcome, FilterScope, MockConfig,
     PatternEntry, RejectPatterns,
 };
 pub use self::routing::{RouteRef, RoutingConfig};
+pub use self::unimplemented::{
+    detect_unimplemented_features, log_unimplemented_features, UnimplementedFeature,
+};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -303,6 +303,26 @@ pub struct PostProcessConfig {
     /// automatically. Default `false` — the operator opts in.
     #[serde(default)]
     pub workflow_extraction: bool,
+    /// Which successful dispatches are distilled into draft charts.
+    /// Default `"frontier"` — the VISION learning loop learns from
+    /// frontier-assisted (escalated/fallback) solutions, not the common
+    /// local-primary path. `"all"` restores the blanket behavior by
+    /// explicit opt-in.
+    #[serde(default)]
+    pub workflow_extraction_mode: WorkflowExtractionMode,
+}
+
+/// Extraction scope for the M10 learning loop (see `PostProcessConfig`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkflowExtractionMode {
+    /// Only frontier-assisted dispatches (an index > 0 in the primary +
+    /// fallback chain) are distilled into draft charts.
+    #[default]
+    #[serde(rename = "frontier")]
+    Frontier,
+    /// Every successful dispatch is distilled.
+    #[serde(rename = "all")]
+    All,
 }
 
 fn default_total_timeout_ms() -> u64 {
@@ -319,6 +339,8 @@ fn default_retry_interval() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    // Tests assert float config values against literal defaults — deliberate.
+    #![allow(clippy::float_cmp)]
     use super::*;
 
     #[test]
@@ -350,7 +372,7 @@ mod tests {
         assert_eq!(cfg.embedding_model.as_deref(), Some("embed"));
         assert_eq!(cfg.reranker_model.as_deref(), Some("rerank"));
 
-        let absent: RouterConfig = serde_json::from_str(r#"{}"#).unwrap();
+        let absent: RouterConfig = serde_json::from_str(r"{}").unwrap();
         assert!(absent.embedding_model.is_none());
         assert!(absent.reranker_model.is_none());
     }
@@ -411,15 +433,25 @@ mod tests {
     fn post_process_defaults_to_disabled() {
         let cfg = PostProcessConfig::default();
         assert!(!cfg.workflow_extraction, "extraction is opt-in");
+        assert_eq!(
+            cfg.workflow_extraction_mode,
+            WorkflowExtractionMode::Frontier,
+            "default scope is frontier-assisted only"
+        );
     }
 
     #[test]
     fn post_process_absent_section_defaults_cleanly() {
-        let cfg: RouterConfig = serde_json::from_str(r#"{"server": {"bind_addr": "127.0.0.1:0"}}"#)
-            .unwrap();
+        let cfg: RouterConfig =
+            serde_json::from_str(r#"{"server": {"bind_addr": "127.0.0.1:0"}}"#).unwrap();
         assert!(
             !cfg.post_process.workflow_extraction,
             "absent post_process section defaults extraction off"
+        );
+        assert_eq!(
+            cfg.post_process.workflow_extraction_mode,
+            WorkflowExtractionMode::Frontier,
+            "absent mode field defaults to frontier"
         );
     }
 
@@ -428,10 +460,28 @@ mod tests {
         let json = r#"{ "workflow_extraction": true }"#;
         let cfg: PostProcessConfig = serde_json::from_str(json).unwrap();
         assert!(cfg.workflow_extraction);
+        assert_eq!(
+            cfg.workflow_extraction_mode,
+            WorkflowExtractionMode::Frontier,
+            "absent mode field keeps the frontier default"
+        );
 
         let serialized = serde_json::to_string(&cfg).unwrap();
         let back: PostProcessConfig = serde_json::from_str(&serialized).unwrap();
         assert!(back.workflow_extraction);
+        assert_eq!(back.workflow_extraction_mode, cfg.workflow_extraction_mode);
+    }
+
+    #[test]
+    fn workflow_extraction_mode_parses_both_variants() {
+        let all: WorkflowExtractionMode = serde_json::from_str(r#""all""#).expect("all parses");
+        assert_eq!(all, WorkflowExtractionMode::All);
+
+        let frontier: WorkflowExtractionMode =
+            serde_json::from_str(r#""frontier""#).expect("frontier parses");
+        assert_eq!(frontier, WorkflowExtractionMode::Frontier);
+
+        assert!(serde_json::from_str::<WorkflowExtractionMode>(r#""bogus""#).is_err());
     }
 
     #[test]
@@ -443,5 +493,26 @@ mod tests {
         let cfg: RouterConfig = serde_json::from_str(json).unwrap();
         assert!(cfg.post_process.workflow_extraction);
         assert_eq!(cfg.charts.dir.as_deref(), Some("env/workflows/charts"));
+        assert_eq!(
+            cfg.post_process.workflow_extraction_mode,
+            WorkflowExtractionMode::Frontier,
+            "existing configs without the new field still deserialize"
+        );
+    }
+
+    #[test]
+    fn router_config_parses_extraction_mode_all() {
+        let json = r#"{
+            "post_process": {
+                "workflow_extraction": true,
+                "workflow_extraction_mode": "all"
+            }
+        }"#;
+        let cfg: RouterConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.post_process.workflow_extraction);
+        assert_eq!(
+            cfg.post_process.workflow_extraction_mode,
+            WorkflowExtractionMode::All
+        );
     }
 }

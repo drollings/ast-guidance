@@ -23,8 +23,8 @@ pub fn extract_user_message(ctx: &WorkContext) -> Result<String, WorkError> {
     let request_str = get_metadata_string(ctx, "request")
         .ok_or_else(|| WorkError::Execution("missing request".into()))?;
 
-    let request: RouterRequest = serde_json::from_str(&request_str)
-        .map_err(|e| WorkError::Execution(e.to_string()))?;
+    let request: RouterRequest =
+        serde_json::from_str(&request_str).map_err(|e| WorkError::Execution(e.to_string()))?;
 
     request
         .messages

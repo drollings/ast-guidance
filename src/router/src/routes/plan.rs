@@ -170,12 +170,7 @@ impl PlanRoute {
     }
 
     /// Shared selection+binding+fit pipeline for both interview rounds.
-    fn plan_inner(
-        &self,
-        user_message: &str,
-        entities: &[Entity],
-        retry: bool,
-    ) -> PlanResult {
+    fn plan_inner(&self, user_message: &str, entities: &[Entity], retry: bool) -> PlanResult {
         let mut selector = ChartSelector::new(
             self.charts.clone(),
             self.selector_backend.clone(),
@@ -236,8 +231,7 @@ impl PlanRoute {
                     );
                     fresh_draft()
                 } else {
-                    let mut questions: Vec<String> =
-                        gaps.iter().map(|g| gap_prompt(g)).collect();
+                    let mut questions: Vec<String> = gaps.iter().map(|g| gap_prompt(g)).collect();
                     questions.truncate(crate::charts::CHART_MAX_INTERVIEW_QUESTIONS);
                     PlanResult {
                         workflow: WorkflowConfig::default(),

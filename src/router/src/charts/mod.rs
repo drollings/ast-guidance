@@ -68,8 +68,9 @@ pub enum ChartError {
     DuplicateName(String),
     #[error("unresolved chart dependency: {0}")]
     UnresolvedDependency(String),
-        #[error("template render failed for target {target}: {detail}")]
-    Render { target: String, detail: String },    #[error("entity binding failed for target {target}, dep {dep}: {detail}")]
+    #[error("template render failed for target {target}: {detail}")]
+    Render { target: String, detail: String },
+    #[error("entity binding failed for target {target}, dep {dep}: {detail}")]
     Binding {
         target: String,
         dep: String,
@@ -147,9 +148,7 @@ impl ChartDef {
         // description
         if self.description.chars().count() > CHART_DESCRIPTION_MAX_CHARS {
             return Err(ChartError::Invalid {
-                reason: format!(
-                    "chart description exceeds {CHART_DESCRIPTION_MAX_CHARS} chars"
-                ),
+                reason: format!("chart description exceeds {CHART_DESCRIPTION_MAX_CHARS} chars"),
             });
         }
 
@@ -274,7 +273,10 @@ fn validate_rubric(rubric: &ChartRubric, owner: &str) -> Result<(), ChartError> 
     }
     if !(0.0..=1.0).contains(&rubric.min_score) {
         return Err(ChartError::Invalid {
-            reason: format!("{owner} rubric min_score {} outside [0,1]", rubric.min_score),
+            reason: format!(
+                "{owner} rubric min_score {} outside [0,1]",
+                rubric.min_score
+            ),
         });
     }
     Ok(())
@@ -414,14 +416,12 @@ pub fn chart_to_json(chart: &ChartDef) -> Result<String, ChartError> {
     })
 }
 
-/// Convenience for tests and seed data: parse a `ChartDef` from JSON,
-/// wrapped in `ChartError::Parse`.
-pub fn chart_from_json(json: &str) -> Result<ChartDef, ChartError> {
-    serde_json::from_str(json).map_err(|e| ChartError::Parse {
-        source: e,
-        path: "<deserialize>".into(),
-    })
-}
+/// Consolidated parse helper: deserialize **and** validate a `ChartDef`
+/// from JSON. Parsing a chart always enforces the content model. The
+/// canonical home is `store::chart_from_str`; this re-export exposes it at
+/// the `charts` module root so in-module consumers don't reach into
+/// `store` for a pure content-model operation.
+pub use store::chart_from_str;
 
 #[cfg(test)]
 mod tests {
@@ -531,7 +531,9 @@ mod tests {
         chart.targets[2].depends = vec![DepSpec::Capability {
             name: "external_data".into(),
         }];
-        let warnings = chart.validate().expect("entity-only dep is a warning, not an error");
+        let warnings = chart
+            .validate()
+            .expect("entity-only dep is a warning, not an error");
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].dep, "external_data");
     }
@@ -558,10 +560,21 @@ mod tests {
     fn golden_seed_round_trips_and_validates() {
         // Appendix A seed chart: round-trip through serde_json.
         let json = chart_to_json(&valid_chart()).expect("serializes");
-        let chart: ChartDef = chart_from_json(&json).expect("round-trips");
+        let chart: ChartDef = chart_from_str(&json).expect("round-trips");
         assert_eq!(chart.name, "bug_triage");
         assert_eq!(chart.targets.len(), 3);
         chart.validate().expect("round-tripped chart validates");
+    }
+
+    #[test]
+    fn parse_helper_validates_content_model() {
+        // Parsing a chart must validate it, not just deserialize: an empty
+        // template is rejected by `chart_from_str`.
+        let mut chart = valid_chart();
+        chart.targets[0].template = String::new();
+        let json = chart_to_json(&chart).expect("serializes");
+        let err = chart_from_str(&json).unwrap_err();
+        assert!(matches!(err, ChartError::Invalid { .. }));
     }
 
     #[test]
@@ -587,7 +600,7 @@ mod tests {
         });
         chart.validate().expect("rubric chart validates");
         let json = chart_to_json(&chart).expect("serializes");
-        let back: ChartDef = chart_from_json(&json).expect("round-trips");
+        let back: ChartDef = chart_from_str(&json).expect("round-trips");
         assert_eq!(back.targets[0].rubric, chart.targets[0].rubric);
     }
 

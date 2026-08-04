@@ -124,7 +124,7 @@ mod tests {
             .metadata
             .get("command_result")
             .and_then(|v| v.as_str())
-            .map_or(false, |s| s.contains("my-snapshot")));
+            .is_some_and(|s| s.contains("my-snapshot")));
     }
 
     #[test]

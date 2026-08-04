@@ -29,7 +29,7 @@ use fluent_wvr::Runtime;
 use guidance_llm::client::ChatBackend;
 use serde::Serialize;
 
-use crate::charts::compile::{compile_chart_stages, topo_order, CompiledTarget};
+use crate::charts::compile::{compile_chart_stages, CompiledTarget};
 use crate::charts::rubric::{check_rubric, RubricCache};
 use crate::charts::stage::{CHART_OUTPUT_META_KEY, CHART_TARGET_META_KEY};
 use crate::charts::store::ChartStore;
@@ -160,15 +160,15 @@ impl ChartExecutionPlan {
     ///
     /// Uses the same stage construction + dependency resolution as the
     /// `PipelineGraph` path (`compile_chart_stages`) and verifies the topo
-    /// order up front (fail fast — a broken graph never runs).
+    /// order up front (fail fast — a broken graph never runs). The topo
+    /// order is computed once by `compile_chart_stages` and reused here.
     pub fn compile(
         chart: &ChartDef,
         entities: &[Entity],
         backend: &Arc<dyn ChatBackend>,
         limiter: &Arc<Limiter>,
     ) -> Result<Self, ChartError> {
-        let targets = compile_chart_stages(chart, entities, backend, limiter)?;
-        let order = topo_order(&targets)?;
+        let (targets, order) = compile_chart_stages(chart, entities, backend, limiter)?;
         Ok(Self {
             chart_name: chart.name.clone(),
             chart_rubric: chart.rubric.clone(),
@@ -238,14 +238,10 @@ impl ChartExecutionPlan {
                         format!("chart.{}.{}", self.chart_name, target.name),
                     )),
                 };
-                zone.register_with_context(wrapped, ctx).map_err(|e| {
-                    ChartError::Compile {
-                        reason: format!(
-                            "register chart target '{}': {e}",
-                            target.name
-                        ),
-                    }
-                })?;
+                zone.register_with_context(wrapped, ctx)
+                    .map_err(|e| ChartError::Compile {
+                        reason: format!("register chart target '{}': {e}", target.name),
+                    })?;
             }
 
             let zone_summary = zone.await;
@@ -258,22 +254,14 @@ impl ChartExecutionPlan {
                 .chain(zone_summary.failed)
                 .chain(zone_summary.cancelled)
             {
-                self.process_event(
-                    event,
-                    opts,
-                    &mut completed,
-                    &mut failed,
-                    &mut summary,
-                )?;
+                self.process_event(event, opts, &mut completed, &mut failed, &mut summary)?;
             }
 
             // A failed *essential* target fails the whole chart — stop
             // scheduling further waves.
-            let any_essential_failed = failed.iter().any(|name| {
-                self.targets
-                    .iter()
-                    .any(|t| t.name == *name && t.essential)
-            });
+            let any_essential_failed = failed
+                .iter()
+                .any(|name| self.targets.iter().any(|t| t.name == *name && t.essential));
             if any_essential_failed {
                 break;
             }
@@ -374,9 +362,8 @@ impl ChartExecutionPlan {
     ) -> Result<(), ChartError> {
         match event {
             ZoneEvent::Completed { name, output } => {
-                let decision: StageDecision = output
-                    .data_as()
-                    .map_err(|e| ChartError::Compile {
+                let decision: StageDecision =
+                    output.data_as().map_err(|e| ChartError::Compile {
                         reason: format!("chart target '{name}' output unreadable: {e}"),
                     })?;
                 let Some(target) = self.targets.iter().find(|t| t.name == *name) else {
@@ -529,10 +516,7 @@ mod tests {
     }
 
     impl guidance_llm::client::ChatBackend for KeyedBackend {
-        fn chat_complete(
-            &self,
-            messages: &[ChatMessage],
-        ) -> Result<String, LlmError> {
+        fn chat_complete(&self, messages: &[ChatMessage]) -> Result<String, LlmError> {
             let system = messages
                 .iter()
                 .find(|m| m.role == "system")
@@ -567,10 +551,7 @@ mod tests {
     }
 
     impl guidance_llm::client::ChatBackend for RetryOnceBackend {
-        fn chat_complete(
-            &self,
-            _messages: &[ChatMessage],
-        ) -> Result<String, LlmError> {
+        fn chat_complete(&self, _messages: &[ChatMessage]) -> Result<String, LlmError> {
             let mut left = self
                 .failures_left
                 .lock()
@@ -650,12 +631,12 @@ mod tests {
 
     fn build_plan(
         chart_json: &str,
-        backend: Arc<dyn ChatBackend>,
+        backend: &Arc<dyn ChatBackend>,
         entities: &[Entity],
     ) -> ChartExecutionPlan {
         let chart = chart_from_str(chart_json).expect("chart parses");
         let limiter = Arc::new(Limiter::new(4));
-        ChartExecutionPlan::compile(&chart, entities, &backend, &limiter).expect("compiles")
+        ChartExecutionPlan::compile(&chart, entities, backend, &limiter).expect("compiles")
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -664,10 +645,13 @@ mod tests {
             r#"{"out": "a-done"}"#.into(),
             r#"{"out": "b-done"}"#.into(),
         ]));
-        let plan = build_plan(&linear_chart_json(), backend, &[]);
+        let plan = build_plan(&linear_chart_json(), &backend, &[]);
         assert_eq!(plan.order(), &["a".to_string(), "b".to_string()]);
 
-        let summary = plan.execute(&make_ctx("run"), &default_opts()).await.expect("runs");
+        let summary = plan
+            .execute(&make_ctx("run"), &default_opts())
+            .await
+            .expect("runs");
         assert_eq!(summary.completed.len(), 2);
         assert_eq!(summary.completed[0].reason, "chart target 'a' completed");
         assert_eq!(summary.completed[1].reason, "chart target 'b' completed");
@@ -699,7 +683,7 @@ mod tests {
             ("right ".to_string(), r#"{"out": "right-done"}"#.to_string()),
             ("join ".to_string(), r#"{"out": "join"}"#.to_string()),
         ]));
-        let plan = build_plan(&diamond_chart_json(), backend, &[]);
+        let plan = build_plan(&diamond_chart_json(), &backend, &[]);
 
         let summary = plan
             .execute(&make_ctx("run"), &default_opts())
@@ -733,7 +717,7 @@ mod tests {
     async fn essential_failure_aborts_chart() {
         // base fails (NoResponse) → essential → nothing else runs.
         let backend: Arc<dyn ChatBackend> = Arc::new(StubChatBackend::new(vec![]));
-        let plan = build_plan(&linear_chart_json(), backend, &[]);
+        let plan = build_plan(&linear_chart_json(), &backend, &[]);
         let summary = plan
             .execute(&make_ctx("run"), &default_opts())
             .await
@@ -747,14 +731,17 @@ mod tests {
     async fn zone_retry_recovers_a_transient_target_failure() {
         // `a`'s LLM call errors on the first attempt, then succeeds. With
         // max_retries = 1 the Zone retries and the whole chain completes.
-        let backend: Arc<dyn ChatBackend> = Arc::new(RetryOnceBackend::new(
-            r#"{"out": "a-retried"}"#.to_string(),
-        ));
-        let plan = build_plan(&linear_chart_json(), backend, &[]);
+        let backend: Arc<dyn ChatBackend> =
+            Arc::new(RetryOnceBackend::new(r#"{"out": "a-retried"}"#.to_string()));
+        let plan = build_plan(&linear_chart_json(), &backend, &[]);
         let mut opts = default_opts();
         opts.max_retries = 1;
         let summary = plan.execute(&make_ctx("run"), &opts).await.expect("runs");
-        assert_eq!(summary.completed.len(), 2, "a recovers via Zone retry, then b runs");
+        assert_eq!(
+            summary.completed.len(),
+            2,
+            "a recovers via Zone retry, then b runs"
+        );
         assert!(summary.failed.is_empty());
         assert!(summary.cancelled.is_empty());
         assert!(summary.accepted);
@@ -762,10 +749,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn no_retries_means_transient_failure_fails_target() {
-        let backend: Arc<dyn ChatBackend> = Arc::new(RetryOnceBackend::new(
-            r#"{"out": "a"}"#.to_string(),
-        ));
-        let plan = build_plan(&linear_chart_json(), backend, &[]);
+        let backend: Arc<dyn ChatBackend> =
+            Arc::new(RetryOnceBackend::new(r#"{"out": "a"}"#.to_string()));
+        let plan = build_plan(&linear_chart_json(), &backend, &[]);
         // max_retries = 0 (default): a's first error is fatal.
         let summary = plan
             .execute(&make_ctx("run"), &default_opts())
@@ -802,8 +788,11 @@ mod tests {
             r#"{"answer": 42}"#.into(),
             r#"{"done": true}"#.into(),
         ]));
-        let plan = build_plan(&rubric_chart_json(), backend, &[]);
-        let summary = plan.execute(&make_ctx("run"), &default_opts()).await.expect("runs");
+        let plan = build_plan(&rubric_chart_json(), &backend, &[]);
+        let summary = plan
+            .execute(&make_ctx("run"), &default_opts())
+            .await
+            .expect("runs");
         assert_eq!(summary.completed.len(), 2, "probe + after both promote");
         assert!(summary.failed.is_empty());
         assert!(summary.accepted);
@@ -817,8 +806,11 @@ mod tests {
             r#"{"no_answer": true}"#.into(),
             r#"{"done": true}"#.into(),
         ]));
-        let plan = build_plan(&rubric_chart_json(), backend, &[]);
-        let summary = plan.execute(&make_ctx("run"), &default_opts()).await.expect("runs");
+        let plan = build_plan(&rubric_chart_json(), &backend, &[]);
+        let summary = plan
+            .execute(&make_ctx("run"), &default_opts())
+            .await
+            .expect("runs");
         assert!(summary.failed.contains(&"probe".to_string()));
         assert!(summary.cancelled.contains(&"after".to_string()));
         assert!(!summary.accepted);
@@ -839,8 +831,11 @@ mod tests {
             r#"{"only_unexpected": true}"#.into(),
             r#"{"done": true}"#.into(),
         ]));
-        let plan = build_plan(&linear_chart_json(), backend, &[]);
-        let summary = plan.execute(&make_ctx("run"), &default_opts()).await.expect("runs");
+        let plan = build_plan(&linear_chart_json(), &backend, &[]);
+        let summary = plan
+            .execute(&make_ctx("run"), &default_opts())
+            .await
+            .expect("runs");
         assert_eq!(summary.completed.len(), 2);
         assert!(summary.accepted);
     }
@@ -858,12 +853,14 @@ mod tests {
                   "template": "t {{ request }}", "essential": true }
             ]
         }"#;
-        let backend: Arc<dyn ChatBackend> = Arc::new(StubChatBackend::always(
-            r#"{"not_the_final_answer": true}"#,
-        ));
-        let plan = build_plan(chart_json, backend, &[]);
-        let summary = plan.execute(&make_ctx("run"), &default_opts()).await.expect("runs");
-        assert!(summary.accepted == false, "chart-level rubric rejects");
+        let backend: Arc<dyn ChatBackend> =
+            Arc::new(StubChatBackend::always(r#"{"not_the_final_answer": true}"#));
+        let plan = build_plan(chart_json, &backend, &[]);
+        let summary = plan
+            .execute(&make_ctx("run"), &default_opts())
+            .await
+            .expect("runs");
+        assert!(!summary.accepted, "chart-level rubric rejects");
         assert!(summary.failed.is_empty(), "target itself did not fail");
         let rejected: Vec<_> = summary
             .audit
@@ -880,7 +877,7 @@ mod tests {
             r#"{"out": "a"}"#.into(),
             r#"{"out": "b"}"#.into(),
         ]));
-        let plan = build_plan(&linear_chart_json(), backend, &[]);
+        let plan = build_plan(&linear_chart_json(), &backend, &[]);
         let mut opts = default_opts();
         opts.fit = Some("exact".into());
         opts.score = Some(0.93);
@@ -899,13 +896,17 @@ mod tests {
             r#"{"out": "a"}"#.into(),
             r#"{"out": "b"}"#.into(),
         ]));
-        let plan = build_plan(&linear_chart_json(), backend, &[]);
+        let plan = build_plan(&linear_chart_json(), &backend, &[]);
         let hist = Arc::new(LatencyHistogram::new());
         let mut opts = default_opts();
         opts.metrics = Some(hist.clone());
         let summary = plan.execute(&make_ctx("run"), &opts).await.expect("runs");
         assert_eq!(summary.completed.len(), 2);
-        assert!(hist.count() >= 2, "per-target latency recorded, got {}", hist.count());
+        assert!(
+            hist.count() >= 2,
+            "per-target latency recorded, got {}",
+            hist.count()
+        );
     }
 
     // ── Golden e2e: real seed chart + rubric through the Zone ─────────────
@@ -949,8 +950,9 @@ mod tests {
             ),
         ]));
         let limiter = Arc::new(Limiter::new(4));
-        let plan = ChartExecutionPlan::compile(&chart, &[entity.clone()], &backend, &limiter)
-            .expect("seed chart compiles");
+        let plan =
+            ChartExecutionPlan::compile(&chart, std::slice::from_ref(&entity), &backend, &limiter)
+                .expect("seed chart compiles");
         assert_eq!(plan.order().len(), 3);
 
         let mut opts = default_opts();
@@ -962,7 +964,7 @@ mod tests {
         let mut ctx = make_ctx("app crashes on startup");
         ctx.metadata.insert(
             crate::charts::binding::ENTITIES_META_KEY.into(),
-            MetadataValue::String(serde_json::to_string(&[entity.clone()]).unwrap()),
+            MetadataValue::String(serde_json::to_string(std::slice::from_ref(&entity)).unwrap()),
         );
 
         let summary = plan
@@ -971,7 +973,7 @@ mod tests {
             .expect("seed chart executes under Zone supervision");
 
         if summary.completed.len() != 3 {
-            eprintln!("FAILED summary: {:#?}", summary);
+            eprintln!("FAILED summary: {summary:#?}");
             panic!("seed chart did not complete 3 targets");
         }
         assert!(summary.failed.is_empty());
@@ -984,11 +986,7 @@ mod tests {
             assert_eq!(entry.score, Some(0.99));
             assert!(matches!(entry.verdict, ChartTargetVerdict::Completed));
         }
-        let target_names: Vec<&str> = summary
-            .audit
-            .iter()
-            .map(|e| e.target.as_str())
-            .collect();
+        let target_names: Vec<&str> = summary.audit.iter().map(|e| e.target.as_str()).collect();
         assert_eq!(target_names, vec!["reproduce", "root_cause", "fix_plan"]);
     }
 
@@ -1024,13 +1022,17 @@ mod tests {
             "g ".to_string(),
             r#"{"wrong": true}"#.to_string(),
         )]));
-        let plan = build_plan(&rubric_failing_chart_json(), backend, &[]);
+        let plan = build_plan(&rubric_failing_chart_json(), &backend, &[]);
 
         for i in 0..crate::charts::CHART_STALE_FAILS {
             let mut opts = default_opts();
             opts.health = Some(store.clone());
             let summary = plan.execute(&make_ctx("run"), &opts).await.expect("runs");
-            assert!(summary.rubric_rejected(), "run {} rejected by rubric", i + 1);
+            assert!(
+                summary.rubric_rejected(),
+                "run {} rejected by rubric",
+                i + 1
+            );
             if i + 1 < crate::charts::CHART_STALE_FAILS {
                 assert!(!store.is_demoted("gated"));
             }
@@ -1060,16 +1062,15 @@ mod tests {
         // draft is promoted to selectable.
         let failing: Arc<dyn ChatBackend> =
             Arc::new(StubChatBackend::always(r#"{"no_out": true}"#));
-        let plan = build_plan(&rubric_failing_chart_json(), failing, &[]);
+        let plan = build_plan(&rubric_failing_chart_json(), &failing, &[]);
         let mut opts = default_opts();
         opts.health = Some(store.clone());
         let summary = plan.execute(&make_ctx("run"), &opts).await.expect("runs");
         assert!(summary.rubric_rejected());
         assert!(store.is_draft("gated"), "still a draft after a failure");
 
-        let passing: Arc<dyn ChatBackend> =
-            Arc::new(StubChatBackend::always(r#"{"out": "g"}"#));
-        let plan = build_plan(&rubric_failing_chart_json(), passing, &[]);
+        let passing: Arc<dyn ChatBackend> = Arc::new(StubChatBackend::always(r#"{"out": "g"}"#));
+        let plan = build_plan(&rubric_failing_chart_json(), &passing, &[]);
         let summary = plan.execute(&make_ctx("run"), &opts).await.expect("runs");
         assert!(!summary.rubric_rejected());
         assert!(!store.is_draft("gated"), "a passing run promotes the draft");

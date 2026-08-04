@@ -1,4 +1,7 @@
 #[cfg(test)]
+// The file is included as `mod tests` (transforms/mod.rs:10) and nests an
+// inner `mod tests` to keep the harness private — intentional structure.
+#[allow(clippy::module_inception)]
 mod tests {
     use crate::testing::test_request;
     use crate::transforms::decompose_hypothetical::DecomposeToAnonymizedHypothetical;

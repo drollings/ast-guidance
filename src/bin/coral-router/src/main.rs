@@ -291,9 +291,14 @@ fn build_plan_route(config: &RouterConfig) -> PlanRoute {
     }
     // M10 learning loop: attach the dispatch post-processing hook when the
     // operator opts in (`post_process.workflow_extraction`). Off by default.
+    // The two `Arc`s are NOT redundant: `plan_route` is Arc-shared into the
+    // HTTP server, while the extractor is separately Arc-wrapped because the
+    // same `WorkflowExtractor` instance is handed to the `PlanRoute` *and*
+    // cloned out of it by the dispatch post-process path (handler.rs).
     if config.post_process.workflow_extraction {
-        let extractor =
-            fluent_router::charts::extract::WorkflowExtractor::new(store).enabled(true);
+        let extractor = fluent_router::charts::extract::WorkflowExtractor::new(store)
+            .enabled(true)
+            .with_extraction_mode(config.post_process.workflow_extraction_mode);
         route = route.with_workflow_extractor(Arc::new(extractor));
         tracing::info!(
             target: "coral-router",

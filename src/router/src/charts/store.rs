@@ -65,8 +65,11 @@ struct ChartIndex {
     ids: Vec<String>,
     /// Flat `(chart, embedding)` list for the brute-force fallback.
     flat: Vec<(String, Vec<f32>)>,
-    /// Cosine HNSW graph. Read-guarded; built once before the store is shared.
-    hnsw: RwLock<hnsw_rs::hnsw::Hnsw<'static, f32, hnsw_rs::anndists::dist::DistCosine>>,
+    /// Cosine HNSW graph. Written exactly once (in `build_index`) and
+    /// read-only thereafter; `invalidate_index` drops the whole
+    /// `ChartIndex` rather than mutating the graph, so a `RwLock` here would
+    /// be pure ceremony.
+    hnsw: hnsw_rs::hnsw::Hnsw<'static, f32, hnsw_rs::anndists::dist::DistCosine>,
 }
 
 /// In-memory registry of validated charts, backed by JSON files on disk.
@@ -228,10 +231,7 @@ impl ChartStore {
             let mut subsumed = chart;
             subsumed.name.clone_from(&existing_name);
             subsumed.validate().map_err(|e| ChartError::Invalid {
-                reason: format!(
-                    "subsumed chart '{}' failed validation: {e}",
-                    subsumed.name
-                ),
+                reason: format!("subsumed chart '{}' failed validation: {e}", subsumed.name),
             })?;
             self.mark_draft(&subsumed.name);
             self.charts
@@ -488,7 +488,7 @@ impl ChartStore {
             embedder,
             ids,
             flat,
-            hnsw: RwLock::new(hnsw),
+            hnsw,
         }));
         tracing::info!(
             target: "router.charts.store",
@@ -523,11 +523,9 @@ impl ChartStore {
         // Cosine HNSW graph; brute force is the canonical fallback when the
         // graph is empty or returns nothing for this query.
         let mut hits: Vec<(String, f32)> = {
-            let hnsw = index
+            index
                 .hnsw
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            hnsw.search(&query, k, k)
+                .search(&query, k, k)
                 .into_iter()
                 .filter_map(|n| {
                     index
@@ -801,7 +799,7 @@ mod tests {
         let outcome = store.upsert_idempotent(dup, 0.5).unwrap();
         match outcome {
             UpsertOutcome::Subsumed { by } => assert_eq!(by, "alpha"),
-            other => panic!("expected subsume, got {other:?}"),
+            other @ UpsertOutcome::Inserted => panic!("expected subsume, got {other:?}"),
         }
         assert_eq!(store.len(), 1, "near-neighbor dedup must not duplicate");
         assert!(store.get("alpha").is_some());

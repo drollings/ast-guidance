@@ -267,11 +267,11 @@ fn parse_judge_output(raw: &str, min_score: f64) -> Result<RubricVerdict, ChartE
         let start = cleaned.find('{');
         let end = cleaned.rfind('}');
         match (start, end) {
-            (Some(s), Some(e)) if e > s => serde_json::from_str(&cleaned[s..=e]).map_err(
-                |e| ChartError::Selection {
+            (Some(s), Some(e)) if e > s => {
+                serde_json::from_str(&cleaned[s..=e]).map_err(|e| ChartError::Selection {
                     reason: format!("rubric judge output unparseable: {e}"),
-                },
-            )?,
+                })?
+            }
             _ => {
                 return Err(ChartError::Selection {
                     reason: "rubric judge returned no JSON object".into(),
@@ -282,7 +282,10 @@ fn parse_judge_output(raw: &str, min_score: f64) -> Result<RubricVerdict, ChartE
     let obj = value.as_object().ok_or_else(|| ChartError::Selection {
         reason: "rubric judge output is not a JSON object".into(),
     })?;
-    let score = obj.get("score").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+    let score = obj
+        .get("score")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
     let accepted = obj
         .get("accepted")
         .and_then(serde_json::Value::as_bool)
@@ -312,7 +315,7 @@ mod tests {
 
     fn rubric(require: &[&str]) -> ChartRubric {
         ChartRubric {
-            require_fields: require.iter().map(|s| s.to_string()).collect(),
+            require_fields: require.iter().map(ToString::to_string).collect(),
             judge_model: None,
             min_score: 0.7,
         }
@@ -352,7 +355,8 @@ mod tests {
     #[test]
     fn nested_path_check() {
         let out = serde_json::json!({"answer": {"steps": ["a"], "verdict": "ok"}});
-        let v = check_rubric(&rubric(&["answer.verdict"]), &out, None, None, "t").expect("no error");
+        let v =
+            check_rubric(&rubric(&["answer.verdict"]), &out, None, None, "t").expect("no error");
         assert!(v.accepted);
     }
 

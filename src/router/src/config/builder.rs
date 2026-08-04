@@ -170,7 +170,12 @@ impl RouterConfig {
         backend: &Arc<dyn ChatBackend>,
         limiter: &Arc<Limiter>,
     ) -> Result<PipelineGraph, ChartError> {
-        let targets = crate::charts::compile::compile_chart_stages(chart, entities, backend, limiter)?;
+        let (targets, _order) =
+            crate::charts::compile::compile_chart_stages(chart, entities, backend, limiter)?;
+        // The topo `_order` is ignored here: the `PipelineGraph` path
+        // re-derives its own schedule from each stage's `depends()`/
+        // `provides()` (its own `DependencyGraph`), so the compile order is
+        // only consumed by the Zone-supervised `ChartExecutionPlan` path.
         let stages: Vec<Arc<dyn Component>> = targets.into_iter().map(|t| t.stage).collect();
         PipelineGraph::new(stages).map_err(|e| ChartError::Compile {
             reason: format!("chart '{}' stage graph invalid: {e}", chart.name),
@@ -364,8 +369,7 @@ mod tests {
             "warning must name the dropped pipeline, logs:\n{joined}"
         );
         assert!(
-            joined.contains("configured_classifier")
-                && joined.contains("resolved_classifier"),
+            joined.contains("configured_classifier") && joined.contains("resolved_classifier"),
             "warning must log resolved-vs-configured classifier keys, logs:\n{joined}"
         );
         assert!(
@@ -411,7 +415,12 @@ mod tests {
             self.prompts
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .extend(messages.iter().filter(|m| m.role == "system").map(|m| m.content.clone()));
+                .extend(
+                    messages
+                        .iter()
+                        .filter(|m| m.role == "system")
+                        .map(|m| m.content.clone()),
+                );
             Ok(r#"{"ok": true}"#.to_string())
         }
     }
@@ -505,18 +514,32 @@ mod tests {
         });
         let limiter = Arc::new(Limiter::new(4));
         let graph = config
-            .build_chart_pipeline(&triage_chart(), &[entity.clone()], &backend, &limiter)
+            .build_chart_pipeline(
+                &triage_chart(),
+                std::slice::from_ref(&entity),
+                &backend,
+                &limiter,
+            )
             .expect("chart builds into a runnable pipeline");
 
-        let ctx = request_ctx("app crashes on startup", &[entity.clone()]);
+        let ctx = request_ctx("app crashes on startup", std::slice::from_ref(&entity));
         let output = graph.execute(&ctx).expect("chart pipeline executes");
         let result: crate::pipeline::PipelineResult = output.data_as().expect("pipeline result");
 
         // Topo order: reproduce → root_cause → fix_plan (3 decisions).
         assert_eq!(result.decisions.len(), 3);
-        assert_eq!(result.decisions[0].reason, "chart target 'reproduce' completed");
-        assert_eq!(result.decisions[1].reason, "chart target 'root_cause' completed");
-        assert_eq!(result.decisions[2].reason, "chart target 'fix_plan' completed");
+        assert_eq!(
+            result.decisions[0].reason,
+            "chart target 'reproduce' completed"
+        );
+        assert_eq!(
+            result.decisions[1].reason,
+            "chart target 'root_cause' completed"
+        );
+        assert_eq!(
+            result.decisions[2].reason,
+            "chart target 'fix_plan' completed"
+        );
 
         // Every stage made one LLM call (3 system prompts recorded).
         let recorded = prompts.lock().unwrap().clone();
@@ -553,9 +576,8 @@ mod tests {
         let backend: Arc<dyn ChatBackend> = Arc::new(StubChatBackend::always("{}"));
         let limiter = Arc::new(Limiter::new(4));
         // No entities → root_cause's required `report` dep is unmatched.
-        let err = match config.build_chart_pipeline(&triage_chart(), &[], &backend, &limiter) {
-            Err(e) => e,
-            Ok(_) => panic!("expected compile error for unbound chart"),
+        let Err(err) = config.build_chart_pipeline(&triage_chart(), &[], &backend, &limiter) else {
+            panic!("expected compile error for unbound chart")
         };
         assert!(
             matches!(&err, ChartError::Compile { reason } if reason.contains("not fully bound")),

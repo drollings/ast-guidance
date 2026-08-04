@@ -29,6 +29,9 @@ use crate::server::serve_http;
 use crate::testing::mock::{MockDispatchContext, MockTranscriptEntry, TranscriptProvider};
 use guidance_llm::client::ChatBackend;
 
+/// Upstream responder: given the parsed request body, produce an HTTP response.
+type UpstreamRespond = Arc<dyn Fn(&Value) -> hyper::Response<ResponseBody> + Send + Sync>;
+
 /// A running router server bound to an ephemeral port.
 struct TestServer {
     addr: std::net::SocketAddr,
@@ -168,7 +171,9 @@ async fn spawn_plan_server() -> TestServer {
         path: index_path.display().to_string(),
     };
     let store = ChartStore::new(Some(handle));
-    store.upsert(chart_from_str(triage).expect("chart parses")).expect("upsert");
+    store
+        .upsert(chart_from_str(triage).expect("chart parses"))
+        .expect("upsert");
 
     let plan_route = Arc::new(PlanRoute::new().with_chart_store(Arc::new(store)));
     let config = make_config("http://127.0.0.1:1", false, false, 5000, 2000);
@@ -239,7 +244,11 @@ fn mock_for(user_message: &str, dispatch_response: &str) -> MockDispatchContext 
 }
 
 /// POST an OpenAI-style chat completion body, bounded by an overall timeout.
-async fn post_chat(base_url: &str, body: Value, timeout_ms: u64) -> Result<reqwest::Response, String> {
+async fn post_chat(
+    base_url: &str,
+    body: Value,
+    timeout_ms: u64,
+) -> Result<reqwest::Response, String> {
     let client = reqwest::Client::new();
     tokio::time::timeout(
         Duration::from_millis(timeout_ms),
@@ -275,7 +284,13 @@ fn sse_delta_content(body: &str) -> Vec<String> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn buffered_happy_path_returns_200_with_choices() {
-    let config = make_config("http://upstream.test:8080/v1/chat/completions", false, false, 5000, 2000);
+    let config = make_config(
+        "http://upstream.test:8080/v1/chat/completions",
+        false,
+        false,
+        5000,
+        2000,
+    );
     let server = spawn_test_server(config, Some(mock_for("What is 2+2?", "4"))).await;
 
     let body = json!({
@@ -287,10 +302,7 @@ async fn buffered_happy_path_returns_200_with_choices() {
         .expect("request must complete");
     assert_eq!(response.status(), 200);
 
-    let value: Value = response
-        .json()
-        .await
-        .expect("response must be valid JSON");
+    let value: Value = response.json().await.expect("response must be valid JSON");
     assert_eq!(value["choices"][0]["message"]["content"], "4");
     assert_eq!(value["choices"][0]["finish_reason"], "stop");
 }
@@ -299,8 +311,18 @@ async fn buffered_happy_path_returns_200_with_choices() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn streaming_request_returns_sse_data_lines() {
-    let config = make_config("http://upstream.test:8080/v1/chat/completions", true, false, 5000, 2000);
-    let server = spawn_test_server(config, Some(mock_for("Tell me a story", "Once upon a time"))).await;
+    let config = make_config(
+        "http://upstream.test:8080/v1/chat/completions",
+        true,
+        false,
+        5000,
+        2000,
+    );
+    let server = spawn_test_server(
+        config,
+        Some(mock_for("Tell me a story", "Once upon a time")),
+    )
+    .await;
 
     let body = json!({
         "model": "fast",
@@ -321,13 +343,10 @@ async fn streaming_request_returns_sse_data_lines() {
     );
 
     let text = response.text().await.expect("read SSE body");
-    let data_lines: Vec<&str> = text
-        .lines()
-        .filter(|l| l.starts_with("data: "))
-        .collect();
+    let data_lines: Vec<&str> = text.lines().filter(|l| l.starts_with("data: ")).collect();
     assert!(!data_lines.is_empty(), "expected at least one data: line");
     assert!(
-        data_lines.iter().any(|l| *l == "data: [DONE]"),
+        data_lines.contains(&"data: [DONE]"),
         "stream must terminate with [DONE]"
     );
     assert!(
@@ -340,7 +359,13 @@ async fn streaming_request_returns_sse_data_lines() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_json_returns_400() {
-    let config = make_config("http://upstream.test:8080/v1/chat/completions", false, false, 5000, 2000);
+    let config = make_config(
+        "http://upstream.test:8080/v1/chat/completions",
+        false,
+        false,
+        5000,
+        2000,
+    );
     let server = spawn_test_server(config, None).await;
 
     let client = reqwest::Client::new();
@@ -362,7 +387,13 @@ async fn malformed_json_returns_400() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_payload_returns_413() {
-    let mut config = make_config("http://upstream.test:8080/v1/chat/completions", false, false, 5000, 2000);
+    let mut config = make_config(
+        "http://upstream.test:8080/v1/chat/completions",
+        false,
+        false,
+        5000,
+        2000,
+    );
     config.server.max_payload = 64;
     let server = spawn_test_server(config, None).await;
 
@@ -382,11 +413,20 @@ async fn oversized_payload_returns_413() {
 async fn multibyte_utf8_message_at_120_byte_boundary_returns_200() {
     // 5 ASCII bytes + 39 CJK chars (3 bytes each) = 122 bytes; byte 120 falls
     // mid-character. The old `&s[..120]` slice in the handler panicked here.
-    let msg = format!("{}", "x".repeat(5) + &"你".repeat(39));
+    let msg = "x".repeat(5) + &"你".repeat(39);
     assert_eq!(msg.len(), 122);
-    assert!(!msg.is_char_boundary(120), "test must put byte 120 mid-char");
+    assert!(
+        !msg.is_char_boundary(120),
+        "test must put byte 120 mid-char"
+    );
 
-    let config = make_config("http://upstream.test:8080/v1/chat/completions", false, false, 5000, 2000);
+    let config = make_config(
+        "http://upstream.test:8080/v1/chat/completions",
+        false,
+        false,
+        5000,
+        2000,
+    );
     let server = spawn_test_server(config, Some(mock_for(&msg, "ok"))).await;
 
     let body = json!({
@@ -405,26 +445,29 @@ async fn multibyte_utf8_message_at_120_byte_boundary_returns_200() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn never_responding_upstream_times_out() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind upstream");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind upstream");
     let addr = listener.local_addr().expect("upstream addr");
     let held = Arc::new(std::sync::Mutex::new(Vec::new()));
     let held_for_task = held.clone();
     let _held_connections = tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    held_for_task
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(stream);
-                }
-                Err(_) => break,
-            }
+        while let Ok((stream, _)) = listener.accept().await {
+            held_for_task
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(stream);
         }
     });
 
     let total_timeout_ms = 500;
-    let config = make_config(&format!("http://{addr}"), false, false, total_timeout_ms, total_timeout_ms);
+    let config = make_config(
+        &format!("http://{addr}"),
+        false,
+        false,
+        total_timeout_ms,
+        total_timeout_ms,
+    );
     let server = spawn_test_server(config, None).await;
 
     let body = json!({
@@ -452,10 +495,10 @@ async fn never_responding_upstream_times_out() {
 // ── Scenario 7a: filter_thinking — buffered strip ────────────────────────
 
 /// Spawn an in-process mock upstream that answers every request via `respond`.
-async fn spawn_mock_upstream(
-    respond: Arc<dyn Fn(&Value) -> hyper::Response<ResponseBody> + Send + Sync>,
-) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind upstream");
+async fn spawn_mock_upstream(respond: UpstreamRespond) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind upstream");
     let addr = listener.local_addr().expect("upstream addr");
 
     tokio::spawn(async move {
@@ -465,21 +508,18 @@ async fn spawn_mock_upstream(
             };
             let io = TokioIo::new(stream);
             let respond = respond.clone();
-            let service = hyper::service::service_fn(
-                move |req: hyper::Request<Incoming>| {
-                    let respond = respond.clone();
-                    async move {
-                        let body_bytes = req
-                            .collect()
-                            .await
-                            .map(|c| c.to_bytes())
-                            .unwrap_or_default();
-                        let value =
-                            serde_json::from_slice::<Value>(&body_bytes).unwrap_or(Value::Null);
-                        Ok::<_, std::convert::Infallible>(respond(&value))
-                    }
-                },
-            );
+            let service = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
+                let respond = respond.clone();
+                async move {
+                    let body_bytes = req
+                        .collect()
+                        .await
+                        .map(http_body_util::Collected::to_bytes)
+                        .unwrap_or_default();
+                    let value = serde_json::from_slice::<Value>(&body_bytes).unwrap_or(Value::Null);
+                    Ok::<_, std::convert::Infallible>(respond(&value))
+                }
+            });
             tokio::spawn(async move {
                 let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, service)
@@ -548,7 +588,8 @@ async fn filter_thinking_never_leaks_partial_tag_in_stream() {
     // close tag across SSE writes; the router must hold the partial tags
     // until they complete so no fragment ever reaches the client.
     let upstream = spawn_mock_upstream(Arc::new(|_req: &Value| {
-        let (mut tx, rx) = http_body_util::channel::Channel::<Bytes, std::convert::Infallible>::new(4);
+        let (mut tx, rx) =
+            http_body_util::channel::Channel::<Bytes, std::convert::Infallible>::new(4);
         tokio::spawn(async move {
             let events = [
                 r#"data: {"choices":[{"delta":{"content":"Hello <thi"}}]}"#,
@@ -557,7 +598,11 @@ async fn filter_thinking_never_leaks_partial_tag_in_stream() {
                 "data: [DONE]",
             ];
             for event in events {
-                if tx.send_data(Bytes::from(format!("{event}\n\n"))).await.is_err() {
+                if tx
+                    .send_data(Bytes::from(format!("{event}\n\n")))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -618,9 +663,9 @@ async fn plan_route_responds_with_targeted_clarification_then_executes() {
     assert_eq!(r1["status"], "clarify");
     assert_eq!(r1["source"], "template_adapted");
     assert!(
-        r1["questions"]
-            .as_array()
-            .is_some_and(|q| q.iter().any(|x| x.as_str().is_some_and(|s| s.contains("report")))),
+        r1["questions"].as_array().is_some_and(|q| q
+            .iter()
+            .any(|x| x.as_str().is_some_and(|s| s.contains("report")))),
         "targeted question must name the gap: {r1:?}"
     );
     let gaps: Vec<String> = r1["gaps"]
@@ -721,7 +766,10 @@ async fn plan_route_unconfigured_returns_service_unavailable() {
 
 /// Spawn the real server with a plan route (M10 extraction hook over a
 /// boot-loaded chart store).
-async fn spawn_server_with_plan_route(config: RouterConfig, plan_route: Arc<PlanRoute>) -> TestServer {
+async fn spawn_server_with_plan_route(
+    config: RouterConfig,
+    plan_route: Arc<PlanRoute>,
+) -> TestServer {
     let provider = TranscriptProvider::new(HashMap::new());
     let backend: Arc<dyn ChatBackend> = Arc::new(provider);
     let pipelines = Arc::new(config.build_all_pipelines_with_backend(Some(&backend)));
@@ -786,8 +834,12 @@ async fn successful_dispatch_distills_a_draft_chart() {
     let config = make_config(&upstream, false, false, 5000, 2000);
 
     // A shared store with the M10 extraction hook enabled (operator opt-in).
+    // Mode `"all"` keeps the blanket extraction the e2e asserts (the default
+    // `"frontier"` scope would skip this single-target primary dispatch).
     let store = Arc::new(ChartStore::new(None));
-    let extractor = WorkflowExtractor::new(store.clone()).enabled(true);
+    let extractor = WorkflowExtractor::new(store.clone())
+        .enabled(true)
+        .with_extraction_mode(crate::config::WorkflowExtractionMode::All);
     let plan_route = Arc::new(
         PlanRoute::new()
             .with_chart_store(store.clone())
@@ -804,7 +856,10 @@ async fn successful_dispatch_distills_a_draft_chart() {
         .expect("request must complete");
     assert_eq!(response.status(), 200);
     let value: Value = response.json().await.expect("valid JSON response");
-    assert_eq!(value["choices"][0]["message"]["content"], "the answer is 42");
+    assert_eq!(
+        value["choices"][0]["message"]["content"],
+        "the answer is 42"
+    );
 
     // The successful buffered dispatch was distilled into a draft chart.
     let name = "what_is_the_answer";
@@ -816,6 +871,19 @@ async fn successful_dispatch_distills_a_draft_chart() {
     assert!(
         store.is_draft(name),
         "the auto-extracted chart is a draft until rubric-validated"
+    );
+    // M10a LOD0 fidelity: the draft's template captures the real prompt shape
+    // (the role-prefixed message) — not the synthesized "Solve the following
+    // request…" wrapper.
+    let chart = store.get(name).expect("chart exists");
+    let template = &chart.targets[0].template;
+    assert!(
+        template.starts_with("user: {{ request }}"),
+        "template must reflect the real prompt shape, got: {template:?}"
+    );
+    assert!(
+        !template.contains("Solve the following request"),
+        "no synthesized wrapper in the LOD0 template, got: {template:?}"
     );
     // And the draft is not selectable yet (excluded from selection).
     assert!(!store.charts_sorted().iter().any(|c| c.name == name));

@@ -35,7 +35,11 @@ impl ScoreMatrix {
                 // (zero contribution) so they can never poison `total` and
                 // panic the sort below.
                 let raw_score = scores.get(dim).copied().unwrap_or(0.0);
-                let score = if raw_score.is_finite() { raw_score } else { 0.0 };
+                let score = if raw_score.is_finite() {
+                    raw_score
+                } else {
+                    0.0
+                };
                 let weight = self.weights.get(i).copied().unwrap_or(0.0);
                 route_vector.push((dim.clone(), score));
 

@@ -1,6 +1,8 @@
 //! Rubric-based test fixtures for `ResultScorer` and `Summarizer`.
 //!
 //! All tests use `StubChatBackend` — no live model, no network.
+// Stub scores are compared against literal thresholds — deliberate.
+#![allow(clippy::float_cmp)]
 
 use std::sync::Arc;
 
@@ -135,9 +137,8 @@ fn test_scorer_rejection_produces_compact_summary() {
         result.summary.len()
             <= result
                 .summary
-                .find(|c: char| c == '.')
-                .map(|i| i + 1)
-                .unwrap_or(result.summary.len()),
+                .find('.')
+                .map_or(result.summary.len(), |i| i + 1),
         "rejected summary should be compact (single sentence)"
     );
 }

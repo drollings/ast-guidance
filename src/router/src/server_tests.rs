@@ -1,4 +1,7 @@
 #[cfg(test)]
+// The file is included as `mod server_tests` (lib.rs:62) and nests an inner
+// `mod server_tests` to keep the harness private — intentional structure.
+#[allow(clippy::module_inception)]
 mod server_tests {
     use std::collections::HashMap;
     use std::sync::Arc;

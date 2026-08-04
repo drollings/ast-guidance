@@ -57,9 +57,9 @@ pub mod workflow_config;
 pub mod testing;
 
 #[cfg(test)]
-mod server_tests;
-#[cfg(test)]
 mod server_http_tests;
+#[cfg(test)]
+mod server_tests;
 #[cfg(test)]
 mod stage_tests;
 #[cfg(test)]

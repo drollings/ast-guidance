@@ -177,9 +177,7 @@ pub fn error_response(message: &str, error_type: &str) -> serde_json::Value {
 
 /// Convert RouterRequest messages into Vec<serde_json::Value> for dispatch.
 /// Used by both server.rs dispatch_to_llm and dispatch::frontier backends.
-pub fn messages_to_json(
-    request: &RouterRequest,
-) -> Result<Vec<serde_json::Value>, NormalizeError> {
+pub fn messages_to_json(request: &RouterRequest) -> Result<Vec<serde_json::Value>, NormalizeError> {
     request
         .messages
         .iter()
@@ -198,8 +196,8 @@ pub fn messages_to_json(
             };
             let mut msg = serde_json::json!({"role": m.role, "content": content});
             if let Some(ref tc) = m.tool_calls {
-                msg["tool_calls"] = serde_json::to_value(tc)
-                    .map_err(|e| NormalizeError::Parse(e.to_string()))?;
+                msg["tool_calls"] =
+                    serde_json::to_value(tc).map_err(|e| NormalizeError::Parse(e.to_string()))?;
             }
             if let Some(ref id) = m.tool_call_id {
                 msg["tool_call_id"] = serde_json::Value::String(id.clone());
@@ -354,7 +352,7 @@ mod tests {
         assert_eq!(json[0]["role"], "assistant");
         assert_eq!(json[0]["content"][0]["type"], "text");
         assert_eq!(json[0]["content"][1]["type"], "image_url");
-        assert!(json[0]["tool_calls"][0]["function"]["name"] == "lookup");
+        assert_eq!(json[0]["tool_calls"][0]["function"]["name"], "lookup");
     }
 
     #[test]

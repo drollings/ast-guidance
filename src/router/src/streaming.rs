@@ -132,7 +132,8 @@ impl StreamingHandler {
                 // the next chunk (otherwise a split `</thi` + `nk>` close
                 // would be missed and the tail would leak).
                 let hold = Self::tag_prefix_len(remaining, CLOSE_TAGS);
-                self.think_pending.push_str(&remaining[..remaining.len() - hold]);
+                self.think_pending
+                    .push_str(&remaining[..remaining.len() - hold]);
                 self.pending.push_str(&remaining[remaining.len() - hold..]);
                 self.chunk_index += 1;
                 return output;

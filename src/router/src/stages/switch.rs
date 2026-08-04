@@ -291,6 +291,9 @@ pub(crate) fn mirror_stage_metadata(
 
 #[cfg(test)]
 mod tests {
+    // The 3.14 literal is a deliberate round float for the formatting test,
+    // not an approximation of π.
+    #![allow(clippy::approx_constant)]
     use super::*;
     use crate::pipeline::PipelineResult;
     use crate::test_stubs;

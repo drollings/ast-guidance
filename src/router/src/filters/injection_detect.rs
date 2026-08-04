@@ -273,7 +273,7 @@ mod tests {
     fn empty_text_returns_nothing() {
         let filter = InjectionDetectFilter::new(0.10);
         let ctx = FilterContext {
-            user_message: "".into(),
+            user_message: String::new(),
             is_frontier_bound: false,
         };
         assert!(filter.evaluate(&ctx).is_none());

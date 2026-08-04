@@ -198,7 +198,7 @@ mod tests {
     use super::*;
     use crate::types::{RouterMessage, RouterMessageContent, RouterRequest};
 
-    fn make_request_with_matches(text: &str, matches: Vec<MatchEntry>) -> RouterRequest {
+    fn make_request_with_matches(text: &str, matches: &[MatchEntry]) -> RouterRequest {
         let mut req = RouterRequest {
             model: "test-model".into(),
             messages: vec![RouterMessage {
@@ -245,7 +245,7 @@ mod tests {
         ];
 
         let anon = CodewordAnonymizer::new();
-        let request = make_request_with_matches(text, matches.clone());
+        let request = make_request_with_matches(text, &matches);
         let result = anon.transform(&request, &[]).unwrap();
         let output = result.messages[0].content.to_string_lossy();
 
@@ -273,7 +273,7 @@ mod tests {
         ];
 
         let anon = CodewordAnonymizer::new();
-        let request = make_request_with_matches(text, matches);
+        let request = make_request_with_matches(text, &matches);
         let result = anon.transform(&request, &[]).unwrap();
         let output = result.messages[0].content.to_string_lossy();
 
@@ -291,7 +291,7 @@ mod tests {
         let matches = vec![make_match("email", "user@example.com", 12, 28)];
 
         let anon = CodewordAnonymizer::new();
-        let request = make_request_with_matches(text, matches);
+        let request = make_request_with_matches(text, &matches);
         let result = anon.transform(&request, &[]).unwrap();
         let output = result.messages[0].content.to_string_lossy();
 
@@ -310,7 +310,7 @@ mod tests {
     #[test]
     fn no_matches_passes_unchanged() {
         let text = "What is the capital of France?";
-        let request = make_request_with_matches(text, vec![]);
+        let request = make_request_with_matches(text, &[]);
         let anon = CodewordAnonymizer::new();
         let result = anon.transform(&request, &[]).unwrap();
         let output = result.messages[0].content.to_string_lossy();
@@ -323,7 +323,7 @@ mod tests {
         let matches = vec![make_match("email", "user@example.com", 9, 25)];
 
         let anon = CodewordAnonymizer::new();
-        let request = make_request_with_matches(text, matches);
+        let request = make_request_with_matches(text, &matches);
         let result = anon.transform(&request, &[]).unwrap();
 
         let map = result.metadata.get("codeword_map");
