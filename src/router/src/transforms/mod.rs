@@ -14,7 +14,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::types::RouterRequest;
+use crate::types::{RouterMessageContent, RouterRequest};
 
 #[derive(Debug, Error, Clone, Serialize, Deserialize)]
 pub enum TransformError {
@@ -26,11 +26,29 @@ pub enum TransformError {
 
 pub trait TransformStrategy: Send + Sync {
     fn name(&self) -> &str;
-    fn transform(
-        &self,
-        request: &RouterRequest,
-        pii_classes: &[String],
-    ) -> Result<RouterRequest, TransformError>;
+    fn transform(&self, request: &RouterRequest) -> Result<RouterRequest, TransformError>;
 }
 
 pub type TransformStrategyRef = Arc<dyn TransformStrategy>;
+
+/// Shared clone-messages/iterate/match boilerplate for transforms that rewrite
+/// each `Text` message in place (M7.5 / D9 — the six-copy clone/iterate/match
+/// skeleton is consolidated here). `Parts` messages are left untouched.
+///
+/// Each transform becomes a thin closure: only the per-message rewrite
+/// (and any side-channel it wants, e.g. a captured anonymize map) lives in the
+/// caller.
+pub fn rewrite_text_messages(
+    request: &RouterRequest,
+    mut rewrite: impl FnMut(&str) -> Result<String, TransformError>,
+) -> Result<RouterRequest, TransformError> {
+    let mut transformed = request.clone();
+    for message in &mut transformed.messages {
+        let text = match &message.content {
+            RouterMessageContent::Text(s) => s.clone(),
+            RouterMessageContent::Parts(_) => continue,
+        };
+        message.content = RouterMessageContent::Text(rewrite(&text)?);
+    }
+    Ok(transformed)
+}

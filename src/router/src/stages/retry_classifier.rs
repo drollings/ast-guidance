@@ -175,23 +175,7 @@ impl WorkUnit for RetryClassifier {
     }
 }
 
-impl FieldAccess for RetryClassifier {
-    fn set_field(&mut self, _name: &str, _value: &str) -> Result<(), FieldError> {
-        Err(FieldError::NotFound(
-            "RetryClassifier has no configurable fields".into(),
-        ))
-    }
-
-    fn get_field(&self, _name: &str) -> Result<String, FieldError> {
-        Err(FieldError::NotFound(
-            "RetryClassifier has no configurable fields".into(),
-        ))
-    }
-
-    fn field_names(&self) -> &'static [&'static str] {
-        &[]
-    }
-}
+impl_fieldless!(RetryClassifier);
 
 impl Describable for RetryClassifier {
     fn describe(&self) -> serde_json::Value {

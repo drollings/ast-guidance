@@ -41,24 +41,6 @@ impl Middleware for TimingMiddleware {
     }
 }
 
-pub struct RetryMiddleware {
-    max_attempts: u32,
-    backoff_ms: u64,
-}
-impl RetryMiddleware {
-    pub fn new(max_attempts: u32, backoff_ms: u64) -> Self {
-        Self {
-            max_attempts,
-            backoff_ms,
-        }
-    }
-}
-impl Middleware for RetryMiddleware {
-    fn wrap(&self, inner: Arc<dyn Component>) -> Arc<dyn Component> {
-        Arc::new(WithRetry::new(inner, self.max_attempts, self.backoff_ms))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,15 +63,9 @@ mod tests {
     }
 
     #[test]
-    fn test_retry_middleware() {
-        let wrapped = RetryMiddleware::new(3, 1).wrap(Arc::new(PassthroughUnit::new("retry_test")));
-        assert!(wrapped.execute(&WorkContext::default()).unwrap().success);
-    }
-    #[test]
     fn test_middleware_chain() {
-        let chain = fluent_wvr::wrapper::MiddlewareChain::new()
-            .push(Box::new(TimingMiddleware::new()))
-            .push(Box::new(RetryMiddleware::new(2, 1)));
+        let chain =
+            fluent_wvr::wrapper::MiddlewareChain::new().push(Box::new(TimingMiddleware::new()));
         let wrapped = chain.apply(Arc::new(PassthroughUnit::new("chained")));
         assert!(wrapped.execute(&WorkContext::default()).unwrap().success);
     }

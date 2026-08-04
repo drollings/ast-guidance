@@ -87,6 +87,16 @@ fn make_config(
 /// optional dispatch mock. The default transcript classifier routes to the
 /// `fast` target.
 async fn spawn_test_server(config: RouterConfig, mock: Option<MockDispatchContext>) -> TestServer {
+    spawn_test_server_with_sessions(config, mock, None).await
+}
+
+/// `spawn_test_server` with an optional `SessionRegistry` (D6 session-step
+/// tracking on the dispatch path).
+async fn spawn_test_server_with_sessions(
+    config: RouterConfig,
+    mock: Option<MockDispatchContext>,
+    sessions: Option<std::sync::Arc<crate::dag_session::SessionRegistry>>,
+) -> TestServer {
     let provider = TranscriptProvider::new(HashMap::new());
     let backend: Arc<dyn ChatBackend> = Arc::new(provider);
     let pipelines = Arc::new(config.build_all_pipelines_with_backend(Some(&backend)));
@@ -112,6 +122,7 @@ async fn spawn_test_server(config: RouterConfig, mock: Option<MockDispatchContex
             None,
             None,
             None,
+            sessions,
         )
         .await
         {
@@ -125,10 +136,13 @@ async fn spawn_test_server(config: RouterConfig, mock: Option<MockDispatchContex
 /// Spawn a server with a plan route (M8 interview round-trip tests). The
 /// chart store is seeded with `bug_triage`; no selector backend is attached,
 /// so the deterministic/HNSW binding is the sole authority on executability.
+/// An execution backend feeds the two chart targets (reproduce → root_cause)
+/// so an exact hit executes server-side (M4/D3).
 async fn spawn_plan_server() -> TestServer {
     use crate::charts::store::{chart_from_str, ChartStore};
     use crate::hnsw::HnswIndexHandle;
     use crate::routes::plan::PlanRoute;
+    use crate::test_stubs::StubChatBackend;
 
     let triage = r#"{
         "name": "bug_triage",
@@ -175,7 +189,14 @@ async fn spawn_plan_server() -> TestServer {
         .upsert(chart_from_str(triage).expect("chart parses"))
         .expect("upsert");
 
-    let plan_route = Arc::new(PlanRoute::new().with_chart_store(Arc::new(store)));
+    let plan_route = Arc::new(
+        PlanRoute::new()
+            .with_chart_store(Arc::new(store))
+            .with_execution_backend(Arc::new(StubChatBackend::new(vec![
+                r#"{"plan": "minimal repro"}"#.to_string(),
+                r#"{"cause": "null pointer deref in async task"}"#.to_string(),
+            ]))),
+    );
     let config = make_config("http://127.0.0.1:1", false, false, 5000, 2000);
     let pipelines = Arc::new(config.build_all_pipelines_with_backend(None));
     let routes = Arc::new(config.routes.clone());
@@ -199,6 +220,7 @@ async fn spawn_plan_server() -> TestServer {
             None,
             None,
             Some(plan_route),
+            None,
         )
         .await
         {
@@ -305,6 +327,50 @@ async fn buffered_happy_path_returns_200_with_choices() {
     let value: Value = response.json().await.expect("response must be valid JSON");
     assert_eq!(value["choices"][0]["message"]["content"], "4");
     assert_eq!(value["choices"][0]["finish_reason"], "stop");
+}
+
+// ── D6: session-step recording on the dispatch path ──────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_step_recorded_and_completed_on_dispatch_path() {
+    use crate::dag_session::SessionRegistry;
+    use crate::session::StepStatus;
+
+    let config = make_config(
+        "http://upstream.test:8080/v1/chat/completions",
+        false,
+        false,
+        5000,
+        2000,
+    );
+    let sessions = Arc::new(SessionRegistry::new(None));
+    let server = spawn_test_server_with_sessions(
+        config,
+        Some(mock_for("What is 2+2?", "4")),
+        Some(Arc::clone(&sessions)),
+    )
+    .await;
+
+    let body = json!({
+        "model": "fast",
+        "messages": [{"role": "user", "content": "What is 2+2?"}],
+        "session_id": "sess-http-1"
+    });
+    let response = post_chat(&server.base_url(), body, 5000)
+        .await
+        .expect("request must complete");
+    assert_eq!(response.status(), 200);
+
+    // The request was recorded as a completed step on the session keyed by
+    // `session_id`, with the model name attached (rewind restores by model).
+    let session = sessions.get_or_create("sess-http-1");
+    let session = session.lock().unwrap();
+    assert_eq!(session.model.as_deref(), Some("fast"));
+    assert_eq!(session.step_count(), 1);
+    let step_id = session.step_ids().first().unwrap().clone();
+    let step = session.get_step(&step_id).unwrap();
+    assert_eq!(step.status, StepStatus::Completed);
+    assert!(step.result.as_ref().unwrap().accepted);
 }
 
 // ── Scenario 2: SSE stream ───────────────────────────────────────────────
@@ -701,10 +767,17 @@ async fn plan_route_responds_with_targeted_clarification_then_executes() {
         "the interviewed gap is reported as filled"
     );
     assert!(
-        r2["workflow"]["workflows"]["bug_triage"]["stages"]
-            .as_array()
-            .is_some_and(|s| s.len() == 2),
-        "executed workflow carries the compiled chart: {r2:?}"
+        r2["final_output"].is_object(),
+        "executed response carries the final output: {r2:?}"
+    );
+    assert_eq!(
+        r2["final_output"]["cause"], "null pointer deref in async task",
+        "executed result equals the golden transcript"
+    );
+    assert_eq!(r2["accepted"], true, "chart accepted after execution");
+    assert!(
+        r2["audit"].is_array() && r2["audit"].as_array().is_some_and(|a| a.len() == 2),
+        "audit trail has one entry per completed target: {r2:?}"
     );
 }
 
@@ -794,6 +867,7 @@ async fn spawn_server_with_plan_route(
             None,
             None,
             Some(plan_route),
+            None,
         )
         .await
         {

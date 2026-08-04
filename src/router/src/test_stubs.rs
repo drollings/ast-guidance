@@ -77,21 +77,7 @@ impl WorkUnit for SimplePassStage {
     }
 }
 
-impl FieldAccess for SimplePassStage {
-    fn set_field(&mut self, _name: &str, _value: &str) -> Result<(), FieldError> {
-        Err(FieldError::NotFound(
-            "SimplePassStage has no configurable fields".into(),
-        ))
-    }
-    fn get_field(&self, _name: &str) -> Result<String, FieldError> {
-        Err(FieldError::NotFound(
-            "SimplePassStage has no configurable fields".into(),
-        ))
-    }
-    fn field_names(&self) -> &'static [&'static str] {
-        &[]
-    }
-}
+impl_fieldless!(SimplePassStage);
 
 impl Describable for SimplePassStage {
     fn describe(&self) -> serde_json::Value {
@@ -161,21 +147,7 @@ impl WorkUnit for FailingStage {
     }
 }
 
-impl FieldAccess for FailingStage {
-    fn set_field(&mut self, _name: &str, _value: &str) -> Result<(), FieldError> {
-        Err(FieldError::NotFound(
-            "FailingStage has no configurable fields".into(),
-        ))
-    }
-    fn get_field(&self, _name: &str) -> Result<String, FieldError> {
-        Err(FieldError::NotFound(
-            "FailingStage has no configurable fields".into(),
-        ))
-    }
-    fn field_names(&self) -> &'static [&'static str] {
-        &[]
-    }
-}
+impl_fieldless!(FailingStage);
 
 impl Describable for FailingStage {
     fn describe(&self) -> serde_json::Value {

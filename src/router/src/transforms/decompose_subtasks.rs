@@ -18,11 +18,7 @@ impl TransformStrategy for DecomposeToSubtasks {
         "decompose_to_subtasks"
     }
 
-    fn transform(
-        &self,
-        request: &RouterRequest,
-        _pii_classes: &[String],
-    ) -> Result<RouterRequest, TransformError> {
+    fn transform(&self, request: &RouterRequest) -> Result<RouterRequest, TransformError> {
         let mut transformed = request.clone();
 
         let user_text: String = request

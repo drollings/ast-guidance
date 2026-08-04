@@ -1,28 +1,33 @@
 use std::sync::Arc;
 
+use fluent_concurrency::pool::Limiter;
 use guidance_llm::client::ChatBackend;
 
 use crate::charts::binding::Entity;
-use crate::charts::compile::compile_chart;
+use crate::charts::binding::ENTITIES_META_KEY;
+use crate::charts::execute::{ChartExecOptions, ChartExecutionPlan, ChartExecutionSummary};
 use crate::charts::extract::WorkflowExtractor;
 use crate::charts::select::{ChartFit, ChartSelector};
 use crate::charts::store::ChartStore;
 use crate::config::ChartsConfig;
-use crate::workflow_config::WorkflowConfig;
 
 pub struct PlanRoute {
-    /// HNSW index for prior workflows.
-    workflow_index: Option<crate::hnsw::HnswIndexHandle>,
     /// The chart store — the single owner of the workflow_library index
     /// path. Shared via `Arc` so the M7 `ChartSelector` and the route read
     /// from the same boot-loaded store.
     charts: Arc<ChartStore>,
     /// Adjudicator backend for chart selection (M7 step 3). `None` degrades
-    /// selection to deterministic + HNSW only.
+    /// selection to deterministic + HNSW only. Also doubles as the rubric
+    /// judge backend for chart execution (M4.1).
     selector_backend: Option<Arc<dyn ChatBackend>>,
     /// Reranker backend for chart selection (M7 step 2.5). `None` skips
     /// candidate re-ranking (Step 2 → Step 3 directly).
     reranker_backend: Option<Arc<dyn ChatBackend>>,
+    /// Backend that executes a selected chart's targets (M4.1 server-side
+    /// execution). `None` degrades an exact fit to a fresh draft.
+    execution_backend: Option<Arc<dyn ChatBackend>>,
+    /// Bounds concurrent chart-target LLM calls during execution.
+    limiter: Arc<Limiter>,
     /// Chart-selection configuration (thresholds, max candidates).
     cfg: ChartsConfig,
     /// M10 dispatch post-processing hook: distills successful dispatches into
@@ -32,13 +37,19 @@ pub struct PlanRoute {
 
 #[derive(Debug, Clone)]
 pub struct PlanResult {
-    pub workflow: WorkflowConfig,
     pub source: PlanSource,
     pub interview_questions: Vec<String>,
     /// Raw gap dep names behind the rendered questions (M8 round-trip: the
     /// handler echoes these back so the interview stays exactly one round).
     pub gaps: Vec<String>,
     pub gaps_filled: Vec<String>,
+    /// Execution summary when a chart was compiled + executed server-side
+    /// (Exact / interviewed-Exact hit). `None` for clarify and fresh-draft.
+    pub summary: Option<ChartExecutionSummary>,
+    /// Selection provenance label (`"exact"` / `"partial"` / `"mismatch"`).
+    pub fit: Option<String>,
+    /// Selection confidence in `[0, 1]` (audit trail provenance).
+    pub score: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,20 +68,14 @@ impl Default for PlanRoute {
 impl PlanRoute {
     pub fn new() -> Self {
         Self {
-            workflow_index: None,
             charts: Arc::new(ChartStore::new(None)),
             selector_backend: None,
             reranker_backend: None,
+            execution_backend: None,
+            limiter: Arc::new(Limiter::new(4)),
             cfg: ChartsConfig::default(),
             extractor: None,
         }
-    }
-
-    #[must_use]
-    pub fn with_index(mut self, index: crate::hnsw::HnswIndexHandle) -> Self {
-        self.workflow_index = Some(index);
-        self.charts = Arc::new(ChartStore::new(self.workflow_index.clone()));
-        self
     }
 
     /// Attach the boot-loaded chart store. The store is shared (`Arc`) so the
@@ -94,6 +99,21 @@ impl PlanRoute {
     #[must_use]
     pub fn with_reranker_backend(mut self, backend: Arc<dyn ChatBackend>) -> Self {
         self.reranker_backend = Some(backend);
+        self
+    }
+
+    /// Attach the backend that executes a selected chart's targets (M4.1).
+    /// Mock-injectable.
+    #[must_use]
+    pub fn with_execution_backend(mut self, backend: Arc<dyn ChatBackend>) -> Self {
+        self.execution_backend = Some(backend);
+        self
+    }
+
+    /// Attach a limiter bounding concurrent chart-target LLM calls.
+    #[must_use]
+    pub fn with_limiter(mut self, limiter: Arc<Limiter>) -> Self {
+        self.limiter = limiter;
         self
     }
 
@@ -122,28 +142,21 @@ impl PlanRoute {
         self.charts.as_ref()
     }
 
-    pub fn register_template(&mut self, _task_class: impl Into<String>, _workflow: WorkflowConfig) {
-        // Retained for API compatibility with the stub; the chart store is
-        // the backing store now.
-    }
-
-    /// Plan a request against the chart library (M7).
+    /// Plan a request against the chart library (M7), executing server-side.
     ///
     /// Selection outcome drives the returned plan:
     ///
-    /// - `Exact`: compile the chart into its `WorkflowConfig`, `source =
-    ///   HnswHit`.
+    /// - `Exact`: compile + execute the chart under Zone supervision, `source
+    ///   = HnswHit`, with the execution summary populated.
     /// - `Partial { gaps }`: `source = TemplateAdapted` with the gaps turned
     ///   into `interview_questions` (≤ `CHART_MAX_INTERVIEW_QUESTIONS`),
-    ///   `workflow` unset.
-    /// - `Mismatch`: `source = FreshDraft`, `workflow` unset (fall through to
+    ///   `summary = None`.
+    /// - `Mismatch`: `source = FreshDraft`, `summary = None` (fall through to
     ///   blank-slate planning).
     ///
-    /// The chart's `WorkflowConfig` is compiled (not executed) here — the
-    /// caller owns the `ChatBackend`/`Limiter` and executes it downstream.
     /// `gaps_filled` is reserved for the M8 interview loop.
-    pub fn plan(&self, user_message: &str, entities: &[Entity]) -> PlanResult {
-        self.plan_inner(user_message, entities, false)
+    pub async fn plan(&self, user_message: &str, entities: &[Entity]) -> PlanResult {
+        self.plan_inner(user_message, entities, false).await
     }
 
     /// Round-2 entry for the one-round interview loop (M8).
@@ -152,16 +165,16 @@ impl PlanRoute {
     /// dep name). Re-binds and:
     ///
     /// - `Exact` now → `source = TemplateAdapted` with `gaps_filled` set to
-    ///   the previously-asked gaps (the chart became executable).
+    ///   the previously-asked gaps, and the chart executed server-side.
     /// - Still `Partial`/`Mismatch` → `source = FreshDraft`. The interview is
     ///   one round, never open-ended (VISION: terminate, don't loop).
-    pub fn plan_interviewed(
+    pub async fn plan_interviewed(
         &self,
         user_message: &str,
         entities: &[Entity],
         prior_gaps: &[String],
     ) -> PlanResult {
-        let mut result = self.plan_inner(user_message, entities, true);
+        let mut result = self.plan_inner(user_message, entities, true).await;
         if result.source == PlanSource::HnswHit {
             result.source = PlanSource::TemplateAdapted;
             result.gaps_filled = prior_gaps.to_vec();
@@ -170,7 +183,7 @@ impl PlanRoute {
     }
 
     /// Shared selection+binding+fit pipeline for both interview rounds.
-    fn plan_inner(&self, user_message: &str, entities: &[Entity], retry: bool) -> PlanResult {
+    async fn plan_inner(&self, user_message: &str, entities: &[Entity], retry: bool) -> PlanResult {
         let mut selector = ChartSelector::new(
             self.charts.clone(),
             self.selector_backend.clone(),
@@ -201,24 +214,8 @@ impl PlanRoute {
                     );
                     return fresh_draft();
                 };
-                match compile_chart(&chart, entities) {
-                    Ok(workflow) => PlanResult {
-                        workflow,
-                        source: PlanSource::HnswHit,
-                        interview_questions: Vec::new(),
-                        gaps: Vec::new(),
-                        gaps_filled: Vec::new(),
-                    },
-                    Err(e) => {
-                        tracing::error!(
-                            target: "router.plan",
-                            chart = %chart.name,
-                            error = %e,
-                            "exact-selected chart failed to compile"
-                        );
-                        fresh_draft()
-                    }
-                }
+                self.execute_chart(&chart, user_message, entities, "exact", selection.score)
+                    .await
             }
             ChartFit::Partial { gaps } => {
                 if retry {
@@ -234,15 +231,82 @@ impl PlanRoute {
                     let mut questions: Vec<String> = gaps.iter().map(|g| gap_prompt(g)).collect();
                     questions.truncate(crate::charts::CHART_MAX_INTERVIEW_QUESTIONS);
                     PlanResult {
-                        workflow: WorkflowConfig::default(),
                         source: PlanSource::TemplateAdapted,
                         interview_questions: questions,
                         gaps,
                         gaps_filled: Vec::new(),
+                        summary: None,
+                        fit: Some("partial".into()),
+                        score: Some(selection.score),
                     }
                 }
             }
             ChartFit::Mismatch => fresh_draft(),
+        }
+    }
+
+    /// Compile + execute an exact-selected chart under Zone supervision.
+    ///
+    /// A missing `execution_backend` or a compile error degrades to a fresh
+    /// draft (never a crash): the chart library is advisory, not mandatory.
+    async fn execute_chart(
+        &self,
+        chart: &crate::charts::ChartDef,
+        user_message: &str,
+        entities: &[Entity],
+        fit: &str,
+        score: f64,
+    ) -> PlanResult {
+        let Some(backend) = self.execution_backend.clone() else {
+            tracing::error!(
+                target: "router.plan",
+                chart = %chart.name,
+                "no execution backend configured — exact fit degrades to fresh draft"
+            );
+            return fresh_draft();
+        };
+        let base_ctx = plan_ctx(user_message, entities);
+        let plan = match ChartExecutionPlan::compile(chart, entities, &backend, &self.limiter) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(
+                    target: "router.plan",
+                    chart = %chart.name,
+                    error = %e,
+                    "exact-selected chart failed to compile"
+                );
+                return fresh_draft();
+            }
+        };
+        let opts = ChartExecOptions {
+            runtime: fluent_concurrency::tokio_runtime(),
+            judge: self.selector_backend.clone(),
+            cache: None,
+            metrics: None,
+            health: Some(self.charts.clone()),
+            fit: Some(fit.into()),
+            score: Some(score),
+            ..Default::default()
+        };
+        match plan.execute(&base_ctx, &opts).await {
+            Ok(summary) => PlanResult {
+                source: PlanSource::HnswHit,
+                interview_questions: Vec::new(),
+                gaps: Vec::new(),
+                gaps_filled: Vec::new(),
+                summary: Some(summary),
+                fit: Some(fit.into()),
+                score: Some(score),
+            },
+            Err(e) => {
+                tracing::error!(
+                    target: "router.plan",
+                    chart = %chart.name,
+                    error = %e,
+                    "chart execution failed"
+                );
+                fresh_draft()
+            }
         }
     }
 }
@@ -250,11 +314,13 @@ impl PlanRoute {
 /// A `FreshDraft` plan: no chart hit, planning falls through to a blank slate.
 fn fresh_draft() -> PlanResult {
     PlanResult {
-        workflow: WorkflowConfig::default(),
         source: PlanSource::FreshDraft,
         interview_questions: Vec::new(),
         gaps: Vec::new(),
         gaps_filled: Vec::new(),
+        summary: None,
+        fit: None,
+        score: None,
     }
 }
 
@@ -263,16 +329,28 @@ fn gap_prompt(gap: &str) -> String {
     format!("Please provide the missing input: {gap}")
 }
 
+/// Build the base execution `WorkContext` carrying the request + bound
+/// entities (the chart stages re-bind from the structured `entities` at
+/// execution time — see `ChartPromptStage`).
+fn plan_ctx(user_message: &str, entities: &[Entity]) -> fluent_wvr::WorkContext {
+    let request_json = serde_json::json!({
+        "model": "chart",
+        "messages": [{"role": "user", "content": user_message}]
+    });
+    let mut ctx = fluent_wvr::WorkContext::default();
+    ctx.set_structured("request", &request_json);
+    if !entities.is_empty() {
+        ctx.set_structured(ENTITIES_META_KEY, &entities);
+    }
+    ctx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::charts::binding::ENTITIES_META_KEY;
     use crate::charts::store::{chart_from_str, ChartStore};
     use crate::hnsw::HnswIndexHandle;
     use crate::test_stubs::{HashEmbedder, StubChatBackend};
-    use fluent_concurrency::pool::Limiter;
-    use fluent_wvr::prelude::*;
-    use guidance_llm::client::ChatBackend;
     use tempfile::TempDir;
 
     fn triage_chart_json() -> String {
@@ -338,27 +416,8 @@ mod tests {
         (Arc::new(store), tmp)
     }
 
-    fn request_ctx(text: &str, entities: &[Entity]) -> WorkContext {
-        let ctx_json = serde_json::json!({
-            "model": "test",
-            "messages": [{"role": "user", "content": text}]
-        });
-        let mut ctx = WorkContext::default();
-        ctx.metadata.insert(
-            "request".into(),
-            MetadataValue::String(ctx_json.to_string()),
-        );
-        if !entities.is_empty() {
-            ctx.metadata.insert(
-                ENTITIES_META_KEY.into(),
-                MetadataValue::String(serde_json::to_string(entities).unwrap()),
-            );
-        }
-        ctx
-    }
-
-    #[test]
-    fn plan_partial_returns_interview_questions_for_gaps() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plan_partial_returns_interview_questions_for_gaps() {
         let (store, _tmp) = indexed_store();
         let route = PlanRoute::new()
             .with_chart_store(store)
@@ -367,7 +426,9 @@ mod tests {
             )))
             .with_charts_config(ChartsConfig::default());
         // No report entity → root_cause is unbound → Partial.
-        let result = route.plan("Triage a bug report into reproduction", &[]);
+        let result = route
+            .plan("Triage a bug report into reproduction", &[])
+            .await;
         assert_eq!(result.source, PlanSource::TemplateAdapted);
         assert!(
             result
@@ -377,10 +438,11 @@ mod tests {
             "interview questions must cover the missing dep, got {:?}",
             result.interview_questions
         );
+        assert!(result.summary.is_none());
     }
 
-    #[test]
-    fn plan_mismatch_falls_through_to_fresh_draft() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plan_mismatch_falls_through_to_fresh_draft() {
         let (store, _tmp) = indexed_store();
         let route = PlanRoute::new()
             .with_chart_store(store)
@@ -388,60 +450,74 @@ mod tests {
                 r#"{"chart": null, "fit": "mismatch"}"#,
             )))
             .with_charts_config(ChartsConfig::default());
-        let result = route.plan("how do I cook pasta", &[]);
+        let result = route.plan("how do I cook pasta", &[]).await;
         assert_eq!(result.source, PlanSource::FreshDraft);
-        assert!(result.workflow.workflows.is_empty());
+        assert!(result.summary.is_none());
     }
 
-    #[test]
-    fn plan_exact_hit_compiles_chart_and_executes_to_golden() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plan_exact_hit_executes_chart_to_golden() {
         let (store, _tmp) = indexed_store();
         let route = PlanRoute::new()
             .with_chart_store(store.clone())
             .with_selector_backend(Arc::new(StubChatBackend::always(
                 r#"{"chart": "bug_triage", "fit": "exact"}"#,
             )))
+            .with_execution_backend(Arc::new(StubChatBackend::new(vec![
+                r#"{"plan": "minimal repro"}"#.to_string(),
+                golden().to_string(),
+            ])))
             .with_charts_config(ChartsConfig::default());
 
         let entities = vec![report_entity()];
         let request = "Triage a bug report into reproduction, root cause, and fix plan";
 
-        let result = route.plan(request, &entities);
+        let result = route.plan(request, &entities).await;
         assert_eq!(result.source, PlanSource::HnswHit);
-        let workflow = &result.workflow.workflows["bug_triage"];
-        assert_eq!(workflow.stages.len(), 2, "compiled chart has 2 targets");
-
-        // Execute the compiled chart through the pipeline builder with a stub
-        // backend; the final target's output must equal the golden transcript.
-        let golden = serde_json::json!({"cause": "null pointer deref in async task"});
-        let exec_backend: Arc<dyn ChatBackend> = Arc::new(StubChatBackend::new(vec![
-            r#"{"plan": "minimal repro"}"#.to_string(),
-            golden.to_string(),
-        ]));
-        let config = crate::config::RouterConfig::default();
-        let limiter = Arc::new(Limiter::new(4));
-        let chart = store.get("bug_triage").expect("chart in store");
-        let graph = config
-            .build_chart_pipeline(&chart, &entities, &exec_backend, &limiter)
-            .expect("chart compiles into a runnable pipeline");
-        let output = graph
-            .execute(&request_ctx(request, &entities))
-            .expect("chart pipeline executes");
-        let result: crate::pipeline::PipelineResult = output.data_as().expect("pipeline result");
+        let summary = result.summary.expect("executed chart summary");
         assert_eq!(
-            result.decisions.len(),
+            summary.completed.len(),
             2,
             "topo order: reproduce → root_cause"
         );
-        let final_decision = result.decisions.last().unwrap();
         assert_eq!(
-            final_decision.metadata["output"], golden,
+            summary.final_output,
+            Some(golden()),
             "executed result equals the golden transcript"
         );
+        assert!(summary.accepted);
     }
 
-    #[test]
-    fn plan_with_reranker_backend_still_selects() {
+    fn golden() -> serde_json::Value {
+        serde_json::json!({"cause": "null pointer deref in async task"})
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plan_exact_without_execution_backend_degrades_to_fresh_draft() {
+        let (store, _tmp) = indexed_store();
+        let route = PlanRoute::new()
+            .with_chart_store(store)
+            .with_selector_backend(Arc::new(StubChatBackend::always(
+                r#"{"chart": "bug_triage", "fit": "exact"}"#,
+            )))
+            .with_charts_config(ChartsConfig::default());
+        let entities = vec![report_entity()];
+        let result = route
+            .plan(
+                "Triage a bug report into reproduction, root cause, and fix plan",
+                &entities,
+            )
+            .await;
+        assert_eq!(
+            result.source,
+            PlanSource::FreshDraft,
+            "an exact fit with no execution backend cannot execute — degrade, don't crash"
+        );
+        assert!(result.summary.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plan_with_reranker_backend_still_selects() {
         // The reranker backend (M7 step 2.5) is threaded into the selector.
         // A stub that returns the correct ranking, plus an adjudicator that
         // picks the chart, must yield an HnswHit exactly as without a
@@ -453,13 +529,17 @@ mod tests {
             .with_selector_backend(Arc::new(StubChatBackend::always(
                 r#"{"chart": "bug_triage", "fit": "exact"}"#,
             )))
+            .with_execution_backend(Arc::new(StubChatBackend::new(vec![
+                r#"{"plan": "minimal repro"}"#.to_string(),
+                golden().to_string(),
+            ])))
             .with_charts_config(ChartsConfig::default());
 
         let entities = vec![report_entity()];
         let request = "Triage a bug report into reproduction, root cause, and fix plan";
-        let result = route.plan(request, &entities);
+        let result = route.plan(request, &entities).await;
         assert_eq!(result.source, PlanSource::HnswHit);
-        assert!(result.workflow.workflows.contains_key("bug_triage"));
+        assert!(result.summary.is_some());
     }
 
     // ── M8: one-round interview loop ─────────────────────────────────────
@@ -475,10 +555,10 @@ mod tests {
             .with_charts_config(ChartsConfig::default())
     }
 
-    #[test]
-    fn interview_questions_are_capped_at_max() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interview_questions_are_capped_at_max() {
         let route = partial_route();
-        let result = route.plan("Triage a bug report", &[]);
+        let result = route.plan("Triage a bug report", &[]).await;
         assert_eq!(result.source, PlanSource::TemplateAdapted);
         assert!(
             result.interview_questions.len() <= crate::charts::CHART_MAX_INTERVIEW_QUESTIONS,
@@ -493,19 +573,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn interview_round_trip_binds_answer_and_executes() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interview_round_trip_binds_answer_and_executes() {
         // HNSW-backed route with NO selector backend: the binding is the sole
         // authority on executability, so round 2 re-bind closes the gap.
         let (store, _tmp) = indexed_store();
         let route = PlanRoute::new()
             .with_chart_store(store)
+            .with_execution_backend(Arc::new(StubChatBackend::new(vec![
+                r#"{"plan": "minimal repro"}"#.to_string(),
+                golden().to_string(),
+            ])))
             .with_charts_config(ChartsConfig::default());
         let request = "Triage a bug report into reproduction, root cause, and fix plan";
 
         // Round 1: no report entity → the binding leaves `report` unmatched →
         // Partial with one targeted question.
-        let round1 = route.plan(request, &[]);
+        let round1 = route.plan(request, &[]).await;
         assert_eq!(round1.source, PlanSource::TemplateAdapted);
         assert_eq!(round1.interview_questions.len(), 1);
         assert_eq!(round1.gaps, vec!["report".to_string()]);
@@ -513,7 +597,9 @@ mod tests {
 
         // Round 2: the answer arrives as an entity (kind = gap dep name) and
         // is re-bound → the chart becomes executable.
-        let round2 = route.plan_interviewed(request, &[report_entity()], &gaps);
+        let round2 = route
+            .plan_interviewed(request, &[report_entity()], &gaps)
+            .await;
         assert_eq!(
             round2.source,
             PlanSource::TemplateAdapted,
@@ -521,17 +607,17 @@ mod tests {
         );
         assert_eq!(round2.gaps_filled, vec!["report".to_string()]);
         assert!(
-            round2.workflow.workflows.contains_key("bug_triage"),
-            "interviewed chart compiles into a runnable workflow"
+            round2.summary.is_some(),
+            "interviewed chart executes into a summary"
         );
     }
 
-    #[test]
-    fn second_interview_failure_terminates_as_fresh_draft() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn second_interview_failure_terminates_as_fresh_draft() {
         let route = partial_route();
         // Round 1 asks for `report`; round 2 answers with an entity that does
         // NOT satisfy the predicate (wrong kind) → still Partial → FreshDraft.
-        let round1 = route.plan("Triage a bug report", &[]);
+        let round1 = route.plan("Triage a bug report", &[]).await;
         let gaps = round1.gaps.clone();
         // An entity whose value does NOT satisfy the `report` predicate
         // (title is missing) → binding still leaves `report` unmatched.
@@ -540,7 +626,9 @@ mod tests {
             kind: "note".into(),
             value: serde_json::json!({"body": "no title field"}),
         };
-        let round2 = route.plan_interviewed("Triage a bug report", &[bad_entity], &gaps);
+        let round2 = route
+            .plan_interviewed("Triage a bug report", &[bad_entity], &gaps)
+            .await;
         assert_eq!(
             round2.source,
             PlanSource::FreshDraft,

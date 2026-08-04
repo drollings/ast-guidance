@@ -217,8 +217,7 @@ impl super::Library {
         // path; only fall back to the capped brute-force scan when no HNSW
         // index is available. Capability-filtered searches bypass the HNSW
         // route because the index cannot apply the filter.
-        if capability_filter.is_none() && self.embedded_node_count()? > MAX_KNN_CANDIDATES as i64
-        {
+        if capability_filter.is_none() && self.embedded_node_count()? > MAX_KNN_CANDIDATES as i64 {
             if let Some(hits) = self.hnsw_search(query_vec, k) {
                 return Ok(hits);
             }
@@ -265,7 +264,11 @@ impl super::Library {
             }
         }
 
-        let top_k = knn_brute_force(query_vec, candidates.into_iter(), k);
+        let top_k = knn_brute_force(
+            query_vec,
+            candidates.iter().map(|(idx, emb)| (*idx, emb.as_slice())),
+            k,
+        );
         let results = top_k
             .into_iter()
             .map(|(idx, distance)| KnnHit {

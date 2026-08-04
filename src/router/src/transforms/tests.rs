@@ -21,7 +21,7 @@ mod tests {
     fn test_no_transform_passes_through_unchanged() {
         let transform = NoTransform;
         let request = make_request("Hello, world!");
-        let result = transform.transform(&request, &[]).unwrap();
+        let result = transform.transform(&request).unwrap();
         assert_eq!(result.model, "test-model");
         assert_eq!(result.messages.len(), 1);
         assert_eq!(
@@ -37,7 +37,7 @@ mod tests {
         request.temperature = Some(0.7);
         request.max_tokens = Some(2048);
         request.session_id = Some("sess-1".into());
-        let result = transform.transform(&request, &[]).unwrap();
+        let result = transform.transform(&request).unwrap();
         assert_eq!(result.temperature, Some(0.7));
         assert_eq!(result.max_tokens, Some(2048));
         assert_eq!(result.session_id, Some("sess-1".into()));
@@ -55,7 +55,7 @@ mod tests {
     fn test_pii_anonymize_redacts_ssn() {
         let transform = PiiAnonymize;
         let request = make_request("My SSN is 123-45-6789. Please help.");
-        let result = transform.transform(&request, &[]).unwrap();
+        let result = transform.transform(&request).unwrap();
         let output = result.messages[0].content.to_string_lossy();
         assert!(!output.contains("123-45-6789"), "SSN should be redacted");
         assert!(
@@ -68,7 +68,7 @@ mod tests {
     fn test_pii_anonymize_redacts_email() {
         let transform = PiiAnonymize;
         let request = make_request("Contact me at user@example.com for details.");
-        let result = transform.transform(&request, &[]).unwrap();
+        let result = transform.transform(&request).unwrap();
         let output = result.messages[0].content.to_string_lossy();
         assert!(
             !output.contains("user@example.com"),
@@ -84,7 +84,7 @@ mod tests {
     fn test_pii_anonymize_redacts_credit_card() {
         let transform = PiiAnonymize;
         let request = make_request("Card: 4111-1111-1111-1111 expires 12/25.");
-        let result = transform.transform(&request, &[]).unwrap();
+        let result = transform.transform(&request).unwrap();
         let output = result.messages[0].content.to_string_lossy();
         assert!(
             !output.contains("4111-1111-1111-1111"),
@@ -96,7 +96,7 @@ mod tests {
     fn test_pii_anonymize_redacts_phone() {
         let transform = PiiAnonymize;
         let request = make_request("Call me at 555-123-4567.");
-        let result = transform.transform(&request, &[]).unwrap();
+        let result = transform.transform(&request).unwrap();
         let output = result.messages[0].content.to_string_lossy();
         assert!(!output.contains("555-123-4567"), "phone should be redacted");
     }
@@ -105,7 +105,7 @@ mod tests {
     fn test_pii_anonymize_stores_anonymize_map() {
         let transform = PiiAnonymize;
         let request = make_request("My email is user@example.com and SSN is 123-45-6789.");
-        let result = transform.transform(&request, &[]).unwrap();
+        let result = transform.transform(&request).unwrap();
         let map = result.metadata.get("anonymize_map");
         assert!(map.is_some(), "anonymize_map should be present in metadata");
     }
@@ -114,7 +114,7 @@ mod tests {
     fn test_pii_anonymize_no_pii_passes_unchanged() {
         let transform = PiiAnonymize;
         let request = make_request("What is the capital of France?");
-        let result = transform.transform(&request, &[]).unwrap();
+        let result = transform.transform(&request).unwrap();
         let output = result.messages[0].content.to_string_lossy();
         assert_eq!(output, "What is the capital of France?");
     }
@@ -131,7 +131,7 @@ mod tests {
     fn test_decompose_hypothetical_no_pii_in_output() {
         let transform = DecomposeToAnonymizedHypothetical;
         let request = make_request("My SSN is 123-45-6789 and email is user@example.com");
-        let result = transform.transform(&request, &[]).unwrap();
+        let result = transform.transform(&request).unwrap();
         let output = result.messages[0].content.to_string_lossy();
         assert!(
             !output.contains("123-45-6789"),
@@ -147,7 +147,7 @@ mod tests {
     fn test_decompose_hypothetical_creates_system_and_user_messages() {
         let transform = DecomposeToAnonymizedHypothetical;
         let request = make_request("What is Rust?");
-        let result = transform.transform(&request, &[]).unwrap();
+        let result = transform.transform(&request).unwrap();
         assert_eq!(result.messages.len(), 2);
         assert_eq!(result.messages[0].role, "system");
         assert_eq!(result.messages[1].role, "user");
@@ -157,7 +157,7 @@ mod tests {
     fn test_decompose_hypothetical_contains_rubric() {
         let transform = DecomposeToAnonymizedHypothetical;
         let request = make_request("Help me with my code.");
-        let result = transform.transform(&request, &[]).unwrap();
+        let result = transform.transform(&request).unwrap();
         let system_content = result.messages[0].content.to_string_lossy();
         assert!(
             system_content.contains("Rubric"),
@@ -173,7 +173,7 @@ mod tests {
     fn test_decompose_hypothetical_metadata() {
         let transform = DecomposeToAnonymizedHypothetical;
         let request = make_request("Test query");
-        let result = transform.transform(&request, &[]).unwrap();
+        let result = transform.transform(&request).unwrap();
         let transform_val = result.metadata.get("transform");
         assert!(transform_val.is_some());
         assert_eq!(
@@ -216,7 +216,7 @@ mod tests {
 
         let transform = DecomposeToSubtasks::new(Box::new(decomposer));
         let request = make_request("Build a web app");
-        let result = transform.transform(&request, &[]).unwrap();
+        let result = transform.transform(&request).unwrap();
 
         // Should have system + user messages
         assert_eq!(result.messages.len(), 2);
@@ -247,7 +247,7 @@ mod tests {
 
         let transform = DecomposeToSubtasks::new(Box::new(EmptyDecomposer));
         let request = make_request(""); // empty user message triggers NotApplicable
-        let result = transform.transform(&request, &[]);
+        let result = transform.transform(&request);
         assert!(result.is_err(), "empty user text should error");
     }
 

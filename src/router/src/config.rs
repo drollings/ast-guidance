@@ -326,15 +326,15 @@ pub enum WorkflowExtractionMode {
 }
 
 fn default_total_timeout_ms() -> u64 {
-    300_000
+    common_core::constants::DEFAULT_TOTAL_TIMEOUT_MS
 }
 
 fn default_idle_timeout_ms() -> u64 {
-    30_000
+    common_core::constants::DEFAULT_IDLE_TIMEOUT_MS
 }
 
 fn default_retry_interval() -> u64 {
-    1
+    common_core::constants::DEFAULT_RETRY_INTERVAL_S
 }
 
 #[cfg(test)]
@@ -513,6 +513,32 @@ mod tests {
         assert_eq!(
             cfg.post_process.workflow_extraction_mode,
             WorkflowExtractionMode::All
+        );
+    }
+
+    #[test]
+    fn model_entry_serde_defaults_read_canonical_constants() {
+        // The same constants `RoutingTarget` reads (M7.2 divergence guard).
+        let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+            "endpoint": "http://localhost:8080/v1/chat/completions",
+            "intelligence": 2,
+            "cost_input": 1e-6,
+            "cost_output": 6e-6,
+            "cost_cached_read": 4e-7,
+            "speed": 8,
+        }))
+        .unwrap();
+        assert_eq!(
+            entry.total_timeout_ms,
+            common_core::constants::DEFAULT_TOTAL_TIMEOUT_MS
+        );
+        assert_eq!(
+            entry.idle_timeout_ms,
+            common_core::constants::DEFAULT_IDLE_TIMEOUT_MS
+        );
+        assert_eq!(
+            entry.retry_base_interval_s,
+            common_core::constants::DEFAULT_RETRY_INTERVAL_S
         );
     }
 }

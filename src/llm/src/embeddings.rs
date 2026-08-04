@@ -259,9 +259,9 @@ impl<T: EmbeddingProvider + Send + Sync + 'static> EmbeddingProvider
         // `block_in_place` / fallback-runtime pattern from `do_http_post`
         // (which mirrors `client.rs::chat_complete`).
         match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(move || {
-                handle.block_on(self.embed_batch_async(texts))
-            }),
+            Ok(handle) => {
+                tokio::task::block_in_place(move || handle.block_on(self.embed_batch_async(texts)))
+            }
             Err(_) => fallback_runtime().block_on(self.embed_batch_async(texts)),
         }
     }

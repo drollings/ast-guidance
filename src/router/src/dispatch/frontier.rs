@@ -1,13 +1,15 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use fluent_concurrency::pool::Limiter;
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::types::{
     RouterChoice, RouterMessage, RouterMessageContent, RouterRequest, RouterResponse, Usage,
 };
+
+// Provider request/response builders, reserved for the frontier escalation
+// ladder (forward track — see ROADMAP_20260804_DRY §0.5). The production
+// dispatch path is `ChatBackend` in `dispatch::backend`; this module only
+// owns the wire-format build/parse logic for the OpenAI- and Anthropic-style
+// Messages APIs that the ladder will compose.
 
 impl DispatchError {
     pub fn is_retryable(&self) -> bool {
@@ -43,13 +45,6 @@ pub enum StreamEvent {
     Error(String),
 }
 
-pub trait DispatchBackend: Send + Sync {
-    fn provider_name(&self) -> &str;
-    fn build_request(&self, request: &RouterRequest) -> Result<Value, DispatchError>;
-    fn parse_response(&self, body: &Value) -> Result<RouterResponse, DispatchError>;
-    fn parse_stream_event(&self, event: &[u8]) -> Result<StreamEvent, DispatchError>;
-}
-
 pub struct OpenAiBackend {
     pub api_base: String,
     pub api_key: Option<String>,
@@ -62,14 +57,8 @@ impl OpenAiBackend {
             api_key,
         }
     }
-}
 
-impl DispatchBackend for OpenAiBackend {
-    fn provider_name(&self) -> &str {
-        "openai"
-    }
-
-    fn build_request(&self, request: &RouterRequest) -> Result<Value, DispatchError> {
+    pub fn build_request(&self, request: &RouterRequest) -> Result<Value, DispatchError> {
         let messages: Vec<Value> = crate::normalize::messages_to_json(request)
             .map_err(|e| DispatchError::RequestBuild(e.to_string()))?;
 
@@ -94,7 +83,7 @@ impl DispatchBackend for OpenAiBackend {
         Ok(body)
     }
 
-    fn parse_response(&self, body: &Value) -> Result<RouterResponse, DispatchError> {
+    pub fn parse_response(&self, body: &Value) -> Result<RouterResponse, DispatchError> {
         let id = body
             .get("id")
             .and_then(Value::as_str)
@@ -171,7 +160,7 @@ impl DispatchBackend for OpenAiBackend {
         })
     }
 
-    fn parse_stream_event(&self, event: &[u8]) -> Result<StreamEvent, DispatchError> {
+    pub fn parse_stream_event(&self, event: &[u8]) -> Result<StreamEvent, DispatchError> {
         let text = std::str::from_utf8(event)
             .map_err(|e| DispatchError::StreamParse(format!("invalid UTF-8 in stream: {e}")))?;
 
@@ -210,14 +199,12 @@ impl DispatchBackend for OpenAiBackend {
     }
 }
 
-pub struct AnthropicBackend;
+/// Anthropic Messages-API builders, reserved for the frontier escalation
+/// ladder (forward track — see ROADMAP_20260804_DRY §0.5).
+pub struct Anthropic;
 
-impl DispatchBackend for AnthropicBackend {
-    fn provider_name(&self) -> &str {
-        "anthropic"
-    }
-
-    fn build_request(&self, request: &RouterRequest) -> Result<Value, DispatchError> {
+impl Anthropic {
+    pub fn build_request(request: &RouterRequest) -> Result<Value, DispatchError> {
         let mut system_parts: Vec<String> = Vec::new();
         let mut messages: Vec<Value> = Vec::new();
 
@@ -263,7 +250,7 @@ impl DispatchBackend for AnthropicBackend {
         Ok(body)
     }
 
-    fn parse_response(&self, body: &Value) -> Result<RouterResponse, DispatchError> {
+    pub fn parse_response(body: &Value) -> Result<RouterResponse, DispatchError> {
         let id = body
             .get("id")
             .and_then(Value::as_str)
@@ -319,7 +306,7 @@ impl DispatchBackend for AnthropicBackend {
         })
     }
 
-    fn parse_stream_event(&self, event: &[u8]) -> Result<StreamEvent, DispatchError> {
+    pub fn parse_stream_event(event: &[u8]) -> Result<StreamEvent, DispatchError> {
         let text = std::str::from_utf8(event)
             .map_err(|e| DispatchError::StreamParse(format!("invalid UTF-8 in stream: {e}")))?;
 
@@ -348,132 +335,6 @@ impl DispatchBackend for AnthropicBackend {
         } else {
             Err(DispatchError::StreamParse("unexpected SSE format".into()))
         }
-    }
-}
-
-pub struct OpenAiCompatBackend {
-    pub api_base: String,
-    pub api_key: Option<String>,
-    pub provider_label: String,
-    openai: OpenAiBackend,
-}
-
-impl OpenAiCompatBackend {
-    pub fn new(
-        api_base: impl Into<String>,
-        api_key: Option<String>,
-        provider_label: impl Into<String>,
-    ) -> Self {
-        let base: String = api_base.into();
-        let key = api_key;
-        let openai = OpenAiBackend::new(&base, key.clone());
-        Self {
-            api_base: base,
-            api_key: key,
-            provider_label: provider_label.into(),
-            openai,
-        }
-    }
-}
-
-impl DispatchBackend for OpenAiCompatBackend {
-    fn provider_name(&self) -> &str {
-        &self.provider_label
-    }
-
-    fn build_request(&self, request: &RouterRequest) -> Result<Value, DispatchError> {
-        self.openai.build_request(request)
-    }
-
-    fn parse_response(&self, body: &Value) -> Result<RouterResponse, DispatchError> {
-        self.openai.parse_response(body)
-    }
-
-    fn parse_stream_event(&self, event: &[u8]) -> Result<StreamEvent, DispatchError> {
-        self.openai.parse_stream_event(event)
-    }
-}
-
-struct ProviderConfig {
-    backend: Arc<dyn DispatchBackend>,
-    api_key: Option<String>,
-}
-
-pub struct LlmDispatcher {
-    providers: HashMap<String, ProviderConfig>,
-    http_client: reqwest::Client,
-    limiter: Limiter,
-}
-
-impl LlmDispatcher {
-    pub fn new(max_concurrent: usize) -> Self {
-        Self {
-            providers: HashMap::new(),
-            http_client: reqwest::Client::new(),
-            limiter: Limiter::new(max_concurrent),
-        }
-    }
-
-    pub fn register_backend(
-        &mut self,
-        name: impl Into<String>,
-        backend: Arc<dyn DispatchBackend>,
-        api_key: Option<String>,
-    ) {
-        self.providers
-            .insert(name.into(), ProviderConfig { backend, api_key });
-    }
-
-    pub fn get_backend(&self, name: &str) -> Option<&Arc<dyn DispatchBackend>> {
-        self.providers.get(name).map(|pc| &pc.backend)
-    }
-
-    pub async fn dispatch(
-        &self,
-        provider: &str,
-        _model: &str,
-        request: &RouterRequest,
-    ) -> Result<RouterResponse, DispatchError> {
-        let pc = self
-            .providers
-            .get(provider)
-            .ok_or_else(|| DispatchError::UnsupportedProvider(provider.into()))?;
-
-        let body = pc.backend.build_request(request)?;
-
-        let api_url = match provider {
-            "openai" => "https://api.openai.com/v1/chat/completions",
-            "anthropic" => "https://api.anthropic.com/v1/messages",
-            other => {
-                if other.starts_with("http://") || other.starts_with("https://") {
-                    other
-                } else {
-                    return Err(DispatchError::UnsupportedProvider(format!(
-                        "no known API URL for provider: {other}"
-                    )));
-                }
-            }
-        };
-
-        let api_key = pc.api_key.clone();
-
-        let response = self
-            .limiter
-            .run(|| async {
-                let mut req = self.http_client.post(api_url).json(&body);
-                if let Some(ref key) = api_key {
-                    req = req.header("Authorization", format!("Bearer {key}"));
-                }
-                req.send()
-                    .await
-                    .map_err(|e| DispatchError::Http(e.to_string()))?
-                    .json::<Value>()
-                    .await
-                    .map_err(|e| DispatchError::ResponseParse(e.to_string()))
-            })
-            .await?;
-
-        pc.backend.parse_response(&response)
     }
 }
 

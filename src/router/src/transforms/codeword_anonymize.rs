@@ -3,8 +3,8 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::transforms::{TransformError, TransformStrategy};
-use crate::types::{RouterMessageContent, RouterRequest};
+use crate::transforms::{rewrite_text_messages, TransformError, TransformStrategy};
+use crate::types::RouterRequest;
 
 /// Session-scoped, reversible codeword anonymizer (MOA_ROUTER_SPEC §4).
 ///
@@ -154,28 +154,16 @@ impl TransformStrategy for CodewordAnonymizer {
         "codeword_anonymize"
     }
 
-    fn transform(
-        &self,
-        request: &RouterRequest,
-        _pii_classes: &[String],
-    ) -> Result<RouterRequest, TransformError> {
-        let mut transformed = request.clone();
-
+    fn transform(&self, request: &RouterRequest) -> Result<RouterRequest, TransformError> {
         let matches = Self::extract_matches_from_metadata(request);
 
         if matches.is_empty() {
-            return Ok(transformed);
+            return Ok(request.clone());
         }
 
-        for message in &mut transformed.messages {
-            let original = match &message.content {
-                RouterMessageContent::Text(s) => s.clone(),
-                RouterMessageContent::Parts(_) => continue,
-            };
-
-            let anonymized = self.apply_substitution(&original, &matches);
-            message.content = RouterMessageContent::Text(anonymized);
-        }
+        let mut transformed = rewrite_text_messages(request, |content| {
+            Ok(self.apply_substitution(content, &matches))
+        })?;
 
         // Record the codeword map in metadata for downstream reverse-substitution
         let map = self.mapping.lock().unwrap();
@@ -246,7 +234,7 @@ mod tests {
 
         let anon = CodewordAnonymizer::new();
         let request = make_request_with_matches(text, &matches);
-        let result = anon.transform(&request, &[]).unwrap();
+        let result = anon.transform(&request).unwrap();
         let output = result.messages[0].content.to_string_lossy();
 
         // The first email gets CODEWORD_EMAIL_1, second gets CODEWORD_EMAIL_2
@@ -274,7 +262,7 @@ mod tests {
 
         let anon = CodewordAnonymizer::new();
         let request = make_request_with_matches(text, &matches);
-        let result = anon.transform(&request, &[]).unwrap();
+        let result = anon.transform(&request).unwrap();
         let output = result.messages[0].content.to_string_lossy();
 
         // Both occurrences of "email1@test.com" should become CODEWORD_EMAIL_1
@@ -292,7 +280,7 @@ mod tests {
 
         let anon = CodewordAnonymizer::new();
         let request = make_request_with_matches(text, &matches);
-        let result = anon.transform(&request, &[]).unwrap();
+        let result = anon.transform(&request).unwrap();
         let output = result.messages[0].content.to_string_lossy();
 
         assert!(
@@ -312,7 +300,7 @@ mod tests {
         let text = "What is the capital of France?";
         let request = make_request_with_matches(text, &[]);
         let anon = CodewordAnonymizer::new();
-        let result = anon.transform(&request, &[]).unwrap();
+        let result = anon.transform(&request).unwrap();
         let output = result.messages[0].content.to_string_lossy();
         assert_eq!(output, "What is the capital of France?");
     }
@@ -324,7 +312,7 @@ mod tests {
 
         let anon = CodewordAnonymizer::new();
         let request = make_request_with_matches(text, &matches);
-        let result = anon.transform(&request, &[]).unwrap();
+        let result = anon.transform(&request).unwrap();
 
         let map = result.metadata.get("codeword_map");
         assert!(map.is_some(), "codeword_map should be present in metadata");

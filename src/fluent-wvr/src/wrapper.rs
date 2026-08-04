@@ -17,19 +17,19 @@ pub struct RetryResult<T> {
     pub attempts: usize,
 }
 
-/// Retry with jittered exponential backoff using `std::thread::sleep`.
+/// Retry a synchronous closure with jittered-exponential backoff using
+/// `std::thread::sleep`.
 ///
-/// Delay per attempt: `base_ms * attempt + fastrand::u64(0..jitter_range)`.
-/// Jitter defaults to 50% of `base_ms` (the `base_ms` value is doubled to
-/// produce the jitter range). This is a synchronous wrapper; the async path
-/// belongs in `fluent-concurrency::AsyncRetry` when a second async consumer
-/// materializes.
+/// The delay schedule is delegated to `common_core::retry::backoff_ms`
+/// (base × 2^(attempt-1) plus 100% jitter). This is the synchronous,
+/// explicitly-blocking counterpart to `common_core::retry::retry_async`;
+/// it is documented as such and must NOT be called from a `WorkUnit::execute`
+/// body (the WorkUnit purity contract — see `WorkUnit`'s doc comment).
 pub fn retry_call<F, T, E>(max_attempts: usize, base_ms: u64, f: F) -> Result<RetryResult<T>, E>
 where
     F: Fn() -> Result<T, E>,
 {
     assert!(max_attempts >= 1);
-    let jitter_ms = base_ms;
     let mut attempts = 0;
     loop {
         attempts += 1;
@@ -44,20 +44,14 @@ where
                 if attempts >= max_attempts {
                     return Err(e);
                 }
-                sleep_backoff(attempts, base_ms, jitter_ms);
+                std::thread::sleep(Duration::from_millis(common_core::retry::backoff_ms(
+                    base_ms,
+                    attempts as u32,
+                    100,
+                )));
             }
         }
     }
-}
-
-fn sleep_backoff(attempts: usize, base_ms: u64, jitter_ms: u64) {
-    let jitter = if jitter_ms > 0 {
-        fastrand::u64(0..jitter_ms)
-    } else {
-        0
-    };
-    let delay = Duration::from_millis(base_ms * attempts as u64 + jitter);
-    std::thread::sleep(delay);
 }
 
 /// A `WorkUnit` wrapper that logs execution timing and optionally records
@@ -170,93 +164,6 @@ impl<U: crate::Component> crate::Describable for Instrumented<U> {
 }
 
 impl_component!(generic (U: crate::Component + 'static) for Instrumented<U>);
-
-#[derive(Clone)]
-pub struct WithRetry<U> {
-    inner: U,
-    max_attempts: u32,
-    base_ms: u64,
-    jitter_pct: u32,
-}
-
-impl<U: WorkUnit> WithRetry<U> {
-    pub fn new(inner: U, max_attempts: u32, backoff_ms: u64) -> Self {
-        Self {
-            inner,
-            max_attempts,
-            base_ms: backoff_ms,
-            jitter_pct: 50,
-        }
-    }
-
-    /// Build a `WithRetry` with configurable jitter.
-    ///
-    /// `jitter_pct` is the percentage of `base_ms` used as the jitter
-    /// range (0–100). A value of 50 means the jitter is `0..base_ms`.
-    pub fn new_jittered(inner: U, max_attempts: u32, base_ms: u64, jitter_pct: u32) -> Self {
-        Self {
-            inner,
-            max_attempts,
-            base_ms,
-            jitter_pct: jitter_pct.min(100),
-        }
-    }
-}
-
-impl<U: WorkUnit> WorkUnit for WithRetry<U> {
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-
-    fn depends(&self) -> &[ArcIntern<str>] {
-        self.inner.depends()
-    }
-
-    fn provides(&self) -> &[ArcIntern<str>] {
-        self.inner.provides()
-    }
-
-    fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-        let mut attempts = 0u32;
-        let jitter_ms = self.base_ms * u64::from(self.jitter_pct) / 100;
-        loop {
-            attempts += 1;
-            match self.inner.execute(ctx) {
-                Ok(output) => return Ok(output),
-                Err(e) => {
-                    if attempts >= self.max_attempts {
-                        return Err(e);
-                    }
-                    sleep_backoff(attempts as usize, self.base_ms, jitter_ms);
-                }
-            }
-        }
-    }
-
-    fn type_name(&self) -> &'static str {
-        self.inner.type_name()
-    }
-}
-
-impl<U: crate::Component> FieldAccess for WithRetry<U> {
-    fn set_field(&mut self, name: &str, value: &str) -> Result<(), FieldError> {
-        <U as FieldAccess>::set_field(&mut self.inner, name, value)
-    }
-    fn get_field(&self, name: &str) -> Result<String, FieldError> {
-        <U as FieldAccess>::get_field(&self.inner, name)
-    }
-    fn field_names(&self) -> &'static [&'static str] {
-        <U as FieldAccess>::field_names(&self.inner)
-    }
-}
-
-impl<U: crate::Component> crate::Describable for WithRetry<U> {
-    fn describe(&self) -> serde_json::Value {
-        <U as crate::Describable>::describe(&self.inner)
-    }
-}
-
-impl_component!(generic (U: crate::Component + 'static) for WithRetry<U>);
 
 /// A wrapper that adapts any `Arc<dyn Component>` at runtime.
 ///
@@ -430,8 +337,9 @@ impl Describable for ComponentAdapter {
 
 impl_component!(ComponentAdapter);
 
-/// Post-erasure Component wrapper. Unlike newtype wrappers (Instrumented,
-/// WithRetry), middleware wraps an already-erased `Arc<dyn Component>`.
+/// Post-erasure Component wrapper. Unlike the newtype wrappers
+/// (`Instrumented`, `ComponentAdapter`), middleware wraps an
+/// already-erased `Arc<dyn Component>`.
 pub trait Middleware: Send + Sync {
     fn wrap(&self, inner: Arc<dyn Component>) -> Arc<dyn Component>;
 }
@@ -737,34 +645,6 @@ mod tests {
     impl_component!(MockUnit);
 
     #[test]
-    fn pipeline_retry_success() {
-        let unit = MockUnit::ok("mock");
-        let wrapped = WithRetry::new(unit, 3, 1);
-        let ctx = WorkContext::default();
-        let result = wrapped.execute(&ctx);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn with_retry_accepts_unit_depends_provides() {
-        let inner = MockUnit::ok("mock");
-        let wrapped = WithRetry::new(inner, 3, 1);
-        assert_eq!(wrapped.name(), "mock");
-        assert!(wrapped.depends().is_empty());
-        assert!(wrapped.provides().is_empty());
-    }
-
-    #[test]
-    fn with_retry_new_jittered_clamps_jitter_pct() {
-        let inner = MockUnit::ok("mock");
-        // jitter_pct > 100 should be clamped to 100
-        let wrapped = WithRetry::new_jittered(inner, 3, 10, 150);
-        let ctx = WorkContext::default();
-        let result = wrapped.execute(&ctx);
-        assert!(result.is_ok());
-    }
-
-    #[test]
     fn instrumented_delegates() {
         let inner = MockUnit::ok("mock");
         let wrapped = Instrumented::new(inner, "test-label");
@@ -818,16 +698,6 @@ mod tests {
         let arc: Arc<dyn Component> = Arc::new(instr);
         assert!(crate::component_downcast_ref::<Instrumented<MockUnit>>(&*arc).is_some());
         // Instrumented does not auto-leak the inner type
-        assert!(crate::component_downcast_ref::<MockUnit>(&*arc).is_none());
-    }
-
-    #[test]
-    fn with_retry_downcast_roundtrip() {
-        let inner = MockUnit::ok("mock");
-        let wr = WithRetry::new(inner, 3, 1);
-        let arc: Arc<dyn Component> = Arc::new(wr);
-        assert!(crate::component_downcast_ref::<WithRetry<MockUnit>>(&*arc).is_some());
-        // WithRetry does not auto-leak the inner type
         assert!(crate::component_downcast_ref::<MockUnit>(&*arc).is_none());
     }
 
@@ -1160,15 +1030,6 @@ mod tests {
         let inst = Instrumented::new(unit, "test.label");
         let cloned = inst.clone();
         assert_eq!(cloned.label, "test.label");
-    }
-
-    #[test]
-    fn with_retry_clone() {
-        let unit = CloneableUnit;
-        let wr = WithRetry::new(unit, 3, 100);
-        let cloned = wr.clone();
-        assert_eq!(cloned.max_attempts, 3);
-        assert_eq!(cloned.base_ms, 100);
     }
 
     #[test]

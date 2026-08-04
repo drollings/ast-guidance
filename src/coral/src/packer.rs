@@ -43,19 +43,11 @@ pub trait ContextPackerExt {
     /// 2. For each node, select LOD by effective distance
     /// 3. FFD bin-pack into token budget (shared core in `guidance_llm`)
     /// 4. Return packed nodes with selected LOD text
-    fn pack(
-        &self,
-        focus_id: NodeId,
-        library: &Library,
-    ) -> Result<Vec<PackedNode>, PackerError>;
+    fn pack(&self, focus_id: NodeId, library: &Library) -> Result<Vec<PackedNode>, PackerError>;
 }
 
 impl ContextPackerExt for ContextPacker {
-    fn pack(
-        &self,
-        focus_id: NodeId,
-        library: &Library,
-    ) -> Result<Vec<PackedNode>, PackerError> {
+    fn pack(&self, focus_id: NodeId, library: &Library) -> Result<Vec<PackedNode>, PackerError> {
         let focus_node = library
             .get_node(focus_id)?
             .ok_or_else(|| PackerError::NodeNotFound("focus node not found".into()))?;
@@ -104,10 +96,8 @@ impl ContextPackerExt for ContextPacker {
         }
 
         // 3. FFD bin-pack into token budget (shared core)
-        let items: Vec<(&str, &PackedNode)> = candidates
-            .iter()
-            .map(|c| (c.text.as_str(), c))
-            .collect();
+        let items: Vec<(&str, &PackedNode)> =
+            candidates.iter().map(|c| (c.text.as_str(), c)).collect();
         let packed = self.ffd_pack(&items);
 
         Ok(packed.into_iter().cloned().collect())
@@ -215,10 +205,8 @@ mod tests {
                 graph_distance: 2.0,
             },
         ];
-        let items: Vec<(&str, &PackedNode)> = candidates
-            .iter()
-            .map(|c| (c.text.as_str(), c))
-            .collect();
+        let items: Vec<(&str, &PackedNode)> =
+            candidates.iter().map(|c| (c.text.as_str(), c)).collect();
         let packed = packer.ffd_pack(&items);
         assert_eq!(packed.len(), 3);
     }

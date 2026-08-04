@@ -189,14 +189,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // to the plan route. A missing directory is tolerated (empty store).
     let plan_route = Arc::new(build_plan_route(&config));
 
-    let mut server = RouterServer::new(
-        pipelines,
-        routes,
-        config.models,
-        &config.server,
-        classifier,
-    )
-    .with_plan_route(plan_route);
+    let mut server =
+        RouterServer::new(pipelines, routes, config.models, &config.server, classifier)
+            .with_plan_route(plan_route);
 
     if let Some(ctx) = mock_dispatch {
         server = server.with_mock(ctx);
@@ -289,6 +284,16 @@ fn build_plan_route(config: &RouterConfig) -> PlanRoute {
     if let Some(backend) = default_reranker_backend(config) {
         route = route.with_reranker_backend(backend);
     }
+    // M4 server-side execution: the same charts model runs a selected chart's
+    // targets (and doubles as the rubric judge). A shared limiter bounds
+    // concurrent chart-target LLM calls. When no charts model is configured
+    // the exact fit degrades to a fresh draft (see `PlanRoute::execute_chart`).
+    if let Some(backend) = default_adjudicator_backend(config) {
+        route = route.with_execution_backend(backend);
+    }
+    route = route.with_limiter(Arc::new(fluent_concurrency::pool::Limiter::new(
+        CHART_EXECUTION_CONCURRENCY,
+    )));
     // M10 learning loop: attach the dispatch post-processing hook when the
     // operator opts in (`post_process.workflow_extraction`). Off by default.
     // The two `Arc`s are NOT redundant: `plan_route` is Arc-shared into the
@@ -312,6 +317,9 @@ fn build_plan_route(config: &RouterConfig) -> PlanRoute {
 /// actual vector length is whatever the endpoint returns (the embeddings HTTP
 /// client parses the response); this only sets the declared capacity.
 const CHART_EMBEDDING_DIMS: u32 = 768;
+
+/// Max concurrent chart-target LLM calls during M4 server-side execution.
+const CHART_EXECUTION_CONCURRENCY: usize = 4;
 
 /// Derive an OpenAI-compatible embeddings base URL from a chat-completions
 /// endpoint: `http://host:port/v1/chat/completions` → `http://host:port/v1`
@@ -392,8 +400,10 @@ fn default_reranker_backend(config: &RouterConfig) -> Option<Arc<dyn ChatBackend
 /// Load `env/coral-router.json` relative to the crate root (test helper).
 #[cfg(test)]
 fn load_router_config() -> RouterConfig {
-    let config_path =
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../../env/coral-router.json");
+    let config_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../env/coral-router.json"
+    );
     let content = std::fs::read_to_string(config_path).unwrap();
     serde_json::from_str(&content).unwrap()
 }

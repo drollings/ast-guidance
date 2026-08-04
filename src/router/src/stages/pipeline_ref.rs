@@ -92,23 +92,7 @@ impl WorkUnit for PipelineRefStage {
     }
 }
 
-impl FieldAccess for PipelineRefStage {
-    fn set_field(&mut self, _name: &str, _value: &str) -> Result<(), FieldError> {
-        Err(FieldError::NotFound(
-            "PipelineRefStage has no configurable fields".into(),
-        ))
-    }
-
-    fn get_field(&self, _name: &str) -> Result<String, FieldError> {
-        Err(FieldError::NotFound(
-            "PipelineRefStage has no configurable fields".into(),
-        ))
-    }
-
-    fn field_names(&self) -> &'static [&'static str] {
-        &[]
-    }
-}
+impl_fieldless!(PipelineRefStage);
 
 impl Describable for PipelineRefStage {
     fn describe(&self) -> serde_json::Value {

@@ -10,6 +10,7 @@ pub mod embeddings;
 pub mod error;
 pub mod http_class;
 pub mod llm_queue;
+pub mod parse;
 pub mod pii_patterns;
 pub mod url;
 
@@ -33,3 +34,4 @@ pub use embeddings::{
 };
 pub use error::EmbedError;
 pub use http_class::HttpClass;
+pub use parse::{parse_json_response, strip_json_fence, JsonParseError};

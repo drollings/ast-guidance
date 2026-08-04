@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 fluent-router = { path = "../../router" }
+fluent-concurrency = { path = "../../fluent-concurrency" }
 common-core = { path = "../../common-core" }
 guidance-llm = { path = "../../llm" }
 clap = { workspace = true, features = ["derive"] }

@@ -5,14 +5,16 @@ use fluent_wvr::prelude::*;
 use crate::types::{RouterMessageContent, RouterRequest};
 
 /// Extract the last user message from the request carried in
-/// `ctx.metadata["request"]`.
+/// `ctx.structured["request"]`.
 ///
-/// The request is the serialized canonical `RouterRequest`, so content may be
-/// either a plain string (`RouterMessageContent::Text`) or an array of content
-/// parts (`RouterMessageContent::Parts`, the OpenAI multi-part form used by
-/// clients like Brave Leo). Text rendering for both forms lives in the single
-/// canonical helper `RouterMessageContent::to_string_lossy` — this function
-/// only picks the message, it never re-implements content rendering.
+/// The request is the structured canonical `RouterRequest` (a typed
+/// `serde_json::Value` in the structured channel, not a JSON string), so
+/// content may be either a plain string (`RouterMessageContent::Text`) or an
+/// array of content parts (`RouterMessageContent::Parts`, the OpenAI
+/// multi-part form used by clients like Brave Leo). Text rendering for both
+/// forms lives in the single canonical helper
+/// `RouterMessageContent::to_string_lossy` — this function only picks the
+/// message, it never re-implements content rendering.
 ///
 /// Selection semantics: the last `role == "user"` message whose content
 /// renders to text. A `Text` message is returned verbatim (an empty string is
@@ -20,11 +22,9 @@ use crate::types::{RouterMessageContent, RouterRequest};
 /// extractable text (e.g. image-only) is skipped so an earlier text message
 /// still resolves, matching the historical skip of non-string content.
 pub fn extract_user_message(ctx: &WorkContext) -> Result<String, WorkError> {
-    let request_str = get_metadata_string(ctx, "request")
-        .ok_or_else(|| WorkError::Execution("missing request".into()))?;
-
-    let request: RouterRequest =
-        serde_json::from_str(&request_str).map_err(|e| WorkError::Execution(e.to_string()))?;
+    let request: RouterRequest = ctx
+        .structured("request")
+        .map_err(|e| WorkError::Execution(format!("missing request: {e}")))?;
 
     request
         .messages
@@ -72,10 +72,7 @@ mod tests {
             metadata: Default::default(),
         };
         let mut ctx = WorkContext::default();
-        ctx.metadata.insert(
-            "request".into(),
-            MetadataValue::String(serde_json::to_string(&request).unwrap()),
-        );
+        ctx.set_structured("request", &request);
         ctx
     }
 

@@ -536,10 +536,16 @@ impl ChartStore {
                 .collect()
         };
         if hits.is_empty() {
-            hits = knn_brute_force(&query, index.flat.clone().into_iter(), k)
-                .into_iter()
-                .map(|(name, d)| (name, (1.0 - d).max(0.0)))
-                .collect();
+            // Borrow the flat list — no full-candidate clone per query; only
+            // the top-K names are materialized into `String`s below.
+            hits = knn_brute_force(
+                &query,
+                index.flat.iter().map(|(n, e)| (n.as_str(), e.as_slice())),
+                k,
+            )
+            .into_iter()
+            .map(|(name, d)| (name.to_string(), (1.0 - d).max(0.0)))
+            .collect();
         }
         hits.sort_by(|a, b| b.1.total_cmp(&a.1));
         hits.truncate(k);

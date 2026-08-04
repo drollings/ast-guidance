@@ -65,20 +65,6 @@ pub enum StageVerdict {
     Error,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum RoutingDestination {
-    LocalAgent {
-        model: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        adapter: Option<String>,
-        session_id: String,
-    },
-    Frontier {
-        provider: String,
-        model: String,
-    },
-}
-
 /// Structured PII verdict recorded by the deterministic pre-filter for
 /// output-filter decisions (the `"pii_filter"` handoff key).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

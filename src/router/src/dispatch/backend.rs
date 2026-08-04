@@ -3,8 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::dispatch::frontier::DispatchBackend;
-use crate::metrics::classify_error;
+use crate::metrics::FailureClass;
 use bytes::Bytes;
 use common_core::drain_sse_lines;
 use common_core::hash::uuid_v4;
@@ -222,7 +221,7 @@ impl ChatBackend for OpenAiChatBackend {
                         total_timeout_ms = total_timeout_ms,
                         idle_timeout_ms = idle_timeout_ms,
                         error = %e,
-                        error_class = classify_error(&e.to_string()).label(),
+                        error_class = FailureClass::from(e).label(),
                         "chat completion failed"
                     );
                 }
@@ -310,7 +309,7 @@ impl ChatBackend for OpenAiChatBackend {
                                 target: "router.dispatch",
                                 model = %model_for_task,
                                 error = %e,
-                                error_class = classify_error(&e.to_string()).label(),
+                                error_class = FailureClass::from(&e).label(),
                                 idle_timeout_ms = idle_timeout_ms,
                                 "stream read error or idle timeout"
                             );
@@ -415,39 +414,27 @@ impl ChatBackend for RetryChatBackend {
     ) -> Pin<Box<dyn Future<Output = Result<RouterResponse, DispatchError>> + Send>> {
         let inner = self.inner.clone();
         let max_attempts = (self.retry_count + 1).max(1);
-        let retry_base = self.retry_base_interval_s;
+        let base_ms = self.retry_base_interval_s * 1000;
 
         Box::pin(async move {
-            let mut last_err = DispatchError::Http("no attempt made".into());
-            for attempt in 0..max_attempts {
-                match inner
-                    .complete(
-                        request.clone(),
-                        model.clone(),
-                        params.clone(),
-                        idle_timeout_ms,
-                        total_timeout_ms,
-                    )
-                    .await
-                {
-                    Ok(resp) => return Ok(resp),
-                    Err(e) if e.is_retryable() && attempt + 1 < max_attempts => {
-                        last_err = e;
-                        let delay = retry_base * 1000 * (1u64 << attempt);
-                        tracing::info!(
-                            target: "router.dispatch.retry",
-                            attempt = attempt + 1,
-                            max_attempts = max_attempts,
-                            delay_ms = delay,
-                            error = %last_err,
-                            "retrying chat completion after backoff"
-                        );
-                        tokio::time::sleep(Duration::from_millis(delay)).await;
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            Err(last_err)
+            common_core::retry::retry_async(
+                max_attempts,
+                base_ms,
+                0,
+                DispatchError::is_retryable,
+                || async {
+                    inner
+                        .complete(
+                            request.clone(),
+                            model.clone(),
+                            params.clone(),
+                            idle_timeout_ms,
+                            total_timeout_ms,
+                        )
+                        .await
+                },
+            )
+            .await
         })
     }
 
@@ -462,57 +449,38 @@ impl ChatBackend for RetryChatBackend {
     ) -> Pin<Box<dyn Future<Output = Result<StreamResult, DispatchError>> + Send>> {
         let inner = self.inner.clone();
         let max_attempts = (self.retry_count + 1).max(1);
-        let retry_base = self.retry_base_interval_s;
+        let base_ms = self.retry_base_interval_s * 1000;
 
         Box::pin(async move {
-            let mut last_err = DispatchError::Http("no attempt made".into());
-            for attempt in 0..max_attempts {
-                let result = tokio::time::timeout(
-                    Duration::from_millis(total_timeout_ms),
-                    inner.stream_complete(
-                        request.clone(),
-                        model.clone(),
-                        params.clone(),
-                        idle_timeout_ms,
-                        total_timeout_ms,
-                        filter_thinking,
-                    ),
-                )
-                .await;
-
-                match result {
-                    Ok(Ok(stream)) => return Ok(stream),
-                    Ok(Err(e)) if e.is_retryable() && attempt + 1 < max_attempts => {
-                        last_err = e;
-                        let delay = retry_base * 1000 * (1u64 << attempt);
-                        tracing::info!(
-                            target: "router.dispatch.retry",
-                            attempt = attempt + 1,
-                            max_attempts = max_attempts,
-                            delay_ms = delay,
-                            error = %last_err,
-                            "retrying stream chat completion after backoff"
-                        );
-                        tokio::time::sleep(Duration::from_millis(delay)).await;
+            // The streaming path applies the total-timeout on each connection
+            // attempt; a connection that fails to open within the budget is
+            // retried like any other retryable failure.
+            common_core::retry::retry_async(
+                max_attempts,
+                base_ms,
+                0,
+                DispatchError::is_retryable,
+                || async {
+                    match tokio::time::timeout(
+                        Duration::from_millis(total_timeout_ms),
+                        inner.stream_complete(
+                            request.clone(),
+                            model.clone(),
+                            params.clone(),
+                            idle_timeout_ms,
+                            total_timeout_ms,
+                            filter_thinking,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(stream)) => Ok(stream),
+                        Ok(Err(e)) => Err(e),
+                        Err(_) => Err(DispatchError::Http("total timeout".into())),
                     }
-                    Ok(Err(e)) => return Err(e),
-                    Err(_) if attempt + 1 < max_attempts => {
-                        last_err = DispatchError::Http("total timeout".into());
-                        let delay = retry_base * 1000 * (1u64 << attempt);
-                        tracing::warn!(
-                            target: "router.dispatch.retry",
-                            attempt = attempt + 1,
-                            max_attempts = max_attempts,
-                            delay_ms = delay,
-                            total_timeout_ms = total_timeout_ms,
-                            "stream connection timed out — retrying after backoff"
-                        );
-                        tokio::time::sleep(Duration::from_millis(delay)).await;
-                    }
-                    Err(_) => return Err(DispatchError::Http("total timeout exhausted".into())),
-                }
-            }
-            Err(last_err)
+                },
+            )
+            .await
         })
     }
 }

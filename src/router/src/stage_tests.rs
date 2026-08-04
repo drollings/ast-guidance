@@ -82,10 +82,7 @@ mod tests {
             ]
         });
         let mut ctx = WorkContext::default();
-        ctx.metadata.insert(
-            "request".into(),
-            MetadataValue::String(request_json.to_string()),
-        );
+        ctx.set_structured("request", &request_json);
         ctx
     }
 
@@ -383,15 +380,12 @@ mod tests {
             for _ in 0..4 {
                 scope.spawn(|| {
                     let mut ctx = WorkContext::default();
-                    ctx.metadata.insert(
-                        "request".into(),
-                        MetadataValue::String(
-                            serde_json::json!({
-                                "model": "test",
-                                "messages": [{"role": "user", "content": "hello"}],
-                            })
-                            .to_string(),
-                        ),
+                    ctx.set_structured(
+                        "request",
+                        &serde_json::json!({
+                            "model": "test",
+                            "messages": [{"role": "user", "content": "hello"}],
+                        }),
                     );
                     let output = stage.execute(&ctx).expect("execute");
                     let _decision: StageDecision = output.data_as().expect("data_as");

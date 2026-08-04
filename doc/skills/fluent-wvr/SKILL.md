@@ -184,8 +184,20 @@ pub trait Component: FieldAccess + Describable + WorkUnit + Send + Sync {
 /// Two arms: the concrete-type form writes `impl Component for $type`
 /// directly; the `generic (bounds) for Type<…>` form writes
 /// `impl <$($generics)*> Component for $type` so wrapper types like
-/// `Instrumented<U>` and `WithRetry<U>` can satisfy the supertrait
+/// `Instrumented<U>` can satisfy the supertrait
 /// without copy-pasting the same body.
+
+/// Use `impl_fieldless!(Type)` for components with **no configurable fields**:
+/// it writes the `FieldAccess` no-op trio (`set_field`/`get_field` →
+/// `FieldError::NotFound` with the `"<TypeName> has no configurable fields"`
+/// message, `field_names` → `&[]`). Mirrors `impl_component!`'s concrete +
+/// generic arms. Do NOT use it on types with real fields (`CommandUnit`, WASM
+/// components) — those derive or hand-implement `FieldAccess`.
+///
+/// ```ignore
+/// impl_fieldless!(MyConfig);                                  // concrete
+/// impl_fieldless!(generic (U: Component + 'static) for Wrapper<U>);  // generic
+/// ```
 
 /// Free functions for downcasting (no blanket impl — Rust dyn-compatibility).
 pub fn component_downcast_ref<T: 'static>(comp: &dyn Component) -> Option<&T>;
@@ -309,7 +321,7 @@ use fluent_wvr::prelude::*;
 // Brings in: Component, WorkUnit, FieldAccess, Describable, FieldError,
 // WorkContext, WorkError, WorkOutput, Capability, CapabilitySet,
 // impl_component, retry_call, ComponentAdapter, ExecuteFn,
-// Instrumented, WithRetry, Middleware, MiddlewareChain, Pipeline,
+// Instrumented, Middleware, MiddlewareChain, Pipeline,
 // SuffixedComponent, MetadataValue, ArcIntern.
 ```
 
@@ -687,58 +699,37 @@ impl_component!(generic (U: Component + 'static) for Instrumented<U>);
 
 The wrapper also implements `FieldAccess` (delegating `set_field`/`get_field`/`field_names` to the inner) and `Describable` (delegates to inner). `set_field` is *not* rejected — it forwards to the inner type, which requires exclusive access to the inner (`&mut U`) or interior mutability inside the implementation. The `name()` call passes through to the inner type — `Instrumented` does not rename the unit; it only adds observability.
 
-### Retry wrapper
+### Retry
+
+There is **no** `WithRetry` newtype wrapper anymore. A `WorkUnit::execute`
+body MUST NOT block (the WorkUnit purity contract — see the `WorkUnit` doc
+comment) — the old `WithRetry` slept with `std::thread::sleep` inside
+`execute`, which blocked tokio worker threads and was removed by the M5
+consolidation (ROADMAP_20260804_DRY). Retry lives in two canonical homes:
+
+- **Async transport retry**: `common_core::retry::retry_async(max_attempts,
+  base_ms, jitter_pct, is_retryable, op)` — used by `RetryChatBackend` and the
+  `Zone` supervisor. `Zone` drives per-attempt timeout, `WorkError::Timeout`
+  routing, and dependency cancellation on top of it.
+- **Sync free-function retry**: `retry_call(max_attempts, base_ms, f)` —
+  the documented, explicitly-blocking counterpart for non-async contexts
+  (tests, CLI helpers). It delegates its delay to
+  `common_core::retry::backoff_ms` and must never be called from a
+  `WorkUnit::execute` body.
 
 ```rust
-pub struct WithRetry<U> {
-    inner: U,
-    max_attempts: u32,
-    base_ms: u64,
-    jitter_pct: u32,
-}
+// async transport retry (canonical):
+let resp = common_core::retry::retry_async(3, 1000, 0, DispatchError::is_retryable, || async {
+    client.post(&url).json(&body).send().await
+}).await?;
 
-impl<U: WorkUnit> WithRetry<U> {
-    pub fn new(inner: U, max_attempts: u32, backoff_ms: u64) -> Self { /* … */ }
-    pub fn new_jittered(
-        inner: U, max_attempts: u32, base_ms: u64, jitter_pct: u32,
-    ) -> Self { /* … */ }
-}
-
-impl<U: WorkUnit> WorkUnit for WithRetry<U> {
-    fn name(&self) -> &str { self.inner.name() }
-    fn depends(&self) -> &[ArcIntern<str>] { self.inner.depends() }
-    fn provides(&self) -> &[ArcIntern<str>] { self.inner.provides() }
-
-    fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-        // Linear backoff with configurable jitter; uses std::thread::sleep,
-        // NOT tokio::time::sleep — sync work-unit contract.
-        let mut attempts = 0u32;
-        loop {
-            attempts += 1;
-            match self.inner.execute(ctx) {
-                Ok(output) => return Ok(output),
-                Err(e) if attempts < self.max_attempts => {
-                    let jitter = if self.jitter_pct > 0 {
-                        fastrand::u64(0..self.base_ms * self.jitter_pct as u64 / 100)
-                    } else { 0 };
-                    std::thread::sleep(Duration::from_millis(
-                        self.base_ms * attempts as u64 + jitter,
-                    ));
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-}
-impl_component!(generic (U: Component + 'static) for WithRetry<U>);
+// sync free-function retry (explicitly blocking — not for execute):
+let retried = retry_call(3, 50, || parse_file(path))?;
 ```
 
-`WithRetry` is a **synchronous** retry — it sleeps with `std::thread::sleep`
-inside the executor, which is allowed because `WorkUnit::execute` is
-documented as a sync boundary. For async retry semantics, use the
-`Zone` supervisor (M6) instead, which routes the underlying error to
-`ZoneSummary::failed` and runs `execute` on a fresh task budget per
-attempt.
+For async retry with supervision, use the `Zone` supervisor (Pattern in
+`fluent-concurrency`), which routes the underlying error to
+`ZoneSummary::failed` and runs `execute` on a fresh task budget per attempt.
 
 ### Application at the registration site
 
@@ -746,10 +737,7 @@ Apply wrappers **before** type erasure — this is the only point where the comp
 
 ```rust
 // Compose before type erasure: wraps are inlined
-let unit = Instrumented::new(
-    WithRetry::new(MyWorkUnit::new(), /* max_attempts: */ 3, /* backoff_ms: */ 50),
-    "ingest_yago",
-);
+let unit = Instrumented::new(MyWorkUnit::new(), "ingest_yago");
 registry.push(Arc::new(unit));   // one vtable boundary total
 ```
 
@@ -1252,12 +1240,14 @@ impl Middleware for TimingMiddleware {
 }
 ```
 
-`RetryMiddleware` (in the same file) wraps with `WithRetry::new`
-from `fluent-wvr`. The middleware crate does **not** redefine its own
-wrapper types — it composes the canonical ones. The actual
+The middleware crate does **not** redefine its own wrapper types — it
+composes the canonical ones. The actual
 `TimingMiddleware::with_histogram(histogram)` constructor takes an
 `Arc<LatencyHistogram>`; without one, it produces an `Instrumented`
-that logs via `tracing::info!` only.
+that logs via `tracing::info!` only. `RetryMiddleware` was deleted by the
+M5 consolidation (its `WithRetry` wrapper slept inside `execute`, violating
+the WorkUnit purity contract); async retry composes `common_core::retry`
+or the `Zone` supervisor instead.
 
 ### Stacking middleware
 
@@ -1265,8 +1255,7 @@ that logs via `tracing::info!` only.
 let unit: Arc<dyn Component> = Arc::new(CommandUnit { ... });
 
 let chain: MiddlewareChain = MiddlewareChain::new()
-    .push(Box::new(TimingMiddleware::new()))
-    .push(Box::new(RetryMiddleware::new(3, 50)));
+    .push(Box::new(TimingMiddleware::new()));
 
 let wrapped = chain.apply(unit);
 ```
@@ -1280,7 +1269,7 @@ let wrapped = chain.apply(unit);
 - **Use `Arc<dyn Component>`**, not `Box`, because middleware may be shared across threads.
 - **Apply middleware at registration time**, not at execution time.
 - **Each middleware layer adds one vtable dispatch.** Minimize layers on hot paths.
-- **Reuse `Instrumented` and `WithRetry` from fluent-wvr.** Do not define parallel wrapper types inside `dag` — the whole point of fluent-wvr is the single source of truth.
+- **Reuse `Instrumented` from fluent-wvr.** Do not define parallel wrapper types inside `dag` — the whole point of fluent-wvr is the single source of truth.
 
 ---
 
@@ -1454,10 +1443,9 @@ component.set_field("port", "9000")?;
 component.set_field("verbose", "true")?;
 
 // 3. Wrap: add cross-cutting concerns before type erasure (inlineable)
-let wrapped = Instrumented::new(
-    WithRetry::new(component, /* max_attempts: */ 3, /* backoff_ms: */ 50),
-    "my_tool",
-);
+// (retry composes `common_core::retry` or the `Zone` supervisor instead —
+// see the Retry section in Pattern 3)
+let wrapped = Instrumented::new(component, "my_tool");
 
 // 4. Erase to Arc<dyn Component>: uniform handle from this point on
 let handle: Arc<dyn Component> = Arc::new(wrapped);
@@ -2014,7 +2002,7 @@ When writing new code in `rust-src/`:
 
 4. **New runtime-configurable component** → Implement `FieldAccess` (instance method `field_names(&self)`), `Describable` (instance method `describe(&self)`), and `WorkUnit`. Then add `impl_component!(MyType);` after the three impls. There is **no blanket impl** — `impl_component!` is the canonical way to satisfy the supertrait. Both `field_names` and `describe` **must be instance methods** for trait-object dispatch to work.
 
-5. **New cross-cutting logic** → Newtype wrapper **before type erasure** (Pattern 3). If the type is already erased, use Middleware (Pattern 9). Never wrap after type erasure. The canonical wrappers are `Instrumented::new(inner, label)` (timing/observability) and `WithRetry::new(inner, max_attempts, backoff_ms)` (sync retry with jittered backoff).
+5. **New cross-cutting logic** → Newtype wrapper **before type erasure** (Pattern 3). If the type is already erased, use Middleware (Pattern 9). Never wrap after type erasure. The canonical wrapper is `Instrumented::new(inner, label)` (timing/observability). Retry composes `common_core::retry` (async `retry_async` / sync `retry_call`) or the `Zone` supervisor — never a blocking sleep inside `execute`.
 
 6. **New subsystem with multiple implementations** → Define a trait with `Send + Sync`. Store as `Arc<dyn Trait>`. Never use `dyn Trait` with only one implementation.
 
@@ -2111,7 +2099,7 @@ or `Timeout` → `cancelled` (with `CancelReason::{Timeout, DependencyFailed, Ab
 
 ## 22. Future Work — MCP Handler as WorkUnit
 
-An MCP method handler (e.g. `coral_query`, `guidance_explain`) is a natural `WorkUnit`: the method name maps to `name()`, and the dispatch body maps to `execute()`. Converting MCP handlers to `WorkUnit` implementations would allow them to participate in the DAG orchestration pipeline, middleware chains, and `Instrumented`/`WithRetry` wrappers.
+An MCP method handler (e.g. `coral_query`, `guidance_explain`) is a natural `WorkUnit`: the method name maps to `name()`, and the dispatch body maps to `execute()`. Converting MCP handlers to `WorkUnit` implementations would allow them to participate in the DAG orchestration pipeline, middleware chains, and `Instrumented` wrappers.
 
 **Do not implement this now.** There is currently only one `JsonRpcHandler` per MCP server, and the `WorkUnit` interface would require adapting the JSON-RPC request/response model into `WorkContext`/`WorkOutput`. This is a follow-up task to be undertaken only when a second consumer of MCP method dispatch appears or when MCP methods need DAG orchestration.
 

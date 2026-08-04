@@ -63,12 +63,17 @@ pub struct KvSnapshot {
     pub session_id: String,
     /// Filesystem path to the KV cache file written by llama.cpp's server.
     pub file_path: PathBuf,
-    pub token_count: usize,
+    /// Token count, when the caller records it. `None` where the value is
+    /// unknowable (cold-tier enumeration of a raw file with no sidecar) —
+    /// never a fabricated default.
+    pub token_count: Option<usize>,
     pub created_at: u64,
     pub last_used_at: u64,
-    pub llama_cpp_version: String,
+    /// llama.cpp build version, when recorded. `None` where unknowable.
+    pub llama_cpp_version: Option<String>,
     pub model_quant: Option<String>,
-    pub base_model_hash: String,
+    /// Base-model hash, when recorded. `None` where unknowable.
+    pub base_model_hash: Option<String>,
 }
 
 /// Hot tier: in-process, RAM-resident LRU cache of recently-used snapshot
@@ -289,12 +294,13 @@ impl ColdKvCache {
             adapter: adapter.map(String::from),
             session_id: session_id.to_string(),
             file_path: path,
-            token_count: 0,
+            // Unknowable without a sidecar: `None`, not a fabricated default.
+            token_count: None,
             created_at: created,
             last_used_at: modified,
-            llama_cpp_version: String::new(),
+            llama_cpp_version: None,
             model_quant: None,
-            base_model_hash: String::new(),
+            base_model_hash: None,
         })
     }
 
@@ -410,12 +416,13 @@ impl ColdKvCache {
             adapter,
             session_id,
             file_path: path.to_path_buf(),
-            token_count: 0,
+            // Unknowable without a sidecar: `None`, not a fabricated default.
+            token_count: None,
             created_at: created,
             last_used_at: modified,
-            llama_cpp_version: String::new(),
+            llama_cpp_version: None,
             model_quant: None,
-            base_model_hash: String::new(),
+            base_model_hash: None,
         })
     }
 }
@@ -425,6 +432,10 @@ impl ColdKvCache {
 /// Hot tier tracks sessions with actively-loaded llama.cpp slots (metadata only).
 /// Cold tier is the durable disk store keyed by `(model, adapter, session)`.
 /// On a cold-tier hit, the metadata is promoted to the hot tier.
+///
+/// Clone is cheap (both tiers are `Arc`-shared), so a single manager can be
+/// attached to many `DependencySession`s.
+#[derive(Clone)]
 pub struct KvCacheManager {
     hot: Arc<HotKvCache>,
     cold: Arc<ColdKvCache>,
@@ -487,12 +498,12 @@ mod tests {
             adapter: None,
             session_id: session_id.into(),
             file_path: PathBuf::new(),
-            token_count: 100,
+            token_count: Some(100),
             created_at: now_secs(),
             last_used_at: now_secs(),
-            llama_cpp_version: "0.1.0".into(),
+            llama_cpp_version: Some("0.1.0".into()),
             model_quant: None,
-            base_model_hash: "abc123".into(),
+            base_model_hash: Some("abc123".into()),
         }
     }
 
@@ -504,7 +515,7 @@ mod tests {
 
         let retrieved = cache.get("test-model", None, "sess-1").unwrap();
         assert_eq!(retrieved.session_id, "sess-1");
-        assert_eq!(retrieved.token_count, 100);
+        assert_eq!(retrieved.token_count, Some(100));
     }
 
     #[test]
@@ -533,12 +544,12 @@ mod tests {
                 adapter: None,
                 session_id: format!("sess-{i}"),
                 file_path: PathBuf::new(),
-                token_count: 1,
+                token_count: Some(1),
                 created_at: now_secs(),
                 last_used_at: now_secs(),
-                llama_cpp_version: "0.1".into(),
+                llama_cpp_version: Some("0.1".into()),
                 model_quant: None,
-                base_model_hash: "hash".into(),
+                base_model_hash: Some("hash".into()),
             });
         }
 

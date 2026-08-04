@@ -8,11 +8,7 @@ impl TransformStrategy for NoTransform {
         "none"
     }
 
-    fn transform(
-        &self,
-        request: &RouterRequest,
-        _pii_classes: &[String],
-    ) -> Result<RouterRequest, TransformError> {
+    fn transform(&self, request: &RouterRequest) -> Result<RouterRequest, TransformError> {
         Ok(request.clone())
     }
 }

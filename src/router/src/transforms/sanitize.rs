@@ -1,7 +1,7 @@
 use std::str::Chars;
 
-use crate::transforms::{TransformError, TransformStrategy};
-use crate::types::{RouterMessageContent, RouterRequest};
+use crate::transforms::{rewrite_text_messages, TransformError, TransformStrategy};
+use crate::types::RouterRequest;
 
 pub struct Sanitize;
 
@@ -10,28 +10,11 @@ impl TransformStrategy for Sanitize {
         "sanitize"
     }
 
-    fn transform(
-        &self,
-        request: &RouterRequest,
-        _pii_classes: &[String],
-    ) -> Result<RouterRequest, TransformError> {
-        let mut transformed = request.clone();
-
-        for message in &mut transformed.messages {
-            let text = match &message.content {
-                RouterMessageContent::Text(s) => s.clone(),
-                RouterMessageContent::Parts(_) => continue,
-            };
-
-            let cleaned: String = AnsiStripper::new(&text).collect();
-            let cleaned = filter_unsafe_chars(&cleaned);
-
-            if cleaned != text {
-                message.content = RouterMessageContent::Text(cleaned);
-            }
-        }
-
-        Ok(transformed)
+    fn transform(&self, request: &RouterRequest) -> Result<RouterRequest, TransformError> {
+        rewrite_text_messages(request, |content| {
+            let cleaned: String = AnsiStripper::new(content).collect();
+            Ok(filter_unsafe_chars(&cleaned))
+        })
     }
 }
 
@@ -184,7 +167,7 @@ mod tests {
     fn bidi_override_removed() {
         let m = Sanitize;
         let req = make_request("hello\u{202E}world"); // RLO
-        let result = m.transform(&req, &[]).unwrap();
+        let result = m.transform(&req).unwrap();
         assert_eq!(text_of(&result), "helloworld");
     }
 
@@ -192,7 +175,7 @@ mod tests {
     fn plane14_tags_removed() {
         let m = Sanitize;
         let req = make_request("text\u{E0001}more"); // Plane-14 tag
-        let result = m.transform(&req, &[]).unwrap();
+        let result = m.transform(&req).unwrap();
         assert_eq!(text_of(&result), "textmore");
     }
 
@@ -200,7 +183,7 @@ mod tests {
     fn null_byte_removed() {
         let m = Sanitize;
         let req = make_request("before\x00after");
-        let result = m.transform(&req, &[]).unwrap();
+        let result = m.transform(&req).unwrap();
         assert_eq!(text_of(&result), "beforeafter");
     }
 
@@ -208,7 +191,7 @@ mod tests {
     fn c1_control_removed() {
         let m = Sanitize;
         let req = make_request("a\u{0081}b"); // C1 control
-        let result = m.transform(&req, &[]).unwrap();
+        let result = m.transform(&req).unwrap();
         assert_eq!(text_of(&result), "ab");
     }
 
@@ -216,7 +199,7 @@ mod tests {
     fn ansi_color_stripped() {
         let m = Sanitize;
         let req = make_request("\u{1B}[31mRED\u{1B}[0m normal");
-        let result = m.transform(&req, &[]).unwrap();
+        let result = m.transform(&req).unwrap();
         assert_eq!(text_of(&result), "RED normal");
     }
 
@@ -224,7 +207,7 @@ mod tests {
     fn ansi_256_color_stripped() {
         let m = Sanitize;
         let req = make_request("\u{1B}[38;5;196mbright red\u{1B}[0m");
-        let result = m.transform(&req, &[]).unwrap();
+        let result = m.transform(&req).unwrap();
         assert_eq!(text_of(&result), "bright red");
     }
 
@@ -232,7 +215,7 @@ mod tests {
     fn ansi_rgb_stripped() {
         let m = Sanitize;
         let req = make_request("\u{1B}[38;2;255;0;0mRGB red\u{1B}[0m");
-        let result = m.transform(&req, &[]).unwrap();
+        let result = m.transform(&req).unwrap();
         assert_eq!(text_of(&result), "RGB red");
     }
 
@@ -240,7 +223,7 @@ mod tests {
     fn normal_text_preserved() {
         let m = Sanitize;
         let req = make_request("Hello, 世界! 😀 and more text.");
-        let result = m.transform(&req, &[]).unwrap();
+        let result = m.transform(&req).unwrap();
         assert_eq!(text_of(&result), "Hello, 世界! 😀 and more text.");
     }
 
@@ -248,7 +231,7 @@ mod tests {
     fn plain_text_passes_unchanged() {
         let m = Sanitize;
         let req = make_request("just some plain text");
-        let result = m.transform(&req, &[]).unwrap();
+        let result = m.transform(&req).unwrap();
         assert_eq!(text_of(&result), "just some plain text");
     }
 }

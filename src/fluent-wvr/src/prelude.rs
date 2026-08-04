@@ -4,11 +4,11 @@
 //! use fluent_wvr::prelude::*;
 //! ```
 
-pub use crate::impl_component;
 pub use crate::wrapper::{
     retry_call, ComponentAdapter, ExecuteFn, Instrumented, Middleware, MiddlewareChain, Pipeline,
-    SuffixedComponent, WithRetry,
+    SuffixedComponent,
 };
+pub use crate::{impl_component, impl_fieldless};
 pub use crate::{
     Capability, CapabilitySet, Component, Describable, FieldAccess, FieldError, MetadataValue,
     WorkContext, WorkError, WorkOutput, WorkUnit,

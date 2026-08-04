@@ -33,6 +33,7 @@ pub mod io;
 pub mod jsonrpc;
 pub mod metrics;
 pub mod prelude;
+pub mod retry;
 pub mod shell;
 pub mod shell_parser;
 #[cfg(feature = "sqlite")]
@@ -68,6 +69,7 @@ pub use jsonrpc::{
     METHOD_NOT_FOUND,
 };
 pub use metrics::LatencyHistogram;
+pub use retry::{backoff_ms, retry_async};
 pub use shell::{run_capture, run_command, run_shell_capture, shell_cmd, CommandOutput};
 #[cfg(feature = "sqlite")]
 pub use sqlite::{

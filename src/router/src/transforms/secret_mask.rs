@@ -2,8 +2,8 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::transforms::{TransformError, TransformStrategy};
-use crate::types::{RouterMessageContent, RouterRequest};
+use crate::transforms::{rewrite_text_messages, TransformError, TransformStrategy};
+use crate::types::RouterRequest;
 
 static SECRET_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
@@ -44,24 +44,12 @@ impl TransformStrategy for SecretMask {
         "secret_mask"
     }
 
-    fn transform(
-        &self,
-        request: &RouterRequest,
-        _pii_classes: &[String],
-    ) -> Result<RouterRequest, TransformError> {
-        let mut transformed = request.clone();
-
-        for message in &mut transformed.messages {
-            let text_ref = match &message.content {
-                RouterMessageContent::Text(s) => s,
-                RouterMessageContent::Parts(_) => continue,
-            };
-            if !SECRET_RE.is_match(text_ref) {
-                continue;
+    fn transform(&self, request: &RouterRequest) -> Result<RouterRequest, TransformError> {
+        rewrite_text_messages(request, |content| {
+            if !SECRET_RE.is_match(content) {
+                return Ok(content.to_string());
             }
-            let text = text_ref.clone();
-
-            let masked = SECRET_RE.replace_all(&text, |caps: &regex::Captures| {
+            let masked = SECRET_RE.replace_all(content, |caps: &regex::Captures| {
                 if let Some(m) = caps.name("bearer") {
                     format!("{}****", m.as_str())
                 } else if let Some(m) = caps.name("basic") {
@@ -72,13 +60,8 @@ impl TransformStrategy for SecretMask {
                     "****".to_string()
                 }
             });
-
-            if masked != text {
-                message.content = RouterMessageContent::Text(masked.to_string());
-            }
-        }
-
-        Ok(transformed)
+            Ok(masked.to_string())
+        })
     }
 }
 
@@ -98,7 +81,7 @@ mod tests {
     fn bearer_token_masked_prefix_preserved() {
         let m = SecretMask;
         let req = make_request("Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9");
-        let result = m.transform(&req, &[]).unwrap();
+        let result = m.transform(&req).unwrap();
         let output = text_of(&result);
         assert!(output.contains("Bearer ****"), "got: {output}");
         assert!(!output.contains("eyJhbGci"), "got: {output}");
@@ -108,7 +91,7 @@ mod tests {
     fn basic_auth_masked() {
         let m = SecretMask;
         let req = make_request("Basic dXNlcjpwYXNzd29yZA==");
-        let result = m.transform(&req, &[]).unwrap();
+        let result = m.transform(&req).unwrap();
         let output = text_of(&result);
         assert!(output.contains("Basic ****"), "got: {output}");
         assert!(!output.contains("dXNlcjpwYXNzd29yZA=="), "got: {output}");
@@ -118,7 +101,7 @@ mod tests {
     fn password_keyvalue_masked() {
         let m = SecretMask;
         let req = make_request("password=superSecret123!");
-        let result = m.transform(&req, &[]).unwrap();
+        let result = m.transform(&req).unwrap();
         let output = text_of(&result);
         assert!(output.contains("password=****"), "got: {output}");
         assert!(!output.contains("superSecret123"), "got: {output}");
@@ -128,7 +111,7 @@ mod tests {
     fn sk_prefix_key_masked() {
         let m = SecretMask;
         let req = make_request("Use key sk-abc123def456ghijklmnopqrstuvwxyz");
-        let result = m.transform(&req, &[]).unwrap();
+        let result = m.transform(&req).unwrap();
         let output = text_of(&result);
         assert!(
             !output.contains("sk-abc123def456ghijklmnopqrstuvwxyz"),
@@ -140,7 +123,7 @@ mod tests {
     fn akia_key_masked() {
         let m = SecretMask;
         let req = make_request("AWS key: AKIA1234567890ABCDEF");
-        let result = m.transform(&req, &[]).unwrap();
+        let result = m.transform(&req).unwrap();
         let output = text_of(&result);
         assert!(!output.contains("AKIA1234567890ABCDEF"), "got: {output}");
     }
@@ -149,7 +132,7 @@ mod tests {
     fn github_token_masked() {
         let m = SecretMask;
         let req = make_request("Token: ghp_abc123def456ghijklmnopqrstuvwxyz123456");
-        let result = m.transform(&req, &[]).unwrap();
+        let result = m.transform(&req).unwrap();
         let output = text_of(&result);
         assert!(!output.contains("ghp_abc"), "got: {output}");
     }
@@ -158,7 +141,7 @@ mod tests {
     fn multiple_secrets_all_masked() {
         let m = SecretMask;
         let req = make_request("Bearer tok123 password=abc api_key=xyz");
-        let result = m.transform(&req, &[]).unwrap();
+        let result = m.transform(&req).unwrap();
         let output = text_of(&result);
         assert!(output.contains("Bearer ****"), "got: {output}");
         assert!(output.contains("password=****"), "got: {output}");
@@ -172,7 +155,7 @@ mod tests {
     fn clean_text_passes_unchanged() {
         let m = SecretMask;
         let req = make_request("Hello, how are you?");
-        let result = m.transform(&req, &[]).unwrap();
+        let result = m.transform(&req).unwrap();
         assert_eq!(text_of(&result), "Hello, how are you?");
     }
 
@@ -180,7 +163,7 @@ mod tests {
     fn matching_case_insensitive_bearer() {
         let m = SecretMask;
         let req = make_request("BEARER token123");
-        let result = m.transform(&req, &[]).unwrap();
+        let result = m.transform(&req).unwrap();
         let output = text_of(&result);
         assert!(
             output.to_lowercase().contains("bearer ****"),
@@ -200,7 +183,7 @@ mod tests {
             "secret",
         ] {
             let req = make_request(&format!("{name}=value123"));
-            let result = m.transform(&req, &[]).unwrap();
+            let result = m.transform(&req).unwrap();
             let output = text_of(&result);
             assert!(
                 !output.contains("value123"),

@@ -21,11 +21,12 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// Brute-force KNN search: compute cosine distance from `query` to every
 /// candidate, sort ascending, and return the top `k` as `(id, distance)`.
 ///
-/// `candidates` yields `(id, embedding_slice)` pairs. Candidates whose
-/// embedding length differs from `query` are silently skipped.
-pub fn knn_brute_force<Id: Clone>(
+/// `candidates` yields `(id, embedding_slice)` pairs borrowing the caller's
+/// data — no full candidate-list clone. Candidates whose embedding length
+/// differs from `query` are silently skipped.
+pub fn knn_brute_force<'a, Id: Clone>(
     query: &[f32],
-    candidates: impl Iterator<Item = (Id, Vec<f32>)>,
+    candidates: impl Iterator<Item = (Id, &'a [f32])>,
     k: usize,
 ) -> Vec<(Id, f32)> {
     if query.is_empty() || k == 0 {
@@ -36,7 +37,7 @@ pub fn knn_brute_force<Id: Clone>(
             if emb.len() != query.len() {
                 return None;
             }
-            let distance = 1.0 - cosine_similarity(query, &emb);
+            let distance = 1.0 - cosine_similarity(query, emb);
             Some((id, distance))
         })
         .collect();
@@ -190,7 +191,11 @@ mod tests {
             (2, vec![0.0, 1.0, 0.0]),
             (3, vec![0.9, 0.1, 0.0]),
         ];
-        let results = knn_brute_force(&query, candidates.into_iter(), 2);
+        let results = knn_brute_force(
+            &query,
+            candidates.iter().map(|(id, e)| (*id, e.as_slice())),
+            2,
+        );
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, 1);
         assert!((results[0].1 - 0.0).abs() < 1e-5);
@@ -201,7 +206,11 @@ mod tests {
     fn knn_brute_force_skips_mismatched_dimensions() {
         let query = vec![1.0, 0.0];
         let candidates = vec![(1u32, vec![1.0, 0.0]), (2, vec![1.0, 0.0, 0.0])];
-        let results = knn_brute_force(&query, candidates.into_iter(), 10);
+        let results = knn_brute_force(
+            &query,
+            candidates.iter().map(|(id, e)| (*id, e.as_slice())),
+            10,
+        );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 1);
     }
@@ -209,7 +218,7 @@ mod tests {
     #[test]
     fn knn_brute_force_empty_query_returns_empty() {
         let candidates = vec![(1u32, vec![1.0])];
-        let results = knn_brute_force(&[], candidates.into_iter(), 5);
+        let results = knn_brute_force(&[], candidates.iter().map(|(id, e)| (*id, e.as_slice())), 5);
         assert!(results.is_empty());
     }
 
@@ -217,7 +226,11 @@ mod tests {
     fn knn_brute_force_zero_k_returns_empty() {
         let query = vec![1.0, 0.0];
         let candidates = vec![(1u32, vec![1.0, 0.0])];
-        let results = knn_brute_force(&query, candidates.into_iter(), 0);
+        let results = knn_brute_force(
+            &query,
+            candidates.iter().map(|(id, e)| (*id, e.as_slice())),
+            0,
+        );
         assert!(results.is_empty());
     }
 

@@ -50,3 +50,64 @@ macro_rules! impl_component {
         }
     };
 }
+
+/// Eliminates the `FieldAccess` no-op trio for components that expose no
+/// configurable fields: `set_field`/`get_field` → `FieldError::NotFound`,
+/// `field_names` → `&[]`.
+///
+/// Mirrors `impl_component!`'s two arms (concrete + generic). The `NotFound`
+/// message derives from `stringify!($type)`, so it stays
+/// `"<TypeName> has no configurable fields"` for concrete types.
+///
+/// # Usage
+///
+/// ```text
+/// // struct MyConfig { ... }   // no `#[derive(FieldAccess)]`
+/// impl_fieldless!(MyConfig);
+/// ```
+///
+/// Do **not** use this on types with real fields (`CommandUnit`, WASM
+/// components) — those must derive or hand-implement `FieldAccess`.
+#[macro_export]
+macro_rules! impl_fieldless {
+    // Generic form: `generic (bounds) for Type<...>`
+    (generic ( $($generics:tt)* ) for $type:ty) => {
+        impl < $($generics)* > $crate::FieldAccess for $type {
+            fn set_field(&mut self, _name: &str, _value: &str) -> Result<(), $crate::FieldError> {
+                Err($crate::FieldError::NotFound(format!(
+                    "{} has no configurable fields",
+                    stringify!($type)
+                )))
+            }
+            fn get_field(&self, _name: &str) -> Result<String, $crate::FieldError> {
+                Err($crate::FieldError::NotFound(format!(
+                    "{} has no configurable fields",
+                    stringify!($type)
+                )))
+            }
+            fn field_names(&self) -> &'static [&'static str] {
+                &[]
+            }
+        }
+    };
+    // Concrete type (no generics)
+    ($type:ty) => {
+        impl $crate::FieldAccess for $type {
+            fn set_field(&mut self, _name: &str, _value: &str) -> Result<(), $crate::FieldError> {
+                Err($crate::FieldError::NotFound(format!(
+                    "{} has no configurable fields",
+                    stringify!($type)
+                )))
+            }
+            fn get_field(&self, _name: &str) -> Result<String, $crate::FieldError> {
+                Err($crate::FieldError::NotFound(format!(
+                    "{} has no configurable fields",
+                    stringify!($type)
+                )))
+            }
+            fn field_names(&self) -> &'static [&'static str] {
+                &[]
+            }
+        }
+    };
+}

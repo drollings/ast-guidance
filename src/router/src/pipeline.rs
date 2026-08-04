@@ -11,7 +11,6 @@ use common_core::constants::default_true;
 
 use crate::config::ModelEntry;
 use crate::pipeline_types::{PipelineStage, StageDecision, StageMetadata, StageVerdict};
-use crate::stages::common::get_metadata_string;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingTarget {
@@ -73,16 +72,20 @@ impl RoutingTarget {
     }
 }
 
+/// Canonical timeout/retry defaults, centralized in `common_core::constants`.
+/// **D7 behavior change (ROADMAP_20260804_DRY M7.2):** the `RoutingTarget`
+/// serde path moves from 120s/10s to the `config.rs` values 300s/30s — the
+/// divergence was a latent bug. Both modules now read the same constant.
 fn default_retry_interval() -> u64 {
-    1
+    common_core::constants::DEFAULT_RETRY_INTERVAL_S
 }
 
 fn default_idle_timeout_ms() -> u64 {
-    10_000
+    common_core::constants::DEFAULT_IDLE_TIMEOUT_MS
 }
 
 fn default_total_timeout_ms() -> u64 {
-    120_000
+    common_core::constants::DEFAULT_TOTAL_TIMEOUT_MS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,14 +126,12 @@ impl PipelineOrchestrator {
 
     fn build_stage_context(
         base: &WorkContext,
-        current_request: &str,
+        current_request: &serde_json::Value,
         _decisions: &[StageDecision],
     ) -> WorkContext {
         let mut ctx = base.clone();
-        ctx.metadata.insert(
-            "request".into(),
-            MetadataValue::String(current_request.to_string()),
-        );
+        ctx.structured
+            .insert("request".into(), current_request.clone());
         ctx
     }
 
@@ -138,7 +139,7 @@ impl PipelineOrchestrator {
         verdict: &StageVerdict,
         stage_name: PipelineStage,
         decision: &StageDecision,
-        current_request: &mut String,
+        current_request: &mut serde_json::Value,
         routing_target: &mut Option<RoutingTarget>,
         classifier_response: &mut Option<String>,
     ) -> Option<Result<WorkOutput, WorkError>> {
@@ -171,7 +172,11 @@ impl PipelineOrchestrator {
                         new_request_len = rewritten.len(),
                         "request rerouted"
                     );
-                    *current_request = rewritten.to_string();
+                    // Boundary: the rewritten request arrives as a string
+                    // (a re-serialized `RouterRequest`), so parse it back
+                    // into the structured channel's Value form.
+                    *current_request = serde_json::from_str(rewritten)
+                        .unwrap_or_else(|_| serde_json::Value::String(rewritten.to_string()));
                 }
                 None
             }
@@ -248,7 +253,11 @@ impl WorkUnit for PipelineOrchestrator {
 
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
         let mut decisions: Vec<StageDecision> = Vec::new();
-        let mut current_request = get_metadata_string(ctx, "request").unwrap_or_default();
+        let mut current_request: serde_json::Value = ctx
+            .structured
+            .get("request")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         let mut routing_target: Option<RoutingTarget> = None;
         let mut classifier_response: Option<String> = None;
 
@@ -341,23 +350,7 @@ impl WorkUnit for PipelineOrchestrator {
     }
 }
 
-impl FieldAccess for PipelineOrchestrator {
-    fn set_field(&mut self, _name: &str, _value: &str) -> Result<(), FieldError> {
-        Err(FieldError::NotFound(
-            "PipelineOrchestrator has no configurable fields".into(),
-        ))
-    }
-
-    fn get_field(&self, _name: &str) -> Result<String, FieldError> {
-        Err(FieldError::NotFound(
-            "PipelineOrchestrator has no configurable fields".into(),
-        ))
-    }
-
-    fn field_names(&self) -> &'static [&'static str] {
-        &[]
-    }
-}
+impl_fieldless!(PipelineOrchestrator);
 
 impl Describable for PipelineOrchestrator {
     fn describe(&self) -> serde_json::Value {
@@ -434,5 +427,25 @@ mod tests {
         entry.name = None;
         let rt = RoutingTarget::from_model_entry("lfm", &entry);
         assert_eq!(rt.model, "lfm");
+    }
+
+    #[test]
+    fn routing_target_serde_defaults_read_canonical_constants() {
+        // Round-trips through the serde path (no explicit timeout/retry fields)
+        // so the defaults actually exercised are the serde defaults — guards
+        // against the 120s/10s-vs-300s/30s divergence recurring (D7).
+        let rt: RoutingTarget = serde_json::from_str(r#"{"url":"u","model":"m"}"#).unwrap();
+        assert_eq!(
+            rt.total_timeout_ms,
+            common_core::constants::DEFAULT_TOTAL_TIMEOUT_MS
+        );
+        assert_eq!(
+            rt.idle_timeout_ms,
+            common_core::constants::DEFAULT_IDLE_TIMEOUT_MS
+        );
+        assert_eq!(
+            rt.retry_base_interval_s,
+            common_core::constants::DEFAULT_RETRY_INTERVAL_S
+        );
     }
 }

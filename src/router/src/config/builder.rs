@@ -7,16 +7,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use common_core::config::load_json_or_default;
-use fluent_concurrency::pool::Limiter;
 use fluent_wvr::prelude::Component;
 use guidance_llm::client::ChatBackend;
 use guidance_llm::{LlmClient, LlmConfig};
 
 use super::{default_true, RejectPatterns, RouterConfig};
-use crate::charts::binding::Entity;
-use crate::charts::{ChartDef, ChartError};
 use crate::pipeline::PipelineOrchestrator;
-use crate::pipeline_graph::PipelineGraph;
 use crate::score_matrix::ScoreMatrix;
 
 /// Named pipeline parameters. Pipelines are stored as a map keyed by name.
@@ -150,38 +146,6 @@ impl RouterConfig {
         Some(PipelineOrchestrator::new(stages))
     }
 
-    /// Build a runnable `PipelineGraph` of `ChartPromptStage`s for a chart.
-    ///
-    /// This is the M5 builder mapping: a bound chart becomes executable
-    /// stages, each rendering its template at execution time and calling the
-    /// injected `ChatBackend`. Stage `depends`/`provides` are the concrete
-    /// asset names needed for `PipelineGraph` topo-ordering; `upstream_ids`
-    /// drive the `stage.{id}.output` metadata reads.
-    ///
-    /// The stage construction + dependency resolution is delegated to
-    /// `compile_chart_stages` (shared with the M9 Zone supervisor — DRY).
-    ///
-    /// Returns `ChartError::Compile` for the same gaps as `compile_chart`
-    /// (unmatched required deps, ambiguous bindings).
-    pub fn build_chart_pipeline(
-        &self,
-        chart: &ChartDef,
-        entities: &[Entity],
-        backend: &Arc<dyn ChatBackend>,
-        limiter: &Arc<Limiter>,
-    ) -> Result<PipelineGraph, ChartError> {
-        let (targets, _order) =
-            crate::charts::compile::compile_chart_stages(chart, entities, backend, limiter)?;
-        // The topo `_order` is ignored here: the `PipelineGraph` path
-        // re-derives its own schedule from each stage's `depends()`/
-        // `provides()` (its own `DependencyGraph`), so the compile order is
-        // only consumed by the Zone-supervised `ChartExecutionPlan` path.
-        let stages: Vec<Arc<dyn Component>> = targets.into_iter().map(|t| t.stage).collect();
-        PipelineGraph::new(stages).map_err(|e| ChartError::Compile {
-            reason: format!("chart '{}' stage graph invalid: {e}", chart.name),
-        })
-    }
-
     pub fn build_all_pipelines(&self) -> HashMap<String, Arc<PipelineOrchestrator>> {
         self.build_all_pipelines_with_backend(None)
     }
@@ -293,8 +257,10 @@ mod tests {
     use std::sync::Mutex;
     use tracing_subscriber::layer::SubscriberExt;
 
+    use crate::charts::binding::Entity;
+    use crate::charts::{ChartDef, ChartError};
     use crate::test_stubs::StubChatBackend;
-    use fluent_wvr::WorkUnit;
+    use fluent_concurrency::pool::Limiter;
 
     /// A `MakeWriter` that captures formatted log lines for assertions.
     #[derive(Clone, Default)]
@@ -478,30 +444,15 @@ mod tests {
             "messages": [{"role": "user", "content": text}]
         });
         let mut ctx = fluent_wvr::WorkContext::default();
-        ctx.metadata.insert(
-            "request".into(),
-            fluent_wvr::MetadataValue::String(ctx_json.to_string()),
-        );
+        ctx.set_structured("request", &ctx_json);
         if !entities.is_empty() {
-            ctx.metadata.insert(
-                crate::charts::binding::ENTITIES_META_KEY.into(),
-                fluent_wvr::MetadataValue::String(serde_json::to_string(entities).unwrap()),
-            );
+            ctx.set_structured(crate::charts::binding::ENTITIES_META_KEY, &entities);
         }
         ctx
     }
 
-    #[test]
-    fn chart_pipeline_executes_in_topo_order_with_preamble_and_prior_output() {
-        let config: RouterConfig = serde_json::from_str(
-            r#"{
-                "pipelines": {"default": {"classifier": false}},
-                "models": {},
-                "model_groups": {}
-            }"#,
-        )
-        .expect("valid config");
-
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chart_executes_in_topo_order_with_preamble_and_prior_output() {
         let entity = Entity {
             id: "issue-42".into(),
             kind: "report".into(),
@@ -513,32 +464,40 @@ mod tests {
             prompts: prompts.clone(),
         });
         let limiter = Arc::new(Limiter::new(4));
-        let graph = config
-            .build_chart_pipeline(
-                &triage_chart(),
-                std::slice::from_ref(&entity),
-                &backend,
-                &limiter,
-            )
-            .expect("chart builds into a runnable pipeline");
+        let plan = crate::charts::execute::ChartExecutionPlan::compile(
+            &triage_chart(),
+            std::slice::from_ref(&entity),
+            &backend,
+            &limiter,
+        )
+        .expect("chart compiles into an executable plan");
 
         let ctx = request_ctx("app crashes on startup", std::slice::from_ref(&entity));
-        let output = graph.execute(&ctx).expect("chart pipeline executes");
-        let result: crate::pipeline::PipelineResult = output.data_as().expect("pipeline result");
+        let opts = crate::charts::execute::ChartExecOptions {
+            runtime: fluent_concurrency::tokio_runtime(),
+            ..Default::default()
+        };
+        let summary = plan
+            .execute(&ctx, &opts)
+            .await
+            .expect("chart executes under Zone supervision");
 
-        // Topo order: reproduce → root_cause → fix_plan (3 decisions).
-        assert_eq!(result.decisions.len(), 3);
+        // Topo order: reproduce → root_cause → fix_plan (3 completed targets).
+        assert_eq!(summary.completed.len(), 3);
+        assert!(summary.failed.is_empty());
+        assert!(summary.accepted);
+        let reasons: Vec<&str> = summary
+            .completed
+            .iter()
+            .map(|d| d.reason.as_str())
+            .collect();
         assert_eq!(
-            result.decisions[0].reason,
-            "chart target 'reproduce' completed"
-        );
-        assert_eq!(
-            result.decisions[1].reason,
-            "chart target 'root_cause' completed"
-        );
-        assert_eq!(
-            result.decisions[2].reason,
-            "chart target 'fix_plan' completed"
+            reasons,
+            vec![
+                "chart target 'reproduce' completed",
+                "chart target 'root_cause' completed",
+                "chart target 'fix_plan' completed",
+            ]
         );
 
         // Every stage made one LLM call (3 system prompts recorded).
@@ -563,20 +522,13 @@ mod tests {
     }
 
     #[test]
-    fn chart_pipeline_rejects_unbound_chart_at_build_time() {
-        let config: RouterConfig = serde_json::from_str(
-            r#"{
-                "pipelines": {"default": {"classifier": false}},
-                "models": {},
-                "model_groups": {}
-            }"#,
-        )
-        .expect("valid config");
-
+    fn chart_compile_rejects_unbound_chart_at_build_time() {
         let backend: Arc<dyn ChatBackend> = Arc::new(StubChatBackend::always("{}"));
         let limiter = Arc::new(Limiter::new(4));
         // No entities → root_cause's required `report` dep is unmatched.
-        let Err(err) = config.build_chart_pipeline(&triage_chart(), &[], &backend, &limiter) else {
+        let Err(err) =
+            crate::charts::compile::compile_chart_stages(&triage_chart(), &[], &backend, &limiter)
+        else {
             panic!("expected compile error for unbound chart")
         };
         assert!(

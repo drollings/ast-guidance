@@ -10,11 +10,7 @@ impl TransformStrategy for DecomposeToAnonymizedHypothetical {
         "decompose_to_anonymized_hypothetical"
     }
 
-    fn transform(
-        &self,
-        request: &RouterRequest,
-        _pii_classes: &[String],
-    ) -> Result<RouterRequest, TransformError> {
+    fn transform(&self, request: &RouterRequest) -> Result<RouterRequest, TransformError> {
         let mut system_msg: Option<RouterMessage> = None;
         let mut hypothetical_msg: Option<RouterMessage> = None;
 

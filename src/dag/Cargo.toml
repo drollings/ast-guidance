@@ -17,6 +17,8 @@ bon = { workspace = true }
 
 [dev-dependencies]
 fluent-wvr-testutil = { path = "../fluent-wvr-testutil" }
+fluent-concurrency = { path = "../fluent-concurrency" }
+tokio = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

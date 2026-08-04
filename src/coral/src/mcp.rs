@@ -218,7 +218,9 @@ impl JsonRpcHandler for McpServer {
         if raw.len() > MAX_MCP_REQUEST_SIZE {
             return Err(JsonRpcError {
                 code: -32600,
-                message: format!("request exceeds MAX_MCP_REQUEST_SIZE ({MAX_MCP_REQUEST_SIZE} bytes)"),
+                message: format!(
+                    "request exceeds MAX_MCP_REQUEST_SIZE ({MAX_MCP_REQUEST_SIZE} bytes)"
+                ),
             });
         }
         let request: JsonRpcRequest = serde_json::from_str(raw)?;

@@ -14,6 +14,7 @@ use fluent_wvr::prelude::*;
 use tokio::net::TcpListener;
 
 use crate::config::{ModelEntry, RouteRef, ServerConfig};
+use crate::dag_session::SessionRegistry;
 use crate::ledger::ContentNodeLedger;
 use crate::pipeline::PipelineOrchestrator;
 use crate::routes::plan::PlanRoute;
@@ -32,6 +33,8 @@ pub struct RouterServer {
     cache: Option<Arc<ResponseCache>>,
     /// Chart store + selector host (boot-loaded; M7/M8 dispatch to it).
     plan_route: Option<Arc<PlanRoute>>,
+    /// Per-`session_id` `DependencySession` registry (D6 canonical session).
+    sessions: Option<Arc<SessionRegistry>>,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
@@ -56,6 +59,7 @@ impl RouterServer {
             ledger: None,
             cache: None,
             plan_route: None,
+            sessions: None,
             depends: vec![],
             provides: vec![ArcIntern::from("http.endpoint")],
         }
@@ -76,6 +80,15 @@ impl RouterServer {
     #[must_use]
     pub fn with_plan_route(mut self, plan_route: Arc<PlanRoute>) -> Self {
         self.plan_route = Some(plan_route);
+        self
+    }
+
+    /// Attach the per-session `DependencySession` registry (D6 canonical
+    /// session). Each chat-completion request then tracks a step in the
+    /// session keyed by its `session_id`.
+    #[must_use]
+    pub fn with_sessions(mut self, sessions: Arc<SessionRegistry>) -> Self {
+        self.sessions = Some(sessions);
         self
     }
 
@@ -116,6 +129,7 @@ impl RouterServer {
             self.ledger.clone(),
             self.cache.clone(),
             self.plan_route.clone(),
+            self.sessions.clone(),
         )
         .await
     }
@@ -143,6 +157,7 @@ impl WorkUnit for RouterServer {
         let ledger = self.ledger.clone();
         let cache = self.cache.clone();
         let plan_route = self.plan_route.clone();
+        let sessions = self.sessions.clone();
         let rt = ctx.rt.clone();
 
         let _handle = rt.spawn(Box::pin(async move {
@@ -157,6 +172,7 @@ impl WorkUnit for RouterServer {
                 ledger,
                 cache,
                 plan_route,
+                sessions,
             )
             .await
             {
@@ -171,21 +187,7 @@ impl WorkUnit for RouterServer {
     }
 }
 
-impl FieldAccess for RouterServer {
-    fn set_field(&mut self, _name: &str, _value: &str) -> Result<(), FieldError> {
-        Err(FieldError::NotFound(
-            "RouterServer has no configurable fields".into(),
-        ))
-    }
-    fn get_field(&self, _name: &str) -> Result<String, FieldError> {
-        Err(FieldError::NotFound(
-            "RouterServer has no configurable fields".into(),
-        ))
-    }
-    fn field_names(&self) -> &'static [&'static str] {
-        &[]
-    }
-}
+impl_fieldless!(RouterServer);
 
 impl Describable for RouterServer {
     fn describe(&self) -> serde_json::Value {
@@ -206,6 +208,7 @@ async fn run_http(
     ledger: Option<Arc<ContentNodeLedger>>,
     cache: Option<Arc<ResponseCache>>,
     plan_route: Option<Arc<PlanRoute>>,
+    sessions: Option<Arc<SessionRegistry>>,
 ) -> Result<(), crate::error::ServerError> {
     let listener =
         TcpListener::bind(bind_addr)
@@ -228,6 +231,7 @@ async fn run_http(
         ledger,
         cache,
         plan_route,
+        sessions,
     )
     .await
 }
@@ -246,6 +250,7 @@ pub(crate) async fn serve_http(
     ledger: Option<Arc<ContentNodeLedger>>,
     cache: Option<Arc<ResponseCache>>,
     plan_route: Option<Arc<PlanRoute>>,
+    sessions: Option<Arc<SessionRegistry>>,
 ) -> Result<(), crate::error::ServerError> {
     use hyper_util::rt::TokioIo;
 
@@ -280,6 +285,7 @@ pub(crate) async fn serve_http(
         let ledger = ledger.clone();
         let cache = cache.clone();
         let plan_route = plan_route.clone();
+        let sessions = sessions.clone();
         let http_client = http_client.clone();
 
         tokio::spawn(async move {
@@ -297,6 +303,7 @@ pub(crate) async fn serve_http(
                     ledger.clone(),
                     cache.clone(),
                     plan_route.clone(),
+                    sessions.clone(),
                     http_client.clone(),
                 )
             });

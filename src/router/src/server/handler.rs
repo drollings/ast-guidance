@@ -1,11 +1,12 @@
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use common_core::hash::uuid_v4;
 use common_core::ResponseCache;
 use http_body_util::BodyExt;
 
 use crate::config::{ModelEntry, RouteRef};
+use crate::dag_session::{DependencySession, SessionRegistry, SessionStep, StepResult};
 use crate::ledger::ContentNodeLedger;
 use crate::normalize;
 use crate::pipeline::{PipelineOrchestrator, RoutingTarget};
@@ -19,6 +20,7 @@ use crate::server::responses::make_text_completion;
 use crate::server::responses::HyperResponse;
 use crate::server::responses::ServerStats;
 use crate::testing::mock::MockDispatchContext;
+use crate::types::RouterRequest;
 
 /// Best-effort ledger insert, moved off the async handler via
 /// `spawn_blocking` so sync rusqlite never runs on a tokio worker thread.
@@ -59,6 +61,67 @@ pub(crate) async fn record_ledger_result(
     .ok();
 }
 
+/// Per-request handle into a `DependencySession` step (D6). Holds the session
+/// `Arc` and the request's step id so the outcome can be recorded exactly once
+/// from whichever terminal branch the request takes. Locking is scoped to the
+/// `complete` call — never held across an await.
+struct SessionStepHandle {
+    session: Arc<Mutex<DependencySession>>,
+    step_id: String,
+}
+
+impl SessionStepHandle {
+    fn complete(&self, accepted: bool, score: Option<f64>, content: String, error: Option<String>) {
+        let mut session = match self.session.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        let _ = session.complete_step(
+            &self.step_id,
+            StepResult {
+                content,
+                accepted,
+                score,
+                latency_ms: 0,
+                error,
+            },
+        );
+    }
+}
+
+/// Register the request as a step in the session keyed by `session_id` (if a
+/// `SessionRegistry` is wired) and return a handle to complete it when the
+/// outcome is known.
+fn begin_session_step(
+    sessions: Option<&Arc<SessionRegistry>>,
+    session_id: &str,
+    model_name: &str,
+    adapter: Option<&str>,
+    request_id: &str,
+    request_text: &str,
+) -> Option<SessionStepHandle> {
+    let registry = sessions?;
+    let session = registry.get_or_create(session_id);
+    {
+        let mut s = match session.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        s.set_model(model_name);
+        if let Some(adapter) = adapter {
+            s.adapter = Some(adapter.to_string());
+        }
+        let step_id = format!("req-{request_id}");
+        if s.get_step(&step_id).is_none() {
+            let _ = s.add_step(SessionStep::new(step_id.clone(), request_text));
+        }
+    }
+    Some(SessionStepHandle {
+        session,
+        step_id: format!("req-{request_id}"),
+    })
+}
+
 async fn handle_chat_completion(
     req: hyper::Request<hyper::body::Incoming>,
     pipelines: Arc<std::collections::HashMap<String, Arc<PipelineOrchestrator>>>,
@@ -71,6 +134,7 @@ async fn handle_chat_completion(
     ledger: Option<Arc<ContentNodeLedger>>,
     cache: Option<Arc<ResponseCache>>,
     plan_route: Option<Arc<PlanRoute>>,
+    sessions: Option<Arc<SessionRegistry>>,
     http_client: Arc<reqwest::Client>,
 ) -> Result<HyperResponse, std::convert::Infallible> {
     // M10: the dispatch post-processing hook (workflow extraction), if the
@@ -130,7 +194,6 @@ async fn handle_chat_completion(
         .find(|m| m.role == "user")
         .map(|m| common_core::string::truncate_utf8(&m.content.to_string_lossy(), 120))
         .unwrap_or_default();
-    let request_json = serde_json::to_string(&router_request).unwrap_or_default();
 
     tracing::info!(
         target: "router.server",
@@ -159,8 +222,20 @@ async fn handle_chat_completion(
     )
     .await;
 
+    // D6 canonical session: register the request as a step and complete it at
+    // whichever terminal branch the request takes (outcome recorded exactly
+    // once).
+    let session_step = begin_session_step(
+        sessions.as_ref(),
+        &session_id,
+        &model_name,
+        router_request.adapter.as_deref(),
+        &request_id,
+        &request_text,
+    );
+
     let pipeline_result =
-        resolve_pipeline(&model_name, &routes, &models, &pipelines, &request_json);
+        resolve_pipeline(&model_name, &routes, &models, &pipelines, &router_request);
 
     let user_text = router_request
         .messages
@@ -192,6 +267,15 @@ async fn handle_chat_completion(
         )
         .await;
 
+        if let Some(ref step) = session_step {
+            step.complete(
+                false,
+                Some(0.0),
+                reason.to_string(),
+                Some(reason.to_string()),
+            );
+        }
+
         let completion = make_error_completion(&model_name, reason);
         return Ok(completion_to_response(
             &completion,
@@ -216,6 +300,9 @@ async fn handle_chat_completion(
             resp_str.clone(),
         )
         .await;
+        if let Some(ref step) = session_step {
+            step.complete(true, Some(1.0), resp_str.clone(), None);
+        }
         let completion = make_text_completion(&model_name, resp_str);
         return Ok(completion_to_response(
             &completion,
@@ -226,7 +313,7 @@ async fn handle_chat_completion(
     }
 
     if let Some(ref rt) = pipeline_result.routing_target {
-        return handle_dispatch(
+        let resp = handle_dispatch(
             rt,
             &router_request,
             &model_name,
@@ -240,7 +327,16 @@ async fn handle_chat_completion(
             stats.as_ref(),
             workflow_extractor.clone(),
         )
-        .await;
+        .await?;
+        if let Some(ref step) = session_step {
+            step.complete(
+                resp.status().is_success(),
+                None,
+                format!("dispatched to {}: {}", rt.model, resp.status()),
+                None,
+            );
+        }
+        return Ok(resp);
     }
 
     if let Some((ref key, ref entry)) = classifier {
@@ -251,7 +347,7 @@ async fn handle_chat_completion(
             fallback_url = %rt_for_fallback.url,
             "no routing target — dispatching to classifier fallback"
         );
-        return handle_dispatch(
+        let resp = handle_dispatch(
             &rt_for_fallback,
             &router_request,
             &model_name,
@@ -265,7 +361,16 @@ async fn handle_chat_completion(
             stats.as_ref(),
             workflow_extractor.clone(),
         )
-        .await;
+        .await?;
+        if let Some(ref step) = session_step {
+            step.complete(
+                resp.status().is_success(),
+                None,
+                format!("dispatched to classifier fallback: {}", resp.status()),
+                None,
+            );
+        }
+        return Ok(resp);
     }
 
     tracing::warn!(
@@ -281,6 +386,9 @@ async fn handle_chat_completion(
         "fallback response".to_string(),
     )
     .await;
+    if let Some(ref step) = session_step {
+        step.complete(true, Some(0.5), "fallback response".to_string(), None);
+    }
     let completion = crate::server::responses::fallback_completion(&model_name);
     Ok(completion_to_response(
         &completion,
@@ -294,8 +402,8 @@ async fn handle_chat_completion(
 ///
 /// The request body carries the user message and an optional entity list
 /// (the client's answers to a prior clarification, serialized as entities —
-/// the same shape stored under `entities_json`). The response is structured
-/// JSON, never free-form chat:
+/// the same shape stored under structured `entities`). The response is
+/// structured JSON, never free-form chat:
 ///
 /// - `{"status": "clarify", "questions": [...], "gaps": [...]}` — the chart
 ///   needs one round of targeted answers; the client replies with `entities`
@@ -381,29 +489,21 @@ async fn handle_plan_request(
         .unwrap_or_default();
 
     let result = if retry {
-        route.plan_interviewed(message, &entities, &prior_gaps)
+        route
+            .plan_interviewed(message, &entities, &prior_gaps)
+            .await
     } else {
-        route.plan(message, &entities)
+        route.plan(message, &entities).await
     };
 
     let response = match result.source {
         crate::routes::plan::PlanSource::FreshDraft => {
             serde_json::json!({ "status": "fresh_draft", "source": "fresh_draft" })
         }
-        crate::routes::plan::PlanSource::HnswHit => serde_json::json!({
-            "status": "executed",
-            "source": "hnsw_hit",
-            "workflow": result.workflow,
-            "gaps_filled": result.gaps_filled,
-        }),
+        crate::routes::plan::PlanSource::HnswHit => plan_executed_response("hnsw_hit", &result),
         crate::routes::plan::PlanSource::TemplateAdapted => {
             if result.interview_questions.is_empty() {
-                serde_json::json!({
-                    "status": "executed",
-                    "source": "template_adapted",
-                    "workflow": result.workflow,
-                    "gaps_filled": result.gaps_filled,
-                })
+                plan_executed_response("template_adapted", &result)
             } else {
                 serde_json::json!({
                     "status": "clarify",
@@ -420,6 +520,35 @@ async fn handle_plan_request(
     ))
 }
 
+/// Build the D3 `/v1/plan` "executed" response: execution results, not a
+/// compiled graph. Carries selection provenance (`fit`/`score`) and the
+/// execution summary (`final_output`/`accepted`/`audit`) when the chart ran.
+fn plan_executed_response(
+    source: &str,
+    result: &crate::routes::plan::PlanResult,
+) -> serde_json::Value {
+    let mut executed = serde_json::json!({
+        "status": "executed",
+        "source": source,
+        "gaps_filled": result.gaps_filled,
+    });
+    if let Some(fit) = &result.fit {
+        executed["fit"] = serde_json::Value::String(fit.clone());
+    }
+    if let Some(score) = result.score {
+        executed["score"] = serde_json::json!(score);
+    }
+    if let Some(summary) = &result.summary {
+        executed["accepted"] = serde_json::json!(summary.accepted);
+        if let Some(output) = &summary.final_output {
+            executed["final_output"] = output.clone();
+        }
+        executed["audit"] = serde_json::to_value(&summary.audit).unwrap_or_default();
+        executed["completed"] = serde_json::to_value(&summary.completed).unwrap_or_default();
+    }
+    executed
+}
+
 #[allow(clippy::implicit_hasher)]
 pub async fn handle_request(
     req: hyper::Request<hyper::body::Incoming>,
@@ -433,6 +562,7 @@ pub async fn handle_request(
     ledger: Option<Arc<ContentNodeLedger>>,
     cache: Option<Arc<ResponseCache>>,
     plan_route: Option<Arc<PlanRoute>>,
+    sessions: Option<Arc<SessionRegistry>>,
     http_client: Arc<reqwest::Client>,
 ) -> Result<HyperResponse, std::convert::Infallible> {
     let method = req.method().clone();
@@ -499,6 +629,7 @@ pub async fn handle_request(
                 ledger,
                 cache,
                 plan_route,
+                sessions,
                 http_client,
             )
             .await
@@ -563,7 +694,7 @@ fn resolve_pipeline(
     routes: &std::collections::HashMap<String, RouteRef>,
     models: &std::collections::HashMap<String, ModelEntry>,
     pipelines: &std::collections::HashMap<String, Arc<PipelineOrchestrator>>,
-    request_json: &str,
+    router_request: &RouterRequest,
 ) -> crate::pipeline::PipelineResult {
     use fluent_wvr::prelude::*;
 
@@ -588,10 +719,7 @@ fn resolve_pipeline(
     };
 
     let mut ctx = WorkContext::default();
-    ctx.metadata.insert(
-        "request".into(),
-        MetadataValue::String(request_json.to_string()),
-    );
+    ctx.set_structured("request", router_request);
 
     let mut all_decisions = Vec::new();
     let mut last_result: Option<crate::pipeline::PipelineResult> = None;

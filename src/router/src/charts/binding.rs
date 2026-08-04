@@ -16,9 +16,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{DepSpec, EntityPredicate, FieldRule, FieldType};
 
-/// Metadata key under which the HTTP handler / upstream stage places the
-/// serialized entity list (`serde_json::to_string(&entities)`).
-pub const ENTITIES_META_KEY: &str = "entities_json";
+/// Structured-metadata key under which the HTTP handler / upstream stage
+/// places the entity list (as `serde_json::Value`, read via `set_structured`).
+pub const ENTITIES_META_KEY: &str = "entities";
 
 /// A candidate context entity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,24 +340,18 @@ fn resolve_segment<'a>(v: &'a serde_json::Value, segment: &str) -> Option<&'a se
     v.get(segment)
 }
 
-/// Parse the entity list from a `WorkContext`'s metadata.
+/// Parse the entity list from a `WorkContext`'s structured channel.
 ///
-/// The HTTP handler or an upstream stage places the entities as
-/// `serde_json::to_string(&entities)` under `ctx.metadata["entities_json"]`
-/// (a string — `MetadataValue` is scalar-only). Absence or a parse failure
-/// yields `[]` — never fails the request.
+/// The HTTP handler or an upstream stage places the entities as a typed
+/// `serde_json::Value` under `ctx.structured["entities"]`. Absence or a
+/// deserialization failure yields `[]` — never fails the request.
 pub fn parse_entities_from_ctx(ctx: &WorkContext) -> Vec<Entity> {
-    let raw = match ctx.metadata.get(ENTITIES_META_KEY) {
-        Some(fluent_wvr::prelude::MetadataValue::String(s)) => s.clone(),
-        _ => return Vec::new(),
-    };
-    serde_json::from_str::<Vec<Entity>>(&raw).unwrap_or_default()
+    ctx.structured(ENTITIES_META_KEY).unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluent_wvr::prelude::MetadataValue;
 
     fn entity(id: &str, kind: &str, value: serde_json::Value) -> Entity {
         Entity {
@@ -727,10 +721,7 @@ mod tests {
         let mut ctx = WorkContext::default();
         assert!(parse_entities_from_ctx(&ctx).is_empty());
         let entities = vec![entity("e1", "report", serde_json::json!({"title": "T"}))];
-        ctx.metadata.insert(
-            ENTITIES_META_KEY.into(),
-            MetadataValue::String(serde_json::to_string(&entities).unwrap()),
-        );
+        ctx.set_structured(ENTITIES_META_KEY, &entities);
         let parsed = parse_entities_from_ctx(&ctx);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].id, "e1");
@@ -739,10 +730,8 @@ mod tests {
     #[test]
     fn parse_entities_from_ctx_ignores_garbage() {
         let mut ctx = WorkContext::default();
-        ctx.metadata.insert(
-            ENTITIES_META_KEY.into(),
-            MetadataValue::String("not json".into()),
-        );
+        ctx.structured
+            .insert(ENTITIES_META_KEY.into(), serde_json::json!([{"id": 1}]));
         assert!(parse_entities_from_ctx(&ctx).is_empty());
     }
 

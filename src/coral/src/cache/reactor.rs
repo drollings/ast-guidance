@@ -123,7 +123,11 @@ impl QueueReactor {
                         Arc::clone(&args.library),
                         Arc::clone(pool),
                     );
-                    tiers.push(wrap_tier(Arc::new(unit), "coral.l2.wasm", Arc::clone(&hist)));
+                    tiers.push(wrap_tier(
+                        Arc::new(unit),
+                        "coral.l2.wasm",
+                        Arc::clone(&hist),
+                    ));
                     histograms.push(hist);
                 }
             }
@@ -133,7 +137,11 @@ impl QueueReactor {
         {
             let hist = Arc::new(LatencyHistogram::new());
             let unit = L3GraphUnit::new(Arc::clone(&router));
-            tiers.push(wrap_tier(Arc::new(unit), "coral.l3.graph", Arc::clone(&hist)));
+            tiers.push(wrap_tier(
+                Arc::new(unit),
+                "coral.l3.graph",
+                Arc::clone(&hist),
+            ));
             histograms.push(hist);
         }
 
@@ -141,7 +149,11 @@ impl QueueReactor {
         if let Some(ref embedder) = args.embedder {
             let hist = Arc::new(LatencyHistogram::new());
             let unit = L4SemanticUnit::new(Arc::clone(&router), Arc::clone(embedder));
-            tiers.push(wrap_tier(Arc::new(unit), "coral.l4.semantic", Arc::clone(&hist)));
+            tiers.push(wrap_tier(
+                Arc::new(unit),
+                "coral.l4.semantic",
+                Arc::clone(&hist),
+            ));
             histograms.push(hist);
         }
 
@@ -149,7 +161,11 @@ impl QueueReactor {
         if let Some(ref frontier) = args.frontier_config {
             let hist = Arc::new(LatencyHistogram::new());
             let unit = L5FrontierUnit::new(frontier.clone());
-            tiers.push(wrap_tier(Arc::new(unit), "coral.l5.frontier", Arc::clone(&hist)));
+            tiers.push(wrap_tier(
+                Arc::new(unit),
+                "coral.l5.frontier",
+                Arc::clone(&hist),
+            ));
             histograms.push(hist);
         }
 

@@ -4,13 +4,20 @@
 //! Composes `fluent_dag::dep_graph::DependencyGraph<K>` — does **not**
 //! re-implement graph algorithms (no hand-rolled `HashMap` dependents index,
 //! no manual topo sort, no manual transitive DFS).
+//!
+//! `SessionRegistry` (in this module) is the canonical server-side session
+//! home (decision D6): sessions are created per `session_id`, attached to a
+//! shared `KvCacheManager`, and retained for the process lifetime so
+//! checkpoint/rewind state survives across requests.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use fluent_dag::dep_graph::{DependencyGraph, GraphError};
 use serde::{Deserialize, Serialize};
 
-use crate::kv_cache::{KvCacheError, KvCacheManager};
+use crate::kv_cache::{ColdKvCache, HotKvCache, KvCacheError, KvCacheManager, KvSnapshot};
 use crate::session::StepStatus;
 
 /// Errors produced by dependency-session operations.
@@ -100,6 +107,12 @@ impl SessionStep {
 /// ```
 pub struct DependencySession {
     pub session_id: String,
+    /// The model this session dispatches to. Set by the server on request;
+    /// used as the KV-cache snapshot key component (rewind no longer
+    /// hard-codes `"unknown"`).
+    pub model: Option<String>,
+    /// Optional adapter (LoRA) name, part of the KV-cache snapshot key.
+    pub adapter: Option<String>,
     steps: HashMap<String, SessionStep>,
     graph: DependencyGraph<String>,
     completed: HashSet<String>,
@@ -113,6 +126,8 @@ impl DependencySession {
     pub fn new(session_id: impl Into<String>) -> Self {
         Self {
             session_id: session_id.into(),
+            model: None,
+            adapter: None,
             steps: HashMap::new(),
             graph: DependencyGraph::new(),
             completed: HashSet::new(),
@@ -120,6 +135,26 @@ impl DependencySession {
             kv_cache: None,
             step_order: Vec::new(),
         }
+    }
+
+    /// Set the model name this session dispatches to (used for KV-cache
+    /// snapshot keying on rewind).
+    #[must_use]
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+
+    /// Set the adapter (LoRA) name, part of the KV-cache snapshot key.
+    #[must_use]
+    pub fn with_adapter(mut self, adapter: impl Into<String>) -> Self {
+        self.adapter = Some(adapter.into());
+        self
+    }
+
+    /// Update the model name in place (called on each request).
+    pub fn set_model(&mut self, model: impl Into<String>) {
+        self.model = Some(model.into());
     }
 
     /// Attach a KV cache manager for checkpoint/rewind support.
@@ -241,10 +276,16 @@ impl DependencySession {
     /// checkpoint step.
     ///
     /// Steps are reset to `Pending` but their result data is preserved
-    /// for audit (it is not deleted). If a `KvCacheManager` is attached
-    /// and a model name is provided, the KV cache snapshot is restored
-    /// from the cold tier.
-    pub async fn rewind_to_checkpoint(&mut self, checkpoint_name: &str) -> Result<(), DagError> {
+    /// for audit (it is not deleted). If a `KvCacheManager` is attached and
+    /// a model name has been set, the KV cache snapshot is **actually
+    /// restored**: the metadata record is retrieved from the cold tier
+    /// (promoted to the hot tier by `KvCacheManager::retrieve`) and returned
+    /// to the caller, which passes its `file_path` to the next dispatch's
+    /// slot-restore. Returns `None` when no snapshot exists.
+    pub async fn rewind_to_checkpoint(
+        &mut self,
+        checkpoint_name: &str,
+    ) -> Result<Option<Arc<KvSnapshot>>, DagError> {
         // Verify checkpoint exists.
         self.checkpoints
             .get(checkpoint_name)
@@ -279,40 +320,6 @@ impl DependencySession {
 
         self.checkpoints.remove(checkpoint_name);
 
-        // Restore KV cache snapshot from cold tier if a manager is attached.
-        if let Some(ref kv) = self.kv_cache {
-            match kv
-                .retrieve(
-                    "unknown", // model not tracked in DependencySession — caller sets via metadata
-                    None,
-                    &self.session_id,
-                )
-                .await
-            {
-                Ok(snapshot) => {
-                    tracing::info!(
-                        session_id = %self.session_id,
-                        file_path = %snapshot.file_path.display(),
-                        token_count = snapshot.token_count,
-                        "kv cache snapshot metadata retrieved for rewind"
-                    );
-                }
-                Err(KvCacheError::NotFound(_)) => {
-                    tracing::debug!(
-                        session_id = %self.session_id,
-                        "no kv cache snapshot found for rewind"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        session_id = %self.session_id,
-                        error = %e,
-                        "kv cache retrieve failed during rewind"
-                    );
-                }
-            }
-        }
-
         if !discarded.is_empty() {
             tracing::info!(
                 session_id = %self.session_id,
@@ -322,7 +329,57 @@ impl DependencySession {
             );
         }
 
-        Ok(())
+        // Restore the KV cache snapshot for real. A session with no model
+        // name cannot key a snapshot (the key is `(model, adapter, session)`),
+        // so the restore is skipped — never a fabricated `"unknown"` lookup.
+        let Some(model) = self.model.as_deref() else {
+            tracing::debug!(
+                session_id = %self.session_id,
+                "no model name on session — skipping kv cache restore"
+            );
+            return Ok(None);
+        };
+
+        Ok(self.restore_kv_snapshot(model).await)
+    }
+
+    /// Retrieve + restore the KV cache snapshot for this session: the
+    /// metadata record is loaded from the cold tier (promoted to the hot tier
+    /// by `KvCacheManager::retrieve`) and returned so the caller can pass its
+    /// `file_path` to the next dispatch's slot-restore. `None` when no
+    /// snapshot exists.
+    async fn restore_kv_snapshot(&self, model: &str) -> Option<Arc<KvSnapshot>> {
+        let kv = self.kv_cache.as_ref()?;
+        match kv
+            .retrieve(model, self.adapter.as_deref(), &self.session_id)
+            .await
+        {
+            Ok(snapshot) => {
+                tracing::info!(
+                    session_id = %self.session_id,
+                    model = %model,
+                    file_path = %snapshot.file_path.display(),
+                    token_count = snapshot.token_count.unwrap_or(0),
+                    "kv cache snapshot restored for rewind — pass file_path to next dispatch"
+                );
+                Some(snapshot)
+            }
+            Err(KvCacheError::NotFound(_)) => {
+                tracing::debug!(
+                    session_id = %self.session_id,
+                    "no kv cache snapshot found for rewind"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    error = %e,
+                    "kv cache retrieve failed during rewind"
+                );
+                None
+            }
+        }
     }
 
     /// Set a step's status to InProgress (only if currently Pending).
@@ -372,6 +429,82 @@ impl DependencySession {
     /// some step but provided by none).
     pub fn unresolved_deps(&self) -> Vec<String> {
         self.graph.unresolved_deps()
+    }
+}
+
+/// Poison-safe mutex lock: a panic while the mutex was held must not wedge
+/// the registry permanently.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Process-wide registry of `DependencySession`s keyed by `session_id`.
+///
+/// The canonical server-side session home (decision D6): sessions are
+/// created on first use, attached to a shared `KvCacheManager`, and retained
+/// for the process lifetime so checkpoint/rewind state survives across
+/// requests. Each session is individually `Mutex`-wrapped so the server can
+/// mutate it from the (async) request path without holding the registry lock
+/// across an await.
+#[derive(Clone)]
+pub struct SessionRegistry {
+    inner: Arc<SessionRegistryInner>,
+}
+
+struct SessionRegistryInner {
+    sessions: Mutex<HashMap<String, Arc<Mutex<DependencySession>>>>,
+    kv_cache: KvCacheManager,
+}
+
+impl SessionRegistry {
+    /// Create a registry. `kv_root` is the cold-tier mountpoint for KV cache
+    /// snapshots; when `None`, a process-local temp directory is used (still
+    /// durable across requests, ephemeral across restarts).
+    pub fn new(kv_root: Option<PathBuf>) -> Self {
+        let hot = Arc::new(HotKvCache::new(1024, 512));
+        let cold = Arc::new(ColdKvCache::new(
+            kv_root.unwrap_or_else(|| std::env::temp_dir().join("coral-router-kv-cache")),
+            4096,
+            7 * 24 * 3600, // 7-day TTL
+            crate::config::EvictionPolicy::Lru,
+        ));
+        Self {
+            inner: Arc::new(SessionRegistryInner {
+                sessions: Mutex::new(HashMap::new()),
+                kv_cache: KvCacheManager::new(hot, cold),
+            }),
+        }
+    }
+
+    /// The shared KV cache manager (hot + cold tiers) attached to every
+    /// session in this registry.
+    pub fn kv_cache(&self) -> &KvCacheManager {
+        &self.inner.kv_cache
+    }
+
+    /// Look up a session by ID, creating it (with the shared `KvCacheManager`
+    /// attached) on first use.
+    pub fn get_or_create(&self, session_id: &str) -> Arc<Mutex<DependencySession>> {
+        let mut sessions = lock(&self.inner.sessions);
+        sessions
+            .entry(session_id.to_string())
+            .or_insert_with(|| {
+                Arc::new(Mutex::new(
+                    DependencySession::new(session_id).with_kv_cache(self.inner.kv_cache.clone()),
+                ))
+            })
+            .clone()
+    }
+
+    /// Drop a session (its KV cache snapshot, if any, is retained in the
+    /// cold tier for a future session with the same ID).
+    pub fn remove(&self, session_id: &str) {
+        lock(&self.inner.sessions).remove(session_id);
+    }
+
+    /// Number of live sessions.
+    pub fn session_count(&self) -> usize {
+        lock(&self.inner.sessions).len()
     }
 }
 
@@ -682,5 +815,105 @@ mod tests {
 
         session.add_step(step).unwrap();
         assert_eq!(session.step_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_rewind_restores_kv_snapshot_for_real() {
+        use crate::kv_cache::KvSnapshot;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = tempfile::tempdir().unwrap();
+        let hot = Arc::new(HotKvCache::new(10, 1024));
+        let kv = KvCacheManager::new(
+            Arc::clone(&hot),
+            Arc::new(ColdKvCache::new(
+                dir.path(),
+                1024,
+                86400,
+                crate::config::EvictionPolicy::Lru,
+            )),
+        );
+
+        let src_file = src_dir.path().join("rewind.kv");
+        tokio::fs::write(&src_file, b"kv bytes").await.unwrap();
+        let snapshot = KvSnapshot {
+            model: "model-x".into(),
+            adapter: None,
+            session_id: "sess-1".into(),
+            file_path: src_file,
+            token_count: Some(42),
+            created_at: common_core::now_secs(),
+            last_used_at: common_core::now_secs(),
+            llama_cpp_version: Some("0.1.0".into()),
+            model_quant: None,
+            base_model_hash: Some("abc".into()),
+        };
+        kv.store(snapshot).await.unwrap();
+        // Force a cold-tier hit so rewind exercises the reload-into-hot-tier
+        // path rather than a hot-tier cache hit.
+        hot.remove("model-x", None, "sess-1");
+
+        let mut session = DependencySession::new("sess-1")
+            .with_model("model-x")
+            .with_kv_cache(kv);
+        session
+            .add_step(SessionStep::new("a", "Step A").with_checkpoint())
+            .unwrap();
+        session
+            .add_step(SessionStep::new("b", "Step B").with_depends(vec!["a".into()]))
+            .unwrap();
+
+        session.complete_step("a", ok_result("a done")).unwrap();
+        session.complete_step("b", ok_result("b done")).unwrap();
+
+        // Real restore: the snapshot is returned to the caller (its file_path
+        // feeds the next dispatch's slot-restore), not a log-only no-op.
+        let restored = session
+            .rewind_to_checkpoint("a")
+            .await
+            .unwrap()
+            .expect("snapshot should be restored");
+        assert_eq!(restored.session_id, "sess-1");
+        assert_eq!(
+            restored.file_path,
+            dir.path().join("model-x/sess-1/sess-1.kv")
+        );
+        assert!(restored.file_path.exists());
+        // M6.2: the cold tier does NOT fabricate an unknown token count —
+        // a raw reload without a sidecar reports `None`.
+        assert_eq!(restored.token_count, None);
+
+        // Steps were still reset (data preserved for audit).
+        assert_eq!(session.get_step("a").unwrap().status, StepStatus::Pending);
+        assert!(session.get_step("a").unwrap().result.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_rewind_without_model_skips_restore() {
+        let mut session = DependencySession::new("sess-1");
+        session
+            .add_step(SessionStep::new("a", "Step A").with_checkpoint())
+            .unwrap();
+        session.complete_step("a", ok_result("a done")).unwrap();
+
+        let restored = session.rewind_to_checkpoint("a").await.unwrap();
+        assert!(restored.is_none(), "no model → no snapshot keyed → None");
+    }
+
+    #[test]
+    fn test_session_registry_get_or_create() {
+        let registry = SessionRegistry::new(None);
+        assert_eq!(registry.session_count(), 0);
+
+        let session = registry.get_or_create("sess-1");
+        assert_eq!(registry.session_count(), 1);
+        assert_eq!(session.lock().unwrap().session_id, "sess-1");
+
+        // Second lookup returns the same session (state survives).
+        let again = registry.get_or_create("sess-1");
+        assert!(Arc::ptr_eq(&session, &again));
+
+        registry.remove("sess-1");
+        assert_eq!(registry.session_count(), 0);
     }
 }

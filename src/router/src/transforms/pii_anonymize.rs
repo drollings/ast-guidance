@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use guidance_llm::anonymize;
 
-use crate::transforms::{TransformError, TransformStrategy};
-use crate::types::{RouterMessageContent, RouterRequest};
+use crate::transforms::{rewrite_text_messages, TransformError, TransformStrategy};
+use crate::types::RouterRequest;
 
 pub struct PiiAnonymize;
 
@@ -12,24 +12,14 @@ impl TransformStrategy for PiiAnonymize {
         "pii_anonymize"
     }
 
-    fn transform(
-        &self,
-        request: &RouterRequest,
-        _pii_classes: &[String],
-    ) -> Result<RouterRequest, TransformError> {
-        let mut transformed = request.clone();
+    fn transform(&self, request: &RouterRequest) -> Result<RouterRequest, TransformError> {
         let mut anonymize_map: HashMap<String, String> = HashMap::new();
 
-        for message in &mut transformed.messages {
-            let original = match &message.content {
-                RouterMessageContent::Text(s) => s.clone(),
-                RouterMessageContent::Parts(_) => continue,
-            };
-
-            let anonymized = anonymize(&original);
-            build_anonymize_map(&original, &anonymized, &mut anonymize_map);
-            message.content = RouterMessageContent::Text(anonymized);
-        }
+        let mut transformed = rewrite_text_messages(request, |content| {
+            let anonymized = anonymize(content);
+            build_anonymize_map(content, &anonymized, &mut anonymize_map);
+            Ok(anonymized)
+        })?;
 
         if !anonymize_map.is_empty() {
             let map_obj: serde_json::Map<String, serde_json::Value> = anonymize_map

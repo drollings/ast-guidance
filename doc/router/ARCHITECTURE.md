@@ -41,8 +41,8 @@ The architecture follows the MOA Router Specification (`MOA_ROUTER_SPEC.md`) and
                                     │
                    ┌─────────────────┼──────────────────┐
                    ▼                 ▼                   ▼
-             Local Agent      Frontier API          Watchdogs
-           (AgentRegistry)  (ChatBackend chain)  (Token/WallClock/Repeat)
+             Local dispatch   Frontier ladder    Watchdogs
+            (ChatBackend chain) (forward track)  (Token/WallClock/Repeat)
 ```
 
 ## Pipeline: Two-stage design
@@ -75,7 +75,7 @@ Data flows between stages as `StageDecision` (serde JSON) serialized into `WorkO
 | File | Role |
 |------|------|
 | `types.rs` | `RouterRequest`, `RouterResponse`, `RouterMessage`, `RouterChoice`, `Usage` — serde-serializable OpenAI protocol |
-| `pipeline_types.rs` | `StageDecision`, `PipelineStage`, `StageVerdict`, `RoutingDestination` — the structured record every stage emits |
+| `pipeline_types.rs` | `StageDecision`, `PipelineStage`, `StageVerdict` — the structured record every stage emits |
 | `config.rs` | `RouterConfig`, `ModelEntry`, `SessionProfile`, `AuditLogConfig`, `ChartsConfig`, `PostProcessConfig` — deserialized from `env/coral-router.json`. Split into submodules re-exported from `config`: `PipelineParams` in `config/builder.rs`, `RoutingConfig` in `config/routing.rs`, `RejectPatterns`/`PatternEntry`/`FilterAction`/`FilterScope`/`ConfidenceGate` in `config/filters.rs` |
 
 ### Pipeline & Stages
@@ -83,13 +83,11 @@ Data flows between stages as `StageDecision` (serde JSON) serialized into `WorkO
 | File | Role |
 |------|------|
 | `pipeline.rs` | `PipelineOrchestrator` — `WorkUnit` that iterates stages, collects decisions, short-circuits on reject/error |
-| `pipeline_graph.rs` | DAG-based pipeline topology with dynamic stage routing via `fluent_dag::dep_graph::DependencyGraph` |
 | `normalize.rs` | OpenAI JSON ↔ `RouterRequest`/`RouterResponse` conversion; `error_response()` for OpenAI-format errors |
 | `stages/deterministic.rs` | `DeterministicPreFilter` — delegates to `DeterministicFilterEngine` for regex PII detection; slash-command dispatch (`/help`, `/stats`, `/checkpoint`) |
 | `stages/classifier.rs` | `ClassifierStage` — single LLM call returning structured JSON; resolves route via `RoutingConfig::resolve_route`; resolves score matrix; builds routing target |
 | `stages/common.rs` | Shared helpers — `extract_user_message()`, `get_metadata_string()` |
 | `stages/retry_classifier.rs` | `RetryClassifier` — wraps the classifier stage with retry-with-backoff for LLM call resilience |
-| `stages/switch.rs` | `SwitchStage` — branching pipeline logic for conditional stage dispatch |
 | `stages/pipeline_ref.rs` | `PipelineRef` — re-usable pipeline stage from named config |
 
 ### Filters (MOA_ROUTER_SPEC §2)
@@ -105,29 +103,23 @@ Data flows between stages as `StageDecision` (serde JSON) serialized into `WorkO
 
 | File | Role |
 |------|------|
-| `dispatch/backend.rs` | `ChatBackend` trait (`complete` / `stream_complete`); `OpenAiChatBackend` (single-attempt HTTP), `RetryChatBackend` (exponential-backoff retry), `FallbackChatBackend` (ordered backend chain) |
-| `dispatch/frontier.rs` | `DispatchBackend` trait (`provider_name`, `build_request`, `parse_response`, `parse_stream_event`) + `DispatchError`; backends `OpenAiBackend`, `AnthropicBackend`, `OpenAiCompatBackend`; `LlmDispatcher` with concurrency `Limiter` |
-| `dispatch/retry.rs` | `retry_http_request` — bare HTTP POST retry with exponential backoff and `HttpClass` classification |
-| `dispatch/agent.rs` | `AgentDispatcher` — bridges `RoutingDestination::LocalAgent` to `AgentRegistry` with KV-cache restore/save |
-| `agent.rs` | `AgentRegistry` — maps `(model, adapter, session)` triple to `ResultPool<AgentTask, String, AgentError>` |
+| `dispatch/backend.rs` | `ChatBackend` trait (`complete` / `stream_complete`); `OpenAiChatBackend` (single-attempt HTTP), `RetryChatBackend` (jittered-exponential retry via `common_core::retry`), `FallbackChatBackend` (ordered backend chain) — the single production dispatch path (D4) |
+| `dispatch/frontier.rs` | `DispatchError` + `is_retryable` (the public error type of `ChatBackend`); `OpenAiBackend` (its `parse_response` is reused by `OpenAiChatBackend`); `Anthropic` Messages-API `build_request`/`parse_response`/`parse_stream_event` free helpers + `StreamEvent` — reserved for the frontier escalation ladder (forward track, D4) |
 
 ### Session & Orchestration
 
 | File | Role |
 |------|------|
 | `session.rs` | Thin shim — re-exports `StepStatus` from `fluent-types` (the canonical session node schema is `fluent_types::ContentNode`; `SessionStep` in `dag_session.rs` carries a `status: StepStatus`) |
-| `orchestrator.rs` | `OrchestratorSession` — linear session with recency compaction, checkpoint/rewind, LLM client |
-| `dag_session.rs` | `DependencySession` — DAG-based session composing `fluent_dag::dep_graph::DependencyGraph<String>` for step dependency tracking, checkpoint/rewind, KV-cache snapshot restore |
-| `compaction.rs` | `CompactionStrategy` trait; `RecencyCompaction` demotes older nodes to higher LOD (less detail) |
-| `ledger.rs` | `ContentNodeLedger` — SQLite-backed LOD0 request/response recording via `common_core::sqlite::open_wal()`; records requests before pipeline, updates with results afterward; supports `collapse_node()` for context condensation |
+| `dag_session.rs` | `DependencySession` — DAG-based session composing `fluent_dag::dep_graph::DependencyGraph<String>` for step dependency tracking, checkpoint/rewind, real KV-cache snapshot restore (model/adapter/session keyed); `SessionRegistry` — the canonical server-side session home (D6) |
+| `ledger.rs` | `ContentNodeLedger` — SQLite-backed canonical `ContentNode` store via `common_core::sqlite::open_wal()`; records requests before pipeline, updates with results afterward; owns the LOD lifecycle (LOD0/LOD5 eager, LOD1–4 lazy from LOD0 via `Summarizer`); `CompactionStrategy`/`RecencyCompaction` (folded in from the deleted `compaction.rs`) demote older nodes to higher LOD |
 
 ### Routes (MOA_ROUTER_SPEC §6-7)
 
 | File | Role |
 |------|------|
-| `routes/plan.rs` | `PlanRoute` — retrieves similar prior workflows via HNSW index; template workflow application; gap analysis; targeted interview generation |
+| `routes/plan.rs` | `PlanRoute` — retrieves similar prior workflows via HNSW index; template workflow application; gap analysis; targeted interview generation; server-side chart execution (M4/D3) |
 | `routes/rigor.rs` | `RigorRoute` — blue/red/judge 3-pass protocol; KV-cache checkpoint/rewind support; frontier escalation threshold |
-| `workflow_config.rs` | `WorkflowConfig` — serializable workflow templates with range switches and branching |
 | `charts/` | Chart (DAG workflow) library — `ChartStore`, binding, compile, execute, render, rubric, select, extract (`WorkflowExtractor`) — the M6–M10 workflow engine consumed by `PlanRoute` and the dispatch learning loop |
 
 ### Infrastructure
@@ -145,29 +137,17 @@ Data flows between stages as `StageDecision` (serde JSON) serialized into `WorkO
 | `summarization.rs` | `ResultScorer` + `Summarizer` — both `WorkUnit` impls that call an LLM to score/condense responses |
 | `score_matrix.rs` | `ScoreMatrix` — multi-dimensional weighted scoring (coherence/complexity/completeness/risk) with per-route dimension bands; resolved in classifier stage |
 | `transforms/` | `TransformStrategy` trait: `NoTransform`, `PiiAnonymize`, `DecomposeToAnonymizedHypothetical`, `DecomposeToSubtasks`, `CodewordAnonymizer` (session-scoped codeword substitution), `Sanitize`, `SecretMask` |
-| `indexer.rs` | `AdapterIndexer` — eager validation of LoRA adapter files at startup |
-| `metrics.rs` | `RouterMetrics` — per-model/agent latency histograms via `common_core::metrics::LatencyHistogram`, stage verdict counters, watchdog/error counters |
+| `metrics.rs` | `FailureClass` + `classify_error` — typed-first error classification (`From<&DispatchError>` / `From<&WorkError>` / `From<&ServerError>`) with a string-regex fallback for opaque shell/command output (D10) |
 | `logging.rs` | Two-stream `tracing` subscriber: operational JSON/console rolling file + optional audit log stream (separate retention, always JSON, gated on `router.audit=info`) |
-| `frontier/modes.rs` | `FrontierMode` enum — `AnonymizedHypothetical`, `AuthorizedCodeReview`, `WorkflowComposition`, `CopilotJudge`; `FrontierResult` and `AuditEntry` for the frontier audit trail (mode execution is a placeholder today — `execute_frontier_mode` returns `ServerError::FrontierNotImplemented` until agent wiring lands) |
-| `hnsw.rs` | `HnswIndices` — three named HNSW index handles (`workflow_library`, `rubric_cache`, `blacklist_similarity`) for future coral embedding integration |
+| `frontier/modes.rs` | `EscalationMode` ladder — `Filter`, `Question`, `Team`, `Turnover` (VISION's escalation ladder; D8 — the old `FrontierMode` four-involvement-modes enum is gone); `FrontierResult` and `AuditEntry` for the frontier audit trail. Runtime is forward track — `execute_frontier_mode` returns `ServerError::FrontierNotImplemented` until the ladder dispatch loop lands |
+| `hnsw.rs` | `HnswIndexHandle` — one HNSW index handle type for the chart store's brute-force/`knn_brute_force` fallback (the dead `HnswIndices` aggregate was pruned, M8) |
 | `testing/` | `TranscriptProvider`, `MockTranscriptEntry`, `MockDispatchContext` — transcript-driven integration-test harness for E2E and golden tests |
 
 ### Adapter architecture (`dispatch/`)
 
-The provider adapters follow the **Strategy** pattern in `dispatch/frontier.rs`:
-
-```rust
-pub trait DispatchBackend: Send + Sync {
-    fn provider_name(&self) -> &str;
-    fn build_request(&self, request: &RouterRequest) -> Result<Value, DispatchError>;
-    fn parse_response(&self, body: &Value) -> Result<RouterResponse, DispatchError>;
-    fn parse_stream_event(&self, event: &[u8]) -> Result<StreamEvent, DispatchError>;
-}
-```
-
-Three backends ship: `OpenAiBackend`, `AnthropicBackend`, `OpenAiCompatBackend`. `LlmDispatcher` holds a `HashMap<String, ProviderConfig>` and a `Limiter` for concurrency capping, dispatching through `reqwest`.
-
-The **production dispatch path** does not use `LlmDispatcher`; it runs through `dispatch/backend.rs`, which defines the `ChatBackend` trait that every server dispatch site depends on:
+The **production dispatch path** runs through `dispatch/backend.rs`, which
+defines the `ChatBackend` trait that every server dispatch site depends on
+(the single dispatch trait, D4):
 
 ```rust
 pub trait ChatBackend: Send + Sync {
@@ -178,22 +158,24 @@ pub trait ChatBackend: Send + Sync {
 }
 ```
 
-Concrete backends: `OpenAiChatBackend` (single-attempt HTTP; non-2xx status classified via `HttpClass` into `DispatchError::RateLimited` vs `DispatchError::Http`), `RetryChatBackend` (exponential backoff `retry_base * 1000 * 2^attempt`), and `FallbackChatBackend` (ordered backend chain). `server/dispatch.rs::dispatch_real` iterates the primary `RoutingTarget` plus its `fallbacks` list, wrapping each target in a retry backend and short-circuiting on non-retryable errors. Streaming flows through `StreamingHandler` (see below) over an `http_body_util` channel.
+Concrete backends: `OpenAiChatBackend` (single-attempt HTTP; non-2xx status
+classified via `HttpClass` into `DispatchError::RateLimited` vs
+`DispatchError::Http`), `RetryChatBackend` (jittered-exponential retry via
+`common_core::retry::retry_async` — the single backoff helper), and
+`FallbackChatBackend` (ordered backend chain). `server/dispatch.rs::dispatch_real`
+iterates the primary `RoutingTarget` plus its `fallbacks` list, wrapping each
+target in a retry backend and short-circuiting on non-retryable errors.
+Streaming flows through `StreamingHandler` (see below) over an
+`http_body_util` channel.
 
-### Agent architecture (`agent.rs`, `dispatch/agent.rs`)
-
-Agents are keyed on the triple `(model, adapter_option, session_id)`. Each identity gets its own `ResultPool` — this is deliberate: all requests for the same identity route to the same worker pool, preserving KV-cache affinity in the underlying llama.cpp server.
-
-```rust
-pub struct AgentRegistry {
-    pools: HashMap<AgentIdentity, Arc<ResultPool<AgentTask, String, AgentError>>>,
-    adapters: HashMap<(String, String), AdapterHandle>,  // (base_model, name)
-    runtime: Arc<dyn Runtime>,
-    …
-}
-```
-
-The `AgentDispatcher` wraps registry access with pre-dispatch KV-cache restore and post-dispatch KV-cache save, plus per-token watchdog checking.
+`dispatch/frontier.rs` owns the wire-format build/parse logic reserved for the
+frontier escalation ladder (forward track): `OpenAiBackend` (whose
+`parse_response` is reused by `OpenAiChatBackend`), the `Anthropic` Messages-API
+helpers (`build_request` / `parse_response` / `parse_stream_event`), and
+`StreamEvent`. The old `DispatchBackend` trait, `LlmDispatcher`,
+`ProviderConfig`, and `OpenAiCompatBackend` were deleted by the M3 dispatch
+collapse (D4); the Anthropic request/response/stream builders were preserved
+as the free helpers the ladder will compose.
 
 ### Filter engine architecture (`filters/`)
 
@@ -213,13 +195,13 @@ trait Filter: Send + Sync {
 | Primitive | Source | Used by router at |
 |-----------|--------|-------------------|
 | `Component` / `WorkUnit` | `fluent-wvr` | Every pipeline stage, `PipelineOrchestrator`, `RouterServer` |
-| `DependencyGraph<K>` | `fluent-dag::dep_graph` | `DependencySession` for step DAG tracking; `pipeline_graph` for dynamic pipeline topology |
-| `ResultPool` | `fluent-concurrency::pool` | `AgentRegistry` — one pool per `(model, adapter, session)` |
+| `DependencyGraph<K>` | `fluent-dag::dep_graph` | `DependencySession` for step DAG tracking |
+| `ResultPool` | `fluent-concurrency::pool` | `guidance-llm` request queue (`src/llm/src/client.rs`) |
 | `PriorityResultPool` | `fluent-concurrency::pool` | `AffinityScheduler` — priority dispatch with aging |
 | `Limiter` | `fluent-concurrency::pool` | `ClassifierStage` — concurrent classifier call cap; `charts/compile.rs` + `charts/execute.rs` — chart-DAG execution cap |
 | `WorkContext` | `fluent-wvr` | Carries request, caps, runtime through every stage |
 | `Runtime` trait | `fluent-wvr` | Plugged via `fluent_concurrency::tokio_runtime()` everywhere |
-| `LatencyHistogram` | `common-core::metrics` | `RouterMetrics` — per-model and per-agent latency |
+| `LatencyHistogram` | `common-core::metrics` | `Instrumented::with_metrics` wiring + `bin/guidance` histogram |
 | `open_wal()` | `common-core::sqlite` | `ContentNodeLedger` — WAL-mode SQLite with busy timeout |
 | `HttpClass` | `guidance-llm` | `dispatch/backend.rs` — status classification in `OpenAiChatBackend` (streaming + buffered) |
 | `DispatchError::is_retryable()` | `fluent-router` | `dispatch/frontier.rs` — retry/fallback decisions in `dispatch/backend.rs` and `server/dispatch.rs` |

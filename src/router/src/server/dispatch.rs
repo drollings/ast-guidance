@@ -38,6 +38,7 @@ pub async fn handle_dispatch(
 
     if !target_streams {
         if let Some(cache_backend) = cache {
+            // Boundary: the cache key is the serialized request body.
             let request_json = serde_json::to_string(router_request).unwrap_or_default();
             if let Some(cached) = cache_backend.get(&rt.model, &request_json) {
                 stats
@@ -239,6 +240,7 @@ async fn dispatch_to_single_target(
     // Cache only the primary (first) target's response
     if is_primary {
         if let Some(cache_backend) = cache {
+            // Boundary: the cache key is the serialized request body.
             let request_json = serde_json::to_string(router_request).unwrap_or_default();
             if let Ok(response_json) = serde_json::to_value(&completion) {
                 cache_backend.set(&target.model, &request_json, response_json);

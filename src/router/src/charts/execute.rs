@@ -35,7 +35,6 @@ use crate::charts::stage::{CHART_OUTPUT_META_KEY, CHART_TARGET_META_KEY};
 use crate::charts::store::ChartStore;
 use crate::charts::{ChartDef, ChartError, ChartRubric};
 use crate::pipeline_types::StageDecision;
-use crate::stages::switch::mirror_stage_metadata;
 
 use super::binding::Entity;
 
@@ -196,7 +195,7 @@ impl ChartExecutionPlan {
     /// target's dependents never become ready (they land in `cancelled`).
     ///
     /// `base_ctx` must carry the request (`request`) and, when the chart has
-    /// entity deps, the bound entities (`entities_json`).
+    /// entity deps, the bound entities (structured `entities`).
     pub async fn execute(
         &self,
         base_ctx: &WorkContext,
@@ -473,7 +472,8 @@ impl ChartExecutionPlan {
 }
 
 /// Build a target's execution context: the base request/entities plus the
-/// accumulated `stage.{id}.*` metadata of all completed upstream targets.
+/// accumulated `stage.{id}` structured metadata of all completed upstream
+/// targets (raw `serde_json::Value`, one entry per upstream).
 fn build_target_context(
     base: &WorkContext,
     target: &CompiledTarget,
@@ -481,7 +481,8 @@ fn build_target_context(
 ) -> WorkContext {
     let mut ctx = base.clone();
     for (id, decision) in completed {
-        mirror_stage_metadata(&mut ctx.metadata, id, &decision.metadata);
+        ctx.structured
+            .insert(format!("stage.{id}"), decision.metadata.clone());
     }
     // Make the target's own name visible as metadata for rendering/audit.
     ctx.metadata.insert(
@@ -614,10 +615,7 @@ mod tests {
             "messages": [{"role": "user", "content": text}]
         });
         let mut ctx = WorkContext::default();
-        ctx.metadata.insert(
-            "request".into(),
-            MetadataValue::String(request_json.to_string()),
-        );
+        ctx.set_structured("request", &request_json);
         ctx
     }
 
@@ -960,11 +958,11 @@ mod tests {
         opts.score = Some(0.99);
 
         // The ctx must carry both the request and the bound entities — the
-        // stages re-bind from `entities_json` at execution time.
+        // stages re-bind from the structured `entities` at execution time.
         let mut ctx = make_ctx("app crashes on startup");
-        ctx.metadata.insert(
-            crate::charts::binding::ENTITIES_META_KEY.into(),
-            MetadataValue::String(serde_json::to_string(std::slice::from_ref(&entity)).unwrap()),
+        ctx.set_structured(
+            crate::charts::binding::ENTITIES_META_KEY,
+            &std::slice::from_ref(&entity),
         );
 
         let summary = plan

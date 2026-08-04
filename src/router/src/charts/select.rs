@@ -169,17 +169,21 @@ impl ChartSelector {
     /// whole-identifier matches (`contains_ident_word` treats `_` as a
     /// boundary, so `bug_triage` is nameable as `bug_triage`).
     fn deterministic_hit(&self, request: &str) -> Option<Arc<ChartDef>> {
-        for chart in self.store.charts_sorted() {
+        let sorted = self.store.charts_sorted();
+        for chart in &sorted {
             if contains_ident_word(request, &chart.name) {
-                return Some(chart);
+                return Some(chart.clone());
             }
         }
-        self.store.charts_sorted().into_iter().find(|chart| {
-            chart
-                .targets
-                .iter()
-                .any(|t| t.provides.iter().any(|p| contains_ident_word(request, p)))
-        })
+        sorted
+            .iter()
+            .find(|chart| {
+                chart
+                    .targets
+                    .iter()
+                    .any(|t| t.provides.iter().any(|p| contains_ident_word(request, p)))
+            })
+            .cloned()
     }
 
     /// Step 2: top-k charts by similarity to the embedded raw request,
@@ -509,50 +513,13 @@ fn build_adjudicator_prompt(
 
 /// Parse an adjudicator response into a `ChartMatch`-shaped verdict.
 ///
-/// Tolerant by design (mirrors `parse_classifier_response`): strip markdown
-/// code fences, then fast-path a direct parse; on failure, extract the first
-/// `{...}` object and sanitize missing fields to defaults.
+/// Tolerant by design (mirrors `parse_classifier_response`): the shared
+/// `guidance_llm::parse_json_response` strips markdown code fences, fast-paths
+/// a direct parse, then extracts the first `{...}` object; missing fields are
+/// sanitized to defaults.
 fn parse_adjudicator_output(raw: &str) -> Option<AdjudicatorOutput> {
-    let cleaned = strip_code_fences(raw);
-    let value = match serde_json::from_str::<serde_json::Value>(cleaned) {
-        Ok(v) => v,
-        Err(_) => extract_first_json_object(cleaned)?,
-    };
+    let value = guidance_llm::parse_json_response(raw).ok()?;
     sanitize_adjudicator_output(&value)
-}
-
-/// Strip a surrounding markdown code fence, if present.
-fn strip_code_fences(raw: &str) -> &str {
-    let trimmed = raw.trim();
-    let after_open = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .unwrap_or(trimmed);
-    after_open.trim_end_matches("```").trim()
-}
-
-/// Extract the first `{...}` JSON object from an otherwise-noisy response.
-fn extract_first_json_object(raw: &str) -> Option<serde_json::Value> {
-    let start = raw.find('{')?;
-    let end = raw.rfind('}')?;
-    if end <= start {
-        return None;
-    }
-    serde_json::from_str(&raw[start..=end]).ok()
-}
-
-/// Extract the first JSON value (array or object) from a noisy response.
-/// Mirrors `extract_first_json_object` but tolerates a leading `[...]`.
-fn extract_first_json_value(raw: &str) -> Option<serde_json::Value> {
-    if let Some(start) = raw.find('[') {
-        let end = raw.rfind(']')?;
-        if end > start {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw[start..=end]) {
-                return Some(v);
-            }
-        }
-    }
-    extract_first_json_object(raw)
 }
 
 /// Fill missing adjudicator fields with defaults (sanitize philosophy).
@@ -633,15 +600,13 @@ fn build_rerank_prompt(request: &str, candidates: &[(String, f64)], store: &Char
 
 /// Parse a reranker response into an ordered list of candidate names.
 ///
-/// Tolerant by design (mirrors `parse_adjudicator_output`): strip fences,
-/// accept a bare array or a `{"ranking": [...]}` object, and drop non-string
-/// entries. `None` means "not parseable" — the caller keeps the HNSW order.
+/// Tolerant by design (mirrors `parse_adjudicator_output`): the shared
+/// `guidance_llm::parse_json_response` strips fences, accepts a bare array or
+/// a `{"ranking": [...]}` object, and extracts the first balanced JSON value.
+/// Non-string entries are dropped. `None` means "not parseable" — the caller
+/// keeps the HNSW order.
 fn parse_rerank_output(raw: &str) -> Option<Vec<String>> {
-    let cleaned = strip_code_fences(raw);
-    let value = match serde_json::from_str::<serde_json::Value>(cleaned) {
-        Ok(v) => v,
-        Err(_) => extract_first_json_value(cleaned)?,
-    };
+    let value = guidance_llm::parse_json_response(raw).ok()?;
     let names: Option<Vec<&str>> = match &value {
         serde_json::Value::Array(arr) => Some(arr.iter().filter_map(|v| v.as_str()).collect()),
         serde_json::Value::Object(obj) => obj
@@ -702,15 +667,12 @@ fn build_ambiguity_prompt(amb: &AmbiguousDep) -> String {
 
 /// Parse an ambiguity-adjudicator response into a candidate entity id.
 ///
-/// Tolerant by design: strips code fences, fast-paths a direct parse, and on
-/// failure extracts the first `{...}` object. Returns `None` when the id is
-/// missing or empty — the caller falls back to the deterministic tie-break.
+/// Tolerant by design: the shared `guidance_llm::parse_json_response` strips
+/// code fences and extracts the first `{...}` object. Returns `None` when the
+/// id is missing or empty — the caller falls back to the deterministic
+/// tie-break.
 fn parse_ambiguity_output(raw: &str) -> Option<String> {
-    let cleaned = strip_code_fences(raw);
-    let value = match serde_json::from_str::<serde_json::Value>(cleaned) {
-        Ok(v) => v,
-        Err(_) => extract_first_json_object(cleaned)?,
-    };
+    let value = guidance_llm::parse_json_response(raw).ok()?;
     let id = value
         .as_object()?
         .get("entity_id")

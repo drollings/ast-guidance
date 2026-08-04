@@ -91,7 +91,10 @@ When a unit fails/panics/times out, `cancel_dependents_of(name)` (`zone.rs:189-2
 
 - Yields once before the first attempt so pending abort signals are processed.
 - Calls `unit.execute(&ctx)`.
-- On `Err(WorkError)`, sleeps `100 * attempts` ms and retries up to `max_retries` times.
+- On `Err(WorkError)`, sleeps the shared jittered-exponential backoff
+  (`common_core::retry::retry_async` with base 100ms — first retry ≈ 100ms,
+  100/200/400… — per the D5 schedule change in ROADMAP_20260804_DRY) and
+  retries up to `max_retries` times.
 - Wraps the whole thing in `tokio::time::timeout(timeout_ms, …)`; on timeout returns `Err(WorkError::Timeout { duration_ms, unit })`.
 
 **Panic propagation**: panics are *not* caught via `catch_unwind`. They propagate through `JoinSet` as `JoinError::Panic`, which `Zone::poll` intercepts (`zone.rs:256-285`) and records as `ZoneEvent::Panicked`. This is deliberate: a `catch_unwind` would lose the panic site and prevent the dependency-aware cancellation graph from firing.
@@ -323,9 +326,10 @@ The `fluent-wvr` crate defines `Component`, `WorkUnit`, `FieldAccess`, `Describa
 **Wrappers from `fluent-wvr`**:
 
 - `Instrumented<U>` — wraps any `WorkUnit`/`Component` with `tracing::info!` timing on every `execute`, plus optional `Arc<LatencyHistogram>` recording via `Instrumented::with_metrics(inner, label, histogram)`. The histogram is the canonical latency surface from `common_core::metrics`.
-- `WithRetry<U>` — wraps any `WorkUnit`/`Component` with jittered-exponential retry. Configurable via `WithRetry::new(inner, max_attempts, backoff_ms)` (default 50% jitter) or `WithRetry::new_jittered(inner, max_attempts, base_ms, jitter_pct)` (0–100, clamped).
-- `ComponentAdapter` — runtime override of `name`, `execute`, and any field on a `Component`. `set_field` forwards via `Arc::get_mut` when possible and otherwise stores an override on the adapter. This is the only wrapper that handles the shared-Arc case correctly. `Instrumented` and `WithRetry` are *transparent* wrappers: their `FieldAccess` impls delegate `set_field`/`get_field`/`field_names` straight to the inner type (requiring exclusive access to the inner or interior mutability), matching the delegation semantics of their `WorkUnit` impls.
-- `retry_call(max_attempts, base_ms, f)` — the free-function sync retry with the same jittered-exponential backoff as `WithRetry`. Returns `Result<RetryResult<T>, E>` where `RetryResult` carries the attempt count.
+- `ComponentAdapter` — runtime override of `name`, `execute`, and any field on a `Component`. `set_field` forwards via `Arc::get_mut` when possible and otherwise stores an override on the adapter. This is the only wrapper that handles the shared-Arc case correctly. `Instrumented` is a *transparent* wrapper: its `FieldAccess` impls delegate `set_field`/`get_field`/`field_names` straight to the inner type (requiring exclusive access to the inner or interior mutability), matching the delegation semantics of its `WorkUnit` impls.
+- `retry_call(max_attempts, base_ms, f)` — the synchronous free-function retry (explicitly blocking, never for `execute` bodies) with jittered-exponential backoff. Returns `Result<RetryResult<T>, E>` where `RetryResult` carries the attempt count. The async canonical path is `common_core::retry::retry_async`.
+
+**Retry**: there is no `WithRetry` wrapper (deleted by the M5 DRY consolidation — it slept with `std::thread::sleep` inside `execute`, violating the WorkUnit purity contract). The single jittered-exponential backoff helper lives in `common_core::retry` (`backoff_ms` / `retry_async`); `Zone` drives per-attempt timeout, `WorkError::Timeout` routing, and dependency cancellation on top of it.
 
 **Macros from `fluent-wvr`**:
 
@@ -334,7 +338,13 @@ The `fluent-wvr` crate defines `Component`, `WorkUnit`, `FieldAccess`, `Describa
 
 **Arc blanket impls** (`fluent-wvr/src/lib.rs:50-129`): the type `Arc<dyn Component>` is the universal wire type. Blanket impls provide `WorkUnit`/`FieldAccess`/`Describable`/`Component` for `Arc<dyn Component>` and `WorkUnit` for `Arc<dyn WorkUnit>`. The latter exists for cases where the implementor doesn't need the full `Component` surface. This is the boundary that lets `Zone`, `ComponentAdapter`, and any orchestrator dispatch through a uniform `Arc<dyn Component>` without knowing the concrete type.
 
-**Cross-cutting concerns** (retry, timing, rate limiting) are applied via these wrappers *before* type erasure, preserving zero-cost inlining. Note that `Zone` also has its own internal retry (per-task, with 100ms backoff and a `WorkContext`-driven timeout) — this is *not* a third implementation of the same algorithm, but rather the zone-level primitive that exists because the wrapper-level retry is single-shot (per `submit`-equivalent), whereas the zone manages a long-lived set of units with retries driven by `WorkContext::max_retries` and `WorkContext::timeout_ms`.
+**Cross-cutting concerns** (timing, rate limiting) are applied via the
+`Instrumented` wrapper *before* type erasure, preserving zero-cost inlining.
+Retry composes `common_core::retry` (the single jittered-exponential backoff
+helper); `Zone` has its own per-task retry loop (driven by
+`WorkContext::max_retries` / `WorkContext::timeout_ms`, sleeping via the
+shared helper) that exists because the zone manages a long-lived set of units
+with dependency cancellation, whereas the helper is per-call.
 
 ## 5. Performance & Locality Guarantees
 
@@ -365,7 +375,7 @@ The crate is no longer "proposed" — it ships. The current `Cargo.toml`:
 - `reqwest` — backing HTTP client for `NetCapability`
 - `common-core` (with `sqlite` feature) — `LatencyHistogram` (used by `Instrumented::with_metrics` in `fluent-wvr` consumers) and `open_wal` for `DbCapability`'s connection pool
 - `rusqlite` — backing driver for `DbCapability`
-- `fastrand` — seeded PRNG for `TestRuntime` and jitter in `WithRetry` / `retry_call`
+- `fastrand` — seeded PRNG for `TestRuntime` and jitter in `common_core::retry` / `retry_call`
 - `internment` (with `arc` and `serde` features) — `ArcIntern<str>` for work unit names, dependency asset names, and configuration keys
 
 **Dev-dependencies:**
@@ -381,7 +391,7 @@ No `async-trait`, no `bumpalo`, no `crossbeam`. Tokio's channels, `Notify`, and 
 1. **No `#[async_trait]` or macro-heavy execution.** The framework uses manual `Future` impls and `async fn` where the compiler can see the boundaries. The `Zone` is a hand-written `impl Future` (`zone.rs:207-310`); `Scope` uses `tokio::task::JoinSet` directly.
 2. **No `tokio::spawn` without a scope.** The `tokio::spawn` calls in the crate are limited to: `Scope::close` (drain) and `Scope::close_graceful` (drain); `Zone`'s `JoinSet`; `WorkerPool`/`ResultPool`/`PriorityResultPool` worker loops; and `DbCapability::query`/`execute` (which `spawn_blocking` for sync `rusqlite` work). Every async effect outside these sites flows through `Scope::spawn` (which tracks the handle) or through a pool (which tracks workers).
 3. **No `dyn Trait` in a per-item loop.** The `PartitionedRouter` hashes once per submit; `PriorityQueue` dispatches via `BTreeMap` keys, not vtables; `CapabilitySet::get` uses `TypeId` (pointer-sized) rather than string comparison; `PartitionedRouter` does no per-job vtable dispatch.
-4. **No ambient `tokio::fs::read` or `tokio::time::sleep`.** All I/O is called through a capability method (`FsCapability::read`, `NetCapability::http_get`, `DbCapability::query`, etc.) which calls `check_capability(self)` first. `tokio::time::sleep` is allowed in the framework's own internals (Zone retry, Zone timeout) and in the `Runtime::sleep` backend, but consumer code is expected to use `Limiter::run`, `WithRetry`, or `Zone` rather than calling it directly.
+4. **No ambient `tokio::fs::read` or `tokio::time::sleep`.** All I/O is called through a capability method (`FsCapability::read`, `NetCapability::http_get`, `DbCapability::query`, etc.) which calls `check_capability(self)` first. `tokio::time::sleep` is allowed in the framework's own internals (Zone retry, Zone timeout) and in the `Runtime::sleep` backend, but consumer code is expected to use `Limiter::run`, `common_core::retry`, or `Zone` rather than calling it directly.
 5. **No automatic restart.** Zones contain; they do not restart. Restart is a deliberate operator action.
 
 ## 8. Dependency Resolution with DependencyGraph

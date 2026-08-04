@@ -571,16 +571,18 @@ handled a given request, why, and what it cost.
 - **Escalation ladder** as a configurable per-group sequence of frontier
   engagement modes (filter → question → team → turnover), tried in order
   after all local models fail. Each mode is a progressively more permissive
-  policy for crossing the local-to-frontier boundary. Config-only today; the
-  binary emits a startup warning if an escalation ladder is configured (see
-  M5.3).
+  policy for crossing the local-to-frontier boundary. The ladder taxonomy is
+  canonical: `frontier/modes.rs` defines `EscalationMode { Filter, Question,
+  Team, Turnover }` (decision D8 of `ROADMAP_20260804_DRY` — the old
+  `FrontierMode` "four involvement modes" enum is gone). The *runtime* is
+  forward track: `execute_frontier_mode` is a typed stub returning
+  `ServerError::FrontierNotImplemented`, and the binary emits a startup
+  warning if an escalation ladder is configured (see
+  `config/unimplemented.rs`). Per-mode local model roles (decomposer,
+  assembler, draft, judge) and parallel-classifier fan-out are specified in
+  the ladder docs but not yet backed by `ResultPool` or `Zone` supervision.
 - The `rigor` route — types and structure exist; execution is not yet wired
   to live agents.
-- Four frontier involvement modes — enum and signature only; escalation ladder
-  (filter/question/team/turnover) is designed and config-specified but not
-  yet wired to live dispatch. Per-mode local model roles (decomposer,
-  assembler, draft, judge) and parallel-classifier fan-out are specified in
-  config but not yet backed by `ResultPool` or `Zone` supervision.
 - Origin-typed Content Nodes and the dedicated `audit`/`concern` node
   convention.
 
@@ -606,7 +608,7 @@ Core modules decomposed for Single Responsibility:
 - `coral/src/cache/` — reactor.rs, stats.rs
 
 Key architectural improvements:
-- `OrchestratorSession`, `ResultScorer`, `Summarizer` now accept `Arc<dyn ChatBackend>` (DIP)
+- `ResultScorer`, `Summarizer` now accept `Arc<dyn ChatBackend>` (DIP). (`OrchestratorSession` also did at the time; it was folded into `ContentNodeLedger` by the D6 session/ledger consolidation on 2026-08-04.)
 - `ClassifierStage` also takes `Arc<dyn ChatBackend>` (DIP)
 - PII regex patterns centralized in `guidance_llm::pii_patterns` (DRY)
 - Think-block stripping canonical in `common_core::string` (DRY)

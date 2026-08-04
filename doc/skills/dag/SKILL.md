@@ -1,7 +1,7 @@
 # fluent-dag — Dependency Graph & DAG-driven Workflows
 
 **Context**: `fluent-dag` (`src/dag/`) provides the canonical dependency-tracking
-primitive for the workspace, plus an executor, resolver, work-unit dispatcher,
+primitive for the workspace, plus a resolver, work-unit dispatcher, the
 type-inference engine, target registry, and capability-based middleware.
 
 **Prime directive**: Never re-implement graph algorithms. Always compose
@@ -64,7 +64,6 @@ indefinitely. `topo_sort` returns `Err(GraphError::Cycle)` on cycles.
 |----------|---------------|------|
 | `Zone` (fluent-concurrency) | Task supervision cancellation tree | `src/fluent-concurrency/src/zone.rs` |
 | `DependencySession` (fluent-router) | Session step DAG with checkpoint/rewind | `src/router/src/dag_session.rs` |
-| `PipelineGraph` (fluent-router) | Pipeline stage topology with dynamic stage routing | `src/router/src/pipeline_graph.rs` |
 
 ## When to use
 
@@ -94,13 +93,14 @@ for node in graph.topo_sort()? {
 
 | Module | Purpose | Path |
 |--------|---------|------|
-| `executor` | Executes a sequence of targets through the graph | `src/dag/src/executor.rs` |
+| `executor` | ~~Sequential target executor~~ **pruned (M2)** — run plans under `Zone` via the `TargetWorkUnit` bridge instead | (`deleted`; see `target_work_unit`) |
 | `resolver` | Resolves abstract dependencies to concrete targets; `ProviderSelection::{All, NarrowOne}` policy | `src/dag/src/resolver.rs` |
+| `target_work_unit` | `TargetWorkUnit` — `Target` → `WorkUnit` bridge (`from_target`), runnable under `Zone` supervision | `src/dag/src/target_work_unit.rs` |
 | `closure` | Shared transitive-closure primitive (DFS over depends edges) — `pub(crate)` | `src/dag/src/closure.rs` |
 | `narrowing` | Narrowing pipeline (essential/strict-sat/locality/no-dep) + error constructors — `pub(crate)` | `src/dag/src/narrowing.rs` |
 | `work_unit` | CommandUnit — shell command wrapper implementing `Component` | `src/dag/src/work_unit.rs` |
 | `target` | Target + TargetRegistry + re-export of `CapabilityRegistry` from `common_core::interner` | `src/dag/src/target.rs` |
-| `middleware` | TimingMiddleware, RetryMiddleware, MiddlewareChain | `src/dag/src/middleware.rs` |
+| `middleware` | TimingMiddleware + MiddlewareChain (RetryMiddleware deleted — retry composes `common_core::retry`/`Zone`) | `src/dag/src/middleware.rs` |
 | `type_inference` | Class hierarchy / subtyping for target resolution | `src/dag/src/type_inference.rs` |
 | `wvr` | Re-exports `fluent_wvr` core types for DAG integration | `src/dag/src/wvr.rs` |
 | `yamake_loader` | JSON loader for yamake-compatible target definitions with self-provision for File/Phony targets | `src/dag/src/yamake_loader.rs` |
@@ -164,8 +164,9 @@ different uncontested capability Y.
 
 `resolver::resolve(target_names)` returns `ExecutionPlan { order, target_names }`
 — a topologically-sorted list of target bit-indices and their human-readable
-names. The `executor` module runs targets in `plan.order` sequence, dispatching
-by `ExecutorKind`.
+names. Run the plan by mapping each target to a `TargetWorkUnit` via
+`TargetWorkUnit::from_target` and executing it (sequentially in `plan.order`,
+or as a supervision `Zone` that runs independent waves concurrently).
 
 ### Error Types (from `common_core::error::ResolverError`)
 

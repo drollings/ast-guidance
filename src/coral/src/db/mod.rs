@@ -580,9 +580,15 @@ mod tests {
             drop(conn);
             let candidates: Vec<(usize, Vec<f32>)> = rows
                 .into_iter()
-                .filter_map(|(i, b)| search_vector::math::try_bytes_to_vec(&b).map(|v| (i as usize, v)))
+                .filter_map(|(i, b)| {
+                    search_vector::math::try_bytes_to_vec(&b).map(|v| (i as usize, v))
+                })
                 .collect();
-            let _legacy = knn_brute_force(&query, candidates.into_iter(), 10);
+            let _legacy = knn_brute_force(
+                &query,
+                candidates.iter().map(|(i, b)| (*i, b.as_slice())),
+                10,
+            );
         }
         let legacy_elapsed = start.elapsed();
 

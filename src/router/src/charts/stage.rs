@@ -235,23 +235,7 @@ impl WorkUnit for ChartPromptStage {
     }
 }
 
-impl FieldAccess for ChartPromptStage {
-    fn set_field(&mut self, _name: &str, _value: &str) -> Result<(), FieldError> {
-        Err(FieldError::NotFound(
-            "ChartPromptStage has no configurable fields".into(),
-        ))
-    }
-
-    fn get_field(&self, _name: &str) -> Result<String, FieldError> {
-        Err(FieldError::NotFound(
-            "ChartPromptStage has no configurable fields".into(),
-        ))
-    }
-
-    fn field_names(&self) -> &'static [&'static str] {
-        &[]
-    }
-}
+impl_fieldless!(ChartPromptStage);
 
 impl Describable for ChartPromptStage {
     fn describe(&self) -> serde_json::Value {
@@ -272,11 +256,10 @@ impl_component!(ChartPromptStage);
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
-/// Read prior chart-target outputs from the `stage.{id}.output` metadata
-/// mirror. `PipelineGraph` promotes each chart stage's decision metadata
-/// under `stage.{stage_id}.` and serializes non-scalar values (like the
-/// `output` object) to JSON strings so they survive the scalar-only
-/// `MetadataValue` boundary.
+/// Read prior chart-target outputs from the structured `stage.{id}` channel.
+/// The executor (`ChartExecutionPlan::execute`) stores each completed
+/// upstream target's full decision metadata under `structured["stage.{id}"]`;
+/// the `output` field within it is the structured output value.
 ///
 /// The returned map wraps each output under an `output` key so templates
 /// access it as `upstream.<stage_id>.output` (the documented contract in
@@ -287,10 +270,13 @@ fn read_metadata_json(
 ) -> HashMap<String, serde_json::Value> {
     let mut upstream = HashMap::new();
     for id in upstream_ids {
-        let key = format!("stage.{id}.{CHART_OUTPUT_META_KEY}");
-        if let Some(MetadataValue::String(raw)) = ctx.metadata.get(&key) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
-                upstream.insert(id.clone(), serde_json::json!({ CHART_OUTPUT_META_KEY: v }));
+        let key = format!("stage.{id}");
+        if let Some(meta) = ctx.structured.get(&key) {
+            if let Some(output) = meta.get(CHART_OUTPUT_META_KEY) {
+                upstream.insert(
+                    id.clone(),
+                    serde_json::json!({ CHART_OUTPUT_META_KEY: output.clone() }),
+                );
             }
         }
     }
@@ -299,21 +285,15 @@ fn read_metadata_json(
 
 /// Parse a chart-target LLM response into a structured `output` value.
 ///
-/// Sanitization policy: trim, strip common markdown code fences
-/// (```` ```json ```` / ```` ``` ````), then parse as JSON. Unparseable
+/// Sanitization policy: the shared `guidance_llm::parse_json_response`
+/// trims, strips common markdown code fences (```` ```json ```` / ```` ``` ````),
+/// fast-paths a direct parse, then extracts the first JSON value. Unparseable
 /// responses fall back to a string leaf so the raw text still flows to
-/// upstream targets via `stage.{id}.output`.
+/// upstream targets via the structured `stage.{id}.output` channel.
 fn parse_output(response: &str) -> serde_json::Value {
-    let trimmed = response.trim();
-    let stripped = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .map(str::trim)
-        .and_then(|s| s.strip_suffix("```").map(str::trim))
-        .unwrap_or(trimmed);
-    match serde_json::from_str::<serde_json::Value>(stripped) {
+    match guidance_llm::parse_json_response(response) {
         Ok(v) => v,
-        Err(_) => serde_json::Value::String(trimmed.to_string()),
+        Err(_) => serde_json::Value::String(response.trim().to_string()),
     }
 }
 
@@ -329,15 +309,9 @@ mod tests {
             "messages": [{"role": "user", "content": user_text}]
         });
         let mut ctx = WorkContext::default();
-        ctx.metadata.insert(
-            "request".into(),
-            MetadataValue::String(request_json.to_string()),
-        );
+        ctx.set_structured("request", &request_json);
         if !entities.is_empty() {
-            ctx.metadata.insert(
-                super::super::binding::ENTITIES_META_KEY.into(),
-                MetadataValue::String(serde_json::to_string(entities).unwrap()),
-            );
+            ctx.set_structured(super::super::binding::ENTITIES_META_KEY, &entities);
         }
         ctx
     }
@@ -399,9 +373,9 @@ mod tests {
                 value: serde_json::json!({"title": "Segfault on load"}),
             }],
         );
-        ctx.metadata.insert(
-            "stage.reproduce.output".into(),
-            MetadataValue::String(serde_json::json!({"plan": "minimal repro"}).to_string()),
+        ctx.structured.insert(
+            "stage.reproduce".into(),
+            serde_json::json!({"output": {"plan": "minimal repro"}}),
         );
 
         let backend = StubChatBackend::always(r#"{"cause": "null pointer deref"}"#);
@@ -529,9 +503,9 @@ mod tests {
             vec!["repro_plan".to_string()],
         );
         let mut ctx = make_ctx("crash on startup", &[]);
-        ctx.metadata.insert(
-            "stage.reproduce.output".into(),
-            MetadataValue::String(serde_json::json!({"plan": "minimal repro"}).to_string()),
+        ctx.structured.insert(
+            "stage.reproduce".into(),
+            serde_json::json!({"output": {"plan": "minimal repro"}}),
         );
         stage
             .execute(&ctx)

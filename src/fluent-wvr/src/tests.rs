@@ -813,3 +813,80 @@ fn set_field_on_shared_arc_returns_readonly() {
         other => panic!("expected ReadOnly, got: {other:?}"),
     }
 }
+
+// --- `impl_fieldless!` macro tests ---
+
+struct FieldlessUnit;
+
+impl WorkUnit for FieldlessUnit {
+    fn name(&self) -> &str {
+        "fieldless"
+    }
+    fn depends(&self) -> &[ArcIntern<str>] {
+        &[]
+    }
+    fn provides(&self) -> &[ArcIntern<str>] {
+        &[]
+    }
+    fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+        Ok(WorkOutput::ok("no-op"))
+    }
+}
+
+impl Describable for FieldlessUnit {
+    fn describe(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+}
+
+impl_component!(FieldlessUnit);
+impl_fieldless!(FieldlessUnit);
+
+#[test]
+fn impl_fieldless_produces_fieldless_no_ops() {
+    let unit = FieldlessUnit;
+    assert!(unit.field_names().is_empty());
+    let err = unit.get_field("anything").unwrap_err();
+    match err {
+        FieldError::NotFound(msg) => {
+            assert_eq!(msg, "FieldlessUnit has no configurable fields")
+        }
+        other => panic!("expected NotFound, got: {other:?}"),
+    }
+    let mut unit = FieldlessUnit;
+    let err = unit.set_field("anything", "value").unwrap_err();
+    match err {
+        FieldError::NotFound(msg) => {
+            assert_eq!(msg, "FieldlessUnit has no configurable fields")
+        }
+        other => panic!("expected NotFound, got: {other:?}"),
+    }
+}
+
+struct GenericFieldlessWrapper<U> {
+    inner: U,
+}
+impl<U: Component> WorkUnit for GenericFieldlessWrapper<U> {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn depends(&self) -> &[ArcIntern<str>] {
+        self.inner.depends()
+    }
+    fn provides(&self) -> &[ArcIntern<str>] {
+        self.inner.provides()
+    }
+    fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+        self.inner.execute(ctx)
+    }
+}
+impl_fieldless!(generic (U: Component + 'static) for GenericFieldlessWrapper<U>);
+
+#[test]
+fn impl_fieldless_generic_arm_works() {
+    let wrapped = GenericFieldlessWrapper {
+        inner: FieldlessUnit,
+    };
+    assert!(wrapped.field_names().is_empty());
+    assert!(wrapped.get_field("x").is_err());
+}

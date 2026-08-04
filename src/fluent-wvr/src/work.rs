@@ -114,6 +114,7 @@ impl std::fmt::Display for WorkOutput {
 ///     max_retries: 3,
 ///     timeout_ms: 10_000,
 ///     metadata: Default::default(),
+///     structured: Default::default(),
 ///     rt: Arc::new(NoopRuntime),
 ///     caps: CapabilitySet::new(),
 /// };
@@ -125,6 +126,13 @@ pub struct WorkContext {
     pub max_retries: u32,
     pub timeout_ms: u64,
     pub metadata: HashMap<String, MetadataValue>,
+    /// Typed/structured metadata channel. Unlike `metadata` (scalar
+    /// `MetadataValue`), this holds arbitrary `serde_json::Value` payloads —
+    /// the canonical home for structured handoffs such as the serialized
+    /// `RouterRequest` (`"request"`), bound chart entities (`"entities"`),
+    /// and per-stage outputs (`"stage.{id}"`). Crosses crate boundaries as
+    /// `serde_json::Value` only (never a domain type).
+    pub structured: HashMap<String, serde_json::Value>,
     pub rt: Arc<dyn Runtime>,
     pub caps: CapabilitySet,
 }
@@ -136,6 +144,7 @@ impl std::fmt::Debug for WorkContext {
             .field("max_retries", &self.max_retries)
             .field("timeout_ms", &self.timeout_ms)
             .field("metadata", &self.metadata)
+            .field("structured", &self.structured)
             .field("rt", &"<dyn Runtime>")
             .field("caps", &self.caps)
             .finish()
@@ -149,6 +158,7 @@ impl Default for WorkContext {
             max_retries: 0,
             timeout_ms: 30_000,
             metadata: HashMap::new(),
+            structured: HashMap::new(),
             rt: Arc::new(NoopRuntime),
             caps: CapabilitySet::new(),
         }
@@ -164,8 +174,29 @@ impl WorkContext {
             max_retries: 0,
             timeout_ms: unit.default_timeout_ms(),
             metadata: HashMap::new(),
+            structured: HashMap::new(),
             rt: Arc::new(NoopRuntime),
             caps,
+        }
+    }
+
+    /// Read a structured value by key, deserializing it to a typed value.
+    /// The single place that does `serde_json::from_value` for the channel.
+    pub fn structured<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<T, WorkError> {
+        let value = self.structured.get(key).ok_or_else(|| {
+            WorkError::Execution(format!("structured metadata key not found: {key}"))
+        })?;
+        serde_json::from_value(value.clone())
+            .map_err(|e| WorkError::Execution(format!("structured metadata key {key:?}: {e}")))
+    }
+
+    /// Write a structured value by key, serializing a typed value.
+    /// The single place that does `serde_json::to_value` for the channel.
+    /// A serialization failure is silently skipped (matches the typed-setter
+    /// convention of `StageMetadata`).
+    pub fn set_structured<T: serde::Serialize>(&mut self, key: &str, value: &T) {
+        if let Ok(v) = serde_json::to_value(value) {
+            self.structured.insert(key.to_string(), v);
         }
     }
 

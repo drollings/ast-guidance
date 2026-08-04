@@ -13,6 +13,38 @@ pub struct CommandUnit {
     provides: Vec<ArcIntern<str>>,
 }
 
+/// Shared shell-execution semantics for `CommandUnit` and `TargetWorkUnit`.
+///
+/// Single source of truth for the `dry_run` / no-op / `run_shell_capture`
+/// contract so the two shell-backed work units never diverge.
+pub(crate) fn run_shell_command(
+    name: &str,
+    command: &str,
+    ctx: &WorkContext,
+) -> Result<WorkOutput, WorkError> {
+    if ctx.dry_run {
+        return Ok(WorkOutput::ok(format!(
+            "[DRY-RUN] would execute: {command}"
+        )));
+    }
+    if command.is_empty() {
+        return Ok(WorkOutput::ok(format!("no-op: {name}")));
+    }
+    let output = common_core::shell::run_shell_capture(command)
+        .map_err(|e| WorkError::Execution(format!("command failed: {e}")))?;
+    if output.success {
+        Ok(WorkOutput::ok_with_data(
+            format!("{name} completed"),
+            serde_json::json!({"stdout": output.stdout}),
+        ))
+    } else {
+        Err(WorkError::Execution(format!(
+            "{name} failed: {}",
+            output.stderr
+        )))
+    }
+}
+
 impl WorkUnit for CommandUnit {
     fn name(&self) -> &str {
         &self.name
@@ -24,28 +56,7 @@ impl WorkUnit for CommandUnit {
         &self.provides
     }
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-        if ctx.dry_run {
-            return Ok(WorkOutput::ok(format!(
-                "[DRY-RUN] would execute: {}",
-                self.command
-            )));
-        }
-        if self.command.is_empty() {
-            return Ok(WorkOutput::ok(format!("no-op: {}", self.name)));
-        }
-        let output = common_core::shell::run_shell_capture(&self.command)
-            .map_err(|e| WorkError::Execution(format!("command failed: {e}")))?;
-        if output.success {
-            Ok(WorkOutput::ok_with_data(
-                format!("{} completed", self.name),
-                serde_json::json!({"stdout": output.stdout}),
-            ))
-        } else {
-            Err(WorkError::Execution(format!(
-                "{} failed: {}",
-                self.name, output.stderr
-            )))
-        }
+        run_shell_command(&self.name, &self.command, ctx)
     }
 }
 

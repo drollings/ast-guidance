@@ -78,11 +78,8 @@ fn route(
     pipeline: &PipelineOrchestrator,
     request: &RouterRequest,
 ) -> Result<PipelineResult, WorkError> {
-    let request_json = serde_json::to_string(request)
-        .map_err(|e| WorkError::Execution(format!("serialization error: {e}")))?;
     let mut ctx = WorkContext::default();
-    ctx.metadata
-        .insert("request".into(), MetadataValue::String(request_json));
+    ctx.set_structured("request", request);
     let output = pipeline.execute(&ctx)?;
     output
         .data_take()

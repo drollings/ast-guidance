@@ -142,22 +142,24 @@ fn log_classifier_raw_response(response: &str) {
     );
 }
 
+// LLM boundary: parse the classifier's raw LLM response text (JSON in a
+// string from the model). The tolerant pipeline (fence-strip → parse →
+// extract-first-value) is the shared `guidance_llm::parse_json_response`
+// (M7.4). `true` = pristine parse, `false` = recovered via sanitization.
 fn parse_classifier_response(response: &str, default_route: &str) -> (ClassifierOutput, bool) {
     // Fast path: try direct parse first
     if let Ok(o) = serde_json::from_str::<ClassifierOutput>(response) {
         return (o, true);
     }
 
-    // Slow path: sanitize partial JSON
-    let raw: serde_json::Value = match serde_json::from_str(response) {
+    // Slow path: sanitize partial JSON via the shared tolerant parser
+    let raw: serde_json::Value = match guidance_llm::parse_json_response(response) {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(
                 target: "router.pipeline.stage2",
                 error = %e,
                 raw_response_len = response.len(),
-                error_line = e.line(),
-                error_column = e.column(),
                 "classifier LLM response was not valid JSON at all — falling back to default route",
             );
             log_classifier_raw_response(response);
@@ -355,39 +357,29 @@ fn build_routing_target_value(
     routing_config: &RoutingConfig,
     min_complexity: Option<u8>,
 ) -> serde_json::Value {
-    /// Build a single routing target JSON value from a model entry + name pair.
-    fn target_json(name: &str, entry: &crate::config::ModelEntry) -> serde_json::Value {
-        serde_json::json!({
-            "url": entry.endpoint,
-            "model": name,
-            "params": entry.params,
-            "filter_thinking": entry.filter_thinking,
-            "retry_count": entry.retry_count,
-            "retry_base_interval_s": entry.retry_base_interval_s,
-            "stream": entry.stream,
-            "idle_timeout_ms": entry.idle_timeout_ms,
-            "total_timeout_ms": entry.total_timeout_ms,
-        })
-    }
-
+    // Canonical mapping (M7.3): build a typed `RoutingTarget` via
+    // `from_model_entry` so `params`, `stream`, `filter_thinking`,
+    // `idle_timeout_ms`, `total_timeout_ms`, and `retry_count` travel
+    // identically on every dispatch path. `model_name` is already the
+    // resolved name (`entry.name` or the config key) — `from_model_entry`
+    // reproduces it exactly, so the emitted `model` field is unchanged.
     let group = routing_config
         .routes
         .get(route_name)
         .or_else(|| routing_config.routes.get(&routing_config.default_route))
         .map_or(String::new(), |r| r.group.clone());
 
-    let fallbacks: Vec<serde_json::Value> = routing_config
+    let mut rt = crate::pipeline::RoutingTarget::from_model_entry(model_name, model);
+    rt.group = Some(group);
+    rt.target_name = Some(route_name.to_string());
+    rt.fallbacks = routing_config
         .all_dispatch_targets(route_name, min_complexity)
         .into_iter()
         .skip(1) // skip the primary (already included)
-        .map(|(name, entry)| target_json(&name, &entry))
+        .map(|(name, entry)| crate::pipeline::RoutingTarget::from_model_entry(&name, &entry))
         .collect();
 
-    let mut rt = target_json(model_name, model);
-    rt["group"] = serde_json::Value::String(group);
-    rt["target_name"] = serde_json::Value::String(route_name.to_string());
-    rt["fallbacks"] = serde_json::Value::Array(fallbacks);
-    rt
+    serde_json::to_value(&rt).expect("RoutingTarget serializes to a JSON value")
 }
 
 pub struct ClassifierStage {
@@ -782,23 +774,7 @@ impl ClassifierStage {
     }
 }
 
-impl FieldAccess for ClassifierStage {
-    fn set_field(&mut self, _name: &str, _value: &str) -> Result<(), FieldError> {
-        Err(FieldError::NotFound(
-            "ClassifierStage has no configurable fields".into(),
-        ))
-    }
-
-    fn get_field(&self, _name: &str) -> Result<String, FieldError> {
-        Err(FieldError::NotFound(
-            "ClassifierStage has no configurable fields".into(),
-        ))
-    }
-
-    fn field_names(&self) -> &'static [&'static str] {
-        &[]
-    }
-}
+impl_fieldless!(ClassifierStage);
 
 impl Describable for ClassifierStage {
     fn describe(&self) -> serde_json::Value {

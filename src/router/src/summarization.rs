@@ -28,8 +28,8 @@ pub struct ScoredResult {
 
 /// Scores agent/frontier responses against a rubric using a local model.
 ///
-/// Inputs from `WorkContext` metadata:
-/// - `"request"` — original user query (JSON array of messages)
+/// Inputs from `WorkContext`:
+/// - `structured["request"]` — original user query (structured `RouterRequest`)
 /// - `"response"` — agent/frontier response text
 ///
 /// Output: `ScoredResult` in `WorkOutput.data`
@@ -126,23 +126,7 @@ impl WorkUnit for ResultScorer {
     }
 }
 
-impl FieldAccess for ResultScorer {
-    fn set_field(&mut self, _name: &str, _value: &str) -> Result<(), FieldError> {
-        Err(FieldError::NotFound(
-            "ResultScorer has no configurable fields".into(),
-        ))
-    }
-
-    fn get_field(&self, _name: &str) -> Result<String, FieldError> {
-        Err(FieldError::NotFound(
-            "ResultScorer has no configurable fields".into(),
-        ))
-    }
-
-    fn field_names(&self) -> &'static [&'static str] {
-        &[]
-    }
-}
+impl_fieldless!(ResultScorer);
 
 impl Describable for ResultScorer {
     fn describe(&self) -> serde_json::Value {
@@ -246,23 +230,7 @@ impl WorkUnit for Summarizer {
     }
 }
 
-impl FieldAccess for Summarizer {
-    fn set_field(&mut self, _name: &str, _value: &str) -> Result<(), FieldError> {
-        Err(FieldError::NotFound(
-            "Summarizer has no configurable fields".into(),
-        ))
-    }
-
-    fn get_field(&self, _name: &str) -> Result<String, FieldError> {
-        Err(FieldError::NotFound(
-            "Summarizer has no configurable fields".into(),
-        ))
-    }
-
-    fn field_names(&self) -> &'static [&'static str] {
-        &[]
-    }
-}
+impl_fieldless!(Summarizer);
 
 impl Describable for Summarizer {
     fn describe(&self) -> serde_json::Value {

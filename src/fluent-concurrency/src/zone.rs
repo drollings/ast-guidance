@@ -327,25 +327,28 @@ async fn execute_with_timeout_and_retry(
     // executing the synchronous work unit body.
     tokio::task::yield_now().await;
     let fut = async {
-        let mut attempts = 0u32;
-        loop {
-            // Allow abort signals to be processed before each attempt.
-            tokio::task::yield_now().await;
-            attempts += 1;
-            // Intentionally NOT wrapped in catch_unwind so that panics
-            // propagate through JoinSet as JoinError::Panic. This ensures
-            // Zone::poll intercepts them and triggers the dependency-aware
-            // cancellation graph via cancel_dependents_of.
-            match unit.execute(&ctx) {
-                Ok(output) => return Ok(output),
-                Err(e) => {
-                    if attempts > max_retries {
-                        return Err(e);
-                    }
-                    tokio::time::sleep(Duration::from_millis(100 * u64::from(attempts))).await;
-                }
-            }
-        }
+        // D5 (ROADMAP_20260804_DRY): the retry schedule is the canonical
+        // jittered-exponential helper from `common-core::retry`. Base 100ms
+        // keeps the first retry ≈ 100ms (deliberate schedule change from the
+        // old linear 100ms*attempt — documented in the roadmap checklist).
+        // `max_retries` counts retries after the first attempt, so the helper
+        // runs `max_retries + 1` attempts total.
+        common_core::retry::retry_async(
+            max_retries.saturating_add(1).max(1),
+            100,
+            50,
+            |_: &WorkError| true,
+            || async {
+                // Allow abort signals to be processed before each attempt.
+                tokio::task::yield_now().await;
+                // Intentionally NOT wrapped in catch_unwind so that panics
+                // propagate through JoinSet as JoinError::Panic. This ensures
+                // Zone::poll intercepts them and triggers the dependency-aware
+                // cancellation graph via cancel_dependents_of.
+                unit.execute(&ctx)
+            },
+        )
+        .await
     };
 
     if timeout_ms > 0 {

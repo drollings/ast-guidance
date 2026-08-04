@@ -252,33 +252,12 @@ fn judge_output(
     parse_judge_output(&response, rubric.min_score)
 }
 
-/// Parse a judge response (tolerant: fences + first-object extraction).
+/// Parse a judge response (tolerant: shared `parse_json_response` strips
+/// fences and extracts the first `{...}` object).
 fn parse_judge_output(raw: &str, min_score: f64) -> Result<RubricVerdict, ChartError> {
-    let trimmed = raw.trim();
-    let cleaned = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .unwrap_or(trimmed)
-        .trim_end_matches("```")
-        .trim();
-    let value = if let Ok(v) = serde_json::from_str::<serde_json::Value>(cleaned) {
-        v
-    } else {
-        let start = cleaned.find('{');
-        let end = cleaned.rfind('}');
-        match (start, end) {
-            (Some(s), Some(e)) if e > s => {
-                serde_json::from_str(&cleaned[s..=e]).map_err(|e| ChartError::Selection {
-                    reason: format!("rubric judge output unparseable: {e}"),
-                })?
-            }
-            _ => {
-                return Err(ChartError::Selection {
-                    reason: "rubric judge returned no JSON object".into(),
-                });
-            }
-        }
-    };
+    let value = guidance_llm::parse_json_response(raw).map_err(|e| ChartError::Selection {
+        reason: format!("rubric judge output unparseable: {e}"),
+    })?;
     let obj = value.as_object().ok_or_else(|| ChartError::Selection {
         reason: "rubric judge output is not a JSON object".into(),
     })?;

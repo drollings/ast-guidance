@@ -56,9 +56,11 @@ src/
     job-copilot-daemon/ job-copilot binary (serve, validate-profile, install-native-messaging, doctor)
   guidance/            guidance-core: AST parser, sync engine, query engine, config
   coral/               coral-context: graph DB, cache router, MCP server, WASM runtime
-  dag/                 guidance-dag: executor, resolver, work_unit, adapter, middleware,
-                       drift, type_inference, target, capability registry, error types,
-                       dep_graph (DependencyGraph<K> — canonical dependency-tracking primitive)
+  dag/                 guidance-dag: resolver, target_work_unit (Target → WorkUnit
+                       bridge, runnable under Zone supervision), work_unit (CommandUnit),
+                       adapter, middleware, drift, type_inference, target, capability
+                       registry, error types, dep_graph (DependencyGraph<K> — canonical
+                       dependency-tracking primitive)
   fluent-wvr/          Fluent WVR: Component, WorkUnit, FieldAccess, Describable traits
   fluent-wvr-macros/   Proc macros for FieldAccess derive
   fluent-concurrency/  WorkerPool, Scope, Limiter, PriorityQueue, CreditFlow,
@@ -79,12 +81,16 @@ src/
   job-copilot/          job-copilot-core: config, schema, sanitize, profile, dispatcher, server, components
   router/              fluent-router: LLM Router & Agent Orchestration Framework,
                        DependencySession (composes DependencyGraph), pipeline,
-                       config, stages, transforms, dispatch, watchdog, server
+                       config, stages, transforms, dispatch, server
     src/
       pipeline.rs              PipelineOrchestrator — 3-stage sequential pipeline
       server.rs                HTTP server (+ frontier dispatch after pipeline)
       config.rs                RouterConfig deserialization + pipeline builder
       normalize.rs             Request/response normalization to OpenAI format
+      ledger.rs                ContentNodeLedger — canonical ContentNode store;
+                               LOD0/LOD5 eager, LOD1–4 lazy from LOD0 via
+                               Summarizer; CompactionStrategy/RecencyCompaction
+                               (folded in from deleted compaction.rs)
       stages/
         deterministic.rs       Stage 1: command dispatch, PII detection
         classifier.rs          Stage 2: single LLM call that subsumes the former
@@ -93,11 +99,16 @@ src/
                                rejection
         common.rs              Shared stage helpers (extract_user_message, …)
         retry_classifier.rs    Retry-with-backoff wrapper over the classifier
-        switch.rs              Branching pipeline logic for conditional dispatch
         pipeline_ref.rs        Re-usable named pipeline stage
+      frontier/
+        modes.rs               EscalationMode ladder taxonomy (filter → question →
+                               team → turnover) + FrontierResult/AuditEntry;
+                               execute_frontier_mode stub (forward track)
       dispatch/
-        frontier.rs            Frontier dispatcher (OpenAI/Anthropic backends)
-        agent.rs               Agent dispatcher
+        backend.rs             ChatBackend + OpenAiChatBackend/RetryChatBackend/
+                               FallbackChatBackend (production dispatch trait)
+        frontier.rs            OpenAI/Anthropic wire-format build/parse helpers,
+                               reserved for the escalation ladder (forward track)
 extension/             Chromium MV3 extension (JS/HTML/CSS — not a Cargo crate)
 .guidance/
   guidance-config.json   Model / provider configuration
@@ -151,11 +162,12 @@ anything that knows what a "node", "session", "target", "embedding", or
 | Text utilities (`contains_ignore_case`, `truncate_at_sentence`, …) | `common-core::string` | `src/common-core/src/string.rs` |
 | Path / fs helpers (`mtime`, `read_file_alloc_err`, `write_atomic`, …) | `common-core::io` | `src/common-core/src/io.rs` |
 | Shared error leaf types (`IoError`, `SqliteError`, `ResolverError`) | `common-core::error` | `src/common-core/src/error.rs` |
-| Cross-crate magic constants (`MAX_FILE_SIZE`, `HnswParams`, …) | `common-core::constants` | `src/common-core/src/constants.rs` |
+| Cross-crate magic constants (`MAX_FILE_SIZE`, `HnswParams`, …) and the canonical timeout/retry defaults (`DEFAULT_TOTAL_TIMEOUT_MS`=300_000, `DEFAULT_IDLE_TIMEOUT_MS`=30_000, `DEFAULT_RETRY_INTERVAL_S`=1) | `common-core::constants` | `src/common-core/src/constants.rs` |
 | Bitset / capability registry | `common-core::interner` | `src/common-core/src/interner.rs` |
 | BitSetDrift | `common-core::drift` | `src/common-core/src/drift.rs` |
 | Latency histograms / metrics | `common-core::metrics` | `src/common-core/src/metrics.rs` |
-| Fluent WVR newtype wrappers (`Instrumented`, `WithRetry`, `ComponentAdapter`, `Pipeline`, `retry_call`) | `fluent-wvr::wrapper` | `src/fluent-wvr/src/wrapper.rs` |
+| Fluent WVR newtype wrappers (`Instrumented`, `ComponentAdapter`, `Pipeline`, `retry_call`) | `fluent-wvr::wrapper` | `src/fluent-wvr/src/wrapper.rs` |
+| Jittered-exponential retry (`backoff_ms`, `retry_async`) | `common-core::retry` | `src/common-core/src/retry.rs` |
 | Shared domain newtypes (`NodeId`, `SessionId`, `TargetId`, `LOD_COUNT`) | `guidance-types` | `src/types/src/lib.rs` |
 | Cosine similarity / brute-force KNN | `search-vector::math` | `src/search-vector/src/math.rs` |
 | SQLite open helpers + schemas | `common-core::sqlite` | `src/common-core/src/sqlite.rs` (feature `sqlite`) |
@@ -167,7 +179,8 @@ anything that knows what a "node", "session", "target", "embedding", or
 | Test utilities (`impl_component_for_test!`, `PassthroughUnit`, `tempdir()`) | `fluent-wvr-testutil` | `src/fluent-wvr-testutil/src/lib.rs` |
 | 80% import line for component work (`Component`, `WorkUnit`, `FieldAccess`, `prelude::*`) | `fluent-wvr::prelude` | `src/fluent-wvr/src/prelude.rs` |
 | HTML stripping (`strip_html`) | `common-core::string` | `src/common-core/src/string.rs` |
-| `impl_component!` macro (eliminates as_any boilerplate) | `fluent-wvr::impl_component!` | `src/fluent-wvr/src/macros.rs` |
+| `impl_component!` / `impl_fieldless!` macros (eliminate `as_any`/fieldless-`FieldAccess` boilerplate) | `fluent-wvr::impl_component!` / `fluent-wvr::impl_fieldless!` | `src/fluent-wvr/src/macros.rs` |
+| Tolerant LLM-JSON parse (`parse_json_response` — fence-strip → parse → extract) | `guidance_llm::parse` | `src/llm/src/parse.rs` |
 | `ComponentArcExt::try_as_any_mut` (safe mutable access to shared Arc) | `fluent-wvr::ComponentArcExt` | `src/fluent-wvr/src/traits.rs` |
 | `WorkOutput::typed` (Result-returning) and `WorkOutput::data_take` (zero-copy) | `fluent-wvr::WorkOutput` | `src/fluent-wvr/src/work.rs` |
 | `make_hnsw()` | `common-core::sqlite` | `src/common-core/src/sqlite.rs` (feature `sqlite`) |
@@ -206,8 +219,9 @@ histogram)` is the future-ready API for recording per-unit execution
 durations.  The in-tree consumer today is the CLI-level `cmd_histogram` in
 `src/bin/guidance/src/main.rs` (total command timing).  Candidate adoption
 sites are documented in the `with_metrics` doc comment (the L4 Semantic KNN
-dispatch in `coral::cache::reactor`, and the top-level dispatch in
-`dag::executor`).  Adoption at any of those moves M12 from "test-only" to a
+dispatch in `coral::cache::reactor`, and the top-level dispatch on the
+`TargetWorkUnit` bridge under `Zone` supervision).  Adoption at any of those
+moves M12 from "test-only" to a
 real consumer wiring.
 
 ### Dependency tracking

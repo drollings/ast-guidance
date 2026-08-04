@@ -148,11 +148,7 @@ mod tests {
     #[test]
     fn test_ffd_pack_respects_budget() {
         let packer = ContextPacker::new(10);
-        let items = vec![
-            ("aaaa", "first"),
-            ("bb", "second"),
-            ("cc", "third"),
-        ];
+        let items = vec![("aaaa", "first"), ("bb", "second"), ("cc", "third")];
         let packed = packer.ffd_pack(&items);
         // Budget 10 tokens (generous) — all three fit
         assert_eq!(packed.len(), 3);
