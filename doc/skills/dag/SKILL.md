@@ -64,6 +64,7 @@ indefinitely. `topo_sort` returns `Err(GraphError::Cycle)` on cycles.
 |----------|---------------|------|
 | `Zone` (fluent-concurrency) | Task supervision cancellation tree | `src/fluent-concurrency/src/zone.rs` |
 | `DependencySession` (fluent-router) | Session step DAG with checkpoint/rewind | `src/router/src/dag_session.rs` |
+| `PipelineGraph` (fluent-router) | Pipeline stage topology with dynamic stage routing | `src/router/src/pipeline_graph.rs` |
 
 ## When to use
 

@@ -35,8 +35,8 @@ Every high-overhead effect (file system, database, AI inference endpoint, blocki
 **Concrete capability tokens** (`src/io/`):
 
 - `FsCapability` — gates `tokio::fs::{read, write, metadata}`. Constructed via `FsCapability::new()`.
-- `NetCapability` — wraps a `reqwest::Client` configured via `NetConfig { max_idle_per_host, idle_timeout, connect_timeout, request_timeout, user_agent }`. Constructed via `NetCapability::new()` or `with_config(&NetConfig)`. Exposes `http_get`, `http_post`, `tcp_connect`, and the raw `client()`.
-- `DbCapability` — opens a 5-connection `rusqlite` pool with WAL mode enabled. Constructed via `DbCapability::open(path)`. Exposes `query(sql) -> Vec<HashMap<String, String>>` and `execute(sql) -> usize`, both of which `spawn_blocking` the synchronous `rusqlite` work and return a `PooledConnection` (RAII; the connection returns to the pool on `Drop`).
+- `NetCapability` — wraps a `reqwest::Client` configured via `NetConfig { max_idle_per_host, idle_timeout, connect_timeout, request_timeout, user_agent }`. Constructed via `NetCapability::new()` or `with_config(&NetConfig)`. Exposes `http_get`, `http_post`, `http_post_json_stream` (returns a streaming `Stream<Item = Result<Bytes, IoError>>` of response chunks, used by SSE forwarding), `tcp_connect`, and the raw `client()`.
+- `DbCapability` — opens a 5-connection `rusqlite` pool with WAL mode enabled. Constructed via `DbCapability::open(path)`. Exposes `query(sql) -> Vec<HashMap<String, String>>` and `execute(sql) -> usize`, both of which check out a `PooledConnection` (RAII; the connection returns to the pool on `Drop`) and offload the synchronous `rusqlite` work via `spawn_blocking`.
 
 **Helpers** (`capability.rs`):
 
@@ -68,39 +68,35 @@ A `Scope` is the fundamental owner of tasks. It is **`#[must_use]`** and require
 
 ### 3.3 `Zone` — Failure Containment & Supervision
 
-A `Zone` is a `Scope` plus a dependency graph, a typed event sink, retry-with-backoff, and per-task timeouts. It is **also** a `Future<Output = ZoneSummary>` (`zone.rs:273-376`), so the canonical use is `let summary: ZoneSummary = zone.await`.
+A `Zone` is a `Scope` plus a dependency graph, a typed event sink, retry-with-backoff, and per-task timeouts. It is **also** a `Future<Output = ZoneSummary>` (`zone.rs:207-310`), so the canonical use is `let summary: ZoneSummary = zone.await`.
 
-**Construction** (`zone.rs:117-144`):
+**Construction** (`zone.rs:115-140`):
 
 - `Zone::new(runtime: Arc<dyn Runtime>, caps: CapabilitySet) -> Self` — defaults to `ZoneConfig::default()`.
 - `Zone::new_with_config(runtime, caps, config: ZoneConfig) -> Self`.
 
-**Configuration** (`zone.rs:48-59`): `ZoneConfig { poll_budget: usize }` — maximum tasks polled per `Zone::poll` invocation. Default `64`. When the budget is exhausted, the zone wakes itself with `cx.waker().wake_by_ref()` to prevent executor starvation.
+**Configuration** (`zone.rs:49-60`): `ZoneConfig { poll_budget: usize }` — maximum tasks polled per `Zone::poll` invocation. Default `64`. When the budget is exhausted, the zone wakes itself with `cx.waker().wake_by_ref()` to prevent executor starvation.
 
-**Registration** (`zone.rs:152-193`):
+**Registration** (`zone.rs:148-172`):
 
 - `register(unit: Arc<dyn Component>) -> Result<&mut Self, ZoneError>` — builds a `WorkContext` via `WorkContext::for_unit_in_zone(&self.runtime, &self.caps, |_| {})` and forwards.
 - `register_with_context(unit, ctx: WorkContext) -> Result<&mut Self, ZoneError>` — explicit context.
 - `ZoneError::DuplicateName(ArcIntern<str>)` — duplicate `name()` rejection. The signature is `Result`, not panicking, so callers can decide.
 
-**Dependency tracking** (`zone.rs:101-111, 174-189, 210-270`): each registered unit contributes to two inverted maps:
+**Dependency tracking** (`zone.rs:98-113, 189-204, 207-310`): each registered unit contributes to a `DependencyGraph<ArcIntern<str>>` composed from `fluent_dag::dep_graph` (`zone.rs:105`), plus two maps for the abort side effects: `task_names: HashMap<task::Id, ArcIntern<str>>` and `abort_handles: HashMap<ArcIntern<str>, AbortHandle>`.
 
-- `deps: HashMap<ArcIntern<str>, Vec<ArcIntern<str>>>` — `unit_name → [assets it depends on]`.
-- `task_provides: HashMap<ArcIntern<str>, Vec<ArcIntern<str>>>` — `unit_name → [assets it provides]`.
-- `provides_to_dependents: HashMap<ArcIntern<str>, Vec<ArcIntern<str>>>` — `asset → [units that depend on it]`. This is the O(1) lookup for transitive cancellation.
+When a unit fails/panics/times out, `cancel_dependents_of(name)` (`zone.rs:189-204`) calls `DependencyGraph::dependents_of(name)` — a cycle-resilient DFS — and aborts each transitive dependent's handle. A back-edge into the DFS active path emits a `tracing::warn!` rather than panicking — the cycle is left in place but the offending dependents are not double-cancelled.
 
-When a unit fails/panics/times out, `cancel_dependents_of(name)` performs a DFS over the inverted index, with separate `visited` and `active_path` sets to detect cycles. A back-edge into `active_path` emits a `tracing::warn!` rather than panicking — the cycle is left in place but the offending dependents are not double-cancelled.
-
-**Retry and timeout** (`zone.rs:386-427`): each registered unit is wrapped in `execute_with_timeout_and_retry` which:
+**Retry and timeout** (`zone.rs:320-362`): each registered unit is wrapped in `execute_with_timeout_and_retry` which:
 
 - Yields once before the first attempt so pending abort signals are processed.
 - Calls `unit.execute(&ctx)`.
 - On `Err(WorkError)`, sleeps `100 * attempts` ms and retries up to `max_retries` times.
 - Wraps the whole thing in `tokio::time::timeout(timeout_ms, …)`; on timeout returns `Err(WorkError::Timeout { duration_ms, unit })`.
 
-**Panic propagation**: panics are *not* caught via `catch_unwind`. They propagate through `JoinSet` as `JoinError::Panic`, which `Zone::poll` intercepts at `zone.rs:336-348` and records as `ZoneEvent::Panicked`. This is deliberate: a `catch_unwind` would lose the panic site and prevent the dependency-aware cancellation graph from firing.
+**Panic propagation**: panics are *not* caught via `catch_unwind`. They propagate through `JoinSet` as `JoinError::Panic`, which `Zone::poll` intercepts (`zone.rs:256-285`) and records as `ZoneEvent::Panicked`. This is deliberate: a `catch_unwind` would lose the panic site and prevent the dependency-aware cancellation graph from firing.
 
-**Event taxonomy** (`zone.rs:19-74`):
+**Event taxonomy** (`zone.rs:20-75`):
 
 ```text
 ZoneEvent::Completed   { name, output }
@@ -115,7 +111,7 @@ CancelReason::Aborted
 
 `WorkError` and `WorkOutput` are defined in `fluent-wvr::work` with three error variants: `Execution(String)`, `Dependency(String)`, and `Timeout { duration_ms: u64, unit: String }`. `WorkOutput` carries a `serde_json::Value data` field with `typed`/`typed_infallible`/`data_as`/`data_take` accessors for structured-data round-tripping.
 
-**Summary** (`zone.rs:68-74`): `ZoneSummary { completed, panicked, failed, cancelled: Vec<ZoneEvent> }`. The zone `await`s to completion (when all `JoinSet` entries are drained and `active_count == 0`) and yields the summary.
+**Summary** (`zone.rs:69-75`): `ZoneSummary { completed, panicked, failed, cancelled: Vec<ZoneEvent> }`. The zone `await`s to completion (when all `JoinSet` entries are drained and `active_count == 0`) and yields the summary.
 
 **Key properties:**
 - A panic in task A does **not** propagate to the parent runtime thread. It is caught as a `JoinError` by the zone's `poll` loop.
@@ -154,7 +150,7 @@ Internally it uses a `Queue<T>` (see below) and a `Notify` for close-wakes-waite
 
 ### 3.5 `Limiter` — Lightweight Concurrency Cap
 
-For cases where you don't need a dedicated worker pool, just a cap on concurrent executions, the `Limiter` is a `Semaphore`-backed wrapper (`pool.rs:376-422`).
+For cases where you don't need a dedicated worker pool, just a cap on concurrent executions, the `Limiter` is a `Semaphore`-backed wrapper (`pool.rs:363-420`).
 
 **API**:
 
@@ -170,7 +166,7 @@ impl Limiter {
 }
 ```
 
-`run_sync` first tries `tokio::runtime::Handle::try_current()`. If a runtime is active, it `block_on`s the permit-acquire + closure. Otherwise, it builds a dedicated current-thread runtime for the duration of the call. This is the right tool for synchronous callers (e.g., a CLI handler invoked outside an async context) that need to bound concurrency.
+`run_sync` first tries `tokio::runtime::Handle::try_current()`. Inside a running **multi-threaded** runtime (the router's HTTP handler does this) it drives the permit-acquire + closure via `tokio::task::block_in_place(|| handle.block_on(block))` — a bare `Handle::block_on` would panic with "Cannot start a runtime from within a runtime". Inside a current-thread runtime it uses `handle.block_on(block)`. With no active runtime it builds a dedicated current-thread runtime for the duration of the call. This is the right tool for synchronous callers (e.g., a CLI handler invoked outside an async context) that need to bound concurrency.
 
 This is the Rust equivalent of the `credit_flow` sender side: acquire a slot, run the work, release the slot on completion.
 
@@ -267,13 +263,13 @@ pub trait Runtime: Send + Sync + 'static {
 
 - `NoopRuntime` (in `fluent-wvr/src/runtime.rs:33-55`) — for `WorkContext::default()`. `spawn` panics with a clear message if called outside a tokio runtime; inside one, it spawns an empty future. `sleep` returns immediately. `now` returns `Instant::now()`.
 - `TokioRuntime` (in `fluent-concurrency/src/runtime/tokio.rs:11-26`) — production. Delegates to `tokio::spawn` and `tokio::time::sleep`. Constructed via the convenience function `fluent_concurrency::tokio_runtime() -> Arc<dyn Runtime>` (`lib.rs:19-21`).
-- `TestRuntime` (in `fluent-concurrency/src/runtime/test.rs:13-54`) — wraps a `tokio::runtime::Handle` plus a seeded `fastrand::Rng` for reproducible non-determinism. Use with `tokio::time::start_paused` for record-replay tests. Note: `TestRuntime::Clone` re-seeds from a draw of the parent's PRNG, so cloned runtimes do **not** preserve the original seed sequence — this is a known limitation; test designs should construct fresh `TestRuntime`s from a fixed seed rather than cloning.
+- `TestRuntime` (in `fluent-concurrency/src/runtime/test.rs:13-56`) — wraps a `tokio::runtime::Handle` plus a seeded `fastrand::Rng` for reproducible non-determinism. Use with `tokio::time::start_paused` for record-replay tests. Note: `TestRuntime::Clone` re-seeds from the stored `seed` field, so cloned runtimes reproduce the **same** deterministic PRNG sequence as the original (they do *not* advance a shared stream). Clones share the underlying `Handle`; the PRNG state is per-clone.
 
 ### 3.10 Bonus Primitives
 
 These exist in the crate but are not in the original spec. They earn their place by filling gaps that real consumers hit.
 
-**`ResultPool<T, R, E>`** (`pool.rs:245-359`) — the result-returning variant of `WorkerPool`. The handler is `Fn(T) -> Fut where Fut: Future<Output = Result<R, E>>`, and `submit(job) -> Future<Output = Result<R, ResultPoolError<E>>>`. Internally each `submit` allocates a `tokio::sync::oneshot::channel`; the worker sends its `Result<R, E>` back through the channel. The cost is one `oneshot` per submit; the benefit is that the submitter gets the result as an `await`able future rather than passing through a side channel. This is the canonical pool for "fan out N independent jobs, collect N results" workloads (e.g., `AST_POOL` and `DB_POOL` in `src/guidance/src/runtime.rs`).
+**`ResultPool<T, R, E>`** (`pool.rs:244-334`) — the result-returning variant of `WorkerPool`. The handler is `Fn(T) -> Fut where Fut: Future<Output = Result<R, E>>`, and `submit(job) -> Future<Output = Result<R, ResultPoolError<E>>>`. Internally each `submit` allocates a `tokio::sync::oneshot::channel`; the worker sends its `Result<R, E>` back through the channel. The cost is one `oneshot` per submit; the benefit is that the submitter gets the result as an `await`able future rather than passing through a side channel. This is the canonical pool for "fan out N independent jobs, collect N results" workloads (e.g., `AST_POOL` and `DB_POOL` in `src/guidance/src/runtime.rs`).
 
 ```rust
 pub enum ResultPoolError<E> { Pool(PoolError), Inner(E), Canceled }
@@ -282,33 +278,35 @@ impl<T, R, E> ResultPool<T, R, E> {
     pub fn new<F, Fut>(runtime, cap, queue_capacity, handler: F) -> Self;
     pub fn worker_count(&self) -> usize;
     pub async fn submit(&self, job: T) -> Result<R, ResultPoolError<E>>;
-    pub async fn try_submit(&self, job: T) -> Result<(), PoolError>;   // see note below
-    pub async fn submit_forget(&self, job: T) -> Result<(), PoolError>; // alias for try_submit
     pub async fn shutdown(self);
 }
 ```
 
-Note on `try_submit` / `submit_forget`: these are provided for API compatibility with `WorkerPool` but, because `ResultPool`'s worker protocol requires a `oneshot::Sender`, they still allocate a `oneshot` channel whose receiver is immediately dropped. They are not fire-and-forget. If you need true fan-out with no result, use `WorkerPool` instead.
+There is **no** fire-and-forget variant: because the worker protocol requires a `oneshot::Sender`, every submission — even one whose result is ignored — allocates a channel. If you need true fan-out with no result, use `WorkerPool` instead.
 
-**`PriorityResultPool<T, R, E>`** (`pool.rs:435-528`) — priority-ordered variant of `ResultPool`. Jobs are submitted with `submit(job, priority)`; higher priority values are dispatched first, FIFO within the same priority. Internally it uses the `PriorityQueue` from §3.6 wrapped in a `tokio::sync::Mutex`. Workers follow the **drain-then-wait** pattern (the M9 contract from `ROADMAP_20260720_WVR_MORE.md`): on each wake they drain the entire queue before blocking on `Notify`, preventing wakeup collapse under burst. This is the right tool when some jobs are time-sensitive and others can wait.
+**`PriorityResultPool<T, R, E>`** (`pool.rs:433-529`) — priority-ordered variant of `ResultPool`. Jobs are submitted with `submit(job, priority)`; higher priority values are dispatched first, FIFO within the same priority. Internally it uses the `PriorityQueue` from §3.6 wrapped in a `tokio::sync::Mutex`. Workers follow the **drain-then-wait** pattern (the M9 contract from `ROADMAP_20260720_WVR_MORE.md`): on each wake they drain the entire queue before blocking on `Notify`, preventing wakeup collapse under burst. This is the right tool when some jobs are time-sensitive and others can wait.
 
-**`LlmRequestQueue`** (`llm_queue.rs:142-181`) — typed wrapper over `ResultPool` for LLM chat completions. The crate is transport-agnostic: the `Fn(LlmTask) -> Result<String, LlmError>` handler is supplied at construction time; the default OpenAI-compatible HTTP handler lives in `guidance-llm`. This split keeps `reqwest` out of the boundary that downstream callers care about.
+**`LlmRequestQueue`** (`llm_queue.rs:156-185`) — typed wrapper over `ResultPool` for LLM chat completions. The crate is transport-agnostic: the `Fn(LlmTask) -> Result<String, LlmError>` handler is supplied at construction time; the default OpenAI-compatible HTTP handler lives in `guidance-llm`. This split keeps `reqwest` out of the boundary that downstream callers care about.
 
 ```rust
 pub struct LlmRequestQueue { pool: Arc<ResultPool<LlmTask, String, LlmError>> }
 
 pub struct LlmTask    { pub messages: Vec<ChatMessage>, pub config: LlmConfig }
 pub struct LlmConfig  { pub api_url: String, pub model: String, pub think: Option<bool>,
-                        pub timeout_ms: u64 (default 2000), pub debug: bool, pub show_prompts: bool }
+                        pub timeout_ms: u64 (default 2000),
+                        pub extra_body_params: Option<serde_json::Value>,
+                        pub debug: bool, pub show_prompts: bool }
 pub struct ChatMessage { pub role: String, pub content: String }
 pub struct LlmQueueConfig { pub worker_count: usize, pub queue_capacity: usize }
 
 pub enum LlmError { Api(String), Http(String), NoResponse, RateLimited }
 ```
 
+`LlmConfig.extra_body_params` is arbitrary JSON merged into every request body (e.g. `num_ctx`, `temperature`, `stop`); `"model"`, `"messages"`, and `"stream"` keys are ignored because those are set explicitly by the chat-completion logic. `LlmConfig::new()` is a `bon` builder (`start_fn = new`).
+
 **`Reserve`** (`reserve.rs:7-94`) — RAII permit on a shared `Arc<AtomicUsize>`. `try_acquire(counter) -> Option<Self>` atomically decrements and returns the permit, or `None` if already at zero. `commit(self)` consumes the permit permanently; otherwise `Drop` returns it to the counter. This is a lower-level primitive than `Limiter`: it does not own the counter (the caller supplies it), and it does not run a closure. Use `Limiter` for "run this with a permit" and `Reserve` for "acquire now, release later" patterns. The crate's own tests are the only in-tree consumer today.
 
-**`AffinityScheduler<T, R, E>`** (`affinity.rs:58-166`) — wraps `PriorityResultPool` with session-aware priority boosting and starvation aging. Tracks which session is currently "affine" and gives its tasks a priority bonus (`AgingConfig::affinity_bonus`, default +10). Starved tasks (different session) periodically increase in base priority at `AgingConfig::aging_rate` (default +2 per 5s tick) up to `AgingConfig::max_priority` (default 100). `set_affinity(Option<String>)` switches the active session. `submit(task, base_priority)` computes the effective priority and delegates to the pool. Designed for multi-session agent dispatch where context-switching between sessions should be minimized.
+**`AffinityScheduler<T, R, E>`** (`affinity.rs:59-191`) — wraps `PriorityResultPool` with session-aware priority boosting and starvation aging. Tracks which session is currently "affine" and gives its tasks a priority bonus (`AgingConfig::affinity_bonus`, default +10). Starved tasks (different session) periodically increase in base priority at `AgingConfig::aging_rate` (default +2 per 5s tick) up to `AgingConfig::max_priority` (default 100). `set_affinity(Option<String>)` switches the active session. `submit(task: ScheduledTask<T>, base_priority)` computes the effective priority and delegates to the pool. Designed for multi-session agent dispatch where context-switching between sessions should be minimized.
 
 **`thread_local_resource!`** (`thread_resource.rs:37-45`) — macro that declares a thread-local `RefCell<Option<T>>` backed by `Default`. The `with_tlr(&STATIC, |res| ...)` accessor takes-or-defaults, calls the closure, and stores the value back after the closure returns. This is the canonical mechanism for per-thread pooled resources (e.g., AST parsers, string builders) that benefit from reuse across calls without allocating each time.
 
@@ -326,7 +324,7 @@ The `fluent-wvr` crate defines `Component`, `WorkUnit`, `FieldAccess`, `Describa
 
 - `Instrumented<U>` — wraps any `WorkUnit`/`Component` with `tracing::info!` timing on every `execute`, plus optional `Arc<LatencyHistogram>` recording via `Instrumented::with_metrics(inner, label, histogram)`. The histogram is the canonical latency surface from `common_core::metrics`.
 - `WithRetry<U>` — wraps any `WorkUnit`/`Component` with jittered-exponential retry. Configurable via `WithRetry::new(inner, max_attempts, backoff_ms)` (default 50% jitter) or `WithRetry::new_jittered(inner, max_attempts, base_ms, jitter_pct)` (0–100, clamped).
-- `ComponentAdapter` — runtime override of `name`, `execute`, and any field on a `Component`. `set_field` forwards via `Arc::get_mut` when possible and otherwise stores an override on the adapter. This is the only wrapper that handles the shared-Arc case correctly; `Instrumented` and `WithRetry` are deliberately read-only wrappers and reject `set_field` with `FieldError::NotFound`.
+- `ComponentAdapter` — runtime override of `name`, `execute`, and any field on a `Component`. `set_field` forwards via `Arc::get_mut` when possible and otherwise stores an override on the adapter. This is the only wrapper that handles the shared-Arc case correctly. `Instrumented` and `WithRetry` are *transparent* wrappers: their `FieldAccess` impls delegate `set_field`/`get_field`/`field_names` straight to the inner type (requiring exclusive access to the inner or interior mutability), matching the delegation semantics of their `WorkUnit` impls.
 - `retry_call(max_attempts, base_ms, f)` — the free-function sync retry with the same jittered-exponential backoff as `WithRetry`. Returns `Result<RetryResult<T>, E>` where `RetryResult` carries the attempt count.
 
 **Macros from `fluent-wvr`**:
@@ -380,7 +378,7 @@ No `async-trait`, no `bumpalo`, no `crossbeam`. Tokio's channels, `Notify`, and 
 
 ## 7. Anti-Patterns Explicitly Rejected
 
-1. **No `#[async_trait]` or macro-heavy execution.** The framework uses manual `Future` impls and `async fn` where the compiler can see the boundaries. The `Zone` is a hand-written `impl Future` (`zone.rs:273-376`); `Scope` uses `tokio::task::JoinSet` directly.
+1. **No `#[async_trait]` or macro-heavy execution.** The framework uses manual `Future` impls and `async fn` where the compiler can see the boundaries. The `Zone` is a hand-written `impl Future` (`zone.rs:207-310`); `Scope` uses `tokio::task::JoinSet` directly.
 2. **No `tokio::spawn` without a scope.** The `tokio::spawn` calls in the crate are limited to: `Scope::close` (drain) and `Scope::close_graceful` (drain); `Zone`'s `JoinSet`; `WorkerPool`/`ResultPool`/`PriorityResultPool` worker loops; and `DbCapability::query`/`execute` (which `spawn_blocking` for sync `rusqlite` work). Every async effect outside these sites flows through `Scope::spawn` (which tracks the handle) or through a pool (which tracks workers).
 3. **No `dyn Trait` in a per-item loop.** The `PartitionedRouter` hashes once per submit; `PriorityQueue` dispatches via `BTreeMap` keys, not vtables; `CapabilitySet::get` uses `TypeId` (pointer-sized) rather than string comparison; `PartitionedRouter` does no per-job vtable dispatch.
 4. **No ambient `tokio::fs::read` or `tokio::time::sleep`.** All I/O is called through a capability method (`FsCapability::read`, `NetCapability::http_get`, `DbCapability::query`, etc.) which calls `check_capability(self)` first. `tokio::time::sleep` is allowed in the framework's own internals (Zone retry, Zone timeout) and in the `Runtime::sleep` backend, but consumer code is expected to use `Limiter::run`, `WithRetry`, or `Zone` rather than calling it directly.

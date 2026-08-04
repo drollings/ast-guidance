@@ -156,8 +156,10 @@ pub trait WorkUnit: Send + Sync {
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError>;
 
     /// Default per-unit timeout. Override to specialise.
-    /// The `Zone` supervisor reads this via `WorkContext::for_unit` and
-    /// enforces it through `execute_with_timeout_and_retry`.
+    /// `WorkContext::for_unit(unit, caps)` seeds `timeout_ms` from this value
+    /// for standalone execution. Inside a `Zone`, `register_with_context`
+    /// sets `ctx.timeout_ms` explicitly and the supervisor enforces it
+    /// through `execute_with_timeout_and_retry`.
     fn default_timeout_ms(&self) -> u64 { 30_000 }
 
     /// Concrete type name. Default uses `std::any::type_name::<Self>()`
@@ -307,7 +309,8 @@ use fluent_wvr::prelude::*;
 // Brings in: Component, WorkUnit, FieldAccess, Describable, FieldError,
 // WorkContext, WorkError, WorkOutput, Capability, CapabilitySet,
 // impl_component, retry_call, ComponentAdapter, ExecuteFn,
-// Instrumented, WithRetry, MetadataValue, ArcIntern.
+// Instrumented, WithRetry, Middleware, MiddlewareChain, Pipeline,
+// SuffixedComponent, MetadataValue, ArcIntern.
 ```
 
 > `ComponentArcExt`, `FieldSchema`, `SchemaProvider`, and
@@ -682,7 +685,7 @@ impl<U: WorkUnit> WorkUnit for Instrumented<U> {
 impl_component!(generic (U: Component + 'static) for Instrumented<U>);
 ```
 
-The wrapper also implements `FieldAccess` (delegates `get_field`/`field_names` to the inner; `set_field` returns `FieldError::NotFound` so callers configure the inner before wrapping) and `Describable` (delegates to inner). The `name()` call passes through to the inner type — `Instrumented` does not rename the unit; it only adds observability.
+The wrapper also implements `FieldAccess` (delegating `set_field`/`get_field`/`field_names` to the inner) and `Describable` (delegates to inner). `set_field` is *not* rejected — it forwards to the inner type, which requires exclusive access to the inner (`&mut U`) or interior mutability inside the implementation. The `name()` call passes through to the inner type — `Instrumented` does not rename the unit; it only adds observability.
 
 ### Retry wrapper
 
@@ -844,7 +847,7 @@ pub enum ProviderConfig {
 
 ### Component serialization (deferred)
 
-Adding `Serialize` to the `Component` trait would require every implementor to be serializable — a breaking change for types holding `Arc<dyn Provider>`, `Mutex<Plugin>`, etc. A `PersistableComponent` trait stub exists in `fluent-wvr/src/lib.rs` as a design placeholder. Do NOT implement it until a second consumer materializes that needs to persist component state.
+Adding `Serialize` to the `Component` trait would require every implementor to be serializable — a breaking change for types holding `Arc<dyn Provider>`, `Mutex<Plugin>`, etc. A `PersistableComponent` trait stub exists in `fluent-wvr/src/traits.rs` as a design placeholder. Do NOT implement it until a second consumer materializes that needs to persist component state.
 
 ### Rules
 
@@ -1566,22 +1569,24 @@ println!("p50={p50}ms p99={p99}ms total={}ms", histogram.sum_ms());
 **Production consumer:** The `with_metrics` wrapper is wired into
 three sites in the workspace:
 
-1. `coral/src/cache_reactor.rs:100,113,125,142` — Coral's `QueueReactor`
-   wraps each cache tier (`L2WasmUnit`, `L3GraphUnit`, `L4SemanticUnit`,
-   `L5FrontierUnit`) in `Instrumented::with_metrics(adapted, label, hist)`
-   before erasing to `Arc<dyn Component>`. The histograms are exposed
-   via the `coral_stats` MCP method, returning aggregated p50/p99/count/sum
-   per tier.
+1. `coral/src/cache/reactor.rs:22-28` — Coral's `QueueReactor` (the module
+   moved from `cache_reactor.rs` to `cache/reactor.rs`) wraps each cache tier
+   (`L2WasmUnit`, `L3GraphUnit`, `L4SemanticUnit`, `L5FrontierUnit`) in
+   `Instrumented::with_metrics(adapted, label, hist)` via the shared
+   `wrap_tier` helper before erasing to `Arc<dyn Component>`. The histograms
+   are exposed via the `coral_stats` MCP method, returning aggregated
+   p50/p99/count/sum per tier.
 
-2. `dag/src/middleware.rs:37,42` — `TimingMiddleware` wraps an
+2. `dag/src/middleware.rs:34` — `TimingMiddleware` wraps an
    `Arc<dyn Component>` in `Instrumented::with_metrics` when a histogram
    is provided, falling back to `Instrumented::new` otherwise.
 
-3. `job-copilot/src/server/handler.rs:882` — per-component instrumentation
-   for form analysis.
+3. `router/src/charts/execute.rs:231` — the chart-DAG executor wraps every
+   compiled workflow target in `Instrumented::with_metrics` before erasure,
+   so workflow-execution latency lands in a shared `LatencyHistogram`.
 
 A consumer test that exercises the histogram path end-to-end lives in
-`wrapper.rs:619-637` (`instrumented_with_metrics_records_duration`).
+`wrapper.rs:783-800` (`instrumented_with_metrics_records_duration`).
 
 ### Key properties
 
@@ -2063,7 +2068,7 @@ When writing new code in `rust-src/`:
 
 28. **Run `cargo clippy --workspace -- -D warnings` before finishing.** The project enforces `#![deny(warnings)]`. (Pre-existing `uninlined_format_args` warnings at `fluent-wvr/src/work.rs:278,284` are grandfathered — do not introduce more.)
 
-29. **Run `cargo test --workspace` before finishing.** All 1213 tests must pass.
+29. **Run `cargo test --workspace` before finishing.** All ~1600 workspace tests must pass.
 
 30. **Check for `unsafe` blocks.** The workspace has 3 `unsafe` blocks, all in `wasm_ipc/src/lib.rs` for `read_unaligned` of packed struct fields. Every new `unsafe` block must be justified and documented; the `forbid(unsafe_code)` lint is set at the crate level for both `fluent-wvr` and `fluent-concurrency`.
 
@@ -2087,7 +2092,7 @@ runtime in `fluent-concurrency`. The full surface is documented in
 | `ResultPool<T, R, E>` | `fluent-concurrency/src/pool.rs` | Worker pool that returns a typed `Result<R, ResultPoolError<E>>`; `ResultPoolError` is `Inner(E) \| Canceled \| Pool(PoolError)` |
 | `PriorityResultPool<T, R, E>` | `fluent-concurrency/src/pool.rs` | Priority-ordered variant; workers drain fully before blocking on `Notify`; `submit` uses `notify_waiters` to avoid wakeup collapse |
 | `Limiter` | `fluent-concurrency/src/pool.rs` | Concurrency cap (N-at-a-time), no queue |
-| `Queue<T>` | `fluent-concurrency/src/queue.rs` | Bounded async FIFO; `PoolError::Full` on overflow |
+| `Queue<T>` | `fluent-concurrency/src/pool.rs` | Bounded async FIFO; `PoolError::Full` on overflow |
 | `PriorityQueue<T>` | `fluent-concurrency/src/queue.rs` | O(log P) for distinct priorities, O(1) for all-zero fast path |
 | `PartitionedRouter<K, J>` | `fluent-concurrency/src/router.rs` | Hash-based sharding; preserves causal ordering per key |
 | `CreditFlow` | `fluent-concurrency/src/flow.rs` | Sender/receiver backpressure with `CreditSpec { initial, more_after }` |
