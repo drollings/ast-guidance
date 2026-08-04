@@ -18,6 +18,8 @@ use crate::testing::mock::MockDispatchContext;
 use crate::types::{RouterMessageContent, RouterRequest, RouterResponse};
 use common_core::string::strip_thinking_blocks;
 
+use crate::charts::extract::WorkflowExtractor;
+
 pub async fn handle_dispatch(
     rt: &RoutingTarget,
     router_request: &RouterRequest,
@@ -30,6 +32,7 @@ pub async fn handle_dispatch(
     ledger: Option<&Arc<ContentNodeLedger>>,
     cache: Option<&Arc<ResponseCache>>,
     stats: &ServerStats,
+    extractor: Option<Arc<WorkflowExtractor>>,
 ) -> Result<HyperResponse, std::convert::Infallible> {
     let target_streams = is_stream && rt.stream;
 
@@ -54,6 +57,8 @@ pub async fn handle_dispatch(
                         http_client,
                         target_streams,
                         cache,
+                        user_text,
+                        extractor,
                     )
                     .await;
                 };
@@ -89,6 +94,8 @@ pub async fn handle_dispatch(
                     http_client,
                     target_streams,
                     cache,
+                    user_text,
+                    extractor,
                 )
                 .await;
             }
@@ -132,6 +139,8 @@ pub async fn handle_dispatch(
         http_client,
         target_streams,
         cache,
+        user_text,
+        extractor,
     )
     .await
 }
@@ -161,6 +170,8 @@ async fn dispatch_to_single_target(
     stream: bool,
     cache: Option<&Arc<ResponseCache>>,
     is_primary: bool,
+    user_text: &str,
+    extractor: Option<Arc<WorkflowExtractor>>,
 ) -> Result<HyperResponse, DispatchError> {
     let backend = make_backend(http_client, target);
 
@@ -214,6 +225,17 @@ async fn dispatch_to_single_target(
         }
     }
 
+    // M10 learning loop: a successful buffered dispatch is a solved solution —
+    // distill it into a draft chart (best-effort, never fails the request).
+    if let Some(extractor) = extractor {
+        let answer = completion
+            .choices
+            .first()
+            .map(|c| c.message.content.to_string_lossy())
+            .unwrap_or_default();
+        extractor.record_success(user_text, &target.model, &answer);
+    }
+
     Ok(completion_to_response(
         &completion,
         "",
@@ -229,6 +251,8 @@ pub async fn dispatch_real(
     http_client: &reqwest::Client,
     stream: bool,
     cache: Option<&Arc<ResponseCache>>,
+    user_text: &str,
+    extractor: Option<Arc<WorkflowExtractor>>,
 ) -> Result<HyperResponse, std::convert::Infallible> {
     let all_targets = std::iter::once(rt)
         .chain(rt.fallbacks.iter())
@@ -251,8 +275,17 @@ pub async fn dispatch_real(
         );
 
         let attempt_start = Instant::now();
-        match dispatch_to_single_target(target, router_request, http_client, stream, cache, i == 0)
-            .await
+        match dispatch_to_single_target(
+            target,
+            router_request,
+            http_client,
+            stream,
+            cache,
+            i == 0,
+            user_text,
+            extractor.clone(),
+        )
+        .await
         {
             Ok(resp) => {
                 return Ok(resp);

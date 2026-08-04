@@ -168,6 +168,28 @@ pub enum WorkflowStage {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         depends_on: Vec<String>,
     },
+
+    /// A chart-target prompt stage.  Maps to `ChartPromptStage`: renders its
+    /// minijinja `template` at execution time, makes one LLM call through the
+    /// injected `ChatBackend`, and emits a `StageDecision` whose `output`
+    /// metadata provides the chart target's assets.
+    ///
+    /// Produced by `charts::compile::compile_chart` from a `ChartDef` (M5).
+    /// Chart targets use stage-id == asset-name == target name, so
+    /// `depends_on` lists the upstream target names whose `output` this stage
+    /// reads via the `stage.{id}.output` metadata mirror.
+    #[serde(rename = "chart_prompt")]
+    ChartPrompt {
+        id: String,
+        /// Inline minijinja source (the chart target's template).
+        template: String,
+        /// Prior chart-target stage ids (upstream providers).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        depends_on: Vec<String>,
+        /// Chart-target `essential` flag (M9 rubric gating metadata).
+        #[serde(default)]
+        essential: bool,
+    },
 }
 
 // ── Supporting types ─────────────────────────────────────────────────────
@@ -320,6 +342,53 @@ mod tests {
                 assert_eq!(r.prompts.len(), 2);
             }
             _ => panic!("expected Classify stage"),
+        }
+    }
+
+    #[test]
+    fn parse_chart_prompt() {
+        let json = r#"{
+            "workflows": {
+                "default": {
+                    "stages": [
+                        { "id": "reproduce", "type": "chart_prompt",
+                          "template": "reproduce {{ request }}", "essential": true },
+                        { "id": "root_cause", "type": "chart_prompt",
+                          "template": "root cause {{ upstream.reproduce.output }}",
+                          "depends_on": ["reproduce"] }
+                    ]
+                }
+            }
+        }"#;
+        let cfg: WorkflowConfig = serde_json::from_str(json).unwrap();
+        let def = cfg.default_workflow().unwrap();
+        assert_eq!(def.stages.len(), 2);
+        match &def.stages[0] {
+            WorkflowStage::ChartPrompt {
+                id,
+                template,
+                depends_on,
+                essential,
+            } => {
+                assert_eq!(id, "reproduce");
+                assert_eq!(template, "reproduce {{ request }}");
+                assert!(essential);
+                assert!(depends_on.is_empty());
+            }
+            _ => panic!("expected ChartPrompt stage"),
+        }
+        match &def.stages[1] {
+            WorkflowStage::ChartPrompt {
+                id,
+                depends_on,
+                essential,
+                ..
+            } => {
+                assert_eq!(id, "root_cause");
+                assert_eq!(depends_on, &vec!["reproduce".to_string()]);
+                assert!(!essential);
+            }
+            _ => panic!("expected ChartPrompt stage"),
         }
     }
 

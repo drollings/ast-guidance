@@ -20,6 +20,7 @@
 //! - `dag_session` — `DependencySession`, `SessionStep`, `StepResult`, `DagError`
 
 pub mod agent;
+pub mod charts;
 pub mod compaction;
 pub mod config;
 pub mod dag_session;

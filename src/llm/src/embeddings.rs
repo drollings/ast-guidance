@@ -354,6 +354,11 @@ pub struct OpenAiEmbedding {
     api_key: String,
     model: String,
     dims: u32,
+    /// Model-level inference params merged into every embeddings request body
+    /// (e.g. `num_ctx` for llama.cpp slot sizing). Kept on the embedding so the
+    /// chart HNSW embedder reuses the same slot configuration as the chat
+    /// classifier instead of opening a second default-context instance.
+    params: Option<serde_json::Value>,
 }
 
 impl OpenAiEmbedding {
@@ -363,6 +368,16 @@ impl OpenAiEmbedding {
         api_key: Option<&str>,
         dims: u32,
     ) -> Result<Self, EmbeddingError> {
+        Self::new_with_params(model, base_url, api_key, dims, None)
+    }
+
+    pub fn new_with_params(
+        model: Option<&str>,
+        base_url: Option<&str>,
+        api_key: Option<&str>,
+        dims: u32,
+        params: Option<serde_json::Value>,
+    ) -> Result<Self, EmbeddingError> {
         let base_url = base_url.unwrap_or("https://api.openai.com/v1").to_string();
         let api_key = api_key.ok_or(EmbeddingError::NoApiKey)?;
         validate_url(&base_url)?;
@@ -371,7 +386,27 @@ impl OpenAiEmbedding {
             api_key: api_key.to_string(),
             model: model.unwrap_or("text-embedding-3-small").to_string(),
             dims,
+            params,
         })
+    }
+
+    /// Build the request body merging model-level `params` into the standard
+    /// `{"model", "input"}` shape. Core fields cannot be overwritten.
+    fn request_body(&self, input: &serde_json::Value) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "input": input,
+        });
+        if let Some(params) = self.params.as_ref() {
+            if let Some(obj) = params.as_object() {
+                for (k, v) in obj {
+                    if k != "model" && k != "input" {
+                        body[k] = v.clone();
+                    }
+                }
+            }
+        }
+        body
     }
 
     fn embeddings_url(&self) -> String {
@@ -402,10 +437,7 @@ impl EmbeddingProvider for OpenAiEmbedding {
         if text.is_empty() {
             return Ok(Vec::new());
         }
-        let body = serde_json::json!({
-            "model": self.model,
-            "input": text,
-        });
+        let body = self.request_body(&serde_json::json!(text));
         let resp_bytes = do_http_post(&self.embeddings_url(), &body, Some(&self.api_key))?;
         parse_openai_response(&resp_bytes)
     }
@@ -415,10 +447,7 @@ impl EmbeddingProvider for OpenAiEmbedding {
             .iter()
             .map(|t| serde_json::Value::String(t.to_string()))
             .collect();
-        let body = serde_json::json!({
-            "model": self.model,
-            "input": inputs,
-        });
+        let body = self.request_body(&serde_json::Value::Array(inputs));
         let resp_bytes = do_http_post(&self.embeddings_url(), &body, Some(&self.api_key))?;
         parse_openai_batch_response(&resp_bytes)
     }
@@ -427,10 +456,7 @@ impl EmbeddingProvider for OpenAiEmbedding {
         if text.is_empty() {
             return Ok(Vec::new());
         }
-        let body = serde_json::json!({
-            "model": self.model,
-            "input": text,
-        });
+        let body = self.request_body(&serde_json::json!(text));
         let resp_bytes =
             do_http_post_async(&self.embeddings_url(), &body, Some(&self.api_key)).await?;
         parse_openai_response(&resp_bytes)
@@ -441,10 +467,7 @@ impl EmbeddingProvider for OpenAiEmbedding {
             .iter()
             .map(|t| serde_json::Value::String(t.to_string()))
             .collect();
-        let body = serde_json::json!({
-            "model": self.model,
-            "input": inputs,
-        });
+        let body = self.request_body(&serde_json::Value::Array(inputs));
         let resp_bytes =
             do_http_post_async(&self.embeddings_url(), &body, Some(&self.api_key)).await?;
         parse_openai_batch_response(&resp_bytes)
@@ -617,6 +640,7 @@ pub fn create_embedding_provider(
     api_key: Option<&str>,
     dims: u32,
     cache_limit: Option<usize>,
+    params: Option<&serde_json::Value>,
 ) -> Result<Box<dyn EmbeddingProvider>, EmbeddingError> {
     let limit = cache_limit.unwrap_or(DEFAULT_CACHE_LIMIT);
     let provider: Box<dyn EmbeddingProvider> = match name {
@@ -626,7 +650,7 @@ pub fn create_embedding_provider(
             limit,
         )),
         "openai" => Box::new(CachedEmbeddingProvider::new_with_limit(
-            OpenAiEmbedding::new(model, base_url, api_key, dims)?,
+            OpenAiEmbedding::new_with_params(model, base_url, api_key, dims, params.cloned())?,
             limit,
         )),
         _ => {
@@ -637,7 +661,13 @@ pub fn create_embedding_provider(
                 ))
             } else if let Some(custom_url) = name.strip_prefix("custom:") {
                 Box::new(CachedEmbeddingProvider::new_with_limit(
-                    OpenAiEmbedding::new(model, Some(custom_url), api_key, dims)?,
+                    OpenAiEmbedding::new_with_params(
+                        model,
+                        Some(custom_url),
+                        api_key,
+                        dims,
+                        params.cloned(),
+                    )?,
                     limit,
                 ))
             } else {
@@ -653,14 +683,14 @@ mod tests {
     use super::*;
     #[test]
     fn create_noop_provider() {
-        let p = create_embedding_provider("none", None, None, None, 768, None).unwrap();
+        let p = create_embedding_provider("none", None, None, None, 768, None, None).unwrap();
         assert_eq!(p.name(), "none");
         assert_eq!(p.dimensions(), 768);
     }
 
     #[test]
     fn create_unknown_provider() {
-        let result = create_embedding_provider("bogus", None, None, None, 0, None);
+        let result = create_embedding_provider("bogus", None, None, None, 0, None, None);
         assert!(result.is_err());
     }
 
@@ -788,6 +818,7 @@ mod tests {
             None,
             4096,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(p.name(), "ollama");
@@ -801,6 +832,7 @@ mod tests {
             None,
             Some("sk-test"),
             768,
+            None,
             None,
         )
         .unwrap();
@@ -1170,6 +1202,7 @@ mod tests {
             None,
             4096,
             None,
+            None,
         );
         assert!(result.is_ok());
     }
@@ -1187,5 +1220,61 @@ mod tests {
 
         let cache = provider.cache.lock().unwrap();
         assert_eq!(cache.len(), limit);
+    }
+
+    #[test]
+    fn openai_embed_forwards_slot_params_in_request_body() {
+        // The chart HNSW embedder must send the same `num_ctx` slot sizing as
+        // the chat classifier — otherwise the gguf server opens a second
+        // default-context instance for the same model (pipeline.rs test
+        // documents the same failure mode for chat).
+        let server = httpmock::MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/embeddings")
+                .body_contains("num_ctx")
+                .body_contains("\"num_ctx\":98304");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"data": [{"embedding": [0.1, 0.2, 0.3], "index": 0}]}"#);
+        });
+        let p = OpenAiEmbedding::new_with_params(
+            Some("text-embedding-3-small"),
+            Some(&server.url("")),
+            Some("sk-test"),
+            3,
+            Some(serde_json::json!({"num_ctx": 98304, "parallel": 3})),
+        )
+        .unwrap();
+        let vec = p.embed("hello").unwrap();
+        assert_eq!(vec.len(), 3);
+        mock.assert();
+    }
+
+    #[test]
+    fn openai_embed_params_cannot_override_model_or_input() {
+        // Core fields are authoritative: `params` may supply slot sizing but
+        // must never clobber `model`/`input`.
+        let server = httpmock::MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/embeddings")
+                .body_contains("\"model\":\"text-embedding-3-small\"")
+                .body_contains("\"input\":\"hello\"");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"data": [{"embedding": [0.1, 0.2, 0.3], "index": 0}]}"#);
+        });
+        let p = OpenAiEmbedding::new_with_params(
+            Some("text-embedding-3-small"),
+            Some(&server.url("")),
+            Some("sk-test"),
+            3,
+            Some(serde_json::json!({"model": "evil", "input": "evil", "num_ctx": 98304})),
+        )
+        .unwrap();
+        let vec = p.embed("hello").unwrap();
+        assert_eq!(vec.len(), 3);
+        mock.assert();
     }
 }

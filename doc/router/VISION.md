@@ -519,6 +519,17 @@ handled a given request, why, and what it cost.
   `DependencyGraph<K>` rather than maintained as parallel hand-rolled
   implementations in the execution supervisor and the router's own session
   logic.
+- The **DAG workflow chart library** is load-bearing and owned by
+  `fluent-router`: human-authored chart JSON files load at boot into a
+  `ChartStore`, a request is matched against the library by deterministic
+  capability match → HNSW retrieval (`workflow_library` index) → LLM
+  adjudication, and the matched chart is compiled into executable stages,
+  run under `Zone` supervision (timeout/retry/cancel-dependents), and gated
+  by per-target and chart-level rubrics. A one-round interview closes
+  `Partial` fits before blank-slate planning. The M10 learning loop is wired:
+  successful dispatches (`post_process.workflow_extraction`) are distilled
+  into *draft* charts, upserted idempotently against near neighbors, and
+  demoted after `CHART_STALE_FAILS` consecutive rubric failures.
 
 **Actively landing (near-term milestones):**
 
@@ -554,15 +565,15 @@ handled a given request, why, and what it cost.
   rigor-route red-team view, specialist-agent narrowed view).
 - Three separate library-scale HNSW indices (prior-workflow library,
   rubric/validated-answer cache, blacklist-adjacent similarity) —
-  structurally scoped, not yet populated or wired into a request path.
+  structurally scoped; the prior-workflow library is populated and wired into
+  the plan route, the rubric/validated-answer cache is populated by the M9
+  rubric gate, the blacklist index remains unpopulated.
 - **Escalation ladder** as a configurable per-group sequence of frontier
   engagement modes (filter → question → team → turnover), tried in order
   after all local models fail. Each mode is a progressively more permissive
   policy for crossing the local-to-frontier boundary. Config-only today; the
   binary emits a startup warning if an escalation ladder is configured (see
   M5.3).
-- The `plan` route — module and types exist; gap-analysis and interview
-  generation are still stubs.
 - The `rigor` route — types and structure exist; execution is not yet wired
   to live agents.
 - Four frontier involvement modes — enum and signature only; escalation ladder
@@ -630,10 +641,10 @@ Key architectural improvements:
 - Implement complexity-based model selection at terminal dispatch: pick the
   cheapest model in the group whose `intelligence` meets the classifier's
   `complexity` score.
-- Implement `post_process.workflow_extraction`: decompose successful
-  frontier-assisted solutions into `Target` DAG nodes, store in Coral
-  Context as `ContentNode` entries with dependency edges, keyed by
-  embedding for future cache-reactor replay.
+- Route the M10 workflow-extraction loop into Coral Context's ledger as
+  `ContentNode` entries (the router-owned `ChartStore` is the landing place
+  today; importing into coral is blocked by the import-boundary contract
+  until a shared store crate is justified by a second consumer).
 
 ## Longer-term direction
 

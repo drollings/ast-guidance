@@ -524,6 +524,17 @@ pub fn find_subseq(haystack: &[u8], start: usize, needle: &[u8]) -> Option<usize
         .map(|i| start + i)
 }
 
+/// Truncate `s` to at most `max_chars` Unicode scalar values, never cutting
+/// a code point. Unlike `truncate_utf8` (which is byte-based and appends a
+/// `…` ellipsis when truncating), this is a hard char cap with no suffix —
+/// the caller decides whether to append anything.
+pub fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    s.chars().take(max_chars).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -921,5 +932,30 @@ mod tests {
     #[test]
     fn skill_name_from_ref_fallback() {
         assert_eq!(skill_name_from_ref("doc/skills/foo.md"), "foo.md");
+    }
+
+    #[test]
+    fn truncate_chars_short_input_unchanged() {
+        assert_eq!(truncate_chars("hello", 10), "hello");
+        assert_eq!(truncate_chars("", 5), "");
+    }
+
+    #[test]
+    fn truncate_chars_exact_boundary() {
+        assert_eq!(truncate_chars("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_chars_cuts_at_char_boundary() {
+        // 10 CJK chars (3 bytes each); cap at 4 → 4 chars, no partial char.
+        let s = "汉".repeat(10);
+        let out = truncate_chars(&s, 4);
+        assert_eq!(out, "汉".repeat(4));
+        assert_eq!(out.chars().count(), 4);
+    }
+
+    #[test]
+    fn truncate_chars_no_ellipsis() {
+        assert_eq!(truncate_chars("abcdef", 3), "abc");
     }
 }

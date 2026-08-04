@@ -3,7 +3,7 @@ use std::sync::Mutex;
 
 use fluent_wvr::prelude::*;
 use guidance_llm::client::ChatBackend;
-use guidance_llm::{ChatMessage, LlmError};
+use guidance_llm::{BatchEmbedding, ChatMessage, EmbeddingError, EmbeddingProvider, LlmError};
 
 use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
 
@@ -180,3 +180,66 @@ impl Describable for FailingStage {
     }
 }
 impl_component!(FailingStage);
+
+// ── Deterministic test embedder (DRY: shared by charts store/select/plan) ──
+
+/// FNV-1a over lowercase word tokens into a fixed-dimension vector,
+/// L2-normalized. Deterministic and collision-tolerant — enough for tests
+/// that need cosine similarity without a live embedding endpoint.
+pub struct HashEmbedder {
+    dims: usize,
+}
+
+impl HashEmbedder {
+    pub fn new(dims: usize) -> Self {
+        Self { dims }
+    }
+}
+
+fn fnv1a(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |mut h, b| {
+        h ^= u64::from(b);
+        h.wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+impl EmbeddingProvider for HashEmbedder {
+    fn name(&self) -> &'static str {
+        "test-hash"
+    }
+
+    fn dimensions(&self) -> u32 {
+        self.dims as u32
+    }
+
+    fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        let mut vec = vec![0.0f32; self.dims];
+        for token in text.split(|c: char| !c.is_ascii_alphanumeric()) {
+            if token.is_empty() {
+                continue;
+            }
+            let h = fnv1a(&token.to_ascii_lowercase());
+            let bucket = (h % self.dims as u64) as usize;
+            vec[bucket] += 1.0;
+        }
+        let norm = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for x in &mut vec {
+                *x /= norm;
+            }
+        }
+        Ok(vec)
+    }
+
+    fn embed_batch(&self, texts: &[&str]) -> Result<BatchEmbedding, EmbeddingError> {
+        let mut flat = Vec::new();
+        for t in texts {
+            flat.extend_from_slice(&self.embed(t)?);
+        }
+        Ok(BatchEmbedding {
+            flat,
+            count: texts.len(),
+            dims: self.dims,
+        })
+    }
+}

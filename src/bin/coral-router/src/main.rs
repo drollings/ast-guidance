@@ -3,16 +3,20 @@ use std::sync::Arc;
 
 use clap::Parser;
 use common_core::config::load_json_or_default;
+use fluent_router::charts::store::ChartStore;
 use fluent_router::config::{
     detect_unimplemented_features, log_unimplemented_features, validate_no_self_routing,
     RouterConfig,
 };
+use fluent_router::hnsw::HnswIndexHandle;
 use fluent_router::logging::init_router_logging;
+use fluent_router::routes::plan::PlanRoute;
 use fluent_router::server::RouterServer;
 use fluent_router::testing::{
     load_transcript_file, transcript_provider_from_entries, MockDispatchContext,
 };
 use guidance_llm::client::ChatBackend;
+use guidance_llm::{create_embedding_provider, EmbeddingProvider, LlmClient, LlmConfig};
 
 #[derive(Parser)]
 #[command(
@@ -168,25 +172,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let routes = config.routes.clone();
 
     let classifier_model_name = config.classifier_model.as_deref().unwrap_or("fast");
-    let classifier_url = config
+    let classifier = config
         .models
         .get(classifier_model_name)
-        .map(|m| m.endpoint.clone());
+        .map(|m| (classifier_model_name.to_string(), m.clone()));
 
     tracing::info!(
         bind_addr = %config.server.bind_addr,
-        classifier_url = ?classifier_url,
+        classifier_url = ?classifier.as_ref().map(|(_, m)| m.endpoint.clone()),
         classifier_model = %classifier_model_name,
         "starting coral-router server"
     );
+
+    // Chart store boot: load `config.charts.dir` (fail fast on a corrupt
+    // file — a half-loaded library must not serve), attach the shared store
+    // to the plan route. A missing directory is tolerated (empty store).
+    let plan_route = Arc::new(build_plan_route(&config));
 
     let mut server = RouterServer::new(
         pipelines,
         routes,
         config.models,
         &config.server,
-        classifier_url,
-    );
+        classifier,
+    )
+    .with_plan_route(plan_route);
 
     if let Some(ctx) = mock_dispatch {
         server = server.with_mock(ctx);
@@ -195,6 +205,192 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     server.serve().await?;
 
     Ok(())
+}
+
+/// Construct the boot-loaded chart store and attach it to the plan route.
+///
+/// Semantics (decision D3 — fail fast): a missing chart directory yields an
+/// empty store (`ChartStore::load_dir` logs a `warn!`); a present-but-invalid
+/// chart file aborts boot so a corrupted library never half-loads.
+///
+/// M7 retrieval: when `charts.index_path` is configured the `workflow_library`
+/// index is built at boot (lazy + failure-tolerant — a down embedding endpoint
+/// disables HNSW retrieval but never aborts boot; deterministic match and LLM
+/// adjudication still work). The adjudicator backend is wired from
+/// `charts.selector_model` when set.
+fn build_plan_route(config: &RouterConfig) -> PlanRoute {
+    let index_handle = config
+        .charts
+        .index_path
+        .as_deref()
+        .map(|path| HnswIndexHandle {
+            name: "workflow_library".into(),
+            path: path.into(),
+        });
+    let store = ChartStore::new(index_handle);
+
+    if let Some(ref dir) = config.charts.dir {
+        match store.load_dir(std::path::Path::new(dir)) {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::error!(
+                    target: "coral-router",
+                    chart_dir = %dir,
+                    error = %e,
+                    "fatal: chart store failed to load",
+                );
+                eprintln!("FATAL: chart store failed to load: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let mut names = store.list();
+    names.sort_unstable();
+    tracing::info!(
+        target: "coral-router",
+        chart_dir = ?config.charts.dir,
+        chart_count = store.len(),
+        chart_names = ?names,
+        "chart store loaded",
+    );
+
+    // Build the workflow_library HNSW index at boot (M7 step 2). Lazy: only
+    // when index_path is configured. Failure-tolerant: a missing/unreachable
+    // embedding endpoint skips the build with a warning, never aborts boot.
+    if config.charts.index_path.is_some() {
+        match default_chart_embedder(config) {
+            Some(embedder) => match store.build_index(embedder) {
+                Ok(()) => tracing::info!(
+                    target: "coral-router",
+                    index_path = ?config.charts.index_path,
+                    "workflow_library index built at boot",
+                ),
+                Err(e) => tracing::warn!(
+                    target: "coral-router",
+                    error = %e,
+                    "workflow_library index build skipped — HNSW retrieval disabled (degraded)",
+                ),
+            },
+            None => tracing::warn!(
+                target: "coral-router",
+                "no embedder derivable from model config — HNSW retrieval disabled (degraded)",
+            ),
+        }
+    }
+
+    let store = Arc::new(store);
+    let mut route = PlanRoute::new()
+        .with_chart_store(store.clone())
+        .with_charts_config(config.charts.clone());
+    if let Some(backend) = default_adjudicator_backend(config) {
+        route = route.with_selector_backend(backend);
+    }
+    if let Some(backend) = default_reranker_backend(config) {
+        route = route.with_reranker_backend(backend);
+    }
+    // M10 learning loop: attach the dispatch post-processing hook when the
+    // operator opts in (`post_process.workflow_extraction`). Off by default.
+    if config.post_process.workflow_extraction {
+        let extractor =
+            fluent_router::charts::extract::WorkflowExtractor::new(store).enabled(true);
+        route = route.with_workflow_extractor(Arc::new(extractor));
+        tracing::info!(
+            target: "coral-router",
+            "workflow extraction enabled — successful dispatches become draft charts",
+        );
+    }
+    route
+}
+
+/// Number of embedding dimensions to declare for the chart embedder. The
+/// actual vector length is whatever the endpoint returns (the embeddings HTTP
+/// client parses the response); this only sets the declared capacity.
+const CHART_EMBEDDING_DIMS: u32 = 768;
+
+/// Derive an OpenAI-compatible embeddings base URL from a chat-completions
+/// endpoint: `http://host:port/v1/chat/completions` → `http://host:port/v1`
+/// (the embeddings client appends `/embeddings`).
+fn embeddings_base_url(endpoint: &str) -> String {
+    let trimmed = endpoint.trim_end_matches('/');
+    if let Some(base) = trimmed.strip_suffix("/v1/chat/completions") {
+        format!("{base}/v1")
+    } else if let Some(base) = trimmed.strip_suffix("/chat/completions") {
+        format!("{base}/v1")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Build the default chart embedder from the model config, if derivable.
+///
+/// Uses the root-level `embedding_model` (falling back to the selector model,
+/// then the classifier model's) to reach an OpenAI-compatible `/v1/embeddings`.
+/// An empty API key is sent — local llama.cpp servers ignore the header.
+/// Returns `None` when no model is configured or the URL is not embeddable,
+/// leaving HNSW retrieval disabled.
+fn default_chart_embedder(config: &RouterConfig) -> Option<Arc<dyn EmbeddingProvider>> {
+    let key = config
+        .embedding_model
+        .as_deref()
+        .or(config.charts.selector_model.as_deref())
+        .or(config.classifier_model.as_deref())?;
+    let entry = config.models.get(key)?;
+    let base = embeddings_base_url(&entry.endpoint);
+    let boxed = create_embedding_provider(
+        "openai",
+        entry.name.as_deref(),
+        Some(&base),
+        Some(""),
+        CHART_EMBEDDING_DIMS,
+        None,
+        entry.params.as_ref(),
+    )
+    .ok()?;
+    Some(Arc::from(boxed))
+}
+
+/// Build the chart-selection adjudicator backend from the selector model, if
+/// configured. Mirrors `build_classifier_client` (the DIP factory: exactly one
+/// place constructs a concrete `LlmClient` for the selector).
+fn default_adjudicator_backend(config: &RouterConfig) -> Option<Arc<dyn ChatBackend>> {
+    let key = config.charts.selector_model.as_deref()?;
+    let entry = config.models.get(key)?;
+    let model_name = entry.name.as_deref().unwrap_or(key);
+    let llm_config = LlmConfig::new()
+        .api_url(entry.endpoint.clone())
+        .model(model_name.to_string())
+        .timeout_ms(entry.total_timeout_ms)
+        .maybe_extra_body_params(entry.params.clone())
+        .build();
+    Some(Arc::new(LlmClient::with_config(llm_config)))
+}
+
+/// Build the chart-candidate reranker backend (M7 step 2.5) from the
+/// root-level `reranker_model`, if configured. Mirrors
+/// `default_adjudicator_backend`: exactly one place constructs a concrete
+/// `LlmClient` for the reranker. The rerank is a cross-encoder-style LLM call
+/// over the HNSW candidates before adjudication (`None` skips the stage).
+fn default_reranker_backend(config: &RouterConfig) -> Option<Arc<dyn ChatBackend>> {
+    let key = config.reranker_model.as_deref()?;
+    let entry = config.models.get(key)?;
+    let model_name = entry.name.as_deref().unwrap_or(key);
+    let llm_config = LlmConfig::new()
+        .api_url(entry.endpoint.clone())
+        .model(model_name.to_string())
+        .timeout_ms(entry.total_timeout_ms)
+        .maybe_extra_body_params(entry.params.clone())
+        .build();
+    Some(Arc::new(LlmClient::with_config(llm_config)))
+}
+
+/// Load `env/coral-router.json` relative to the crate root (test helper).
+#[cfg(test)]
+fn load_router_config() -> RouterConfig {
+    let config_path =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../../env/coral-router.json");
+    let content = std::fs::read_to_string(config_path).unwrap();
+    serde_json::from_str(&content).unwrap()
 }
 
 #[cfg(test)]
@@ -240,5 +436,27 @@ mod config_tests {
         let c: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert!(c.get("server").and_then(|v| v.get("bind_addr")).is_some());
         assert!(c.get("models").is_some());
+    }
+
+    #[test]
+    fn test_embedding_model_key_derives_embedder() {
+        // The env config points `embedding_model` at the `embed` model; the
+        // embedder must derive from that key (and build against its endpoint).
+        let config = super::load_router_config();
+        let embedder = super::default_chart_embedder(&config);
+        assert!(
+            embedder.is_some(),
+            "embedding_model: \"embed\" must yield a working chart embedder"
+        );
+    }
+
+    #[test]
+    fn test_reranker_model_key_derives_backend() {
+        let config = super::load_router_config();
+        // No reranker_model in the env config today → no backend (stage off).
+        assert!(
+            super::default_reranker_backend(&config).is_none(),
+            "no reranker_model configured → rerank stage disabled"
+        );
     }
 }

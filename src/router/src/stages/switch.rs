@@ -254,6 +254,41 @@ fn json_to_metadata_value(v: &serde_json::Value) -> Option<MetadataValue> {
     }
 }
 
+/// Mirror a stage's decision metadata under `stage.{stage_id}.{key}` so
+/// chart targets (and any stage) can read a *prior* stage's structured
+/// `output` via the metadata map.
+///
+/// Unlike [`promote_decision_metadata`] (which promotes scalars only),
+/// non-scalar values (objects/arrays) are serialized to JSON strings — the
+/// scalar-only `MetadataValue` boundary cannot hold them natively. Readers
+/// (e.g. `charts::stage::read_metadata_json`) parse the string back.
+///
+/// This is additive: existing `prefilter.*` / `classifier.*` / `router.*`
+/// keys (written by `promote_decision_metadata`) are untouched, so current
+/// readers keep working.
+pub(crate) fn mirror_stage_metadata(
+    target: &mut HashMap<String, MetadataValue>,
+    stage_id: &str,
+    metadata: &serde_json::Value,
+) {
+    let Some(obj) = metadata.as_object() else {
+        return;
+    };
+    for (k, v) in obj {
+        let key = format!("stage.{stage_id}.{k}");
+        match v {
+            serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                target.insert(key, MetadataValue::String(v.to_string()));
+            }
+            _ => {
+                if let Some(mv) = json_to_metadata_value(v) {
+                    target.insert(key, mv);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

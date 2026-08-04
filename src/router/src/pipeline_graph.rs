@@ -34,7 +34,7 @@ use fluent_wvr::prelude::*;
 use crate::pipeline::{PipelineResult, RoutingTarget};
 use crate::pipeline_types::{PipelineStage, StageDecision, StageMetadata, StageVerdict};
 use crate::stages::common::get_metadata_string;
-use crate::stages::switch::promote_decision_metadata;
+use crate::stages::switch::{mirror_stage_metadata, promote_decision_metadata};
 
 /// A DAG-based pipeline executor.  Stages are registered with their
 /// dependency declarations; execution order is derived from topological
@@ -253,6 +253,15 @@ impl WorkUnit for PipelineGraph {
                     promote_decision_metadata(
                         &mut accumulated_metadata,
                         prefix,
+                        &decision.metadata,
+                    );
+
+                    // Mirror under `stage.{stage_id}.*` so chart targets can
+                    // read prior stages' structured `output` (and so multiple
+                    // chart stages don't clobber each other under `classifier.*`).
+                    mirror_stage_metadata(
+                        &mut accumulated_metadata,
+                        &stage_name_human,
                         &decision.metadata,
                     );
 
@@ -497,6 +506,113 @@ mod tests {
         assert!(
             err.to_string().contains("stub fail"),
             "graph should propagate stage error: {err}"
+        );
+    }
+
+    /// A stage whose decision metadata carries a scalar and a structured
+    /// object — shape-check for `mirror_stage_metadata` promotion.
+    struct MetadataStage {
+        name: ArcIntern<str>,
+        /// Asset this stage provides (if any).
+        provides: Vec<ArcIntern<str>>,
+        /// Asset this stage depends on (if any).
+        depends: Vec<ArcIntern<str>>,
+        /// Key this stage reads from its ctx (e.g. `stage.reproduce.output`)
+        /// and re-emits in its own decision metadata.
+        read_key: Option<String>,
+    }
+
+    impl MetadataStage {
+        fn new(name: &str, read_key: Option<&str>) -> Self {
+            Self {
+                name: ArcIntern::from(name.to_string()),
+                provides: vec![],
+                depends: vec![],
+                read_key: read_key.map(str::to_string),
+            }
+        }
+    }
+
+    impl WorkUnit for MetadataStage {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn depends(&self) -> &[ArcIntern<str>] {
+            &self.depends
+        }
+        fn provides(&self) -> &[ArcIntern<str>] {
+            &self.provides
+        }
+        fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+            let mut metadata = serde_json::json!({
+                "intent": "code",
+                "output": {"plan": "minimal repro"},
+            });
+            if let Some(key) = &self.read_key {
+                if let Some(MetadataValue::String(raw)) = ctx.metadata.get(key) {
+                    metadata["seen_prior_output"] = serde_json::from_str(raw).unwrap_or_default();
+                }
+            }
+            WorkOutput::typed(
+                "done",
+                &StageDecision {
+                    stage: PipelineStage::Classifier,
+                    verdict: StageVerdict::Passed,
+                    score: None,
+                    reason: "r".into(),
+                    latency_ms: 0,
+                    metadata,
+                },
+            )
+        }
+    }
+
+    impl FieldAccess for MetadataStage {
+        fn set_field(&mut self, _name: &str, _value: &str) -> Result<(), FieldError> {
+            Err(FieldError::NotFound("none".into()))
+        }
+        fn get_field(&self, _name: &str) -> Result<String, FieldError> {
+            Err(FieldError::NotFound("none".into()))
+        }
+        fn field_names(&self) -> &'static [&'static str] {
+            &[]
+        }
+    }
+
+    impl Describable for MetadataStage {
+        fn describe(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+    }
+    impl_component!(MetadataStage);
+
+    #[test]
+    fn graph_mirrors_stage_metadata_under_stage_id() {
+        // reproduce runs first and provides `output`; root_cause reads the
+        // promoted `stage.reproduce.output` from its own ctx.
+        let mut repro = MetadataStage::new("reproduce", None);
+        repro.provides = vec![ArcIntern::from("reproduce_output")];
+        let mut root_cause = MetadataStage::new("root_cause", Some("stage.reproduce.output"));
+        root_cause.depends = vec![ArcIntern::from("reproduce_output")];
+        let graph = PipelineGraph::new(vec![Arc::new(repro), Arc::new(root_cause)]).unwrap();
+
+        let ctx = WorkContext::default();
+        let output = graph.execute(&ctx).unwrap();
+        let result: PipelineResult = output.data_as().unwrap();
+        assert_eq!(result.decisions.len(), 2);
+
+        // The downstream stage saw the prior structured output.
+        let root = &result.decisions[1].metadata;
+        assert_eq!(
+            root["seen_prior_output"],
+            serde_json::json!({"plan": "minimal repro"})
+        );
+
+        // Existing scalar promotion still works under `classifier.*` and the
+        // bare key (switch-on-single-field convention).
+        assert_eq!(
+            result.decisions[0].metadata["intent"],
+            serde_json::json!("code")
         );
     }
 }

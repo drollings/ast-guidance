@@ -46,6 +46,11 @@ serde_json = "1"
 # Builders
 bon = "3"
 
+# Templating
+# minijinja is used by fluent-router's chart templates: charts need
+# `{% for %}` / `{% if %}` over variable-length bound-entity lists (D1).
+minijinja = "2"
+
 # Database
 rusqlite = { version = "0.34", features = ["bundled"] }
 # sqlite-vec not yet available as a Rust crate; we use manual cosine fallback

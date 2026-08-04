@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
 use crate::config::RouterConfig;
+use crate::routes::plan::PlanRoute;
 use crate::server::responses::ResponseBody;
 use crate::server::serve_http;
 use crate::testing::mock::{MockDispatchContext, MockTranscriptEntry, TranscriptProvider};
@@ -107,6 +108,7 @@ async fn spawn_test_server(config: RouterConfig, mock: Option<MockDispatchContex
             mock,
             None,
             None,
+            None,
         )
         .await
         {
@@ -115,6 +117,110 @@ async fn spawn_test_server(config: RouterConfig, mock: Option<MockDispatchContex
     });
 
     TestServer { addr, handle }
+}
+
+/// Spawn a server with a plan route (M8 interview round-trip tests). The
+/// chart store is seeded with `bug_triage`; no selector backend is attached,
+/// so the deterministic/HNSW binding is the sole authority on executability.
+async fn spawn_plan_server() -> TestServer {
+    use crate::charts::store::{chart_from_str, ChartStore};
+    use crate::hnsw::HnswIndexHandle;
+    use crate::routes::plan::PlanRoute;
+
+    let triage = r#"{
+        "name": "bug_triage",
+        "description": "Triage a bug report into reproduction, root cause, and fix plan",
+        "schema_version": 1,
+        "author_model": "human",
+        "targets": [
+            {
+                "name": "reproduce",
+                "provides": ["repro_plan"],
+                "depends": [],
+                "template": "reproduce {{ request }}",
+                "essential": true
+            },
+            {
+                "name": "root_cause",
+                "provides": ["root_cause"],
+                "depends": [
+                    { "kind": "capability", "name": "repro_plan" },
+                    { "kind": "entity_match", "name": "report",
+                      "description": "the bug report",
+                      "predicate": {
+                        "fields": [
+                            { "path": "title", "ty": "string", "required": true }
+                        ]
+                      },
+                      "required": true }
+                ],
+                "template": "cause {{ request }}",
+                "essential": true
+            }
+        ]
+    }"#;
+
+    let tmp = std::env::temp_dir().join(format!("plan-test-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).ok();
+    let index_path = tmp.join("workflow_library.sqlite");
+    let handle = HnswIndexHandle {
+        name: "workflow_library".into(),
+        path: index_path.display().to_string(),
+    };
+    let store = ChartStore::new(Some(handle));
+    store.upsert(chart_from_str(triage).expect("chart parses")).expect("upsert");
+
+    let plan_route = Arc::new(PlanRoute::new().with_chart_store(Arc::new(store)));
+    let config = make_config("http://127.0.0.1:1", false, false, 5000, 2000);
+    let pipelines = Arc::new(config.build_all_pipelines_with_backend(None));
+    let routes = Arc::new(config.routes.clone());
+    let models = Arc::new(config.models.clone());
+    let max_payload = config.server.max_payload;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+
+    let handle = tokio::spawn(async move {
+        if let Err(e) = serve_http(
+            listener,
+            pipelines,
+            routes,
+            models,
+            max_payload,
+            None,
+            None,
+            None,
+            None,
+            Some(plan_route),
+        )
+        .await
+        {
+            tracing::error!(target: "router.test", error = %e, "plan test server failed");
+        }
+    });
+
+    TestServer { addr, handle }
+}
+
+/// POST a plan request, bounded by an overall timeout.
+async fn post_plan(
+    base_url: &str,
+    body: Value,
+    timeout_ms: u64,
+) -> Result<reqwest::Response, String> {
+    let client = reqwest::Client::new();
+    tokio::time::timeout(
+        Duration::from_millis(timeout_ms),
+        client
+            .post(format!("{base_url}/v1/plan"))
+            .json(&body)
+            .send(),
+    )
+    .await
+    .map_err(|_| "plan request timed out".to_string())?
+    .map_err(|e| format!("plan request failed: {e}"))
 }
 
 /// A dispatch mock with a single canned entry.
@@ -493,4 +599,224 @@ async fn filter_thinking_never_leaks_partial_tag_in_stream() {
         joined, "Hello the answer",
         "assembled stream content is wrong (partial tags not held correctly)"
     );
+}
+
+// ── M8: plan route interview round-trip ──────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_route_responds_with_targeted_clarification_then_executes() {
+    let server = spawn_plan_server().await;
+    let request = "Please bug_triage this report";
+
+    // Round 1: no report entity → structured clarification (never free chat).
+    let body = json!({ "message": request });
+    let resp = post_plan(&server.base_url(), body, 5000)
+        .await
+        .expect("plan round 1");
+    assert_eq!(resp.status(), 200);
+    let r1: Value = resp.json().await.expect("json response");
+    assert_eq!(r1["status"], "clarify");
+    assert_eq!(r1["source"], "template_adapted");
+    assert!(
+        r1["questions"]
+            .as_array()
+            .is_some_and(|q| q.iter().any(|x| x.as_str().is_some_and(|s| s.contains("report")))),
+        "targeted question must name the gap: {r1:?}"
+    );
+    let gaps: Vec<String> = r1["gaps"]
+        .as_array()
+        .expect("gaps echoed")
+        .iter()
+        .filter_map(|g| g.as_str().map(ToOwned::to_owned))
+        .collect();
+    assert_eq!(gaps, vec!["report".to_string()]);
+
+    // Round 2: the answer arrives as an entity (kind = gap dep name) plus the
+    // echoed gaps and retry=true → the chart is bound and compiled.
+    let answer = json!({
+        "message": request,
+        "entities": [{
+            "id": "issue-42",
+            "kind": "report",
+            "value": {"title": "Segfault on startup"}
+        }],
+        "gaps": gaps,
+        "retry": true
+    });
+    let resp = post_plan(&server.base_url(), answer, 5000)
+        .await
+        .expect("plan round 2");
+    assert_eq!(resp.status(), 200);
+    let r2: Value = resp.json().await.expect("json response");
+    assert_eq!(r2["status"], "executed");
+    assert_eq!(r2["source"], "template_adapted");
+    assert_eq!(
+        r2["gaps_filled"],
+        json!(["report"]),
+        "the interviewed gap is reported as filled"
+    );
+    assert!(
+        r2["workflow"]["workflows"]["bug_triage"]["stages"]
+            .as_array()
+            .is_some_and(|s| s.len() == 2),
+        "executed workflow carries the compiled chart: {r2:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_route_second_failure_terminates_as_fresh_draft() {
+    let server = spawn_plan_server().await;
+    let request = "Please bug_triage this report";
+
+    let body = json!({ "message": request });
+    let r1: Value = post_plan(&server.base_url(), body, 5000)
+        .await
+        .expect("plan round 1")
+        .json()
+        .await
+        .expect("json response");
+    let gaps: Vec<String> = r1["gaps"]
+        .as_array()
+        .expect("gaps echoed")
+        .iter()
+        .filter_map(|g| g.as_str().map(ToOwned::to_owned))
+        .collect();
+
+    // Round 2 answers with an entity that does NOT satisfy the report
+    // predicate → still Partial → the interview terminates as fresh_draft.
+    let answer = json!({
+        "message": request,
+        "entities": [{
+            "id": "note-1",
+            "kind": "note",
+            "value": {"body": "no title field"}
+        }],
+        "gaps": gaps,
+        "retry": true
+    });
+    let resp = post_plan(&server.base_url(), answer, 5000)
+        .await
+        .expect("plan round 2");
+    assert_eq!(resp.status(), 200);
+    let r2: Value = resp.json().await.expect("json response");
+    assert_eq!(
+        r2["status"], "fresh_draft",
+        "a second failure must not yield another round of questions: {r2:?}"
+    );
+    assert_eq!(r2["source"], "fresh_draft");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_route_unconfigured_returns_service_unavailable() {
+    let config = make_config("http://127.0.0.1:1", false, false, 5000, 2000);
+    let server = spawn_test_server(config, None).await;
+    let body = json!({ "message": "anything" });
+    let resp = post_plan(&server.base_url(), body, 5000)
+        .await
+        .expect("plan request");
+    assert_eq!(resp.status(), 503);
+}
+
+// ── M10: dispatch post-processing — workflow extraction ───────────────────
+
+/// Spawn the real server with a plan route (M10 extraction hook over a
+/// boot-loaded chart store).
+async fn spawn_server_with_plan_route(config: RouterConfig, plan_route: Arc<PlanRoute>) -> TestServer {
+    let provider = TranscriptProvider::new(HashMap::new());
+    let backend: Arc<dyn ChatBackend> = Arc::new(provider);
+    let pipelines = Arc::new(config.build_all_pipelines_with_backend(Some(&backend)));
+    let routes = Arc::new(config.routes.clone());
+    let models = Arc::new(config.models.clone());
+    let max_payload = config.server.max_payload;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+
+    let handle = tokio::spawn(async move {
+        if let Err(e) = serve_http(
+            listener,
+            pipelines,
+            routes,
+            models,
+            max_payload,
+            None,
+            None,
+            None,
+            None,
+            Some(plan_route),
+        )
+        .await
+        {
+            tracing::error!(target: "router.test", error = %e, "test server failed");
+        }
+    });
+
+    TestServer { addr, handle }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn successful_dispatch_distills_a_draft_chart() {
+    use crate::charts::extract::WorkflowExtractor;
+    use crate::charts::store::ChartStore;
+
+    let upstream = spawn_mock_upstream(Arc::new(|_req: &Value| {
+        let body = json!({
+            "id": "cmpl-x",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "fast",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": { "role": "assistant", "content": "the answer is 42" }
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 10, "total_tokens": 15}
+        });
+        let s = serde_json::to_string(&body).expect("serialize");
+        hyper::Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(s)).boxed_unsync())
+            .expect("build response")
+    }))
+    .await;
+
+    let config = make_config(&upstream, false, false, 5000, 2000);
+
+    // A shared store with the M10 extraction hook enabled (operator opt-in).
+    let store = Arc::new(ChartStore::new(None));
+    let extractor = WorkflowExtractor::new(store.clone()).enabled(true);
+    let plan_route = Arc::new(
+        PlanRoute::new()
+            .with_chart_store(store.clone())
+            .with_workflow_extractor(Arc::new(extractor)),
+    );
+    let server = spawn_server_with_plan_route(config, plan_route).await;
+
+    let body = json!({
+        "model": "fast",
+        "messages": [{"role": "user", "content": "What is the answer?"}]
+    });
+    let response = post_chat(&server.base_url(), body, 5000)
+        .await
+        .expect("request must complete");
+    assert_eq!(response.status(), 200);
+    let value: Value = response.json().await.expect("valid JSON response");
+    assert_eq!(value["choices"][0]["message"]["content"], "the answer is 42");
+
+    // The successful buffered dispatch was distilled into a draft chart.
+    let name = "what_is_the_answer";
+    assert!(
+        store.get(name).is_some(),
+        "a draft chart must be auto-extracted, got store = {:?}",
+        store.list()
+    );
+    assert!(
+        store.is_draft(name),
+        "the auto-extracted chart is a draft until rubric-validated"
+    );
+    // And the draft is not selectable yet (excluded from selection).
+    assert!(!store.charts_sorted().iter().any(|c| c.name == name));
 }

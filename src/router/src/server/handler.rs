@@ -8,8 +8,8 @@ use http_body_util::BodyExt;
 use crate::config::{ModelEntry, RouteRef};
 use crate::ledger::ContentNodeLedger;
 use crate::normalize;
-use crate::pipeline::PipelineOrchestrator;
-use crate::pipeline::RoutingTarget;
+use crate::pipeline::{PipelineOrchestrator, RoutingTarget};
+use crate::routes::plan::PlanRoute;
 use crate::server::dispatch::handle_dispatch;
 use crate::server::responses::completion_to_response;
 use crate::server::responses::empty_response;
@@ -68,12 +68,18 @@ async fn handle_chat_completion(
     models: Arc<std::collections::HashMap<String, ModelEntry>>,
     stats: Arc<ServerStats>,
     max_payload: usize,
-    classifier_url: Option<String>,
+    classifier: Option<(String, ModelEntry)>,
     mock_dispatch: Option<Arc<MockDispatchContext>>,
     ledger: Option<Arc<ContentNodeLedger>>,
     cache: Option<Arc<ResponseCache>>,
+    plan_route: Option<Arc<PlanRoute>>,
     http_client: Arc<reqwest::Client>,
 ) -> Result<HyperResponse, std::convert::Infallible> {
+    // M10: the dispatch post-processing hook (workflow extraction), if the
+    // operator configured it. Passed through to successful dispatches only.
+    let workflow_extractor = plan_route
+        .as_ref()
+        .and_then(|p| p.workflow_extractor().cloned());
     let body_bytes = match req.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
@@ -234,31 +240,19 @@ async fn handle_chat_completion(
             ledger.as_ref(),
             cache.as_ref(),
             stats.as_ref(),
+            workflow_extractor.clone(),
         )
         .await;
     }
 
-    if let Some(ref url) = classifier_url {
+    if let Some((ref key, ref entry)) = classifier {
+        let rt_for_fallback = RoutingTarget::from_model_entry(key, entry);
         tracing::info!(
             target: "router.server",
-            model = %model_name,
-            fallback_url = %url,
+            model = %rt_for_fallback.model,
+            fallback_url = %rt_for_fallback.url,
             "no routing target — dispatching to classifier fallback"
         );
-        let rt_for_fallback = RoutingTarget {
-            url: url.clone(),
-            model: model_name.clone(),
-            group: None,
-            target_name: None,
-            params: None,
-            filter_thinking: false,
-            retry_count: 0,
-            retry_base_interval_s: 1,
-            stream: false,
-            idle_timeout_ms: 30000,
-            total_timeout_ms: 30000,
-            fallbacks: vec![],
-        };
         return handle_dispatch(
             &rt_for_fallback,
             &router_request,
@@ -271,6 +265,7 @@ async fn handle_chat_completion(
             ledger.as_ref(),
             cache.as_ref(),
             stats.as_ref(),
+            workflow_extractor.clone(),
         )
         .await;
     }
@@ -297,6 +292,133 @@ async fn handle_chat_completion(
     ))
 }
 
+/// The `plan` route's HTTP surface (M8): a single targeted interview round.
+///
+/// The request body carries the user message and an optional entity list
+/// (the client's answers to a prior clarification, serialized as entities —
+/// the same shape stored under `entities_json`). The response is structured
+/// JSON, never free-form chat:
+///
+/// - `{"status": "clarify", "questions": [...], "gaps": [...]}` — the chart
+///   needs one round of targeted answers; the client replies with `entities`
+///   plus `retry: true` and the echoed `gaps`.
+/// - `{"status": "executed", "workflow": {...}, "source": ..., "gaps_filled":
+///   [...]}` — the chart is bound and compiled.
+/// - `{"status": "fresh_draft", "source": "fresh_draft"}` — no chart fit;
+///   planning falls through to a blank slate.
+///
+/// A `retry` request that still leaves gaps terminates as `fresh_draft`
+/// (VISION: terminate, don't loop).
+async fn handle_plan_request(
+    req: hyper::Request<hyper::body::Incoming>,
+    plan_route: Option<Arc<PlanRoute>>,
+    max_payload: usize,
+    stats: &ServerStats,
+) -> Result<HyperResponse, std::convert::Infallible> {
+    let Some(route) = plan_route else {
+        stats.errors.fetch_add(1, Ordering::Relaxed);
+        return Ok(crate::server::responses::error_response(
+            hyper::StatusCode::SERVICE_UNAVAILABLE,
+            "plan route not configured",
+        ));
+    };
+
+    let body_bytes = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            stats.errors.fetch_add(1, Ordering::Relaxed);
+            return Ok(crate::server::responses::error_response(
+                hyper::StatusCode::BAD_REQUEST,
+                &format!("body read error: {e}"),
+            ));
+        }
+    };
+    if body_bytes.len() > max_payload {
+        return Ok(empty_response(hyper::StatusCode::PAYLOAD_TOO_LARGE));
+    }
+    let body: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            stats.errors.fetch_add(1, Ordering::Relaxed);
+            return Ok(crate::server::responses::error_response(
+                hyper::StatusCode::BAD_REQUEST,
+                &format!("invalid JSON: {e}"),
+            ));
+        }
+    };
+
+    let message = body
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if message.is_empty() {
+        return Ok(crate::server::responses::error_response(
+            hyper::StatusCode::BAD_REQUEST,
+            "missing 'message'",
+        ));
+    }
+
+    let entities: Vec<crate::charts::binding::Entity> = body
+        .get("entities")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| serde_json::from_value(e.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let retry = body.get("retry").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let prior_gaps: Vec<String> = body
+        .get("gaps")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let result = if retry {
+        route.plan_interviewed(message, &entities, &prior_gaps)
+    } else {
+        route.plan(message, &entities)
+    };
+
+    let response = match result.source {
+        crate::routes::plan::PlanSource::FreshDraft => {
+            serde_json::json!({ "status": "fresh_draft", "source": "fresh_draft" })
+        }
+        crate::routes::plan::PlanSource::HnswHit => serde_json::json!({
+            "status": "executed",
+            "source": "hnsw_hit",
+            "workflow": result.workflow,
+            "gaps_filled": result.gaps_filled,
+        }),
+        crate::routes::plan::PlanSource::TemplateAdapted => {
+            if result.interview_questions.is_empty() {
+                serde_json::json!({
+                    "status": "executed",
+                    "source": "template_adapted",
+                    "workflow": result.workflow,
+                    "gaps_filled": result.gaps_filled,
+                })
+            } else {
+                serde_json::json!({
+                    "status": "clarify",
+                    "source": "template_adapted",
+                    "questions": result.interview_questions,
+                    "gaps": result.gaps,
+                })
+            }
+        }
+    };
+    Ok(crate::server::responses::json_response(
+        hyper::StatusCode::OK,
+        &response,
+    ))
+}
+
 #[allow(clippy::implicit_hasher)]
 pub async fn handle_request(
     req: hyper::Request<hyper::body::Incoming>,
@@ -305,10 +427,11 @@ pub async fn handle_request(
     models: Arc<std::collections::HashMap<String, ModelEntry>>,
     stats: Arc<ServerStats>,
     max_payload: usize,
-    classifier_url: Option<String>,
+    classifier: Option<(String, ModelEntry)>,
     mock_dispatch: Option<Arc<MockDispatchContext>>,
     ledger: Option<Arc<ContentNodeLedger>>,
     cache: Option<Arc<ResponseCache>>,
+    plan_route: Option<Arc<PlanRoute>>,
     http_client: Arc<reqwest::Client>,
 ) -> Result<HyperResponse, std::convert::Infallible> {
     let method = req.method().clone();
@@ -370,13 +493,18 @@ pub async fn handle_request(
                 models,
                 stats,
                 max_payload,
-                classifier_url,
+                classifier,
                 mock_dispatch,
                 ledger,
                 cache,
+                plan_route,
                 http_client,
             )
             .await
+        }
+        ("POST", "/v1/plan") => {
+            stats.requests.fetch_add(1, Ordering::Relaxed);
+            handle_plan_request(req, plan_route, max_payload, &stats).await
         }
         _ => {
             if method == hyper::Method::DELETE && path.starts_with("/admin/cache/") {
@@ -436,7 +564,6 @@ fn resolve_pipeline(
     pipelines: &std::collections::HashMap<String, Arc<PipelineOrchestrator>>,
     request_json: &str,
 ) -> crate::pipeline::PipelineResult {
-    use crate::pipeline::RoutingTarget;
     use fluent_wvr::prelude::*;
 
     let route = routes.get(model_name).cloned();
@@ -444,23 +571,7 @@ fn resolve_pipeline(
     let pipeline_names: Vec<String> = if let Some(ref r) = route {
         r.pipelines.clone()
     } else if let Some(model_entry) = models.get(model_name) {
-        let rt = RoutingTarget {
-            url: model_entry.endpoint.clone(),
-            model: model_entry
-                .name
-                .clone()
-                .unwrap_or_else(|| model_name.to_string()),
-            group: None,
-            target_name: Some(model_name.to_string()),
-            params: model_entry.params.clone(),
-            filter_thinking: model_entry.filter_thinking,
-            retry_count: model_entry.retry_count,
-            retry_base_interval_s: model_entry.retry_base_interval_s,
-            stream: model_entry.stream,
-            idle_timeout_ms: model_entry.idle_timeout_ms,
-            total_timeout_ms: model_entry.total_timeout_ms,
-            fallbacks: vec![],
-        };
+        let rt = RoutingTarget::from_model_entry(model_name, model_entry);
         return crate::pipeline::PipelineResult {
             decisions: vec![],
             final_response: None,

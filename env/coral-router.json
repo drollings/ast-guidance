@@ -4,13 +4,13 @@
             "deterministic_prefilter": true,
             "classifier": true,
             "router": true,
-            "coherence_threshold": 0.7,
-            "classifier_model": "tiny",
+            "coherence_threshold": 0.5,
+            "classifier_model": "lfm",
             "blacklist": "env/pii-patterns.json"
         }
     },
     "models": {
-        "tiny": {
+        "lfm": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
             "name": "unsloth/lfm2.5-1.2b-instruct",
             "intelligence": 2,
@@ -30,9 +30,9 @@
                 "sleep_idle_seconds": 7200
             }
         },
-        "fast": {
+        "qwen3.5-4b": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
-            "name": "unsloth/lfm2.5-8b-a1b",
+            "name": "unsloth/qwen3.5-4b-mtp",
             "intelligence": 1,
             "cost_input": 1e-06,
             "cost_output": 6e-06,
@@ -45,14 +45,14 @@
             "retry_count": 2,
             "retry_base_interval_s": 1,
             "params": {
-                "num_ctx": 98304,
-                "parallel": 3,
+                "num_ctx": 163840,
+                "parallel": 4,
                 "sleep_idle_seconds": 7200
             }
         },
-        "mid": {
+        "qwen3.5-9b": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
-            "name": "unsloth/qwen3.5-4b-mtp",
+            "name": "code",
             "intelligence": 3,
             "cost_input": 3e-06,
             "cost_output": 1.8e-05,
@@ -83,12 +83,12 @@
                     "sleep_idle_seconds": 600
                 },
                 "compact": {
-                    "num_ctx": 8192,
+                    "num_ctx": 163840,
                     "sleep_idle_seconds": 300
                 }
             }
         },
-        "heavy": {
+        "qwen3.6-27b": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
             "name": "vinpix/ternary-bonsai-27b-stock-mtp",
             "intelligence": 6,
@@ -126,33 +126,41 @@
                 }
             }
         },
-        "prose": {
+        "thinkingcap": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
-            "name": "altworld/astrea-r8-chat-9b",
-            "intelligence": 3,
+            "name": "protolabsai/thinkingcap-qwen3.6-27b-heretic-mtp",
+            "intelligence": 6,
             "cost_input": 3e-06,
             "cost_output": 1.8e-05,
             "cost_cached_read": 1.2e-06,
             "speed": 5,
-            "total_timeout_ms": 120000,
-            "idle_timeout_ms": 10000,
+            "total_timeout_ms": 240000,
+            "idle_timeout_ms": 15000,
             "stream": true,
             "filter_thinking": true,
             "retry_count": 1,
             "retry_base_interval_s": 2,
             "params": {
-                "num_ctx": 65536,
+                "num_ctx": 131072,
                 "repeat_penalty": 1.05,
-                "temperature": 0.6,
-                "sleep_idle_seconds": 1200
+                "temperature": 0.7,
+                "sleep_idle_seconds": 900
             },
             "sessions": {
-                "prose": {
-                    "num_ctx": 65536,
-                    "sleep_idle_seconds": 1200,
+                "orchestrator": {
+                    "num_ctx": 131072,
+                    "sleep_idle_seconds": 0,
                     "params": {
                         "temperature": 0.7
                     }
+                },
+                "code": {
+                    "num_ctx": 131072,
+                    "sleep_idle_seconds": 900
+                },
+                "compact": {
+                    "num_ctx": 8192,
+                    "sleep_idle_seconds": 300
                 }
             }
         },
@@ -175,6 +183,46 @@
                 "sleep_idle_seconds": 300,
                 "temperature": 0.6
             }
+        },
+        "embed": {
+            "endpoint": "http://localhost:8080/v1/chat/completions",
+            "name": "google/embeddinggemma-300m",
+            "intelligence": 1,
+            "cost_input": 1e-06,
+            "cost_output": 6e-06,
+            "cost_cached_read": 4e-07,
+            "speed": 8,
+            "total_timeout_ms": 20000,
+            "idle_timeout_ms": 4000,
+            "stream": true,
+            "filter_thinking": false,
+            "retry_count": 2,
+            "retry_base_interval_s": 1,
+            "params": {
+                "num_ctx": 8192,
+                "parallel": 1,
+                "sleep_idle_seconds": 15
+            }
+        },
+        "rerank": {
+            "endpoint": "http://localhost:8080/v1/chat/completions",
+            "name": "google/embeddinggemma-300m",
+            "intelligence": 1,
+            "cost_input": 1e-06,
+            "cost_output": 6e-06,
+            "cost_cached_read": 4e-07,
+            "speed": 8,
+            "total_timeout_ms": 20000,
+            "idle_timeout_ms": 4000,
+            "stream": true,
+            "filter_thinking": false,
+            "retry_count": 2,
+            "retry_base_interval_s": 1,
+            "params": {
+                "num_ctx": 8192,
+                "parallel": 1,
+                "sleep_idle_seconds": 15
+            }
         }
     },
     "routes": {
@@ -182,6 +230,11 @@
             "group": "question",
             "pipelines": ["default"],
             "description": "General Q&A, factual queries, chit-chat, and simple questions"
+        },
+        "chat": {
+            "group": "chitchat",
+            "pipelines": ["default"],
+            "description": "Programming, software development, dev-ops, debugging, and technical implementation"
         },
         "code": {
             "group": "code",
@@ -196,36 +249,48 @@
     },
     "model_groups": {
         "classifier": [
-            "tiny"
+            "qwen3.5-4b"
         ],
         "question": [
-            "mid"
+            "qwen3.5-4b"
         ],
         "command": [
-            "mid"
+            "qwen3.5-4b"
         ],
         "code": [
-            "heavy"
+            "qwen3.6-27b"
         ],
         "chitchat": [
-            "mid"
+            "thinkingcap"
         ],
         "psychology": [
-            "heavy"
+            "qwen3.6-27b"
         ],
         "translation": [
             "translation"
         ],
         "orchestrator": [
-            "mid"
+            "qwen3.5-4b"
         ],
         "ledger": [
-            "mid"
+            "qwen3.5-4b"
         ]
     },
-    "system_prompt": "You are Coral, a query classifier and safety router based on LiquidAI's LFM2.5 LLM architecture. Analyze the user's message and output JSON only.",
-    "safety_threshold": 0.5,
+    "system_prompt": "You are Coral, a query classifier and safety router based on an amalgam of edge language models. Analyze the user's message and output JSON only.",
+    "safety_threshold": 0.3,
     "default_route": "local",
+    "charts": {
+        "dir": "env/workflows/charts",
+        "index_path": "data/workflow_library.sqlite",
+        "selector_model": "lfm",
+        "max_candidates": 5,
+        "min_score": 0.6,
+        "entity_context": true
+    },
+    "post_process": {
+        "workflow_extraction": false
+    },
+    "embedding_model": "embed",
     "server": {
         "bind_addr": "127.0.0.1:8079",
         "max_payload": 1048576

@@ -1,0 +1,33 @@
+{
+  "name": "draft_doc",
+  "description": "Draft a structured document from requirements into a final deliverable",
+  "schema_version": 1,
+  "author_model": "human",
+  "targets": [
+    {
+      "name": "outline",
+      "provides": ["doc_outline"],
+      "depends": [],
+      "template": "Given the document request {{ request }}, produce a section outline.\n{% for e in deps.requirements | default([]) %}Requirement: {{ e.value.description }}\n{% endfor %}",
+      "essential": true
+    },
+    {
+      "name": "draft",
+      "provides": ["doc_draft"],
+      "depends": [
+        { "kind": "capability", "name": "doc_outline" }
+      ],
+      "template": "Using the outline {{ upstream.outline.output }}, draft the full document.",
+      "essential": true
+    },
+    {
+      "name": "polish",
+      "provides": ["final_doc"],
+      "depends": [
+        { "kind": "capability", "name": "doc_draft" }
+      ],
+      "template": "Polish the draft {{ upstream.draft.output }} into a final, publication-ready document.",
+      "essential": true
+    }
+  ]
+}

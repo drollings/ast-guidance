@@ -29,6 +29,9 @@ http-body-util = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
 rusqlite = { workspace = true }
+minijinja = { workspace = true }
+hnsw_rs = { workspace = true }
+search-vector = { path = "../search-vector" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

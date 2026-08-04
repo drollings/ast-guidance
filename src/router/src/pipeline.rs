@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use common_core::constants::default_true;
 
+use crate::config::ModelEntry;
 use crate::pipeline_types::{PipelineStage, StageDecision, StageMetadata, StageVerdict};
 use crate::stages::common::get_metadata_string;
 
@@ -46,6 +47,30 @@ pub struct RoutingTarget {
     /// ordered by intelligence proximity to the request complexity.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallbacks: Vec<RoutingTarget>,
+}
+
+impl RoutingTarget {
+    /// Build a routing target from a configured model entry — the canonical
+    /// mapping used by every dispatch path (direct-model requests and the
+    /// classifier fallback) so any call to a model carries its configured
+    /// `params` (e.g. `num_ctx`/`parallel`/`sleep_idle_seconds` for llama.cpp
+    /// slot sizing) plus its timeout/retry/streaming profile.
+    pub fn from_model_entry(model_key: &str, entry: &ModelEntry) -> Self {
+        Self {
+            url: entry.endpoint.clone(),
+            model: entry.name.clone().unwrap_or_else(|| model_key.to_string()),
+            group: None,
+            target_name: Some(model_key.to_string()),
+            params: entry.params.clone(),
+            filter_thinking: entry.filter_thinking,
+            retry_count: entry.retry_count,
+            retry_base_interval_s: entry.retry_base_interval_s,
+            stream: entry.stream,
+            idle_timeout_ms: entry.idle_timeout_ms,
+            total_timeout_ms: entry.total_timeout_ms,
+            fallbacks: vec![],
+        }
+    }
 }
 
 fn default_retry_interval() -> u64 {
@@ -345,3 +370,69 @@ impl Describable for PipelineOrchestrator {
 }
 
 impl_component!(PipelineOrchestrator);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_entry() -> ModelEntry {
+        serde_json::from_value(serde_json::json!({
+            "endpoint": "http://localhost:8080/v1/chat/completions",
+            "name": "unsloth/lfm2.5-1.2b-instruct",
+            "intelligence": 2,
+            "cost_input": 1e-6,
+            "cost_output": 6e-6,
+            "cost_cached_read": 4e-7,
+            "speed": 8,
+            "total_timeout_ms": 40000,
+            "idle_timeout_ms": 8000,
+            "stream": true,
+            "filter_thinking": true,
+            "retry_count": 2,
+            "retry_base_interval_s": 1,
+            "params": {
+                "num_ctx": 98304,
+                "parallel": 3,
+                "sleep_idle_seconds": 7200
+            }
+        }))
+        .expect("valid ModelEntry")
+    }
+
+    #[test]
+    fn from_model_entry_forwards_configured_params_and_profile() {
+        let rt = RoutingTarget::from_model_entry("lfm", &test_entry());
+
+        assert_eq!(rt.url, "http://localhost:8080/v1/chat/completions");
+        assert_eq!(rt.model, "unsloth/lfm2.5-1.2b-instruct");
+        assert_eq!(rt.target_name.as_deref(), Some("lfm"));
+        // The llama.cpp slot args must reach the request body unchanged —
+        // dropping them yields a default-context slot and a second model line.
+        assert_eq!(
+            rt.params.as_ref().and_then(|p| p.get("num_ctx")),
+            Some(&serde_json::json!(98304))
+        );
+        assert_eq!(
+            rt.params.as_ref().and_then(|p| p.get("parallel")),
+            Some(&serde_json::json!(3))
+        );
+        assert_eq!(
+            rt.params.as_ref().and_then(|p| p.get("sleep_idle_seconds")),
+            Some(&serde_json::json!(7200))
+        );
+        assert!(rt.filter_thinking);
+        assert_eq!(rt.retry_count, 2);
+        assert_eq!(rt.retry_base_interval_s, 1);
+        assert!(rt.stream);
+        assert_eq!(rt.idle_timeout_ms, 8000);
+        assert_eq!(rt.total_timeout_ms, 40000);
+    }
+
+    #[test]
+    fn from_model_entry_falls_back_to_key_when_name_missing() {
+        let mut entry = test_entry();
+        entry.name = None;
+        let rt = RoutingTarget::from_model_entry("lfm", &entry);
+        assert_eq!(rt.model, "lfm");
+    }
+}

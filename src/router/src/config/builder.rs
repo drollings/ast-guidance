@@ -7,12 +7,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use common_core::config::load_json_or_default;
+use fluent_concurrency::pool::Limiter;
 use fluent_wvr::prelude::Component;
 use guidance_llm::client::ChatBackend;
 use guidance_llm::{LlmClient, LlmConfig};
 
 use super::{default_true, RejectPatterns, RouterConfig};
+use crate::charts::binding::Entity;
+use crate::charts::{ChartDef, ChartError};
 use crate::pipeline::PipelineOrchestrator;
+use crate::pipeline_graph::PipelineGraph;
 use crate::score_matrix::ScoreMatrix;
 
 /// Named pipeline parameters. Pipelines are stored as a map keyed by name.
@@ -146,6 +150,33 @@ impl RouterConfig {
         Some(PipelineOrchestrator::new(stages))
     }
 
+    /// Build a runnable `PipelineGraph` of `ChartPromptStage`s for a chart.
+    ///
+    /// This is the M5 builder mapping: a bound chart becomes executable
+    /// stages, each rendering its template at execution time and calling the
+    /// injected `ChatBackend`. Stage `depends`/`provides` are the concrete
+    /// asset names needed for `PipelineGraph` topo-ordering; `upstream_ids`
+    /// drive the `stage.{id}.output` metadata reads.
+    ///
+    /// The stage construction + dependency resolution is delegated to
+    /// `compile_chart_stages` (shared with the M9 Zone supervisor — DRY).
+    ///
+    /// Returns `ChartError::Compile` for the same gaps as `compile_chart`
+    /// (unmatched required deps, ambiguous bindings).
+    pub fn build_chart_pipeline(
+        &self,
+        chart: &ChartDef,
+        entities: &[Entity],
+        backend: &Arc<dyn ChatBackend>,
+        limiter: &Arc<Limiter>,
+    ) -> Result<PipelineGraph, ChartError> {
+        let targets = crate::charts::compile::compile_chart_stages(chart, entities, backend, limiter)?;
+        let stages: Vec<Arc<dyn Component>> = targets.into_iter().map(|t| t.stage).collect();
+        PipelineGraph::new(stages).map_err(|e| ChartError::Compile {
+            reason: format!("chart '{}' stage graph invalid: {e}", chart.name),
+        })
+    }
+
     pub fn build_all_pipelines(&self) -> HashMap<String, Arc<PipelineOrchestrator>> {
         self.build_all_pipelines_with_backend(None)
     }
@@ -257,6 +288,9 @@ mod tests {
     use std::sync::Mutex;
     use tracing_subscriber::layer::SubscriberExt;
 
+    use crate::test_stubs::StubChatBackend;
+    use fluent_wvr::WorkUnit;
+
     /// A `MakeWriter` that captures formatted log lines for assertions.
     #[derive(Clone, Default)]
     struct LogCapture(Arc<Mutex<Vec<String>>>);
@@ -361,6 +395,171 @@ mod tests {
         assert!(
             !joined.contains("some configured pipelines were not built"),
             "no aggregate error expected, logs:\n{joined}"
+        );
+    }
+
+    /// Records every system prompt it receives, and returns a canned response.
+    struct RecordingBackend {
+        prompts: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ChatBackend for RecordingBackend {
+        fn chat_complete(
+            &self,
+            messages: &[guidance_llm::ChatMessage],
+        ) -> Result<String, guidance_llm::LlmError> {
+            self.prompts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(messages.iter().filter(|m| m.role == "system").map(|m| m.content.clone()));
+            Ok(r#"{"ok": true}"#.to_string())
+        }
+    }
+
+    fn triage_chart() -> ChartDef {
+        serde_json::from_str(
+            r#"{
+                "name": "bug_triage",
+                "description": "triage",
+                "schema_version": 1,
+                "author_model": "human",
+                "targets": [
+                    {
+                        "name": "reproduce",
+                        "provides": ["repro_plan"],
+                        "depends": [],
+                        "template": "Plan repro for: {{ request }}",
+                        "essential": true
+                    },
+                    {
+                        "name": "root_cause",
+                        "provides": ["root_cause"],
+                        "depends": [
+                            { "kind": "capability", "name": "repro_plan" },
+                            { "kind": "entity_match", "name": "report",
+                              "description": "the report",
+                              "predicate": {
+                                "fields": [
+                                    { "path": "title", "ty": "string", "required": true }
+                                ]
+                              },
+                              "required": true }
+                        ],
+                        "template": "Prior plan: {{ upstream.reproduce.output }}\nReport: {% for e in deps.report %}{{ e.value.title }}{% endfor %}\nCause of: {{ request }}",
+                        "essential": true
+                    },
+                    {
+                        "name": "fix_plan",
+                        "provides": ["fix_plan"],
+                        "depends": [
+                            { "kind": "capability", "name": "root_cause" }
+                        ],
+                        "template": "Fix for: {{ request }}",
+                        "essential": true
+                    }
+                ]
+            }"#,
+        )
+        .expect("triage chart JSON")
+    }
+
+    fn request_ctx(text: &str, entities: &[Entity]) -> fluent_wvr::WorkContext {
+        let ctx_json = serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": text}]
+        });
+        let mut ctx = fluent_wvr::WorkContext::default();
+        ctx.metadata.insert(
+            "request".into(),
+            fluent_wvr::MetadataValue::String(ctx_json.to_string()),
+        );
+        if !entities.is_empty() {
+            ctx.metadata.insert(
+                crate::charts::binding::ENTITIES_META_KEY.into(),
+                fluent_wvr::MetadataValue::String(serde_json::to_string(entities).unwrap()),
+            );
+        }
+        ctx
+    }
+
+    #[test]
+    fn chart_pipeline_executes_in_topo_order_with_preamble_and_prior_output() {
+        let config: RouterConfig = serde_json::from_str(
+            r#"{
+                "pipelines": {"default": {"classifier": false}},
+                "models": {},
+                "model_groups": {}
+            }"#,
+        )
+        .expect("valid config");
+
+        let entity = Entity {
+            id: "issue-42".into(),
+            kind: "report".into(),
+            value: serde_json::json!({"title": "Segfault on startup"}),
+        };
+
+        let prompts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let backend: Arc<dyn ChatBackend> = Arc::new(RecordingBackend {
+            prompts: prompts.clone(),
+        });
+        let limiter = Arc::new(Limiter::new(4));
+        let graph = config
+            .build_chart_pipeline(&triage_chart(), &[entity.clone()], &backend, &limiter)
+            .expect("chart builds into a runnable pipeline");
+
+        let ctx = request_ctx("app crashes on startup", &[entity.clone()]);
+        let output = graph.execute(&ctx).expect("chart pipeline executes");
+        let result: crate::pipeline::PipelineResult = output.data_as().expect("pipeline result");
+
+        // Topo order: reproduce → root_cause → fix_plan (3 decisions).
+        assert_eq!(result.decisions.len(), 3);
+        assert_eq!(result.decisions[0].reason, "chart target 'reproduce' completed");
+        assert_eq!(result.decisions[1].reason, "chart target 'root_cause' completed");
+        assert_eq!(result.decisions[2].reason, "chart target 'fix_plan' completed");
+
+        // Every stage made one LLM call (3 system prompts recorded).
+        let recorded = prompts.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 3, "one LLM call per chart target");
+
+        // reproduce's prompt carries the request.
+        assert!(recorded[0].contains("app crashes on startup"));
+        // root_cause's prompt carries the entity preamble AND the prior output.
+        assert!(
+            recorded[1].contains("Segfault on startup"),
+            "root_cause prompt must include the bound entity preamble: {}",
+            recorded[1]
+        );
+        assert!(
+            recorded[1].contains(r#"{"ok": true}"#),
+            "root_cause prompt must include the prior target output: {}",
+            recorded[1]
+        );
+        // fix_plan's prompt carries the request.
+        assert!(recorded[2].contains("app crashes on startup"));
+    }
+
+    #[test]
+    fn chart_pipeline_rejects_unbound_chart_at_build_time() {
+        let config: RouterConfig = serde_json::from_str(
+            r#"{
+                "pipelines": {"default": {"classifier": false}},
+                "models": {},
+                "model_groups": {}
+            }"#,
+        )
+        .expect("valid config");
+
+        let backend: Arc<dyn ChatBackend> = Arc::new(StubChatBackend::always("{}"));
+        let limiter = Arc::new(Limiter::new(4));
+        // No entities → root_cause's required `report` dep is unmatched.
+        let err = match config.build_chart_pipeline(&triage_chart(), &[], &backend, &limiter) {
+            Err(e) => e,
+            Ok(_) => panic!("expected compile error for unbound chart"),
+        };
+        assert!(
+            matches!(&err, ChartError::Compile { reason } if reason.contains("not fully bound")),
+            "expected compile error, got: {err}"
         );
     }
 }

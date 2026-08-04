@@ -1,0 +1,41 @@
+{
+  "name": "bug_triage",
+  "description": "Triage a bug report into reproduction, root cause, and fix plan",
+  "schema_version": 1,
+  "author_model": "human",
+  "targets": [
+    {
+      "name": "reproduce",
+      "provides": ["repro_plan"],
+      "depends": [],
+      "template": "Given the bug report {{ request }}, write a minimal reproduction plan.\n{% for e in deps.report | default([]) %}Report entity: {{ e.value.title }}\n{% endfor %}",
+      "essential": true
+    },
+    {
+      "name": "root_cause",
+      "provides": ["root_cause"],
+      "depends": [
+        { "kind": "capability", "name": "repro_plan" }
+      ],
+      "template": "Using the reproduction plan {{ upstream.reproduce.output }}, identify the root cause.",
+      "essential": true
+    },
+    {
+      "name": "fix_plan",
+      "provides": ["fix_plan"],
+      "depends": [
+        { "kind": "capability", "name": "root_cause" },
+        { "kind": "entity_match", "name": "report",
+          "description": "the bug report entity",
+          "predicate": {
+            "fields": [
+              { "path": "title", "ty": "string", "required": true }
+            ]
+          },
+          "required": true }
+      ],
+      "template": "Produce a fix plan for {{ upstream.root_cause.output }}.",
+      "essential": true
+    }
+  ]
+}

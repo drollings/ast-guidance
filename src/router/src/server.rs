@@ -16,6 +16,7 @@ use tokio::net::TcpListener;
 use crate::config::{ModelEntry, RouteRef, ServerConfig};
 use crate::ledger::ContentNodeLedger;
 use crate::pipeline::PipelineOrchestrator;
+use crate::routes::plan::PlanRoute;
 use crate::testing::mock::MockDispatchContext;
 
 pub struct RouterServer {
@@ -25,10 +26,12 @@ pub struct RouterServer {
     models: HashMap<String, ModelEntry>,
     bind_addr: String,
     max_payload: usize,
-    classifier_url: Option<String>,
+    classifier: Option<(String, ModelEntry)>,
     mock_dispatch: Option<Arc<MockDispatchContext>>,
     ledger: Option<Arc<ContentNodeLedger>>,
     cache: Option<Arc<ResponseCache>>,
+    /// Chart store + selector host (boot-loaded; M7/M8 dispatch to it).
+    plan_route: Option<Arc<PlanRoute>>,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
@@ -39,7 +42,7 @@ impl RouterServer {
         routes: HashMap<String, RouteRef>,
         models: HashMap<String, ModelEntry>,
         config: &ServerConfig,
-        classifier_url: Option<String>,
+        classifier: Option<(String, ModelEntry)>,
     ) -> Self {
         Self {
             name: ArcIntern::from("router.server"),
@@ -48,10 +51,11 @@ impl RouterServer {
             models,
             bind_addr: config.bind_addr.clone(),
             max_payload: config.max_payload,
-            classifier_url,
+            classifier,
             mock_dispatch: None,
             ledger: None,
             cache: None,
+            plan_route: None,
             depends: vec![],
             provides: vec![ArcIntern::from("http.endpoint")],
         }
@@ -70,6 +74,12 @@ impl RouterServer {
     }
 
     #[must_use]
+    pub fn with_plan_route(mut self, plan_route: Arc<PlanRoute>) -> Self {
+        self.plan_route = Some(plan_route);
+        self
+    }
+
+    #[must_use]
     pub fn with_mock(mut self, mock_dispatch: MockDispatchContext) -> Self {
         tracing::info!(
             target: "router.server",
@@ -81,12 +91,18 @@ impl RouterServer {
     }
 
     pub async fn serve(&self) -> Result<(), crate::error::ServerError> {
+        let chart_count = self
+            .plan_route
+            .as_ref()
+            .map_or(0, |p| p.chart_store().len());
         tracing::info!(
             target: "router.server",
             bind_addr = %self.bind_addr,
             has_mock = self.mock_dispatch.is_some(),
             has_ledger = self.ledger.is_some(),
             has_cache = self.cache.is_some(),
+            has_plan_route = self.plan_route.is_some(),
+            chart_count = chart_count,
             "serving HTTP"
         );
         run_http(
@@ -95,10 +111,11 @@ impl RouterServer {
             Arc::new(self.models.clone()),
             &self.bind_addr,
             self.max_payload,
-            self.classifier_url.clone(),
+            self.classifier.clone(),
             self.mock_dispatch.clone(),
             self.ledger.clone(),
             self.cache.clone(),
+            self.plan_route.clone(),
         )
         .await
     }
@@ -121,10 +138,11 @@ impl WorkUnit for RouterServer {
         let models = Arc::new(self.models.clone());
         let bind_addr = self.bind_addr.clone();
         let max_payload = self.max_payload;
-        let classifier_url = self.classifier_url.clone();
+        let classifier = self.classifier.clone();
         let mock_dispatch = self.mock_dispatch.clone();
         let ledger = self.ledger.clone();
         let cache = self.cache.clone();
+        let plan_route = self.plan_route.clone();
         let rt = ctx.rt.clone();
 
         let _handle = rt.spawn(Box::pin(async move {
@@ -134,10 +152,11 @@ impl WorkUnit for RouterServer {
                 models,
                 &bind_addr,
                 max_payload,
-                classifier_url,
+                classifier,
                 mock_dispatch,
                 ledger,
                 cache,
+                plan_route,
             )
             .await
             {
@@ -182,10 +201,11 @@ async fn run_http(
     models: Arc<HashMap<String, ModelEntry>>,
     bind_addr: &str,
     max_payload: usize,
-    classifier_url: Option<String>,
+    classifier: Option<(String, ModelEntry)>,
     mock_dispatch: Option<Arc<MockDispatchContext>>,
     ledger: Option<Arc<ContentNodeLedger>>,
     cache: Option<Arc<ResponseCache>>,
+    plan_route: Option<Arc<PlanRoute>>,
 ) -> Result<(), crate::error::ServerError> {
     let listener = TcpListener::bind(bind_addr)
         .await
@@ -202,10 +222,11 @@ async fn run_http(
         routes,
         models,
         max_payload,
-        classifier_url,
+        classifier,
         mock_dispatch,
         ledger,
         cache,
+        plan_route,
     )
     .await
 }
@@ -219,10 +240,11 @@ pub(crate) async fn serve_http(
     routes: Arc<HashMap<String, RouteRef>>,
     models: Arc<HashMap<String, ModelEntry>>,
     max_payload: usize,
-    classifier_url: Option<String>,
+    classifier: Option<(String, ModelEntry)>,
     mock_dispatch: Option<Arc<MockDispatchContext>>,
     ledger: Option<Arc<ContentNodeLedger>>,
     cache: Option<Arc<ResponseCache>>,
+    plan_route: Option<Arc<PlanRoute>>,
 ) -> Result<(), crate::error::ServerError> {
     use hyper_util::rt::TokioIo;
 
@@ -250,10 +272,11 @@ pub(crate) async fn serve_http(
         let routes = routes.clone();
         let models = models.clone();
         let stats = stats.clone();
-        let classifier_url = classifier_url.clone();
+        let classifier = classifier.clone();
         let mock_dispatch = mock_dispatch.clone();
         let ledger = ledger.clone();
         let cache = cache.clone();
+        let plan_route = plan_route.clone();
         let http_client = http_client.clone();
 
         tokio::spawn(async move {
@@ -266,10 +289,11 @@ pub(crate) async fn serve_http(
                     models.clone(),
                     stats.clone(),
                     max_payload,
-                    classifier_url.clone(),
+                    classifier.clone(),
                     mock_dispatch.clone(),
                     ledger.clone(),
                     cache.clone(),
+                    plan_route.clone(),
                     http_client.clone(),
                 )
             });
