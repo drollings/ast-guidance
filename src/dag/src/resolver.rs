@@ -1,3 +1,39 @@
+//! Capability-aware dependency resolver.
+//!
+//! ## Two-phase design — read this before editing
+//!
+//! Resolution is deliberately split into **two phases**, and the boundary
+//! between them is load-bearing. The two phases are NOT duplicates of each
+//! other, and `plan_from_set` is NOT a duplicate of
+//! `DependencyGraph::topo_sort`:
+//!
+//! 1. **Phase 1 — narrowing (semantic selection).** `resolve_narrow_one`
+//!    decides *which* targets participate in the plan. Targets are
+//!    duck-typed: an `Abstract` target provides a capability by **name**
+//!    match rather than self-provision, and a capability can have multiple
+//!    competing providers. So this phase *chooses* providers — it does not
+//!    traverse a graph. It applies the narrowing pipeline (`narrowing.rs`),
+//!    resolves implicit name self-provision (`closure.rs`), and records
+//!    narrowing losers in a `rejected` set so they can never re-enter the
+//!    plan through a different capability path.
+//!
+//! 2. **Phase 2 — pure Kahn's algorithm.** Once narrowing has reduced the
+//!    ambiguous, multi-provider capability graph to a clean selection,
+//!    `plan_from_set` topologically orders that *already-selected* set. The
+//!    Kahn sort here is intentionally simple and self-contained: it is the
+//!    payoff of the narrowing step, not a re-implementation of graph
+//!    algorithms that could be delegated.
+//!
+//! `plan_from_set` cannot delegate to `DependencyGraph::topo_sort` because
+//! (a) target ids and capability ids are two `usize` index spaces that
+//! `DependencyGraph<K>`'s single key type would alias, and (b) it must order
+//! exactly the selected set with no re-expansion — re-expanding would
+//! re-introduce rejected (narrowing-loser) targets through uncontested
+//! capabilities. Do not "unify" the two phases or route `plan_from_set`
+//! through `DependencyGraph` without addressing both constraints.
+//!
+//! See also: `REVIEW_20260804_PROGRESS.md` §3.3 for the design rationale.
+
 use std::collections::{HashMap, HashSet};
 
 use crate::closure::{self, ClosureCtx};
@@ -129,6 +165,15 @@ impl<'a> DependencyResolver<'a> {
         self.plan_from_set(&needed)
     }
 
+    /// Phase 1 of the two-phase design (see the module doc comment): narrow
+    /// the duck-typed, multi-provider capability graph down to the set of
+    /// targets that will execute.
+    ///
+    /// This is a *selection* pass (a fixpoint over provider contests), not a
+    /// graph walk. It records narrowing losers in the `rejected` set so the
+    /// Phase 2 Kahn sort (`plan_from_set`) never re-introduces them. Keep it
+    /// separate from the ordering phase — the two phases are deliberately
+    /// distinct and must not be collapsed into one.
     fn resolve_narrow_one(
         &self,
         seed_bits: &[usize],
@@ -311,6 +356,16 @@ impl<'a> DependencyResolver<'a> {
         self.plan_from_set(&combined)
     }
 
+    /// Phase 2 of the two-phase design (see the module doc comment): a pure
+    /// Kahn's topological sort over the already-selected `needed` set.
+    ///
+    /// This is intentionally a self-contained implementation and is NOT a
+    /// duplicate of `DependencyGraph::topo_sort_inner`: it orders a
+    /// *selection result* rather than a registered graph, it operates in a
+    /// dual index-space (target ids vs. capability ids both share `usize`),
+    /// and it must not re-expand the set — narrowing losers in `rejected`
+    /// must stay out. Do not refactor this to delegate to `DependencyGraph`
+    /// without resolving those two constraints.
     fn plan_from_set(&self, needed: &HashSet<usize>) -> Result<ExecutionPlan, ResolverError> {
         let mut in_degree: HashMap<usize, usize> = needed.iter().map(|&k| (k, 0)).collect();
         let mut adj: HashMap<usize, Vec<usize>> = HashMap::new();
