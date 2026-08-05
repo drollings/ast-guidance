@@ -6,6 +6,7 @@ use crate::io::db::DbCapability;
 use crate::io::fs::FsCapability;
 use crate::io::net::NetCapability;
 use crate::scope::CURRENT_CAPS;
+use fluent_db::error::DbError;
 use fluent_wvr::prelude::*;
 
 #[tokio::test(start_paused = true)]
@@ -110,9 +111,8 @@ async fn test_capability_boundary_enforcement_db() {
     let result = db.query("SELECT 1").await;
     assert!(result.is_err());
     let err = result.unwrap_err();
-    assert_eq!(
-        err.kind(),
-        std::io::ErrorKind::PermissionDenied,
+    assert!(
+        matches!(err, DbError::PermissionDenied(_)),
         "expected PermissionDenied for db, got: {err}"
     );
     assert!(
@@ -127,9 +127,8 @@ async fn test_capability_boundary_enforcement_db_execute() {
     let result = db.execute("CREATE TABLE t (id INTEGER)").await;
     assert!(result.is_err());
     let err = result.unwrap_err();
-    assert_eq!(
-        err.kind(),
-        std::io::ErrorKind::PermissionDenied,
+    assert!(
+        matches!(err, DbError::PermissionDenied(_)),
         "expected PermissionDenied for db execute, got: {err}"
     );
     assert!(

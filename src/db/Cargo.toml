@@ -17,7 +17,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 internment = { workspace = true, features = ["arc", "serde"] }
 bon = { workspace = true }
-rusqlite = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true, features = ["hooks"] }
 hnsw_rs = { workspace = true, optional = true }
 anndists = { workspace = true, optional = true }
 

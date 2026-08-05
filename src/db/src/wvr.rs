@@ -3,12 +3,12 @@
 //! `DbWorkUnit` wraps a synchronous store operation so it can run under a
 //! `Zone` supervisor (or any `WorkUnit` orchestrator) without violating the
 //! WorkUnit purity contract (`fluent-wvr` SKILL §10): `execute` is
-//! synchronous and returns promptly, offloading the blocking rusqlite work to
-//! a dedicated blocking thread via `tokio::task::block_in_place` when running
-//! on a multi-threaded runtime worker (the canonical `Zone`/`ResultPool`
-//! context). When no runtime is active (standalone sync tests, current-thread
-//! runtimes) the op runs directly — acceptable because `execute` still
-//! returns promptly and the caller is not an async executor.
+//! synchronous and returns promptly. On a multi-threaded runtime worker (the
+//! canonical `Zone`/`ResultPool` context) the blocking rusqlite work is
+//! offloaded via `tokio::task::block_in_place`; on a current-thread runtime
+//! (or with no runtime active) it runs on a dedicated scoped OS thread via
+//! `std::thread::scope`, so a slow op still cannot block the caller's single
+//! thread.
 //!
 //! `DbStore` is the blocking-connection abstraction: `SqliteStore` runs the
 //! closure against its `Mutex<Connection>`; `Arc<SqlitePool>` acquires a
@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use internment::ArcIntern;
 
+use fluent_wvr::capability::CURRENT_CAPS;
 use fluent_wvr::{impl_component, impl_fieldless, Describable};
 use fluent_wvr::{WorkContext, WorkError, WorkOutput, WorkUnit};
 
@@ -154,13 +155,30 @@ where
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
         // Offload to a blocking thread when on a multi-threaded runtime worker
         // (the canonical Zone/ResultPool context) so the executor isn't
-        // starved. Without an active runtime, or on a current-thread runtime,
-        // run directly — the op is still synchronous and returns promptly.
+        // starved. On a current-thread runtime (or with no runtime active), run
+        // the op on a dedicated scoped OS thread instead of inline, so a
+        // genuinely slow op still cannot block the caller's single thread.
         match tokio::runtime::Handle::try_current() {
             Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
                 tokio::task::block_in_place(|| (self.op)(ctx))
             }
-            _ => (self.op)(ctx),
+            _ => {
+                // Run the op on a dedicated scoped OS thread. `thread::scope`
+                // joins it before returning; a thread panic surfaces as the
+                // join's `Err` (the op's own `WorkError` propagates as-is).
+                // `ctx.caps` is re-scoped into the thread so capability-gated
+                // pool helpers work off the executor thread too.
+                let caps = ctx.caps.clone();
+                match std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| CURRENT_CAPS.sync_scope(caps, || (self.op)(ctx)))
+                        .join()
+                }) {
+                    Ok(Ok(out)) => Ok(out),
+                    Ok(Err(we)) => Err(we),
+                    Err(_) => Err(WorkError::Execution("db work unit thread panicked".into())),
+                }
+            }
         }
     }
 }
@@ -385,5 +403,32 @@ mod tests {
             .with_conn_blocking(|conn| Ok(conn.query_row("SELECT 41 + 1", [], |row| row.get(0))?))
             .expect("pool with_conn_blocking");
         assert_eq!(n, 42);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_thread_runtime_supports_pool_backed_op() {
+        // Nit 2: on a current-thread runtime there is no `block_in_place`, so a
+        // pool-backed op used to run inline and `block_on` inside the runtime
+        // worker panics ("cannot block the current thread from within a
+        // runtime"). The scoped-OS-thread offload gives the op a fresh thread
+        // where the sync→async bridge falls back to `fallback_runtime`.
+        let pool =
+            Arc::new(SqlitePool::open_in_memory(&crate::pool::PoolConfig::default()).unwrap());
+        let unit = DbWorkUnit::builder()
+            .name("db.poolct")
+            .op(Box::new(move |_ctx: &WorkContext| {
+                let n: i64 = pool
+                    .with_conn_blocking(|conn| {
+                        Ok(conn.query_row("SELECT 41 + 1", [], |row| row.get(0))?)
+                    })
+                    .map_err(|e| WorkError::Execution(e.to_string()))?;
+                WorkOutput::typed("got", &n).map_err(|e| WorkError::Execution(e.to_string()))
+            }) as StoreUnitOp)
+            .build();
+        let out = unit
+            .execute(&WorkContext::default())
+            .expect("pool-backed op must complete on the scoped thread");
+        assert!(out.success);
+        assert_eq!(out.data, serde_json::json!(42));
     }
 }

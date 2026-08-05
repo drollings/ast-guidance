@@ -14,17 +14,34 @@
 //!
 //! The lossy all-values-as-strings `query` / `execute` methods are **deprecated**
 //! (M3, §0.5): new code should use the typed `SqlitePool::query_row` /
-//! `query_rows` / `execute` helpers with typed row mappers.
+//! `query_rows` / `execute` helpers with typed row mappers. Both surfaces share
+//! the `DbError` error type — the deprecated methods return `DbError`, not
+//! `IoError`, so callers see one error taxonomy across the whole crate.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use common_core::error::IoError;
-use fluent_wvr::capability::{check_capability, Capability};
+use fluent_wvr::capability::{Capability, CapabilitySet, CURRENT_CAPS};
 
 use crate::error::DbError;
 use crate::pool::{PoolConfig, SqlitePool};
+
+/// Validate that a `DbCapability` token is present in the current task-local,
+/// without needing a token value.
+///
+/// The typed `SqlitePool` helpers hold only the pool, not the token, so they
+/// use this by-type check rather than `check_capability(&DbCapability)`.
+pub(crate) fn check_db_capability() -> Result<(), DbError> {
+    let present = CURRENT_CAPS
+        .try_with(CapabilitySet::contains::<DbCapability>)
+        .unwrap_or(false);
+    if present {
+        Ok(())
+    } else {
+        Err(DbError::PermissionDenied("missing capability: db".into()))
+    }
+}
 
 /// Capability token for pooled SQLite database access.
 pub struct DbCapability {
@@ -62,16 +79,13 @@ impl DbCapability {
     /// `SqlitePool::query_row` / `query_rows` helpers. Kept so existing
     /// callers compile unchanged (§0.5 M3).
     #[deprecated = "use SqlitePool::query_rows/query_row with typed row mappers instead"]
-    pub async fn query(&self, sql: &str) -> Result<Vec<HashMap<String, String>>, IoError> {
-        check_capability(self)?;
+    pub async fn query(&self, sql: &str) -> Result<Vec<HashMap<String, String>>, DbError> {
+        check_db_capability()?;
         let sql = sql.to_string();
         let pool = Arc::clone(&self.pool);
-        let conn = pool
-            .acquire()
-            .await
-            .map_err(|e| IoError(std::io::Error::other(e.to_string())))?;
+        let conn = pool.acquire().await?;
         let result = tokio::task::spawn_blocking(move || {
-            let mut stmt = conn.prepare(&sql).map_err(std::io::Error::other)?;
+            let mut stmt = conn.prepare(&sql).map_err(DbError::from)?;
 
             let columns: Vec<String> = stmt
                 .column_names()
@@ -80,9 +94,9 @@ impl DbCapability {
                 .collect();
 
             let mut rows = Vec::new();
-            let mut rows_iter = stmt.query([]).map_err(std::io::Error::other)?;
+            let mut rows_iter = stmt.query([]).map_err(DbError::from)?;
 
-            while let Some(row) = rows_iter.next().map_err(std::io::Error::other)? {
+            while let Some(row) = rows_iter.next().map_err(DbError::from)? {
                 let mut map = HashMap::new();
                 for (i, col) in columns.iter().enumerate() {
                     let value: String = match row.get::<_, rusqlite::types::Value>(i) {
@@ -99,12 +113,9 @@ impl DbCapability {
 
             Ok(rows)
         })
-        .await;
-
-        match result {
-            Ok(inner) => inner,
-            Err(e) => Err(IoError(std::io::Error::other(e.to_string()))),
-        }
+        .await
+        .map_err(|e| DbError::Other(format!("blocking query task failed: {e}")))?;
+        result
     }
 
     /// Executes a SQL statement (INSERT, UPDATE, DELETE) and returns the
@@ -113,24 +124,18 @@ impl DbCapability {
     /// **Deprecated**: superseded by the typed `SqlitePool::execute`. Kept so
     /// existing callers compile unchanged (§0.5 M3).
     #[deprecated = "use SqlitePool::execute with typed params instead"]
-    pub async fn execute(&self, sql: &str) -> Result<usize, IoError> {
-        check_capability(self)?;
+    pub async fn execute(&self, sql: &str) -> Result<usize, DbError> {
+        check_db_capability()?;
         let sql = sql.to_string();
         let pool = Arc::clone(&self.pool);
-        let conn = pool
-            .acquire()
-            .await
-            .map_err(|e| IoError(std::io::Error::other(e.to_string())))?;
+        let conn = pool.acquire().await?;
         let result = tokio::task::spawn_blocking(move || {
-            let rows_affected = conn.execute(&sql, []).map_err(std::io::Error::other)?;
+            let rows_affected = conn.execute(&sql, []).map_err(DbError::from)?;
             Ok(rows_affected)
         })
-        .await;
-
-        match result {
-            Ok(inner) => inner,
-            Err(e) => Err(IoError(std::io::Error::other(e.to_string()))),
-        }
+        .await
+        .map_err(|e| DbError::Other(format!("blocking execute task failed: {e}")))?;
+        result
     }
 }
 
@@ -183,7 +188,7 @@ mod tests {
         let db = db();
         let result = db.query("SELECT 1").await;
         let err = result.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(matches!(err, DbError::PermissionDenied(_)), "got {err:?}");
         assert!(err.to_string().contains("missing"));
     }
 
@@ -192,7 +197,7 @@ mod tests {
         let db = db();
         let result = db.execute("CREATE TABLE t (id INTEGER)").await;
         let err = result.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(matches!(err, DbError::PermissionDenied(_)), "got {err:?}");
         assert!(err.to_string().contains("missing"));
     }
 

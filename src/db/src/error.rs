@@ -24,6 +24,9 @@ pub enum DbError {
     /// A `UNIQUE`/`PRIMARY KEY` constraint violation.
     #[error("duplicate entry: {0}")]
     DuplicateEntry(String),
+    /// The caller's task-local capability set is missing the required token.
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
     /// The database reported `SQLITE_BUSY`.
     #[error("database busy: {0}")]
     Busy(String),

@@ -12,7 +12,7 @@
 //! run on a blocking worker thread instead of the caller's thread.
 
 use std::ops::{Deref, DerefMut};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -62,6 +62,12 @@ impl PoolConfig {
 pub struct SqlitePool {
     connections: Mutex<Vec<Connection>>,
     semaphore: Arc<Semaphore>,
+    /// Where to reopen a fresh connection when a returned one fails its health
+    /// check (`None` = in-memory pool).
+    path: Option<PathBuf>,
+    /// Sizing / timeout config, retained so replacements are opened with the
+    /// same busy timeout as the original connections.
+    config: PoolConfig,
 }
 
 impl SqlitePool {
@@ -70,16 +76,13 @@ impl SqlitePool {
     pub fn open(path: &Path, config: &PoolConfig) -> Result<Self, DbError> {
         let mut connections = Vec::with_capacity(config.size);
         for _ in 0..config.size {
-            let conn = common_core::sqlite::open_wal(path).map_err(DbError::from)?;
-            if config.busy_timeout_ms > 0 {
-                conn.busy_timeout(Duration::from_millis(config.busy_timeout_ms))
-                    .map_err(DbError::from)?;
-            }
-            connections.push(conn);
+            connections.push(Self::open_wal_configured(path, config)?);
         }
         Ok(Self {
             connections: Mutex::new(connections),
             semaphore: Arc::new(Semaphore::new(config.size)),
+            path: Some(path.to_path_buf()),
+            config: *config,
         })
     }
 
@@ -87,17 +90,42 @@ impl SqlitePool {
     pub fn open_in_memory(config: &PoolConfig) -> Result<Self, DbError> {
         let mut connections = Vec::with_capacity(config.size);
         for _ in 0..config.size {
-            let conn = common_core::sqlite::open_in_memory().map_err(DbError::from)?;
-            if config.busy_timeout_ms > 0 {
-                conn.busy_timeout(Duration::from_millis(config.busy_timeout_ms))
-                    .map_err(DbError::from)?;
-            }
-            connections.push(conn);
+            connections.push(Self::open_in_memory_configured(config)?);
         }
         Ok(Self {
             connections: Mutex::new(connections),
             semaphore: Arc::new(Semaphore::new(config.size)),
+            path: None,
+            config: *config,
         })
+    }
+
+    /// Open a single WAL connection to `path` with the pool's busy timeout.
+    fn open_wal_configured(path: &Path, config: &PoolConfig) -> Result<Connection, DbError> {
+        let conn = common_core::sqlite::open_wal(path).map_err(DbError::from)?;
+        if config.busy_timeout_ms > 0 {
+            conn.busy_timeout(Duration::from_millis(config.busy_timeout_ms))
+                .map_err(DbError::from)?;
+        }
+        Ok(conn)
+    }
+
+    /// Open a single in-memory connection with the pool's busy timeout.
+    fn open_in_memory_configured(config: &PoolConfig) -> Result<Connection, DbError> {
+        let conn = common_core::sqlite::open_in_memory().map_err(DbError::from)?;
+        if config.busy_timeout_ms > 0 {
+            conn.busy_timeout(Duration::from_millis(config.busy_timeout_ms))
+                .map_err(DbError::from)?;
+        }
+        Ok(conn)
+    }
+
+    /// Open a fresh connection matching this pool's backing store.
+    fn open_connection(&self) -> Result<Connection, DbError> {
+        match &self.path {
+            Some(path) => Self::open_wal_configured(path, &self.config),
+            None => Self::open_in_memory_configured(&self.config),
+        }
     }
 
     /// Check out a connection from the pool.
@@ -127,12 +155,35 @@ impl SqlitePool {
         })
     }
 
-    /// Return a connection to the idle set.
+    /// Return a connection to the idle set, health-checking it first.
+    ///
+    /// A connection that fails the cheap `SELECT 1` probe (e.g. one whose
+    /// underlying handle was closed out from under the pool) is discarded and
+    /// replaced with a fresh connection so the pool keeps `config.size` live
+    /// connections — a poisoned connection is never re-queued for reuse.
     fn put(&self, conn: Connection) {
-        self.connections
-            .lock()
-            .expect("pool connections lock poisoned")
-            .push(conn);
+        if Self::connection_is_healthy(&conn) {
+            self.connections
+                .lock()
+                .expect("pool connections lock poisoned")
+                .push(conn);
+        } else {
+            tracing::warn!("discarding unhealthy pooled connection");
+            drop(conn);
+            match self.open_connection() {
+                Ok(fresh) => self
+                    .connections
+                    .lock()
+                    .expect("pool connections lock poisoned")
+                    .push(fresh),
+                Err(e) => tracing::error!("failed to open replacement connection: {e}"),
+            }
+        }
+    }
+
+    /// Cheap guardrail probe: the connection must answer a trivial statement.
+    fn connection_is_healthy(conn: &Connection) -> bool {
+        conn.query_row("SELECT 1", [], |_| Ok(())).is_ok()
     }
 
     /// Run a closure against a checked-out connection on a blocking worker
@@ -140,12 +191,15 @@ impl SqlitePool {
     ///
     /// Acquires a connection, offloads `f` via `tokio::task::spawn_blocking`,
     /// and maps a `JoinError` (task panicked / runtime shutdown) to
-    /// `DbError::Other`.
+    /// `DbError::Other`. Requires a `DbCapability` token in the current
+    /// task-local (the same gate the deprecated facade enforces), so holding a
+    /// raw `Arc<SqlitePool>` does not bypass capability gating.
     pub async fn with_conn<R, F>(self: &Arc<Self>, f: F) -> Result<R, DbError>
     where
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, DbError> + Send + 'static,
     {
+        crate::capability::check_db_capability()?;
         let conn = self.acquire().await?;
         tokio::task::spawn_blocking(move || f(&conn))
             .await
@@ -236,8 +290,9 @@ impl SqlitePool {
 /// A connection checked out from the pool.
 ///
 /// `Deref`/`DerefMut` expose the underlying `rusqlite::Connection`. When
-/// dropped, the connection is automatically returned to the idle set and the
-/// semaphore permit is released.
+/// dropped, the connection is health-checked (`SELECT 1`) and returned to the
+/// idle set — a poisoned connection is discarded and replaced instead of being
+/// re-queued — and the semaphore permit is released.
 pub struct PooledConnection {
     conn: Option<Connection>,
     pool: Arc<SqlitePool>,
@@ -274,8 +329,17 @@ impl Drop for PooledConnection {
 mod tests {
     use super::*;
 
+    use fluent_wvr::capability::CURRENT_CAPS;
+    use fluent_wvr::CapabilitySet;
+
     fn pool() -> Arc<SqlitePool> {
         Arc::new(SqlitePool::open_in_memory(&PoolConfig::default()).unwrap())
+    }
+
+    /// A `CapabilitySet` carrying a `DbCapability` token, for the typed-helper
+    /// tests that now re-check the task-local (nit 4).
+    fn db_caps() -> CapabilitySet {
+        CapabilitySet::new().with(crate::capability::DbCapability::open(":memory:").unwrap())
     }
 
     #[tokio::test]
@@ -305,110 +369,177 @@ mod tests {
 
     #[tokio::test]
     async fn execute_and_query_round_trip() {
-        let pool = pool();
-        pool.execute_batch("CREATE TABLE t (id INTEGER, name TEXT)")
-            .await
-            .unwrap();
-        let n = pool
-            .execute(
-                "INSERT INTO t (id, name) VALUES (?1, ?2)",
-                vec![
-                    rusqlite::types::Value::Integer(1),
-                    rusqlite::types::Value::Text("hello".into()),
-                ],
-            )
-            .await
-            .unwrap();
-        assert_eq!(n, 1);
+        CURRENT_CAPS
+            .scope(db_caps(), async {
+                let pool = pool();
+                pool.execute_batch("CREATE TABLE t (id INTEGER, name TEXT)")
+                    .await
+                    .unwrap();
+                let n = pool
+                    .execute(
+                        "INSERT INTO t (id, name) VALUES (?1, ?2)",
+                        vec![
+                            rusqlite::types::Value::Integer(1),
+                            rusqlite::types::Value::Text("hello".into()),
+                        ],
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(n, 1);
 
-        let name = pool
-            .query_row(
-                "SELECT name FROM t WHERE id = ?1",
-                vec![rusqlite::types::Value::Integer(1)],
-                |row| row.get::<_, String>(0),
-            )
-            .await
-            .unwrap();
-        assert_eq!(name.as_deref(), Some("hello"));
+                let name = pool
+                    .query_row(
+                        "SELECT name FROM t WHERE id = ?1",
+                        vec![rusqlite::types::Value::Integer(1)],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(name.as_deref(), Some("hello"));
 
-        let rows = pool
-            .query_rows(
-                "SELECT id, name FROM t ORDER BY id",
-                Vec::<rusqlite::types::Value>::new(),
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-            )
-            .await
-            .unwrap();
-        assert_eq!(rows, vec![(1, "hello".to_string())]);
+                let rows = pool
+                    .query_rows(
+                        "SELECT id, name FROM t ORDER BY id",
+                        Vec::<rusqlite::types::Value>::new(),
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(rows, vec![(1, "hello".to_string())]);
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn query_row_no_rows_maps_to_none() {
-        let pool = pool();
-        pool.execute_batch("CREATE TABLE t (id INTEGER)")
-            .await
-            .unwrap();
-        let val = pool
-            .query_row(
-                "SELECT id FROM t WHERE id = 999",
-                Vec::<rusqlite::types::Value>::new(),
-                |row| row.get::<_, i64>(0),
-            )
-            .await
-            .unwrap();
-        assert_eq!(val, None);
+        CURRENT_CAPS
+            .scope(db_caps(), async {
+                let pool = pool();
+                pool.execute_batch("CREATE TABLE t (id INTEGER)")
+                    .await
+                    .unwrap();
+                let val = pool
+                    .query_row(
+                        "SELECT id FROM t WHERE id = 999",
+                        Vec::<rusqlite::types::Value>::new(),
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(val, None);
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn query_rows_empty_maps_to_empty_vec() {
-        let pool = pool();
-        pool.execute_batch("CREATE TABLE t (id INTEGER)")
-            .await
-            .unwrap();
-        let rows = pool
-            .query_rows(
-                "SELECT id FROM t",
-                Vec::<rusqlite::types::Value>::new(),
-                |row| row.get::<_, i64>(0),
-            )
-            .await
-            .unwrap();
-        assert!(rows.is_empty());
+        CURRENT_CAPS
+            .scope(db_caps(), async {
+                let pool = pool();
+                pool.execute_batch("CREATE TABLE t (id INTEGER)")
+                    .await
+                    .unwrap();
+                let rows = pool
+                    .query_rows(
+                        "SELECT id FROM t",
+                        Vec::<rusqlite::types::Value>::new(),
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .await
+                    .unwrap();
+                assert!(rows.is_empty());
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn spawn_blocking_offloads_to_worker_thread() {
-        let pool = pool();
-        pool.execute_batch("CREATE TABLE t (id INTEGER)")
-            .await
-            .unwrap();
-        let current = std::thread::current().id();
-        let offloaded = pool
-            .query_rows(
-                "SELECT 1",
-                Vec::<rusqlite::types::Value>::new(),
-                move |_row| {
-                    let in_worker = std::thread::current().id();
-                    assert_ne!(in_worker, current, "map must run off the async thread");
-                    Ok(())
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(offloaded.len(), 1);
+        CURRENT_CAPS
+            .scope(db_caps(), async {
+                let pool = pool();
+                pool.execute_batch("CREATE TABLE t (id INTEGER)")
+                    .await
+                    .unwrap();
+                let current = std::thread::current().id();
+                let offloaded = pool
+                    .query_rows(
+                        "SELECT 1",
+                        Vec::<rusqlite::types::Value>::new(),
+                        move |_row| {
+                            let in_worker = std::thread::current().id();
+                            assert_ne!(in_worker, current, "map must run off the async thread");
+                            Ok(())
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(offloaded.len(), 1);
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn failing_sql_maps_to_db_error() {
+        CURRENT_CAPS
+            .scope(db_caps(), async {
+                let pool = pool();
+                let err = pool
+                    .query_rows(
+                        "SELECT * FROM no_such_table",
+                        Vec::<rusqlite::types::Value>::new(),
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(matches!(err, DbError::Sqlite(_)));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn typed_helpers_require_db_capability() {
+        // Nit 4: the typed helpers re-check the task-local, so a pool held
+        // without a `DbCapability` token must be denied.
         let pool = pool();
-        let err = pool
-            .query_rows(
-                "SELECT * FROM no_such_table",
-                Vec::<rusqlite::types::Value>::new(),
-                |row| row.get::<_, i64>(0),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, DbError::Sqlite(_)));
+        let err = pool.query_rows("SELECT 1", Vec::<rusqlite::types::Value>::new(), |row| {
+            row.get::<_, i64>(0)
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, DbError::PermissionDenied(_)),
+            "expected PermissionDenied without a DbCapability, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poisoned_connection_is_discarded_on_return() {
+        // Nit 3: a connection that fails the `SELECT 1` health check must not
+        // be re-queued. Deny all authorizations on the checked-out connection,
+        // so even the health probe fails, then verify the pool still serves a
+        // fresh, healthy connection.
+        use rusqlite::hooks::Authorization;
+
+        CURRENT_CAPS
+            .scope(db_caps(), async {
+                let pool = pool();
+                {
+                    let conn = pool.acquire().await.unwrap();
+                    conn.authorizer(Some(|_: rusqlite::hooks::AuthContext<'_>| {
+                        Authorization::Deny
+                    }));
+                } // dropped -> health check fails -> discarded, replacement opened
+                let n: i64 = pool
+                    .query_row(
+                        "SELECT 1",
+                        Vec::<rusqlite::types::Value>::new(),
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .await
+                    .unwrap()
+                    .expect("pool must hand out a healthy replacement connection");
+                assert_eq!(n, 1);
+            })
+            .await;
     }
 }
