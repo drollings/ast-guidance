@@ -36,16 +36,17 @@ Every high-overhead effect (file system, database, AI inference endpoint, blocki
 
 - `FsCapability` — gates `tokio::fs::{read, write, metadata}`. Constructed via `FsCapability::new()`.
 - `NetCapability` — wraps a `reqwest::Client` configured via `NetConfig { max_idle_per_host, idle_timeout, connect_timeout, request_timeout, user_agent }`. Constructed via `NetCapability::new()` or `with_config(&NetConfig)`. Exposes `http_get`, `http_post`, `http_post_json_stream` (returns a streaming `Stream<Item = Result<Bytes, IoError>>` of response chunks, used by SSE forwarding), `tcp_connect`, and the raw `client()`.
-- `DbCapability` — opens a 5-connection `rusqlite` pool with WAL mode enabled. Constructed via `DbCapability::open(path)`. Exposes `query(sql) -> Vec<HashMap<String, String>>` and `execute(sql) -> usize`, both of which check out a `PooledConnection` (RAII; the connection returns to the pool on `Drop`) and offload the synchronous `rusqlite` work via `spawn_blocking`.
+- `DbCapability` — **home is now `fluent-db`** (`fluent_db::capability`, re-exported from `fluent_concurrency::io::db::DbCapability` to keep the module path). Opens a `fluent-db::SqlitePool` (default 5 connections, WAL mode enabled) via `DbCapability::open(path)`. The legacy lossy `query(sql) -> Vec<HashMap<String, String>>` and `execute(sql) -> usize` (all-values-as-strings) are **deprecated** (§0.5 M3): new code uses the typed `SqlitePool::query_row` / `query_rows` / `execute` helpers. Both still check out a `PooledConnection` (RAII; the connection returns to the pool on `Drop`) and offload the synchronous `rusqlite` work via `spawn_blocking`.
 
 **Helpers** (`capability.rs`):
 
 - `default_capability_set() -> CapabilitySet` — pre-populated with `FsCapability` and `NetCapability`.
-- `capability_set_with_db(path) -> Result<CapabilitySet, IoError>` — also adds a `DbCapability` rooted at `path`.
+- `capability_set_with_db(path) -> Result<CapabilitySet, DbError>` — also adds a `DbCapability` rooted at `path` (error type is `fluent_db::error::DbError`).
 
-**Gating** (`io/mod.rs:37-46`): `check_capability<C: Capability>(cap: &C)` reads `CURRENT_CAPS.try_with(|caps| caps.get::<C>().is_some())`. If absent, returns `Err(io::Error::new(PermissionDenied, CapabilityError::Missing { name: cap.name() }))`. The `name()` field on the trait is informational only; `CapabilitySet::get` uses `TypeId::of::<C>()` for the actual lookup.
+**Gating**: `check_capability<C: Capability>(cap: &C)` (canonical home `fluent_wvr::capability::check_capability`, re-exported from `fluent_concurrency::io`) reads `CURRENT_CAPS.try_with(|caps| caps.get::<C>().is_some())`. If absent, returns `Err(io::Error::new(PermissionDenied, CapabilityError::Missing { name: cap.name() }))`. The `name()` field on the trait is informational only; `CapabilitySet::get` uses `TypeId::of::<C>()` for the actual lookup. `CURRENT_CAPS` is a `tokio::task_local!` owned by `fluent-wvr` (re-exported from `fluent_concurrency::scope`) so both this crate and `fluent-db` read the same variable without a dependency cycle.
 
-**Error type** (`io/mod.rs:9-14`): `CapabilityError::{Missing { name }, Exhausted { name, detail }}`. The `Exhausted` variant is currently only used by `DbCapability`'s pool-empty branch.
+**Error type** (`fluent_wvr::capability::CapabilityError`, re-exported unchanged
+from `fluent_concurrency::io`): `CapabilityError::{Missing { name }, Exhausted { name, detail }}`. The `Exhausted` variant is currently only used by `DbCapability`'s pool-empty branch.
 
 This is a lightweight, safe, two-phase effect pipeline. It maps directly to RabbitMQ's `credit_flow` and Tokio's `Semaphore` semantics, but without the lifetime complications of `tokio::sync::SemaphorePermit`.
 
@@ -387,8 +388,8 @@ The crate is no longer "proposed" — it ships. The current `Cargo.toml`:
 - `thiserror` — error enums (`PoolError`, `ResultPoolError`, `ZoneError`, `LlmError`, `CapabilityError`)
 - `tracing` — `info!`, `warn!`, `error!` from `Instrumented`, `Zone`'s cycle detection, and `Scope`'s panic-during-unwind path
 - `reqwest` — backing HTTP client for `NetCapability`
-- `common-core` (with `sqlite` feature) — `LatencyHistogram` (used by `Instrumented::with_metrics` in `fluent-wvr` consumers) and `open_wal` for `DbCapability`'s connection pool
-- `rusqlite` — backing driver for `DbCapability`
+- `common-core` — `LatencyHistogram` (used by `Instrumented::with_metrics` in `fluent-wvr` consumers), `retry` (Zone backoff), and `error::IoError`
+- `fluent-db` (**optional**, `db` feature, default-on) — `SqlitePool` / `DbCapability` for the database surface. `rusqlite` and `common-core`'s `sqlite` feature are no longer direct deps; they come in transitively only when the `db` feature is on (D11).
 - `fastrand` — seeded PRNG for `TestRuntime` and jitter in `common_core::retry` / `retry_call`
 - `internment` (with `arc` and `serde` features) — `ArcIntern<str>` for work unit names, dependency asset names, and configuration keys
 
@@ -403,7 +404,7 @@ No `async-trait`, no `bumpalo`, no `crossbeam`. Tokio's channels, `Notify`, and 
 ## 7. Anti-Patterns Explicitly Rejected
 
 1. **No `#[async_trait]` or macro-heavy execution.** The framework uses manual `Future` impls and `async fn` where the compiler can see the boundaries. The `Zone` is a hand-written `impl Future` (`zone.rs:207-310`); `Scope` uses `tokio::task::JoinSet` directly.
-2. **No `tokio::spawn` without a scope.** The `tokio::spawn` calls in the crate are limited to: `Scope::close` (drain) and `Scope::close_graceful` (drain); `Zone`'s `JoinSet`; `WorkerPool`/`ResultPool`/`PriorityResultPool` worker loops; and `DbCapability::query`/`execute` (which `spawn_blocking` for sync `rusqlite` work). Every async effect outside these sites flows through `Scope::spawn` (which tracks the handle) or through a pool (which tracks workers).
+2. **No `tokio::spawn` without a scope.** The `tokio::spawn` calls in the crate are limited to: `Scope::close` (drain) and `Scope::close_graceful` (drain); `Zone`'s `JoinSet`; `WorkerPool`/`ResultPool`/`PriorityResultPool` worker loops; and `DbCapability::query`/`execute` in `fluent-db` (which `spawn_blocking` for sync `rusqlite` work). Every async effect outside these sites flows through `Scope::spawn` (which tracks the handle) or through a pool (which tracks workers).
 3. **No `dyn Trait` in a per-item loop.** The `PartitionedRouter` hashes once per submit; `PriorityQueue` dispatches via `BTreeMap` keys, not vtables; `CapabilitySet::get` uses `TypeId` (pointer-sized) rather than string comparison; `PartitionedRouter` does no per-job vtable dispatch.
 4. **No ambient `tokio::fs::read` or `tokio::time::sleep`.** All I/O is called through a capability method (`FsCapability::read`, `NetCapability::http_get`, `DbCapability::query`, etc.) which calls `check_capability(self)` first. `tokio::time::sleep` is allowed in the framework's own internals (Zone retry, Zone timeout) and in the `Runtime::sleep` backend, but consumer code is expected to use `Limiter::run`, `common_core::retry`, or `Zone` rather than calling it directly.
 5. **No automatic restart.** Zones contain; they do not restart. Restart is a deliberate operator action.

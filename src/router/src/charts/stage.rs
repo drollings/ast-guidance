@@ -11,9 +11,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use fluent_concurrency::pool::Limiter;
-use fluent_wvr::prelude::*;
 use fluent_llm::client::ChatBackend;
 use fluent_llm::ChatMessage;
+use fluent_wvr::prelude::*;
 
 use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
 use crate::stages::common::extract_user_message;

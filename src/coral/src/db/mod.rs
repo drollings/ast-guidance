@@ -7,14 +7,13 @@ pub mod schema;
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::{Mutex, RwLock};
 
-use anndists::dist::DistCosine;
 use bitvec::vec::BitVec;
-use fluent_types::{ContentNode, NodeId};
+use fluent_db::error::DbError;
+use fluent_db::hnsw::HnswIndex;
+use fluent_db::store::SqliteStore;
 use fluent_llm::EmbeddingProvider;
-use hnsw_rs::hnsw::Hnsw;
-use search_vector::error::DbError;
+use fluent_types::{ContentNode, NodeId};
 use thiserror::Error;
 
 // Promoted to `common-core::constants` (ROADMAP_20260804_SHARED_CORE M4.3);
@@ -23,51 +22,46 @@ pub use common_core::constants::MAX_KNN_CANDIDATES;
 
 #[derive(Error, Debug)]
 pub enum LibraryError {
-    #[error("SQLite error: {0}")]
-    Sqlite(#[from] common_core::error::SqliteError),
     #[error("database error: {0}")]
-    Db(#[from] DbError),
+    Db(DbError),
     #[error("node not found: {0}")]
     NodeNotFound(String),
     #[error("duplicate node: {0}")]
     DuplicateNode(String),
 }
 
-impl From<rusqlite::Error> for LibraryError {
-    fn from(e: rusqlite::Error) -> Self {
-        // M9.2d: surface a UNIQUE-constraint violation as the typed
-        // `DuplicateNode` variant instead of leaking the raw `SqliteError`.
-        if common_core::sqlite::is_unique_violation(&e) {
-            return LibraryError::DuplicateNode(e.to_string());
+impl From<DbError> for LibraryError {
+    fn from(e: DbError) -> Self {
+        // A UNIQUE-constraint violation surfaces as the typed `DuplicateNode`
+        // variant instead of leaking the raw `DbError::DuplicateEntry` (D3).
+        match e {
+            DbError::DuplicateEntry(msg) => LibraryError::DuplicateNode(msg),
+            other => LibraryError::Db(other),
         }
-        LibraryError::Sqlite(common_core::error::SqliteError(e))
     }
 }
 
 pub struct Library {
-    pub(crate) conn: Mutex<rusqlite::Connection>,
-    pub(crate) hnsw: RwLock<Option<Hnsw<'static, f32, DistCosine>>>,
-    pub(crate) hnsw_id_map: Mutex<Vec<i64>>,
+    pub(crate) store: SqliteStore,
+    pub(crate) hnsw: HnswIndex,
 }
 
 impl Library {
     pub fn open(path: &Path) -> Result<Self, LibraryError> {
-        let conn = common_core::sqlite::open_wal(path)?;
+        let store = SqliteStore::open(path)?;
         let lib = Self {
-            conn: Mutex::new(conn),
-            hnsw: RwLock::new(None),
-            hnsw_id_map: Mutex::new(Vec::new()),
+            store,
+            hnsw: HnswIndex::new(),
         };
         lib.init_schema()?;
         Ok(lib)
     }
 
     pub fn open_in_memory() -> Result<Self, LibraryError> {
-        let conn = common_core::sqlite::open_in_memory()?;
+        let store = SqliteStore::open_in_memory()?;
         let lib = Self {
-            conn: Mutex::new(conn),
-            hnsw: RwLock::new(None),
-            hnsw_id_map: Mutex::new(Vec::new()),
+            store,
+            hnsw: HnswIndex::new(),
         };
         lib.init_schema()?;
         Ok(lib)
@@ -415,12 +409,15 @@ mod tests {
     fn test_insert_entity_hierarchy() {
         let lib = Library::open_in_memory().expect("db");
         lib.insert_entity_hierarchy("sub", "super").expect("insert");
-        let conn = lib.conn.lock().unwrap();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM entity_hierarchy WHERE subclass_iri = ?1 AND superclass_iri = ?2",
-            params!["sub", "super"],
-            |row| row.get(0),
-        ).expect("query");
+        let count: i64 = lib
+            .store
+            .query_row(
+                "SELECT COUNT(*) FROM entity_hierarchy WHERE subclass_iri = ?1 AND superclass_iri = ?2",
+                params!["sub", "super"],
+                |row| row.get(0),
+            )
+            .expect("query")
+            .expect("count");
         assert_eq!(count, 1);
     }
 
@@ -521,7 +518,7 @@ mod tests {
     #[cfg(feature = "hnsw-bench")]
     #[ignore = "100K-node KNN benchmark — run explicitly with --features hnsw-bench -- --ignored --nocapture"]
     fn knn_search_100k_benchmark() {
-        use search_vector::math::knn_brute_force;
+        use fluent_db::vector::knn_brute_force;
         use std::time::Instant;
 
         let lib = Library::open_in_memory().expect("db");
@@ -558,21 +555,18 @@ mod tests {
         // SQLite, deserialize each blob, brute-force over all candidates.
         let start = Instant::now();
         {
-            let conn = lib.conn.lock().unwrap();
-            let mut stmt = conn
-                .prepare("SELECT id, embedding FROM context_nodes WHERE embedding IS NOT NULL")
-                .expect("prepare");
-            let rows: Vec<(i64, Vec<u8>)> = stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .expect("query")
-                .flatten()
-                .collect();
-            drop(stmt);
-            drop(conn);
+            let rows: Vec<(i64, Vec<u8>)> = lib
+                .store
+                .query_rows(
+                    "SELECT id, embedding FROM context_nodes WHERE embedding IS NOT NULL",
+                    &[],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("query");
             let candidates: Vec<(usize, Vec<f32>)> = rows
                 .into_iter()
                 .filter_map(|(i, b)| {
-                    search_vector::math::try_bytes_to_vec(&b).map(|v| (i as usize, v))
+                    fluent_db::vector::try_bytes_to_vec(&b).map(|v| (i as usize, v))
                 })
                 .collect();
             let _legacy = knn_brute_force(

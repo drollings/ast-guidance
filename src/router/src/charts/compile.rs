@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use fluent_concurrency::pool::Limiter;
 use fluent_dag::dep_graph::DependencyGraph;
-use fluent_wvr::prelude::Component;
 use fluent_llm::client::ChatBackend;
+use fluent_wvr::prelude::Component;
 
 use crate::charts::stage::ChartPromptStage;
 

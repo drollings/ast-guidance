@@ -16,7 +16,10 @@ pub fn default_capability_set() -> CapabilitySet {
 }
 
 /// Returns a `CapabilitySet` with Fs, Net, and Db capabilities.
-pub fn capability_set_with_db(path: &str) -> Result<CapabilitySet, common_core::error::IoError> {
+///
+/// `DbCapability` is provided by `fluent-db`; the error taxonomy is
+/// `fluent_db::error::DbError`.
+pub fn capability_set_with_db(path: &str) -> Result<CapabilitySet, fluent_db::error::DbError> {
     let db = DbCapability::open(path)?;
     Ok(CapabilitySet::new()
         .with(FsCapability::new())

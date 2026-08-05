@@ -1,15 +1,11 @@
 use std::path::Path;
-use std::sync::{Mutex, RwLock};
 
 use crate::error::DbError;
-use common_core::constants::HnswParams;
+use crate::math;
+use fluent_db::hnsw::HnswIndex;
+use fluent_db::store::SqliteStore;
 use rusqlite::params;
 use thiserror::Error;
-
-use crate::math;
-
-use anndists::dist::DistCosine;
-use hnsw_rs::hnsw::Hnsw;
 
 #[derive(Error, Debug)]
 pub enum VectorDbError {
@@ -21,12 +17,6 @@ pub enum VectorDbError {
     DimensionMismatch { expected: usize, got: usize },
 }
 
-impl From<rusqlite::Error> for VectorDbError {
-    fn from(e: rusqlite::Error) -> Self {
-        VectorDbError::Sqlite(common_core::error::SqliteError(e))
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub id: i64,
@@ -36,38 +26,39 @@ pub struct SearchResult {
     pub similarity: f32,
 }
 
+/// SQLite hybrid search engine backed by the canonical `fluent-db` components:
+/// a `SqliteStore` for the connection/schema and an `HnswIndex` for the KNN
+/// index (M4). The public method surface is unchanged from the pre-M4 shape so
+/// `bin/guidance`, `guidance::query_engine`, `guidance::sync_engine`, and
+/// `bin/guidance::mcp` call sites keep compiling.
 pub struct GuidanceDb {
-    conn: Mutex<rusqlite::Connection>,
-    hnsw: RwLock<Option<Hnsw<'static, f32, DistCosine>>>,
-    hnsw_id_map: Mutex<Vec<i64>>,
+    store: SqliteStore,
+    hnsw: HnswIndex,
 }
 
 impl GuidanceDb {
     pub fn open(path: &Path) -> Result<Self, VectorDbError> {
-        let conn = common_core::sqlite::open_wal(path)?;
+        let store = SqliteStore::open(path)?;
         let db = Self {
-            conn: Mutex::new(conn),
-            hnsw: RwLock::new(None),
-            hnsw_id_map: Mutex::new(Vec::new()),
+            store,
+            hnsw: HnswIndex::new(),
         };
         db.init_schema()?;
         Ok(db)
     }
 
     pub fn open_in_memory() -> Result<Self, VectorDbError> {
-        let conn = common_core::sqlite::open_in_memory()?;
+        let store = SqliteStore::open_in_memory()?;
         let db = Self {
-            conn: Mutex::new(conn),
-            hnsw: RwLock::new(None),
-            hnsw_id_map: Mutex::new(Vec::new()),
+            store,
+            hnsw: HnswIndex::new(),
         };
         db.init_schema()?;
         Ok(db)
     }
 
     fn init_schema(&self) -> Result<(), VectorDbError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute_batch(
+        self.store.init_schema(
             "CREATE TABLE IF NOT EXISTS guidance_nodes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -80,13 +71,18 @@ impl GuidanceDb {
                 created_at TEXT DEFAULT (datetime('now'))
             );",
         )?;
-        common_core::sqlite::init_embedding_cache(&conn)?;
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_nodes_name ON guidance_nodes(name);
-             CREATE INDEX IF NOT EXISTS idx_nodes_source ON guidance_nodes(source);
-             CREATE INDEX IF NOT EXISTS idx_nodes_name_source ON guidance_nodes(name, source);
-             CREATE INDEX IF NOT EXISTS idx_cache_query_hash ON embedding_cache(query_hash);",
-        )?;
+        self.store.with_conn(|conn| {
+            common_core::sqlite::init_embedding_cache(conn).map_err(DbError::from)?;
+            common_core::sqlite::run_batch(
+                conn,
+                "CREATE INDEX IF NOT EXISTS idx_nodes_name ON guidance_nodes(name);
+                 CREATE INDEX IF NOT EXISTS idx_nodes_source ON guidance_nodes(source);
+                 CREATE INDEX IF NOT EXISTS idx_nodes_name_source ON guidance_nodes(name, source);
+                 CREATE INDEX IF NOT EXISTS idx_cache_query_hash ON embedding_cache(query_hash);",
+            )
+            .map_err(DbError::from)?;
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -100,26 +96,31 @@ impl GuidanceDb {
         language: &str,
         embedding: Option<&[f32]>,
     ) -> Result<i64, VectorDbError> {
-        let conn = self.conn.lock().unwrap();
         let embedding_blob = embedding.map(math::vec_to_bytes);
 
-        conn.execute(
-            "INSERT INTO guidance_nodes (name, source, signature, comment, module, language, embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                name,
-                source,
-                signature,
-                comment,
-                module,
-                language,
-                embedding_blob,
-            ],
-        )?;
+        // INSERT + last_insert_rowid run under one connection lock so the
+        // returned id is the row this call wrote.
+        let node_id = self.store.with_conn(|conn| {
+            fluent_db::query::execute(
+                conn,
+                "INSERT INTO guidance_nodes (name, source, signature, comment, module, language, embedding)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    name,
+                    source,
+                    signature,
+                    comment,
+                    module,
+                    language,
+                    embedding_blob,
+                ],
+            )?;
+            Ok(fluent_db::query::last_insert_rowid(conn))
+        })?;
 
-        let node_id = conn.last_insert_rowid();
-
-        // Insert into HNSW index if embedding is provided
+        // Insert into HNSW index if embedding is provided. The connection lock
+        // is released before the index lock so the `hnsw → id_map → conn`
+        // ordering is never inverted (R9).
         if let Some(emb) = embedding {
             self.hnsw_insert(node_id, emb);
         }
@@ -129,52 +130,26 @@ impl GuidanceDb {
 
     /// Insert a vector into the HNSW index.
     fn hnsw_insert(&self, node_id: i64, embedding: &[f32]) {
-        let mut guard = self.hnsw.write().unwrap();
-        let hnsw = guard.get_or_insert_with(|| {
-            let p = HnswParams::default();
-            common_core::sqlite::make_hnsw(&p, p.initial_capacity)
-        });
-
-        let external_id = {
-            let mut id_map = self.hnsw_id_map.lock().unwrap();
-            let idx = id_map.len();
-            id_map.push(node_id);
-            idx
-        };
-
-        hnsw.insert((embedding, external_id));
+        self.hnsw.insert(node_id, embedding);
     }
 
     /// Rebuild the HNSW index from all embedded nodes in the database.
     pub fn rebuild_hnsw(&self) -> Result<usize, VectorDbError> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT id, embedding FROM guidance_nodes WHERE embedding IS NOT NULL")?;
-
-        let rows: Vec<(i64, Vec<u8>)> = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })?
-            .filter_map(Result::ok)
-            .collect();
+        let rows = self.store.query_rows(
+            "SELECT id, embedding FROM guidance_nodes WHERE embedding IS NOT NULL",
+            &[],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )?;
 
         let count = rows.len();
-
-        // Build new HNSW index
-        let p = HnswParams::default();
-        let hnsw = common_core::sqlite::make_hnsw(&p, count.max(p.initial_capacity));
-
-        let mut id_map = Vec::with_capacity(count);
-        for (i, (node_id, blob)) in rows.into_iter().enumerate() {
-            let embedding = math::bytes_to_vec(&blob);
-            if !embedding.is_empty() {
-                hnsw.insert((&embedding, i));
-                id_map.push(node_id);
+        self.hnsw.rebuild_from(rows.into_iter(), |blob| {
+            let embedding = math::bytes_to_vec(blob);
+            if embedding.is_empty() {
+                None
+            } else {
+                Some(embedding)
             }
-        }
-
-        *self.hnsw.write().unwrap() = Some(hnsw);
-        *self.hnsw_id_map.lock().unwrap() = id_map;
+        })?;
 
         Ok(count)
     }
@@ -205,26 +180,25 @@ impl GuidanceDb {
 
     /// HNSW approximate nearest neighbor search.
     fn hnsw_search(&self, query_vec: &[f32], k: usize) -> Option<Vec<SearchResult>> {
-        let guard = self.hnsw.read().ok()?;
-        let hnsw = guard.as_ref()?;
-        let id_map = self.hnsw_id_map.lock().ok()?;
-
-        let neighbours = hnsw.search(query_vec, k, k);
-
-        let conn = self.conn.lock().ok()?;
+        let neighbours = self.hnsw.search(query_vec, k);
+        if neighbours.is_empty() {
+            return None;
+        }
+        // Resolve HNSW `d_id` indices through the external-id map, then touch
+        // the connection. The `hnsw → id_map → conn` order is preserved.
+        let id_map = self.hnsw.id_map_snapshot();
 
         let mut results = Vec::with_capacity(neighbours.len());
-        for n in &neighbours {
-            let idx = n.d_id;
-            if idx >= id_map.len() {
+        for (d_id, distance) in neighbours {
+            if d_id >= id_map.len() {
                 continue;
             }
-            let node_id = id_map[idx];
+            let node_id = id_map[d_id];
 
             // Convert cosine distance to similarity: dist = 1 - cos_sim
-            let similarity = 1.0 - n.distance;
+            let similarity = 1.0 - distance;
 
-            if let Ok(row) = conn.query_row(
+            if let Ok(Some(row)) = self.store.query_row(
                 "SELECT name, source, signature FROM guidance_nodes WHERE id = ?1",
                 params![node_id],
                 |row| {
@@ -250,39 +224,36 @@ impl GuidanceDb {
         query_vec: &[f32],
         k: usize,
     ) -> Result<Vec<SearchResult>, VectorDbError> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let rows = self.store.query_rows(
             "SELECT id, name, source, signature, embedding FROM guidance_nodes WHERE embedding IS NOT NULL",
+            &[],
+            |row| {
+                let id: i64 = row.get(0)?;
+                let name: String = row.get(1)?;
+                let source: String = row.get(2)?;
+                let signature: Option<String> = row.get(3)?;
+                let embedding_blob: Option<Vec<u8>> = row.get(4)?;
+                Ok((id, name, source, signature, embedding_blob))
+            },
         )?;
 
-        let mut results: Vec<SearchResult> = Vec::new();
-
-        let rows = stmt.query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let name: String = row.get(1)?;
-            let source: String = row.get(2)?;
-            let signature: Option<String> = row.get(3)?;
-            let embedding_blob: Option<Vec<u8>> = row.get(4)?;
-            Ok((id, name, source, signature, embedding_blob))
-        })?;
-
-        for row_result in rows {
-            let (id, name, source, signature, embedding_blob) = row_result?;
-            if let Some(blob) = embedding_blob {
-                let embedding = math::bytes_to_vec(&blob);
+        let mut results: Vec<SearchResult> = rows
+            .into_iter()
+            .filter_map(|(id, name, source, signature, embedding_blob)| {
+                let embedding = math::bytes_to_vec(&embedding_blob?);
                 if embedding.len() != query_vec.len() {
-                    continue;
+                    return None;
                 }
                 let similarity = math::cosine_similarity(query_vec, &embedding);
-                results.push(SearchResult {
+                Some(SearchResult {
                     id,
                     name,
                     source,
                     signature,
                     similarity,
-                });
-            }
-        }
+                })
+            })
+            .collect();
 
         results.sort_by(|a, b| {
             b.similarity
@@ -295,17 +266,14 @@ impl GuidanceDb {
     }
 
     pub fn keyword_search(&self, query: &str) -> Result<Vec<SearchResult>, VectorDbError> {
-        let conn = self.conn.lock().unwrap();
-
         // 1. Try exact full-query substring match first (fast, precise).
         let pattern = format!("%{query}%");
-        let mut stmt = conn.prepare(
+        let exact: Vec<SearchResult> = self.store.query_rows(
             "SELECT id, name, source, signature FROM guidance_nodes
              WHERE name LIKE ?1 OR signature LIKE ?1 OR comment LIKE ?1
              LIMIT 50",
-        )?;
-        let exact: Vec<SearchResult> = stmt
-            .query_map(params![pattern], |row| {
+            params![pattern],
+            |row| {
                 Ok(SearchResult {
                     id: row.get(0)?,
                     name: row.get(1)?,
@@ -313,8 +281,8 @@ impl GuidanceDb {
                     signature: row.get(3)?,
                     similarity: 1.0,
                 })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+            },
+        )?;
         if !exact.is_empty() {
             return Ok(exact);
         }
@@ -366,27 +334,25 @@ impl GuidanceDb {
              LIMIT 50"
         );
 
-        let mut stmt = conn.prepare(&sql)?;
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = token_patterns
-            .iter()
-            .map(|p| Box::new(p.clone()) as Box<dyn rusqlite::types::ToSql>)
+        let mut params: Vec<rusqlite::types::Value> = token_patterns
+            .into_iter()
+            .map(rusqlite::types::Value::from)
             .collect();
-        params.push(Box::new(min_matches));
+        params.push(rusqlite::types::Value::Integer(i64::from(min_matches)));
 
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(Box::as_ref).collect();
-        let results = stmt
-            .query_map(param_refs.as_slice(), |row| {
-                Ok(SearchResult {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    source: row.get(2)?,
-                    signature: row.get(3)?,
-                    similarity: row.get::<_, i32>(4)? as f32,
+        self.store
+            .with_conn(|conn| {
+                fluent_db::query::query_rows_from_iter(conn, &sql, params, |row| {
+                    Ok(SearchResult {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        source: row.get(2)?,
+                        signature: row.get(3)?,
+                        similarity: row.get::<_, i32>(4)? as f32,
+                    })
                 })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(results)
+            })
+            .map_err(VectorDbError::from)
     }
 
     pub fn hybrid_search(
@@ -403,27 +369,40 @@ impl GuidanceDb {
             Vec::new()
         };
 
-        let mut fused = rrf_merge(keyword_results, vector_results, 60.0);
+        // Generic ranked fusion over `(id, item)` pairs (M7). Reached via the
+        // `search_vector::math` re-export of `fluent_db::vector::rrf_merge`.
+        let mut fused: Vec<SearchResult> = math::rrf_merge(
+            keyword_results.into_iter().map(|r| (r.id, r)).collect(),
+            vector_results.into_iter().map(|r| (r.id, r)).collect(),
+            60.0,
+        )
+        .into_iter()
+        .map(|(score, mut r)| {
+            r.similarity = score as f32;
+            r
+        })
+        .collect();
         fused.truncate(k);
 
         Ok(fused)
     }
 
     pub fn get_node_count(&self) -> Result<i64, VectorDbError> {
-        let conn = self.conn.lock().unwrap();
-        let count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM guidance_nodes", [], |row| row.get(0))?;
-        Ok(count)
+        let count = self
+            .store
+            .query_row("SELECT COUNT(*) FROM guidance_nodes", &[], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        Ok(count.unwrap_or(0))
     }
 
     pub fn get_embedding_count(&self) -> Result<i64, VectorDbError> {
-        let conn = self.conn.lock().unwrap();
-        let count: i64 = conn.query_row(
+        let count = self.store.query_row(
             "SELECT COUNT(*) FROM guidance_nodes WHERE embedding IS NOT NULL",
-            [],
-            |row| row.get(0),
+            &[],
+            |row| row.get::<_, i64>(0),
         )?;
-        Ok(count)
+        Ok(count.unwrap_or(0))
     }
 
     /// Sync all JSON files from a directory into the `guidance_nodes` table.
@@ -436,10 +415,9 @@ impl GuidanceDb {
 
         let synced = {
             let mut synced = 0;
-            let conn = self.conn.lock().unwrap();
 
             // Clear existing nodes before re-sync to avoid stale duplicates.
-            conn.execute("DELETE FROM guidance_nodes", [])?;
+            self.store.execute("DELETE FROM guidance_nodes", &[])?;
 
             let mut json_files = Vec::new();
             common_core::walk::walk_files(json_dir, &["json"], |path| {
@@ -448,18 +426,14 @@ impl GuidanceDb {
 
             for path in &json_files {
                 let content = common_core::io::read_to_string_err(path).map_err(|e| {
-                    VectorDbError::Sqlite(common_core::error::SqliteError(
-                        rusqlite::Error::ToSqlConversionFailure(Box::new(e)),
-                    ))
+                    DbError::Other(format!("failed to read {}: {e}", path.display()))
                 })?;
                 if content.trim().is_empty() {
                     continue;
                 }
 
                 let doc: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
-                    VectorDbError::Sqlite(common_core::error::SqliteError(
-                        rusqlite::Error::ToSqlConversionFailure(Box::new(e)),
-                    ))
+                    DbError::Other(format!("failed to parse {}: {e}", path.display()))
                 })?;
 
                 let source = doc["meta"]["source"].as_str().unwrap_or("");
@@ -478,18 +452,19 @@ impl GuidanceDb {
                         let _is_anchor = member["is_anchor"].as_bool().unwrap_or(false);
 
                         // Check for existing row with same (name, signature).
-                        let exists: bool = conn
+                        let exists: bool = self
+                            .store
                             .query_row(
                                 "SELECT 1 FROM guidance_nodes WHERE name = ?1 AND signature IS ?2 LIMIT 1",
                                 rusqlite::params![name, signature],
                                 |_| Ok(true),
-                            )
+                            )?
                             .unwrap_or(false);
                         if exists {
                             continue;
                         }
 
-                        let _ = conn.execute(
+                        let _ = self.store.execute(
                             "INSERT INTO guidance_nodes (name, source, signature, comment, module, language)
                              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                             rusqlite::params![
@@ -519,57 +494,13 @@ impl GuidanceDb {
 
     /// Check if the HNSW index is built.
     pub fn has_hnsw(&self) -> bool {
-        self.hnsw.read().is_ok_and(|g| g.is_some())
+        self.hnsw.is_built()
     }
 
     /// Get the number of points in the HNSW index.
     pub fn hnsw_len(&self) -> usize {
-        self.hnsw
-            .read()
-            .ok()
-            .and_then(|g| g.as_ref().map(Hnsw::get_nb_point))
-            .unwrap_or(0)
+        self.hnsw.len()
     }
-}
-
-/// Reciprocal Rank Fusion: merges two ranked result lists using RRF scoring.
-/// RRF score = sum(1 / (k + rank(engine))) for each result appearing in either list.
-/// Results not present in a list get rank = infinity (contribute 0).
-/// `k` is the RRF constant (typically 60).
-pub fn rrf_merge(
-    keyword_results: Vec<SearchResult>,
-    vector_results: Vec<SearchResult>,
-    k_constant: f64,
-) -> Vec<SearchResult> {
-    use std::collections::HashMap;
-
-    let mut rrf_scores: HashMap<i64, (f64, SearchResult)> = HashMap::new();
-
-    for (rank, result) in keyword_results.into_iter().enumerate() {
-        rrf_scores.insert(result.id, (1.0 / (k_constant + rank as f64), result));
-    }
-
-    for (rank, result) in vector_results.into_iter().enumerate() {
-        let score = 1.0 / (k_constant + rank as f64);
-        let entry = rrf_scores.entry(result.id).or_insert_with(|| (0.0, result));
-        entry.0 += score;
-    }
-
-    let mut merged: Vec<SearchResult> = rrf_scores
-        .into_values()
-        .map(|(score, mut r)| {
-            r.similarity = score as f32;
-            r
-        })
-        .collect();
-
-    merged.sort_by(|a, b| {
-        b.similarity
-            .partial_cmp(&a.similarity)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    merged
 }
 
 #[cfg(test)]
@@ -671,82 +602,5 @@ mod tests {
             .hybrid_search("hello", Some(&emb), 5)
             .expect("hybrid search");
         assert!(!results.is_empty());
-    }
-
-    #[test]
-    fn test_rrf_merge_single_result() {
-        let kw = vec![SearchResult {
-            id: 1,
-            name: "foo".into(),
-            source: "src/foo.zig".into(),
-            signature: None,
-            similarity: 0.0,
-        }];
-        let vec_results = vec![];
-        let merged = rrf_merge(kw, vec_results, 60.0);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].name, "foo");
-    }
-
-    #[test]
-    fn test_rrf_merge_boosts_shared_results() {
-        let kw = vec![
-            SearchResult {
-                id: 1,
-                name: "shared".into(),
-                source: "a.zig".into(),
-                signature: None,
-                similarity: 0.0,
-            },
-            SearchResult {
-                id: 2,
-                name: "kw_only".into(),
-                source: "a.zig".into(),
-                signature: None,
-                similarity: 0.0,
-            },
-        ];
-        let vec_results = vec![
-            SearchResult {
-                id: 1,
-                name: "shared".into(),
-                source: "a.zig".into(),
-                signature: None,
-                similarity: 0.0,
-            },
-            SearchResult {
-                id: 3,
-                name: "vec_only".into(),
-                source: "a.zig".into(),
-                signature: None,
-                similarity: 0.0,
-            },
-        ];
-        let merged = rrf_merge(kw, vec_results, 60.0);
-        // shared (id=1) should be ranked first since it appears in both lists
-        assert!(merged.len() >= 2);
-        assert_eq!(merged[0].name, "shared");
-        assert!(merged[0].similarity > merged[1].similarity);
-    }
-
-    #[test]
-    fn test_rrf_merge_deduplicates() {
-        let kw = vec![SearchResult {
-            id: 1,
-            name: "dup".into(),
-            source: "x.zig".into(),
-            signature: None,
-            similarity: 0.0,
-        }];
-        let vec_results = vec![SearchResult {
-            id: 1,
-            name: "dup".into(),
-            source: "x.zig".into(),
-            signature: None,
-            similarity: 0.0,
-        }];
-        let merged = rrf_merge(kw.clone(), vec_results, 60.0);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].name, "dup");
     }
 }

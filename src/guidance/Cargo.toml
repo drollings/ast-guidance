@@ -11,6 +11,7 @@ search-vector = { path = "../search-vector" }
 fluent-llm = { path = "../llm" }
 fluent-concurrency = { path = "../fluent-concurrency" }
 fluent-wvr = { path = "../fluent-wvr" }
+fluent-db = { path = "../db" }
 memory-plugin = { path = "../memory-plugin" }
 serde = { workspace = true }
 serde_json = { workspace = true }

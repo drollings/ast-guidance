@@ -20,8 +20,10 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use common_core::sqlite::open_wal;
 use common_core::sync::lock;
+use fluent_db::error::DbError;
+use fluent_db::migrate::{ensure_column, migrate, Migration};
+use fluent_db::store::SqliteStore;
 use fluent_types::{ContentNode, NodeId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -72,7 +74,7 @@ pub struct LedgerEntry {
 }
 
 pub struct ContentNodeLedger {
-    db: Mutex<rusqlite::Connection>,
+    store: SqliteStore,
     next_id: Mutex<i64>,
     summarizer: Option<Summarizer>,
 }
@@ -96,44 +98,23 @@ fn derive_label(role: &str, content: &str) -> String {
 impl ContentNodeLedger {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, LedgerError> {
         let db_path = path.into();
-        let db = open_wal(&db_path).map_err(|e| LedgerError::Db(e.to_string()))?;
-        db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS ledger (
-                node_id INTEGER PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                request_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                turn_index INTEGER NOT NULL DEFAULT 0,
-                accepted INTEGER NOT NULL DEFAULT 1,
-                acceptance_score REAL,
-                active_lod INTEGER NOT NULL DEFAULT 0,
-                parent_id INTEGER,
-                step_id TEXT,
-                metadata TEXT NOT NULL DEFAULT '{}',
-                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-                label TEXT NOT NULL DEFAULT '',
-                lod TEXT NOT NULL DEFAULT '[]',
-                content_json TEXT NOT NULL DEFAULT '{}'
-            );
-            CREATE INDEX IF NOT EXISTS idx_ledger_session ON ledger(session_id, turn_index);",
-        )
-        .map_err(|e| LedgerError::Db(e.to_string()))?;
+        let store = SqliteStore::open(&db_path).map_err(|e| LedgerError::Db(e.to_string()))?;
 
-        // Best-effort migration of pre-LOD databases (new columns absent).
-        ensure_column(&db, "label", "label TEXT NOT NULL DEFAULT ''")
+        // Versioned schema lifecycle (fluent_db::migrate): the base schema
+        // migration creates the table; the column migrations upgrade
+        // pre-LOD databases idempotently.
+        let migrations: [&dyn Migration; 4] = [
+            &LedgerBaseSchema,
+            &LedgerLabelColumn,
+            &LedgerLodColumn,
+            &LedgerContentJsonColumn,
+        ];
+        store
+            .with_conn(|conn| migrate(conn, &migrations))
             .map_err(|e| LedgerError::Db(e.to_string()))?;
-        ensure_column(&db, "lod", "lod TEXT NOT NULL DEFAULT '[]'")
-            .map_err(|e| LedgerError::Db(e.to_string()))?;
-        ensure_column(
-            &db,
-            "content_json",
-            "content_json TEXT NOT NULL DEFAULT '{}'",
-        )
-        .map_err(|e| LedgerError::Db(e.to_string()))?;
 
         Ok(Self {
-            db: Mutex::new(db),
+            store,
             next_id: Mutex::new(1),
             summarizer: None,
         })
@@ -208,7 +189,6 @@ impl ContentNodeLedger {
     /// Record a node under a fixed NodeId (internal — avoids a second
     /// next_id bump when the caller already allocated one).
     fn insert_node(&self, node: &ContentNode) -> Result<(), LedgerError> {
-        let db = lock(&self.db);
         let metadata = node
             .metadata
             .as_ref()
@@ -226,31 +206,32 @@ impl ContentNodeLedger {
             .filter(|l| !l.is_empty())
             .unwrap_or_else(|| derive_label(&node.role.clone().unwrap_or_default(), content));
 
-        db.execute(
-            "INSERT INTO ledger (node_id, session_id, request_id, role, content, turn_index,
-                                 accepted, acceptance_score, active_lod, parent_id, step_id,
-                                 metadata, created_at, label, lod, content_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-            rusqlite::params![
-                node.id.map(NodeId::as_int),
-                node.session_id.clone().unwrap_or_default(),
-                node.request_id.clone().unwrap_or_default(),
-                node.role.clone().unwrap_or_default(),
-                content,
-                node.turn_index.unwrap_or(0) as i64,
-                node.accepted.unwrap_or(true),
-                node.acceptance_score,
-                i64::from(node.active_lod.unwrap_or(LOD0_FULL_TEXT)),
-                node.parent_id.map(NodeId::as_int),
-                node.step_id.as_deref(),
-                metadata,
-                node.created_at.unwrap_or_else(common_core::now_secs) as i64,
-                label,
-                lod_json,
-                content_json,
-            ],
-        )
-        .map_err(|e| LedgerError::Db(e.to_string()))?;
+        self.store
+            .execute(
+                "INSERT INTO ledger (node_id, session_id, request_id, role, content, turn_index,
+                                     accepted, acceptance_score, active_lod, parent_id, step_id,
+                                     metadata, created_at, label, lod, content_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                rusqlite::params![
+                    node.id.map(NodeId::as_int),
+                    node.session_id.clone().unwrap_or_default(),
+                    node.request_id.clone().unwrap_or_default(),
+                    node.role.clone().unwrap_or_default(),
+                    content,
+                    node.turn_index.unwrap_or(0) as i64,
+                    node.accepted.unwrap_or(true),
+                    node.acceptance_score,
+                    i64::from(node.active_lod.unwrap_or(LOD0_FULL_TEXT)),
+                    node.parent_id.map(NodeId::as_int),
+                    node.step_id.as_deref(),
+                    metadata,
+                    node.created_at.unwrap_or_else(common_core::now_secs) as i64,
+                    label,
+                    lod_json,
+                    content_json,
+                ],
+            )
+            .map_err(|e| LedgerError::Db(e.to_string()))?;
         Ok(())
     }
 
@@ -271,7 +252,6 @@ impl ContentNodeLedger {
 
     /// Persist an updated node (flat projection + `content_json`).
     fn update_node(&self, node: &ContentNode) -> Result<(), LedgerError> {
-        let db = lock(&self.db);
         let metadata = node
             .metadata
             .as_ref()
@@ -289,32 +269,33 @@ impl ContentNodeLedger {
             .filter(|l| !l.is_empty())
             .unwrap_or_else(|| derive_label(&node.role.clone().unwrap_or_default(), content));
 
-        db.execute(
-            "UPDATE ledger SET session_id = ?1, request_id = ?2, role = ?3, content = ?4,
-                               turn_index = ?5, accepted = ?6, acceptance_score = ?7,
-                               active_lod = ?8, parent_id = ?9, step_id = ?10, metadata = ?11,
-                               created_at = ?12, label = ?13, lod = ?14, content_json = ?15
-             WHERE node_id = ?16",
-            rusqlite::params![
-                node.session_id.clone().unwrap_or_default(),
-                node.request_id.clone().unwrap_or_default(),
-                node.role.clone().unwrap_or_default(),
-                content,
-                node.turn_index.unwrap_or(0) as i64,
-                node.accepted.unwrap_or(true),
-                node.acceptance_score,
-                i64::from(node.active_lod.unwrap_or(LOD0_FULL_TEXT)),
-                node.parent_id.map(NodeId::as_int),
-                node.step_id.as_deref(),
-                metadata,
-                node.created_at.unwrap_or_else(common_core::now_secs) as i64,
-                label,
-                lod_json,
-                content_json,
-                node.id.map(NodeId::as_int),
-            ],
-        )
-        .map_err(|e| LedgerError::Db(e.to_string()))?;
+        self.store
+            .execute(
+                "UPDATE ledger SET session_id = ?1, request_id = ?2, role = ?3, content = ?4,
+                                   turn_index = ?5, accepted = ?6, acceptance_score = ?7,
+                                   active_lod = ?8, parent_id = ?9, step_id = ?10, metadata = ?11,
+                                   created_at = ?12, label = ?13, lod = ?14, content_json = ?15
+                 WHERE node_id = ?16",
+                rusqlite::params![
+                    node.session_id.clone().unwrap_or_default(),
+                    node.request_id.clone().unwrap_or_default(),
+                    node.role.clone().unwrap_or_default(),
+                    content,
+                    node.turn_index.unwrap_or(0) as i64,
+                    node.accepted.unwrap_or(true),
+                    node.acceptance_score,
+                    i64::from(node.active_lod.unwrap_or(LOD0_FULL_TEXT)),
+                    node.parent_id.map(NodeId::as_int),
+                    node.step_id.as_deref(),
+                    metadata,
+                    node.created_at.unwrap_or_else(common_core::now_secs) as i64,
+                    label,
+                    lod_json,
+                    content_json,
+                    node.id.map(NodeId::as_int),
+                ],
+            )
+            .map_err(|e| LedgerError::Db(e.to_string()))?;
         Ok(())
     }
 
@@ -412,20 +393,28 @@ impl ContentNodeLedger {
 
     /// Fetch a node by ID (canonical `ContentNode`, hydrated from `content_json`).
     pub fn get_node(&self, node_id: NodeId) -> Option<ContentNode> {
-        let db = lock(&self.db);
-        let json: String = db
+        let json: Option<String> = self
+            .store
             .query_row(
                 "SELECT content_json FROM ledger WHERE node_id = ?1",
                 rusqlite::params![node_id.as_int()],
                 |r| r.get(0),
             )
-            .ok()?;
-        let parsed = serde_json::from_str::<ContentNode>(&json).ok();
-        if parsed.is_some() {
-            return parsed;
+            .ok()
+            .flatten();
+        if let Some(json) = json {
+            let parsed = serde_json::from_str::<ContentNode>(&json).ok();
+            if parsed.is_some() {
+                return parsed;
+            }
         }
         // Pre-LOD rows have '{}': hydrate from the flat projection.
-        hydrate_node(&db, node_id).ok().flatten()
+        self.store
+            .with_conn(|conn| {
+                hydrate_node(conn, node_id).map_err(|e| DbError::Other(e.to_string()))
+            })
+            .ok()
+            .flatten()
     }
 
     /// All nodes for a session (canonical `ContentNode`s), most recent first.
@@ -434,27 +423,15 @@ impl ContentNodeLedger {
         session_id: &str,
         limit: usize,
     ) -> Result<Vec<ContentNode>, LedgerError> {
-        let ids = {
-            let db = lock(&self.db);
-            let mut stmt = db
-                .prepare(
-                    "SELECT node_id FROM ledger WHERE session_id = ?1
-                     ORDER BY turn_index DESC LIMIT ?2",
-                )
-                .map_err(|e| LedgerError::Db(e.to_string()))?;
-
-            let rows = stmt
-                .query_map(rusqlite::params![session_id, limit as i64], |r| {
-                    Ok(NodeId::from_int(r.get(0)?))
-                })
-                .map_err(|e| LedgerError::Db(e.to_string()))?;
-
-            let mut ids = Vec::new();
-            for id in rows {
-                ids.push(id.map_err(|e| LedgerError::Db(e.to_string()))?);
-            }
-            ids
-        }; // drop the db guard before per-node fetch (Mutex is not reentrant)
+        let ids = self
+            .store
+            .query_rows(
+                "SELECT node_id FROM ledger WHERE session_id = ?1
+                 ORDER BY turn_index DESC LIMIT ?2",
+                rusqlite::params![session_id, limit as i64],
+                |r| Ok(NodeId::from_int(r.get(0)?)),
+            )
+            .map_err(|e| LedgerError::Db(e.to_string()))?;
 
         let mut nodes = Vec::new();
         for id in ids {
@@ -470,43 +447,43 @@ impl ContentNodeLedger {
         session_id: &str,
         limit: usize,
     ) -> Result<Vec<LedgerEntry>, LedgerError> {
-        let db = lock(&self.db);
-        let mut stmt = db
-            .prepare(
+        self.store
+            .query_rows(
                 "SELECT node_id, session_id, request_id, role, content,
                         turn_index, accepted, acceptance_score, active_lod,
                         parent_id, step_id, metadata, created_at
                  FROM ledger WHERE session_id = ?1
                  ORDER BY turn_index DESC LIMIT ?2",
+                rusqlite::params![session_id, limit as i64],
+                |row| {
+                    Ok(LedgerEntry {
+                        node_id: NodeId::from_int(row.get(0)?),
+                        session_id: row.get(1)?,
+                        request_id: row.get(2)?,
+                        role: row.get(3)?,
+                        content: row.get(4)?,
+                        turn_index: row.get(5)?,
+                        accepted: row.get(6)?,
+                        acceptance_score: row.get(7)?,
+                        active_lod: row.get(8)?,
+                        parent_id: row.get::<_, Option<i64>>(9)?.map(NodeId::from_int),
+                        step_id: row.get(10)?,
+                        metadata: serde_json::from_str(row.get::<_, String>(11)?.as_str())
+                            .unwrap_or_default(),
+                        created_at: row.get(12)?,
+                    })
+                },
             )
-            .map_err(|e| LedgerError::Db(e.to_string()))?;
+            .map_err(|e| LedgerError::Db(e.to_string()))
+    }
 
-        let entries = stmt
-            .query_map(rusqlite::params![session_id, limit as i64], |row| {
-                Ok(LedgerEntry {
-                    node_id: NodeId::from_int(row.get(0)?),
-                    session_id: row.get(1)?,
-                    request_id: row.get(2)?,
-                    role: row.get(3)?,
-                    content: row.get(4)?,
-                    turn_index: row.get(5)?,
-                    accepted: row.get(6)?,
-                    acceptance_score: row.get(7)?,
-                    active_lod: row.get(8)?,
-                    parent_id: row.get::<_, Option<i64>>(9)?.map(NodeId::from_int),
-                    step_id: row.get(10)?,
-                    metadata: serde_json::from_str(row.get::<_, String>(11)?.as_str())
-                        .unwrap_or_default(),
-                    created_at: row.get(12)?,
-                })
-            })
-            .map_err(|e| LedgerError::Db(e.to_string()))?;
-
-        let mut result = Vec::new();
-        for entry in entries {
-            result.push(entry.map_err(|e| LedgerError::Db(e.to_string()))?);
-        }
-        Ok(result)
+    /// Panic while holding the connection mutex (test-only): exercises the
+    /// poison-recovery path in `SqliteStore`'s `common_core::sync::lock`.
+    #[cfg(test)]
+    fn poison_conn(&self) {
+        let _ = self.store.with_conn(|_| -> Result<(), DbError> {
+            panic!("simulated panic while holding db mutex")
+        });
     }
 }
 
@@ -632,16 +609,93 @@ fn ensure_lod_eager(node: &mut ContentNode) {
     }
 }
 
-/// Best-effort `ALTER TABLE` for a missing column (pre-LOD database upgrade).
-fn ensure_column(db: &rusqlite::Connection, name: &str, ddl: &str) -> Result<(), rusqlite::Error> {
-    let has = db
-        .prepare("SELECT 1 FROM pragma_table_info('ledger') WHERE name = ?1")
-        .and_then(|mut stmt| stmt.query_row(rusqlite::params![name], |_| Ok(())))
-        .is_ok();
-    if !has {
-        db.execute_batch(&format!("ALTER TABLE ledger ADD COLUMN {ddl}"))?;
+/// Versioned ledger schema lifecycle (fluent_db::migrate, M6.2).
+///
+/// One migration per schema step: the base table + session index, then the
+/// three LOD-era columns (`label`, `lod`, `content_json`) that pre-LOD
+/// databases lack. Each column migration is a no-op when the column already
+/// exists, so a fresh database and an upgraded one converge.
+struct LedgerBaseSchema;
+
+impl Migration for LedgerBaseSchema {
+    fn version(&self) -> u32 {
+        1
     }
-    Ok(())
+    fn name(&self) -> &str {
+        "ledger-base-schema"
+    }
+    fn up(&self, tx: &mut rusqlite::Transaction<'_>) -> Result<(), DbError> {
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS ledger (
+                node_id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                turn_index INTEGER NOT NULL DEFAULT 0,
+                accepted INTEGER NOT NULL DEFAULT 1,
+                acceptance_score REAL,
+                active_lod INTEGER NOT NULL DEFAULT 0,
+                parent_id INTEGER,
+                step_id TEXT,
+                metadata TEXT NOT NULL DEFAULT '{}',
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                label TEXT NOT NULL DEFAULT '',
+                lod TEXT NOT NULL DEFAULT '[]',
+                content_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_ledger_session ON ledger(session_id, turn_index);",
+        )
+        .map_err(DbError::from)?;
+        Ok(())
+    }
+}
+
+struct LedgerLabelColumn;
+
+impl Migration for LedgerLabelColumn {
+    fn version(&self) -> u32 {
+        2
+    }
+    fn name(&self) -> &str {
+        "ledger-label-column"
+    }
+    fn up(&self, tx: &mut rusqlite::Transaction<'_>) -> Result<(), DbError> {
+        ensure_column(tx, "ledger", "label", "label TEXT NOT NULL DEFAULT ''")
+    }
+}
+
+struct LedgerLodColumn;
+
+impl Migration for LedgerLodColumn {
+    fn version(&self) -> u32 {
+        3
+    }
+    fn name(&self) -> &str {
+        "ledger-lod-column"
+    }
+    fn up(&self, tx: &mut rusqlite::Transaction<'_>) -> Result<(), DbError> {
+        ensure_column(tx, "ledger", "lod", "lod TEXT NOT NULL DEFAULT '[]'")
+    }
+}
+
+struct LedgerContentJsonColumn;
+
+impl Migration for LedgerContentJsonColumn {
+    fn version(&self) -> u32 {
+        4
+    }
+    fn name(&self) -> &str {
+        "ledger-content-json-column"
+    }
+    fn up(&self, tx: &mut rusqlite::Transaction<'_>) -> Result<(), DbError> {
+        ensure_column(
+            tx,
+            "ledger",
+            "content_json",
+            "content_json TEXT NOT NULL DEFAULT '{}'",
+        )
+    }
 }
 
 // ── LOD compaction policy ─────────────────────────────────────────────────
@@ -730,8 +784,7 @@ mod tests {
         let ledger = temp_ledger();
         // Poison the db mutex by panicking while it is held.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = ledger.db.lock().unwrap();
-            panic!("simulated panic while holding db mutex");
+            ledger.poison_conn();
         }));
         // Subsequent calls must still succeed via the poison-recovery helper.
         let id = ledger

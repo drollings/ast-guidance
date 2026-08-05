@@ -10,9 +10,9 @@ hnsw-bench = []
 [dependencies]
 fluent-wvr = { path = "../fluent-wvr" }
 fluent-concurrency = { path = "../fluent-concurrency" }
+fluent-db = { path = "../db" }
 common-core = { path = "../common-core", features = ["sqlite"] }
 fluent-types = { path = "../types" }
-search-vector = { path = "../search-vector" }
 fluent-llm = { path = "../llm" }
 guidance-ontology = { path = "../ontology" }
 guidance-rdf = { path = "../rdf" }
@@ -24,10 +24,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 bon = { workspace = true }
 rusqlite = { workspace = true }
-lru = { workspace = true }
 extism = { workspace = true }
-hnsw_rs = { workspace = true }
-anndists = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

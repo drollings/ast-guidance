@@ -4,8 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-common-core = { path = "../common-core", features = ["sqlite"] }
-rusqlite = { workspace = true }
+common-core = { path = "../common-core" }
+fluent-db = { path = "../db" }
 blake3 = { workspace = true }
 thiserror = { workspace = true }
 

@@ -45,6 +45,20 @@ This is a rust monorepo with multiple projects and shared infrastructure.  coral
 It must NOT import from `guidance`, `coral`, `wasm_ipc`, `knowledge`,
 `ontology`, or `rdf`.
 
+`fluent-db` (`src/db/`) may import from `common-core` (with `sqlite` feature),
+`fluent-wvr`, `tokio`, `rusqlite`, `hnsw_rs`, `anndists`, `serde`, `thiserror`,
+`tracing`. It must NOT import from `fluent-concurrency`, `guidance`, `coral`,
+`fluent-router`, `search-vector`, `knowledge`, `ontology`, `rdf`, `fluent-types`,
+or `wasm_ipc`. The capability-gating primitives (`CURRENT_CAPS`,
+`check_capability`, `CapabilityError`) live in `fluent-wvr` so both
+`fluent-db` and `fluent-concurrency` can read the same task-local without a
+cyclic dependency; `fluent-concurrency` re-exports `DbCapability` from
+`fluent-db` behind its `db` feature.
+
+`search-vector` / `coral-context` / `fluent-router` / `fluent-knowledge` /
+`memory-plugin` / `guidance-core` may additionally import `fluent-db` as they
+adopt it (M4–M8 of ROADMAP_20260804_DB).
+
 
 ## Source Layout
 
@@ -74,6 +88,11 @@ src/
                        no imports from dag/, coral/, or guidance/
   content-node/        guidance-content-node (lod slicing, file content annotation)
   search-vector/       guidance-search-vector (SQLite hybrid search + HNSW index)
+  db/                  fluent-db: canonical database-access layer (pooled/typed/async,
+                       feature-gated on `sqlite`). Owns SqliteStore, SqlitePool,
+                       DbError, HnswIndex, TtlCache, vector math, migrations, query
+                       helpers, DbCapability, DbWorkUnit (M2+ of ROADMAP_20260804_DB).
+                       Raw SQLite mechanics stay in common-core::sqlite.
   knowledge/           fluent-knowledge (WordIndex, TrigramIndex, CsrGraph, QueryCache)
   ontology/            guidance-ontology (entity extraction, YAGO taxonomy, capability inference)
   rdf/                 guidance-rdf (Turtle/N-Quads parser, normalization)
@@ -171,7 +190,15 @@ anything that knows what a "node", "session", "target", "embedding", or
 | Fluent WVR newtype wrappers (`Instrumented`, `ComponentAdapter`, `Pipeline`, `retry_call`, `ComponentCascade`) | `fluent-wvr::wrapper` | `src/fluent-wvr/src/wrapper.rs` |
 | Jittered-exponential retry (`backoff_ms`, `retry_async`) | `common-core::retry` | `src/common-core/src/retry.rs` |
 | Shared domain newtypes (`NodeId`, `SessionId`, `TargetId`, `LOD_COUNT`) | `guidance-types` | `src/types/src/lib.rs` |
-| Cosine similarity / brute-force KNN | `search-vector::math` | `src/search-vector/src/math.rs` |
+| Cosine similarity / brute-force KNN / RRF fusion (`cosine_similarity`, `knn_brute_force`, `vec_to_bytes`/`bytes_to_vec`/`try_bytes_to_vec`, `QuantizedEmbedding`, `cosine_similarity_q8`, `rrf_merge`) | `fluent-db::vector` (`search-vector::math` re-exports it) | `src/db/src/vector.rs` |
+| Database error taxonomy (`DbError` — `Sqlite|NotFound|DuplicateEntry|Busy|PoolExhausted|InvalidSchemaVersion|Other`; the single `From<rusqlite::Error>` centralizing `is_unique_violation` → `DuplicateEntry` and `SQLITE_BUSY` → `Busy`) | `fluent-db::error` | `src/db/src/error.rs` |
+| Single-connection store (open/WAL/schema-init/migrations/typed helpers, poison-safe lock) | `fluent-db::store` (`SqliteStore`) | `src/db/src/store.rs` |
+| Pooled async store (`Semaphore` + `spawn_blocking` + RAII checkout, `PoolConfig { size, busy_timeout_ms }`) | `fluent-db::pool` (`SqlitePool`) | `src/db/src/pool.rs` |
+| Typed statement helpers (`query_row`/`query_rows`/`execute`/`execute_batch`/`query_rows_from_iter`/`last_insert_rowid`/`transaction`) | `fluent-db::query` | `src/db/src/query.rs` |
+| Idempotent schema migrations (`Migration` trait, `migrate` via `PRAGMA user_version`, `ensure_column`, `schema_version`) | `fluent-db::migrate` | `src/db/src/migrate.rs` |
+| TTL/LRU key-value cache store (`TtlCache` — get-with-expiry/put/evict_expired/evict_lru/clear/stats) | `fluent-db::cache` | `src/db/src/cache.rs` |
+| HNSW-backed index store (`HnswIndex` — insert/rebuild_from/search/id_map; lock order `hnsw → id_map` never inverted, R9) | `fluent-db::hnsw` | `src/db/src/hnsw.rs` |
+| Capability token over the pool (`DbCapability` — gated via `fluent_wvr::capability::check_capability`; re-exported from `fluent-concurrency::io::db` behind its `db` feature) | `fluent-db::capability` | `src/db/src/capability.rs` |
 | SQLite open helpers + schemas (`open_wal`, `is_unique_violation`, `in_clause`) | `common-core::sqlite` | `src/common-core/src/sqlite.rs` (feature `sqlite`) |
 | JSON-RPC / MCP stdio loop | `common-core::jsonrpc` | `src/common-core/src/jsonrpc.rs` |
 | Token budget helpers | `common-core::tokens` | `src/common-core/src/tokens.rs` |
@@ -188,6 +215,7 @@ anything that knows what a "node", "session", "target", "embedding", or
 | HTTP-status → failure taxonomy (`HttpClass`, `FailureClass`, `classify_http_status`) | `guidance-llm::http_class` | `src/llm/src/http_class.rs` |
 | Typed LLM request queue (`LlmRequestQueue`, `build_default_queue`, `default_handler`) — worker-pool dispatch for chat completions | `guidance-llm::llm_queue` | `src/llm/src/llm_queue.rs` |
 | `ComponentArcExt::try_as_any_mut` (safe mutable access to shared Arc) | `fluent-wvr::ComponentArcExt` | `src/fluent-wvr/src/traits.rs` |
+| Database `Component`/`WorkUnit` adapters (`DbStore` — blocking-connection abstraction; `DbWorkUnit<F>` — `execute` offloads via `block_in_place`; `store_unit(Arc<SqliteStore>, name, op)` factory) | `fluent-db::wvr` | `src/db/src/wvr.rs` |
 | `WorkOutput::typed` (Result-returning) and `WorkOutput::data_take` (zero-copy) | `fluent-wvr::WorkOutput` | `src/fluent-wvr/src/work.rs` |
 | `make_hnsw()` | `common-core::sqlite` | `src/common-core/src/sqlite.rs` (feature `sqlite`) |
 | `Middleware` trait | `fluent-wvr::wrapper` | `src/fluent-wvr/src/wrapper.rs` |
@@ -213,10 +241,12 @@ Current single-consumer limits (candidates for future promotion):
 the same `HnswParams::default()` constants. They remain separate because no
 shared vector store exists between the two crates today. If a shared store
 appears in the future, host the HNSW index in `search-vector` and have `coral`
-delegate. Both crates use `knn_brute_force` from `search-vector::math` for
-brute-force fallback and `common_core::sqlite::make_hnsw()` for index
-construction — the positional-argument unpacking of `Hnsw::new(...)` is now
-centralized in exactly one place.
+delegate. Both crates compose `fluent-db` components for index construction and
+brute-force fallback: `fluent_db::hnsw::HnswIndex` (which internally calls
+`common_core::sqlite::make_hnsw` — the positional-argument unpacking of
+`Hnsw::new(...)` is centralized in exactly one place) and
+`knn_brute_force`/`try_bytes_to_vec` from `fluent_db::vector` (re-exported via
+`search-vector::math`).
 
 ### Metrics / Instrumented wiring (M12)
 

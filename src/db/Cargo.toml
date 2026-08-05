@@ -1,0 +1,30 @@
+[package]
+name = "fluent-db"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["sqlite"]
+sqlite = ["dep:rusqlite", "dep:hnsw_rs", "dep:anndists", "common-core/sqlite"]
+
+[dependencies]
+fluent-wvr = { path = "../fluent-wvr" }
+common-core = { path = "../common-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+internment = { workspace = true, features = ["arc", "serde"] }
+bon = { workspace = true }
+rusqlite = { workspace = true, optional = true }
+hnsw_rs = { workspace = true, optional = true }
+anndists = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+fluent-wvr-testutil = { path = "../fluent-wvr-testutil" }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

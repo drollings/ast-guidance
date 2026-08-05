@@ -2,6 +2,64 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+// The `CapabilitySet` installed for the current async task.
+//
+// This is the canonical home of the capability-gating task-local. It lives
+// here (rather than in a consumer crate) so that both `fluent-concurrency`
+// (which propagates capabilities through `Scope`/`Zone` spawn boundaries)
+// and `fluent-db` (whose `DbCapability` must gate its operations) can read
+// the *same* variable without a cyclic dependency between the two crates.
+//
+// - `fluent-concurrency::scope::CURRENT_CAPS` is a re-export of this static.
+// - `fluent-concurrency::io::check_capability` re-exports the check below.
+//
+// `tokio::task_local!` expands to a `const`-like static; see `CapabilitySet`
+// for the type-map backing it.
+tokio::task_local! {
+    pub static CURRENT_CAPS: CapabilitySet;
+}
+
+/// Why a capability request was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapabilityError {
+    /// The capability was not present in the current task-local `CapabilitySet`.
+    Missing { name: &'static str },
+    /// The capability is present, but the underlying resource is exhausted.
+    Exhausted { name: &'static str, detail: String },
+}
+
+impl std::fmt::Display for CapabilityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing { name } => write!(f, "missing capability: {name}"),
+            Self::Exhausted { name, detail } => {
+                write!(f, "capability exhausted: {name} — {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CapabilityError {}
+
+impl From<CapabilityError> for std::io::Error {
+    fn from(err: CapabilityError) -> Self {
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, err)
+    }
+}
+
+/// Validates that the current task-local `CapabilitySet` contains the requested
+/// capability. Returns `Err(PermissionDenied)` if the capability is absent.
+pub fn check_capability<C: Capability>(cap: &C) -> Result<(), std::io::Error> {
+    let present = CURRENT_CAPS
+        .try_with(|caps| caps.get::<C>().is_some())
+        .unwrap_or(false);
+    if present {
+        Ok(())
+    } else {
+        Err(CapabilityError::Missing { name: cap.name() }.into())
+    }
+}
+
 /// A capability token that can be placed in a `CapabilitySet` to gate access
 /// to resources (network, filesystem, database).
 ///
@@ -175,5 +233,35 @@ mod tests {
         caps = caps.with(NetCapability);
         assert!(!caps.is_empty());
         assert_eq!(caps.len(), 1);
+    }
+
+    #[test]
+    fn capability_error_missing_display_and_io_kind() {
+        let err = CapabilityError::Missing { name: "db" };
+        assert_eq!(err.to_string(), "missing capability: db");
+        let io_err: std::io::Error = err.into();
+        assert_eq!(io_err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(io_err.to_string().contains("missing capability: db"));
+    }
+
+    #[tokio::test]
+    async fn check_capability_gates_on_task_local() {
+        let cap = NetCapability;
+        // Outside a CURRENT_CAPS scope: denied.
+        assert!(check_capability(&cap).is_err());
+        // Inside a scope that contains the capability: allowed.
+        let result = CURRENT_CAPS
+            .scope(CapabilitySet::new().with(NetCapability), async {
+                check_capability(&cap)
+            })
+            .await;
+        assert!(result.is_ok());
+        // Inside a scope that lacks it: denied with PermissionDenied.
+        let result = CURRENT_CAPS
+            .scope(CapabilitySet::new(), async { check_capability(&cap) })
+            .await
+            .unwrap_err();
+        assert_eq!(result.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(result.to_string().contains("missing"));
     }
 }

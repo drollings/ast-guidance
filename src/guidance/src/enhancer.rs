@@ -1,6 +1,6 @@
-use fluent_types::GuidanceDoc;
 use fluent_llm::client::LlmClient;
 use fluent_llm::ChatMessage;
+use fluent_types::GuidanceDoc;
 use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;

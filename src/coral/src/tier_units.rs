@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use fluent_wvr::prelude::*;
 use fluent_llm::client::{is_malformed_response, ChatBackend, LlmClient};
 use fluent_llm::LlmConfig;
 use fluent_llm::LlmRequestQueue;
+use fluent_wvr::prelude::*;
 use internment::ArcIntern;
 
 use crate::cache_l1::{CacheTier, RoutingResult};

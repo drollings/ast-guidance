@@ -1,9 +1,11 @@
-use std::path::PathBuf;
-use std::sync::{Arc, LazyLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use fluent_concurrency::pool::{global_pool_config, ResultPool};
 use fluent_concurrency::runtime::tokio::TokioRuntime;
 use fluent_concurrency::thread_resource::with_tlr;
+use fluent_db::wvr::{DbWorkUnit, StoreUnitOp};
+use fluent_wvr::{WorkContext, WorkError, WorkOutput, WorkUnit};
 
 use crate::ast_parser::AstParser;
 use crate::sync_engine::{GenConfig, SyncEngine, SyncEngineError};
@@ -54,6 +56,48 @@ pub static AST_POOL: LazyLock<Arc<ResultPool<AstGenPayload, GuidanceDoc, SyncEng
         ))
     });
 
+/// Shared `GuidanceDb` cache for the DB sync pool (M8.2).
+///
+/// The first `DbSyncPayload` to reach `DB_POOL` opens the database once; later
+/// jobs at the same path reuse it, so the connection/schema lifecycle lives in
+/// `fluent-db`/`search-vector` rather than being hand-opened per job.
+static SHARED_DB: Mutex<Option<(PathBuf, Arc<GuidanceDb>)>> = Mutex::new(None);
+
+fn shared_guidance_db(path: &Path) -> Result<Arc<GuidanceDb>, String> {
+    let mut cache = SHARED_DB
+        .lock()
+        .map_err(|_| "shared guidance db lock poisoned".to_string())?;
+    if let Some((cached_path, db)) = cache.as_ref() {
+        if cached_path == path {
+            return Ok(Arc::clone(db));
+        }
+    }
+    let db = Arc::new(GuidanceDb::open(path).map_err(|e| e.to_string())?);
+    *cache = Some((path.to_path_buf(), Arc::clone(&db)));
+    Ok(db)
+}
+
+/// Build the `DbWorkUnit` that performs a guidance DB sync (M8.2).
+///
+/// The op runs on a dedicated blocking thread via `DbWorkUnit::execute`'s
+/// offload, so the `ResultPool` worker never blocks on the rusqlite work.
+/// The full `sync_from_dir` (SQL writes + HNSW rebuild) lives on
+/// `GuidanceDb`, so the generic op form is used over the shared db rather
+/// than a bare-connection `store_unit` op.
+fn db_sync_work_unit(job: DbSyncPayload) -> DbWorkUnit<StoreUnitOp> {
+    DbWorkUnit::builder()
+        .name("db.sync")
+        .op(Box::new(move |_ctx: &WorkContext| {
+            let db = shared_guidance_db(&job.db_path).map_err(WorkError::Execution)?;
+            let count = db
+                .sync_from_dir(&job.json_dir)
+                .map_err(|e| WorkError::Execution(e.to_string()))?;
+            WorkOutput::typed("synced guidance db", &count)
+                .map_err(|e| WorkError::Execution(e.to_string()))
+        }) as StoreUnitOp)
+        .build()
+}
+
 /// Shared database sync pool — serializes writes to avoid SQLite contention.
 pub static DB_POOL: LazyLock<Arc<ResultPool<DbSyncPayload, usize, String>>> = LazyLock::new(|| {
     Arc::new(ResultPool::new(
@@ -61,12 +105,11 @@ pub static DB_POOL: LazyLock<Arc<ResultPool<DbSyncPayload, usize, String>>> = La
         1,
         100,
         |job: DbSyncPayload| async move {
-            tokio::task::spawn_blocking(move || {
-                let db = GuidanceDb::open(&job.db_path).map_err(|e| e.to_string())?;
-                db.sync_from_dir(&job.json_dir).map_err(|e| e.to_string())
-            })
-            .await
-            .unwrap_or_else(|e| Err(e.to_string()))
+            let unit = db_sync_work_unit(job);
+            let output = unit
+                .execute(&WorkContext::default())
+                .map_err(|e| e.to_string())?;
+            output.data_take::<usize>().map_err(|e| e.to_string())
         },
     ))
 });

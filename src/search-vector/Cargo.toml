@@ -5,11 +5,10 @@ edition.workspace = true
 
 [dependencies]
 common-core = { path = "../common-core", features = ["sqlite"] }
+fluent-db = { path = "../db" }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-hnsw_rs = { workspace = true }
-anndists = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

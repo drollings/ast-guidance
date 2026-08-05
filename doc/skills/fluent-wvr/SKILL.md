@@ -1176,6 +1176,46 @@ impl Describable for WasmComponent {
 impl_component!(WasmComponent);
 ```
 
+### Implementation: database work-unit (`fluent-db::wvr::DbWorkUnit`)
+
+Synchronous database operations are not natively schedulable as `WorkUnit`s:
+`execute` MUST NOT block a tokio worker thread. `fluent-db` (the canonical
+database-access crate, `src/db/`) solves this with the `DbWorkUnit<F>`
+adapter — a `Component`/`WorkUnit` whose `execute` offloads the blocking
+rusqlite op off the executor via `tokio::task::block_in_place` (on a
+multi-thread runtime worker) or runs it directly (otherwise). It composes the
+`fluent-db` store shapes rather than touching a `Connection` itself:
+
+```rust
+use fluent_db::wvr::store_unit;
+use fluent_db::store::SqliteStore;
+use fluent_wvr::prelude::*;
+
+let store: Arc<SqliteStore> = Arc::new(SqliteStore::open(path)?);
+
+// `store_unit` wraps a `Fn(&Connection) -> Result<WorkOutput, DbError>` op;
+// `execute` offloads it and maps `DbError` → `WorkError::Execution`.
+let unit: Arc<dyn Component> = Arc::new(Instrumented::new(
+    store_unit(
+        store,
+        "db.sync",
+        |conn| {
+            let n = fluent_db::query::execute(conn, "UPDATE t SET seen = 1", [])?;
+            Ok(WorkOutput::ok_with_data("synced", serde_json::json!({ "rows": n })))
+        },
+    ),
+    "db.sync",
+));
+```
+
+`DbWorkUnit::builder()` (bon-style: `.name()`, `.op(...)`, `.depends()`,
+`.provides()`, `.default_timeout_ms()`) is the fully general form for ops that
+need to read `&WorkContext` or return arbitrary `WorkOutput`. Because the op
+runs on a blocking thread, the unit can be registered under a `Zone` for
+timeout/retry/dependency-cancellation without violating the purity contract —
+the `Zone`'s per-attempt budget applies to the offloaded task, and the
+executor is never starved.
+
 ### Orchestration — uniform loop
 
 The orchestrator sees a single `Arc<dyn Component>` handle regardless

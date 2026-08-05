@@ -5,9 +5,9 @@
 
 use std::path::Path;
 
+use fluent_llm::ChatMessage;
 use guidance_core::config::ProjectConfig;
 use guidance_core::sync::json_store::load_guidance;
-use fluent_llm::ChatMessage;
 
 /// Maximum total characters of diff context sent to the LLM.
 const TOTAL_CONTEXT_CAP: usize = 12_000;
@@ -315,8 +315,7 @@ pub fn generate_commit_message(
 
     // Use the direct HTTP path — avoids LlmClient's DefaultQueue which creates
     // a nested tokio runtime that panics when called from #[tokio::main].
-    let raw =
-        fluent_llm::chat_complete_http(api_url, &messages, model, None, None, debug, false)?;
+    let raw = fluent_llm::chat_complete_http(api_url, &messages, model, None, None, debug, false)?;
 
     // Parse bullet lines from the response — strip prefix, then re-add
     // uniformly so the output is consistent regardless of what the LLM used.

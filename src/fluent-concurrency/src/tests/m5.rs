@@ -1,3 +1,7 @@
+// Exercises the capability-gated I/O engines. The db tests use the legacy
+// string-map `DbCapability::query`/`execute` (deprecated in fluent-db) as the
+// behavior oracle.
+#![allow(deprecated)]
 use crate::io::db::DbCapability;
 use crate::io::fs::FsCapability;
 use crate::io::net::NetCapability;

@@ -24,9 +24,9 @@ use std::sync::Arc;
 use common_core::metrics::LatencyHistogram;
 use fluent_concurrency::pool::Limiter;
 use fluent_concurrency::zone::{Zone, ZoneEvent};
+use fluent_llm::client::ChatBackend;
 use fluent_wvr::prelude::*;
 use fluent_wvr::Runtime;
-use fluent_llm::client::ChatBackend;
 use serde::Serialize;
 
 use crate::charts::compile::{compile_chart_stages, CompiledTarget};

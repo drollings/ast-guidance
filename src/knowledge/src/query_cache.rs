@@ -1,6 +1,12 @@
+//! TTL/LRU query cache delegating to `fluent_db::cache::TtlCache` (D7).
+//!
+//! The eviction/expiry logic and `query_cache` table now live in `fluent-db`;
+//! this module keeps the knowledge-specific lowercase-`fnv1a64` key
+//! derivation and the domain `QueryCache`/`Entry` types.
+
 use common_core::hash::fnv1a64;
-use common_core::time::now_secs;
-use rusqlite::{params, Connection};
+use fluent_db::cache::TtlCache;
+use fluent_db::error::DbError;
 use std::path::Path;
 
 #[derive(Debug)]
@@ -11,14 +17,19 @@ pub struct Entry {
     pub ttl_seconds: u64,
 }
 
+/// Knowledge-specific key derivation: lowercase the query, then hash with
+/// `fnv1a64` and hex-encode.
+fn query_key(query: &str) -> String {
+    let hash = fnv1a64(query.to_lowercase().as_bytes());
+    format!("{hash:016x}")
+}
+
 pub struct QueryCache {
-    db: Connection,
-    default_ttl_seconds: u64,
-    max_entries: usize,
+    inner: TtlCache,
 }
 
 impl QueryCache {
-    pub fn new(db_path: &Path, default_ttl_seconds: u64) -> rusqlite::Result<Self> {
+    pub fn new(db_path: &Path, default_ttl_seconds: u64) -> Result<Self, DbError> {
         Self::with_max_entries(db_path, default_ttl_seconds, 4096)
     }
 
@@ -26,137 +37,43 @@ impl QueryCache {
         db_path: &Path,
         default_ttl_seconds: u64,
         max_entries: usize,
-    ) -> rusqlite::Result<Self> {
-        let db = common_core::sqlite::open_wal(db_path)?;
-        db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS query_cache (
-                key TEXT PRIMARY KEY,
-                result_json TEXT NOT NULL,
-                timestamp INTEGER NOT NULL,
-                ttl_seconds INTEGER NOT NULL
-            )",
-        )?;
-        let cache = Self {
-            db,
-            default_ttl_seconds,
-            max_entries,
-        };
-        cache.evict_expired()?;
-        Ok(cache)
-    }
-
-    pub fn new_in_memory(default_ttl_seconds: u64) -> rusqlite::Result<Self> {
-        let db = common_core::sqlite::open_in_memory()?;
-        db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS query_cache (
-                key TEXT PRIMARY KEY,
-                result_json TEXT NOT NULL,
-                timestamp INTEGER NOT NULL,
-                ttl_seconds INTEGER NOT NULL
-            )",
-        )?;
+    ) -> Result<Self, DbError> {
         Ok(Self {
-            db,
-            default_ttl_seconds,
-            max_entries: 4096,
+            inner: TtlCache::open_with_key(db_path, default_ttl_seconds, max_entries, query_key)?,
         })
     }
 
-    fn query_key(query: &str) -> String {
-        let hash = fnv1a64(query.to_lowercase().as_bytes());
-        format!("{hash:016x}")
+    pub fn new_in_memory(default_ttl_seconds: u64) -> Result<Self, DbError> {
+        Ok(Self {
+            inner: TtlCache::open_in_memory_with_key(default_ttl_seconds, query_key)?,
+        })
     }
 
-    pub fn get(&self, query: &str) -> rusqlite::Result<Option<Entry>> {
-        let key = Self::query_key(query);
-        let mut stmt = self.db.prepare(
-            "SELECT key, result_json, timestamp, ttl_seconds FROM query_cache WHERE key = ?1",
-        )?;
-        let result = stmt.query_row(params![key], |row| {
-            Ok(Entry {
-                query: row.get(0)?,
-                result_summary: row.get(1)?,
-                timestamp: row.get(2)?,
-                ttl_seconds: row.get(3)?,
-            })
-        });
-        match result {
-            Ok(entry) => {
-                let now = now_secs();
-                // TTL=0 means always expired; otherwise check timestamp
-                if entry.ttl_seconds == 0 || now > entry.timestamp + entry.ttl_seconds {
-                    // Expired — remove it
-                    self.db
-                        .execute("DELETE FROM query_cache WHERE key = ?1", params![key])?;
-                    return Ok(None);
-                }
-                Ok(Some(entry))
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e),
-        }
+    pub fn get(&self, query: &str) -> Result<Option<Entry>, DbError> {
+        Ok(self.inner.get(query)?.map(|e| Entry {
+            query: e.key,
+            result_summary: e.result_summary,
+            timestamp: e.timestamp,
+            ttl_seconds: e.ttl_seconds,
+        }))
     }
 
-    pub fn put(&self, query: &str, result: &str) -> rusqlite::Result<()> {
-        let key = Self::query_key(query);
-        let now = now_secs();
-        self.db.execute(
-            "INSERT OR REPLACE INTO query_cache (key, result_json, timestamp, ttl_seconds) VALUES (?1, ?2, ?3, ?4)",
-            params![key, result, now, self.default_ttl_seconds],
-        )?;
-
-        // Evict if over capacity
-        self.evict_lru()?;
-
-        Ok(())
+    pub fn put(&self, query: &str, result: &str) -> Result<(), DbError> {
+        self.inner.put(query, result)
     }
 
-    /// Remove all expired entries (TTL=0 or timestamp+ttl < now).
-    pub fn evict_expired(&self) -> rusqlite::Result<usize> {
-        let now = now_secs();
-        let count = self.db.execute(
-            "DELETE FROM query_cache WHERE ttl_seconds = 0 OR ?1 > timestamp + ttl_seconds",
-            params![now],
-        )?;
-        Ok(count)
+    /// Remove all expired entries. Returns the number removed.
+    pub fn evict_expired(&self) -> Result<usize, DbError> {
+        self.inner.evict_expired()
     }
 
-    /// Evict oldest entries when over capacity (LRU by timestamp).
-    fn evict_lru(&self) -> rusqlite::Result<()> {
-        let count: usize = self
-            .db
-            .query_row("SELECT COUNT(*) FROM query_cache", [], |row| row.get(0))?;
-
-        if count > self.max_entries {
-            let excess = count - self.max_entries;
-            self.db.execute(
-                "DELETE FROM query_cache WHERE key IN (
-                    SELECT key FROM query_cache ORDER BY timestamp ASC LIMIT ?1
-                )",
-                params![excess],
-            )?;
-        }
-        Ok(())
+    /// Remove every entry. Returns the number removed.
+    pub fn clear(&self) -> Result<usize, DbError> {
+        self.inner.clear()
     }
 
-    pub fn clear(&self) -> rusqlite::Result<()> {
-        self.db.execute("DELETE FROM query_cache", [])?;
-        Ok(())
-    }
-
-    pub fn stats(&self) -> rusqlite::Result<(usize, u64, usize)> {
-        let count: usize = self
-            .db
-            .query_row("SELECT COUNT(*) FROM query_cache", [], |row| row.get(0))?;
-        let expired: usize = {
-            let now = now_secs();
-            self.db.query_row(
-                "SELECT COUNT(*) FROM query_cache WHERE ?1 > timestamp + ttl_seconds",
-                params![now],
-                |row| row.get(0),
-            )?
-        };
-        Ok((count, self.default_ttl_seconds, expired))
+    pub fn stats(&self) -> Result<(usize, u64, usize), DbError> {
+        self.inner.stats()
     }
 }
 

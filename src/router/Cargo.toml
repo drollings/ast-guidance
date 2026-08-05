@@ -10,6 +10,7 @@ common-core = { path = "../common-core", features = ["sqlite"] }
 fluent-types = { path = "../types" }
 fluent-llm = { path = "../llm" }
 fluent-dag = { path = "../dag" }
+fluent-db = { path = "../db" }
 fluent-wvr-testutil = { path = "../fluent-wvr-testutil" }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -30,7 +31,6 @@ http = { workspace = true }
 bytes = { workspace = true }
 rusqlite = { workspace = true }
 minijinja = { workspace = true }
-hnsw_rs = { workspace = true }
 search-vector = { path = "../search-vector" }
 
 [dev-dependencies]

@@ -7,9 +7,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use common_core::config::load_json_or_default;
-use fluent_wvr::prelude::Component;
 use fluent_llm::client::ChatBackend;
 use fluent_llm::{LlmClient, LlmConfig};
+use fluent_wvr::prelude::Component;
 
 use super::{default_true, RejectPatterns, RouterConfig};
 use crate::pipeline::PipelineOrchestrator;

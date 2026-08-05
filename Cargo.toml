@@ -23,6 +23,7 @@ members = [
     "src/router",
     "src/bin/coral-router",
     "src/bin/yamake-coral",
+    "src/db",
 ]
 
 [workspace.package]

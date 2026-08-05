@@ -10,16 +10,8 @@ pub enum CacheError {
     PersistFailed(String),
     #[error("invalid cache capacity: {0}")]
     InvalidCapacity(usize),
-    #[error("database error: {0}")]
-    Database(#[from] common_core::error::SqliteError),
     #[error("embedding error: {0}")]
     Embedding(String),
-}
-
-impl From<rusqlite::Error> for CacheError {
-    fn from(e: rusqlite::Error) -> Self {
-        CacheError::Database(common_core::error::SqliteError(e))
-    }
 }
 
 #[cfg(test)]

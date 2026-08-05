@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use clap::Parser;
 use common_core::config::load_json_or_default;
+use fluent_llm::client::ChatBackend;
+use fluent_llm::{create_embedding_provider, EmbeddingProvider, LlmClient, LlmConfig};
 use fluent_router::charts::store::ChartStore;
 use fluent_router::config::{
     detect_unimplemented_features, log_unimplemented_features, validate_no_self_routing,
@@ -15,8 +17,6 @@ use fluent_router::server::RouterServer;
 use fluent_router::testing::{
     load_transcript_file, transcript_provider_from_entries, MockDispatchContext,
 };
-use fluent_llm::client::ChatBackend;
-use fluent_llm::{create_embedding_provider, EmbeddingProvider, LlmClient, LlmConfig};
 
 #[derive(Parser)]
 #[command(

@@ -2,9 +2,9 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use common_core::sync::lock;
-use fluent_wvr::prelude::*;
 use fluent_llm::client::ChatBackend;
 use fluent_llm::{BatchEmbedding, ChatMessage, EmbeddingError, EmbeddingProvider, LlmError};
+use fluent_wvr::prelude::*;
 
 use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
 

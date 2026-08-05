@@ -27,7 +27,7 @@ pub mod work;
 pub mod prelude;
 pub mod wrapper;
 
-pub use capability::{Capability, CapabilitySet};
+pub use capability::{check_capability, Capability, CapabilityError, CapabilitySet, CURRENT_CAPS};
 pub use fluent_wvr_macros::{Describable, FieldAccess};
 pub use internment::ArcIntern;
 pub use metadata::MetadataValue;

@@ -28,4 +28,7 @@ mod m1;
 mod m2;
 mod m3;
 mod m4;
+// m5 exercises the capability-gated I/O engines (fs/net/db), which are
+// compiled only when the `db` feature is on.
+#[cfg(feature = "db")]
 mod m5;

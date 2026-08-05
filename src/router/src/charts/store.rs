@@ -10,9 +10,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
 
-use common_core::constants::HnswParams;
-use common_core::sqlite::{make_hnsw, open_wal};
 use common_core::sync::{lock_read, lock_write};
+use fluent_db::error::DbError;
+use fluent_db::hnsw::HnswIndex;
+use fluent_db::store::SqliteStore;
 use fluent_llm::EmbeddingProvider;
 use search_vector::math::{knn_brute_force, try_bytes_to_vec, vec_to_bytes};
 
@@ -66,11 +67,11 @@ struct ChartIndex {
     ids: Vec<String>,
     /// Flat `(chart, embedding)` list for the brute-force fallback.
     flat: Vec<(String, Vec<f32>)>,
-    /// Cosine HNSW graph. Written exactly once (in `build_index`) and
-    /// read-only thereafter; `invalidate_index` drops the whole
-    /// `ChartIndex` rather than mutating the graph, so a `RwLock` here would
-    /// be pure ceremony.
-    hnsw: hnsw_rs::hnsw::Hnsw<'static, f32, hnsw_rs::anndists::dist::DistCosine>,
+    /// Cosine HNSW graph (owned by `fluent_db::hnsw::HnswIndex`). Written
+    /// exactly once (in `build_index`) and read-only thereafter;
+    /// `invalidate_index` drops the whole `ChartIndex` rather than mutating
+    /// the graph, so a `RwLock` here would be pure ceremony.
+    hnsw: HnswIndex,
 }
 
 /// In-memory registry of validated charts, backed by JSON files on disk.
@@ -367,23 +368,31 @@ impl ChartStore {
             }
         }
 
-        let conn = open_wal(path).map_err(|e| ChartError::Index {
+        // The workflow_library persistence file is a `fluent_db::SqliteStore`
+        // (connection lifecycle, schema init); the in-memory retrieval graph
+        // is a `fluent_db::hnsw::HnswIndex`.
+        let store = SqliteStore::open(path).map_err(|e| ChartError::Index {
             reason: format!("open workflow_library db {}: {e}", path.display()),
         })?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS workflow_library (\
-             chart TEXT PRIMARY KEY, doc_text TEXT NOT NULL, embedding BLOB NOT NULL);",
-        )
-        .map_err(|e| ChartError::Index {
-            reason: format!("init workflow_library schema: {e}"),
-        })?;
+        store
+            .init_schema(
+                "CREATE TABLE IF NOT EXISTS workflow_library (\
+                 chart TEXT PRIMARY KEY, doc_text TEXT NOT NULL, embedding BLOB NOT NULL);",
+            )
+            .map_err(|e| ChartError::Index {
+                reason: format!("init workflow_library schema: {e}"),
+            })?;
 
         // All-or-nothing embed pass: compute every chart's vector first; only
         // when all succeed do we build the graph and persist.
         let mut entries: Vec<(String, String, Vec<f32>)> = Vec::with_capacity(self.len());
         for chart in self.charts_sorted() {
             let doc = chart_doc_text(&chart);
-            let embedding = match load_cached_embedding(&conn, &chart.name, &doc) {
+            let cached = store.with_conn(|conn| {
+                load_cached_embedding(conn, &chart.name, &doc)
+                    .map_err(|e| DbError::Other(e.to_string()))
+            });
+            let embedding = match cached {
                 Ok(Some(v)) => v,
                 Ok(None) => {
                     let v = embedder.embed(&doc).map_err(|e| ChartError::Index {
@@ -399,32 +408,41 @@ impl ChartStore {
                     }
                     v
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    return Err(ChartError::Index {
+                        reason: match e {
+                            DbError::Other(s) => s,
+                            other => other.to_string(),
+                        },
+                    })
+                }
             };
             entries.push((chart.name.clone(), doc, embedding));
         }
 
-        let p = HnswParams::default();
-        let hnsw = make_hnsw(&p, entries.len().max(p.initial_capacity));
+        let hnsw = HnswIndex::new();
         let mut ids: Vec<String> = Vec::with_capacity(entries.len());
         let mut flat: Vec<(String, Vec<f32>)> = Vec::with_capacity(entries.len());
         for (name, _doc, emb) in &entries {
-            hnsw.insert((emb.as_slice(), ids.len()));
+            // External index (`d_id`) aligns with the `ids` position; the
+            // node-id argument is not used for resolution here.
+            hnsw.insert(ids.len() as i64, emb);
             ids.push(name.clone());
             flat.push((name.clone(), emb.clone()));
         }
 
         // Persist (upsert) so a later boot reuses these vectors.
         for (name, doc, emb) in &entries {
-            conn.execute(
-                "INSERT INTO workflow_library (chart, doc_text, embedding) VALUES (?1, ?2, ?3) \
-                 ON CONFLICT(chart) DO UPDATE \
-                 SET doc_text = excluded.doc_text, embedding = excluded.embedding",
-                rusqlite::params![name, doc, vec_to_bytes(emb)],
-            )
-            .map_err(|e| ChartError::Index {
-                reason: format!("persist embedding for '{name}': {e}"),
-            })?;
+            store
+                .execute(
+                    "INSERT INTO workflow_library (chart, doc_text, embedding) VALUES (?1, ?2, ?3) \
+                     ON CONFLICT(chart) DO UPDATE \
+                     SET doc_text = excluded.doc_text, embedding = excluded.embedding",
+                    rusqlite::params![name, doc, vec_to_bytes(emb)],
+                )
+                .map_err(|e| ChartError::Index {
+                    reason: format!("persist embedding for '{name}': {e}"),
+                })?;
         }
 
         *lock_write(&self.built) = Some(Arc::new(ChartIndex {
@@ -462,19 +480,17 @@ impl ChartStore {
 
         // Cosine HNSW graph; brute force is the canonical fallback when the
         // graph is empty or returns nothing for this query.
-        let mut hits: Vec<(String, f32)> = {
-            index
-                .hnsw
-                .search(&query, k, k)
-                .into_iter()
-                .filter_map(|n| {
-                    index
-                        .ids
-                        .get(n.d_id)
-                        .map(|name| (name.clone(), (1.0 - n.distance).max(0.0)))
-                })
-                .collect()
-        };
+        let mut hits: Vec<(String, f32)> = index
+            .hnsw
+            .search(&query, k)
+            .into_iter()
+            .filter_map(|(d_id, distance)| {
+                index
+                    .ids
+                    .get(d_id)
+                    .map(|name| (name.clone(), (1.0 - distance).max(0.0)))
+            })
+            .collect();
         if hits.is_empty() {
             // Borrow the flat list — no full-candidate clone per query; only
             // the top-K names are materialized into `String`s below.

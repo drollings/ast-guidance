@@ -3,18 +3,25 @@ name = "fluent-concurrency"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["db"]
+# The `db` feature pulls in the pooled-database surface. It is default-on so
+# existing consumers keep working; `--no-default-features` builds the pool /
+# zone / scope / queue primitives with zero database weight (D11).
+db = ["dep:fluent-db", "fluent-db/sqlite"]
+
 [dependencies]
 tokio = { workspace = true }
 fluent-wvr = { path = "../fluent-wvr" }
 fluent-dag = { path = "../dag" }
+fluent-db = { path = "../db", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bon = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
-common-core = { path = "../common-core", features = ["sqlite"] }
-rusqlite = { workspace = true }
+common-core = { path = "../common-core" }
 fastrand = { workspace = true }
 internment = { workspace = true, features = ["arc", "serde"] }
 futures-util = { workspace = true }

@@ -6,9 +6,10 @@ description = "Pluggable memory tier for guidance — deterministic search with 
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-common-core = { path = "../common-core", features = ["sqlite"] }
+common-core = { path = "../common-core" }
 fluent-wvr = { path = "../fluent-wvr" }
 fluent-concurrency = { path = "../fluent-concurrency" }
+fluent-db = { path = "../db" }
 fluent-types = { path = "../types" }
 
 internment = { workspace = true }
@@ -17,7 +18,7 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-rusqlite = { workspace = true, features = ["bundled"] }
+rusqlite = { workspace = true }
 regex = { workspace = true }
 
 [dev-dependencies]
