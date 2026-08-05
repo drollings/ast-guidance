@@ -11,7 +11,7 @@
 //! hanging the test binary.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -25,13 +25,45 @@ use tokio::net::TcpListener;
 
 use crate::config::RouterConfig;
 use crate::routes::plan::PlanRoute;
-use crate::server::responses::ResponseBody;
+use crate::server::handler::ServerDeps;
+use crate::server::responses::{ResponseBody, ServerStats};
 use crate::server::serve_http;
 use crate::testing::mock::{MockDispatchContext, MockTranscriptEntry, TranscriptProvider};
 use fluent_llm::client::ChatBackend;
+use tracing_subscriber::layer::SubscriberExt;
 
 /// Upstream responder: given the parsed request body, produce an HTTP response.
 type UpstreamRespond = Arc<dyn Fn(&Value) -> hyper::Response<ResponseBody> + Send + Sync>;
+
+/// Assemble the `ServerDeps` request context for a test server. `pipelines`
+/// are prebuilt (usually with a `TranscriptProvider` classifier); optional
+/// mock/sessions/plan_route escalate through the ladder only when wired.
+fn test_deps(
+    pipelines: Arc<std::collections::HashMap<String, Arc<crate::pipeline::PipelineOrchestrator>>>,
+    config: &RouterConfig,
+    mock: Option<Arc<MockDispatchContext>>,
+    sessions: Option<Arc<crate::dag_session::SessionRegistry>>,
+    plan_route: Option<Arc<PlanRoute>>,
+    ladders: std::collections::HashMap<String, Arc<crate::dispatch::escalation::EscalationLadder>>,
+    context_cache: Option<Arc<dyn fluent_types::ContextCache>>,
+) -> ServerDeps {
+    ServerDeps {
+        pipelines,
+        routes: Arc::new(config.routes.clone()),
+        models: Arc::new(config.models.clone()),
+        stats: Arc::new(ServerStats::new()),
+        max_payload: config.server.max_payload,
+        classifier: None,
+        mock_dispatch: mock,
+        ledger: None,
+        cache: None,
+        plan_route,
+        sessions,
+        http_client: Arc::new(reqwest::Client::new()),
+        ladders,
+        context_cache,
+    }
+}
 
 /// A running router server bound to an ephemeral port.
 struct TestServer {
@@ -101,32 +133,16 @@ async fn spawn_test_server_with_sessions(
     let provider = TranscriptProvider::new(HashMap::new());
     let backend: Arc<dyn ChatBackend> = Arc::new(provider);
     let pipelines = Arc::new(config.build_all_pipelines_with_backend(Some(&backend)));
-    let routes = Arc::new(config.routes.clone());
-    let models = Arc::new(config.models.clone());
     let mock = mock.map(Arc::new);
-    let max_payload = config.server.max_payload;
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
 
+    let deps = test_deps(pipelines, &config, mock, sessions, None, HashMap::new(), None);
     let handle = tokio::spawn(async move {
-        if let Err(e) = serve_http(
-            listener,
-            pipelines,
-            routes,
-            models,
-            max_payload,
-            None,
-            mock,
-            None,
-            None,
-            None,
-            sessions,
-        )
-        .await
-        {
+        if let Err(e) = serve_http(listener, deps).await {
             tracing::error!(target: "router.test", error = %e, "test server failed");
         }
     });
@@ -200,31 +216,23 @@ async fn spawn_plan_server() -> TestServer {
     );
     let config = make_config("http://127.0.0.1:1", false, false, 5000, 2000);
     let pipelines = Arc::new(config.build_all_pipelines_with_backend(None));
-    let routes = Arc::new(config.routes.clone());
-    let models = Arc::new(config.models.clone());
-    let max_payload = config.server.max_payload;
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
 
+    let deps = test_deps(
+        pipelines,
+        &config,
+        None,
+        None,
+        Some(plan_route),
+        HashMap::new(),
+        None,
+    );
     let handle = tokio::spawn(async move {
-        if let Err(e) = serve_http(
-            listener,
-            pipelines,
-            routes,
-            models,
-            max_payload,
-            None,
-            None,
-            None,
-            None,
-            Some(plan_route),
-            None,
-        )
-        .await
-        {
+        if let Err(e) = serve_http(listener, deps).await {
             tracing::error!(target: "router.test", error = %e, "plan test server failed");
         }
     });
@@ -844,31 +852,23 @@ async fn spawn_server_with_plan_route(
     let provider = TranscriptProvider::new(HashMap::new());
     let backend: Arc<dyn ChatBackend> = Arc::new(provider);
     let pipelines = Arc::new(config.build_all_pipelines_with_backend(Some(&backend)));
-    let routes = Arc::new(config.routes.clone());
-    let models = Arc::new(config.models.clone());
-    let max_payload = config.server.max_payload;
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
 
+    let deps = test_deps(
+        pipelines,
+        &config,
+        None,
+        None,
+        Some(plan_route),
+        HashMap::new(),
+        None,
+    );
     let handle = tokio::spawn(async move {
-        if let Err(e) = serve_http(
-            listener,
-            pipelines,
-            routes,
-            models,
-            max_payload,
-            None,
-            None,
-            None,
-            None,
-            Some(plan_route),
-            None,
-        )
-        .await
-        {
+        if let Err(e) = serve_http(listener, deps).await {
             tracing::error!(target: "router.test", error = %e, "test server failed");
         }
     });
@@ -959,4 +959,225 @@ async fn successful_dispatch_distills_a_draft_chart() {
     );
     // And the draft is not selectable yet (excluded from selection).
     assert!(!store.charts_sorted().iter().any(|c| c.name == name));
+}
+
+// ── M3: escalation ladder — integration ───────────────────────────────────
+
+/// A capture writer + global subscriber that records every formatted tracing
+/// line into a process-wide buffer. Installed exactly once (`OnceLock`); the
+/// escalation tests assert on the `router.audit` lines it captures. No other
+/// test in this binary sets a global subscriber, so first-wins is safe.
+#[derive(Clone, Default)]
+struct AuditCapture(Arc<Mutex<Vec<String>>>);
+
+impl std::io::Write for AuditCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        lock(&self.0).push(String::from_utf8_lossy(buf).into_owned());
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl tracing_subscriber::fmt::MakeWriter<'_> for AuditCapture {
+    type Writer = Self;
+    fn make_writer(&self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+fn install_audit_capture() -> Arc<Mutex<Vec<String>>> {
+    static CAPTURE: std::sync::OnceLock<Arc<Mutex<Vec<String>>>> = std::sync::OnceLock::new();
+    CAPTURE
+        .get_or_init(|| {
+            let capture = Arc::new(Mutex::new(Vec::<String>::new()));
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(AuditCapture(capture.clone()))
+                    .with_ansi(false)
+                    .with_target(true),
+            );
+            let _ = tracing::subscriber::set_global_default(subscriber);
+            capture
+        })
+        .clone()
+}
+
+/// A config whose `fast` group carries an escalation ladder (turnover) pointed
+/// at `frontier_url`. The local `fast` model's endpoint is dead
+/// (`127.0.0.1:1`) so the local chain always exhausts into the ladder.
+fn escalated_config(frontier_url: &str) -> RouterConfig {
+    let value = json!({
+        "pipelines": {"default": {"deterministic_prefilter": true, "classifier": true}},
+        "models": {"fast": {
+            "endpoint": "http://127.0.0.1:1",
+            "name": "fast",
+            "intelligence": 1,
+            "cost_input": 0.000001,
+            "cost_output": 0.000006,
+            "cost_cached_read": 0.0000004,
+            "speed": 10,
+            "total_timeout_ms": 2000,
+            "idle_timeout_ms": 1000,
+            "stream": false,
+            "retry_count": 0,
+            "retry_base_interval_s": 1
+        }},
+        "model_groups": {"fast": {
+            "models": ["fast"],
+            "escalation": {
+                "modes": ["turnover"],
+                "frontier": {"endpoint": frontier_url, "model": "claude"}
+            }
+        }},
+        "routes": {"fast": {"group": "fast", "pipelines": ["default"]}},
+        "default_route": "fast"
+    });
+    serde_json::from_value(value).expect("valid escalated test config")
+}
+
+/// Spawn a server from prebuilt `ServerDeps` (escalation tests need ladders
+/// and/or a context cache that `spawn_test_server` does not wire).
+async fn spawn_test_server_with_deps(deps: ServerDeps) -> TestServer {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let handle = tokio::spawn(async move {
+        if let Err(e) = serve_http(listener, deps).await {
+            tracing::error!(target: "router.test", error = %e, "test server failed");
+        }
+    });
+    TestServer { addr, handle }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn escalation_ladder_responds_after_local_chain_fails() {
+    let capture = install_audit_capture();
+    lock(&capture).clear();
+
+    let upstream = spawn_mock_upstream(Arc::new(|_req: &Value| {
+        let body = json!({
+            "id": "cmpl-escalated",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "claude",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "frontier rescued the request"}
+            }],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        });
+        let s = serde_json::to_string(&body).expect("serialize");
+        hyper::Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(s)).boxed_unsync())
+            .expect("build response")
+    }))
+    .await;
+
+    let config = escalated_config(&upstream);
+    let http_client = reqwest::Client::new();
+    let ladders = config.build_escalation_ladders(&http_client);
+    assert_eq!(ladders.len(), 1, "one ladder for the fast group");
+
+    let provider = TranscriptProvider::new(HashMap::new());
+    let backend: Arc<dyn ChatBackend> = Arc::new(provider);
+    let pipelines = Arc::new(config.build_all_pipelines_with_backend(Some(&backend)));
+    let deps = test_deps(pipelines, &config, None, None, None, ladders, None);
+    let server = spawn_test_server_with_deps(deps).await;
+
+    let resp = post_chat(
+        &server.base_url(),
+        json!({
+            "model": "fast",
+            "messages": [{"role": "user", "content": "what is the answer?"}]
+        }),
+        8000,
+    )
+    .await
+    .expect("chat completion");
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "frontier rescued the request"
+    );
+
+    // Every escalation interaction wrote a `kind = "escalation"` audit record
+    // with the mode and acceptance — captured by the global subscriber.
+    let lines = lock(&capture).join("\n");
+    assert!(
+        lines.contains("router.audit"),
+        "audit stream must carry the record, got:\n{lines}"
+    );
+    assert!(
+        lines.contains("\"mode\":\"turnover\"") && lines.contains("\"accepted\":true"),
+        "escalation audit record must carry mode/accepted, got:\n{lines}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn context_cache_short_circuits_before_frontier_integration() {
+    let capture = install_audit_capture();
+    lock(&capture).clear();
+
+    // A context hit must be returned without any frontier contact, so the
+    // upstream is not even spawned — point it at a dead address.
+    let config = escalated_config("http://127.0.0.1:1");
+    let http_client = reqwest::Client::new();
+    let ladders = config.build_escalation_ladders(&http_client);
+
+    let provider = TranscriptProvider::new(HashMap::new());
+    let backend: Arc<dyn ChatBackend> = Arc::new(provider);
+    let pipelines = Arc::new(config.build_all_pipelines_with_backend(Some(&backend)));
+
+    struct CannedCache;
+    impl fluent_types::ContextCache for CannedCache {
+        fn lookup(&self, query: &str) -> Option<fluent_types::ContextHit> {
+            query
+                .eq_ignore_ascii_case("known fact")
+                .then(|| fluent_types::ContextHit {
+                    source: "test-cache".into(),
+                    content: "cached fact".into(),
+                    score: 0.99,
+                    metadata: None,
+                })
+        }
+    }
+    let context_cache: Arc<dyn fluent_types::ContextCache> = Arc::new(CannedCache);
+
+    let deps = test_deps(
+        pipelines,
+        &config,
+        None,
+        None,
+        None,
+        ladders,
+        Some(context_cache),
+    );
+    let server = spawn_test_server_with_deps(deps).await;
+
+    let resp = post_chat(
+        &server.base_url(),
+        json!({
+            "model": "fast",
+            "messages": [{"role": "user", "content": "known fact"}]
+        }),
+        8000,
+    )
+    .await
+    .expect("chat completion");
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(body["choices"][0]["message"]["content"], "cached fact");
+
+    let lines = lock(&capture).join("\n");
+    assert!(
+        lines.contains("\"mode\":\"context\"") && lines.contains("\"source\":\"test-cache\""),
+        "context short-circuit must be audited with the cache source, got:\n{lines}"
+    );
 }

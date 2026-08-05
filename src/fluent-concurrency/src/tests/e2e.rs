@@ -90,7 +90,12 @@ async fn test_e2e_zone_mixed_outcomes() {
         fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
             match self.outcome {
                 "ok" => Ok(WorkOutput::ok("done")),
+                // Permanent failure — non-retryable; the unit fails on the
+                // first attempt.
                 "fail" => Err(WorkError::Execution("failed".into())),
+                // Transient failure — retryable; keeps the unit pending under
+                // a retrying zone until a dependent provider's failure reaches it.
+                "dep_fail" => Err(WorkError::Dependency("awaiting shared".into())),
                 "panic" => panic!("intentional panic"),
                 _ => unreachable!(),
             }
@@ -110,7 +115,7 @@ async fn test_e2e_zone_mixed_outcomes() {
     .register_with_context(
         Arc::new(OutcomeUnit {
             name: "child1".into(),
-            outcome: "fail",
+            outcome: "dep_fail",
             deps: vec![shared.clone()],
             provides: vec![],
         }),
@@ -148,7 +153,7 @@ async fn test_e2e_panic_cascade_with_independent_neighbors() {
     ))
     .unwrap();
     zone.register_with_context(
-        Arc::new(StubComponent::fail("child").with_dep("shared")),
+        Arc::new(StubComponent::dep_fail("child").with_dep("shared")),
         WorkContext {
             max_retries: 10,
             ..WorkContext::default()
@@ -198,6 +203,10 @@ async fn test_e2e_cycle_resiliency() {
         name: String,
         deps: Vec<ArcIntern<str>>,
         provides: Vec<ArcIntern<str>>,
+        /// `false` → permanent `WorkError::Execution` (fails immediately);
+        /// `true` → transient `WorkError::Dependency` (retries, stays pending
+        /// until a dependent's failure cancels it).
+        retryable: bool,
     }
     impl WorkUnit for CycleUnit {
         fn name(&self) -> &str {
@@ -210,7 +219,11 @@ async fn test_e2e_cycle_resiliency() {
             &self.provides
         }
         fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-            Err(WorkError::Execution("cycle member".into()))
+            if self.retryable {
+                Err(WorkError::Dependency("cycle member".into()))
+            } else {
+                Err(WorkError::Execution("cycle member".into()))
+            }
         }
     }
     impl_component_for_test!(CycleUnit);
@@ -222,6 +235,7 @@ async fn test_e2e_cycle_resiliency() {
         name: "A".into(),
         deps: vec![b_provides.clone()],
         provides: vec![a_provides.clone()],
+        retryable: false,
     }))
     .unwrap();
     zone.register_with_context(
@@ -229,6 +243,7 @@ async fn test_e2e_cycle_resiliency() {
             name: "B".into(),
             deps: vec![a_provides.clone()],
             provides: vec![b_provides.clone()],
+            retryable: true,
         }),
         WorkContext {
             max_retries: 10,

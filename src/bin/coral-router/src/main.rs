@@ -6,10 +6,7 @@ use common_core::config::load_json_or_default;
 use fluent_llm::client::ChatBackend;
 use fluent_llm::{create_embedding_provider, EmbeddingProvider, LlmClient, LlmConfig};
 use fluent_router::charts::store::ChartStore;
-use fluent_router::config::{
-    detect_unimplemented_features, log_unimplemented_features, validate_no_self_routing,
-    RouterConfig,
-};
+use fluent_router::config::{validate_no_self_routing, RouterConfig};
 use fluent_router::hnsw::HnswIndexHandle;
 use fluent_router::logging::init_router_logging;
 use fluent_router::routes::plan::PlanRoute;
@@ -58,15 +55,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     let mut config: RouterConfig = load_json_or_default(args.config.as_ref());
-
-    // Config-selected-but-unimplemented surfaces must be loud at startup.
-    // The typed `RouterConfig` drops unknown keys, so check the raw JSON.
-    let raw_config = std::fs::read_to_string(&args.config)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-    if let Some(raw) = raw_config {
-        log_unimplemented_features(&detect_unimplemented_features(&raw));
-    }
 
     // CLI overrides take priority over config file
     let bind_addr = match (args.host.as_deref(), args.port) {
@@ -169,7 +157,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (pipelines, None)
     };
 
-    let routes = config.routes.clone();
+    // M4.4: with a classification tree the `routes` view is derived from the
+    // tree's terminal nodes (plus the explicit flat map) so the server's
+    // model→pipeline resolution needs no structural change.
+    let routes = config.routes_view();
 
     let classifier_model_name = config.classifier_model.as_deref().unwrap_or("fast");
     let classifier = config
@@ -189,9 +180,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // to the plan route. A missing directory is tolerated (empty store).
     let plan_route = Arc::new(build_plan_route(&config));
 
-    let mut server =
-        RouterServer::new(pipelines, routes, config.models, &config.server, classifier)
-            .with_plan_route(plan_route);
+    // M3 escalation ladders: one per `model_groups[g].escalation` config.
+    let http_client = reqwest::Client::new();
+    let ladders = config.build_escalation_ladders(&http_client);
+
+    let mut server = RouterServer::new(pipelines, routes, config.models, &config.server, classifier)
+        .with_plan_route(plan_route)
+        .with_ladders(ladders);
 
     if let Some(ctx) = mock_dispatch {
         server = server.with_mock(ctx);

@@ -21,7 +21,7 @@ use std::sync::{Mutex, RwLock};
 
 use anndists::dist::DistCosine;
 use common_core::constants::HnswParams;
-use common_core::sync::lock;
+use common_core::sync::{lock, lock_read, lock_write};
 use hnsw_rs::hnsw::Hnsw;
 
 use crate::error::DbError;
@@ -56,10 +56,7 @@ impl HnswIndex {
     ///
     /// Lock order: `hnsw` (write) → `id_map`.
     pub fn insert(&self, node_id: i64, embedding: &[f32]) -> usize {
-        let mut guard = self
-            .hnsw
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = lock_write(&self.hnsw);
         let hnsw = guard.get_or_insert_with(|| {
             let p = HnswParams::default();
             common_core::sqlite::make_hnsw(&p, p.initial_capacity)
@@ -102,10 +99,7 @@ impl HnswIndex {
             }
         }
 
-        *self
-            .hnsw
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hnsw);
+        *lock_write(&self.hnsw) = Some(hnsw);
         *lock(&self.id_map) = id_map;
 
         Ok(count)
@@ -119,10 +113,7 @@ impl HnswIndex {
     /// the caller touches its connection, so the `hnsw → id_map → conn`
     /// ordering is preserved.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(usize, f32)> {
-        let guard = match self.hnsw.read() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        let guard = lock_read(&self.hnsw);
         let Some(hnsw) = guard.as_ref() else {
             return Vec::new();
         };
@@ -139,16 +130,12 @@ impl HnswIndex {
 
     /// Whether the index has been built (any `insert`/`rebuild_from` ran).
     pub fn is_built(&self) -> bool {
-        self.hnsw.read().is_ok_and(|g| g.is_some())
+        lock_read(&self.hnsw).is_some()
     }
 
     /// Number of points currently in the index.
     pub fn len(&self) -> usize {
-        self.hnsw
-            .read()
-            .ok()
-            .and_then(|g| g.as_ref().map(Hnsw::get_nb_point))
-            .unwrap_or(0)
+        lock_read(&self.hnsw).as_ref().map_or(0, Hnsw::get_nb_point)
     }
 
     /// Whether the index contains no points.
@@ -241,5 +228,25 @@ mod tests {
         idx.insert(9, &[1.0, 0.0]);
         assert_eq!(idx.id_map_snapshot(), vec![5, 9]);
         assert_eq!(idx.len(), 2);
+    }
+
+    #[test]
+    fn poisoned_hnsw_rwlock_still_serves_insert_and_search() {
+        // M2.2: the hnsw `RwLock` must recover from poison via
+        // `common_core::sync::lock_write` / `lock_read`. A panic while holding
+        // a write guard obtained via `.write().unwrap()` poisons the lock; a
+        // subsequent `insert`/`search` must still work.
+        let idx = HnswIndex::new();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = idx.hnsw.write().unwrap();
+            panic!("boom");
+        }));
+        assert!(panic.is_err(), "expected the closure to panic");
+        idx.insert(101, &[1.0, 0.0, 0.0]);
+        let nearest = idx.search(&[1.0, 0.1, 0.0], 1);
+        assert_eq!(nearest.len(), 1);
+        assert_eq!(idx.id_map_snapshot()[nearest[0].0], 101);
+        assert!(idx.is_built());
+        assert_eq!(idx.len(), 1);
     }
 }

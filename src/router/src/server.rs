@@ -15,6 +15,7 @@ use tokio::net::TcpListener;
 
 use crate::config::{ModelEntry, RouteRef, ServerConfig};
 use crate::dag_session::SessionRegistry;
+use crate::dispatch::escalation::EscalationLadder;
 use crate::ledger::ContentNodeLedger;
 use crate::pipeline::PipelineOrchestrator;
 use crate::routes::plan::PlanRoute;
@@ -35,6 +36,10 @@ pub struct RouterServer {
     plan_route: Option<Arc<PlanRoute>>,
     /// Per-`session_id` `DependencySession` registry (D6 canonical session).
     sessions: Option<Arc<SessionRegistry>>,
+    /// Per-model-group escalation ladders (M3).
+    ladders: HashMap<String, Arc<EscalationLadder>>,
+    /// Deterministic-fact cache consulted before escalating (M3).
+    context_cache: Option<Arc<dyn fluent_types::ContextCache>>,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
@@ -60,6 +65,8 @@ impl RouterServer {
             cache: None,
             plan_route: None,
             sessions: None,
+            ladders: HashMap::new(),
+            context_cache: None,
             depends: vec![],
             provides: vec![ArcIntern::from("http.endpoint")],
         }
@@ -92,6 +99,29 @@ impl RouterServer {
         self
     }
 
+    /// Attach the per-model-group escalation ladders (M3).
+    #[must_use]
+    pub fn with_ladders(mut self, ladders: HashMap<String, Arc<EscalationLadder>>) -> Self {
+        tracing::info!(
+            target: "router.server",
+            ladder_count = ladders.len(),
+            "escalation ladders attached",
+        );
+        self.ladders = ladders;
+        self
+    }
+
+    /// Attach the deterministic context cache consulted before escalating (M3).
+    #[must_use]
+    pub fn with_context_cache(mut self, context_cache: Arc<dyn fluent_types::ContextCache>) -> Self {
+        tracing::info!(
+            target: "router.server",
+            "context cache attached — escalation short-circuits on hits",
+        );
+        self.context_cache = Some(context_cache);
+        self
+    }
+
     #[must_use]
     pub fn with_mock(mut self, mock_dispatch: MockDispatchContext) -> Self {
         tracing::info!(
@@ -116,22 +146,35 @@ impl RouterServer {
             has_cache = self.cache.is_some(),
             has_plan_route = self.plan_route.is_some(),
             chart_count = chart_count,
+            ladder_count = self.ladders.len(),
             "serving HTTP"
         );
-        run_http(
-            Arc::new(self.pipelines.clone()),
-            Arc::new(self.routes.clone()),
-            Arc::new(self.models.clone()),
-            &self.bind_addr,
-            self.max_payload,
-            self.classifier.clone(),
-            self.mock_dispatch.clone(),
-            self.ledger.clone(),
-            self.cache.clone(),
-            self.plan_route.clone(),
-            self.sessions.clone(),
-        )
-        .await
+        let deps = handler::ServerDeps {
+            pipelines: Arc::new(self.pipelines.clone()),
+            routes: Arc::new(self.routes.clone()),
+            models: Arc::new(self.models.clone()),
+            stats: Arc::new(responses::ServerStats::new()),
+            max_payload: self.max_payload,
+            classifier: self.classifier.clone(),
+            mock_dispatch: self.mock_dispatch.clone(),
+            ledger: self.ledger.clone(),
+            cache: self.cache.clone(),
+            plan_route: self.plan_route.clone(),
+            sessions: self.sessions.clone(),
+            http_client: Arc::new(
+                reqwest::Client::builder()
+                    .connect_timeout(Duration::from_secs(10))
+                    .build()
+                    .map_err(|e| {
+                        crate::error::ServerError::Http(format!(
+                            "HTTP client build failed: {e}"
+                        ))
+                    })?,
+            ),
+            ladders: self.ladders.clone(),
+            context_cache: self.context_cache.clone(),
+        };
+        run_http(&self.bind_addr, deps).await
     }
 }
 
@@ -147,35 +190,28 @@ impl WorkUnit for RouterServer {
     }
 
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-        let pipelines = Arc::new(self.pipelines.clone());
-        let routes = Arc::new(self.routes.clone());
-        let models = Arc::new(self.models.clone());
         let bind_addr = self.bind_addr.clone();
         let max_payload = self.max_payload;
-        let classifier = self.classifier.clone();
-        let mock_dispatch = self.mock_dispatch.clone();
-        let ledger = self.ledger.clone();
-        let cache = self.cache.clone();
-        let plan_route = self.plan_route.clone();
-        let sessions = self.sessions.clone();
+        let deps = handler::ServerDeps {
+            pipelines: Arc::new(self.pipelines.clone()),
+            routes: Arc::new(self.routes.clone()),
+            models: Arc::new(self.models.clone()),
+            stats: Arc::new(responses::ServerStats::new()),
+            max_payload,
+            classifier: self.classifier.clone(),
+            mock_dispatch: self.mock_dispatch.clone(),
+            ledger: self.ledger.clone(),
+            cache: self.cache.clone(),
+            plan_route: self.plan_route.clone(),
+            sessions: self.sessions.clone(),
+            http_client: Arc::new(reqwest::Client::new()),
+            ladders: self.ladders.clone(),
+            context_cache: self.context_cache.clone(),
+        };
         let rt = ctx.rt.clone();
 
         let _handle = rt.spawn(Box::pin(async move {
-            if let Err(e) = run_http(
-                pipelines,
-                routes,
-                models,
-                &bind_addr,
-                max_payload,
-                classifier,
-                mock_dispatch,
-                ledger,
-                cache,
-                plan_route,
-                sessions,
-            )
-            .await
-            {
+            if let Err(e) = run_http(&bind_addr, deps).await {
                 tracing::error!(target: "router.server", error = %e, "HTTP server error");
             }
         }));
@@ -198,17 +234,8 @@ impl Describable for RouterServer {
 impl_component!(RouterServer);
 
 async fn run_http(
-    pipelines: Arc<HashMap<String, Arc<PipelineOrchestrator>>>,
-    routes: Arc<HashMap<String, RouteRef>>,
-    models: Arc<HashMap<String, ModelEntry>>,
     bind_addr: &str,
-    max_payload: usize,
-    classifier: Option<(String, ModelEntry)>,
-    mock_dispatch: Option<Arc<MockDispatchContext>>,
-    ledger: Option<Arc<ContentNodeLedger>>,
-    cache: Option<Arc<ResponseCache>>,
-    plan_route: Option<Arc<PlanRoute>>,
-    sessions: Option<Arc<SessionRegistry>>,
+    deps: handler::ServerDeps,
 ) -> Result<(), crate::error::ServerError> {
     let listener =
         TcpListener::bind(bind_addr)
@@ -220,20 +247,7 @@ async fn run_http(
 
     tracing::info!(target: "router.server", addr = %bind_addr, "HTTP server listening (hyper)");
 
-    serve_http(
-        listener,
-        pipelines,
-        routes,
-        models,
-        max_payload,
-        classifier,
-        mock_dispatch,
-        ledger,
-        cache,
-        plan_route,
-        sessions,
-    )
-    .await
+    serve_http(listener, deps).await
 }
 
 /// Accept loop over an already-bound listener. Public(crate) so integration
@@ -241,31 +255,9 @@ async fn run_http(
 /// a real server with no rebind race; production entry is `run_http`.
 pub(crate) async fn serve_http(
     listener: TcpListener,
-    pipelines: Arc<HashMap<String, Arc<PipelineOrchestrator>>>,
-    routes: Arc<HashMap<String, RouteRef>>,
-    models: Arc<HashMap<String, ModelEntry>>,
-    max_payload: usize,
-    classifier: Option<(String, ModelEntry)>,
-    mock_dispatch: Option<Arc<MockDispatchContext>>,
-    ledger: Option<Arc<ContentNodeLedger>>,
-    cache: Option<Arc<ResponseCache>>,
-    plan_route: Option<Arc<PlanRoute>>,
-    sessions: Option<Arc<SessionRegistry>>,
+    deps: handler::ServerDeps,
 ) -> Result<(), crate::error::ServerError> {
     use hyper_util::rt::TokioIo;
-
-    let stats = Arc::new(responses::ServerStats::new());
-    // Connect-timeout only on the shared client: a full `.timeout()` would
-    // abort streaming bodies mid-read. Total/idle enforcement is per-request
-    // in the dispatch backends (see `ChatBackend::complete`).
-    let http_client = Arc::new(
-        reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| {
-                crate::error::ServerError::Http(format!("HTTP client build failed: {e}"))
-            })?,
-    );
 
     loop {
         let (stream, _peer) = match listener.accept().await {
@@ -276,36 +268,13 @@ pub(crate) async fn serve_http(
             }
         };
 
-        let pipelines = pipelines.clone();
-        let routes = routes.clone();
-        let models = models.clone();
-        let stats = stats.clone();
-        let classifier = classifier.clone();
-        let mock_dispatch = mock_dispatch.clone();
-        let ledger = ledger.clone();
-        let cache = cache.clone();
-        let plan_route = plan_route.clone();
-        let sessions = sessions.clone();
-        let http_client = http_client.clone();
+        let deps = deps.clone();
 
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let service = hyper::service::service_fn(move |req| {
-                handler::handle_request(
-                    req,
-                    pipelines.clone(),
-                    routes.clone(),
-                    models.clone(),
-                    stats.clone(),
-                    max_payload,
-                    classifier.clone(),
-                    mock_dispatch.clone(),
-                    ledger.clone(),
-                    cache.clone(),
-                    plan_route.clone(),
-                    sessions.clone(),
-                    http_client.clone(),
-                )
+                let deps = deps.clone();
+                handler::handle_request(req, deps)
             });
 
             if let Err(e) = hyper::server::conn::http1::Builder::new()

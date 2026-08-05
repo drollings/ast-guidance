@@ -19,6 +19,22 @@ pub enum WorkError {
     Timeout { duration_ms: u64, unit: String },
 }
 
+impl WorkError {
+    /// Whether the error represents a transient condition worth retrying.
+    ///
+    /// `Execution` is a *permanent* failure — the unit ran and failed, so a
+    /// retry would burn backoff budget without a recovery signal. `Dependency`
+    /// (a prerequisite not yet satisfied) and `Timeout` (attempt budget
+    /// exhausted, e.g. by transient overload) are retryable.
+    ///
+    /// This is the canonical predicate for retry loops that drive
+    /// `WorkUnit::execute` (the `Zone` supervisor and any future caller);
+    /// `common_core::retry::retry_async` short-circuits on `false`.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, WorkError::Dependency(_) | WorkError::Timeout { .. })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkOutput {
     pub success: bool,
@@ -320,6 +336,20 @@ mod tests {
         let a = WorkError::Execution("boom".into());
         let b = WorkError::Execution("boom".into());
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn work_error_is_retryable_classification() {
+        // Execution is a permanent failure — never retry.
+        assert!(!WorkError::Execution("boom".into()).is_retryable());
+        // Dependency (prerequisite not yet satisfied) is transient — retry.
+        assert!(WorkError::Dependency("awaiting asset".into()).is_retryable());
+        // Timeout (budget exhausted under load) is transient — retry.
+        assert!(WorkError::Timeout {
+            duration_ms: 100,
+            unit: "u".into()
+        }
+        .is_retryable());
     }
 
     #[test]

@@ -4,13 +4,16 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use fluent_wvr::component_downcast_ref;
 use fluent_wvr::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use common_core::constants::default_true;
 
 use crate::config::ModelEntry;
-use crate::pipeline_types::{PipelineStage, StageDecision, StageMetadata, StageVerdict};
+use crate::pipeline_types::{
+    PipelineStage, StageDecision, StageDecisionProducer, StageMetadata, StageVerdict,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingTarget {
@@ -124,11 +127,7 @@ impl PipelineOrchestrator {
         PipelineOrchestratorBuilder::default()
     }
 
-    fn build_stage_context(
-        base: &WorkContext,
-        current_request: &serde_json::Value,
-        _decisions: &[StageDecision],
-    ) -> WorkContext {
+    fn build_stage_context(base: &WorkContext, current_request: &serde_json::Value) -> WorkContext {
         let mut ctx = base.clone();
         ctx.structured
             .insert("request".into(), current_request.clone());
@@ -152,6 +151,14 @@ impl PipelineOrchestrator {
                             response_len = resp.len(),
                             "classifier direct response"
                         );
+                        crate::audit::emit(
+                            "route",
+                            serde_json::json!({
+                                "stage": "classifier",
+                                "verdict": "direct_response",
+                                "response_len": resp.len(),
+                            }),
+                        );
                         *classifier_response = Some(resp.to_string());
                     }
                     if let Some(rt) = metadata.routing_target() {
@@ -160,6 +167,16 @@ impl PipelineOrchestrator {
                             target_model = %rt.model,
                             target_url = %rt.url,
                             "classifier set routing target"
+                        );
+                        crate::audit::emit(
+                            "route",
+                            serde_json::json!({
+                                "stage": "classifier",
+                                "verdict": "passed",
+                                "target_route": rt.target_name,
+                                "target_model": rt.model,
+                                "target_url": rt.url,
+                            }),
                         );
                         *routing_target = Some(rt);
                     }
@@ -171,6 +188,14 @@ impl PipelineOrchestrator {
                     tracing::info!(target: "router.pipeline",
                         new_request_len = rewritten.len(),
                         "request rerouted"
+                    );
+                    crate::audit::emit(
+                        "route",
+                        serde_json::json!({
+                            "stage": stage_name,
+                            "verdict": "rerouted",
+                            "new_request_len": rewritten.len(),
+                        }),
                     );
                     // Boundary: the rewritten request arrives as a string
                     // (a re-serialized `RouterRequest`), so parse it back
@@ -185,6 +210,14 @@ impl PipelineOrchestrator {
                     stage = ?stage_name,
                     reason = %decision.reason,
                     "pipeline rejected request"
+                );
+                crate::audit::emit(
+                    "route",
+                    serde_json::json!({
+                        "stage": stage_name,
+                        "verdict": "rejected",
+                        "reason": decision.reason,
+                    }),
                 );
                 Some(WorkOutput::typed(
                     "rejected",
@@ -218,6 +251,20 @@ impl PipelineOrchestrator {
             }
         }
     }
+}
+
+/// Router-internal downcast to the typed decision producers (M5.4). The
+/// pipelines built by `config::RouterConfigBuilder` contain exactly
+/// `DeterministicPreFilter` and `ClassifierStage`; the `None` fallback keeps
+/// the orchestrator usable with arbitrary components (test stubs, pipeline
+/// refs), which then go through the `WorkOutput` channel unchanged.
+fn as_producer(stage: &dyn Component) -> Option<&dyn StageDecisionProducer> {
+    component_downcast_ref::<crate::stages::deterministic::DeterministicPreFilter>(stage)
+        .map(|s| s as &dyn StageDecisionProducer)
+        .or_else(|| {
+            component_downcast_ref::<crate::stages::classifier::ClassifierStage>(stage)
+                .map(|s| s as &dyn StageDecisionProducer)
+        })
 }
 
 #[derive(Default)]
@@ -262,17 +309,30 @@ impl WorkUnit for PipelineOrchestrator {
         let mut classifier_response: Option<String> = None;
 
         for stage in &self.stages {
-            let stage_ctx = Self::build_stage_context(ctx, &current_request, &decisions);
+            let stage_ctx = Self::build_stage_context(ctx, &current_request);
             let start = Instant::now();
 
             let stage_name_human = stage.name().to_string();
             tracing::debug!(target: "router.pipeline", stage = %stage_name_human, "stage entering");
 
-            match stage.execute(&stage_ctx) {
-                Ok(output) => {
-                    let mut decision: StageDecision = output
+            // M5.4: typed handoff. The known stages implement
+            // `StageDecisionProducer`, so their `StageDecision` is produced by
+            // a direct method call with the running decision accumulator
+            // passed by reference — no per-stage serialize→deserialize through
+            // `WorkOutput.data`. Arbitrary components (test stubs, pipeline
+            // refs) fall back to the `WorkOutput` channel unchanged.
+            let decision = if let Some(producer) = as_producer(stage.as_ref()) {
+                producer.evaluate(&stage_ctx, &decisions)
+            } else {
+                stage.execute(&stage_ctx).and_then(|output| {
+                    output
                         .data_take()
-                        .map_err(|e| WorkError::Execution(e.to_string()))?;
+                        .map_err(|e| WorkError::Execution(e.to_string()))
+                })
+            };
+
+            match decision {
+                Ok(mut decision) => {
                     let latency_ms = start.elapsed().as_millis() as u64;
                     decision.latency_ms = latency_ms;
                     let verdict = decision.verdict.clone();

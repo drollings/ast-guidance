@@ -1,11 +1,33 @@
 //! Pipeline decision types — structured decision records emitted by each
 //! stage during request processing.
 
+use fluent_wvr::{WorkContext, WorkError};
 use serde::{Deserialize, Serialize};
 
 use crate::config::FilterAction;
 use crate::filters::RegexMatch;
 use crate::pipeline::RoutingTarget;
+
+/// A pipeline stage that emits a typed `StageDecision` (M5.4).
+///
+/// The `PipelineOrchestrator` calls `evaluate` directly, passing the running
+/// decision accumulator (`prior`) by reference — a typed handoff that removes
+/// the per-stage `StageDecision` serialize→deserialize through
+/// `WorkOutput.data`. The `WorkUnit` path (`execute`) remains for composition
+/// (wrappers, dependency graph, tests) and serializes the decision into
+/// `WorkOutput.data` exactly as before.
+pub trait StageDecisionProducer: Send + Sync + 'static {
+    /// The pipeline stage this producer emits decisions for.
+    fn stage_kind(&self) -> PipelineStage;
+
+    /// Produce the typed decision for `ctx`, given the decisions already
+    /// accumulated by earlier stages (`prior`).
+    fn evaluate(
+        &self,
+        ctx: &WorkContext,
+        prior: &[StageDecision],
+    ) -> Result<StageDecision, WorkError>;
+}
 
 /// Emitted by every pipeline stage. Flows through tracing spans.
 #[derive(Debug, Clone, Serialize, Deserialize)]

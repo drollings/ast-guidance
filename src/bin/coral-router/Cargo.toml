@@ -9,6 +9,7 @@ fluent-concurrency = { path = "../../fluent-concurrency" }
 common-core = { path = "../../common-core" }
 fluent-llm = { path = "../../llm" }
 clap = { workspace = true, features = ["derive"] }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

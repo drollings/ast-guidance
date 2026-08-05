@@ -4,8 +4,7 @@
 //!
 //! Resolution is deliberately split into **two phases**, and the boundary
 //! between them is load-bearing. The two phases are NOT duplicates of each
-//! other, and `plan_from_set` is NOT a duplicate of
-//! `DependencyGraph::topo_sort`:
+//! other:
 //!
 //! 1. **Phase 1 — narrowing (semantic selection).** `resolve_narrow_one`
 //!    decides *which* targets participate in the plan. Targets are
@@ -19,18 +18,20 @@
 //!
 //! 2. **Phase 2 — pure Kahn's algorithm.** Once narrowing has reduced the
 //!    ambiguous, multi-provider capability graph to a clean selection,
-//!    `plan_from_set` topologically orders that *already-selected* set. The
-//!    Kahn sort here is intentionally simple and self-contained: it is the
-//!    payoff of the narrowing step, not a re-implementation of graph
-//!    algorithms that could be delegated.
+//!    `plan_from_set` topologically orders that *already-selected* set. It
+//!    shares the Kahn loop with `DependencyGraph::topo_sort_inner` via
+//!    `crate::dep_graph::kahn_sort` — only the edge derivation differs (this
+//!    resolver resolves `depends` capability bits to their providers through
+//!    the registry, then restricts to the selected set).
 //!
-//! `plan_from_set` cannot delegate to `DependencyGraph::topo_sort` because
-//! (a) target ids and capability ids are two `usize` index spaces that
-//! `DependencyGraph<K>`'s single key type would alias, and (b) it must order
-//! exactly the selected set with no re-expansion — re-expanding would
-//! re-introduce rejected (narrowing-loser) targets through uncontested
-//! capabilities. Do not "unify" the two phases or route `plan_from_set`
-//! through `DependencyGraph` without addressing both constraints.
+//! `plan_from_set` cannot delegate wholesale to `DependencyGraph::topo_sort`
+//! because (a) target ids and capability ids are two `usize` index spaces
+//! that `DependencyGraph<K>`'s single key type would alias inside a single
+//! registered graph, and (b) it must order exactly the selected set with no
+//! re-expansion — re-expanding would re-introduce rejected (narrowing-loser)
+//! targets through uncontested capabilities. The shared `kahn_sort` core
+//! sidesteps both: it orders only the nodes handed to it, and each caller
+//! builds its own `in_degree`/`adjacency` from its own source of truth.
 //!
 //! See also: `REVIEW_20260804_PROGRESS.md` §3.3 for the design rationale.
 
@@ -359,13 +360,13 @@ impl<'a> DependencyResolver<'a> {
     /// Phase 2 of the two-phase design (see the module doc comment): a pure
     /// Kahn's topological sort over the already-selected `needed` set.
     ///
-    /// This is intentionally a self-contained implementation and is NOT a
-    /// duplicate of `DependencyGraph::topo_sort_inner`: it orders a
-    /// *selection result* rather than a registered graph, it operates in a
-    /// dual index-space (target ids vs. capability ids both share `usize`),
-    /// and it must not re-expand the set — narrowing losers in `rejected`
-    /// must stay out. Do not refactor this to delegate to `DependencyGraph`
-    /// without resolving those two constraints.
+    /// The Kahn loop itself is shared with `DependencyGraph::topo_sort_inner`
+    /// via `crate::dep_graph::kahn_sort`; only the edge derivation differs
+    /// (this method resolves a target's `depends` capability bits to their
+    /// providers through the registry, then restricts to the already-selected
+    /// `needed` set). It must not re-expand the set — narrowing losers in
+    /// `rejected` stay out because `needed` is exactly the selection result,
+    /// and `kahn_sort` only ever orders the nodes passed to it.
     fn plan_from_set(&self, needed: &HashSet<usize>) -> Result<ExecutionPlan, ResolverError> {
         let mut in_degree: HashMap<usize, usize> = needed.iter().map(|&k| (k, 0)).collect();
         let mut adj: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -387,33 +388,9 @@ impl<'a> DependencyResolver<'a> {
                 }
             }
         }
-        let mut queue: Vec<usize> = in_degree
-            .iter()
-            .filter(|(_, &deg)| deg == 0)
-            .map(|(&k, _)| k)
-            .collect();
-        queue.sort_unstable();
-        let mut order = Vec::with_capacity(needed.len());
-        let mut head = 0;
-        while head < queue.len() {
-            let current = queue[head];
-            head += 1;
-            order.push(current);
-            if let Some(dependents) = adj.get(&current) {
-                for &dep in dependents {
-                    if let Some(deg) = in_degree.get_mut(&dep) {
-                        *deg -= 1;
-                        if *deg == 0 {
-                            queue.push(dep);
-                            queue[head..].sort_unstable();
-                        }
-                    }
-                }
-            }
-        }
-        if order.len() != needed.len() {
+        let Ok(order) = crate::dep_graph::kahn_sort(&mut in_degree, &adj, needed.len()) else {
             return Err(ResolverError::CircularDependency);
-        }
+        };
         let target_names = order
             .iter()
             .map(|&bit_idx| {

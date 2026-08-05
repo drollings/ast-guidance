@@ -4,11 +4,11 @@
 //! (decision D8 — replaces the old `FrontierMode` "four involvement modes"
 //! enum, which never matched the VISION ladder). Stages are tried in order
 //! (filter → question → team → turnover) after every local model in a
-//! `model_group` fails. The ladder *runtime* is forward track
-//! (ROADMAP_20260804_DRY §0.5); these types are the reconciled spec for the
-//! future dispatch loop, and the audit types it will write to.
+//! `model_group` fails. The ladder *runtime* lives in
+//! `crate::dispatch::escalation` (ROADMAP_20260805_REVIEW M3); this module
+//! owns the taxonomy plus the audit types it writes to.
 
-use crate::error::ServerError;
+use serde::{Deserialize, Serialize};
 
 /// A stage of the frontier escalation ladder.
 ///
@@ -17,7 +17,11 @@ use crate::error::ServerError;
 /// modes"). Stages escalate filter → question → team → turnover: the
 /// less-permissive stages are tried first so frontier calls are
 /// progressively more expensive, never all-or-nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `serde` is derived so a configured `model_groups[g].escalation.modes`
+/// list deserializes from config (ROADMAP_20260805_REVIEW M3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EscalationMode {
     /// Deterministic PII/anonymization rules strip sensitive content; the
     /// filtered query is sent as a one-shot prompt to frontier. Frontier
@@ -52,6 +56,11 @@ pub struct FrontierResult {
     pub audit_entry: AuditEntry,
 }
 
+/// The audit payload shape for one frontier interaction — the same fields the
+/// durable audit record carries (`payload`/`raw_response`/`trigger`/
+/// `timestamp`). `crate::dispatch::escalation` builds one per mode run and
+/// emits it via `crate::audit::emit` with `kind = "escalation"` plus the
+/// `mode`/`accepted` fields.
 #[derive(Debug, Clone)]
 pub struct AuditEntry {
     pub payload: String,
@@ -60,37 +69,22 @@ pub struct AuditEntry {
     pub timestamp: u64,
 }
 
-/// Execute a frontier interaction in the given escalation stage.
-/// Full implementation deferred until the escalation-ladder dispatch loop
-/// lands (forward track — ROADMAP_20260804_DRY §0.5).
-#[allow(clippy::unnecessary_wraps)]
-pub fn execute_frontier_mode(
-    _mode: EscalationMode,
-    _payload: &str,
-    _model_endpoint: &str,
-) -> Result<FrontierResult, ServerError> {
-    Err(ServerError::FrontierNotImplemented(
-        "frontier mode execution not yet implemented — requires agent wiring".into(),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn ladder_stages_all_defer_to_the_not_implemented_stub() {
-        for stage in [
-            EscalationMode::Filter,
-            EscalationMode::Question,
-            EscalationMode::Team,
-            EscalationMode::Turnover,
+    fn escalation_mode_serde_round_trips_snake_case() {
+        for (mode, json) in [
+            (EscalationMode::Filter, "\"filter\""),
+            (EscalationMode::Question, "\"question\""),
+            (EscalationMode::Team, "\"team\""),
+            (EscalationMode::Turnover, "\"turnover\""),
         ] {
-            let err = execute_frontier_mode(stage, "payload", "endpoint").unwrap_err();
-            assert!(
-                matches!(err, ServerError::FrontierNotImplemented(_)),
-                "stage {stage:?} must remain a forward-track stub"
-            );
+            let serialized = serde_json::to_string(&mode).unwrap();
+            assert_eq!(serialized, json);
+            let back: EscalationMode = serde_json::from_str(json).unwrap();
+            assert_eq!(back, mode);
         }
     }
 

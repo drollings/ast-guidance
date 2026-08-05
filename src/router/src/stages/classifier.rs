@@ -3,6 +3,14 @@
 //! returns either a direct response, a routing target, or a rejection.
 //! Configurable via `RoutingConfig` from the top-level coral-router config.
 //!
+//! When `RouterConfig.classification` is `Some`, the stage becomes a thin
+//! wrapper over the M4 classification-tree engine (`stages::tree`): the engine
+//! evaluates the nested tree recursively, auto-builds prompts from child keys
+//! and descriptions, enforces per-node coherence/safety thresholds, and emits a
+//! `StageDecision` per visited node plus a durable audit record. The flat path
+//! below no longer guesses route names from classifier `action`/`intent`
+//! strings (ROADMAP_20260805_REVIEW M4.5) — route selection is the tree's job.
+//!
 //! The LLM backend is injected as `Arc<dyn ChatBackend>` rather than a
 //! concrete `LlmClient`, so mock/stub backends can be injected for testing
 //! without duplicating the pipeline wiring.
@@ -19,9 +27,13 @@ use fluent_wvr::prelude::*;
 use crate::metrics::classify_error;
 
 use crate::config::{ClassifierOutput, RoutingConfig};
-use crate::pipeline_types::{PipelineStage, StageDecision, StageMetadata, StageVerdict};
+use crate::pipeline::RoutingTarget;
+use crate::pipeline_types::{
+    PipelineStage, StageDecision, StageDecisionProducer, StageMetadata, StageVerdict,
+};
 use crate::score_matrix::ScoreMatrix;
-use crate::stages::common::extract_user_message;
+use crate::stages::common::{coerce_float, coerce_string, coerce_u8, extract_user_message};
+use crate::stages::tree::ClassificationEngine;
 
 const DEFAULT_COMPLEXITY: u8 = 5;
 const COMPLEXITY_SCALE: f64 = 10.0;
@@ -31,102 +43,21 @@ const DEFAULT_COMPLETENESS: f64 = 0.5;
 /// with defaults, and coercing string-valued numbers back to numeric.
 /// This lets partial or slightly malformed responses (common from smaller LLMs)
 /// survive parsing instead of falling back to the default route.
+///
+/// The field-coercion lives in the shared `stages::common` helpers (the
+/// "surviving normalization" both this stage and the M4 tree engine use).
+/// Route-name guessing is gone — the classification tree replaces it
+/// (ROADMAP_20260805_REVIEW M4.5).
 fn sanitize_classifier_json(mut v: serde_json::Value) -> serde_json::Value {
-    let Some(obj) = v.as_object_mut() else {
-        return v;
-    };
-
-    /// Ensure a floating-point field exists; coerce from string if needed.
-    fn ensure_float(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str, default: f64) {
-        match obj.get(key) {
-            None => {
-                let n = serde_json::Number::from_f64(default)
-                    .unwrap_or_else(|| serde_json::Number::from_f64(0.0).unwrap());
-                obj.insert(key.into(), serde_json::Value::Number(n));
-            }
-            Some(serde_json::Value::String(s)) => {
-                if let Ok(n) = s.parse::<f64>() {
-                    if let Some(num) = serde_json::Number::from_f64(n) {
-                        obj[key] = serde_json::Value::Number(num);
-                    }
-                }
-            }
-            _ => {}
-        }
+    if let Some(obj) = v.as_object_mut() {
+        coerce_float(obj, "coherence_score", 1.0);
+        coerce_float(obj, "safety_score", 1.0);
+        coerce_float(obj, "completeness", 0.5);
+        coerce_float(obj, "risk", 0.0);
+        coerce_u8(obj, "complexity", 5);
+        coerce_string(obj, "action", "route");
+        coerce_string(obj, "reason", "");
     }
-
-    /// Ensure an unsigned-integer field exists; coerce from float or string.
-    fn ensure_u8(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str, default: u8) {
-        match obj.get(key) {
-            None => {
-                obj.insert(
-                    key.into(),
-                    serde_json::Value::Number(serde_json::Number::from(default)),
-                );
-            }
-            Some(serde_json::Value::Number(n)) => {
-                // serde_json::Number can be float or integer; extract as u8
-                if let Some(i) = n.as_u64() {
-                    obj[key] = serde_json::Value::Number(serde_json::Number::from(
-                        i.min(u64::from(u8::MAX)) as u8,
-                    ));
-                } else if let Some(f) = n.as_f64() {
-                    let i = f.round() as u64;
-                    obj[key] = serde_json::Value::Number(serde_json::Number::from(
-                        i.min(u64::from(u8::MAX)) as u8,
-                    ));
-                }
-            }
-            Some(serde_json::Value::String(s)) => {
-                if let Ok(i) = s.parse::<u8>() {
-                    obj[key] = serde_json::Value::Number(serde_json::Number::from(i));
-                } else if let Ok(f) = s.parse::<f64>() {
-                    let i = f.round() as u8;
-                    obj[key] = serde_json::Value::Number(serde_json::Number::from(i));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn ensure_string(
-        obj: &mut serde_json::Map<String, serde_json::Value>,
-        key: &str,
-        default: &str,
-    ) {
-        if !obj.contains_key(key) {
-            obj.insert(key.into(), serde_json::Value::String(default.into()));
-        }
-    }
-
-    ensure_float(obj, "coherence_score", 1.0);
-    ensure_float(obj, "safety_score", 1.0);
-    ensure_float(obj, "completeness", 0.5);
-    ensure_float(obj, "risk", 0.0);
-    ensure_u8(obj, "complexity", 5);
-    ensure_string(obj, "action", "route");
-    ensure_string(obj, "reason", "");
-
-    // Normalize action: if it's not one of the three standard values but
-    // looks like a plausible route name, treat it as a route action and
-    // promote the value to target.
-    if let Some(serde_json::Value::String(action)) = obj.get("action") {
-        let action_lower = action.to_lowercase();
-        let is_standard =
-            action_lower == "route" || action_lower == "respond" || action_lower == "reject";
-        let target_missing = obj
-            .get("target")
-            .and_then(|t| t.as_str())
-            .is_none_or(str::is_empty);
-        if !is_standard && target_missing {
-            obj.insert(
-                "target".into(),
-                serde_json::Value::String(action_lower.clone()),
-            );
-            obj.insert("action".into(), serde_json::Value::String("route".into()));
-        }
-    }
-
     v
 }
 
@@ -247,139 +178,51 @@ fn check_thresholds(
     })
 }
 
-/// Normalize non-standard `action` / `intent` values that look like route names.
+/// Resolve a classifier output to a typed `RoutingTarget`.
 ///
-/// The classifier LLM often identifies the correct intent (e.g. `"intent": "code"`)
-/// but sets the wrong action (e.g. `"action": "respond"` or `"action": "code"`).
+/// Only the three standard `action` values are honored:
+/// - `respond` → `None` (direct response, handled by the caller),
+/// - `route` → the explicit `target` or `default_route`,
+/// - anything else → a warning and the `default_route` fallback.
 ///
-/// Override rules (applied in order):
-///
-/// 1. If `action` is `respond` AND `intent` is a known route AND the query
-///    complexity exceeds the classifier's intelligence, promote to `route` with
-///    `target=intent` — the classifier is not capable enough for this query.
-/// 2. If `action` is a non-standard value that is a known route name, treat it
-///    as `route` with that target.
-fn normalize_classifier_action<'a>(
-    action: &'a str,
-    target: Option<&'a str>,
-    intent: Option<&'a str>,
-    complexity: Option<u8>,
-    classifier_intelligence: u8,
-    routes: &std::collections::HashMap<String, crate::config::RouteRef>,
-) -> (&'a str, Option<&'a str>) {
-    // Intent-driven override: promote respond → route when the query exceeds
-    // the classifier's capability, even if the LLM thought it could handle it.
-    if let Some(intent_route) = intent {
-        let intent_is_route = routes.contains_key(intent_route) || intent_route == "local";
-        let target_matches = target.is_none_or(|t| t == intent_route || t.is_empty());
-        let exceeds_capability = complexity.is_none_or(|c| c > classifier_intelligence);
-        if intent_is_route && target_matches && action != "reject" && exceeds_capability {
-            return ("route", Some(intent_route));
-        }
-    }
-
-    let is_standard = action == "route" || action == "respond" || action == "reject";
-    if is_standard {
-        return (action, target);
-    }
-    // Non-standard action: if it's a route name, treat it as route + target
-    if routes.contains_key(action) || action == "local" {
-        return ("route", Some(action));
-    }
-    // If target is missing and action isn't a route, set target to action anyway
-    // so the downstream "unknown action" log is accurate
-    if target.is_none() && routes.contains_key("local") {
-        return (action, Some("local"));
-    }
-    (action, target)
-}
-
+/// The M4.5 cleanup deleted `normalize_classifier_action`'s route-name
+/// guessing from `action`/`intent` strings — route selection is the
+/// classification tree's job now. Complexity-based model selection still flows
+/// through `RoutingConfig::routing_target` → `resolve_route`.
 fn resolve_routing_target(
     action: &str,
     output: &ClassifierOutput,
     routing_config: &RoutingConfig,
-    classifier_intelligence: u8,
-) -> Option<serde_json::Value> {
-    let min_complexity = output.complexity;
-    let (normalized_action, normalized_target) = normalize_classifier_action(
-        action,
-        output.target.as_deref(),
-        output.intent.as_deref(),
-        output.complexity,
-        classifier_intelligence,
-        &routing_config.routes,
-    );
-    let resolved_route = normalized_target.unwrap_or(&routing_config.default_route);
-
-    if normalized_action == "respond" {
+) -> Option<RoutingTarget> {
+    if action == "respond" {
         tracing::info!(target: "router.pipeline.stage2", "direct response — no dispatch");
         return None;
     }
 
-    let route = if normalized_action == "route" {
-        resolved_route
+    let route = if action == "route" {
+        output.target.as_deref().unwrap_or(&routing_config.default_route)
     } else {
         tracing::warn!(target: "router.pipeline.stage2", action = %action, fallback_route = %routing_config.default_route, "unknown action, falling back to default route");
         &routing_config.default_route
     };
 
-    let resolved = routing_config.resolve_route(route, min_complexity);
-    if let Some((model, model_name)) = &resolved {
+    if let Some(rt) = routing_config.routing_target(route, output.complexity) {
         tracing::info!(target: "router.pipeline.stage2",
             route = %route,
-            model = %model_name,
-            endpoint = %model.endpoint,
-            group = ?routing_config.routes.get(route).map(|r| &r.group),
-            idle_timeout_ms = model.idle_timeout_ms,
-            total_timeout_ms = model.total_timeout_ms,
-            retry_count = model.retry_count,
-            stream = model.stream,
-            filter_thinking = model.filter_thinking,
+            model = %rt.model,
+            url = %rt.url,
+            group = ?rt.group,
+            idle_timeout_ms = rt.idle_timeout_ms,
+            total_timeout_ms = rt.total_timeout_ms,
+            retry_count = rt.retry_count,
+            stream = rt.stream,
+            filter_thinking = rt.filter_thinking,
             "routing target resolved"
         );
-        Some(build_routing_target_value(
-            route,
-            model,
-            model_name,
-            routing_config,
-            min_complexity,
-        ))
-    } else {
-        tracing::warn!(target: "router.pipeline.stage2", route = %route, "resolve_route returned None — no dispatch target");
-        None
+        return Some(rt);
     }
-}
-
-fn build_routing_target_value(
-    route_name: &str,
-    model: &crate::config::ModelEntry,
-    model_name: &str,
-    routing_config: &RoutingConfig,
-    min_complexity: Option<u8>,
-) -> serde_json::Value {
-    // Canonical mapping (M7.3): build a typed `RoutingTarget` via
-    // `from_model_entry` so `params`, `stream`, `filter_thinking`,
-    // `idle_timeout_ms`, `total_timeout_ms`, and `retry_count` travel
-    // identically on every dispatch path. `model_name` is already the
-    // resolved name (`entry.name` or the config key) — `from_model_entry`
-    // reproduces it exactly, so the emitted `model` field is unchanged.
-    let group = routing_config
-        .routes
-        .get(route_name)
-        .or_else(|| routing_config.routes.get(&routing_config.default_route))
-        .map_or(String::new(), |r| r.group.clone());
-
-    let mut rt = crate::pipeline::RoutingTarget::from_model_entry(model_name, model);
-    rt.group = Some(group);
-    rt.target_name = Some(route_name.to_string());
-    rt.fallbacks = routing_config
-        .all_dispatch_targets(route_name, min_complexity)
-        .into_iter()
-        .skip(1) // skip the primary (already included)
-        .map(|(name, entry)| crate::pipeline::RoutingTarget::from_model_entry(&name, &entry))
-        .collect();
-
-    serde_json::to_value(&rt).expect("RoutingTarget serializes to a JSON value")
+    tracing::warn!(target: "router.pipeline.stage2", route = %route, "resolve_route returned None — no dispatch target");
+    None
 }
 
 pub struct ClassifierStage {
@@ -401,6 +244,9 @@ pub struct ClassifierStage {
     /// parallel classifier fan-out; this limiter only bounds the current sync
     /// path so a burst cannot starve every tokio worker via `block_in_place`.
     limiter: Arc<Limiter>,
+    /// The M4 classification-tree engine. `Some` short-circuits `execute` into
+    /// tree evaluation; the flat path below is then unused (M4.5).
+    tree_engine: Option<Arc<ClassificationEngine>>,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
@@ -424,6 +270,38 @@ impl ClassifierStage {
             classifier_intelligence,
             classifier_model: classifier_model.into(),
             limiter,
+            tree_engine: None,
+            depends: vec![ArcIntern::from("pipeline.stage1.output")],
+            provides: vec![ArcIntern::from("pipeline.stage2.output")],
+        }
+    }
+
+    /// Construct the stage in classification-tree mode (ROADMAP_20260805_REVIEW
+    /// M4). The engine owns the tree, the routing table, the per-node backends,
+    /// and the auto-constructed prompts; this stage only extracts the user
+    /// message and converts the engine's final `StageDecision` into a
+    /// `WorkOutput`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_tree(
+        client: Arc<dyn ChatBackend>,
+        routing_config: RoutingConfig,
+        coherence_threshold: f64,
+        score_matrix: Option<ScoreMatrix>,
+        classifier_intelligence: u8,
+        classifier_model: impl Into<String>,
+        limiter: Arc<Limiter>,
+        tree_engine: Arc<ClassificationEngine>,
+    ) -> Self {
+        Self {
+            name: ArcIntern::from("pipeline.stage2.classifier.tree"),
+            client,
+            routing_config,
+            coherence_threshold,
+            score_matrix,
+            classifier_intelligence,
+            classifier_model: classifier_model.into(),
+            limiter,
+            tree_engine: Some(tree_engine),
             depends: vec![ArcIntern::from("pipeline.stage1.output")],
             provides: vec![ArcIntern::from("pipeline.stage2.output")],
         }
@@ -516,7 +394,22 @@ impl WorkUnit for ClassifierStage {
     }
 
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+        let (message, decision) = self.decide(ctx)?;
+        WorkOutput::typed(message, &decision)
+    }
+}
+
+impl ClassifierStage {
+    fn decide(&self, ctx: &WorkContext) -> Result<(String, StageDecision), WorkError> {
         let input = extract_user_message(ctx)?;
+
+        // M4: classification-tree mode — the engine produces the final
+        // `StageDecision` directly (routing target, rejection, or the
+        // `tree_path` of visited nodes in metadata).
+        if let Some(engine) = &self.tree_engine {
+            let evaluation = engine.evaluate(&input)?;
+            return Ok(("classified".into(), evaluation.decision));
+        }
 
         let system_prompt = ctx
             .metadata
@@ -595,14 +488,13 @@ impl WorkUnit for ClassifierStage {
                     &output.action,
                     &output,
                     &self.routing_config,
-                    self.classifier_intelligence,
                 );
-                return Self::build_decision(
+                return Ok(Self::build_decision(
                     &output,
                     fallback_rt.as_ref(),
                     false,
                     self.score_matrix.as_ref(),
-                );
+                ));
             }
         };
 
@@ -642,7 +534,7 @@ impl WorkUnit for ClassifierStage {
                 reason = %decision.reason,
                 "classifier threshold rejection"
             );
-            return WorkOutput::typed("rejected", &decision);
+            return Ok(("rejected".into(), decision));
         }
 
         if output.action == "reject" {
@@ -660,32 +552,45 @@ impl WorkUnit for ClassifierStage {
                     "reason": output.reason,
                 }),
             };
-            return WorkOutput::typed("rejected", &decision);
+            return Ok(("rejected".into(), decision));
         }
 
         let routing_target = resolve_routing_target(
             &output.action,
             &output,
             &self.routing_config,
-            self.classifier_intelligence,
         );
 
-        Self::build_decision(
+        Ok(Self::build_decision(
             &output,
             routing_target.as_ref(),
             ok,
             self.score_matrix.as_ref(),
-        )
+        ))
+    }
+}
+
+impl StageDecisionProducer for ClassifierStage {
+    fn stage_kind(&self) -> PipelineStage {
+        PipelineStage::Classifier
+    }
+
+    fn evaluate(
+        &self,
+        ctx: &WorkContext,
+        _prior: &[StageDecision],
+    ) -> Result<StageDecision, WorkError> {
+        Ok(self.decide(ctx)?.1)
     }
 }
 
 impl ClassifierStage {
     fn build_decision(
         output: &ClassifierOutput,
-        routing_target: Option<&serde_json::Value>,
+        routing_target: Option<&RoutingTarget>,
         ok: bool,
         score_matrix: Option<&ScoreMatrix>,
-    ) -> Result<WorkOutput, WorkError> {
+    ) -> (String, StageDecision) {
         let scored_routes = score_matrix.map(|sm| {
             let scores = std::collections::HashMap::from([
                 ("coherence".into(), output.coherence_score),
@@ -747,17 +652,14 @@ impl ClassifierStage {
             // When we have a routing target, the response is from a misbehaving
             // LLM that output both action=respond + code.  Don't store it as a
             // classifier response — the handler will dispatch instead.
-            if let Ok(typed) = serde_json::from_value::<crate::pipeline::RoutingTarget>(rt.clone())
-            {
-                metadata.set_routing_target(&typed);
-            }
+            metadata.set_routing_target(rt);
         } else if let Some(ref resp) = output.response {
             metadata.set_response(resp.clone());
         }
 
-        WorkOutput::typed(
-            "classified",
-            &StageDecision {
+        (
+            "classified".into(),
+            StageDecision {
                 stage: PipelineStage::Classifier,
                 verdict: StageVerdict::Passed,
                 score: Some(output.coherence_score),

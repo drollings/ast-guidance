@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
@@ -7,6 +8,7 @@ use http_body_util::BodyExt;
 
 use crate::config::{ModelEntry, RouteRef};
 use crate::dag_session::{DependencySession, SessionRegistry, SessionStep, StepResult};
+use crate::dispatch::escalation::{EscalationContext, EscalationLadder};
 use crate::ledger::ContentNodeLedger;
 use crate::normalize;
 use crate::pipeline::{PipelineOrchestrator, RoutingTarget};
@@ -21,6 +23,41 @@ use crate::server::responses::HyperResponse;
 use crate::server::responses::ServerStats;
 use crate::testing::mock::MockDispatchContext;
 use crate::types::RouterRequest;
+
+/// The request-context dependency bundle handed to every HTTP handler
+/// (ROADMAP_20260805_REVIEW M3.0). Collapses the former 12-`Option` parameter
+/// list so escalation (`ladders`, `context_cache`) and future concerns thread
+/// through one struct instead of a growing signature.
+#[derive(Clone)]
+pub struct ServerDeps {
+    pub pipelines: Arc<HashMap<String, Arc<PipelineOrchestrator>>>,
+    pub routes: Arc<HashMap<String, RouteRef>>,
+    pub models: Arc<HashMap<String, ModelEntry>>,
+    pub stats: Arc<ServerStats>,
+    pub max_payload: usize,
+    pub classifier: Option<(String, ModelEntry)>,
+    pub mock_dispatch: Option<Arc<MockDispatchContext>>,
+    pub ledger: Option<Arc<ContentNodeLedger>>,
+    pub cache: Option<Arc<ResponseCache>>,
+    pub plan_route: Option<Arc<PlanRoute>>,
+    pub sessions: Option<Arc<SessionRegistry>>,
+    pub http_client: Arc<reqwest::Client>,
+    /// Per-model-group escalation ladders (M3). Keyed by
+    /// `RoutingTarget.group`; resolved after the local chain exhausts.
+    pub ladders: HashMap<String, Arc<EscalationLadder>>,
+    /// Deterministic-fact cache consulted before escalating (M3).
+    pub context_cache: Option<Arc<dyn fluent_types::ContextCache>>,
+}
+
+impl ServerDeps {
+    /// The escalation ladder for a model's route group, if the group
+    /// configured one. Direct-model requests (no route → no group) get `None`
+    /// — they never escalate.
+    pub fn ladder_for_model(&self, model_name: &str) -> Option<&Arc<EscalationLadder>> {
+        let group = self.routes.get(model_name).map(|r| &r.group)?;
+        self.ladders.get(group)
+    }
+}
 
 /// Best-effort ledger insert, moved off the async handler via
 /// `spawn_blocking` so sync rusqlite never runs on a tokio worker thread.
@@ -124,19 +161,24 @@ fn begin_session_step(
 
 async fn handle_chat_completion(
     req: hyper::Request<hyper::body::Incoming>,
-    pipelines: Arc<std::collections::HashMap<String, Arc<PipelineOrchestrator>>>,
-    routes: Arc<std::collections::HashMap<String, RouteRef>>,
-    models: Arc<std::collections::HashMap<String, ModelEntry>>,
-    stats: Arc<ServerStats>,
-    max_payload: usize,
-    classifier: Option<(String, ModelEntry)>,
-    mock_dispatch: Option<Arc<MockDispatchContext>>,
-    ledger: Option<Arc<ContentNodeLedger>>,
-    cache: Option<Arc<ResponseCache>>,
-    plan_route: Option<Arc<PlanRoute>>,
-    sessions: Option<Arc<SessionRegistry>>,
-    http_client: Arc<reqwest::Client>,
+    deps: ServerDeps,
 ) -> Result<HyperResponse, std::convert::Infallible> {
+    let ServerDeps {
+        pipelines,
+        routes,
+        models,
+        stats,
+        max_payload,
+        classifier,
+        mock_dispatch,
+        ledger,
+        cache,
+        plan_route,
+        sessions,
+        http_client,
+        ladders,
+        context_cache,
+    } = deps;
     // M10: the dispatch post-processing hook (workflow extraction), if the
     // operator configured it. Passed through to successful dispatches only.
     let workflow_extractor = plan_route
@@ -234,6 +276,41 @@ async fn handle_chat_completion(
         &request_text,
     );
 
+    // M3.7 bypass: a session the turnover mode marked frontier-owned skips
+    // the local pipeline and goes straight to the frontier.
+    if let Some(step) = &session_step {
+        let frontier_owned = step
+            .session
+            .lock()
+            .is_ok_and(|s| s.is_frontier_owned());
+        if frontier_owned {
+            let group = routes.get(&model_name).map(|r| r.group.as_str());
+            if let Some(ladder) = group.and_then(|g| ladders.get(g)) {
+                tracing::info!(
+                    target: "router.server",
+                    session_id = %session_id,
+                    "session is frontier-owned — bypassing local pipeline"
+                );
+                let esc_ctx = EscalationContext {
+                    request: &router_request,
+                    user_text: &user_message,
+                    model_name: &model_name,
+                    context_cache: context_cache.as_ref(),
+                    session: Some(&step.session),
+                };
+                if let Some(resp) = ladder.dispatch_frontier(&esc_ctx).await {
+                    step.complete(
+                        resp.status().is_success(),
+                        None,
+                        format!("frontier dispatch: {}", resp.status()),
+                        None,
+                    );
+                    return Ok(resp);
+                }
+            }
+        }
+    }
+
     let pipeline_result =
         resolve_pipeline(&model_name, &routes, &models, &pipelines, &router_request);
 
@@ -326,6 +403,9 @@ async fn handle_chat_completion(
             cache.as_ref(),
             stats.as_ref(),
             workflow_extractor.clone(),
+            &ladders,
+            context_cache.as_ref(),
+            session_step.as_ref().map(|s| &s.session),
         )
         .await?;
         if let Some(ref step) = session_step {
@@ -360,6 +440,9 @@ async fn handle_chat_completion(
             cache.as_ref(),
             stats.as_ref(),
             workflow_extractor.clone(),
+            &ladders,
+            context_cache.as_ref(),
+            session_step.as_ref().map(|s| &s.session),
         )
         .await?;
         if let Some(ref step) = session_step {
@@ -552,21 +635,11 @@ fn plan_executed_response(
 #[allow(clippy::implicit_hasher)]
 pub async fn handle_request(
     req: hyper::Request<hyper::body::Incoming>,
-    pipelines: Arc<std::collections::HashMap<String, Arc<PipelineOrchestrator>>>,
-    routes: Arc<std::collections::HashMap<String, RouteRef>>,
-    models: Arc<std::collections::HashMap<String, ModelEntry>>,
-    stats: Arc<ServerStats>,
-    max_payload: usize,
-    classifier: Option<(String, ModelEntry)>,
-    mock_dispatch: Option<Arc<MockDispatchContext>>,
-    ledger: Option<Arc<ContentNodeLedger>>,
-    cache: Option<Arc<ResponseCache>>,
-    plan_route: Option<Arc<PlanRoute>>,
-    sessions: Option<Arc<SessionRegistry>>,
-    http_client: Arc<reqwest::Client>,
+    deps: ServerDeps,
 ) -> Result<HyperResponse, std::convert::Infallible> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    let ServerDeps { stats, cache, .. } = &deps;
 
     if method == hyper::Method::OPTIONS {
         return Ok(empty_response(hyper::StatusCode::NO_CONTENT));
@@ -616,27 +689,10 @@ pub async fn handle_request(
                 ))
             }
         }
-        ("POST", "/v1/chat/completions") => {
-            handle_chat_completion(
-                req,
-                pipelines,
-                routes,
-                models,
-                stats,
-                max_payload,
-                classifier,
-                mock_dispatch,
-                ledger,
-                cache,
-                plan_route,
-                sessions,
-                http_client,
-            )
-            .await
-        }
+        ("POST", "/v1/chat/completions") => handle_chat_completion(req, deps).await,
         ("POST", "/v1/plan") => {
             stats.requests.fetch_add(1, Ordering::Relaxed);
-            handle_plan_request(req, plan_route, max_payload, &stats).await
+            handle_plan_request(req, deps.plan_route.clone(), deps.max_payload, stats).await
         }
         _ => {
             if method == hyper::Method::DELETE && path.starts_with("/admin/cache/") {

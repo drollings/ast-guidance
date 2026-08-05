@@ -15,15 +15,15 @@
 //!   the rubric says so) before promotion to `provides`.
 //! - **Observability**: every target is wrapped in `Instrumented::with_metrics`
 //!   (the canonical latency surface) and each run emits structured audit
-//!   entries (chart, target, fit, score, verdict) under
-//!   `target: "router.charts.audit"`.
+//!   entries (chart, target, fit, score, verdict) through
+//!   `crate::audit::emit` (`kind = "chart_target"` / `"chart_summary"`).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use common_core::metrics::LatencyHistogram;
 use fluent_concurrency::pool::Limiter;
-use fluent_concurrency::zone::{Zone, ZoneEvent};
+use fluent_concurrency::zone::{Zone, ZoneConfig, ZoneEvent};
 use fluent_llm::client::ChatBackend;
 use fluent_wvr::prelude::*;
 use fluent_wvr::Runtime;
@@ -61,16 +61,33 @@ pub struct ChartAuditEntry {
 
 impl ChartAuditEntry {
     fn emit(&self) {
-        tracing::info!(
-            target: "router.charts.audit",
-            chart = %self.chart,
-            chart_target = %self.target,
-            fit = ?self.fit,
-            score = ?self.score,
-            verdict = ?self.verdict,
-            reason = %self.reason,
-            "chart target audited",
+        crate::audit::emit(
+            "chart_target",
+            serde_json::json!({
+                "chart": self.chart,
+                "chart_target": self.target,
+                "fit": self.fit,
+                "score": self.score,
+                "verdict": self.verdict,
+                "reason": self.reason,
+            }),
         );
+    }
+}
+
+/// Zone retry predicate for chart zones (M5.1).
+///
+/// Chart targets wrap their LLM-call failures in `WorkError::Execution`
+/// (`"chart target '…' LLM call failed: …"`, `charts/stage.rs`). Those are
+/// genuinely transient (rate limits, upstream hiccups) and recoverable when
+/// the caller opts in with `ChartExecOptions.max_retries`. Render/binding
+/// failures (`unmatched deps`, `ambiguous deps`, template errors) are
+/// permanent. So: retry the LLM-call class plus the standard transient
+/// `WorkError`s, but never a permanent `Execution` failure.
+fn chart_retry_predicate(err: &WorkError) -> bool {
+    match err {
+        WorkError::Execution(msg) => msg.contains("LLM call failed"),
+        other => other.is_retryable(),
     }
 }
 
@@ -218,7 +235,14 @@ impl ChartExecutionPlan {
                 break;
             }
 
-            let mut zone = Zone::new(opts.runtime.clone(), CapabilitySet::default());
+            let mut zone = Zone::new_with_config(
+                opts.runtime.clone(),
+                CapabilitySet::default(),
+                ZoneConfig {
+                    is_retryable: chart_retry_predicate,
+                    ..ZoneConfig::default()
+                },
+            );
             for target in &ready {
                 let mut ctx = build_target_context(base_ctx, target, &completed);
                 ctx.max_retries = opts.max_retries;
@@ -335,16 +359,17 @@ impl ChartExecutionPlan {
             }
         }
 
-        tracing::info!(
-            target: "router.charts.audit",
-            chart = %self.chart_name,
-            fit = ?opts.fit,
-            score = ?opts.score,
-            completed = summary.completed.len(),
-            failed = summary.failed.len(),
-            cancelled = summary.cancelled.len(),
-            accepted = accepted,
-            "chart execution summarized",
+        crate::audit::emit(
+            "chart_summary",
+            serde_json::json!({
+                "chart": self.chart_name,
+                "fit": opts.fit,
+                "score": opts.score,
+                "completed": summary.completed.len(),
+                "failed": summary.failed.len(),
+                "cancelled": summary.cancelled.len(),
+                "accepted": accepted,
+            }),
         );
 
         Ok(summary)
@@ -402,15 +427,16 @@ impl ChartExecutionPlan {
                     }
                 }
 
-                tracing::info!(
-                    target: "router.charts.audit",
-                    chart = %self.chart_name,
-                    chart_target = %name,
-                    fit = ?opts.fit,
-                    score = ?opts.score,
-                    verdict = ?ChartTargetVerdict::Completed,
-                    reason = %decision.reason,
-                    "chart target completed",
+                crate::audit::emit(
+                    "chart_target",
+                    serde_json::json!({
+                        "chart": self.chart_name,
+                        "chart_target": name,
+                        "fit": opts.fit,
+                        "score": opts.score,
+                        "verdict": ChartTargetVerdict::Completed,
+                        "reason": decision.reason,
+                    }),
                 );
                 summary.audit.push(ChartAuditEntry {
                     chart: self.chart_name.clone(),

@@ -399,4 +399,173 @@ mod tests {
             "a Limiter::new(1) must serialize classifier calls"
         );
     }
+
+    // ── Stage 2: ClassifierStage in M4 classification-tree mode ─────────────
+
+    /// A backend that records every system prompt and always returns the
+    /// supplied classifier verdict.
+    struct TreeRecordingBackend {
+        prompts: Arc<std::sync::Mutex<Vec<String>>>,
+        response: String,
+    }
+
+    impl fluent_llm::client::ChatBackend for TreeRecordingBackend {
+        fn chat_complete(
+            &self,
+            messages: &[fluent_llm::ChatMessage],
+        ) -> Result<String, fluent_llm::LlmError> {
+            self.prompts.lock().unwrap().extend(
+                messages
+                    .iter()
+                    .filter(|m| m.role == "system")
+                    .map(|m| m.content.clone()),
+            );
+            Ok(self.response.clone())
+        }
+    }
+
+    fn tree_test_config() -> crate::config::RouterConfig {
+        serde_json::from_str(
+            r#"{
+                "pipelines": {"default": {"deterministic_prefilter": false, "classifier": true}},
+                "models": {
+                    "fast": {"endpoint": "http://upstream.test:8080/v1/chat/completions", "name": "fast", "intelligence": 1, "cost_input": 1e-6, "cost_output": 6e-6, "cost_cached_read": 4e-7, "speed": 8},
+                    "code-model": {"endpoint": "http://upstream.test:8080/v1/chat/completions", "name": "code-model", "intelligence": 5, "cost_input": 5e-6, "cost_output": 3e-5, "cost_cached_read": 2e-6, "speed": 5}
+                },
+                "model_groups": {
+                    "fast": ["fast"],
+                    "code": ["code-model"]
+                },
+                "routes": {
+                    "code": {"group": "code", "pipelines": ["default"], "description": "code"},
+                    "local": {"group": "fast", "pipelines": ["default"], "description": "local"}
+                },
+                "default_route": "local",
+                "classification": {
+                    "root": {
+                        "type": "classifier",
+                        "description": "request router",
+                        "model": "fast",
+                        "coherence_threshold": 0.4,
+                        "safety_threshold": 0.3,
+                        "children": [
+                            {
+                                "key": "code",
+                                "description": "programming and implementation",
+                                "node": { "type": "terminal", "route": "code", "group": "code" }
+                            },
+                            {
+                                "key": "general",
+                                "description": "everything else",
+                                "node": {
+                                    "type": "fallback",
+                                    "node": { "type": "terminal", "route": "local", "group": "fast" }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }"#,
+        )
+        .expect("valid tree config")
+    }
+
+    #[test]
+    fn classifier_stage_tree_mode_produces_routing_target() {
+        use crate::pipeline::RoutingTarget;
+
+        let config = tree_test_config();
+        let prompts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let backend: Arc<dyn fluent_llm::client::ChatBackend> = Arc::new(TreeRecordingBackend {
+            prompts: prompts.clone(),
+            response: serde_json::json!({
+                "route": "code",
+                "coherence": 0.9,
+                "safety": 0.9,
+                "complexity": 6,
+                "reason": "code query",
+            })
+            .to_string(),
+        });
+
+        // The stage is built through the pipeline builder (exercises the M4
+        // tree-engine construction path, not a hand-built engine).
+        let pipeline = config
+            .build_named_pipeline_with_backend("default", Some(backend))
+            .expect("tree pipeline should build");
+
+        let mut ctx = WorkContext::default();
+        ctx.set_structured(
+            "request",
+            &serde_json::json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "help me write a sort"}],
+            }),
+        );
+
+        let output = pipeline.execute(&ctx).expect("pipeline executes");
+        let result: crate::pipeline::PipelineResult = output.data_as().expect("pipeline result");
+        assert!(!result.rejected);
+        let rt: RoutingTarget = result
+            .routing_target
+            .expect("tree should produce a routing target");
+        assert_eq!(rt.target_name.as_deref(), Some("code"));
+        assert_eq!(rt.model, "code-model");
+        assert_eq!(rt.group.as_deref(), Some("code"));
+
+        // The auto-generated prompt was sent to the backend.
+        let captured = prompts.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1, "exactly one tree classifier call");
+        assert!(
+            captured[0].contains("- code: programming and implementation"),
+            "auto-constructed prompt lists child routes, got: {}",
+            captured[0]
+        );
+        assert!(
+            captured[0].contains("\"route\": \"<exactly one of: code>\""),
+            "three-axis route enum, got: {}",
+            captured[0]
+        );
+    }
+
+    #[test]
+    fn classifier_stage_tree_mode_rejects_below_threshold() {
+        let config = tree_test_config();
+        let backend: Arc<dyn fluent_llm::client::ChatBackend> = Arc::new(TreeRecordingBackend {
+            prompts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            response: serde_json::json!({
+                "route": "code",
+                "coherence": 0.1,
+                "safety": 0.9,
+                "complexity": 1,
+                "reason": "garbage",
+            })
+            .to_string(),
+        });
+
+        let pipeline = config
+            .build_named_pipeline_with_backend("default", Some(backend))
+            .expect("tree pipeline should build");
+
+        let mut ctx = WorkContext::default();
+        ctx.set_structured(
+            "request",
+            &serde_json::json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "asdf qwerty"}],
+            }),
+        );
+
+        let output = pipeline.execute(&ctx).expect("pipeline executes");
+        let result: crate::pipeline::PipelineResult = output.data_as().expect("pipeline result");
+        assert!(result.rejected);
+        assert!(
+            result
+                .reject_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("coherence")),
+            "rejection should mention coherence, got: {:?}",
+            result.reject_reason
+        );
+    }
 }

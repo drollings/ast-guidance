@@ -1,4 +1,4 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use common_core::http::shared_http_client;
 
@@ -11,20 +11,6 @@ use crate::http_class::HttpClass;
 /// Implemented by `LlmClient` (production) and test stubs.
 pub trait ChatBackend: Send + Sync {
     fn chat_complete(&self, messages: &[ChatMessage]) -> Result<String, LlmError>;
-}
-
-/// Fallback runtime used only when the sync adapter is called from a context
-/// that has no tokio runtime (e.g. a plain `fn main()`). Production callers
-/// inside an async runtime use `Handle::current().block_on` instead.
-fn fallback_runtime() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("failed to build fallback tokio runtime for LlmClient")
-    })
 }
 
 pub struct LlmClient {
@@ -162,17 +148,11 @@ impl ChatBackend for LlmClient {
 /// current-thread runtime (where `block_in_place` panics) and with no active
 /// runtime it falls back to plain `block_on` / the process-wide fallback
 /// runtime.
+///
+/// The implementation delegates to `common_core::runtime::block_on` — the
+/// workspace's single canonical sync→async bridge.
 pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
-                handle.block_on(fut)
-            } else {
-                tokio::task::block_in_place(move || handle.block_on(fut))
-            }
-        }
-        Err(_) => fallback_runtime().block_on(fut),
-    }
+    common_core::runtime::block_on(fut)
 }
 
 /// Async chat completion HTTP call. Honors `LlmConfig::timeout_ms` via

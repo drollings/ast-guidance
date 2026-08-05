@@ -1214,7 +1214,11 @@ need to read `&WorkContext` or return arbitrary `WorkOutput`. Because the op
 runs on a blocking thread, the unit can be registered under a `Zone` for
 timeout/retry/dependency-cancellation without violating the purity contract —
 the `Zone`'s per-attempt budget applies to the offloaded task, and the
-executor is never starved.
+executor is never starved. `execute` scopes `ctx.caps` into the `CURRENT_CAPS`
+task-local on **both** offload paths (`block_in_place` and the scoped-thread
+path), so a pool-backed op that calls `SqlitePool::acquire`/`with_conn` (both
+capability-gated) works under a `Zone`-style context on multi-thread and
+current-thread runtimes alike.
 
 ### Orchestration — uniform loop
 
@@ -2172,14 +2176,6 @@ using the per-unit `default_timeout_ms()` and the zone-wide
 summary discriminates: `Ok(_)` → `completed`, `Err(WorkError::*)` →
 `failed`, `JoinError::is_panic()` → `panicked`, `JoinError::is_cancelled()`
 or `Timeout` → `cancelled` (with `CancelReason::{Timeout, DependencyFailed, Aborted}`).
-
----
-
-## 22. Future Work — MCP Handler as WorkUnit
-
-An MCP method handler (e.g. `coral_query`, `guidance_explain`) is a natural `WorkUnit`: the method name maps to `name()`, and the dispatch body maps to `execute()`. Converting MCP handlers to `WorkUnit` implementations would allow them to participate in the DAG orchestration pipeline, middleware chains, and `Instrumented` wrappers.
-
-**Do not implement this now.** There is currently only one `JsonRpcHandler` per MCP server, and the `WorkUnit` interface would require adapting the JSON-RPC request/response model into `WorkContext`/`WorkOutput`. This is a follow-up task to be undertaken only when a second consumer of MCP method dispatch appears or when MCP methods need DAG orchestration.
 
 ---
 

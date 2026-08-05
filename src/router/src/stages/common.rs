@@ -1,8 +1,70 @@
 //! Shared helpers for pipeline stages.
 
+use serde_json::{Map, Value};
+
 use fluent_wvr::prelude::*;
 
 use crate::types::{RouterMessageContent, RouterRequest};
+
+/// Ensure a floating-point field exists on a classifier/tree JSON object,
+/// coercing a string-valued number back to numeric. The shared "surviving
+/// normalization" used by both the flat `ClassifierStage` sanitizer and the
+/// M4 classification-tree parser (ROADMAP_20260805_REVIEW M4.5).
+pub(crate) fn coerce_float(obj: &mut Map<String, Value>, key: &str, default: f64) {
+    match obj.get(key) {
+        None => {
+            if let Some(n) = serde_json::Number::from_f64(default) {
+                obj.insert(key.into(), Value::Number(n));
+            }
+        }
+        Some(Value::String(s)) => {
+            if let Ok(n) = s.parse::<f64>() {
+                if let Some(num) = serde_json::Number::from_f64(n) {
+                    obj[key] = Value::Number(num);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Ensure an unsigned-integer field exists on a classifier/tree JSON object,
+/// coercing from float or string. The shared "surviving normalization" for the
+/// `complexity` axis.
+pub(crate) fn coerce_u8(obj: &mut Map<String, Value>, key: &str, default: u8) {
+    match obj.get(key) {
+        None => {
+            obj.insert(key.into(), Value::Number(serde_json::Number::from(default)));
+        }
+        Some(Value::Number(n)) => {
+            let as_u8 = n
+                .as_u64()
+                .map(|i| i.min(u64::from(u8::MAX)) as u8)
+                .or_else(|| n.as_f64().map(|f| f.round().min(f64::from(u8::MAX)) as u8));
+            if let Some(v) = as_u8 {
+                obj[key] = Value::Number(serde_json::Number::from(v));
+            }
+        }
+        Some(Value::String(s)) => {
+            let as_u8 = s
+                .parse::<u8>()
+                .ok()
+                .or_else(|| s.parse::<f64>().ok().map(|f| f.round() as u8));
+            if let Some(v) = as_u8 {
+                obj[key] = Value::Number(serde_json::Number::from(v));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Ensure a string field exists on a classifier/tree JSON object with a
+/// default when absent.
+pub(crate) fn coerce_string(obj: &mut Map<String, Value>, key: &str, default: &str) {
+    if !obj.contains_key(key) {
+        obj.insert(key.into(), Value::String(default.into()));
+    }
+}
 
 /// Extract the last user message from the request carried in
 /// `ctx.structured["request"]`.

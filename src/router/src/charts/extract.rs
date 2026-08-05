@@ -267,11 +267,12 @@ impl WorkflowExtractor {
         }
         let chart = extract_chart_from_audit(transcript)?;
         let outcome = self.store.upsert_idempotent(chart, self.near_threshold)?;
-        tracing::info!(
-            target: "router.charts.audit",
-            outcome = ?outcome,
-            author_model = %transcript.author_model,
-            "auto-extracted draft chart",
+        crate::audit::emit(
+            "chart_extract",
+            serde_json::json!({
+                "outcome": outcome,
+                "author_model": transcript.author_model,
+            }),
         );
         Ok(Some(outcome))
     }
@@ -302,10 +303,9 @@ impl WorkflowExtractor {
         let transcript = transcript_from_dispatch(query, prompt, author_model, response);
         match self.extract_from_transcript(&transcript) {
             Ok(_) => {}
-            Err(e) => tracing::warn!(
-                target: "router.charts.audit",
-                error = %e,
-                "auto-extraction skipped — best-effort learning loop",
+            Err(e) => crate::audit::emit(
+                "chart_extract",
+                serde_json::json!({ "error": e.to_string() }),
             ),
         }
     }

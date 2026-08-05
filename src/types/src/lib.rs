@@ -7,6 +7,33 @@ use smol_str::SmolStr;
 
 pub const LOD_COUNT: usize = 6;
 
+/// A deterministic context hit — a short-circuit fact/cached answer that
+/// lets the escalation ladder avoid a frontier call (ROADMAP_20260805_REVIEW
+/// M3). `content` is the verified answer/fact; `source` names the cache that
+/// produced it (e.g. "coral-context" or "ledger") for audit provenance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextHit {
+    pub source: String,
+    pub content: String,
+    #[serde(default)]
+    pub score: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Deterministic-fact lookup used by the escalation ladder **before** engaging
+/// the frontier (VISION: "a `ContextHit` short-circuits").
+///
+/// This is the cross-crate boundary for context retrieval: `fluent-router`
+/// consumes context through this trait only and never imports coral /
+/// knowledge / ontology / rdf. Concrete implementations (coral-context's
+/// cache, the router's ledger-backed cache) are composed at the binary.
+pub trait ContextCache: Send + Sync {
+    /// Look up a deterministic answer/fact for `query`. `None` means the
+    /// cache has no short-circuit hit and the ladder must escalate.
+    fn lookup(&self, query: &str) -> Option<ContextHit>;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub i64);
 
@@ -563,5 +590,25 @@ mod tests {
         let json = serde_json::to_string(&tool).unwrap();
         let t2: WasmTool = serde_json::from_str(&json).unwrap();
         assert_eq!(tool.name, t2.name);
+    }
+    #[test]
+    fn context_hit_roundtrip() {
+        let hit = ContextHit {
+            source: "ledger".into(),
+            content: "2+2 is 4".into(),
+            score: 0.97,
+            metadata: Some(serde_json::json!({ "node_id": 42 })),
+        };
+        let json = serde_json::to_string(&hit).unwrap();
+        let back: ContextHit = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, hit);
+        assert_eq!(back.source, "ledger");
+    }
+    #[test]
+    fn context_hit_defaults_metadata_to_none() {
+        let hit: ContextHit = serde_json::from_str(r#"{"source":"c","content":"x","score":0.5}"#)
+            .unwrap();
+        assert!(hit.metadata.is_none());
+        assert!((hit.score - 0.5).abs() < f32::EPSILON);
     }
 }

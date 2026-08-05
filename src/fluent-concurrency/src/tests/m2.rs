@@ -201,7 +201,10 @@ async fn test_zone_panic_cancels_transitive_dependents() {
             // Fail on first attempt so the retry path kicks in with an
             // async sleep.  With paused time the sleep never completes,
             // keeping the task pending until abort_cancel reaches it.
-            Err(WorkError::Execution("awaiting dependency".into()))
+            // `Dependency` is the transient (retryable) error — a permanent
+            // `Execution` failure would complete immediately and never be
+            // cancellable by the provider's panic.
+            Err(WorkError::Dependency("awaiting dependency".into()))
         }
     }
     impl_component_for_test!(WaitingDep);
@@ -285,7 +288,11 @@ async fn test_zone_real_timeout() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
     let mut zone = Zone::new(runtime, caps);
-    let unit = Arc::new(StubComponent::fail("slow"));
+    // The unit fails with a transient error, so the retry backoff keeps it
+    // alive past the 50ms wall-clock budget — the outer timeout fires and
+    // records a `Timeout` cancellation. (A permanent Execution failure would
+    // short-circuit instantly and report `Failed` instead.)
+    let unit = Arc::new(StubComponent::dep_fail("slow"));
     let ctx = WorkContext {
         timeout_ms: 50,
         max_retries: 5,
@@ -332,7 +339,10 @@ async fn test_zone_retry_with_max_retries() {
         }
         fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
             self.counter.fetch_add(1, Ordering::SeqCst);
-            Err(WorkError::Execution("retry fail".into()))
+            // `Dependency` is transient/retryable, so the zone retries up to
+            // `max_retries` times. A permanent `Execution` failure would
+            // short-circuit on the first attempt.
+            Err(WorkError::Dependency("retry fail".into()))
         }
     }
     impl_component_for_test!(RetryCounter);
@@ -381,7 +391,7 @@ async fn test_zone_dependency_cancellation() {
         StubComponent::fail("parent").with_provides("shared"),
     ))
     .unwrap();
-    let child = Arc::new(StubComponent::fail("child").with_dep("shared"));
+    let child = Arc::new(StubComponent::dep_fail("child").with_dep("shared"));
     zone.register_with_context(
         child,
         WorkContext {
@@ -447,7 +457,7 @@ async fn test_zone_transitive_cancellation() {
         .unwrap();
     zone.register_with_context(
         Arc::new(
-            StubComponent::fail("B")
+            StubComponent::dep_fail("B")
                 .with_dep("a_out")
                 .with_provides("b_out"),
         ),
@@ -458,7 +468,7 @@ async fn test_zone_transitive_cancellation() {
     )
     .unwrap();
     zone.register_with_context(
-        Arc::new(StubComponent::fail("C").with_dep("b_out")),
+        Arc::new(StubComponent::dep_fail("C").with_dep("b_out")),
         WorkContext {
             max_retries: 10,
             ..WorkContext::default()
@@ -494,7 +504,7 @@ async fn test_zone_panic_cancels_dependents() {
     ))
     .unwrap();
     zone.register_with_context(
-        Arc::new(StubComponent::fail("child").with_dep("shared")),
+        Arc::new(StubComponent::dep_fail("child").with_dep("shared")),
         WorkContext {
             max_retries: 10,
             ..WorkContext::default()
@@ -567,7 +577,10 @@ async fn test_zone_drop_aborts_all_tasks() {
 async fn test_zone_config_custom_budget() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let config = ZoneConfig { poll_budget: 32 };
+    let config = ZoneConfig {
+        poll_budget: 32,
+        ..ZoneConfig::default()
+    };
     let mut zone = Zone::new_with_config(runtime, caps, config);
     zone.register(Arc::new(StubComponent::ok("task"))).unwrap();
     let summary: ZoneSummary = (&mut zone).await;
@@ -618,7 +631,10 @@ async fn test_zone_drop_completed_zone_is_safe() {
 /// ZoneConfig satisfies Debug, Clone, Copy, PartialEq, Eq.
 #[test]
 fn test_zone_config_traits() {
-    let a = ZoneConfig { poll_budget: 64 };
+    let a = ZoneConfig {
+        poll_budget: 64,
+        ..ZoneConfig::default()
+    };
     let b = a;
     assert_eq!(a, b);
     let c = a;
@@ -626,12 +642,57 @@ fn test_zone_config_traits() {
     let _ = format!("{a:?}");
 }
 
+/// The default `ZoneConfig::is_retryable` predicate is `WorkError::is_retryable`:
+/// permanent `Execution` failures short-circuit, transient ones retry.
+#[test]
+fn test_zone_config_default_retry_predicate() {
+    let config = ZoneConfig::default();
+    assert!(!(config.is_retryable)(&WorkError::Execution("permanent".into())));
+    assert!((config.is_retryable)(&WorkError::Dependency("transient".into())));
+    assert!((config.is_retryable)(&WorkError::Timeout {
+        duration_ms: 1,
+        unit: "u".into()
+    }));
+}
+
+/// A custom `is_retryable` predicate overrides the default per-zone.
+#[tokio::test(start_paused = true)]
+async fn test_zone_custom_retry_predicate_retries_execution() {
+    tokio::time::resume();
+    let runtime = crate::tokio_runtime();
+    let caps = CapabilitySet::new();
+    // Opt-in predicate: retry even `Execution` failures (legacy unconditional
+    // behavior), as chart zones do for their LLM-call failures.
+    let config = ZoneConfig {
+        is_retryable: |_: &WorkError| true,
+        ..ZoneConfig::default()
+    };
+    let mut zone = Zone::new_with_config(runtime, caps, config);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let cnt = Arc::clone(&counter);
+    let unit = StubComponent::new("retry_exec").with_handler(move |_| {
+        cnt.fetch_add(1, Ordering::SeqCst);
+        Err(WorkError::Execution("boom".into()))
+    });
+    let ctx = WorkContext {
+        max_retries: 2,
+        ..WorkContext::default()
+    };
+    zone.register_with_context(Arc::new(unit), ctx).unwrap();
+    let summary: ZoneSummary = (&mut zone).await;
+    assert_eq!(summary.failed.len(), 1);
+    assert_eq!(counter.load(Ordering::SeqCst), 3, "custom predicate retries");
+}
+
 /// ZoneConfig with poll_budget=1: the minimum valid budget works.
 #[tokio::test(start_paused = true)]
 async fn test_zone_config_budget_one() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let config = ZoneConfig { poll_budget: 1 };
+    let config = ZoneConfig {
+        poll_budget: 1,
+        ..ZoneConfig::default()
+    };
     let mut zone = Zone::new_with_config(runtime, caps, config);
     zone.register(Arc::new(StubComponent::ok("task"))).unwrap();
     let summary: ZoneSummary = (&mut zone).await;
@@ -664,7 +725,7 @@ async fn test_zone_drop_multiple_pending_tasks() {
         let cnt = Arc::clone(&counter);
         let unit = StubComponent::new(&format!("task_{i}")).with_handler(move |_| {
             cnt.fetch_add(1, Ordering::SeqCst);
-            Err(WorkError::Execution("retry".into()))
+            Err(WorkError::Dependency("retry".into()))
         });
         let ctx = WorkContext {
             max_retries: 100,
@@ -690,7 +751,7 @@ async fn test_zone_drop_dependency_graph() {
     let caps = CapabilitySet::new();
     let mut zone = Zone::new(runtime, caps);
     // Provider task that fails and retries
-    let provider = StubComponent::fail("provider").with_provides("shared_asset");
+    let provider = StubComponent::dep_fail("provider").with_provides("shared_asset");
     zone.register_with_context(
         Arc::new(provider),
         WorkContext {
@@ -700,7 +761,7 @@ async fn test_zone_drop_dependency_graph() {
     )
     .unwrap();
     // Dependent task that depends on the provider's asset
-    let dependent = StubComponent::fail("dependent").with_dep("shared_asset");
+    let dependent = StubComponent::dep_fail("dependent").with_dep("shared_asset");
     zone.register_with_context(
         Arc::new(dependent),
         WorkContext {

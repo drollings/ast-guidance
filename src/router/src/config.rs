@@ -2,20 +2,20 @@
 
 pub mod addr;
 pub mod builder;
+pub mod classification;
+pub mod escalation;
 pub mod filters;
 pub mod routing;
-pub mod unimplemented;
 
 pub use self::addr::{hosts_equivalent, parse_bind_addr, validate_no_self_routing};
 pub use self::builder::PipelineParams;
+pub use self::classification::{ClassificationChild, ClassificationNode, ClassificationTree};
+pub use self::escalation::{EscalationLadderConfig, FrontierConfig, ModelGroup};
 pub use self::filters::{
     CommandConfig, ConfidenceGate, FilterAction, FilterOutcome, FilterScope, MockConfig,
     PatternEntry, RejectPatterns,
 };
 pub use self::routing::{RouteRef, RoutingConfig};
-pub use self::unimplemented::{
-    detect_unimplemented_features, log_unimplemented_features, UnimplementedFeature,
-};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -32,7 +32,7 @@ pub struct RouterConfig {
     #[serde(default)]
     pub models: HashMap<String, ModelEntry>,
     #[serde(default)]
-    pub model_groups: HashMap<String, Vec<String>>,
+    pub model_groups: HashMap<String, ModelGroup>,
     #[serde(default)]
     pub routes: HashMap<String, RouteRef>,
     #[serde(default)]
@@ -67,6 +67,12 @@ pub struct RouterConfig {
     /// Post-processing configuration (M10 learning loop).
     #[serde(default)]
     pub post_process: PostProcessConfig,
+    /// Nested classification tree (ROADMAP_20260805_REVIEW M4). `Some` switches
+    /// the classifier stage into tree-driven mode; the flat pipeline
+    /// sections remain for backward compatibility and are derived from the
+    /// tree where the rest of the server needs flat views.
+    #[serde(default)]
+    pub classification: Option<ClassificationTree>,
 }
 
 impl Default for RouterConfig {
@@ -90,7 +96,32 @@ impl Default for RouterConfig {
             score_matrix: None,
             charts: ChartsConfig::default(),
             post_process: PostProcessConfig::default(),
+            classification: None,
         }
+    }
+}
+
+impl RouterConfig {
+    /// The flat `routes` view the server consumes (model → pipeline mapping).
+    ///
+    /// Flat configs return `routes` unchanged. When a classification tree is
+    /// configured, every `terminal` node whose route has no explicit entry gets
+    /// a synthesized `RouteRef` (routed through the terminal's own `group`, or
+    /// the route name when no group is given) so `RoutingConfig::resolve_route`
+    /// and `resolve_pipeline` work with no structural change to the server
+    /// (ROADMAP_20260805_REVIEW M4.4).
+    pub fn routes_view(&self) -> HashMap<String, RouteRef> {
+        let mut routes = self.routes.clone();
+        if let Some(tree) = &self.classification {
+            for (route, group, description) in tree.terminal_views() {
+                routes.entry(route.clone()).or_insert(RouteRef {
+                    group: group.unwrap_or_else(|| route.clone()),
+                    pipelines: vec!["default".into()],
+                    description,
+                });
+            }
+        }
+        routes
     }
 }
 
@@ -540,5 +571,85 @@ mod tests {
             entry.retry_base_interval_s,
             common_core::constants::DEFAULT_RETRY_INTERVAL_S
         );
+    }
+
+    // ── M4 classification-tree derived flat views ────────────────────────
+
+    fn tree_section() -> serde_json::Value {
+        serde_json::json!({
+            "classification": {
+                "root": {
+                    "type": "classifier",
+                    "description": "router",
+                    "model": "fast",
+                    "children": [
+                        {
+                            "key": "code",
+                            "description": "programming",
+                            "node": { "type": "terminal", "route": "code", "group": "code" }
+                        },
+                        {
+                            "key": "brand_new",
+                            "description": "not in flat routes",
+                            "node": { "type": "terminal", "route": "brand_new", "group": "question" }
+                        }
+                    ]
+                }
+            },
+            "models": {
+                "fast": {"endpoint": "http://upstream.test/v1/chat/completions", "name": "fast", "intelligence": 1, "cost_input": 1e-6, "cost_output": 6e-6, "cost_cached_read": 4e-7, "speed": 8}
+            },
+            "model_groups": {
+                "fast": ["fast"],
+                "code": ["fast"],
+                "question": ["fast"]
+            },
+            "routes": {
+                "code": {"group": "code", "pipelines": ["default"], "description": "code"}
+            }
+        })
+    }
+
+    #[test]
+    fn routes_view_synthesizes_terminal_routes() {
+        let cfg: RouterConfig = serde_json::from_value(tree_section()).unwrap();
+        let routes = cfg.routes_view();
+        // Explicit flat route is preserved.
+        assert_eq!(routes["code"].group, "code");
+        assert_eq!(routes["code"].pipelines, vec!["default".to_string()]);
+        // Terminal route without a flat entry is synthesized from its group.
+        assert_eq!(routes["brand_new"].group, "question");
+        assert_eq!(routes["brand_new"].pipelines, vec!["default".to_string()]);
+    }
+
+    #[test]
+    fn routes_view_flat_config_is_unchanged() {
+        let cfg: RouterConfig =
+            serde_json::from_str(r#"{"routes": {"a": {"group": "g"}}}"#).unwrap();
+        assert_eq!(cfg.routes_view().len(), 1);
+        assert!(cfg.routes_view().contains_key("a"));
+    }
+
+    #[test]
+    fn routing_config_derives_system_prompt_from_tree() {
+        let cfg: RouterConfig = serde_json::from_value(tree_section()).unwrap();
+        let routing = cfg.routing_config();
+        assert!(
+            routing.system_prompt.contains("You are a router."),
+            "tree-derived system prompt, got: {}",
+            routing.system_prompt
+        );
+        assert!(
+            routing.routes.contains_key("brand_new"),
+            "derived routes reach the RoutingConfig so terminal resolution works"
+        );
+    }
+
+    #[test]
+    fn routing_config_keeps_explicit_system_prompt() {
+        let mut cfg: RouterConfig = serde_json::from_value(tree_section()).unwrap();
+        cfg.system_prompt = "custom preamble".into();
+        let routing = cfg.routing_config();
+        assert_eq!(routing.system_prompt, "custom preamble");
     }
 }

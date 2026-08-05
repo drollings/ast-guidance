@@ -391,7 +391,14 @@ impl ContentNodeLedger {
         Ok(())
     }
 
-    /// Fetch a node by ID (canonical `ContentNode`, hydrated from `content_json`).
+    /// Fetch a node by ID (canonical `ContentNode`, single source of truth
+    /// in the `content_json` column).
+    ///
+    /// Returns `None` if the node is absent or its `content_json` fails to
+    /// parse. The pre-LOD flat-column hydration fallback was retired (M5.7):
+    /// every schema since the base migration writes `content_json` (and the
+    /// column migrations converge older databases onto it), so the canonical
+    /// read path is single-format.
     pub fn get_node(&self, node_id: NodeId) -> Option<ContentNode> {
         let json: Option<String> = self
             .store
@@ -402,19 +409,7 @@ impl ContentNodeLedger {
             )
             .ok()
             .flatten();
-        if let Some(json) = json {
-            let parsed = serde_json::from_str::<ContentNode>(&json).ok();
-            if parsed.is_some() {
-                return parsed;
-            }
-        }
-        // Pre-LOD rows have '{}': hydrate from the flat projection.
-        self.store
-            .with_conn(|conn| {
-                hydrate_node(conn, node_id).map_err(|e| DbError::Other(e.to_string()))
-            })
-            .ok()
-            .flatten()
+        json.and_then(|json| serde_json::from_str::<ContentNode>(&json).ok())
     }
 
     /// All nodes for a session (canonical `ContentNode`s), most recent first.
@@ -485,67 +480,6 @@ impl ContentNodeLedger {
             panic!("simulated panic while holding db mutex")
         });
     }
-}
-
-/// Hydrate a `ContentNode` from the flat columns (used for rows written
-/// before the `content_json` column existed).
-fn hydrate_node(
-    db: &rusqlite::Connection,
-    node_id: NodeId,
-) -> Result<Option<ContentNode>, LedgerError> {
-    let row = db
-        .query_row(
-            "SELECT session_id, request_id, role, content, turn_index, accepted,
-                    acceptance_score, active_lod, parent_id, step_id, metadata, created_at
-             FROM ledger WHERE node_id = ?1",
-            rusqlite::params![node_id.as_int()],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, i64>(4)?,
-                    r.get::<_, bool>(5)?,
-                    r.get::<_, Option<f64>>(6)?,
-                    r.get::<_, i64>(7)?,
-                    r.get::<_, Option<i64>>(8)?,
-                    r.get::<_, Option<String>>(9)?,
-                    r.get::<_, String>(10)?,
-                    r.get::<_, i64>(11)?,
-                ))
-            },
-        )
-        .map_err(|_| LedgerError::NotFound(node_id))?;
-
-    let content = row.3;
-    Ok(Some(ContentNode {
-        id: Some(node_id),
-        name: format!("node-{}", node_id.as_int()).into(),
-        source: "session".into(),
-        lod: vec![
-            content.clone(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            derive_label(&row.2, &content),
-        ],
-        embedding: None,
-        capabilities: None,
-        session_id: Some(row.0),
-        request_id: Some(row.1),
-        role: Some(row.2),
-        turn_index: Some(row.4 as u64),
-        accepted: Some(row.5),
-        acceptance_score: row.6,
-        active_lod: Some(row.7 as u8),
-        parent_id: row.8.map(NodeId::from_int),
-        step_id: row.9,
-        step_status: None,
-        metadata: serde_json::from_str(&row.10).ok(),
-        created_at: Some(row.11 as u64),
-    }))
 }
 
 /// Build a fresh `ContentNode` with LOD0 (full text) and LOD5 (label) eager.
@@ -777,6 +711,50 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].content, "reply");
         assert!(entries[0].accepted);
+    }
+
+    #[test]
+    fn get_node_single_format_no_flat_hydration_fallback() {
+        let ledger = temp_ledger();
+        // Simulate a migrated pre-LOD row: the flat projection is populated
+        // but `content_json` is still the '{}' placeholder. The canonical
+        // read (`get_node`) must return `None` — the dual-format hydration
+        // fallback is retired (M5.7); only `get_session_entries` (the flat
+        // audit view) reads columns directly.
+        ledger
+            .store
+            .execute(
+                "INSERT INTO ledger (node_id, session_id, request_id, role, content,
+                                     turn_index, accepted, active_lod, metadata, created_at,
+                                     label, lod, content_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    99_i64,
+                    "sess-pre-lod",
+                    "req-pre-lod",
+                    "user",
+                    "legacy flat content",
+                    0_i64,
+                    1_i64,
+                    0_i64,
+                    "{}",
+                    0_i64,
+                    "legacy label",
+                    "[]",
+                    "{}",
+                ],
+            )
+            .unwrap();
+
+        let id = NodeId::from_int(99);
+        assert!(
+            ledger.get_node(id).is_none(),
+            "unparseable content_json -> None"
+        );
+
+        let entries = ledger.get_session_entries("sess-pre-lod", 10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "legacy flat content");
     }
 
     #[test]

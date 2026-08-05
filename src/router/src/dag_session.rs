@@ -120,6 +120,10 @@ pub struct DependencySession {
     checkpoints: HashMap<String, usize>,
     kv_cache: Option<KvCacheManager>,
     step_order: Vec<String>,
+    /// Set when the escalation ladder's turnover mode hands the session to a
+    /// frontier model (ROADMAP_20260805_REVIEW M3.7). Subsequent requests in
+    /// the session bypass the local pipeline and go straight to frontier.
+    frontier_owned: bool,
 }
 
 impl DependencySession {
@@ -135,6 +139,7 @@ impl DependencySession {
             checkpoints: HashMap::new(),
             kv_cache: None,
             step_order: Vec::new(),
+            frontier_owned: false,
         }
     }
 
@@ -144,6 +149,19 @@ impl DependencySession {
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
         self
+    }
+
+    /// Mark the session as frontier-owned (turnover handoff) or not. When
+    /// owned, subsequent requests in the session bypass the local pipeline.
+    pub fn set_frontier_owned(&mut self, owned: bool) {
+        self.frontier_owned = owned;
+    }
+
+    /// Whether the escalation ladder's turnover mode handed this session to a
+    /// frontier model. The server routes such sessions' requests straight to
+    /// the frontier (ROADMAP_20260805_REVIEW M3.7).
+    pub fn is_frontier_owned(&self) -> bool {
+        self.frontier_owned
     }
 
     /// Set the adapter (LoRA) name, part of the KV-cache snapshot key.

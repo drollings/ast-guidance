@@ -128,7 +128,10 @@ pub static DB_POOL: LazyLock<Arc<ResultPool<DbSyncPayload, usize, String>>> = La
 /// let mut zone = Zone::new_with_config(
 ///     Arc::new(TokioRuntime),
 ///     CapabilitySet::default(),
-///     ZoneConfig { poll_budget: 64 },
+///     ZoneConfig {
+///         poll_budget: 64,
+///         ..ZoneConfig::default()
+///     },
 /// );
 /// zone.register(build_task_a);  // provides "parsed"
 /// zone.register(build_task_b);  // depends on "parsed"

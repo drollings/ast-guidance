@@ -46,16 +46,36 @@ pub enum CancelReason {
 }
 
 /// Configuration for a `Zone`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct ZoneConfig {
     /// Maximum number of tasks to poll per `Zone::poll` invocation.
     /// Prevents a single zone from starving the executor.
     pub poll_budget: usize,
+    /// Whether a `WorkError` returned by a registered unit is worth a retry.
+    /// Defaults to `WorkError::is_retryable` — permanent `Execution` failures
+    /// short-circuit without burning backoff budget (M5.1). Override when a
+    /// zone's units wrap genuinely transient failures in
+    /// `WorkError::Execution` (e.g. chart targets whose LLM call failed).
+    pub is_retryable: fn(&WorkError) -> bool,
 }
+
+impl PartialEq for ZoneConfig {
+    fn eq(&self, other: &Self) -> bool {
+        // The retry predicate is a policy function, not data — fn-pointer
+        // addresses are not guaranteed unique, so equality compares the
+        // numeric tuning only.
+        self.poll_budget == other.poll_budget
+    }
+}
+
+impl Eq for ZoneConfig {}
 
 impl Default for ZoneConfig {
     fn default() -> Self {
-        Self { poll_budget: 64 }
+        Self {
+            poll_budget: 64,
+            is_retryable: WorkError::is_retryable,
+        }
     }
 }
 
@@ -175,9 +195,10 @@ impl Zone {
         let name: ArcIntern<str> = ArcIntern::from(unit.name());
         let max_retries = ctx.max_retries;
         let timeout_ms = ctx.timeout_ms;
+        let is_retryable = self.config.is_retryable;
 
         let abort = self.join_set.spawn(async move {
-            execute_with_timeout_and_retry(unit, ctx, max_retries, timeout_ms).await
+            execute_with_timeout_and_retry(unit, ctx, max_retries, timeout_ms, is_retryable).await
         });
 
         let id = abort.id();
@@ -322,6 +343,7 @@ async fn execute_with_timeout_and_retry(
     ctx: WorkContext,
     max_retries: u32,
     timeout_ms: u64,
+    is_retryable: fn(&WorkError) -> bool,
 ) -> Result<WorkOutput, WorkError> {
     // Yield to allow pending abort signals to be processed before
     // executing the synchronous work unit body.
@@ -332,12 +354,15 @@ async fn execute_with_timeout_and_retry(
         // keeps the first retry ≈ 100ms (deliberate schedule change from the
         // old linear 100ms*attempt — documented in the roadmap checklist).
         // `max_retries` counts retries after the first attempt, so the helper
-        // runs `max_retries + 1` attempts total.
+        // runs `max_retries + 1` attempts total. M5.1: the retry predicate is
+        // configurable per zone; the default (`WorkError::is_retryable`) treats
+        // permanent `WorkError::Execution` failures as non-retryable so they
+        // don't burn backoff budget.
         common_core::retry::retry_async(
             max_retries.saturating_add(1).max(1),
             100,
             50,
-            |_: &WorkError| true,
+            is_retryable,
             || async {
                 // Allow abort signals to be processed before each attempt.
                 tokio::task::yield_now().await;

@@ -14,8 +14,6 @@ pub enum ServerError {
         addr: String,
         source: std::io::Error,
     },
-    #[error("frontier mode not implemented: {0}")]
-    FrontierNotImplemented(String),
     #[error("http error: {0}")]
     Http(String),
     #[error("invalid address: {0}")]

@@ -353,6 +353,131 @@ fn test_e2e_custom_fixtures_produce_expected_results() {
     assert!(!good_result.rejected, "good input should not be rejected");
 }
 
+// ── M4: classification-tree config through mock mode ──────────────────────
+
+/// A tree-shaped config: root classifier → terminal nodes, plus a fallback.
+fn make_tree_config() -> RouterConfig {
+    serde_json::from_str(
+        r#"{
+            "pipelines": {"default": {"deterministic_prefilter": true, "classifier": true}},
+            "models": {
+                "fast": {"endpoint": "http://upstream.test:8080/v1/chat/completions", "name": "fast", "intelligence": 1, "cost_input": 1e-6, "cost_output": 6e-6, "cost_cached_read": 4e-7, "speed": 10},
+                "code-model": {"endpoint": "http://upstream.test:8080/v1/chat/completions", "name": "code-model", "intelligence": 5, "cost_input": 5e-6, "cost_output": 3e-5, "cost_cached_read": 2e-6, "speed": 5}
+            },
+            "model_groups": {"fast": ["fast"], "code": ["code-model"]},
+            "routes": {
+                "code": {"group": "code", "pipelines": ["default"], "description": "code"},
+                "local": {"group": "fast", "pipelines": ["default"], "description": "local"}
+            },
+            "default_route": "local",
+            "classification": {
+                "root": {
+                    "type": "classifier",
+                    "description": "request router",
+                    "model": "fast",
+                    "children": [
+                        {
+                            "key": "code",
+                            "description": "programming and implementation",
+                            "node": { "type": "terminal", "route": "code", "group": "code" }
+                        },
+                        {
+                            "key": "general",
+                            "description": "everything else",
+                            "node": {
+                                "type": "fallback",
+                                "node": { "type": "terminal", "route": "local", "group": "fast" }
+                            }
+                        }
+                    ]
+                }
+            }
+        }"#,
+    )
+    .expect("valid tree config")
+}
+
+fn tree_verdict(route: &str, complexity: u8) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "route": route,
+        "coherence": 0.9,
+        "safety": 0.9,
+        "complexity": complexity,
+        "reason": "tree verdict",
+    }))
+    .unwrap()
+}
+
+fn make_tree_pipeline(provider: TranscriptProvider) -> PipelineOrchestrator {
+    let config = make_tree_config();
+    let backend = Arc::new(provider) as Arc<dyn ChatBackend>;
+    config
+        .build_named_pipeline_with_backend("default", Some(backend))
+        .expect("tree pipeline should build with transcript provider")
+}
+
+#[test]
+fn test_e2e_tree_config_routes_to_terminal() {
+    let mut entries = HashMap::new();
+    entries.insert("help me debug rust".into(), tree_verdict("code", 6));
+    let pipeline = make_tree_pipeline(TranscriptProvider::new(entries));
+    let result = route(&pipeline, &make_request("help me debug rust"))
+        .expect("pipeline should complete");
+
+    assert!(!result.rejected, "tree should route, not reject");
+    let rt = result
+        .routing_target
+        .expect("tree should produce a routing target");
+    assert_eq!(rt.target_name.as_deref(), Some("code"));
+    assert_eq!(rt.model, "code-model");
+    assert_eq!(rt.group.as_deref(), Some("code"));
+}
+
+#[test]
+fn test_e2e_tree_config_unknown_route_uses_fallback() {
+    let mut entries = HashMap::new();
+    entries.insert("hello there".into(), tree_verdict("does-not-exist", 2));
+    let pipeline = make_tree_pipeline(TranscriptProvider::new(entries));
+    let result = route(&pipeline, &make_request("hello there"))
+        .expect("pipeline should complete");
+
+    assert!(!result.rejected);
+    let rt = result
+        .routing_target
+        .expect("fallback terminal should produce a routing target");
+    assert_eq!(rt.target_name.as_deref(), Some("local"));
+    assert_eq!(rt.model, "fast");
+}
+
+#[test]
+fn test_e2e_tree_config_rejects_incoherent() {
+    let mut entries = HashMap::new();
+    entries.insert(
+        "asdfghjkl qwerty".into(),
+        serde_json::to_string(&serde_json::json!({
+            "route": "code",
+            "coherence": 0.1,
+            "safety": 0.9,
+            "complexity": 1,
+            "reason": "garbage",
+        }))
+        .unwrap(),
+    );
+    let pipeline = make_tree_pipeline(TranscriptProvider::new(entries));
+    let result = route(&pipeline, &make_request("asdfghjkl qwerty"))
+        .expect("pipeline should complete");
+
+    assert!(result.rejected, "below-threshold tree verdict should reject");
+    assert!(
+        result
+            .reject_reason
+            .as_ref()
+            .is_some_and(|r| r.contains("coherence")),
+        "rejection reason should mention coherence, got: {:?}",
+        result.reject_reason
+    );
+}
+
 // ── Checkpoint/Rewind Cycle (DAG session-level) ─────────────────────────
 
 #[tokio::test]

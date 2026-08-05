@@ -168,28 +168,16 @@ impl<T: Send + Sync + 'static> WorkerPool<T> {
         let queue = Arc::new(Queue::new(queue_capacity));
         let shutdown = Arc::new(Notify::new());
         let handler = Arc::new(handler);
-        let mut workers = Vec::with_capacity(cap);
-
-        for _ in 0..cap {
-            let q = Arc::clone(&queue);
-            let sd = Arc::clone(&shutdown);
-            let h = Arc::clone(&handler);
-            let r = Arc::clone(&runtime);
-            workers.push(r.spawn(Box::pin(async move {
-                loop {
-                    tokio::select! {
-                        () = sd.notified() => break,
-                        item = q.pop() => {
-                            if let Some(item) = item {
-                                h(item).await;
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                }
-            })));
-        }
+        let workers = spawn_queue_workers(
+            runtime,
+            cap,
+            &queue,
+            &shutdown,
+            move |job: T| {
+                let handler = Arc::clone(&handler);
+                async move { handler(job).await }
+            },
+        );
 
         Self {
             queue,
@@ -233,10 +221,142 @@ pub enum ResultPoolError<E> {
     Canceled,
 }
 
-/// Internal wrapper that pairs a job with a oneshot sender for the result.
+/// Internal wrapper pairing a job with a oneshot sender for its result.
+/// Shared by `ResultPool` and `PriorityResultPool` (M5.3 consolidation — the
+/// two pools previously declared separate but identical wrapper structs).
 struct WrappedJob<T, R, E> {
     job: T,
     result_tx: tokio::sync::oneshot::Sender<Result<R, E>>,
+}
+
+/// Priority queue shared by `PriorityResultPool` workers, guarded by a mutex.
+type PriorityJobQueue<T, R, E> =
+    tokio::sync::Mutex<crate::queue::PriorityQueue<WrappedJob<T, R, E>>>;
+
+/// Spawn `cap` worker tasks running one shared worker core (M5.3).
+///
+/// Each worker loops: `next_job().await` resolves to `Some(job)` when work is
+/// available or `None` when the pool is shutting down, and `handle(job).await`
+/// processes it. `next_job` encapsulates the pool's queue discipline — the
+/// `Queue`-backed pools `select!` between a shutdown notification and `pop`
+/// (so shutdown can preempt a pending pop); the priority pool drains its queue
+/// and then waits on shutdown/notify (drain-then-wait). `handle` runs the job;
+/// result pools also reply through the job's oneshot channel. This is the one
+/// worker loop every public pool type parameterizes.
+#[allow(clippy::needless_pass_by_value)]
+fn spawn_workers<J, F, Fut, H, HFut>(
+    runtime: Arc<dyn Runtime>,
+    cap: usize,
+    next_job: F,
+    handle: H,
+) -> Vec<JoinHandle<()>>
+where
+    J: Send + 'static,
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Option<J>> + Send + 'static,
+    H: Fn(J) -> HFut + Send + Sync + 'static,
+    HFut: Future<Output = ()> + Send + 'static,
+{
+    let next_job = Arc::new(next_job);
+    let handle = Arc::new(handle);
+    let mut workers = Vec::with_capacity(cap);
+    for _ in 0..cap {
+        let n = Arc::clone(&next_job);
+        let h = Arc::clone(&handle);
+        let r = Arc::clone(&runtime);
+        workers.push(r.spawn(Box::pin(async move {
+            while let Some(job) = n().await {
+                h(job).await;
+            }
+        })));
+    }
+    workers
+}
+
+/// Spawn `cap` workers for a `Queue`-backed pool (M5.3). Each worker
+/// `select!`s between a shutdown notification and `pop`, so shutdown can
+/// preempt a pending pop; `handle` runs each job. Shared by `WorkerPool`
+/// and `ResultPool`.
+fn spawn_queue_workers<J, H, HFut>(
+    runtime: Arc<dyn Runtime>,
+    cap: usize,
+    queue: &Arc<Queue<J>>,
+    shutdown: &Arc<Notify>,
+    handle: H,
+) -> Vec<JoinHandle<()>>
+where
+    J: Send + 'static,
+    H: Fn(J) -> HFut + Send + Sync + 'static,
+    HFut: Future<Output = ()> + Send + 'static,
+{
+    spawn_workers(
+        runtime,
+        cap,
+        {
+            let queue = Arc::clone(queue);
+            let shutdown = Arc::clone(shutdown);
+            move || {
+                let queue = Arc::clone(&queue);
+                let shutdown = Arc::clone(&shutdown);
+                async move {
+                    tokio::select! {
+                        () = shutdown.notified() => None,
+                        item = queue.pop() => item,
+                    }
+                }
+            }
+        },
+        handle,
+    )
+}
+
+/// Spawn `cap` workers for `PriorityResultPool` (M5.3). Each worker pops one
+/// job under the queue mutex and, when empty, waits for a submit notification
+/// or shutdown (drain-then-wait).
+fn spawn_priority_workers<T, R, E, H, HFut>(
+    runtime: Arc<dyn Runtime>,
+    cap: usize,
+    queue: &Arc<PriorityJobQueue<T, R, E>>,
+    notify: &Arc<Notify>,
+    shutdown: &Arc<Notify>,
+    handle: H,
+) -> Vec<JoinHandle<()>>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+    E: Send + 'static,
+    H: Fn(WrappedJob<T, R, E>) -> HFut + Send + Sync + 'static,
+    HFut: Future<Output = ()> + Send + 'static,
+{
+    spawn_workers(
+        runtime,
+        cap,
+        {
+            let queue = Arc::clone(queue);
+            let notify = Arc::clone(notify);
+            let shutdown = Arc::clone(shutdown);
+            move || {
+                let queue = Arc::clone(&queue);
+                let notify = Arc::clone(&notify);
+                let shutdown = Arc::clone(&shutdown);
+                async move {
+                    loop {
+                        {
+                            let mut pq = queue.lock().await;
+                            if let Some(wrapped) = pq.pop() {
+                                return Some(wrapped);
+                            }
+                        }
+                        tokio::select! {
+                            () = shutdown.notified() => return None,
+                            () = notify.notified() => {},
+                        }
+                    }
+                }
+            }
+        },
+        handle,
+    )
 }
 
 /// Worker pool where the handler returns a `Result<R, E>` and `submit`
@@ -275,29 +395,22 @@ where
         let queue: Arc<Queue<WrappedJob<T, R, E>>> = Arc::new(Queue::new(queue_capacity));
         let shutdown = Arc::new(Notify::new());
         let handler = Arc::new(handler);
-        let mut workers = Vec::with_capacity(cap);
-
-        for _ in 0..cap {
-            let q = Arc::clone(&queue);
-            let sd = Arc::clone(&shutdown);
-            let h = Arc::clone(&handler);
-            let r = Arc::clone(&runtime);
-            workers.push(r.spawn(Box::pin(async move {
-                loop {
-                    tokio::select! {
-                        () = sd.notified() => break,
-                        wrapped = q.pop() => {
-                            if let Some(wrapped) = wrapped {
-                                let result = h(wrapped.job).await;
-                                let _ = wrapped.result_tx.send(result);
-                            } else {
-                                break;
-                            }
-                        }
+        let workers = spawn_queue_workers(
+            runtime,
+            cap,
+            &queue,
+            &shutdown,
+            {
+                let handler = Arc::clone(&handler);
+                move |wrapped: WrappedJob<T, R, E>| {
+                    let handler = Arc::clone(&handler);
+                    async move {
+                        let WrappedJob { job, result_tx } = wrapped;
+                        let _ = result_tx.send(handler(job).await);
                     }
                 }
-            })));
-        }
+            },
+        );
 
         Self {
             queue,
@@ -417,12 +530,6 @@ impl Limiter {
     }
 }
 
-/// Priority-aware wrapper that pairs a job with a oneshot sender.
-struct PriorityWrappedJob<T, R, E> {
-    job: T,
-    result_tx: tokio::sync::oneshot::Sender<Result<R, E>>,
-}
-
 /// A worker pool where jobs are dispatched in priority order.
 ///
 /// Higher priority values are dispatched first. Jobs with the same priority
@@ -434,7 +541,7 @@ where
     R: Send + 'static,
     E: Send + 'static,
 {
-    queue: Arc<tokio::sync::Mutex<crate::queue::PriorityQueue<PriorityWrappedJob<T, R, E>>>>,
+    queue: Arc<PriorityJobQueue<T, R, E>>,
     notify: Arc<Notify>,
     workers: Vec<JoinHandle<()>>,
     shutdown: Arc<Notify>,
@@ -454,44 +561,28 @@ where
         F: Fn(T) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<R, E>> + Send,
     {
-        let queue: Arc<
-            tokio::sync::Mutex<crate::queue::PriorityQueue<PriorityWrappedJob<T, R, E>>>,
-        > = Arc::new(tokio::sync::Mutex::new(crate::queue::PriorityQueue::new()));
+        let queue: Arc<PriorityJobQueue<T, R, E>> =
+            Arc::new(tokio::sync::Mutex::new(crate::queue::PriorityQueue::new()));
         let shutdown = Arc::new(Notify::new());
         let notify = Arc::new(Notify::new());
         let handler = Arc::new(handler);
-        let mut workers = Vec::with_capacity(cap);
-
-        for _ in 0..cap {
-            let q = Arc::clone(&queue);
-            let sd = Arc::clone(&shutdown);
-            let h = Arc::clone(&handler);
-            let r = Arc::clone(&runtime);
-            let nf = Arc::clone(&notify);
-            workers.push(r.spawn(Box::pin(async move {
-                loop {
-                    // Drain everything currently queued.
-                    loop {
-                        let wrapped = {
-                            let mut pq = q.lock().await;
-                            pq.pop()
-                        };
-                        match wrapped {
-                            Some(w) => {
-                                let result = h(w.job).await;
-                                let _ = w.result_tx.send(result);
-                            }
-                            None => break,
-                        }
-                    }
-                    // Nothing left — wait for a new item or shutdown.
-                    tokio::select! {
-                        () = sd.notified() => break,
-                        () = nf.notified() => {},
+        let workers = spawn_priority_workers(
+            runtime,
+            cap,
+            &queue,
+            &notify,
+            &shutdown,
+            {
+                let handler = Arc::clone(&handler);
+                move |wrapped: WrappedJob<T, R, E>| {
+                    let handler = Arc::clone(&handler);
+                    async move {
+                        let WrappedJob { job, result_tx } = wrapped;
+                        let _ = result_tx.send(handler(job).await);
                     }
                 }
-            })));
-        }
+            },
+        );
 
         Self {
             queue,
@@ -505,7 +596,7 @@ where
     /// Higher priority values are dispatched first.
     pub async fn submit(&self, job: T, priority: i32) -> Result<R, ResultPoolError<E>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let wrapped = PriorityWrappedJob { job, result_tx: tx };
+        let wrapped = WrappedJob { job, result_tx: tx };
         {
             let mut pq = self.queue.lock().await;
             pq.push(wrapped, priority);

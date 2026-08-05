@@ -44,7 +44,7 @@ pub struct ChartHealth {
 }
 
 /// Outcome of an idempotent chart upsert (M10).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum UpsertOutcome {
     /// No near neighbor — the chart was stored under its own name (as a
     /// draft; selectable only after a rubric-validated run).
@@ -255,11 +255,13 @@ impl ChartStore {
         entry.stale_failures += 1;
         if entry.stale_failures >= crate::charts::CHART_STALE_FAILS {
             entry.demoted = true;
-            tracing::warn!(
-                target: "router.charts.audit",
-                chart = chart,
-                stale_failures = entry.stale_failures,
-                "chart demoted after CHART_STALE_FAILS consecutive rubric failures",
+            crate::audit::emit(
+                "chart_store",
+                serde_json::json!({
+                    "chart": chart,
+                    "stale_failures": entry.stale_failures,
+                    "demoted": true,
+                }),
             );
             return Some(chart.to_string());
         }
@@ -517,25 +519,18 @@ fn load_cached_embedding(
     chart: &str,
     doc: &str,
 ) -> Result<Option<Vec<f32>>, ChartError> {
-    let mut stmt = conn
-        .prepare("SELECT doc_text, embedding FROM workflow_library WHERE chart = ?1")
-        .map_err(|e| ChartError::Index {
-            reason: format!("prepare cache lookup: {e}"),
-        })?;
-    let mut rows = stmt
-        .query_map([chart], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })
-        .map_err(|e| ChartError::Index {
-            reason: format!("query cache for '{chart}': {e}"),
-        })?;
-    let Some(row) = rows.next().transpose().map_err(|e| ChartError::Index {
-        reason: format!("read cache for '{chart}': {e}"),
-    })?
-    else {
+    let row = fluent_db::query::query_row(
+        conn,
+        "SELECT doc_text, embedding FROM workflow_library WHERE chart = ?1",
+        rusqlite::params![chart],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+    )
+    .map_err(|e| ChartError::Index {
+        reason: format!("query cache for '{chart}': {e}"),
+    })?;
+    let Some((cached_doc, blob)) = row else {
         return Ok(None);
     };
-    let (cached_doc, blob) = row;
     if cached_doc != doc {
         return Ok(None);
     }

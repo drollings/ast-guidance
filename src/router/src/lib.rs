@@ -20,6 +20,7 @@
 //!   eager, LOD1–4 lazy from LOD0 via `Summarizer`), `CompactionStrategy`,
 //!   `RecencyCompaction` (folded in from the deleted `compaction.rs`)
 
+pub mod audit;
 pub mod charts;
 pub mod config;
 pub mod dag_session;

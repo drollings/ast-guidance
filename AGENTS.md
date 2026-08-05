@@ -45,20 +45,6 @@ This is a rust monorepo with multiple projects and shared infrastructure.  coral
 It must NOT import from `guidance`, `coral`, `wasm_ipc`, `knowledge`,
 `ontology`, or `rdf`.
 
-`fluent-db` (`src/db/`) may import from `common-core` (with `sqlite` feature),
-`fluent-wvr`, `tokio`, `rusqlite`, `hnsw_rs`, `anndists`, `serde`, `thiserror`,
-`tracing`. It must NOT import from `fluent-concurrency`, `guidance`, `coral`,
-`fluent-router`, `search-vector`, `knowledge`, `ontology`, `rdf`, `fluent-types`,
-or `wasm_ipc`. The capability-gating primitives (`CURRENT_CAPS`,
-`check_capability`, `CapabilityError`) live in `fluent-wvr` so both
-`fluent-db` and `fluent-concurrency` can read the same task-local without a
-cyclic dependency; `fluent-concurrency` re-exports `DbCapability` from
-`fluent-db` behind its `db` feature.
-
-`search-vector` / `coral-context` / `fluent-router` / `fluent-knowledge` /
-`memory-plugin` / `guidance-core` may additionally import `fluent-db` as they
-adopt it (M4–M8 of ROADMAP_20260804_DB).
-
 
 ## Source Layout
 
@@ -145,25 +131,6 @@ doc/
 
 ---
 
-## Production adoption sites
-
-Which consumers use which `fluent-concurrency` primitives:
-
-| Primitive | Production consumer | Location |
-|---|---|---|
-| `Scope::defer` | `job-copilot` handler | `src/job-copilot/src/server/handler.rs` |
-| `ResultPool` | `guidance-llm` request queue | `src/llm/src/client.rs` |
-| `PriorityResultPool` | `fluent-concurrency` tests only | `src/fluent-concurrency/src/pool.rs` |
-| `WorkerPool` | `fluent-concurrency` tests only | `src/fluent-concurrency/src/pool.rs` |
-| `Queue` | `fluent-concurrency` tests only | `src/fluent-concurrency/src/pool.rs` |
-| `Instrumented::with_metrics` | `bin/guidance` histogram, guidance `Enhancer` | `src/bin/guidance/src/main.rs`, `src/guidance/src/enhancer.rs` |
-| `ComponentAdapter` | `coral` cache reactor | `src/coral/src/cache/reactor.rs` |
-| `PartitionedRouter` | `job-copilot` dispatcher | `src/job-copilot/src/dispatcher/llm.rs` |
-| `Zone` | `fluent-concurrency` supervision | `src/fluent-concurrency/src/zone.rs` |
-| `DependencyGraph` | `Zone` cancellation, `DependencySession` | `src/dag/src/dep_graph.rs`, `src/router/src/dag_session.rs` |
-
----
-
 ## Consolidation Contract
 
 `src/common-core` is the **only permitted zero-domain crate** in the workspace.
@@ -189,11 +156,12 @@ anything that knows what a "node", "session", "target", "embedding", or
 | Poison-safe mutex locking (`lock`, `lock_read`, `lock_write` — `PoisonError::into_inner`) | `common-core::sync` | `src/common-core/src/sync.rs` |
 | Fluent WVR newtype wrappers (`Instrumented`, `ComponentAdapter`, `Pipeline`, `retry_call`, `ComponentCascade`) | `fluent-wvr::wrapper` | `src/fluent-wvr/src/wrapper.rs` |
 | Jittered-exponential retry (`backoff_ms`, `retry_async`) | `common-core::retry` | `src/common-core/src/retry.rs` |
+| Sync→async runtime bridge (`block_on`, `OnceLock` fallback runtime — multi-thread → `block_in_place` + `handle.block_on`; current-thread → `handle.block_on`; no handle → fallback) | `common-core::runtime` | `src/common-core/src/runtime.rs` |
 | Shared domain newtypes (`NodeId`, `SessionId`, `TargetId`, `LOD_COUNT`) | `guidance-types` | `src/types/src/lib.rs` |
 | Cosine similarity / brute-force KNN / RRF fusion (`cosine_similarity`, `knn_brute_force`, `vec_to_bytes`/`bytes_to_vec`/`try_bytes_to_vec`, `QuantizedEmbedding`, `cosine_similarity_q8`, `rrf_merge`) | `fluent-db::vector` (`search-vector::math` re-exports it) | `src/db/src/vector.rs` |
 | Database error taxonomy (`DbError` — `Sqlite|NotFound|DuplicateEntry|Busy|PoolExhausted|InvalidSchemaVersion|Other`; the single `From<rusqlite::Error>` centralizing `is_unique_violation` → `DuplicateEntry` and `SQLITE_BUSY` → `Busy`) | `fluent-db::error` | `src/db/src/error.rs` |
 | Single-connection store (open/WAL/schema-init/migrations/typed helpers, poison-safe lock) | `fluent-db::store` (`SqliteStore`) | `src/db/src/store.rs` |
-| Pooled async store (`Semaphore` + `spawn_blocking` + RAII checkout, `PoolConfig { size, busy_timeout_ms }`) | `fluent-db::pool` (`SqlitePool`) | `src/db/src/pool.rs` |
+| Pooled async store (`Semaphore` + `spawn_blocking` + RAII checkout, `PoolConfig { size, busy_timeout_ms }`; `acquire` capability-gated, `transaction` helper) | `fluent-db::pool` (`SqlitePool`) | `src/db/src/pool.rs` |
 | Typed statement helpers (`query_row`/`query_rows`/`execute`/`execute_batch`/`query_rows_from_iter`/`last_insert_rowid`/`transaction`) | `fluent-db::query` | `src/db/src/query.rs` |
 | Idempotent schema migrations (`Migration` trait, `migrate` via `PRAGMA user_version`, `ensure_column`, `schema_version`) | `fluent-db::migrate` | `src/db/src/migrate.rs` |
 | TTL/LRU key-value cache store (`TtlCache` — get-with-expiry/put/evict_expired/evict_lru/clear/stats) | `fluent-db::cache` | `src/db/src/cache.rs` |
@@ -211,11 +179,12 @@ anything that knows what a "node", "session", "target", "embedding", or
 | `impl_component!` / `impl_fieldless!` macros (eliminate `as_any`/fieldless-`FieldAccess` boilerplate) | `fluent-wvr::impl_component!` / `fluent-wvr::impl_fieldless!` | `src/fluent-wvr/src/macros.rs` |
 | Tolerant LLM-JSON parse (`parse_json_response` — fence-strip → parse → extract) | `fluent_llm::parse` | `src/llm/src/parse.rs` |
 | OpenAI-compatible request body (`build_openai_chat_body` — carries the `chat_template_kwargs: {"enable_thinking": false}` default), stream-delta parser (`parse_openai_stream_delta`/`OpenAiDelta`), and OpenAI-format normalization (`normalize_request`/`normalize_response`/`error_response`/`messages_to_json`, parameterized on `serde_json::Value`) | `guidance-llm::openai` | `src/llm/src/openai.rs` |
+| LLM client sync→async bridge (`client::block_on` — delegates to `common_core::runtime::block_on`; module path preserved for callers) | `guidance-llm::client` | `src/llm/src/client.rs` |
 | LLM endpoint derivation (`chat_completions_url`, `derive_embeddings_url`) + URL validation | `guidance-llm::url` | `src/llm/src/url.rs` |
 | HTTP-status → failure taxonomy (`HttpClass`, `FailureClass`, `classify_http_status`) | `guidance-llm::http_class` | `src/llm/src/http_class.rs` |
 | Typed LLM request queue (`LlmRequestQueue`, `build_default_queue`, `default_handler`) — worker-pool dispatch for chat completions | `guidance-llm::llm_queue` | `src/llm/src/llm_queue.rs` |
 | `ComponentArcExt::try_as_any_mut` (safe mutable access to shared Arc) | `fluent-wvr::ComponentArcExt` | `src/fluent-wvr/src/traits.rs` |
-| Database `Component`/`WorkUnit` adapters (`DbStore` — blocking-connection abstraction; `DbWorkUnit<F>` — `execute` offloads via `block_in_place`; `store_unit(Arc<SqliteStore>, name, op)` factory) | `fluent-db::wvr` | `src/db/src/wvr.rs` |
+| Database `Component`/`WorkUnit` adapters (`DbStore` — blocking-connection abstraction; `DbWorkUnit<F>` — `execute` offloads via `block_in_place`/`spawn_blocking`, scoping `ctx.caps` on **both** offload paths so pool-backed units are capability-correct; `store_unit(Arc<SqliteStore>, name, op)` factory; the pool-backed `DbStore` bridges sync→async via `common_core::runtime::block_on`) | `fluent-db::wvr` | `src/db/src/wvr.rs` |
 | `WorkOutput::typed` (Result-returning) and `WorkOutput::data_take` (zero-copy) | `fluent-wvr::WorkOutput` | `src/fluent-wvr/src/work.rs` |
 | `make_hnsw()` | `common-core::sqlite` | `src/common-core/src/sqlite.rs` (feature `sqlite`) |
 | `Middleware` trait | `fluent-wvr::wrapper` | `src/fluent-wvr/src/wrapper.rs` |
@@ -234,76 +203,3 @@ consumer appears. `MAX_KNN_CANDIDATES` and `MAX_MCP_REQUEST_SIZE` were
 promoted in ROADMAP_20260804_SHARED_CORE M4.3 (coral re-exports them).
 Current single-consumer limits (candidates for future promotion):
 `MAX_WASM_HOST_CALLS` in `src/wasm_ipc/src/lib.rs:17`.
-
-### HNSW instances
-
-`coral` and `search-vector` each maintain **separate** HNSW indices backed by
-the same `HnswParams::default()` constants. They remain separate because no
-shared vector store exists between the two crates today. If a shared store
-appears in the future, host the HNSW index in `search-vector` and have `coral`
-delegate. Both crates compose `fluent-db` components for index construction and
-brute-force fallback: `fluent_db::hnsw::HnswIndex` (which internally calls
-`common_core::sqlite::make_hnsw` — the positional-argument unpacking of
-`Hnsw::new(...)` is centralized in exactly one place) and
-`knn_brute_force`/`try_bytes_to_vec` from `fluent_db::vector` (re-exported via
-`search-vector::math`).
-
-### Metrics / Instrumented wiring (M12)
-
-`common_core::metrics::LatencyHistogram` is the canonical latency surface,
-and `fluent_wvr::wrapper::Instrumented::with_metrics(inner, label,
-histogram)` is the future-ready API for recording per-unit execution
-durations.  The in-tree consumers today are the CLI-level `cmd_histogram` in
-`src/bin/guidance/src/main.rs` (total command timing) and the guidance
-`Enhancer::with_metrics` (`src/guidance/src/enhancer.rs`, per-LLM-call
-latency, wired by ROADMAP_20260804_SHARED_CORE M9).  Coral's `coral_stats`
-aggregates across units via `LatencyHistogram::aggregate` (M4).  Candidate
-adoption sites are documented in the `with_metrics` doc comment (the L4
-Semantic KNN dispatch in `coral::cache::reactor`, and the top-level dispatch
-on the `TargetWorkUnit` bridge under `Zone` supervision).  Adoption at any
-of those moves M12 from "test-only" to a
-real consumer wiring.
-
-### Dependency tracking
-
-`fluent_dag::dep_graph::DependencyGraph<K>` (`src/dag/src/dep_graph.rs`) is
-the **canonical dependency-graph primitive** for the workspace.  It provides
-`register`, `dependents_of` (transitive dependent set via cycle-resilient
-DFS), `topo_sort` / `topo_sort_from` (Kahn's algorithm), `is_ready` /
-`ready_nodes`, and `unresolved_deps` (unsatisfiable dependency detection). 
-Any new dependency-tracking workflow — session step DAGs, build-target
-graphs, task-supervision cancellation trees — MUST compose
-`DependencyGraph<K>` rather than re-implementing graph algorithms.  The
-reference integration is `fluent-concurrency`'s `Zone`
-(`src/fluent-concurrency/src/zone.rs`), which replaced three hand-rolled
-`HashMap`s with a single `DependencyGraph<ArcIntern<str>>`.
-
----
-
-### `filter_thinking` — Think-block filtering contract
-
-Every LLM call (classifier, frontier dispatch buffered, frontier dispatch
-streaming) MUST respect `filter_thinking: bool` from the model config in
-`env/coral-router.json`.  The contract has two parts:
-
-1. **Request body**: The classifier HTTP request body (built by
-   `chat_complete_http_inner_async` in `src/llm/src/client.rs`) MUST include
-   `chat_template_kwargs: {"enable_thinking": false}` as a default so the model
-   does not emit `<think>...</think>` blocks in its response.  Model-level
-   `params` from `ModelEntry` are merged via `extra_body_params` so they can
-   override this default.  The `LlmConfig.think` flag (boolean) is the final
-   override — when `Some(true)` it enables thinking regardless of defaults.
-
-2. **Response filtering**:
-   - **Buffered dispatch** (`dispatch_to_llm_buffered` in `server.rs`): apply
-     `strip_thinking_blocks()` after receiving the full response when
-     `filter_thinking` is true.
-   - **Streaming dispatch** (`dispatch_to_llm_streaming` / `stream_dispatch_inner`
-     in `server.rs`): pass `filter_thinking` to `StreamingHandler` via
-     `with_filter_thinking()`.  The handler tracks think-block open/close tags
-     across chunks so partial tags are never leaked to the client.
-
-When modifying any LLM call path, verify that `ModelEntry.params` from the
-config are forwarded through `LlmConfig.extra_body_params` (for the classifier
-path) or `RoutingTarget.params` (for the frontier dispatch path), and that
-`filter_thinking` is propagated to the response handler.

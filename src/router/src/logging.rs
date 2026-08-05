@@ -7,6 +7,10 @@
 
 use std::path::PathBuf;
 
+use tracing_subscriber::filter::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::Layer;
+
 use crate::config::AuditLogConfig;
 
 /// Configuration for router logging output.
@@ -66,10 +70,7 @@ impl Default for LoggingConfig {
 /// Spans are request-scoped, not session-scoped — no session ID
 /// appears in span metadata (cardinality).
 pub fn init_router_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::error::Error>> {
-    use tracing_subscriber::filter::EnvFilter;
-    use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
-    use tracing_subscriber::Layer;
 
     std::fs::create_dir_all(&config.log_dir).map_err(|e| {
         format!(
@@ -88,11 +89,11 @@ pub fn init_router_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::er
 
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = ops_filter();
 
     // ── Build audit layer (if configured) ─────────────────────────────
-    // The audit writer must outlive the process; use a thread-local
-    // approach: leak the guard so the non-blocking writer lives forever.
+    // The audit writer must outlive the process; leak the guard so the
+    // non-blocking writer lives forever (mirrors the ops writer below).
     struct AuditResources {
         _guard: tracing_appender::non_blocking::WorkerGuard,
         appender: tracing_appender::non_blocking::NonBlocking,
@@ -121,6 +122,15 @@ pub fn init_router_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::er
         })
         .transpose()?;
 
+    // The `NonBlocking` writer is `Clone` (an `Arc` to the inner channel), so
+    // hand a clone to the subscriber and leak the `AuditResources` struct —
+    // dropping it here would drop the `WorkerGuard` and shut down the audit
+    // writer thread before any event is ever flushed (the pre-M1 bug that left
+    // the durable audit file empty).
+    let audit_writer: Option<tracing_appender::non_blocking::NonBlocking> =
+        audit_resources.as_ref().map(|r| r.appender.clone());
+    std::mem::forget(audit_resources);
+
     // ── Build per-branch subscribers ──────────────────────────────────
     // tracing_subscriber's `.with()` changes the concrete type per layer,
     // requiring a match over optional layer combinations. Helper functions
@@ -128,40 +138,6 @@ pub fn init_router_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::er
     //
     // `Layer` trait is imported at the top of this function via
     // `use tracing_subscriber::Layer;`
-
-    /// Build a console (stderr) log layer with optional JSON formatting.
-    fn console_layer<S>(json: bool) -> Box<dyn Layer<S> + Send + Sync>
-    where
-        S: SubscriberExt + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
-    {
-        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-        if json {
-            tracing_subscriber::fmt::layer()
-                .json()
-                .with_writer(std::io::stderr)
-                .with_filter(filter)
-                .boxed()
-        } else {
-            tracing_subscriber::fmt::layer()
-                .with_writer(std::io::stderr)
-                .with_filter(filter)
-                .boxed()
-        }
-    }
-
-    /// Build an audit log layer (always JSON-formatted).
-    fn audit_layer<S>(
-        writer: tracing_appender::non_blocking::NonBlocking,
-    ) -> Box<dyn Layer<S> + Send + Sync>
-    where
-        S: SubscriberExt + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
-    {
-        tracing_subscriber::fmt::layer()
-            .json()
-            .with_writer(writer)
-            .with_filter(EnvFilter::new("router.audit=info"))
-            .boxed()
-    }
 
     macro_rules! init_registry {
         ($file_layer:expr, $has_console:expr, $audit:expr $(,)?) => {{
@@ -196,9 +172,6 @@ pub fn init_router_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::er
         }};
     }
 
-    let audit_writer: Option<tracing_appender::non_blocking::NonBlocking> =
-        audit_resources.map(|r| r.appender);
-
     if config.json_format {
         let file_layer = tracing_subscriber::fmt::layer()
             .json()
@@ -217,6 +190,54 @@ pub fn init_router_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::er
     tracing::info!(target: "router.logging", log_dir = %config.log_dir.display(), audit = config.audit_log.is_some(), "router logging initialized");
 
     Ok(())
+}
+
+/// Ops-stream filter: `info` (or `RUST_LOG`) with the durable audit target
+/// excluded — the audit layer owns `router.audit` exclusively so the ops and
+/// audit streams stay disjoint (ROADMAP_20260805_REVIEW M1.5).
+fn ops_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"))
+        .add_directive("router.audit=off".parse().unwrap())
+}
+
+/// Build a console (stderr) log layer with optional JSON formatting.
+fn console_layer<S>(json: bool) -> Box<dyn Layer<S> + Send + Sync>
+where
+    S: SubscriberExt + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    let filter = ops_filter();
+    if json {
+        tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(std::io::stderr)
+            .with_filter(filter)
+            .boxed()
+    } else {
+        tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_filter(filter)
+            .boxed()
+    }
+}
+
+/// Build an audit log layer (always JSON-formatted).
+///
+/// The filter subscribes to the canonical `router.audit` target (M1.2). It
+/// also keeps `router.charts.audit=info` (M1.1) so pre-M1.3 chart audits
+/// still land in the file; once every producer emits through
+/// `crate::audit::AUDIT_TARGET` the second directive can be reverted.
+fn audit_layer<S>(
+    writer: tracing_appender::non_blocking::NonBlocking,
+) -> Box<dyn Layer<S> + Send + Sync>
+where
+    S: SubscriberExt + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    tracing_subscriber::fmt::layer()
+        .json()
+        .with_writer(writer)
+        .with_filter(EnvFilter::new("router.audit=info,router.charts.audit=info"))
+        .boxed()
 }
 
 fn default_log_dir() -> PathBuf {
@@ -264,5 +285,73 @@ mod tests {
         // We verify the config values are accepted and the function type-checks.
         // In a full integration test we'd spawn a subprocess for this.
         let _ = config;
+    }
+
+    #[test]
+    fn audit_events_reach_audit_writer_not_ops_writer() {
+        use tracing_subscriber::registry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ops_dir = dir.path().join("ops");
+        let audit_dir = dir.path().join("audit");
+        std::fs::create_dir_all(&ops_dir).unwrap();
+        std::fs::create_dir_all(&audit_dir).unwrap();
+
+        let ops_appender = tracing_appender::rolling::RollingFileAppender::builder()
+            .rotation(tracing_appender::rolling::Rotation::NEVER)
+            .filename_prefix("router")
+            .filename_suffix("log")
+            .build(&ops_dir)
+            .unwrap();
+        let audit_appender = tracing_appender::rolling::RollingFileAppender::builder()
+            .rotation(tracing_appender::rolling::Rotation::NEVER)
+            .filename_prefix("audit")
+            .filename_suffix("log")
+            .build(&audit_dir)
+            .unwrap();
+
+        let (ops_nb, ops_guard) = tracing_appender::non_blocking(ops_appender);
+        let (audit_nb, audit_guard) = tracing_appender::non_blocking(audit_appender);
+
+        // The real registry construction: an ops file layer plus the audit
+        // layer over `router.audit=info,router.charts.audit=info`. Used under
+        // `with_default` (never `.init()`) so the global subscriber stays
+        // untouched for the rest of the test binary.
+        let subscriber = registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(ops_nb)
+                    .with_filter(ops_filter()),
+            )
+            .with(audit_layer(audit_nb));
+
+        tracing::subscriber::with_default(subscriber, || {
+            crate::audit::emit("chart_target", serde_json::json!({ "chart": "c" }));
+            tracing::info!(target: "router.pipeline", "ops event");
+        });
+
+        // Dropping the guards flushes the non-blocking writers synchronously.
+        drop(audit_guard);
+        drop(ops_guard);
+
+        let ops_content = std::fs::read_to_string(ops_dir.join("router.log")).unwrap();
+        let audit_content = std::fs::read_to_string(audit_dir.join("audit.log")).unwrap();
+
+        assert!(
+            audit_content.contains("chart_target"),
+            "audit record missing from audit file:\n{audit_content}"
+        );
+        assert!(
+            !audit_content.contains("ops event"),
+            "ops event leaked into audit file:\n{audit_content}"
+        );
+        assert!(
+            ops_content.contains("ops event"),
+            "ops event missing from ops file:\n{ops_content}"
+        );
+        assert!(
+            !ops_content.contains("chart_target"),
+            "audit record leaked into ops file:\n{ops_content}"
+        );
     }
 }

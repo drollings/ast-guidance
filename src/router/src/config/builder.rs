@@ -70,11 +70,22 @@ impl RouterConfig {
     }
 
     pub fn routing_config(&self) -> super::RoutingConfig {
+        // M4.4: when a classification tree is configured and no explicit
+        // `system_prompt` is set, derive one from the root classifier node's
+        // children so flat consumers still observe the auto-generated prompt.
+        let system_prompt = if self.system_prompt.is_empty() {
+            self.classification
+                .as_ref()
+                .and_then(super::ClassificationTree::derive_system_prompt)
+                .unwrap_or_default()
+        } else {
+            self.system_prompt.clone()
+        };
         super::RoutingConfig {
-            routes: self.routes.clone(),
+            routes: self.routes_view(),
             models: self.models.clone(),
             model_groups: self.model_groups.clone(),
-            system_prompt: self.system_prompt.clone(),
+            system_prompt,
             safety_threshold: self.safety_threshold,
             default_route: self.default_route.clone(),
             score_matrix: self.score_matrix.clone(),
@@ -109,6 +120,7 @@ impl RouterConfig {
         }
 
         if params.classifier {
+            let injected_backend = classifier_backend.is_some();
             let routing_config = self.routing_config();
             let classifier_intel = classifier_intelligence(self, params);
             let classifier_model = resolve_classifier_model_key(self, params)
@@ -126,15 +138,48 @@ impl RouterConfig {
                 .unwrap_or_else(default_classifier_concurrency);
             let limiter = Arc::new(fluent_concurrency::pool::Limiter::new(max_concurrency));
             tracing::debug!(target: "router.config", pipeline = %name, classifier_max_concurrency = max_concurrency, "classifier concurrency limiter constructed");
-            stages.push(Arc::new(crate::stages::classifier::ClassifierStage::new(
-                client,
-                routing_config,
-                params.coherence_threshold,
-                params.score_matrix.clone(),
-                classifier_intel,
-                classifier_model,
-                limiter,
-            )));
+
+            let stage = if let Some(tree) = &self.classification {
+                // M4: classification tree drives the classifier stage. The
+                // injected backend (mock/transcript) is always the default
+                // client; per-node model backends are only built in real mode.
+                let engine = build_classification_engine(
+                    self,
+                    tree,
+                    routing_config.clone(),
+                    Arc::clone(&client),
+                    Arc::clone(&limiter),
+                    params.coherence_threshold,
+                    !injected_backend,
+                );
+                tracing::info!(
+                    target: "router.config",
+                    pipeline = %name,
+                    tree_models = ?tree.classifier_model_keys(),
+                    "classifier stage driven by classification tree",
+                );
+                crate::stages::classifier::ClassifierStage::with_tree(
+                    client,
+                    routing_config,
+                    params.coherence_threshold,
+                    params.score_matrix.clone(),
+                    classifier_intel,
+                    classifier_model,
+                    limiter,
+                    Arc::new(engine),
+                )
+            } else {
+                crate::stages::classifier::ClassifierStage::new(
+                    client,
+                    routing_config,
+                    params.coherence_threshold,
+                    params.score_matrix.clone(),
+                    classifier_intel,
+                    classifier_model,
+                    limiter,
+                )
+            };
+            stages.push(Arc::new(stage));
         } else if classifier_backend.is_some() {
             tracing::warn!(
                 target: "router.config",
@@ -200,7 +245,9 @@ impl RouterConfig {
 /// Resolve the classifier model key from config, following the priority:
 /// 1. Pipeline-level `classifier_model`
 /// 2. Root-level `classifier_model`
-/// 3. First model in the `fast` model group
+/// 3. Root `classification` classifier node's `model` (M4.1 — tree configs
+///    boot without a flat classifier key)
+/// 4. First model in the `fast` model group
 fn resolve_classifier_model_key<'a>(
     config: &'a RouterConfig,
     params: &'a PipelineParams,
@@ -211,9 +258,15 @@ fn resolve_classifier_model_key<'a>(
         .or(config.classifier_model.as_deref())
         .or_else(|| {
             config
+                .classification
+                .as_ref()
+                .and_then(super::ClassificationTree::root_classifier_model)
+        })
+        .or_else(|| {
+            config
                 .model_groups
                 .get("fast")
-                .and_then(|names| names.first())
+                .and_then(|group| group.models().first())
                 .map(String::as_str)
         })
 }
@@ -239,15 +292,156 @@ fn build_classifier_client(
     params: &PipelineParams,
 ) -> Option<Arc<dyn ChatBackend>> {
     let model_key = resolve_classifier_model_key(config, params)?;
-    let entry = config.models.get(model_key)?;
-    let model_name_for_llm = entry.name.as_deref().unwrap_or(model_key);
-    let classifier_config = LlmConfig::new()
-        .api_url(entry.endpoint.clone())
-        .model(model_name_for_llm.to_string())
-        .timeout_ms(entry.total_timeout_ms)
-        .maybe_extra_body_params(entry.params.clone())
-        .build();
-    Some(Arc::new(LlmClient::with_config(classifier_config)))
+    config.local_backend(model_key)
+}
+
+/// Build the M4 classification-tree engine for a pipeline.
+///
+/// `default_client` (the injected mock/transcript backend or the real
+/// classifier client) serves every classifier node whose `model` key has no
+/// dedicated backend. When `use_per_node_backends` is true (real mode only —
+/// never when a backend was injected for mock/transcript runs), a dedicated
+/// `LlmClient` is built for each distinct classifier-node model key that
+/// differs from the resolved classifier model.
+fn build_classification_engine(
+    config: &RouterConfig,
+    tree: &super::ClassificationTree,
+    routing: super::RoutingConfig,
+    default_client: Arc<dyn ChatBackend>,
+    limiter: Arc<fluent_concurrency::pool::Limiter>,
+    coherence_threshold: f64,
+    use_per_node_backends: bool,
+) -> crate::stages::tree::ClassificationEngine {
+    let default_params = PipelineParams::default();
+    let default_model_key = resolve_classifier_model_key(config, &default_params);
+    let mut clients = HashMap::new();
+    if use_per_node_backends {
+        for key in tree.classifier_model_keys() {
+            if default_model_key == Some(key.as_str()) {
+                continue;
+            }
+            if let Some(backend) = config.local_backend(&key) {
+                clients.insert(key, backend);
+            }
+        }
+    }
+    crate::stages::tree::ClassificationEngine::new(
+        tree.clone(),
+        routing,
+        default_client,
+        clients,
+        limiter,
+        coherence_threshold,
+    )
+}
+
+impl RouterConfig {
+    /// Build the escalation ladder for every model group that configures one
+    /// (`model_groups[g].escalation`). Groups without a ladder (or without a
+    /// frontier endpoint) are absent — dispatch falls back to
+    /// `fallback_completion` as before.
+    ///
+    /// The ladders are keyed by group name; `RoutingTarget.group` resolves
+    /// which one a failed local chain escalates through
+    /// (ROADMAP_20260805_REVIEW M3.9).
+    pub fn build_escalation_ladders(
+        &self,
+        http_client: &reqwest::Client,
+    ) -> HashMap<String, Arc<crate::dispatch::escalation::EscalationLadder>> {
+        use crate::dispatch::backend::OpenAiChatBackend;
+        use crate::dispatch::escalation::{EscalationBackends, EscalationLadder};
+
+        let mut ladders = HashMap::new();
+        for (group, group_cfg) in &self.model_groups {
+            let Some(ladder_cfg) = group_cfg.escalation() else {
+                continue;
+            };
+            let Some(frontier) = &ladder_cfg.frontier else {
+                continue;
+            };
+            let frontier_client = frontier_api_client(http_client, frontier.api_key_env.as_deref());
+            let backends = EscalationBackends {
+                frontier: Arc::new(OpenAiChatBackend::new(
+                    frontier_client,
+                    frontier.endpoint.clone(),
+                )),
+                decomposer: ladder_cfg
+                    .decomposer_model
+                    .as_deref()
+                    .and_then(|k| self.local_backend(k)),
+                assembler: ladder_cfg
+                    .assembler_model
+                    .as_deref()
+                    .and_then(|k| self.local_backend(k)),
+                classifier: ladder_cfg
+                    .classifier_model
+                    .as_deref()
+                    .and_then(|k| self.local_backend(k)),
+                draft: ladder_cfg
+                    .draft_model
+                    .as_deref()
+                    .and_then(|k| self.local_backend(k)),
+                judge: ladder_cfg
+                    .judge_model
+                    .as_deref()
+                    .and_then(|k| self.local_backend(k)),
+            };
+            tracing::info!(
+                target: "router.config",
+                group = %group,
+                modes = ?ladder_cfg.modes,
+                frontier_model = %frontier.model,
+                "escalation ladder built",
+            );
+            ladders.insert(
+                group.clone(),
+                Arc::new(EscalationLadder::new(ladder_cfg.clone(), backends)),
+            );
+        }
+        ladders
+    }
+
+    /// Build a sync local-model `ChatBackend` from a `models` key — the single
+    /// `LlmClient` construction site shared by the classifier and the
+    /// escalation ladder's local roles (DIP: exactly one concrete
+    /// `ChatBackend` factory in the crate).
+    fn local_backend(&self, key: &str) -> Option<Arc<dyn ChatBackend>> {
+        let entry = self.models.get(key)?;
+        let model_name = entry.name.as_deref().unwrap_or(key);
+        let llm_config = LlmConfig::new()
+            .api_url(entry.endpoint.clone())
+            .model(model_name.to_string())
+            .timeout_ms(entry.total_timeout_ms)
+            .maybe_extra_body_params(entry.params.clone())
+            .build();
+        Some(Arc::new(LlmClient::with_config(llm_config)))
+    }
+}
+
+/// A reqwest client for the frontier backend: the shared client by default,
+/// or a per-ladder client carrying the `Bearer` token from `api_key_env`
+/// (when the variable is set and resolvable).
+fn frontier_api_client(shared: &reqwest::Client, api_key_env: Option<&str>) -> reqwest::Client {
+    let Some(env) = api_key_env else {
+        return shared.clone();
+    };
+    let Ok(key) = std::env::var(env) else {
+        tracing::warn!(
+            target: "router.config",
+            env = %env,
+            "frontier api_key_env set but unreadable — falling back to shared client (no auth header)",
+        );
+        return shared.clone();
+    };
+    let Ok(auth) = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")) else {
+        return shared.clone();
+    };
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::AUTHORIZATION, auth);
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap_or_else(|_| shared.clone())
 }
 
 #[cfg(test)]

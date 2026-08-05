@@ -12,11 +12,9 @@
 //!
 //! `DbStore` is the blocking-connection abstraction: `SqliteStore` runs the
 //! closure against its `Mutex<Connection>`; `Arc<SqlitePool>` acquires a
-//! pooled connection via the sync→async bridge (`Handle::block_on`, safe on
-//! `spawn_blocking`/`block_in_place` threads). `fluent-db` owns this tokio
-//! composition directly — it must not import `fluent-concurrency` (acyclic,
-//! D2), so the bridge mirrors `fluent_llm::client::block_on` rather than
-//! reusing it.
+//! pooled connection via the unified sync→async bridge
+//! (`common_core::runtime::block_on`, the workspace's single canonical
+//! bridge — the private copy was deleted by ROADMAP_20260804_DB_FOLLOWUP M1).
 
 use std::sync::Arc;
 
@@ -66,40 +64,13 @@ impl DbStore for Arc<SqlitePool> {
         R: Send + 'static,
     {
         let pool = Arc::clone(self);
-        block_on(async move {
+        common_core::runtime::block_on(async move {
             let conn = pool.acquire().await?;
             tokio::task::spawn_blocking(move || f(&conn))
                 .await
                 .map_err(|e| DbError::Other(format!("blocking database task failed: {e}")))?
         })
     }
-}
-
-/// Drive an async `acquire` from a blocking (or otherwise sync) context.
-///
-/// Mirrors `fluent_llm::client::block_on` (D9: `fluent-db` owns its tokio
-/// composition). `Handle::block_on` is safe on `spawn_blocking`/`block_in_place`
-/// threads and on the process fallback runtime; it must only be called from a
-/// runtime worker task when wrapped in `block_in_place` (which the
-/// `DbWorkUnit::execute` path guarantees).
-fn block_on<F>(fut: F) -> F::Output
-where
-    F: std::future::Future + Send + 'static,
-{
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => handle.block_on(fut),
-        Err(_) => fallback_runtime().block_on(fut),
-    }
-}
-
-fn fallback_runtime() -> &'static tokio::runtime::Runtime {
-    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build fluent-db fallback runtime")
-    })
 }
 
 /// A `Component`/`WorkUnit` that runs a synchronous database operation on a
@@ -158,17 +129,20 @@ where
         // starved. On a current-thread runtime (or with no runtime active), run
         // the op on a dedicated scoped OS thread instead of inline, so a
         // genuinely slow op still cannot block the caller's single thread.
+        //
+        // On **both** paths `ctx.caps` is re-scoped into the worker via
+        // `CURRENT_CAPS.sync_scope`, so a pool-backed op (whose
+        // `with_conn_blocking` → gated `acquire` reads the task-local) is
+        // capability-correct on multi-thread and current-thread runtimes alike.
+        let caps = ctx.caps.clone();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| (self.op)(ctx))
+                CURRENT_CAPS.sync_scope(caps, || tokio::task::block_in_place(|| (self.op)(ctx)))
             }
             _ => {
                 // Run the op on a dedicated scoped OS thread. `thread::scope`
                 // joins it before returning; a thread panic surfaces as the
                 // join's `Err` (the op's own `WorkError` propagates as-is).
-                // `ctx.caps` is re-scoped into the thread so capability-gated
-                // pool helpers work off the executor thread too.
-                let caps = ctx.caps.clone();
                 match std::thread::scope(|scope| {
                     scope
                         .spawn(|| CURRENT_CAPS.sync_scope(caps, || (self.op)(ctx)))
@@ -235,6 +209,7 @@ mod tests {
 
     use common_core::metrics::LatencyHistogram;
     use fluent_wvr::wrapper::Instrumented;
+    use fluent_wvr::CapabilitySet;
 
     use super::*;
 
@@ -250,6 +225,17 @@ mod tests {
             )
             .unwrap();
         store
+    }
+
+    /// A `CapabilitySet` carrying a `DbCapability` token (M3.1: the pool's
+    /// `acquire` path is gated, so tests that check out a connection must scope
+    /// one).
+    fn db_caps() -> CapabilitySet {
+        CapabilitySet::new().with(crate::capability::DbCapability::open(":memory:").unwrap())
+    }
+
+    fn in_memory_pool() -> Arc<SqlitePool> {
+        Arc::new(SqlitePool::open_in_memory(&crate::pool::PoolConfig::default()).unwrap())
     }
 
     #[test]
@@ -397,11 +383,37 @@ mod tests {
 
     #[test]
     fn db_store_impl_for_pool() {
-        let pool =
-            Arc::new(SqlitePool::open_in_memory(&crate::pool::PoolConfig::default()).unwrap());
-        let n: i64 = pool
-            .with_conn_blocking(|conn| Ok(conn.query_row("SELECT 41 + 1", [], |row| row.get(0))?))
-            .expect("pool with_conn_blocking");
+        let pool = in_memory_pool();
+        // M3.1: `acquire` is capability-gated, so the pool-backed `DbStore`
+        // path must run under a `DbCapability` scope (the sync `sync_scope`
+        // propagates into the fallback-runtime `block_on`).
+        let n: i64 = CURRENT_CAPS.sync_scope(db_caps(), || {
+            pool.with_conn_blocking(|conn| {
+                Ok(conn.query_row("SELECT 41 + 1", [], |row| row.get(0))?)
+            })
+            .expect("pool with_conn_blocking")
+        });
+        assert_eq!(n, 42);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pool_with_conn_blocking_from_bare_multi_thread_task_succeeds() {
+        // M1 §0.5 deliberate improvement: the pool-backed `DbStore` path routes
+        // through the unified `common_core::runtime::block_on`, which wraps a
+        // multi-thread worker in `block_in_place`. Calling
+        // `with_conn_blocking` from a bare async task on a multi-thread runtime
+        // (NOT wrapped in `block_in_place` by the caller) must now succeed —
+        // the old plain `handle.block_on` copy panicked here with "Cannot
+        // start a runtime from within a runtime".
+        let pool = in_memory_pool();
+        let n: i64 = CURRENT_CAPS
+            .scope(db_caps(), async {
+                pool.with_conn_blocking(|conn| {
+                    Ok(conn.query_row("SELECT 41 + 1", [], |row| row.get(0))?)
+                })
+                .expect("pool with_conn_blocking from a bare multi-thread task")
+            })
+            .await;
         assert_eq!(n, 42);
     }
 
@@ -412,8 +424,7 @@ mod tests {
         // worker panics ("cannot block the current thread from within a
         // runtime"). The scoped-OS-thread offload gives the op a fresh thread
         // where the sync→async bridge falls back to `fallback_runtime`.
-        let pool =
-            Arc::new(SqlitePool::open_in_memory(&crate::pool::PoolConfig::default()).unwrap());
+        let pool = in_memory_pool();
         let unit = DbWorkUnit::builder()
             .name("db.poolct")
             .op(Box::new(move |_ctx: &WorkContext| {
@@ -425,10 +436,58 @@ mod tests {
                 WorkOutput::typed("got", &n).map_err(|e| WorkError::Execution(e.to_string()))
             }) as StoreUnitOp)
             .build();
+        let ctx = WorkContext {
+            caps: db_caps(),
+            ..WorkContext::default()
+        };
         let out = unit
-            .execute(&WorkContext::default())
+            .execute(&ctx)
             .expect("pool-backed op must complete on the scoped thread");
         assert!(out.success);
         assert_eq!(out.data, serde_json::json!(42));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pool_backed_db_work_unit_scopes_caps_on_multi_thread_path() {
+        // M3.2: a pool-backed `DbWorkUnit` op calls `with_conn_blocking` →
+        // gated `acquire`, which reads the `CURRENT_CAPS` task-local.
+        // `execute` must re-scope `ctx.caps` around the `block_in_place`
+        // offload (the multi-thread path), so the gate passes when a
+        // `DbCapability` is present and fails (wrapped in
+        // `WorkError::Execution`) when it is not.
+        let pool = in_memory_pool();
+        let make_unit = || {
+            let pool = Arc::clone(&pool);
+            DbWorkUnit::builder()
+                .name("db.poolmt")
+                .op(Box::new(move |_ctx: &WorkContext| {
+                    let n: i64 = pool
+                        .with_conn_blocking(|conn| {
+                            Ok(conn.query_row("SELECT 41 + 1", [], |row| row.get(0))?)
+                        })
+                        .map_err(|e| WorkError::Execution(e.to_string()))?;
+                    WorkOutput::typed("got", &n).map_err(|e| WorkError::Execution(e.to_string()))
+                }) as StoreUnitOp)
+                .build()
+        };
+
+        let with_caps = WorkContext {
+            caps: db_caps(),
+            ..WorkContext::default()
+        };
+        let out = make_unit()
+            .execute(&with_caps)
+            .expect("pool-backed op must succeed when a DbCapability is scoped");
+        assert!(out.success);
+        assert_eq!(out.data, serde_json::json!(42));
+
+        let without_caps = WorkContext::default();
+        let err = make_unit()
+            .execute(&without_caps)
+            .expect_err("pool-backed op must be denied without a DbCapability");
+        assert!(
+            matches!(&err, WorkError::Execution(msg) if msg.contains("permission denied")),
+            "expected wrapped PermissionDenied, got {err:?}"
+        );
     }
 }

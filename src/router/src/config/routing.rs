@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::ModelEntry;
+use crate::config::ModelGroup;
+use crate::pipeline::RoutingTarget;
 use crate::score_matrix::ScoreMatrix;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,7 +28,7 @@ fn default_pipelines() -> Vec<String> {
 pub struct RoutingConfig {
     pub routes: HashMap<String, RouteRef>,
     pub models: HashMap<String, ModelEntry>,
-    pub model_groups: HashMap<String, Vec<String>>,
+    pub model_groups: HashMap<String, ModelGroup>,
     pub system_prompt: String,
     pub safety_threshold: f64,
     pub default_route: String,
@@ -35,6 +37,35 @@ pub struct RoutingConfig {
 }
 
 impl RoutingConfig {
+    /// Resolve a route name to a fully-populated typed `RoutingTarget`.
+    ///
+    /// Reuses `resolve_route` (cheapest model in the route's group whose
+    /// `intelligence` meets `min_complexity`, falling back to the cheapest in
+    /// the group) and attaches the resolved group, the `target_name`, and the
+    /// ordered `fallbacks`. This is the canonical target builder shared by the
+    /// flat classifier stage and the M4 classification-tree engine — a
+    /// terminal node dispatches through it unchanged (ROADMAP_20260805_REVIEW
+    /// M4.3).
+    pub fn routing_target(&self, route: &str, min_complexity: Option<u8>) -> Option<RoutingTarget> {
+        let (entry, model_name) = self.resolve_route(route, min_complexity)?;
+        let group = self
+            .routes
+            .get(route)
+            .or_else(|| self.routes.get(&self.default_route))
+            .map_or(String::new(), |r| r.group.clone());
+
+        let mut rt = RoutingTarget::from_model_entry(&model_name, entry);
+        rt.group = Some(group);
+        rt.target_name = Some(route.to_string());
+        rt.fallbacks = self
+            .all_dispatch_targets(route, min_complexity)
+            .into_iter()
+            .skip(1) // skip the primary (already included)
+            .map(|(name, entry)| RoutingTarget::from_model_entry(&name, &entry))
+            .collect();
+        Some(rt)
+    }
+
     pub fn resolve_route(
         &self,
         route_name: &str,
@@ -72,16 +103,17 @@ impl RoutingConfig {
             tracing::warn!(target: "router.config", route = %route_name, group = %route_ref.group, "model group not found for route");
             return None;
         };
+        let model_keys = model_names.models();
 
         tracing::debug!(target: "router.config",
             route = %route_name,
             group = %route_ref.group,
-            model_count = model_names.len(),
+            model_count = model_keys.len(),
             min_complexity = ?min_complexity,
             "resolving route"
         );
 
-        let candidates: Vec<(&String, &ModelEntry)> = model_names
+        let candidates: Vec<(&String, &ModelEntry)> = model_keys
             .iter()
             .filter_map(|n| self.models.get(n).map(|m| (n, m)))
             .filter(|(_, m)| m.intelligence >= min_complexity.unwrap_or(0))
@@ -89,7 +121,7 @@ impl RoutingConfig {
 
         if candidates.is_empty() {
             tracing::debug!(target: "router.config", route = %route_name, "no candidates passed complexity filter, falling back to cheapest in group");
-            model_names
+            model_keys
                 .iter()
                 .filter_map(|n| self.models.get(n).map(|m| (n, m)))
                 .min_by(|(_, a), (_, b)| {
@@ -142,9 +174,9 @@ impl RoutingConfig {
 
         let target_intelligence = f64::from(min_complexity.unwrap_or(0));
 
-        for (group_key, model_keys) in &self.model_groups {
+        for (group_key, group) in &self.model_groups {
             let is_primary = primary_group == Some(group_key.as_str());
-            for model_key in model_keys {
+            for model_key in group.models() {
                 if !seen.insert(model_key.clone()) {
                     continue;
                 }

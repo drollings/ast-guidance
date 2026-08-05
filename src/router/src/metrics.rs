@@ -86,7 +86,6 @@ impl From<&ServerError> for FailureClass {
             ServerError::Http(msg) => classify_http_status(msg),
             ServerError::Bind { .. } => FailureClass::Network,
             ServerError::Addr(_) => FailureClass::InputValidation,
-            ServerError::FrontierNotImplemented(_) => FailureClass::Unknown,
         }
     }
 }
@@ -353,7 +352,7 @@ mod tests {
         assert_eq!(
             FailureClass::from(&ServerError::Bind {
                 addr: "0.0.0.0:1".into(),
-                source: std::io::Error::new(std::io::ErrorKind::Other, "in use"),
+                source: std::io::Error::other("in use"),
             }),
             FailureClass::Network
         );

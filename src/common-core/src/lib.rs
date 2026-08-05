@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 //! common-core: Zero-domain generic utility crate (hashing, formatting, I/O,
-//! shell, metrics, string utilities, watchdogs, time helpers).
+//! shell, metrics, string utilities, watchdogs, time helpers, sync→async
+//! runtime bridging).
 //!
 //! # Consolidation contract
 //!
@@ -35,6 +36,7 @@ pub mod metrics;
 pub mod prelude;
 pub mod registry;
 pub mod retry;
+pub mod runtime;
 pub mod shell;
 pub mod shell_parser;
 #[cfg(feature = "sqlite")]
@@ -73,6 +75,7 @@ pub use jsonrpc::{
 pub use metrics::LatencyHistogram;
 pub use registry::KeyedRegistry;
 pub use retry::{backoff_ms, retry_async};
+pub use runtime::block_on;
 pub use shell::{run_capture, run_command, run_shell_capture, shell_cmd, CommandOutput};
 #[cfg(feature = "sqlite")]
 pub use sqlite::{

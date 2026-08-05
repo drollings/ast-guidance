@@ -83,7 +83,7 @@ impl DbCapability {
         check_db_capability()?;
         let sql = sql.to_string();
         let pool = Arc::clone(&self.pool);
-        let conn = pool.acquire().await?;
+        let conn = pool.acquire_ungated().await?;
         let result = tokio::task::spawn_blocking(move || {
             let mut stmt = conn.prepare(&sql).map_err(DbError::from)?;
 
@@ -128,7 +128,7 @@ impl DbCapability {
         check_db_capability()?;
         let sql = sql.to_string();
         let pool = Arc::clone(&self.pool);
-        let conn = pool.acquire().await?;
+        let conn = pool.acquire_ungated().await?;
         let result = tokio::task::spawn_blocking(move || {
             let rows_affected = conn.execute(&sql, []).map_err(DbError::from)?;
             Ok(rows_affected)
@@ -159,8 +159,13 @@ mod tests {
     #[tokio::test]
     async fn open_and_pool_round_trip() {
         let db = db();
-        let conn = db.pool().acquire().await.unwrap();
-        conn.execute_batch("CREATE TABLE t (id INTEGER)").unwrap();
+        let caps = db_caps();
+        CURRENT_CAPS
+            .scope(caps, async {
+                let conn = db.pool().acquire().await.unwrap();
+                conn.execute_batch("CREATE TABLE t (id INTEGER)").unwrap();
+            })
+            .await;
     }
 
     #[tokio::test]

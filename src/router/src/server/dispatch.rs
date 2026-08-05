@@ -1,12 +1,15 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use common_core::ResponseCache;
 use http_body_util::BodyExt;
 
+use crate::dag_session::DependencySession;
 use crate::dispatch::backend::ChatBackend;
 use crate::dispatch::backend::OpenAiChatBackend;
 use crate::dispatch::backend::RetryChatBackend;
+use crate::dispatch::escalation::{EscalationContext, EscalationLadder};
 use crate::dispatch::frontier::DispatchError;
 use crate::ledger::ContentNodeLedger;
 use crate::pipeline::RoutingTarget;
@@ -20,6 +23,7 @@ use common_core::string::strip_thinking_blocks;
 
 use crate::charts::extract::WorkflowExtractor;
 
+#[allow(clippy::implicit_hasher)]
 pub async fn handle_dispatch(
     rt: &RoutingTarget,
     router_request: &RouterRequest,
@@ -33,6 +37,9 @@ pub async fn handle_dispatch(
     cache: Option<&Arc<ResponseCache>>,
     stats: &ServerStats,
     extractor: Option<Arc<WorkflowExtractor>>,
+    ladders: &HashMap<String, Arc<EscalationLadder>>,
+    context_cache: Option<&Arc<dyn fluent_types::ContextCache>>,
+    session: Option<&Arc<Mutex<DependencySession>>>,
 ) -> Result<HyperResponse, std::convert::Infallible> {
     let target_streams = is_stream && rt.stream;
 
@@ -60,6 +67,9 @@ pub async fn handle_dispatch(
                         cache,
                         user_text,
                         extractor,
+                        ladders,
+                        context_cache,
+                        session,
                     )
                     .await;
                 };
@@ -97,6 +107,9 @@ pub async fn handle_dispatch(
                     cache,
                     user_text,
                     extractor,
+                    ladders,
+                    context_cache,
+                    session,
                 )
                 .await;
             }
@@ -142,6 +155,9 @@ pub async fn handle_dispatch(
         cache,
         user_text,
         extractor,
+        ladders,
+        context_cache,
+        session,
     )
     .await
 }
@@ -171,7 +187,10 @@ fn make_backend(http_client: &reqwest::Client, target: &RoutingTarget) -> Arc<dy
 /// This is the *reconstructed* prompt (the exact rendered JSON body is not
 /// recoverable at the call site); the choice is documented in
 /// `ROADMAP_20260804_M3_CHECKLIST.md`.
-fn render_prompt(router_request: &RouterRequest) -> String {
+///
+/// `pub(crate)` so the escalation ladder (`dispatch::escalation`) can reuse
+/// it for its `payload` audit field (ROADMAP_20260805_REVIEW M3.8).
+pub(crate) fn render_prompt(router_request: &RouterRequest) -> String {
     router_request
         .messages
         .iter()
@@ -271,6 +290,7 @@ async fn dispatch_to_single_target(
     ))
 }
 
+#[allow(clippy::implicit_hasher)]
 pub async fn dispatch_real(
     rt: &RoutingTarget,
     router_request: &RouterRequest,
@@ -280,6 +300,9 @@ pub async fn dispatch_real(
     cache: Option<&Arc<ResponseCache>>,
     user_text: &str,
     extractor: Option<Arc<WorkflowExtractor>>,
+    ladders: &HashMap<String, Arc<EscalationLadder>>,
+    context_cache: Option<&Arc<dyn fluent_types::ContextCache>>,
+    session: Option<&Arc<Mutex<DependencySession>>>,
 ) -> Result<HyperResponse, std::convert::Infallible> {
     let all_targets = std::iter::once(rt)
         .chain(rt.fallbacks.iter())
@@ -316,11 +339,37 @@ pub async fn dispatch_real(
         .await
         {
             Ok(resp) => {
+                crate::audit::emit(
+                    "route",
+                    serde_json::json!({
+                        "stage": "dispatch",
+                        "verdict": "dispatched",
+                        "model": target.model,
+                        "url": target.url,
+                        "attempt": i + 1,
+                        "total": all_targets.len(),
+                        "outcome": "success",
+                    }),
+                );
                 return Ok(resp);
             }
             Err(e) => {
                 let attempt_latency_ms = attempt_start.elapsed().as_millis() as u64;
                 let is_retryable = e.is_retryable();
+                crate::audit::emit(
+                    "route",
+                    serde_json::json!({
+                        "stage": "dispatch",
+                        "verdict": "dispatch_failed",
+                        "model": target.model,
+                        "url": target.url,
+                        "attempt": i + 1,
+                        "total": all_targets.len(),
+                        "outcome": "failed",
+                        "error": e.to_string(),
+                        "retryable": is_retryable,
+                    }),
+                );
                 tracing::warn!(
                     target: "router.server",
                     attempt = i + 1,
@@ -338,6 +387,29 @@ pub async fn dispatch_real(
                     break;
                 }
             }
+        }
+    }
+
+    // M3 escalation: only after the local chain is exhausted do we engage the
+    // frontier ladder. The ladder is resolved from the resolved route's group
+    // (`RoutingTarget.group`); direct-model targets (no group) get `None`.
+    if let Some(ladder) = rt.group.as_deref().and_then(|g| ladders.get(g)) {
+        tracing::info!(
+            target: "router.server",
+            group = ?rt.group,
+            model = %model_name,
+            last_error = ?last_error,
+            "local chain exhausted — engaging escalation ladder"
+        );
+        let esc_ctx = EscalationContext {
+            request: router_request,
+            user_text,
+            model_name,
+            context_cache,
+            session,
+        };
+        if let Some(resp) = ladder.try_escalate(&esc_ctx).await {
+            return Ok(resp);
         }
     }
 

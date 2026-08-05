@@ -344,9 +344,11 @@ impl<K: Eq + Hash + Clone> DependencyGraph<K> {
         self.topo_sort_inner(&subset)
     }
 
-    /// Shared Kahn's algorithm core used by both `topo_sort` and
-    /// `topo_sort_from`. `subset` is the list of nodes to include
-    /// (references into `self.nodes`).
+    /// Kahn's topological sort of the subgraph over exactly `subset`
+    /// (references into `self.nodes`). Shared edge derivation for
+    /// `topo_sort` and `topo_sort_from`; the Kahn loop itself is
+    /// delegated to the crate-wide [`kahn_sort`] core (shared with
+    /// `DependencyResolver::plan_from_set`).
     fn topo_sort_inner(&self, subset: &[&K]) -> Result<Vec<K>, GraphError>
     where
         K: Ord + std::fmt::Debug,
@@ -376,46 +378,72 @@ impl<K: Eq + Hash + Clone> DependencyGraph<K> {
             }
         }
 
-        // Initial queue: all nodes with in_degree 0, sorted for
-        // deterministic output.
-        let mut queue: Vec<&K> = in_degree
-            .iter()
-            .filter(|(_, &deg)| deg == 0)
-            .map(|(&k, _)| k)
-            .collect();
-        queue.sort_unstable();
+        let order = match kahn_sort(&mut in_degree, &adj, subset.len()) {
+            Ok(order) => order.into_iter().cloned().collect(),
+            Err(partial) => {
+                let ordered_set: HashSet<&K> = partial.iter().copied().collect();
+                let cycle_nodes: Vec<String> = subset
+                    .iter()
+                    .filter(|n| !ordered_set.contains(*n))
+                    .map(|n| format!("{n:?}"))
+                    .collect();
+                return Err(GraphError::CircularDependency(cycle_nodes.join(", ")));
+            }
+        };
 
-        let mut order = Vec::with_capacity(subset.len());
-        let mut head = 0;
-        while head < queue.len() {
-            let current = queue[head];
-            head += 1;
-            order.push(current.clone());
-            if let Some(dependents) = adj.get(&current) {
-                for &dep in dependents {
-                    if let Some(deg) = in_degree.get_mut(dep) {
-                        *deg -= 1;
-                        if *deg == 0 {
-                            queue.push(dep);
-                            queue[head..].sort_unstable();
-                        }
+        Ok(order)
+    }
+}
+
+/// The Kahn's-algorithm core shared by `DependencyGraph::topo_sort_inner`
+/// and `DependencyResolver::plan_from_set`. Both callers derive edges
+/// differently (graph `asset_to_providers` vs. registry `get_providers`),
+/// but once `in_degree` and `adj` are built the ordering loop is
+/// identical.
+///
+/// `in_degree` is consumed (mutated in place); `total` is the number of
+/// nodes that must appear in the output. Returns `Ok(order)` on success or
+/// `Err(partial)` when a cycle leaves some node unvisited — `partial` is
+/// the deterministic order computed so far, so callers can identify the
+/// cycle nodes (all nodes not present in `partial`).
+pub(crate) fn kahn_sort<K: Ord + Clone + Hash>(
+    in_degree: &mut HashMap<K, usize>,
+    adj: &HashMap<K, Vec<K>>,
+    total: usize,
+) -> Result<Vec<K>, Vec<K>> {
+    // Initial queue: all nodes with in_degree 0, sorted for
+    // deterministic output.
+    let mut queue: Vec<K> = in_degree
+        .iter()
+        .filter(|(_, &deg)| deg == 0)
+        .map(|(k, _)| k.clone())
+        .collect();
+    queue.sort_unstable();
+
+    let mut order = Vec::with_capacity(total);
+    let mut head = 0;
+    while head < queue.len() {
+        let current = queue[head].clone();
+        head += 1;
+        order.push(current.clone());
+        if let Some(dependents) = adj.get(&current) {
+            for dep in dependents {
+                if let Some(deg) = in_degree.get_mut(dep) {
+                    *deg -= 1;
+                    if *deg == 0 {
+                        queue.push(dep.clone());
+                        queue[head..].sort_unstable();
                     }
                 }
             }
         }
-
-        if order.len() != subset.len() {
-            let ordered_set: HashSet<&K> = order.iter().collect();
-            let cycle_nodes: Vec<String> = subset
-                .iter()
-                .filter(|n| !ordered_set.contains(*n))
-                .map(|n| format!("{n:?}"))
-                .collect();
-            return Err(GraphError::CircularDependency(cycle_nodes.join(", ")));
-        }
-
-        Ok(order)
     }
+
+    if order.len() != total {
+        return Err(order);
+    }
+
+    Ok(order)
 }
 
 impl<K: Eq + Hash + Clone> Default for DependencyGraph<K> {
