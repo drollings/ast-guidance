@@ -56,6 +56,112 @@ impl<K, V> ReadThroughCache<K, V> {
     }
 }
 
+// ─── Load Cache ────────────────────────────────────────────────────────────
+
+use lru::LruCache;
+use std::borrow::Borrow;
+use std::hash::Hash;
+use std::num::NonZeroUsize;
+use std::sync::Mutex;
+
+type LruLoadFn<K, V, E> = Box<dyn Fn(&K) -> Result<V, E> + Send + Sync>;
+
+/// A bounded, thread-safe get-or-load LRU cache.
+///
+/// Wraps a `Mutex<LruCache<K, V>>` plus a `load` closure invoked on a cache
+/// miss. `get_or_load` keeps the hot path to a single lock acquisition on a
+/// hit; on a miss it drops the lock, runs `load`, and re-acquires only to
+/// insert the freshly loaded value.
+///
+/// Write-through consumers (caches filled explicitly via `insert`, never via
+/// load-on-miss) can use the plain `get`/`insert`/`remove`/`contains`
+/// accessors; the `load` closure is only ever invoked by `get_or_load`.
+pub struct LoadCache<K, V, E> {
+    inner: Mutex<LruCache<K, V>>,
+    load: LruLoadFn<K, V, E>,
+}
+
+impl<K, V, E> LoadCache<K, V, E>
+where
+    K: Clone + Eq + Hash,
+    V: Clone,
+{
+    /// Create a bounded cache holding up to `capacity` entries.
+    ///
+    /// `load` produces a value for a missing key (and may fail with `E`).
+    /// Returns an error when `capacity` is zero.
+    pub fn new(
+        capacity: usize,
+        load: impl Fn(&K) -> Result<V, E> + Send + Sync + 'static,
+    ) -> Result<Self, String> {
+        let cap = NonZeroUsize::new(capacity)
+            .ok_or_else(|| format!("cache capacity must be non-zero, got {capacity}"))?;
+        Ok(Self {
+            inner: Mutex::new(LruCache::new(cap)),
+            load: Box::new(load),
+        })
+    }
+
+    /// Look up `key` without invoking the load closure. Returns a clone of the
+    /// cached value, if present.
+    pub fn get<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.inner.lock().unwrap().get(key).cloned()
+    }
+
+    /// `true` when `key` is present in the cache (never loads on a miss).
+    pub fn contains<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.get(key).is_some()
+    }
+
+    /// Insert `value` under `key`, replacing any existing entry.
+    pub fn insert(&self, key: K, value: V) {
+        self.inner.lock().unwrap().put(key, value);
+    }
+
+    /// Remove `key`, returning the evicted value if present.
+    pub fn remove<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.inner.lock().unwrap().pop(key)
+    }
+
+    /// Look up `key`, loading and caching it on a miss via the `load` closure.
+    pub fn get_or_load(&self, key: K) -> Result<V, E> {
+        if let Some(value) = self.get(&key) {
+            return Ok(value);
+        }
+        let value = (self.load)(&key)?;
+        self.insert(key, value.clone());
+        Ok(value)
+    }
+
+    /// Number of entries currently held.
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().len()
+    }
+
+    /// `true` when the cache holds no entries.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The maximum number of entries before the least-recently-used entry is
+    /// evicted.
+    pub fn capacity(&self) -> usize {
+        self.inner.lock().unwrap().cap().get()
+    }
+}
+
 // ─── Response Cache ────────────────────────────────────────────────────────
 
 use crate::hash::sha256_hex;
@@ -390,5 +496,101 @@ mod tests {
         let result = cache.get(&"d".to_string());
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "load failed");
+    }
+
+    // ─── LoadCache tests ────────────────────────────────────────────────
+
+    fn make_load_cache(load_count: Arc<Mutex<usize>>) -> LoadCache<String, String, String> {
+        LoadCache::new(10, move |key: &String| {
+            *load_count.lock().unwrap() += 1;
+            Ok(format!("loaded:{key}"))
+        })
+        .expect("capacity non-zero")
+    }
+
+    #[test]
+    fn load_cache_miss_loads_and_caches() {
+        let load_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let cache = make_load_cache(Arc::clone(&load_count));
+
+        let v1 = cache.get_or_load("a".to_string()).unwrap();
+        assert_eq!(v1, "loaded:a");
+        assert_eq!(*load_count.lock().unwrap(), 1);
+
+        let v2 = cache.get_or_load("a".to_string()).unwrap();
+        assert_eq!(v2, "loaded:a");
+        assert_eq!(*load_count.lock().unwrap(), 1, "hit must not reload");
+    }
+
+    #[test]
+    fn load_cache_get_does_not_load() {
+        let load_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let cache = make_load_cache(Arc::clone(&load_count));
+
+        assert!(cache.get::<str>("missing").is_none());
+        assert!(!cache.contains::<str>("missing"));
+        assert_eq!(*load_count.lock().unwrap(), 0, "plain get never loads");
+    }
+
+    #[test]
+    fn load_cache_load_error_propagates() {
+        let cache = LoadCache::new(2, |_: &String| -> Result<String, String> {
+            Err("load failed".into())
+        })
+        .expect("capacity non-zero");
+        assert_eq!(
+            cache.get_or_load("a".to_string()).unwrap_err(),
+            "load failed"
+        );
+    }
+
+    #[test]
+    fn load_cache_insert_overrides_and_get_returns_clone() {
+        let cache = make_load_cache(Arc::new(Mutex::new(0)));
+        cache.insert("a".to_string(), "manual".to_string());
+        assert_eq!(cache.get::<str>("a"), Some("manual".to_string()));
+        assert!(!cache.get_or_load("a".to_string()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn load_cache_remove() {
+        let cache = make_load_cache(Arc::new(Mutex::new(0)));
+        cache.insert("a".to_string(), "manual".to_string());
+        assert_eq!(cache.remove::<str>("a"), Some("manual".to_string()));
+        assert!(cache.get::<str>("a").is_none());
+        assert!(cache.remove::<str>("a").is_none());
+    }
+
+    #[test]
+    fn load_cache_evicts_lru() {
+        let cache = LoadCache::new(2, |key: &String| Ok::<_, String>(format!("loaded:{key}")))
+            .expect("capacity non-zero");
+        cache.insert("a".to_string(), "1".to_string());
+        cache.insert("b".to_string(), "2".to_string());
+        // Touching "a" makes it most-recently-used; inserting "c" evicts "b".
+        cache.get::<str>("a");
+        cache.insert("c".to_string(), "3".to_string());
+        assert!(cache.get::<str>("a").is_some());
+        assert!(cache.get::<str>("b").is_none());
+        assert!(cache.get::<str>("c").is_some());
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn load_cache_zero_capacity_rejected() {
+        assert!(LoadCache::new(0, |_: &String| -> Result<String, String> {
+            Ok(String::new())
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn load_cache_capacity_and_len() {
+        let cache = make_load_cache(Arc::new(Mutex::new(0)));
+        assert_eq!(cache.capacity(), 10);
+        assert!(cache.is_empty());
+        cache.insert("a".to_string(), "1".to_string());
+        assert_eq!(cache.len(), 1);
+        assert!(!cache.is_empty());
     }
 }

@@ -17,7 +17,7 @@ members = [
     "src/search-vector",
     "src/rdf",
     "src/ontology",
-    "src/project-knowledge",
+    "src/knowledge",
     "src/wasm_ipc",
     "src/memory-plugin",
     "src/router",

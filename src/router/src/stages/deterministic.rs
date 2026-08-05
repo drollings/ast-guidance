@@ -68,7 +68,7 @@ impl DeterministicPreFilter {
     fn builtin_filters() -> DeterministicFilterEngine {
         use crate::config::{PatternEntry, RejectPatterns};
 
-        let pii_patterns = guidance_llm::pii_patterns::pii_patterns();
+        let pii_patterns = fluent_llm::pii_patterns::pii_patterns();
         let pii_map: std::collections::HashMap<&str, &str> = pii_patterns
             .iter()
             .map(|p| (p.name, p.regex.as_str()))

@@ -610,11 +610,20 @@ Core modules decomposed for Single Responsibility:
 Key architectural improvements:
 - `ResultScorer`, `Summarizer` now accept `Arc<dyn ChatBackend>` (DIP). (`OrchestratorSession` also did at the time; it was folded into `ContentNodeLedger` by the D6 session/ledger consolidation on 2026-08-04.)
 - `ClassifierStage` also takes `Arc<dyn ChatBackend>` (DIP)
-- PII regex patterns centralized in `guidance_llm::pii_patterns` (DRY)
+- PII regex patterns centralized in `fluent_llm::pii_patterns` (DRY)
 - Think-block stripping canonical in `common_core::string` (DRY)
 - `strip_html` canonical in `common_core::string` (DRY)
 - Pipeline verdict handling extracted to `handle_stage_verdict` (SRP)
 - Magic numbers replaced with named constants (Code Quality)
+- OpenAI-compatible dispatch core is canonical in `fluent_llm`:
+  `openai::build_openai_chat_body` (carries the `chat_template_kwargs:
+  {"enable_thinking": false}` default), `openai::parse_openai_stream_delta`,
+  `url::{chat_completions_url, derive_embeddings_url}`, and the OpenAI-format
+  normalization (`normalize_request`/`normalize_response`/`messages_to_json`).
+  `dispatch/backend.rs` and `dispatch/frontier.rs` are thin adapters over it
+  (ROADMAP_20260804_SHARED_CORE M1, D1); the HTTP-status failure taxonomy
+  (`HttpClass`/`FailureClass`) is canonical in `fluent_llm::http_class`
+  (M2, D2).
 
 ## Near-term direction
 

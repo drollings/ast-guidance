@@ -12,12 +12,12 @@
 //! present and non-null. Substring `pattern` is not part of a rubric — the
 //! field-presence rule is intentionally simpler (presence + non-null).
 
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use guidance_llm::client::ChatBackend;
-use guidance_llm::ChatMessage;
+use common_core::cache::LoadCache;
+use common_core::hash::fnv1a64;
+use fluent_llm::client::ChatBackend;
+use fluent_llm::ChatMessage;
 
 use super::binding::resolve_path;
 use super::{ChartError, ChartRubric};
@@ -54,58 +54,69 @@ impl RubricVerdict {
     }
 }
 
-/// In-memory cache of validated rubric/answer pairs (M9).
+/// In-memory memo cache of validated rubric/answer pairs (M9).
 ///
 /// A pair `(rubric, output)` that passed the gate is recorded; a later
 /// identical check short-circuits without re-running the deterministic rules
 /// or the (expensive) judge. In-memory today; promoted to the `rubric_cache`
 /// HNSW/SQLite index when a persistent consumer appears (Consolidation
 /// Contract — cross-crate limits stay local until a second consumer).
-#[derive(Debug, Default)]
+///
+/// Keys are `fnv1a64` hashes of the serialized `(rubric, output)` pair — the
+/// canonical workspace hash (`common_core::hash::fnv1a64`) rather than
+/// `DefaultHasher`, whose SipHash output is randomized per-process.
 pub struct RubricCache {
-    accepted: Mutex<HashMap<u64, ()>>,
+    accepted: LoadCache<u64, (), ()>,
 }
 
 impl RubricCache {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_capacity(100_000)
+    }
+
+    /// Create a bounded memo cache holding up to `capacity` accepted pairs.
+    pub fn with_capacity(capacity: usize) -> Self {
+        let load = |_: &u64| -> Result<(), ()> { Ok(()) };
+        Self {
+            accepted: LoadCache::new(capacity, load)
+                .expect("rubric cache capacity must be non-zero"),
+        }
     }
 
     fn key(rubric: &ChartRubric, output: &serde_json::Value) -> u64 {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        rubric.require_fields.hash(&mut h);
-        rubric.judge_model.hash(&mut h);
-        rubric.min_score.to_bits().hash(&mut h);
-        output.hash(&mut h);
-        h.finish()
+        let bytes = serde_json::to_vec(&(
+            &rubric.require_fields,
+            &rubric.judge_model,
+            rubric.min_score.to_bits(),
+            output,
+        ))
+        .unwrap_or_default();
+        fnv1a64(&bytes)
     }
 
     /// Record a rubric/answer pair that passed the gate.
     pub fn record_accepted(&self, rubric: &ChartRubric, output: &serde_json::Value) {
-        self.accepted
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(Self::key(rubric, output), ());
+        self.accepted.insert(Self::key(rubric, output), ());
     }
 
     /// `true` when this exact rubric/answer pair already passed.
     pub fn is_cached_accepted(&self, rubric: &ChartRubric, output: &serde_json::Value) -> bool {
-        self.accepted
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(&Self::key(rubric, output))
+        self.accepted.contains(&Self::key(rubric, output))
     }
 
     /// Number of recorded pairs (for tests/metrics).
     pub fn len(&self) -> usize {
-        self.accepted
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+        self.accepted.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.accepted.is_empty()
+    }
+}
+
+impl Default for RubricCache {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -255,7 +266,7 @@ fn judge_output(
 /// Parse a judge response (tolerant: shared `parse_json_response` strips
 /// fences and extracts the first `{...}` object).
 fn parse_judge_output(raw: &str, min_score: f64) -> Result<RubricVerdict, ChartError> {
-    let value = guidance_llm::parse_json_response(raw).map_err(|e| ChartError::Selection {
+    let value = fluent_llm::parse_json_response(raw).map_err(|e| ChartError::Selection {
         reason: format!("rubric judge output unparseable: {e}"),
     })?;
     let obj = value.as_object().ok_or_else(|| ChartError::Selection {

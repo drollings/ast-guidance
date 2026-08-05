@@ -7,14 +7,13 @@ use crate::metrics::FailureClass;
 use bytes::Bytes;
 use common_core::drain_sse_lines;
 use common_core::hash::uuid_v4;
-use guidance_llm::HttpClass;
+use fluent_llm::HttpClass;
 use serde_json::Value;
 
 use crate::dispatch::frontier::{DispatchError, OpenAiBackend};
 use crate::normalize;
 use crate::streaming::StreamingHandler;
 use crate::types::{RouterRequest, RouterResponse};
-
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -40,6 +39,7 @@ pub trait ChatBackend: Send + Sync {
         params: Option<Value>,
         idle_timeout_ms: u64,
         total_timeout_ms: u64,
+        filter_thinking: bool,
     ) -> Pin<Box<dyn Future<Output = Result<RouterResponse, DispatchError>> + Send>>;
 
     fn stream_complete(
@@ -62,22 +62,26 @@ fn build_chat_body(
     model: &str,
     params: Option<&Value>,
     stream: bool,
+    filter_thinking: bool,
 ) -> Result<Value, DispatchError> {
     let messages = normalize::messages_to_json(request)
         .map_err(|e| DispatchError::RequestBuild(e.to_string()))?;
-    let mut body = serde_json::json!({"model": model, "messages": messages});
-    if stream {
-        body["stream"] = Value::Bool(true);
-    }
-    if let Some(p) = params {
-        if let Some(obj) = p.as_object() {
-            for (k, v) in obj {
-                if k != "stream" {
-                    body[k] = v.clone();
-                }
-            }
-        }
-    }
+
+    // Canonical body builder (fluent_llm::openai) supplies the
+    // AGENTS.md-mandated `chat_template_kwargs: {"enable_thinking": false}`
+    // default; `params` may override it. When `filter_thinking` is set we pin
+    // the request-side default (belt-and-suspenders with the response-side
+    // strip), so a contradictory `params` override cannot re-enable thinking.
+    let mut body = fluent_llm::openai::build_openai_chat_body(
+        model,
+        &Value::Array(messages),
+        params,
+        stream,
+        filter_thinking.then_some(false),
+    );
+
+    // Router-specific request defaults: temperature/max_tokens fall back to
+    // the request fields when the model params don't set them.
     if !body
         .as_object()
         .is_some_and(|o| o.contains_key("temperature"))
@@ -100,11 +104,7 @@ fn build_chat_body(
 }
 
 fn dispatch_url(endpoint_url: &str) -> String {
-    if endpoint_url.ends_with("/chat/completions") {
-        endpoint_url.to_string()
-    } else {
-        format!("{}/chat/completions", endpoint_url.trim_end_matches('/'))
-    }
+    fluent_llm::url::chat_completions_url(endpoint_url)
 }
 
 /// Wrap a fallible HTTP future in a timeout. Collapses the repeated
@@ -147,6 +147,7 @@ impl ChatBackend for OpenAiChatBackend {
         params: Option<Value>,
         idle_timeout_ms: u64,
         total_timeout_ms: u64,
+        filter_thinking: bool,
     ) -> Pin<Box<dyn Future<Output = Result<RouterResponse, DispatchError>> + Send>> {
         let url = dispatch_url(&self.endpoint_url);
         let client = self.client.clone();
@@ -155,7 +156,8 @@ impl ChatBackend for OpenAiChatBackend {
             let start = Instant::now();
             let log_model = model.clone();
             let result: Result<RouterResponse, DispatchError> = async {
-                let body = build_chat_body(&request, &model, params.as_ref(), false)?;
+                let body =
+                    build_chat_body(&request, &model, params.as_ref(), false, filter_thinking)?;
                 let response =
                     with_total_timeout(total_timeout_ms, "total timeout exceeded", async {
                         client
@@ -246,7 +248,7 @@ impl ChatBackend for OpenAiChatBackend {
 
         Box::pin(async move {
             let stream_start = Instant::now();
-            let body = build_chat_body(&request, &model, params.as_ref(), true)?;
+            let body = build_chat_body(&request, &model, params.as_ref(), true, filter_thinking)?;
             let mut response = with_total_timeout(
                 total_timeout_ms,
                 "total timeout exceeded for stream connection",
@@ -330,45 +332,33 @@ impl ChatBackend for OpenAiChatBackend {
                             return;
                         }
                         if let Some(data) = trimmed.strip_prefix("data: ") {
-                            if let Ok(chunk_json) = serde_json::from_str::<Value>(data) {
-                                let choices = chunk_json
-                                    .get("choices")
-                                    .and_then(|v| v.as_array())
-                                    .cloned()
-                                    .unwrap_or_default();
-                                if let Some(choice) = choices.first() {
-                                    let delta = choice
-                                        .get("delta")
-                                        .and_then(|d| d.get("content"))
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("");
-                                    let finish_reason =
-                                        choice.get("finish_reason").and_then(|v| v.as_str());
+                            // Shared OpenAI stream-delta parser
+                            // (fluent_llm::openai).
+                            let Some(delta) = normalize::parse_openai_stream_delta(data) else {
+                                continue;
+                            };
 
-                                    if let Some(fr) = finish_reason {
-                                        let s = handler.format_chunk(delta, Some(fr));
-                                        if !s.is_empty() {
-                                            let _ = tx.send_data(Bytes::from(s)).await;
-                                        }
-                                        let _ =
-                                            tx.send_data(Bytes::from(handler.format_done())).await;
-                                        return;
-                                    }
-                                    let s = handler.format_chunk(delta, None);
-                                    if !s.is_empty() {
-                                        if !sent_first_chunk {
-                                            sent_first_chunk = true;
-                                            tracing::info!(
-                                                target: "router.dispatch.backend",
-                                                model = %model_for_task,
-                                                stream_ttfb_ms =
-                                                    stream_start.elapsed().as_millis() as u64,
-                                                "stream first chunk"
-                                            );
-                                        }
-                                        let _ = tx.send_data(Bytes::from(s)).await;
-                                    }
+                            if let Some(fr) = &delta.finish_reason {
+                                let s = handler.format_chunk(&delta.delta, Some(fr));
+                                if !s.is_empty() {
+                                    let _ = tx.send_data(Bytes::from(s)).await;
                                 }
+                                let _ = tx.send_data(Bytes::from(handler.format_done())).await;
+                                return;
+                            }
+                            let s = handler.format_chunk(&delta.delta, None);
+                            if !s.is_empty() {
+                                if !sent_first_chunk {
+                                    sent_first_chunk = true;
+                                    tracing::info!(
+                                        target: "router.dispatch.backend",
+                                        model = %model_for_task,
+                                        stream_ttfb_ms =
+                                            stream_start.elapsed().as_millis() as u64,
+                                        "stream first chunk"
+                                    );
+                                }
+                                let _ = tx.send_data(Bytes::from(s)).await;
                             }
                         }
                     }
@@ -411,6 +401,7 @@ impl ChatBackend for RetryChatBackend {
         params: Option<Value>,
         idle_timeout_ms: u64,
         total_timeout_ms: u64,
+        filter_thinking: bool,
     ) -> Pin<Box<dyn Future<Output = Result<RouterResponse, DispatchError>> + Send>> {
         let inner = self.inner.clone();
         let max_attempts = (self.retry_count + 1).max(1);
@@ -430,6 +421,7 @@ impl ChatBackend for RetryChatBackend {
                             params.clone(),
                             idle_timeout_ms,
                             total_timeout_ms,
+                            filter_thinking,
                         )
                         .await
                 },
@@ -507,6 +499,7 @@ impl ChatBackend for FallbackChatBackend {
         params: Option<Value>,
         idle_timeout_ms: u64,
         total_timeout_ms: u64,
+        filter_thinking: bool,
     ) -> Pin<Box<dyn Future<Output = Result<RouterResponse, DispatchError>> + Send>> {
         let backends = self.backends.clone();
 
@@ -520,6 +513,7 @@ impl ChatBackend for FallbackChatBackend {
                         params.clone(),
                         idle_timeout_ms,
                         total_timeout_ms,
+                        filter_thinking,
                     )
                     .await
                 {
@@ -639,6 +633,7 @@ mod tests {
             _params: Option<Value>,
             idle_timeout_ms: u64,
             total_timeout_ms: u64,
+            _filter_thinking: bool,
         ) -> Pin<Box<dyn Future<Output = Result<RouterResponse, DispatchError>> + Send>> {
             let _ = (idle_timeout_ms, total_timeout_ms);
             let mut guard = self.responses.lock().unwrap();
@@ -692,7 +687,14 @@ mod tests {
         let inner = StubBackend::new(vec![Ok(dummy_response())]);
         let backend = RetryChatBackend::new(inner, 2, 1);
         let result = backend
-            .complete(make_test_request("hi"), "m".into(), None, 5000, 30000)
+            .complete(
+                make_test_request("hi"),
+                "m".into(),
+                None,
+                5000,
+                30000,
+                false,
+            )
             .await;
         assert!(result.is_ok());
     }
@@ -702,7 +704,14 @@ mod tests {
         let inner = StubBackend::new(vec![Err(DispatchError::RateLimited), Ok(dummy_response())]);
         let backend = RetryChatBackend::new(inner, 2, 1);
         let result = backend
-            .complete(make_test_request("hi"), "m".into(), None, 5000, 30000)
+            .complete(
+                make_test_request("hi"),
+                "m".into(),
+                None,
+                5000,
+                30000,
+                false,
+            )
             .await;
         assert!(result.is_ok());
     }
@@ -712,7 +721,14 @@ mod tests {
         let inner = StubBackend::new(vec![Err(DispatchError::ResponseParse("bad json".into()))]);
         let backend = RetryChatBackend::new(inner, 2, 1);
         let result = backend
-            .complete(make_test_request("hi"), "m".into(), None, 5000, 30000)
+            .complete(
+                make_test_request("hi"),
+                "m".into(),
+                None,
+                5000,
+                30000,
+                false,
+            )
             .await;
         assert!(result.is_err());
         assert!(matches!(
@@ -729,7 +745,14 @@ mod tests {
         ]);
         let backend = RetryChatBackend::new(inner, 1, 1);
         let result = backend
-            .complete(make_test_request("hi"), "m".into(), None, 5000, 30000)
+            .complete(
+                make_test_request("hi"),
+                "m".into(),
+                None,
+                5000,
+                30000,
+                false,
+            )
             .await;
         assert!(result.is_err());
     }
@@ -744,7 +767,14 @@ mod tests {
         let b2 = StubBackend::new(vec![Ok(dummy_response())]);
         let backend = FallbackChatBackend::new(vec![b1, b2]);
         let result = backend
-            .complete(make_test_request("hi"), "m".into(), None, 5000, 30000)
+            .complete(
+                make_test_request("hi"),
+                "m".into(),
+                None,
+                5000,
+                30000,
+                false,
+            )
             .await;
         assert!(result.is_ok());
     }
@@ -755,7 +785,14 @@ mod tests {
         let b2 = StubBackend::new(vec![Ok(dummy_response())]);
         let backend = FallbackChatBackend::new(vec![b1, b2]);
         let result = backend
-            .complete(make_test_request("hi"), "m".into(), None, 5000, 30000)
+            .complete(
+                make_test_request("hi"),
+                "m".into(),
+                None,
+                5000,
+                30000,
+                false,
+            )
             .await;
         assert!(result.is_ok());
     }
@@ -766,7 +803,14 @@ mod tests {
         let b2 = StubBackend::new(vec![Ok(dummy_response())]);
         let backend = FallbackChatBackend::new(vec![b1, b2]);
         let result = backend
-            .complete(make_test_request("hi"), "m".into(), None, 5000, 30000)
+            .complete(
+                make_test_request("hi"),
+                "m".into(),
+                None,
+                5000,
+                30000,
+                false,
+            )
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("400"));
@@ -778,7 +822,14 @@ mod tests {
         let b2 = StubBackend::new(vec![Err(DispatchError::Http("HTTP 502".into()))]);
         let backend = FallbackChatBackend::new(vec![b1, b2]);
         let result = backend
-            .complete(make_test_request("hi"), "m".into(), None, 5000, 30000)
+            .complete(
+                make_test_request("hi"),
+                "m".into(),
+                None,
+                5000,
+                30000,
+                false,
+            )
             .await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), DispatchError::Http(_)));
@@ -833,6 +884,7 @@ mod tests {
                 None,
                 total_timeout_ms,
                 total_timeout_ms,
+                false,
             ),
         )
         .await;

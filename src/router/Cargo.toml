@@ -8,7 +8,7 @@ fluent-wvr = { path = "../fluent-wvr" }
 fluent-concurrency = { path = "../fluent-concurrency" }
 common-core = { path = "../common-core", features = ["sqlite"] }
 fluent-types = { path = "../types" }
-guidance-llm = { path = "../llm" }
+fluent-llm = { path = "../llm" }
 fluent-dag = { path = "../dag" }
 fluent-wvr-testutil = { path = "../fluent-wvr-testutil" }
 serde = { workspace = true }

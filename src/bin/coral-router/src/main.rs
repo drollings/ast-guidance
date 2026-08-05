@@ -15,8 +15,8 @@ use fluent_router::server::RouterServer;
 use fluent_router::testing::{
     load_transcript_file, transcript_provider_from_entries, MockDispatchContext,
 };
-use guidance_llm::client::ChatBackend;
-use guidance_llm::{create_embedding_provider, EmbeddingProvider, LlmClient, LlmConfig};
+use fluent_llm::client::ChatBackend;
+use fluent_llm::{create_embedding_provider, EmbeddingProvider, LlmClient, LlmConfig};
 
 #[derive(Parser)]
 #[command(
@@ -325,14 +325,7 @@ const CHART_EXECUTION_CONCURRENCY: usize = 4;
 /// endpoint: `http://host:port/v1/chat/completions` → `http://host:port/v1`
 /// (the embeddings client appends `/embeddings`).
 fn embeddings_base_url(endpoint: &str) -> String {
-    let trimmed = endpoint.trim_end_matches('/');
-    if let Some(base) = trimmed.strip_suffix("/v1/chat/completions") {
-        format!("{base}/v1")
-    } else if let Some(base) = trimmed.strip_suffix("/chat/completions") {
-        format!("{base}/v1")
-    } else {
-        trimmed.to_string()
-    }
+    fluent_llm::url::derive_embeddings_url(endpoint)
 }
 
 /// Build the default chart embedder from the model config, if derivable.

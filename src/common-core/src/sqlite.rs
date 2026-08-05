@@ -72,6 +72,29 @@ pub fn init_embedding_cache(conn: &Connection) -> Result<()> {
     conn.execute_batch(EMBEDDING_CACHE_SCHEMA)
 }
 
+/// True when `e` is a SQLite `UNIQUE` or `PRIMARY KEY` constraint violation.
+///
+/// Generalizes coral's `db/mod.rs` classifier so any consumer can surface a
+/// duplicate-key error as a typed variant instead of a raw `SqliteError`.
+/// Extended codes: 2067 = `SQLITE_CONSTRAINT_UNIQUE`, 1555 =
+/// `SQLITE_CONSTRAINT_PRIMARYKEY`.
+pub fn is_unique_violation(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(ffi, _)
+            if ffi.code == rusqlite::ErrorCode::ConstraintViolation
+                && (ffi.extended_code == 2067 || ffi.extended_code == 1555)
+    )
+}
+
+/// Build the `?,?,?,…` placeholder list for a parameterized `WHERE x IN (...)`.
+///
+/// Returns an empty string for `n == 0` (an `IN ()` clause matches nothing and
+/// callers typically guard against it, but the empty string is a valid no-op).
+pub fn in_clause(n: usize) -> String {
+    "?,".repeat(n).trim_end_matches(',').to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +143,56 @@ mod tests {
         init_embedding_cache(&conn).unwrap();
         // Second call must not fail.
         init_embedding_cache(&conn).unwrap();
+    }
+
+    #[test]
+    fn is_unique_violation_detects_unique_and_primary_key() {
+        let conn = open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)")
+            .unwrap();
+
+        let err = conn
+            .execute(
+                "INSERT INTO t (id, name) VALUES (?1, ?2)",
+                rusqlite::params![1, "x"],
+            )
+            .and_then(|_| {
+                conn.execute(
+                    "INSERT INTO t (id, name) VALUES (?1, ?2)",
+                    rusqlite::params![1, "y"],
+                )
+            })
+            .expect_err("duplicate primary key must fail");
+        assert!(is_unique_violation(&err), "PK: {err}");
+
+        let err = conn
+            .execute(
+                "INSERT INTO t (id, name) VALUES (?1, ?2)",
+                rusqlite::params![2, "x"],
+            )
+            .expect_err("duplicate unique name must fail");
+        assert!(is_unique_violation(&err), "UNIQUE: {err}");
+    }
+
+    #[test]
+    fn is_unique_violation_rejects_other_errors() {
+        let conn = open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)")
+            .unwrap();
+        // NOT NULL violation is not a unique/primary-key violation.
+        let not_null = conn
+            .execute(
+                "INSERT INTO t (id, name) VALUES (?1, NULL)",
+                rusqlite::params![3],
+            )
+            .expect_err("NOT NULL violation");
+        assert!(!is_unique_violation(&not_null), "NOT NULL: {not_null}");
+    }
+
+    #[test]
+    fn in_clause_builds_placeholders() {
+        assert_eq!(in_clause(1), "?");
+        assert_eq!(in_clause(3), "?,?,?");
+        assert_eq!(in_clause(0), "");
     }
 }

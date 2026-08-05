@@ -17,7 +17,7 @@ This is a rust monorepo with multiple projects and shared infrastructure.  coral
 
 2. TEST:        make router-test     # fluent-router unit/golden/e2e tests (kills server)
 
-3. SMOKE:       make router-mock     # 18 curl smoke tests against live server
+3. SMOKE:       make router-mock     # 29 curl smoke tests against live server
                 curl -s http://127.0.0.1:8079/health
                 curl -s -X POST http://127.0.0.1:8079/v1/chat/completions \
                   -H "Content-Type: application/json" \
@@ -34,14 +34,15 @@ This is a rust monorepo with multiple projects and shared infrastructure.  coral
 | `make router`       | Build coral-router |
 | `make router-start` | Build + start server (kills old first) |
 | `make router-test`  | Kill server + run fluent-router unit/golden/e2e tests + --help dry-run |
-| `make router-mock`  | Depends on router-start, runs 18 curl smoke tests, leaves server running |
+| `make router-mock`  | Depends on router-start, runs 29 curl smoke tests, leaves server running |
 
 
 ### Import Boundaries
 
 `fluent-router` may import from `common-core`, `fluent-wvr`, `fluent-concurrency`,
-`guidance-llm`, `guidance-types`, `dag`, and standard library / `tokio` / `reqwest`.
-It must NOT import from `guidance`, `coral`, `wasm_ipc`, `project-knowledge`,
+`guidance-llm`, `guidance-types`, `dag`, `search-vector`, and standard library /
+`tokio` / `reqwest`.
+It must NOT import from `guidance`, `coral`, `wasm_ipc`, `knowledge`,
 `ontology`, or `rdf`.
 
 
@@ -66,17 +67,17 @@ src/
   fluent-concurrency/  WorkerPool, Scope, Limiter, PriorityQueue, CreditFlow,
                        Zone (supervision + dependency cancellation via DependencyGraph)
   llm/                 LLM HTTP client + embeddings (CachedEmbeddingProvider, LlmRequestQueue,
-                       LlmClient, url, error)
+                       LlmClient, openai, url, http_class, llm_queue, error)
   types/               guidance-types (FileType, MemberType, Param, Member, etc.)
   common-core/         General-purpose utility crate (fluent-wvr-common)
                        Note: common-core contains no domain-specific logic;
                        no imports from dag/, coral/, or guidance/
   content-node/        guidance-content-node (lod slicing, file content annotation)
   search-vector/       guidance-search-vector (SQLite hybrid search + HNSW index)
-  project-knowledge/   guidance-project-knowledge (WordIndex, TrigramIndex, CsrGraph, QueryCache)
+  knowledge/           fluent-knowledge (WordIndex, TrigramIndex, CsrGraph, QueryCache)
   ontology/            guidance-ontology (entity extraction, YAGO taxonomy, capability inference)
   rdf/                 guidance-rdf (Turtle/N-Quads parser, normalization)
-  wasm_ipc/            guidance-wasm-ipc (WASM IPC binary types)
+  wasm_ipc/            fluent-wasm-ipc (WASM IPC binary types)
   memory-plugin/       Pluggable memory tier (holographic, hindsight, honcho backends)
   job-copilot/          job-copilot-core: config, schema, sanitize, profile, dispatcher, server, components
   router/              fluent-router: LLM Router & Agent Orchestration Framework,
@@ -136,7 +137,7 @@ Which consumers use which `fluent-concurrency` primitives:
 | `PriorityResultPool` | `fluent-concurrency` tests only | `src/fluent-concurrency/src/pool.rs` |
 | `WorkerPool` | `fluent-concurrency` tests only | `src/fluent-concurrency/src/pool.rs` |
 | `Queue` | `fluent-concurrency` tests only | `src/fluent-concurrency/src/pool.rs` |
-| `Instrumented::with_metrics` | `bin/guidance` histogram | `src/bin/guidance/src/main.rs` |
+| `Instrumented::with_metrics` | `bin/guidance` histogram, guidance `Enhancer` | `src/bin/guidance/src/main.rs`, `src/guidance/src/enhancer.rs` |
 | `ComponentAdapter` | `coral` cache reactor | `src/coral/src/cache/reactor.rs` |
 | `PartitionedRouter` | `job-copilot` dispatcher | `src/job-copilot/src/dispatcher/llm.rs` |
 | `Zone` | `fluent-concurrency` supervision | `src/fluent-concurrency/src/zone.rs` |
@@ -159,18 +160,19 @@ anything that knows what a "node", "session", "target", "embedding", or
 | Concept | Canonical location | Notes |
 |---------|-------------------|-------|
 | Hashing (blake3, sha256, fnv1a64, hex) | `common-core::hash` | `src/common-core/src/hash.rs` |
-| Text utilities (`contains_ignore_case`, `truncate_at_sentence`, …) | `common-core::string` | `src/common-core/src/string.rs` |
+| Text utilities (`contains_ignore_case`, `truncate_at_sentence`, `strip_thinking_blocks`, `StreamingThinkFilter`, `AnsiStripper`, `filter_unsafe_chars`, `trim_doc_prefix`, `detect_identifier_kind`, …) | `common-core::string` | `src/common-core/src/string.rs` |
 | Path / fs helpers (`mtime`, `read_file_alloc_err`, `write_atomic`, …) | `common-core::io` | `src/common-core/src/io.rs` |
-| Shared error leaf types (`IoError`, `SqliteError`, `ResolverError`) | `common-core::error` | `src/common-core/src/error.rs` |
+| Shared error leaf types (`IoError`, `SqliteError`, `ResolverError`) + the `impl_from_io_error!` boilerplate macro | `common-core::error` | `src/common-core/src/error.rs` |
 | Cross-crate magic constants (`MAX_FILE_SIZE`, `HnswParams`, …) and the canonical timeout/retry defaults (`DEFAULT_TOTAL_TIMEOUT_MS`=300_000, `DEFAULT_IDLE_TIMEOUT_MS`=30_000, `DEFAULT_RETRY_INTERVAL_S`=1) | `common-core::constants` | `src/common-core/src/constants.rs` |
 | Bitset / capability registry | `common-core::interner` | `src/common-core/src/interner.rs` |
 | BitSetDrift | `common-core::drift` | `src/common-core/src/drift.rs` |
-| Latency histograms / metrics | `common-core::metrics` | `src/common-core/src/metrics.rs` |
-| Fluent WVR newtype wrappers (`Instrumented`, `ComponentAdapter`, `Pipeline`, `retry_call`) | `fluent-wvr::wrapper` | `src/fluent-wvr/src/wrapper.rs` |
+| Latency histograms / metrics (`LatencyHistogram`, `bucket_counts`, `aggregate`) | `common-core::metrics` | `src/common-core/src/metrics.rs` |
+| Poison-safe mutex locking (`lock`, `lock_read`, `lock_write` — `PoisonError::into_inner`) | `common-core::sync` | `src/common-core/src/sync.rs` |
+| Fluent WVR newtype wrappers (`Instrumented`, `ComponentAdapter`, `Pipeline`, `retry_call`, `ComponentCascade`) | `fluent-wvr::wrapper` | `src/fluent-wvr/src/wrapper.rs` |
 | Jittered-exponential retry (`backoff_ms`, `retry_async`) | `common-core::retry` | `src/common-core/src/retry.rs` |
 | Shared domain newtypes (`NodeId`, `SessionId`, `TargetId`, `LOD_COUNT`) | `guidance-types` | `src/types/src/lib.rs` |
 | Cosine similarity / brute-force KNN | `search-vector::math` | `src/search-vector/src/math.rs` |
-| SQLite open helpers + schemas | `common-core::sqlite` | `src/common-core/src/sqlite.rs` (feature `sqlite`) |
+| SQLite open helpers + schemas (`open_wal`, `is_unique_violation`, `in_clause`) | `common-core::sqlite` | `src/common-core/src/sqlite.rs` (feature `sqlite`) |
 | JSON-RPC / MCP stdio loop | `common-core::jsonrpc` | `src/common-core/src/jsonrpc.rs` |
 | Token budget helpers | `common-core::tokens` | `src/common-core/src/tokens.rs` |
 | Directory walk / file scan | `common-core::walk` | `src/common-core/src/walk.rs` |
@@ -180,7 +182,11 @@ anything that knows what a "node", "session", "target", "embedding", or
 | 80% import line for component work (`Component`, `WorkUnit`, `FieldAccess`, `prelude::*`) | `fluent-wvr::prelude` | `src/fluent-wvr/src/prelude.rs` |
 | HTML stripping (`strip_html`) | `common-core::string` | `src/common-core/src/string.rs` |
 | `impl_component!` / `impl_fieldless!` macros (eliminate `as_any`/fieldless-`FieldAccess` boilerplate) | `fluent-wvr::impl_component!` / `fluent-wvr::impl_fieldless!` | `src/fluent-wvr/src/macros.rs` |
-| Tolerant LLM-JSON parse (`parse_json_response` — fence-strip → parse → extract) | `guidance_llm::parse` | `src/llm/src/parse.rs` |
+| Tolerant LLM-JSON parse (`parse_json_response` — fence-strip → parse → extract) | `fluent_llm::parse` | `src/llm/src/parse.rs` |
+| OpenAI-compatible request body (`build_openai_chat_body` — carries the `chat_template_kwargs: {"enable_thinking": false}` default), stream-delta parser (`parse_openai_stream_delta`/`OpenAiDelta`), and OpenAI-format normalization (`normalize_request`/`normalize_response`/`error_response`/`messages_to_json`, parameterized on `serde_json::Value`) | `guidance-llm::openai` | `src/llm/src/openai.rs` |
+| LLM endpoint derivation (`chat_completions_url`, `derive_embeddings_url`) + URL validation | `guidance-llm::url` | `src/llm/src/url.rs` |
+| HTTP-status → failure taxonomy (`HttpClass`, `FailureClass`, `classify_http_status`) | `guidance-llm::http_class` | `src/llm/src/http_class.rs` |
+| Typed LLM request queue (`LlmRequestQueue`, `build_default_queue`, `default_handler`) — worker-pool dispatch for chat completions | `guidance-llm::llm_queue` | `src/llm/src/llm_queue.rs` |
 | `ComponentArcExt::try_as_any_mut` (safe mutable access to shared Arc) | `fluent-wvr::ComponentArcExt` | `src/fluent-wvr/src/traits.rs` |
 | `WorkOutput::typed` (Result-returning) and `WorkOutput::data_take` (zero-copy) | `fluent-wvr::WorkOutput` | `src/fluent-wvr/src/work.rs` |
 | `make_hnsw()` | `common-core::sqlite` | `src/common-core/src/sqlite.rs` (feature `sqlite`) |
@@ -190,15 +196,16 @@ anything that knows what a "node", "session", "target", "embedding", or
 | `Pipeline<T, E>` | `fluent-wvr::wrapper` | `src/fluent-wvr/src/wrapper.rs` |
 | `global_pool_config()` | `fluent-concurrency::pool` | `src/fluent-concurrency/src/pool.rs` |
 | `thread_local_resource!` / `with_tlr` | `fluent-concurrency::thread_resource` | `src/fluent-concurrency/src/thread_resource.rs` |
-| `ReadThroughCache<K, V>` | `common-core::cache` | `src/common-core/src/cache.rs` |
+| `ReadThroughCache<K, V>`, `LoadCache<K, V, E>` (bounded get-or-load LRU) | `common-core::cache` | `src/common-core/src/cache.rs` |
+| Generic keyed registry (`KeyedRegistry<K, V>` — insert/get/get_mut/keys/values/iter/remove/len; register-by-key lookup for plugin/provider registries) | `common-core::registry` | `src/common-core/src/registry.rs` |
 | Generic dependency graph (`DependencyGraph<K>`, `GraphError`) | `fluent-dag::dep_graph` | `src/dag/src/dep_graph.rs` |
 
 Cross-crate limits that currently have a single consumer stay in their
 domain crate but **must** be moved to `common-core::constants` if a second
-consumer appears. Current single-consumer limits (candidates for future
-promotion): `MAX_KNN_CANDIDATES` in `src/coral/src/db.rs:15`,
-`MAX_MCP_REQUEST_SIZE` in `src/coral/src/mcp.rs:11`, `MAX_WASM_HOST_CALLS`
-in `src/wasm_ipc/src/lib.rs:17`.
+consumer appears. `MAX_KNN_CANDIDATES` and `MAX_MCP_REQUEST_SIZE` were
+promoted in ROADMAP_20260804_SHARED_CORE M4.3 (coral re-exports them).
+Current single-consumer limits (candidates for future promotion):
+`MAX_WASM_HOST_CALLS` in `src/wasm_ipc/src/lib.rs:17`.
 
 ### HNSW instances
 
@@ -216,12 +223,15 @@ centralized in exactly one place.
 `common_core::metrics::LatencyHistogram` is the canonical latency surface,
 and `fluent_wvr::wrapper::Instrumented::with_metrics(inner, label,
 histogram)` is the future-ready API for recording per-unit execution
-durations.  The in-tree consumer today is the CLI-level `cmd_histogram` in
-`src/bin/guidance/src/main.rs` (total command timing).  Candidate adoption
-sites are documented in the `with_metrics` doc comment (the L4 Semantic KNN
-dispatch in `coral::cache::reactor`, and the top-level dispatch on the
-`TargetWorkUnit` bridge under `Zone` supervision).  Adoption at any of those
-moves M12 from "test-only" to a
+durations.  The in-tree consumers today are the CLI-level `cmd_histogram` in
+`src/bin/guidance/src/main.rs` (total command timing) and the guidance
+`Enhancer::with_metrics` (`src/guidance/src/enhancer.rs`, per-LLM-call
+latency, wired by ROADMAP_20260804_SHARED_CORE M9).  Coral's `coral_stats`
+aggregates across units via `LatencyHistogram::aggregate` (M4).  Candidate
+adoption sites are documented in the `with_metrics` doc comment (the L4
+Semantic KNN dispatch in `coral::cache::reactor`, and the top-level dispatch
+on the `TargetWorkUnit` bridge under `Zone` supervision).  Adoption at any
+of those moves M12 from "test-only" to a
 real consumer wiring.
 
 ### Dependency tracking

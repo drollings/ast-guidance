@@ -80,7 +80,7 @@ impl super::Library {
 
         let name_by_id: HashMap<i64, String> = {
             let conn = self.conn.lock().ok()?;
-            let placeholders = vec!["?"; node_ids.len()].join(",");
+            let placeholders = common_core::sqlite::in_clause(node_ids.len());
             let sql = format!("SELECT id, name FROM context_nodes WHERE id IN ({placeholders})");
             let mut stmt = conn.prepare(&sql).ok()?;
             let mut rows = stmt

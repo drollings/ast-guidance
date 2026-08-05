@@ -321,11 +321,11 @@ mod tests {
         max_active: std::sync::atomic::AtomicUsize,
     }
 
-    impl guidance_llm::client::ChatBackend for TrackingBackend {
+    impl fluent_llm::client::ChatBackend for TrackingBackend {
         fn chat_complete(
             &self,
-            _messages: &[guidance_llm::ChatMessage],
-        ) -> Result<String, guidance_llm::LlmError> {
+            _messages: &[fluent_llm::ChatMessage],
+        ) -> Result<String, fluent_llm::LlmError> {
             use std::sync::atomic::Ordering;
             let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(now, Ordering::SeqCst);
@@ -367,7 +367,7 @@ mod tests {
         };
         let limiter = Arc::new(fluent_concurrency::pool::Limiter::new(1));
         let stage = ClassifierStage::new(
-            backend as Arc<dyn guidance_llm::client::ChatBackend>,
+            backend as Arc<dyn fluent_llm::client::ChatBackend>,
             routing_config,
             0.7,
             None,

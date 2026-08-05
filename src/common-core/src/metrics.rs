@@ -77,20 +77,50 @@ impl LatencyHistogram {
         }
     }
 
-    pub fn estimate_percentile(&self, pct: f64) -> u64 {
-        let total = self.count();
+    /// Snapshot of the per-bucket counts, indexed by `BUCKET_MS`.
+    pub fn bucket_counts(&self) -> [u64; BUCKET_COUNT] {
+        let mut out = [0u64; BUCKET_COUNT];
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = self.buckets[i].load(Ordering::Relaxed);
+        }
+        out
+    }
+
+    /// Weighted percentile across a set of histograms.
+    ///
+    /// Bucket arrays are summed across all histograms first, then the same
+    /// cumulative walk as [`Self::estimate_percentile`] maps the target rank
+    /// to a bucket bound. This is the canonical aggregate for p50/p99 across
+    /// a multi-tier cascade (previously duplicated in coral's reactor).
+    pub fn aggregate(histograms: &[&LatencyHistogram], pct: f64) -> u64 {
+        let mut buckets = [0u64; BUCKET_COUNT];
+        for h in histograms {
+            let counts = h.bucket_counts();
+            for (i, b) in buckets.iter_mut().enumerate() {
+                *b += counts[i];
+            }
+        }
+        Self::percentile_from_counts(&buckets, pct)
+    }
+
+    fn percentile_from_counts(buckets: &[u64; BUCKET_COUNT], pct: f64) -> u64 {
+        let total: u64 = buckets.iter().sum();
         if total == 0 {
             return 0;
         }
         let target = (total as f64 * pct / 100.0) as u64;
         let mut cumulative = 0u64;
         for (i, &bound) in BUCKET_MS.iter().enumerate() {
-            cumulative += self.buckets[i].load(Ordering::Relaxed);
+            cumulative += buckets[i];
             if cumulative >= target {
                 return bound;
             }
         }
         *BUCKET_MS.last().unwrap_or(&5000)
+    }
+
+    pub fn estimate_percentile(&self, pct: f64) -> u64 {
+        Self::percentile_from_counts(&self.bucket_counts(), pct)
     }
 }
 
@@ -204,5 +234,55 @@ mod tests {
     fn default_creates_empty_histogram() {
         let h = LatencyHistogram::default();
         assert_eq!(h.count(), 0);
+    }
+
+    #[test]
+    fn bucket_counts_snapshot_matches_individual_bucket() {
+        let h = LatencyHistogram::new();
+        h.observe(5);
+        h.observe(50);
+        let counts = h.bucket_counts();
+        assert_eq!(counts[1], 1); // 5ms ≤ 5 → bucket 1
+        assert_eq!(counts[4], 1); // 50ms ≤ 50 → bucket 4
+        assert_eq!(counts.iter().sum::<u64>(), h.count());
+    }
+
+    #[test]
+    fn aggregate_sums_buckets_across_histograms() {
+        let a = LatencyHistogram::new();
+        let b = LatencyHistogram::new();
+        a.observe(1);
+        a.observe(100);
+        b.observe(10);
+        b.observe(100);
+        // values: 1, 10, 100, 100 → p50 target rank 2 → 10ms bucket
+        let p50 = LatencyHistogram::aggregate(&[&a, &b], 50.0);
+        assert_eq!(p50, 10);
+        // p99 target rank 3 → crosses the 100ms bucket
+        let p99 = LatencyHistogram::aggregate(&[&a, &b], 99.0);
+        assert_eq!(p99, 100);
+    }
+
+    #[test]
+    fn aggregate_empty_returns_zero() {
+        let a = LatencyHistogram::new();
+        assert_eq!(LatencyHistogram::aggregate(&[&a], 50.0), 0);
+        assert_eq!(LatencyHistogram::aggregate(&[], 50.0), 0);
+    }
+
+    #[test]
+    fn aggregate_matches_estimate_percentile_for_single_histogram() {
+        let h = LatencyHistogram::new();
+        for ms in [1u64, 10, 100, 1000] {
+            h.observe(ms);
+        }
+        assert_eq!(
+            LatencyHistogram::aggregate(&[&h], 50.0),
+            h.estimate_percentile(50.0)
+        );
+        assert_eq!(
+            LatencyHistogram::aggregate(&[&h], 99.0),
+            h.estimate_percentile(99.0)
+        );
     }
 }

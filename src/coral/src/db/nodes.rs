@@ -50,7 +50,7 @@ impl super::Library {
             return Ok(HashMap::new());
         }
         let conn = self.conn.lock().unwrap();
-        let placeholders = vec!["?"; names.len()].join(",");
+        let placeholders = common_core::sqlite::in_clause(names.len());
         let sql = format!("SELECT id, name FROM context_nodes WHERE name IN ({placeholders})");
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(names.iter().copied()), |row| {

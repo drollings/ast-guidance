@@ -7,7 +7,7 @@ use std::path::Path;
 
 use guidance_core::config::ProjectConfig;
 use guidance_core::sync::json_store::load_guidance;
-use guidance_llm::ChatMessage;
+use fluent_llm::ChatMessage;
 
 /// Maximum total characters of diff context sent to the LLM.
 const TOTAL_CONTEXT_CAP: usize = 12_000;
@@ -267,7 +267,7 @@ pub fn generate_commit_message(
     api_url: &str,
     model: &str,
     debug: bool,
-) -> Result<String, guidance_llm::LlmError> {
+) -> Result<String, fluent_llm::LlmError> {
     let system_prompt = "You are a concise git commit message writer. \
         Output only a bullet list. No code fences, no explanations, no headings.";
 
@@ -316,7 +316,7 @@ pub fn generate_commit_message(
     // Use the direct HTTP path — avoids LlmClient's DefaultQueue which creates
     // a nested tokio runtime that panics when called from #[tokio::main].
     let raw =
-        guidance_llm::chat_complete_http(api_url, &messages, model, None, None, debug, false)?;
+        fluent_llm::chat_complete_http(api_url, &messages, model, None, None, debug, false)?;
 
     // Parse bullet lines from the response — strip prefix, then re-add
     // uniformly so the output is consistent regardless of what the LLM used.

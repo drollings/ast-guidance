@@ -119,7 +119,7 @@ happens only in the Consumer layer.
 | `guidance-dag` | `src/dag/` | DAG executor, resolver, middleware, work unit abstractions |
 | `guidance-content-node` | `src/content-node/` | Level-of-detail text slicing, content annotation |
 | `guidance-search-vector` | `src/search-vector/` | SQLite hybrid search (KNN + keyword + RRF) |
-| `guidance-project-knowledge` | `src/project-knowledge/` | Word/trigram index, CSR graph, frequency tables |
+| `fluent-knowledge` | `src/knowledge/` | Word/trigram index, CSR graph, frequency tables |
 | `guidance-ontology` | `src/ontology/` | Entity extraction, capability inference, YAGO taxonomy |
 | `guidance-rdf` | `src/rdf/` | RDF/Turtle/N-Quads parser, normalizer |
 | `guidance-wasm-ipc` | `src/wasm_ipc/` | `#[repr(C)]` binary IPC schemas for Extism boundary |

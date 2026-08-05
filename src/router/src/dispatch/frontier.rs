@@ -62,10 +62,18 @@ impl OpenAiBackend {
         let messages: Vec<Value> = crate::normalize::messages_to_json(request)
             .map_err(|e| DispatchError::RequestBuild(e.to_string()))?;
 
-        let mut body = serde_json::json!({
-            "model": request.model,
-            "messages": messages,
-        });
+        // Canonical body builder (fluent_llm::openai) supplies the
+        // AGENTS.md-mandated `chat_template_kwargs: {"enable_thinking": false}`
+        // default. The escalation ladder has no `LlmConfig.think` equivalent,
+        // so `think_override` is `None`; router request fields are applied
+        // after the canonical merge.
+        let mut body = fluent_llm::openai::build_openai_chat_body(
+            &request.model,
+            &Value::Array(messages),
+            None,
+            false,
+            None,
+        );
 
         if let Some(temp) = request.temperature {
             body["temperature"] = Value::Number(serde_json::Number::from_f64(temp).unwrap());
@@ -168,33 +176,18 @@ impl OpenAiBackend {
             return Ok(StreamEvent::Done);
         }
 
-        let v: Value =
-            serde_json::from_str(text).map_err(|e| DispatchError::StreamParse(e.to_string()))?;
-        let empty_choices = vec![];
-        let choices = v
-            .get("choices")
-            .and_then(|v| v.as_array())
-            .unwrap_or(&empty_choices);
-
-        if let Some(choice) = choices.first() {
-            let delta = choice
-                .get("delta")
-                .and_then(|d| d.get("content"))
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-            let finish_reason = choice
-                .get("finish_reason")
-                .and_then(Value::as_str)
-                .map(ToString::to_string);
-            Ok(StreamEvent::Chunk {
-                delta,
-                finish_reason,
-            })
-        } else {
-            Err(DispatchError::StreamParse(
+        // Shared OpenAI stream-delta parser (fluent_llm::openai). `None`
+        // here means the payload was unparseable or choice-less — the ladder
+        // treats that as a stream-parse error (matching the previous local
+        // parser's behavior).
+        match crate::normalize::parse_openai_stream_delta(text) {
+            Some(delta) => Ok(StreamEvent::Chunk {
+                delta: delta.delta,
+                finish_reason: delta.finish_reason,
+            }),
+            None => Err(DispatchError::StreamParse(
                 "no choices in stream event".into(),
-            ))
+            )),
         }
     }
 }

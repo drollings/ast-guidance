@@ -72,6 +72,33 @@ pub fn validate_https_or_local_http(url: &str) -> Result<(), UrlError> {
     Ok(())
 }
 
+/// Derive the chat-completions endpoint URL from a base URL.
+///
+/// If `base` already ends in `/chat/completions` it is returned as-is
+/// (after trimming trailing slashes); otherwise `/chat/completions` is
+/// appended.
+pub fn chat_completions_url(base: &str) -> String {
+    let trimmed = base.trim_end_matches('/');
+    if trimmed.ends_with("/chat/completions") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/chat/completions")
+    }
+}
+
+/// Derive an OpenAI-compatible embeddings base URL from a chat-completions
+/// endpoint: `http://host:port/v1/chat/completions` → `http://host:port/v1`
+/// (the embeddings client appends `/embeddings`).
+pub fn derive_embeddings_url(endpoint: &str) -> String {
+    let trimmed = endpoint.trim_end_matches('/');
+    if let Some(base) = trimmed.strip_suffix("/v1/chat/completions") {
+        format!("{base}/v1")
+    } else if let Some(base) = trimmed.strip_suffix("/chat/completions") {
+        format!("{base}/v1")
+    } else {
+        trimmed.to_string()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,5 +172,53 @@ mod tests {
     #[test]
     fn blocks_private_class_c_https() {
         assert!(validate_https_or_local_http("https://192.168.1.1/api").is_err());
+    }
+
+    #[test]
+    fn chat_completions_url_already_suffixed() {
+        assert_eq!(
+            chat_completions_url("http://localhost:11434/v1/chat/completions"),
+            "http://localhost:11434/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_completions_url_appends() {
+        assert_eq!(
+            chat_completions_url("http://localhost:11434/v1"),
+            "http://localhost:11434/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_completions_url_trims_trailing_slash() {
+        assert_eq!(
+            chat_completions_url("http://localhost:11434/v1/"),
+            "http://localhost:11434/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn derive_embeddings_url_v1_chat() {
+        assert_eq!(
+            derive_embeddings_url("http://host:port/v1/chat/completions"),
+            "http://host:port/v1"
+        );
+    }
+
+    #[test]
+    fn derive_embeddings_url_plain_chat() {
+        assert_eq!(
+            derive_embeddings_url("http://host:port/chat/completions"),
+            "http://host:port/v1"
+        );
+    }
+
+    #[test]
+    fn derive_embeddings_url_passthrough() {
+        assert_eq!(
+            derive_embeddings_url("http://host:port/v1"),
+            "http://host:port/v1"
+        );
     }
 }

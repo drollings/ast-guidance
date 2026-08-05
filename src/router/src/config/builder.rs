@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use common_core::config::load_json_or_default;
 use fluent_wvr::prelude::Component;
-use guidance_llm::client::ChatBackend;
-use guidance_llm::{LlmClient, LlmConfig};
+use fluent_llm::client::ChatBackend;
+use fluent_llm::{LlmClient, LlmConfig};
 
 use super::{default_true, RejectPatterns, RouterConfig};
 use crate::pipeline::PipelineOrchestrator;
@@ -257,6 +257,8 @@ mod tests {
     use std::sync::Mutex;
     use tracing_subscriber::layer::SubscriberExt;
 
+    use common_core::sync::lock;
+
     use crate::charts::binding::Entity;
     use crate::charts::{ChartDef, ChartError};
     use crate::test_stubs::StubChatBackend;
@@ -268,10 +270,7 @@ mod tests {
 
     impl Write for LogCapture {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(String::from_utf8_lossy(buf).into_owned());
+            lock(&self.0).push(String::from_utf8_lossy(buf).into_owned());
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -295,11 +294,7 @@ mod tests {
                 .with_target(true),
         );
         let result = tracing::subscriber::with_default(subscriber, f);
-        let logs = capture
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let logs = lock(&capture.0).clone();
         (result, logs)
     }
 
@@ -376,17 +371,14 @@ mod tests {
     impl ChatBackend for RecordingBackend {
         fn chat_complete(
             &self,
-            messages: &[guidance_llm::ChatMessage],
-        ) -> Result<String, guidance_llm::LlmError> {
-            self.prompts
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .extend(
-                    messages
-                        .iter()
-                        .filter(|m| m.role == "system")
-                        .map(|m| m.content.clone()),
-                );
+            messages: &[fluent_llm::ChatMessage],
+        ) -> Result<String, fluent_llm::LlmError> {
+            lock(&self.prompts).extend(
+                messages
+                    .iter()
+                    .filter(|m| m.role == "system")
+                    .map(|m| m.content.clone()),
+            );
             Ok(r#"{"ok": true}"#.to_string())
         }
     }

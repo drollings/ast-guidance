@@ -1,6 +1,8 @@
 //! SSE streaming handler — translates RouterResponse chunks into
 //! OpenAI-compatible streaming delta chunks.
 
+use common_core::string::StreamingThinkFilter;
+
 use crate::types::RouterChoice;
 
 /// SSE streaming handler. Translates RouterChoice chunks into
@@ -12,14 +14,9 @@ pub struct StreamingHandler {
     request_id: String,
     model: String,
     filter_thinking: bool,
-    /// When filter_thinking is true, tracks content inside an unclosed
-    /// thinking block across chunks so partial think tags are never
-    /// leaked to the client.
-    in_think_block: bool,
-    think_pending: String,
-    /// Held-back trailing text that is a proper prefix of an open/close tag
-    /// (e.g. `<thi`), waiting for the next chunk to complete it.
-    pending: String,
+    /// When filter_thinking is true, delegates cross-chunk think-block
+    /// filtering to the shared `StreamingThinkFilter` value type.
+    filter: StreamingThinkFilter,
 }
 
 impl StreamingHandler {
@@ -31,9 +28,7 @@ impl StreamingHandler {
             request_id: request_id.into(),
             model: model.into(),
             filter_thinking: false,
-            in_think_block: false,
-            think_pending: String::new(),
-            pending: String::new(),
+            filter: StreamingThinkFilter::new(),
         }
     }
 
@@ -51,10 +46,10 @@ impl StreamingHandler {
     pub fn format_chunk(&mut self, delta: &str, finish_reason: Option<&str>) -> String {
         self.buffer.push_str(delta);
 
+        self.chunk_index += 1;
         let content_to_send = if self.filter_thinking {
             self.filter_think_block(delta)
         } else {
-            self.chunk_index += 1;
             delta.to_string()
         };
 
@@ -92,94 +87,11 @@ impl StreamingHandler {
     /// Filter thinking blocks from a delta, handling cross-chunk blocks.
     /// Returns the text to emit (empty if entirely inside a think block).
     ///
-    /// Tag splits are handled at the *suffix* level: a trailing run of the
-    /// input that is a proper prefix of an open/close tag is held in `pending`
-    /// until the next chunk can complete it, so `<thi` + `nk>` or
-    /// `</thi` + `nk>` never leaks a partial tag to the client.
+    /// Delegates to the canonical `StreamingThinkFilter` in `common-core`,
+    /// which holds back trailing tag prefixes at the *suffix* level so
+    /// `<thi` + `nk>` or `</thi` + `nk>` never leaks a partial tag.
     fn filter_think_block(&mut self, delta: &str) -> String {
-        const OPEN_TAGS: &[&str] = &["<think>", "<thinking>"];
-        const CLOSE_TAGS: &[&str] = &["</think>", "</thinking>"];
-
-        let mut combined = String::with_capacity(self.pending.len() + delta.len());
-        combined.push_str(&self.pending);
-        combined.push_str(delta);
-        self.pending.clear();
-
-        let mut remaining: &str = &combined;
-        let mut output = String::new();
-
-        loop {
-            if self.in_think_block {
-                // Check for any closing tag in remaining
-                let mut earliest_close: Option<(usize, &str)> = None;
-                for ct in CLOSE_TAGS {
-                    if let Some(pos) = remaining.find(ct) {
-                        if earliest_close.is_none_or(|(e, _)| pos < e) {
-                            earliest_close = Some((pos, ct));
-                        }
-                    }
-                }
-
-                if let Some((pos, ct)) = earliest_close {
-                    // Close the think block — emit nothing for its content
-                    self.in_think_block = false;
-                    self.think_pending.clear();
-                    remaining = &remaining[pos + ct.len()..];
-                    continue;
-                }
-                // Still inside the block — discard the definite content but
-                // hold back a trailing close-tag prefix that may complete in
-                // the next chunk (otherwise a split `</thi` + `nk>` close
-                // would be missed and the tail would leak).
-                let hold = Self::tag_prefix_len(remaining, CLOSE_TAGS);
-                self.think_pending
-                    .push_str(&remaining[..remaining.len() - hold]);
-                self.pending.push_str(&remaining[remaining.len() - hold..]);
-                self.chunk_index += 1;
-                return output;
-            }
-
-            // Not inside a think block — scan for opening tags
-            let mut earliest_open: Option<(usize, &str)> = None;
-            for ot in OPEN_TAGS {
-                if let Some(pos) = remaining.find(ot) {
-                    if earliest_open.is_none_or(|(e, _)| pos < e) {
-                        earliest_open = Some((pos, ot));
-                    }
-                }
-            }
-
-            if let Some((pos, ot)) = earliest_open {
-                output.push_str(&remaining[..pos]);
-                self.in_think_block = true;
-                self.think_pending.clear();
-                remaining = &remaining[pos + ot.len()..];
-                continue;
-            }
-
-            // No complete open tag — emit everything except a trailing run
-            // that could be the start of a tag split across chunks.
-            let hold = Self::tag_prefix_len(remaining, OPEN_TAGS);
-            output.push_str(&remaining[..remaining.len() - hold]);
-            self.pending.push_str(&remaining[remaining.len() - hold..]);
-            self.chunk_index += 1;
-            return output;
-        }
-    }
-
-    /// Length of the longest suffix of `s` that is a proper prefix of any tag
-    /// in `tags` — i.e. a run that could grow into a full tag once the next
-    /// chunk arrives.
-    fn tag_prefix_len(s: &str, tags: &[&str]) -> usize {
-        let mut best = 0;
-        for tag in tags {
-            for len in 1..tag.len() {
-                if s.ends_with(&tag[..len]) {
-                    best = best.max(len);
-                }
-            }
-        }
-        best
+        self.filter.push(delta)
     }
 
     /// Format a single choice as an SSE delta chunk.
@@ -325,47 +237,6 @@ mod tests {
         h.format_chunk("result", None);
         h.format_chunk("<thinking>reasoning</thinking>", None);
         assert_eq!(h.filtered_content(), "result");
-    }
-
-    #[test]
-    fn filtered_content_open_tag_split_across_chunks() {
-        let mut h = StreamingHandler::new("req-1", "test").with_filter_thinking(true);
-        h.format_chunk("Hello <thi", None);
-        h.format_chunk("nk>secret reasoning</think>the answer", None);
-        assert_eq!(
-            h.filtered_content(),
-            "Hello the answer",
-            "a split `<thi`+`nk>` open tag must never leak a partial tag"
-        );
-    }
-
-    #[test]
-    fn filtered_content_close_tag_split_across_chunks() {
-        let mut h = StreamingHandler::new("req-1", "test").with_filter_thinking(true);
-        h.format_chunk("A <think>secret</thi", None);
-        h.format_chunk("nk>B", None);
-        assert_eq!(
-            h.filtered_content(),
-            "A B",
-            "a split `</thi`+`nk>` close tag must not leak its tail"
-        );
-    }
-
-    #[test]
-    fn filtered_content_incomplete_tag_prefix_not_emitted_partial() {
-        let mut h = StreamingHandler::new("req-1", "test").with_filter_thinking(true);
-        // A lone `<` at a chunk boundary is held back, not emitted as a
-        // partial tag.
-        h.format_chunk("value <", None);
-        h.format_chunk("", None);
-        assert_eq!(
-            h.filtered_content(),
-            "value ",
-            "an incomplete tag prefix must be held back, not leaked"
-        );
-        // It only resolves to real text when a non-tag continuation arrives.
-        h.format_chunk("input", None);
-        assert_eq!(h.filtered_content(), "value <input");
     }
 
     #[test]

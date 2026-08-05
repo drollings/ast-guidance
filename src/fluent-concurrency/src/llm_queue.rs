@@ -7,7 +7,7 @@
 //!
 //! The handler is supplied at construction time so this module stays
 //! transport-agnostic: the default OpenAI-compatible HTTP handler lives in
-//! `guidance_llm` (see `guidance_llm::llm_queue::default_handler`). Tests
+//! `fluent_llm` (see `fluent_llm::llm_queue::default_handler`). Tests
 //! and adapters can supply stub handlers without dragging in `reqwest`.
 //!
 //! # Architecture

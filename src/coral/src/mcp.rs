@@ -9,7 +9,8 @@ use thiserror::Error;
 use crate::cache::reactor::QueueReactor;
 use crate::db::Library;
 
-pub const MAX_MCP_REQUEST_SIZE: usize = 10 * 1024 * 1024;
+// Promoted to `common-core::constants` (ROADMAP_20260804_SHARED_CORE M4.3).
+use common_core::constants::MAX_MCP_REQUEST_SIZE;
 
 #[derive(Error, Debug)]
 pub enum McpError {
@@ -25,11 +26,7 @@ pub enum McpError {
     MethodNotFound(String),
 }
 
-impl From<std::io::Error> for McpError {
-    fn from(e: std::io::Error) -> Self {
-        McpError::Io(common_core::error::IoError(e))
-    }
-}
+common_core::impl_from_io_error!(McpError);
 
 pub struct McpServer {
     library: Arc<Library>,

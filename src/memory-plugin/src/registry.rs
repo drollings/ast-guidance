@@ -2,7 +2,7 @@
 
 use crate::traits::{MemoryOps, MemoryPlugin};
 use crate::types::MemoryError;
-use std::collections::BTreeMap;
+use common_core::registry::KeyedRegistry;
 use std::sync::Arc;
 
 /// A registered plugin entry.
@@ -23,7 +23,7 @@ struct PluginEntry {
 /// The registry is designed to be wrapped in `tokio::sync::RwLock` for
 /// the async integration layer.
 pub struct MemoryPluginRegistry {
-    plugins: BTreeMap<&'static str, PluginEntry>,
+    plugins: KeyedRegistry<&'static str, PluginEntry>,
     active_name: Option<&'static str>,
 }
 
@@ -31,7 +31,7 @@ impl MemoryPluginRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
         Self {
-            plugins: BTreeMap::new(),
+            plugins: KeyedRegistry::new(),
             active_name: None,
         }
     }
@@ -47,7 +47,7 @@ impl MemoryPluginRegistry {
     pub fn register(&mut self, plugin: Arc<dyn MemoryPlugin>) {
         let name = <dyn MemoryPlugin as MemoryOps>::name(&*plugin);
         assert!(
-            !self.plugins.contains_key(name),
+            !self.plugins.contains(name),
             "duplicate memory plugin registration: '{name}'"
         );
         self.plugins.insert(
@@ -61,7 +61,7 @@ impl MemoryPluginRegistry {
 
     /// Set the active plugin by name. Only one can be active at a time.
     pub fn set_active(&mut self, name: &'static str) -> Result<(), MemoryError> {
-        if !self.plugins.contains_key(name) {
+        if !self.plugins.contains(name) {
             return Err(MemoryError::InitFailed(format!(
                 "plugin '{name}' not registered"
             )));

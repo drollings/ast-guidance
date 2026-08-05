@@ -1,9 +1,10 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+use common_core::sync::lock;
 use fluent_wvr::prelude::*;
-use guidance_llm::client::ChatBackend;
-use guidance_llm::{BatchEmbedding, ChatMessage, EmbeddingError, EmbeddingProvider, LlmError};
+use fluent_llm::client::ChatBackend;
+use fluent_llm::{BatchEmbedding, ChatMessage, EmbeddingError, EmbeddingProvider, LlmError};
 
 use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
 
@@ -25,10 +26,7 @@ impl StubChatBackend {
 
 impl ChatBackend for StubChatBackend {
     fn chat_complete(&self, _messages: &[ChatMessage]) -> Result<String, LlmError> {
-        let mut queue = self
-            .responses
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut queue = lock(&self.responses);
         queue.pop_front().ok_or(LlmError::NoResponse)
     }
 }
@@ -171,13 +169,6 @@ impl HashEmbedder {
     }
 }
 
-fn fnv1a(s: &str) -> u64 {
-    s.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |mut h, b| {
-        h ^= u64::from(b);
-        h.wrapping_mul(0x0000_0100_0000_01b3)
-    })
-}
-
 impl EmbeddingProvider for HashEmbedder {
     fn name(&self) -> &'static str {
         "test-hash"
@@ -193,7 +184,7 @@ impl EmbeddingProvider for HashEmbedder {
             if token.is_empty() {
                 continue;
             }
-            let h = fnv1a(&token.to_ascii_lowercase());
+            let h = common_core::hash::fnv1a64(token.to_ascii_lowercase().as_bytes());
             let bucket = (h % self.dims as u64) as usize;
             vec[bucket] += 1.0;
         }

@@ -13,11 +13,7 @@ pub enum SyncError {
     SourceNotFound(String),
 }
 
-impl From<std::io::Error> for SyncError {
-    fn from(e: std::io::Error) -> Self {
-        SyncError::Io(common_core::error::IoError(e))
-    }
-}
+common_core::impl_from_io_error!(SyncError);
 
 pub fn sync_comments(
     source_path: &Path,

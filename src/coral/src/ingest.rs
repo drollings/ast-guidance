@@ -23,11 +23,7 @@ pub enum IngestError {
     Parse(String),
 }
 
-impl From<std::io::Error> for IngestError {
-    fn from(e: std::io::Error) -> Self {
-        IngestError::Io(common_core::error::IoError(e))
-    }
-}
+common_core::impl_from_io_error!(IngestError);
 
 #[derive(Debug, Clone, Default)]
 pub struct IngestStats {

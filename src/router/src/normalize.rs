@@ -1,210 +1,43 @@
 //! Request and response normalization — OpenAI-compatible JSON → RouterRequest
 //! and RouterResponse → OpenAI-compatible JSON.
+//!
+//! Thin adapter over the canonical protocol-boundary helpers in
+//! `fluent_llm::openai`. The shared helpers operate on `serde_json::Value`;
+//! this module adapts them to the router's typed `RouterRequest`/`RouterResponse`.
 
-use serde::Deserialize;
-use thiserror::Error;
+use crate::types::{RouterRequest, RouterResponse, Usage};
 
-use crate::types::{RouterMessage, RouterMessageContent, RouterRequest, RouterResponse, Usage};
-
-#[derive(Debug, Error)]
-pub enum NormalizeError {
-    #[error("missing required field: {0}")]
-    MissingField(String),
-    #[error("invalid value for field '{field}': {detail}")]
-    InvalidValue { field: String, detail: String },
-    #[error("JSON parse error: {0}")]
-    Parse(String),
-}
-
-/// OpenAI-compatible chat completion request shape (inbound normalization).
-#[derive(Debug, Deserialize)]
-struct OpenAiChatRequest {
-    pub model: String,
-    pub messages: Vec<OpenAiMessage>,
-    #[serde(default)]
-    pub temperature: Option<f64>,
-    #[serde(default)]
-    pub max_tokens: Option<u32>,
-    #[serde(default)]
-    pub stream: Option<bool>,
-    #[serde(default)]
-    pub tools: Option<Vec<serde_json::Value>>,
-    #[serde(default)]
-    pub tool_choice: Option<String>,
-    #[serde(default)]
-    pub session_id: Option<String>,
-    #[serde(default)]
-    pub agent_id: Option<String>,
-    #[serde(default)]
-    pub adapter: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiMessage {
-    pub role: String,
-    pub content: serde_json::Value,
-    #[serde(default)]
-    pub tool_calls: Option<Vec<serde_json::Value>>,
-    #[serde(default)]
-    pub tool_call_id: Option<String>,
-}
+pub use fluent_llm::openai::NormalizeError;
 
 /// Normalize an OpenAI-compatible chat completion request JSON into a RouterRequest.
 pub fn normalize_request(body: serde_json::Value) -> Result<RouterRequest, NormalizeError> {
-    let raw: OpenAiChatRequest =
-        serde_json::from_value(body).map_err(|e| NormalizeError::Parse(e.to_string()))?;
-
-    if raw.messages.is_empty() {
-        return Err(NormalizeError::MissingField("messages".into()));
-    }
-
-    let messages = raw
-        .messages
-        .into_iter()
-        .map(|m| {
-            let content = normalize_message_content(m.content)?;
-            let tool_calls = m
-                .tool_calls
-                .map(|tc| {
-                    tc.into_iter()
-                        .map(|v| {
-                            serde_json::from_value(v)
-                                .map_err(|e| NormalizeError::Parse(e.to_string()))
-                        })
-                        .collect()
-                })
-                .transpose()?;
-            Ok(RouterMessage {
-                role: m.role,
-                content,
-                tool_calls,
-                tool_call_id: m.tool_call_id,
-            })
-        })
-        .collect::<Result<Vec<_>, NormalizeError>>()?;
-
-    let tools = raw
-        .tools
-        .map(|t| {
-            t.into_iter()
-                .map(|v| {
-                    serde_json::from_value(v).map_err(|e| NormalizeError::Parse(e.to_string()))
-                })
-                .collect()
-        })
-        .transpose()?;
-
-    Ok(RouterRequest {
-        model: raw.model,
-        messages,
-        temperature: raw.temperature,
-        max_tokens: raw.max_tokens,
-        stream: raw.stream,
-        tools,
-        tool_choice: raw.tool_choice,
-        session_id: raw.session_id,
-        agent_id: raw.agent_id,
-        adapter: raw.adapter,
-        metadata: Default::default(),
-    })
-}
-
-fn normalize_message_content(
-    raw: serde_json::Value,
-) -> Result<RouterMessageContent, NormalizeError> {
-    match raw {
-        serde_json::Value::String(s) => Ok(RouterMessageContent::Text(s)),
-        serde_json::Value::Array(_) => {
-            let parts =
-                serde_json::from_value(raw).map_err(|e| NormalizeError::Parse(e.to_string()))?;
-            Ok(RouterMessageContent::Parts(parts))
-        }
-        serde_json::Value::Null => Ok(RouterMessageContent::Text(String::new())),
-        _ => Err(NormalizeError::InvalidValue {
-            field: "content".into(),
-            detail: "content must be a string or array of content parts".into(),
-        }),
-    }
+    let value = fluent_llm::openai::normalize_request(body)?;
+    serde_json::from_value(value).map_err(|e| NormalizeError::Parse(e.to_string()))
 }
 
 /// Normalize a RouterResponse to OpenAI-compatible chat completion JSON.
 pub fn normalize_response(response: &RouterResponse) -> serde_json::Value {
-    normalize_response_with_id(response, &response.id)
+    let value = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
+    fluent_llm::openai::normalize_response(&value)
 }
 
 pub fn normalize_response_with_id(response: &RouterResponse, id: &str) -> serde_json::Value {
-    let choices: Vec<serde_json::Value> = response
-        .choices
-        .iter()
-        .map(|c| {
-            serde_json::json!({
-                "index": c.index,
-                "message": {
-                    "role": c.message.role,
-                    "content": match &c.message.content {
-                        RouterMessageContent::Text(s) => serde_json::Value::String(s.clone()),
-                        RouterMessageContent::Parts(parts) => serde_json::to_value(parts).unwrap_or_default(),
-                    }
-                },
-                "finish_reason": c.finish_reason,
-            })
-        })
-        .collect();
-
-    serde_json::json!({
-        "id": id,
-        "object": "chat.completion",
-        "created": response.created,
-        "model": response.model,
-        "choices": choices,
-        "usage": {
-            "prompt_tokens": response.usage.prompt_tokens,
-            "completion_tokens": response.usage.completion_tokens,
-            "total_tokens": response.usage.total_tokens,
-        },
-    })
+    let value = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
+    fluent_llm::openai::normalize_response_with_id(&value, id)
 }
 
 /// Build an error response in OpenAI-compatible format.
 pub fn error_response(message: &str, error_type: &str) -> serde_json::Value {
-    serde_json::json!({
-        "error": {
-            "message": message,
-            "type": error_type,
-        }
-    })
+    fluent_llm::openai::error_response(message, error_type)
 }
 
 /// Convert RouterRequest messages into Vec<serde_json::Value> for dispatch.
 /// Used by both server.rs dispatch_to_llm and dispatch::frontier backends.
 pub fn messages_to_json(request: &RouterRequest) -> Result<Vec<serde_json::Value>, NormalizeError> {
-    request
-        .messages
-        .iter()
-        .map(|m| {
-            let content = match &m.content {
-                RouterMessageContent::Text(s) => serde_json::Value::String(s.clone()),
-                RouterMessageContent::Parts(parts) => serde_json::Value::Array(
-                    parts
-                        .iter()
-                        .map(|p| {
-                            serde_json::to_value(p)
-                                .map_err(|e| NormalizeError::Parse(e.to_string()))
-                        })
-                        .collect::<Result<_, _>>()?,
-                ),
-            };
-            let mut msg = serde_json::json!({"role": m.role, "content": content});
-            if let Some(ref tc) = m.tool_calls {
-                msg["tool_calls"] =
-                    serde_json::to_value(tc).map_err(|e| NormalizeError::Parse(e.to_string()))?;
-            }
-            if let Some(ref id) = m.tool_call_id {
-                msg["tool_call_id"] = serde_json::Value::String(id.clone());
-            }
-            Ok(msg)
-        })
-        .collect()
+    let messages = serde_json::to_value(&request.messages)
+        .map_err(|e| NormalizeError::Parse(e.to_string()))?;
+    let arr = messages.as_array().cloned().unwrap_or_default();
+    fluent_llm::openai::messages_to_json(&arr)
 }
 
 /// Build a minimal RouterResponse for pipeline rejections.
@@ -226,11 +59,16 @@ pub fn rejection_response(_reason: &str, model: &str) -> RouterResponse {
     }
 }
 
+// Keep the shared error-free helpers importable through this module for the
+// small set of callers that reach into `normalize` for the wire helpers.
+pub use fluent_llm::openai::{parse_openai_stream_delta, OpenAiDelta};
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{
-        ContentPart, FunctionCall, ImageUrl, RouterMessageContent, RouterResponse, ToolCall,
+        ContentPart, FunctionCall, ImageUrl, RouterChoice, RouterMessage, RouterMessageContent,
+        ToolCall,
     };
 
     #[test]
@@ -281,7 +119,7 @@ mod tests {
             object: "chat.completion".into(),
             created: 1000,
             model: "test".into(),
-            choices: vec![crate::types::RouterChoice {
+            choices: vec![RouterChoice {
                 index: 0,
                 message: RouterMessage {
                     role: "assistant".into(),
@@ -377,5 +215,20 @@ mod tests {
         };
         let json = messages_to_json(&request).expect("messages serialize");
         assert_eq!(json[0]["content"], "hello");
+    }
+
+    #[test]
+    fn normalize_parts_content_round_trips() {
+        let body = serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "assistant", "content": [
+                {"type": "text", "text": "a part"},
+                {"type": "image_url", "image_url": {"url": "https://example.test/x.png"}}
+            ]}]
+        });
+        let req = normalize_request(body).unwrap();
+        let json = messages_to_json(&req).unwrap();
+        assert_eq!(json[0]["content"][0]["type"], "text");
+        assert_eq!(json[0]["content"][1]["type"], "image_url");
     }
 }

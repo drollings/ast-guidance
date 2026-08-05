@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use guidance_llm::client::ChatBackend;
-use guidance_llm::{ChatMessage, LlmError};
+use common_core::sync::lock;
+use fluent_llm::client::ChatBackend;
+use fluent_llm::{ChatMessage, LlmError};
 use serde::{Deserialize, Serialize};
 
 use crate::config::ClassifierOutput;
@@ -179,23 +180,17 @@ impl MockDispatchContext {
         };
 
         if let Err(msg) = result {
-            self.failures
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(msg);
+            lock(&self.failures).push(msg);
         }
     }
 
     pub fn validate_rejection(&self, entry: &MockTranscriptEntry, reject_reason: &str) {
         if let Some(expected_substr) = &entry.reject_reason_contains {
             if !reject_reason.contains(expected_substr.as_str()) {
-                self.failures
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(format!(
-                        "rejection reason mismatch for '{}': expected reason to contain '{}', got '{}'",
-                        entry.user_message, expected_substr, reject_reason
-                    ));
+                lock(&self.failures).push(format!(
+                    "rejection reason mismatch for '{}': expected reason to contain '{}', got '{}'",
+                    entry.user_message, expected_substr, reject_reason
+                ));
             }
         }
     }
@@ -230,11 +225,6 @@ impl MockDispatchContext {
     }
 
     pub fn take_failures(&self) -> Vec<String> {
-        std::mem::take(
-            &mut self
-                .failures
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
+        std::mem::take(&mut lock(&self.failures))
     }
 }

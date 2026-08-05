@@ -77,7 +77,7 @@ impl LlmRequestQueue {
 ## Example
 
 ```rust
-use guidance_llm::embeddings::{create_embedding_provider, EmbeddingProvider};
+use fluent_llm::embeddings::{create_embedding_provider, EmbeddingProvider};
 
 let provider = create_embedding_provider(
     "ollama",

@@ -1,4 +1,4 @@
-use guidance_llm::anonymize;
+use fluent_llm::anonymize;
 
 use crate::transforms::{TransformError, TransformStrategy};
 use crate::types::{RouterMessage, RouterMessageContent, RouterRequest};

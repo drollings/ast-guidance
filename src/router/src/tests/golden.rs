@@ -16,7 +16,7 @@ use std::sync::Arc;
 use crate::config::RouterConfig;
 use crate::pipeline::{PipelineOrchestrator, PipelineResult};
 use fluent_wvr::prelude::*;
-use guidance_llm::client::ChatBackend;
+use fluent_llm::client::ChatBackend;
 
 struct GoldenCase {
     name: &'static str,

@@ -1,7 +1,11 @@
 use fluent_types::GuidanceDoc;
-use guidance_llm::client::LlmClient;
-use guidance_llm::ChatMessage;
+use fluent_llm::client::LlmClient;
+use fluent_llm::ChatMessage;
+use std::sync::Arc;
+use std::time::Instant;
 use thiserror::Error;
+
+use common_core::metrics::LatencyHistogram;
 
 #[derive(Error, Debug)]
 pub enum EnhancerError {
@@ -84,6 +88,7 @@ pub struct Enhancer {
     pub generator: Box<dyn CommentGenerator>,
     pub debug: bool,
     pub show_prompts: bool,
+    pub histogram: Option<Arc<LatencyHistogram>>,
 }
 
 impl Enhancer {
@@ -93,6 +98,7 @@ impl Enhancer {
             generator: Box::new(DefaultCommentGenerator),
             debug: false,
             show_prompts: false,
+            histogram: None,
         }
     }
 
@@ -111,6 +117,13 @@ impl Enhancer {
     #[must_use]
     pub fn with_show_prompts(mut self, show: bool) -> Self {
         self.show_prompts = show;
+        self
+    }
+
+    /// Attach a `LatencyHistogram` to record the LLM call duration.
+    #[must_use]
+    pub fn with_metrics(mut self, histogram: Arc<LatencyHistogram>) -> Self {
+        self.histogram = Some(histogram);
         self
     }
 
@@ -212,10 +225,12 @@ impl Enhancer {
             },
         ];
 
-        let response = self
-            .client
-            .chat_complete(&messages)
-            .map_err(|e| EnhancerError::Llm(e.to_string()))?;
+        let start = Instant::now();
+        let response = self.chat_complete_with_retry(&messages);
+        if let Some(ref hist) = self.histogram {
+            hist.observe_duration(start);
+        }
+        let response = response.map_err(|e| EnhancerError::Llm(e.to_string()))?;
 
         if response.is_empty() {
             return Err(EnhancerError::NoResponse);
@@ -239,6 +254,30 @@ impl Enhancer {
         }
 
         Ok(None)
+    }
+
+    /// Chat completion with jittered-exponential retry over the shared
+    /// `common_core::retry::retry_async` helper. Only transient
+    /// (`LlmError::is_retryable()`) failures are retried; permanent errors
+    /// short-circuit on the first attempt, preserving the original
+    /// single-shot behavior byte-for-byte.
+    fn chat_complete_with_retry(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<String, fluent_llm::LlmError> {
+        let client = self.client.clone();
+        let fut = common_core::retry::retry_async(
+            3,
+            common_core::constants::DEFAULT_RETRY_INTERVAL_S * 1000,
+            0,
+            fluent_llm::LlmError::is_retryable,
+            || {
+                let client = client.clone();
+                let messages = messages.to_vec();
+                async move { client.chat_complete_async(&messages).await }
+            },
+        );
+        fluent_llm::client::block_on(fut)
     }
 }
 
@@ -391,5 +430,73 @@ mod tests {
         let prompt = gen.member_prompt("foo", "fn foo()", "mod", "Function", "rust");
         assert!(prompt.contains("foo"), "should contain the name");
         assert!(prompt.contains("Function"), "should contain the kind label");
+    }
+
+    #[test]
+    fn test_call_llm_retries_transient_then_succeeds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static RETRY_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+        RETRY_ATTEMPTS.store(0, Ordering::SeqCst);
+
+        fn is_transient(_req: &httpmock::prelude::HttpMockRequest) -> bool {
+            RETRY_ATTEMPTS.fetch_add(1, Ordering::SeqCst) < 1
+        }
+
+        let server = httpmock::MockServer::start();
+        let transient = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/chat/completions")
+                .matches(is_transient);
+            then.status(429).body("rate limited");
+        });
+
+        let ok_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/chat/completions");
+            then.status(200)
+                .body(r#"{"choices":[{"message":{"content":"<comment>ok</comment>"}}]}"#);
+        });
+
+        let enhancer = Enhancer::new(&server.base_url(), "test");
+        let result = enhancer.enhance_function("foo", "fn foo()", "mod", "zig");
+        assert!(result.is_ok(), "should succeed after retry: {result:?}");
+        assert_eq!(result.unwrap(), Some("ok".to_string()));
+        transient.assert_hits(1);
+        ok_mock.assert_hits(1);
+    }
+
+    #[test]
+    fn test_call_llm_permanent_error_no_retry() {
+        let server = httpmock::MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/chat/completions");
+            then.status(400).body("bad request");
+        });
+
+        let enhancer = Enhancer::new(&server.base_url(), "test");
+        let result = enhancer.enhance_function("foo", "fn foo()", "mod", "zig");
+        assert!(result.is_err(), "permanent error should surface");
+        // A single attempt — no retry for permanent (Api) errors.
+        assert_eq!(mock.hits(), 1);
+    }
+
+    #[test]
+    fn test_call_llm_records_latency_metrics() {
+        let server = httpmock::MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/chat/completions");
+            then.status(200)
+                .body(r#"{"choices":[{"message":{"content":"<comment>hi</comment>"}}]}"#);
+        });
+
+        let hist = Arc::new(LatencyHistogram::new());
+        let enhancer = Enhancer::new(&server.base_url(), "test").with_metrics(Arc::clone(&hist));
+        let result = enhancer.enhance_function("foo", "fn foo()", "mod", "zig");
+        assert!(result.is_ok());
+        assert_eq!(hist.count(), 1, "one LLM call recorded");
+        assert!(hist.sum_ms() > 0, "latency recorded");
     }
 }

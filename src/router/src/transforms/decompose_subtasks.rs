@@ -1,4 +1,4 @@
-use guidance_llm::Decomposer;
+use fluent_llm::Decomposer;
 
 use crate::transforms::{TransformError, TransformStrategy};
 use crate::types::{RouterMessage, RouterMessageContent, RouterRequest};

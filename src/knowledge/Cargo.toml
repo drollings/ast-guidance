@@ -1,5 +1,5 @@
 [package]
-name = "guidance-project-knowledge"
+name = "fluent-knowledge"
 version.workspace = true
 edition.workspace = true
 

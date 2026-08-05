@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use common_core::registry::KeyedRegistry;
 use fluent_types::GuidanceDoc;
 use thiserror::Error;
 
@@ -18,11 +18,7 @@ pub enum PluginError {
     SubprocessCrashed(String),
 }
 
-impl From<std::io::Error> for PluginError {
-    fn from(e: std::io::Error) -> Self {
-        PluginError::Io(common_core::error::IoError(e))
-    }
-}
+common_core::impl_from_io_error!(PluginError);
 
 pub type PluginResult = Result<GuidanceDoc, PluginError>;
 
@@ -34,13 +30,13 @@ pub struct Plugin {
 }
 
 pub struct PluginRegistry {
-    plugins: HashMap<String, Plugin>,
+    plugins: KeyedRegistry<String, Plugin>,
 }
 
 impl PluginRegistry {
     pub fn new() -> Self {
         Self {
-            plugins: HashMap::new(),
+            plugins: KeyedRegistry::new(),
         }
     }
 
@@ -100,7 +96,7 @@ impl PluginRegistry {
     }
 
     pub fn has_plugin_for(&self, ext: &str) -> bool {
-        self.plugins.contains_key(ext)
+        self.plugins.contains(ext)
     }
 }
 

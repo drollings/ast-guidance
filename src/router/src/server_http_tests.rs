@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use common_core::sync::lock;
 use http_body_util::BodyExt;
 use http_body_util::Full;
 use hyper::body::Incoming;
@@ -27,7 +28,7 @@ use crate::routes::plan::PlanRoute;
 use crate::server::responses::ResponseBody;
 use crate::server::serve_http;
 use crate::testing::mock::{MockDispatchContext, MockTranscriptEntry, TranscriptProvider};
-use guidance_llm::client::ChatBackend;
+use fluent_llm::client::ChatBackend;
 
 /// Upstream responder: given the parsed request body, produce an HTTP response.
 type UpstreamRespond = Arc<dyn Fn(&Value) -> hyper::Response<ResponseBody> + Send + Sync>;
@@ -519,10 +520,7 @@ async fn never_responding_upstream_times_out() {
     let held_for_task = held.clone();
     let _held_connections = tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
-            held_for_task
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(stream);
+            lock(&held_for_task).push(stream);
         }
     });
 

@@ -26,11 +26,7 @@ pub enum SyncEngineError {
     Db(String),
 }
 
-impl From<std::io::Error> for SyncEngineError {
-    fn from(e: std::io::Error) -> Self {
-        SyncEngineError::Io(common_core::error::IoError(e))
-    }
-}
+common_core::impl_from_io_error!(SyncEngineError);
 
 #[derive(Debug, Clone, Default)]
 pub struct GenConfig {
@@ -160,7 +156,8 @@ impl SyncEngine {
                 Ok(())
             })
             .step(|ctx: &mut SyncContext| {
-                let json_path = guidance_json_path(ctx);
+                let json_path =
+                    guidance_json_path(&ctx.source_path, &ctx.source_dir, &ctx.guidance_dir);
                 json_store::save_guidance(&json_path, &ctx.doc)?;
                 Ok(())
             })
@@ -236,11 +233,7 @@ impl SyncEngine {
     }
 
     fn guidance_json_path(&self, source_path: &Path) -> PathBuf {
-        let relative = source_path
-            .strip_prefix(&self.source_dir)
-            .unwrap_or(source_path);
-        let json_name = format!("{}.json", relative.display());
-        self.guidance_dir.join("src").join(&json_name)
+        guidance_json_path(source_path, &self.source_dir, &self.guidance_dir)
     }
 
     fn walk_source_files<F>(&self, mut callback: F)
@@ -251,13 +244,14 @@ impl SyncEngine {
     }
 }
 
-fn guidance_json_path(ctx: &SyncContext) -> PathBuf {
-    let relative = ctx
-        .source_path
-        .strip_prefix(&ctx.source_dir)
-        .unwrap_or(&ctx.source_path);
+/// Compute the guidance JSON path for a source file: the path relative to
+/// `source_dir`, suffixed `.json`, under `guidance_dir/src`. The single shared
+/// implementation behind both `SyncEngine::guidance_json_path` and the
+/// pipeline step.
+fn guidance_json_path(source_path: &Path, source_dir: &Path, guidance_dir: &Path) -> PathBuf {
+    let relative = source_path.strip_prefix(source_dir).unwrap_or(source_path);
     let json_name = format!("{}.json", relative.display());
-    ctx.guidance_dir.join("src").join(&json_name)
+    guidance_dir.join("src").join(&json_name)
 }
 
 #[derive(Debug, Clone)]

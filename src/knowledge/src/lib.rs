@@ -1,4 +1,4 @@
-//! guidance-project-knowledge: Word/trigram index, CSR graph, frequency
+//! fluent-knowledge: Word/trigram index, CSR graph, frequency
 //! tables, and tokenizer for project-level knowledge representation.
 
 pub mod csr_graph;

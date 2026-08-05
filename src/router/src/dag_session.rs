@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use common_core::sync::lock;
 use fluent_dag::dep_graph::{DependencyGraph, GraphError};
 use serde::{Deserialize, Serialize};
 
@@ -430,12 +431,6 @@ impl DependencySession {
     pub fn unresolved_deps(&self) -> Vec<String> {
         self.graph.unresolved_deps()
     }
-}
-
-/// Poison-safe mutex lock: a panic while the mutex was held must not wedge
-/// the registry permanently.
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Process-wide registry of `DependencySession`s keyed by `session_id`.

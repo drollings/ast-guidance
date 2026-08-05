@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use common_core::sqlite::open_wal;
+use common_core::sync::lock;
 use fluent_types::{ContentNode, NodeId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -74,12 +75,6 @@ pub struct ContentNodeLedger {
     db: Mutex<rusqlite::Connection>,
     next_id: Mutex<i64>,
     summarizer: Option<Summarizer>,
-}
-
-/// Poison-safe mutex lock: a panic while the mutex was held must not wedge
-/// the ledger permanently. Mirrors the pattern in `metrics.rs`.
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Deterministic, LLM-free LOD5 label (short descriptor), derived eagerly at
@@ -826,7 +821,7 @@ mod tests {
         use crate::test_stubs::StubChatBackend;
         use std::sync::Arc;
 
-        let client: Arc<dyn guidance_llm::client::ChatBackend> =
+        let client: Arc<dyn fluent_llm::client::ChatBackend> =
             Arc::new(StubChatBackend::always("lazy LOD summary"));
         let summarizer = Summarizer::new(client, 20);
         let ledger = temp_ledger().with_summarizer(summarizer);

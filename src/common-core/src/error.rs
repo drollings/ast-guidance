@@ -56,6 +56,49 @@ pub enum ResolverError {
 #[error("sqlite error: {0}")]
 pub struct SqliteError(#[from] pub rusqlite::Error);
 
+/// Generate the standard `impl From<std::io::Error>` that wraps the source
+/// error in `common_core::error::IoError` and stores it in the `Io` variant
+/// of `$ErrorType`.
+///
+/// Consumer enums that carry an `Io(#[from] common_core::error::IoError)`
+/// variant still need an explicit `std::io::Error` conversion (the
+/// `#[from]` on the variant only covers the `IoError` hop; `From` is not
+/// transitive). This macro is that one-line shape.
+///
+/// # Usage
+///
+/// ```ignore
+/// use common_core::error::impl_from_io_error;
+///
+/// #[derive(thiserror::Error, Debug)]
+/// enum MyError {
+///     #[error("I/O error: {0}")]
+///     Io(#[from] common_core::error::IoError),
+/// }
+///
+/// impl_from_io_error!(MyError);
+/// ```
+///
+/// Equivalent to:
+///
+/// ```ignore
+/// impl From<std::io::Error> for MyError {
+///     fn from(e: std::io::Error) -> Self {
+///         MyError::Io(common_core::error::IoError(e))
+///     }
+/// }
+/// ```
+#[macro_export]
+macro_rules! impl_from_io_error {
+    ($error_type:ty) => {
+        impl From<std::io::Error> for $error_type {
+            fn from(e: std::io::Error) -> Self {
+                <$error_type>::Io($crate::error::IoError(e))
+            }
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +129,22 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short");
         let err = IoError(io_err);
         assert_eq!(err.as_inner().kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[derive(Error, Debug)]
+    enum MacroTestError {
+        #[error("I/O error: {0}")]
+        Io(#[from] IoError),
+    }
+
+    impl_from_io_error!(MacroTestError);
+
+    #[test]
+    fn impl_from_io_error_generates_wrapping_conversion() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+        let err: MacroTestError = io_err.into();
+        let msg = err.to_string();
+        assert!(msg.contains("I/O error"), "got: {msg}");
+        assert!(msg.contains("missing"), "got: {msg}");
     }
 }

@@ -6,8 +6,8 @@ use bon::Builder;
 use common_core::hash::content_hash_with_model;
 use common_core::metrics::LatencyHistogram;
 use fluent_types::{ContentNode, NodeId, WasmTool};
-use guidance_llm::decomposer::Decomposer;
-use guidance_llm::LlmConfig;
+use fluent_llm::decomposer::Decomposer;
+use fluent_llm::LlmConfig;
 
 use crate::cache_l1::{CacheTier, L1Cache, RoutingResult};
 use crate::cache_router::ParallelRouter;
@@ -26,25 +26,6 @@ fn wrap_tier(
 ) -> Arc<dyn Component> {
     let adapted = ComponentAdapter::new(unit).with_name_override(name);
     Arc::new(Instrumented::with_metrics(adapted, name, hist))
-}
-
-/// Weighted-percentile estimate across an aggregated bucket histogram.
-/// Mirrors `LatencyHistogram::estimate_percentile` but sums buckets across
-/// all histograms so p50/p99 reflect the whole cascade, not the first tier.
-fn aggregate_percentile(buckets: &[u64; common_core::metrics::BUCKET_COUNT], pct: f64) -> u64 {
-    let total: u64 = buckets.iter().sum();
-    if total == 0 {
-        return 0;
-    }
-    let target = (total as f64 * pct / 100.0) as u64;
-    let mut cumulative = 0u64;
-    for (i, &bound) in common_core::metrics::BUCKET_MS.iter().enumerate() {
-        cumulative += buckets[i];
-        if cumulative >= target {
-            return bound;
-        }
-    }
-    *common_core::metrics::BUCKET_MS.last().unwrap_or(&5000)
 }
 
 #[derive(Builder)]
@@ -67,10 +48,16 @@ pub struct QueueReactorCreateArgs {
 
     pub frontier_config: Option<LlmConfig>,
 
+    /// Opt-in worker-pool sizing for the L5 frontier tier. When set, frontier
+    /// calls flow through a shared `LlmRequestQueue` with this many workers
+    /// (bounded concurrency) instead of unbounded direct HTTP. `None`
+    /// (default) preserves the direct-HTTP path.
+    pub frontier_workers: Option<usize>,
+
     #[builder(default = 3)]
     pub max_depth: u8,
 
-    pub embedder: Option<Arc<dyn guidance_llm::EmbeddingProvider>>,
+    pub embedder: Option<Arc<dyn fluent_llm::EmbeddingProvider>>,
 
     pub wasm_runtime: Option<Arc<dyn WasmRuntime>>,
 
@@ -89,7 +76,7 @@ pub struct QueueReactor {
     pub decomposer: Option<Box<dyn Decomposer>>,
     pub frontier_config: Option<LlmConfig>,
     pub max_depth: u8,
-    pub embedder: Option<Arc<dyn guidance_llm::EmbeddingProvider>>,
+    pub embedder: Option<Arc<dyn fluent_llm::EmbeddingProvider>>,
     pub wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     pub plugin_pool: Option<Arc<PluginPool>>,
 }
@@ -160,7 +147,23 @@ impl QueueReactor {
         // L5: Frontier LLM (only if frontier config is provided) — wrapped with metrics
         if let Some(ref frontier) = args.frontier_config {
             let hist = Arc::new(LatencyHistogram::new());
-            let unit = L5FrontierUnit::new(frontier.clone());
+            let unit = match args.frontier_workers {
+                // M9: route frontier calls through a shared worker pool
+                // (`LlmRequestQueue` with the `default_handler` transport)
+                // sized from the reactor config — opt-in, non-regressing.
+                Some(workers) => {
+                    let workers = workers.max(1);
+                    let queue = fluent_llm::llm_queue::build_default_queue(
+                        fluent_concurrency::tokio_runtime(),
+                        &fluent_concurrency::llm_queue::LlmQueueConfig {
+                            worker_count: workers,
+                            queue_capacity: workers * 10,
+                        },
+                    );
+                    L5FrontierUnit::with_queue(frontier.clone(), queue)
+                }
+                None => L5FrontierUnit::new(frontier.clone()),
+            };
             tiers.push(wrap_tier(
                 Arc::new(unit),
                 "coral.l5.frontier",
@@ -304,18 +307,15 @@ impl QueueReactor {
     pub fn coral_stats(&self) -> CoralStats {
         let mut total_count = 0u64;
         let mut total_sum_ms = 0u64;
-        let mut buckets = [0u64; common_core::metrics::BUCKET_COUNT];
         for h in &self.histograms {
             total_count += h.count();
             total_sum_ms += h.sum_ms();
-            for (i, b) in buckets.iter_mut().enumerate() {
-                *b += h.bucket(i);
-            }
         }
         // M9.5: p50/p99 are aggregated across ALL tier histograms (weighted
         // by count) instead of reflecting only the first tier.
-        let p50 = aggregate_percentile(&buckets, 50.0);
-        let p99 = aggregate_percentile(&buckets, 99.0);
+        let refs: Vec<&LatencyHistogram> = self.histograms.iter().map(Arc::as_ref).collect();
+        let p50 = LatencyHistogram::aggregate(&refs, 50.0);
+        let p99 = LatencyHistogram::aggregate(&refs, 99.0);
         CoralStats {
             tier_count: self.histograms.len(),
             total_count,
@@ -416,7 +416,7 @@ mod tests {
         let node_emb = vec![1.0, 0.0, 0.0, 0.0];
         insert_node_with_embedding(&lib, "embedded_node", node_emb);
 
-        let embedder: Arc<dyn guidance_llm::EmbeddingProvider> = Arc::new(StubEmbedder::new(4));
+        let embedder: Arc<dyn fluent_llm::EmbeddingProvider> = Arc::new(StubEmbedder::new(4));
         let router = Arc::new(ParallelRouter::new(lib, 10, 0.7, 4));
         let unit = crate::tier_units::L4SemanticUnit::new(router, embedder);
 
@@ -439,7 +439,7 @@ mod tests {
             .api_url("http://localhost:11434/v1".into())
             .model("test".into())
             .build();
-        let backend: Box<dyn guidance_llm::client::ChatBackend> =
+        let backend: Box<dyn fluent_llm::client::ChatBackend> =
             Box::new(StubChatBackend::always_err("simulated HTTP failure"));
 
         let unit = crate::tier_units::L5FrontierUnit::with_chat_backend(config, backend);
@@ -469,47 +469,52 @@ mod tests {
 
     #[test]
     fn test_reactor_l4_5_decomposition() {
+        // Production decompose-merge path: an empty library makes the L3
+        // tier miss (keyword search + traverse_all both empty), so the L4.5
+        // block in `route_with_depth` fires; subtasks resolve from the L1
+        // cache, and the merged result is returned as `L4_5Decompose`.
         let lib = Arc::new(Library::open_in_memory().expect("db"));
-        for name in &["subtask_alpha", "subtask_beta"] {
-            let node = ContentNode {
-                id: None,
-                name: (*name).into(),
-                source: format!("source for {name}"),
-                lod: vec![format!("result from {name}")],
-                embedding: None,
-                capabilities: None,
-                ..Default::default()
-            };
-            lib.insert_node(&node).expect("insert");
-        }
+        let sub_alpha = Arc::new(RoutingResult {
+            query: "subtask_alpha".into(),
+            result: "result from subtask_alpha".into(),
+            tier: CacheTier::L3Graph,
+        });
+        let sub_beta = Arc::new(RoutingResult {
+            query: "subtask_beta".into(),
+            result: "result from subtask_beta".into(),
+            tier: CacheTier::L3Graph,
+        });
 
         let mut responses = HashMap::new();
         responses.insert(
             "complex_parent_query".to_string(),
             vec!["subtask_alpha".to_string(), "subtask_beta".to_string()],
         );
-        let decomposer: Box<dyn guidance_llm::decomposer::Decomposer> =
+        let decomposer: Box<dyn fluent_llm::decomposer::Decomposer> =
             Box::new(StubDecomposer::new(responses));
 
-        let args = QueueReactorCreateArgs::builder().library(lib).build();
+        let args = QueueReactorCreateArgs::builder()
+            .library(lib)
+            .decomposer(decomposer)
+            .max_depth(3)
+            .build();
         let reactor = Arc::new(QueueReactor::new(args));
+        reactor.set_l1("subtask_alpha", &sub_alpha);
+        reactor.set_l1("subtask_beta", &sub_beta);
 
-        let unit =
-            crate::tier_units::L4_5DecomposeUnit::new(decomposer, Arc::downgrade(&reactor), 3);
-
-        let mut ctx = fluent_wvr::WorkContext::default();
-        ctx.metadata
-            .insert("query".into(), "complex_parent_query".into());
-        let output = unit.execute(&ctx).expect("L4.5 should succeed");
-        assert_eq!(output.message, "L4.5");
-        let data_str = output.data.to_string();
+        let result = reactor
+            .route_with_depth("complex_parent_query", 0)
+            .expect("L4.5 should succeed");
+        assert_eq!(result.tier, CacheTier::L4_5Decompose);
         assert!(
-            data_str.contains("subtask_alpha"),
-            "result should contain subtask_alpha, got: {data_str}"
+            result.result.contains("subtask_alpha"),
+            "result should contain subtask_alpha, got: {}",
+            result.result
         );
         assert!(
-            data_str.contains("subtask_beta"),
-            "result should contain subtask_beta, got: {data_str}"
+            result.result.contains("subtask_beta"),
+            "result should contain subtask_beta, got: {}",
+            result.result
         );
     }
 
@@ -551,7 +556,7 @@ mod tests {
     #[test]
     fn test_reactor_persist_solution() {
         let lib = Arc::new(Library::open_in_memory().expect("db"));
-        let embedder: Arc<dyn guidance_llm::EmbeddingProvider> = Arc::new(StubEmbedder::new(4));
+        let embedder: Arc<dyn fluent_llm::EmbeddingProvider> = Arc::new(StubEmbedder::new(4));
         let args = QueueReactorCreateArgs::builder()
             .library(lib.clone())
             .embedder(embedder)

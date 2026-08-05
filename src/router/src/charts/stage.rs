@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use fluent_concurrency::pool::Limiter;
 use fluent_wvr::prelude::*;
-use guidance_llm::client::ChatBackend;
-use guidance_llm::ChatMessage;
+use fluent_llm::client::ChatBackend;
+use fluent_llm::ChatMessage;
 
 use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
 use crate::stages::common::extract_user_message;
@@ -285,13 +285,13 @@ fn read_metadata_json(
 
 /// Parse a chart-target LLM response into a structured `output` value.
 ///
-/// Sanitization policy: the shared `guidance_llm::parse_json_response`
+/// Sanitization policy: the shared `fluent_llm::parse_json_response`
 /// trims, strips common markdown code fences (```` ```json ```` / ```` ``` ````),
 /// fast-paths a direct parse, then extracts the first JSON value. Unparseable
 /// responses fall back to a string leaf so the raw text still flows to
 /// upstream targets via the structured `stage.{id}.output` channel.
 fn parse_output(response: &str) -> serde_json::Value {
-    match guidance_llm::parse_json_response(response) {
+    match fluent_llm::parse_json_response(response) {
         Ok(v) => v,
         Err(_) => serde_json::Value::String(response.trim().to_string()),
     }

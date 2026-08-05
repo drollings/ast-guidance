@@ -273,7 +273,7 @@ Then you you must read
     │   ├── src/
     │   │   ├── ast_parser.rs  # use std::path::Path;
     │   │   ├── config.rs  # use std::collections::HashMap;
-    │   │   ├── enhancer.rs  # use guidance_llm::client::LlmClient;
+    │   │   ├── enhancer.rs  # use fluent_llm::client::LlmClient;
     │   │   ├── grounding.rs  # //! Grounding enforcement — ensures...
     │   │   ├── lib.rs  # //! Guidance: AST-guided vector search &
     │   │   ├── memory.rs  # //! Memory integration for the guidance 
@@ -370,13 +370,13 @@ Then you you must read
     │       ├── mapper.rs  # use std::collections::HashMap;
     │       ├── migration.rs  # #[derive(Debug, Clone)]
     │       └── yago.rs  # pub const NS_YAGO: &str = "http://yago-k
-    ├── project-knowledge/
+    ├── knowledge/
     │   ├── Cargo.toml
     │   └── src/
     │       ├── csr_graph.rs  # pub const CSR_MAGIC: u32 = 0x4752_5343;
     │       ├── freq_table.rs  # use std::fs;
     │       ├── index_header.rs  # pub const INDEX_HEADER_SIZE: usize = 10;
-    │       ├── lib.rs  # //! guidance-project-knowledge: Word/tri
+    │       ├── lib.rs  # //! fluent-knowledge: Word/tri
     │       ├── query_cache.rs  # use common_core::hash::fnv1a64;
     │       ├── tokenizer.rs  # pub struct WordTokenizer<'a> {
     │       ├── trigram_index.rs  # use crate::index_header::Header;
@@ -435,8 +435,8 @@ Then you you must read
     │       │   ├── mod.rs  # //! Router test modules.
     │       │   └── rubric_fixtures.rs  # //! Rubric-based test fixtures for `Resu
     │       ├── transforms/
-    │       │   ├── decompose_hypothetical.rs  # use guidance_llm::anonymize;
-    │       │   ├── decompose_subtasks.rs  # use guidance_llm::Decomposer;
+    │       │   ├── decompose_hypothetical.rs  # use fluent_llm::anonymize;
+    │       │   ├── decompose_subtasks.rs  # use fluent_llm::Decomposer;
     │       │   ├── mod.rs  # pub mod none;
     │       │   ├── none.rs  # use crate::transforms::{TransformError, 
     │       │   ├── pii_anonymize.rs  # use std::collections::HashMap;

@@ -9,8 +9,8 @@
 use std::sync::Arc;
 
 use fluent_wvr::prelude::*;
-use guidance_llm::client::ChatBackend;
-use guidance_llm::{ChatMessage, LlmError};
+use fluent_llm::client::ChatBackend;
+use fluent_llm::{ChatMessage, LlmError};
 use serde::{Deserialize, Serialize};
 
 use crate::stages::common::{extract_user_message, get_metadata_string};

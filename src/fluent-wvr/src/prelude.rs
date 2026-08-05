@@ -5,8 +5,8 @@
 //! ```
 
 pub use crate::wrapper::{
-    retry_call, ComponentAdapter, ExecuteFn, Instrumented, Middleware, MiddlewareChain, Pipeline,
-    SuffixedComponent,
+    retry_call, ComponentAdapter, ComponentCascade, ExecuteFn, Instrumented, Middleware,
+    MiddlewareChain, Pipeline, SuffixedComponent,
 };
 pub use crate::{impl_component, impl_fieldless};
 pub use crate::{

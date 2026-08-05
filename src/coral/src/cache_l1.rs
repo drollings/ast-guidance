@@ -1,7 +1,7 @@
-use lru::LruCache;
 use serde::{Deserialize, Serialize};
-use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use common_core::cache::LoadCache;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CacheTier {
@@ -34,7 +34,7 @@ pub struct RoutingResult {
 }
 
 pub struct L1Cache {
-    inner: Mutex<LruCache<String, Arc<RoutingResult>>>,
+    inner: LoadCache<String, Arc<RoutingResult>, crate::error::CacheError>,
     max_entries: usize,
 }
 
@@ -44,30 +44,28 @@ impl L1Cache {
     }
 
     pub fn with_capacity(max_entries: usize) -> Result<Self, crate::error::CacheError> {
-        let capacity = NonZeroUsize::new(max_entries)
-            .ok_or(crate::error::CacheError::InvalidCapacity(max_entries))?;
-        Ok(Self {
-            inner: Mutex::new(LruCache::new(capacity)),
-            max_entries,
-        })
+        let load = |_: &String| -> Result<Arc<RoutingResult>, crate::error::CacheError> {
+            Err(crate::error::CacheError::Miss)
+        };
+        let inner = LoadCache::new(max_entries, load)
+            .map_err(|_| crate::error::CacheError::InvalidCapacity(max_entries))?;
+        Ok(Self { inner, max_entries })
     }
 
     pub fn get(&self, query: &str) -> Option<Arc<RoutingResult>> {
-        let mut cache = self.inner.lock().unwrap();
-        cache.get(query).cloned()
+        self.inner.get(query)
     }
 
     pub fn set(&self, query: String, result: Arc<RoutingResult>) {
-        let mut cache = self.inner.lock().unwrap();
-        cache.put(query, result);
+        self.inner.insert(query, result);
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().len()
+        self.inner.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().unwrap().is_empty()
+        self.inner.is_empty()
     }
 
     pub fn max_entries(&self) -> usize {

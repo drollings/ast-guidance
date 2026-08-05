@@ -16,11 +16,7 @@ pub enum JsonError {
     MissingField(String),
 }
 
-impl From<std::io::Error> for JsonError {
-    fn from(e: std::io::Error) -> Self {
-        JsonError::Io(common_core::error::IoError(e))
-    }
-}
+common_core::impl_from_io_error!(JsonError);
 
 fn parse_member_type(s: &str) -> Option<MemberType> {
     Some(match s {

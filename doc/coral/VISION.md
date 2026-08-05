@@ -476,7 +476,7 @@ guidance explain "query"
 
 1. **SOLID Refactoring**: `db.rs` decomposed into `db/` (schema, nodes, edges, hnsw, embeddings, kv_cache);
    `cache_reactor.rs` decomposed into `cache/` (reactor, stats) — Single Responsibility.
-4. **DRY Consolidation**: PII regexes centralized in `guidance_llm::pii_patterns`;
+4. **DRY Consolidation**: PII regexes centralized in `fluent_llm::pii_patterns`;
    `strip_html` canonical in `common_core::string`;
    think-block stripping canonical in `common_core::string`.
 5. **DIP Architecture**: `OrchestratorSession`, `ResultScorer`, `Summarizer`, `ClassifierStage`

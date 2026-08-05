@@ -226,6 +226,7 @@ async fn dispatch_to_single_target(
             target.params.clone(),
             target.idle_timeout_ms,
             target.total_timeout_ms,
+            filter_thinking,
         )
         .await?;
 

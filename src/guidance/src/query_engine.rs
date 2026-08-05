@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use fluent_types::GuidanceDoc;
-use guidance_project_knowledge::word_index::WordIndex;
+use fluent_knowledge::word_index::WordIndex;
 use thiserror::Error;
 
 use crate::ast_parser;
@@ -40,11 +40,7 @@ pub enum QueryEngineError {
     NoResults,
 }
 
-impl From<std::io::Error> for QueryEngineError {
-    fn from(e: std::io::Error) -> Self {
-        QueryEngineError::Io(common_core::error::IoError(e))
-    }
-}
+common_core::impl_from_io_error!(QueryEngineError);
 
 pub struct QueryEngine {
     pub llm_filter: LlmFilter,
@@ -184,9 +180,21 @@ impl QueryEngine {
         query: &str,
         doc: &GuidanceDoc,
     ) -> Result<Vec<Stage>, QueryEngineError> {
+        self.dispatch_with_filter(query, doc, &self.llm_filter)
+    }
+
+    /// Shared tiered-escalation skeleton, parameterized by the LLM filter.
+    /// `dispatch_search` uses the engine's configured filter; `explain_no_llm`
+    /// uses a no-op filter so concept searches degrade to keyword.
+    fn dispatch_with_filter(
+        &self,
+        query: &str,
+        doc: &GuidanceDoc,
+        llm_filter: &LlmFilter,
+    ) -> Result<Vec<Stage>, QueryEngineError> {
         let ctx = SearchContext {
             word_index: self.word_index.as_ref(),
-            llm_filter: &self.llm_filter,
+            llm_filter,
         };
 
         let mut fsm = strategy::FsmEngine::new();
@@ -289,50 +297,7 @@ impl QueryEngine {
         doc: &GuidanceDoc,
     ) -> Result<Vec<Stage>, QueryEngineError> {
         let noop_filter = LlmFilter::new(Some(Box::new(NoopLlmFilter)));
-        let ctx = SearchContext {
-            word_index: self.word_index.as_ref(),
-            llm_filter: &noop_filter,
-        };
-
-        let mut fsm = strategy::FsmEngine::new();
-        let primary_intent = fsm.run(query).intent;
-
-        let all_intents: [QueryIntent; 8] = [
-            QueryIntent::SingleIdentifier,
-            QueryIntent::IdentifierLookup,
-            QueryIntent::FilePath,
-            QueryIntent::CapabilityQuery,
-            QueryIntent::HowTo,
-            QueryIntent::Conceptual,
-            QueryIntent::MultiKeyword,
-            QueryIntent::GeneralSearch,
-        ];
-
-        let mut ordered: Vec<QueryIntent> = vec![primary_intent];
-        for intent in all_intents {
-            if intent != primary_intent {
-                ordered.push(intent);
-            }
-        }
-
-        let mut tried: Vec<QueryIntent> = Vec::new();
-        for intent in ordered {
-            if tried.contains(&intent) {
-                continue;
-            }
-            tried.push(intent);
-            for backend in &self.backends {
-                if backend.matches(intent) {
-                    match backend.search(query, doc, &ctx) {
-                        Ok(stages) => return Ok(stages),
-                        Err(QueryEngineError::NoResults) => {}
-                        Err(e) => return Err(e),
-                    }
-                }
-            }
-        }
-
-        Err(QueryEngineError::NoResults)
+        self.dispatch_with_filter(query, doc, &noop_filter)
     }
 
     /// Vector explain using RRF (Reciprocal Rank Fusion) hybrid search.
@@ -408,7 +373,7 @@ mod tests {
     use super::*;
     use fluent_types::{GuidanceDoc, Member, MemberType, Meta};
     use fluent_wvr_testutil::tempdir;
-    use guidance_project_knowledge::word_index::WordIndex;
+    use fluent_knowledge::word_index::WordIndex;
 
     fn make_test_doc() -> GuidanceDoc {
         GuidanceDoc {

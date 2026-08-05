@@ -13,8 +13,8 @@ use std::time::Instant;
 
 use fluent_concurrency::pool::Limiter;
 use fluent_wvr::prelude::*;
-use guidance_llm::client::ChatBackend;
-use guidance_llm::ChatMessage;
+use fluent_llm::client::ChatBackend;
+use fluent_llm::ChatMessage;
 
 use crate::metrics::classify_error;
 
@@ -144,7 +144,7 @@ fn log_classifier_raw_response(response: &str) {
 
 // LLM boundary: parse the classifier's raw LLM response text (JSON in a
 // string from the model). The tolerant pipeline (fence-strip → parse →
-// extract-first-value) is the shared `guidance_llm::parse_json_response`
+// extract-first-value) is the shared `fluent_llm::parse_json_response`
 // (M7.4). `true` = pristine parse, `false` = recovered via sanitization.
 fn parse_classifier_response(response: &str, default_route: &str) -> (ClassifierOutput, bool) {
     // Fast path: try direct parse first
@@ -153,7 +153,7 @@ fn parse_classifier_response(response: &str, default_route: &str) -> (Classifier
     }
 
     // Slow path: sanitize partial JSON via the shared tolerant parser
-    let raw: serde_json::Value = match guidance_llm::parse_json_response(response) {
+    let raw: serde_json::Value = match fluent_llm::parse_json_response(response) {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(

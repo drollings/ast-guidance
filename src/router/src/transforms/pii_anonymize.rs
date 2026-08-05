@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use guidance_llm::anonymize;
+use fluent_llm::anonymize;
 
 use crate::transforms::{rewrite_text_messages, TransformError, TransformStrategy};
 use crate::types::RouterRequest;

@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use crate::db::Library;
 
-pub use guidance_llm::ContextPacker;
+pub use fluent_llm::ContextPacker;
 
 #[derive(Error, Debug)]
 pub enum PackerError {
@@ -23,7 +23,7 @@ pub struct PackedNode {
 
 /// Get the text at a given LOD level from a node. Node-specific helper kept
 /// coral-side; the shared LOD-selection and budget-fit logic lives in
-/// `guidance_llm::ContextPacker` (single `ContextPacker` per the roadmap).
+/// `fluent_llm::ContextPacker` (single `ContextPacker` per the roadmap).
 pub fn get_lod_text(node: &ContentNode, level: u8) -> &str {
     let idx = level as usize;
     if idx < node.lod.len() {
@@ -35,13 +35,13 @@ pub fn get_lod_text(node: &ContentNode, level: u8) -> &str {
     }
 }
 
-/// Coral graph-packing extension over the shared `guidance_llm::ContextPacker`.
+/// Coral graph-packing extension over the shared `fluent_llm::ContextPacker`.
 pub trait ContextPackerExt {
     /// Pack context nodes around a focus node.
     ///
     /// 1. BFS from focus node up to depth 5
     /// 2. For each node, select LOD by effective distance
-    /// 3. FFD bin-pack into token budget (shared core in `guidance_llm`)
+    /// 3. FFD bin-pack into token budget (shared core in `fluent_llm`)
     /// 4. Return packed nodes with selected LOD text
     fn pack(&self, focus_id: NodeId, library: &Library) -> Result<Vec<PackedNode>, PackerError>;
 }

@@ -13,11 +13,7 @@ pub enum ParseError {
     UnsupportedLanguage(String),
 }
 
-impl From<std::io::Error> for ParseError {
-    fn from(e: std::io::Error) -> Self {
-        ParseError::Io(common_core::error::IoError(e))
-    }
-}
+common_core::impl_from_io_error!(ParseError);
 
 pub struct AstParser {
     zig: tree_sitter::Parser,
@@ -126,7 +122,7 @@ fn extract_module_comment(root: &tree_sitter::Node, source: &str) -> Option<Stri
     for node in root.children(&mut child) {
         if node.kind() == "comment" || node.kind() == "doc_comment" {
             let text = node.utf8_text(source.as_bytes()).ok()?;
-            let trimmed = trim_doc_prefix(text);
+            let trimmed = common_core::string::trim_doc_prefix(text);
             doc_comments.push(trimmed);
         } else {
             break;
@@ -672,7 +668,7 @@ fn extract_preceding_doc_comment(node: &tree_sitter::Node, source: &str) -> Opti
     let prev_node = node.prev_sibling()?;
     if prev_node.kind() == "doc_comment" || prev_node.kind() == "comment" {
         let text = prev_node.utf8_text(source.as_bytes()).ok()?;
-        Some(trim_doc_prefix(text))
+        Some(common_core::string::trim_doc_prefix(text))
     } else {
         None
     }
@@ -697,21 +693,6 @@ fn check_visibility(node: &tree_sitter::Node, source: &str, language: &str) -> b
         }
     }
     false
-}
-
-fn trim_doc_prefix(text: &str) -> String {
-    let mut lines: Vec<&str> = text.lines().collect();
-    for line in &mut lines {
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("///") {
-            *line = rest.strip_prefix(' ').unwrap_or(rest);
-        } else if let Some(rest) = trimmed.strip_prefix("//!") {
-            *line = rest.strip_prefix(' ').unwrap_or(rest);
-        } else if let Some(rest) = trimmed.strip_prefix('#') {
-            *line = rest.strip_prefix(' ').unwrap_or(rest);
-        }
-    }
-    lines.join("\n")
 }
 
 fn build_signature(

@@ -4,9 +4,6 @@ use std::sync::{Arc, LazyLock};
 use fluent_concurrency::pool::{global_pool_config, ResultPool};
 use fluent_concurrency::runtime::tokio::TokioRuntime;
 use fluent_concurrency::thread_resource::with_tlr;
-use fluent_concurrency::zone::{Zone, ZoneConfig};
-use fluent_wvr::prelude::*;
-use fluent_wvr::Runtime;
 
 use crate::ast_parser::AstParser;
 use crate::sync_engine::{GenConfig, SyncEngine, SyncEngineError};
@@ -74,8 +71,9 @@ pub static DB_POOL: LazyLock<Arc<ResultPool<DbSyncPayload, usize, String>>> = La
     ))
 });
 
-/// Create a Zone that provides structured concurrency, failure containment,
-/// and dependency tracking for a batch of AST generation tasks.
+/// Create a `Zone` with the standard guidance configuration (structured
+/// concurrency, failure containment, and dependency tracking for batches of
+/// AST generation tasks).
 ///
 /// Unlike manual oneshot channel management, a Zone:
 /// - Automatically cancels dependent tasks when a prerequisite fails
@@ -84,23 +82,20 @@ pub static DB_POOL: LazyLock<Arc<ResultPool<DbSyncPayload, usize, String>>> = La
 ///
 /// # Example
 /// ```ignore
-/// let mut zone = create_sync_zone(Arc::new(TokioRuntime));
+/// let mut zone = Zone::new_with_config(
+///     Arc::new(TokioRuntime),
+///     CapabilitySet::default(),
+///     ZoneConfig { poll_budget: 64 },
+/// );
 /// zone.register(build_task_a);  // provides "parsed"
 /// zone.register(build_task_b);  // depends on "parsed"
 /// let summary = zone.await;
 /// // If task_a panics, task_b is automatically cancelled
 /// ```
-pub fn create_sync_zone(runtime: Arc<dyn Runtime>) -> Zone {
-    Zone::new_with_config(
-        runtime,
-        CapabilitySet::default(),
-        ZoneConfig { poll_budget: 64 },
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluent_concurrency::zone::Zone;
 
     #[tokio::test]
     async fn test_ast_pool_static_init() {

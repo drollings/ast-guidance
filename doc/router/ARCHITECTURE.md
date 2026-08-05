@@ -209,7 +209,7 @@ trait Filter: Send + Sync {
 
 ## HttpClass: where it lives and why
 
-`HttpClass` (`HardReject`, `TransientFailure`, `EscalationRequired`, `UpstreamFailure`) is defined in `guidance-llm/src/http_class.rs` and re-exported via `guidance_llm::HttpClass`. It is consumed in two layers:
+`HttpClass` (`HardReject`, `TransientFailure`, `EscalationRequired`, `UpstreamFailure`) is defined in `guidance-llm/src/http_class.rs` and re-exported via `fluent_llm::HttpClass`. It is consumed in two layers:
 
 1. **`LlmClient::chat_complete_http_inner_async`** (in `guidance-llm`) — checks HTTP status before parsing the response body. On a non-2xx status, short-circuits with `LlmError::RateLimited` (retryable) or `LlmError::Api` (permanent). This fixes a latent bug where 503 HTML bodies were parsed as chat-completion JSON.
 
@@ -219,7 +219,7 @@ The router's own error taxonomy mirrors this at a higher level: `DispatchError::
 
 ## Import Boundaries (enforced)
 
-Following AGENTS.md: `fluent-router` imports from `common-core`, `fluent-wvr`, `fluent-concurrency`, `guidance-llm`, `fluent-types`, `fluent-dag`, and standard library / `tokio` / `reqwest`. It does NOT import from `guidance`, `coral`, `wasm_ipc`, `project-knowledge`, `ontology`, or `rdf`.
+Following AGENTS.md: `fluent-router` imports from `common-core`, `fluent-wvr`, `fluent-concurrency`, `guidance-llm`, `fluent-types`, `fluent-dag`, and standard library / `tokio` / `reqwest`. It does NOT import from `guidance`, `coral`, `wasm_ipc`, `knowledge`, `ontology`, or `rdf`.
 
 ## Pipeline data flow detail
 

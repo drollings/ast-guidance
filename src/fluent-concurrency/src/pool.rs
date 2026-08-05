@@ -389,7 +389,7 @@ impl Limiter {
     /// When invoked from *inside* a running multi-threaded tokio runtime (the
     /// router's HTTP handler does this), the future is driven via
     /// `tokio::task::block_in_place` so the worker thread is not starved —
-    /// the same canonical pattern as `guidance_llm::client::chat_complete`
+    /// the same canonical pattern as `fluent_llm::client::chat_complete`
     /// (see `src/llm/src/client.rs`). A bare `Handle::block_on` would panic
     /// with "Cannot start a runtime from within a runtime".
     pub fn run_sync<F, Fut, T>(&self, f: F) -> T

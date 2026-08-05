@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use fluent_concurrency::pool::Limiter;
-use guidance_llm::client::ChatBackend;
+use fluent_llm::client::ChatBackend;
 
 use crate::charts::binding::Entity;
 use crate::charts::binding::ENTITIES_META_KEY;

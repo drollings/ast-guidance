@@ -26,7 +26,7 @@ use fluent_concurrency::pool::Limiter;
 use fluent_concurrency::zone::{Zone, ZoneEvent};
 use fluent_wvr::prelude::*;
 use fluent_wvr::Runtime;
-use guidance_llm::client::ChatBackend;
+use fluent_llm::client::ChatBackend;
 use serde::Serialize;
 
 use crate::charts::compile::{compile_chart_stages, CompiledTarget};
@@ -498,7 +498,8 @@ mod tests {
     use crate::charts::binding::Entity;
     use crate::charts::store::chart_from_str;
     use crate::test_stubs::StubChatBackend;
-    use guidance_llm::{ChatMessage, LlmError};
+    use common_core::sync::lock;
+    use fluent_llm::{ChatMessage, LlmError};
     use std::sync::Mutex;
 
     /// A deterministic test backend that keys responses on a substring of the
@@ -516,7 +517,7 @@ mod tests {
         }
     }
 
-    impl guidance_llm::client::ChatBackend for KeyedBackend {
+    impl fluent_llm::client::ChatBackend for KeyedBackend {
         fn chat_complete(&self, messages: &[ChatMessage]) -> Result<String, LlmError> {
             let system = messages
                 .iter()
@@ -551,12 +552,9 @@ mod tests {
         }
     }
 
-    impl guidance_llm::client::ChatBackend for RetryOnceBackend {
+    impl fluent_llm::client::ChatBackend for RetryOnceBackend {
         fn chat_complete(&self, _messages: &[ChatMessage]) -> Result<String, LlmError> {
-            let mut left = self
-                .failures_left
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut left = lock(&self.failures_left);
             if *left > 0 {
                 *left -= 1;
                 return Err(LlmError::NoResponse);

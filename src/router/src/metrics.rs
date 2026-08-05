@@ -1,5 +1,7 @@
 //! Failure classification for the router pipeline.
 //!
+//! `FailureClass` (the enum + stable labels) is the canonical shared
+//! taxonomy in `fluent_llm::http_class`; this module re-exports it (D2).
 //! Typed-first: `FailureClass` is derived from the typed error
 //! (`DispatchError`/`WorkError`/`ServerError` via `From`), with the string
 //! regex classifier retained only as a fallback for opaque payloads (shell
@@ -7,47 +9,12 @@
 
 use std::sync::LazyLock;
 
-use fluent_wvr::WorkError;
 use regex::Regex;
-use serde::{Deserialize, Serialize};
 
 use crate::dispatch::frontier::DispatchError;
 use crate::error::ServerError;
 
-// ── FailureClass ───────────────────────────────────────────────────────
-
-/// High-level failure classes for error classification.
-///
-/// Every variant serializes to a stable string label for backward
-/// compatibility with existing metrics consumers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FailureClass {
-    Network,
-    Authentication,
-    RateLimit,
-    InputValidation,
-    Storage,
-    Timeout,
-    Internal,
-    Unknown,
-}
-
-impl FailureClass {
-    /// Stable string label for the failure class.
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Network => "network",
-            Self::Authentication => "authentication",
-            Self::RateLimit => "rate_limit",
-            Self::InputValidation => "input_validation",
-            Self::Storage => "storage",
-            Self::Timeout => "timeout",
-            Self::Internal => "internal",
-            Self::Unknown => "unknown",
-        }
-    }
-}
+pub use fluent_llm::http_class::FailureClass;
 
 /// Classify an error message string into a `FailureClass`.
 ///
@@ -110,19 +77,6 @@ impl From<&DispatchError> for FailureClass {
     }
 }
 
-/// Classify a `WorkError` typed-first. `Execution` carries an opaque
-/// shell/command string — the documented regex fallback; `Dependency` and
-/// `Timeout` are typed directly.
-impl From<&WorkError> for FailureClass {
-    fn from(err: &WorkError) -> Self {
-        match err {
-            WorkError::Execution(msg) => classify_error(msg),
-            WorkError::Dependency(_) => FailureClass::Internal,
-            WorkError::Timeout { .. } => FailureClass::Timeout,
-        }
-    }
-}
-
 /// Classify a `ServerError` typed-first. `Dispatch` delegates to the
 /// `DispatchError` mapping; `Http`/`Bind` reuse the status/string logic.
 impl From<&ServerError> for FailureClass {
@@ -138,7 +92,8 @@ impl From<&ServerError> for FailureClass {
 }
 
 /// Extract an HTTP status from a `DispatchError::Http`/`ServerError::Http`
-/// message of the form `"HTTP <code>..."` and map it typed-first. Free-form
+/// message of the form `"HTTP <code>..."` and map it typed-first via the
+/// shared `fluent_llm::http_class::classify_http_status`. Free-form
 /// strings (reqwest errors, timeout labels) fall back to `classify_error`.
 fn classify_http_status(msg: &str) -> FailureClass {
     let status = msg
@@ -146,11 +101,7 @@ fn classify_http_status(msg: &str) -> FailureClass {
         .and_then(|rest| rest.split([' ', ':']).next())
         .and_then(|s| s.parse::<u16>().ok());
     match status {
-        Some(429 | 500 | 502 | 503 | 504) => FailureClass::RateLimit,
-        Some(401 | 403) => FailureClass::Authentication,
-        Some(400 | 404 | 405 | 410 | 413 | 414 | 422) => FailureClass::InputValidation,
-        Some(408) => FailureClass::Timeout,
-        Some(_) => FailureClass::Network,
+        Some(status) => fluent_llm::http_class::classify_http_status(status),
         None => classify_error(msg),
     }
 }
@@ -158,36 +109,19 @@ fn classify_http_status(msg: &str) -> FailureClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluent_wvr::WorkError;
 
-    // ── 4.1 FailureClass label round-trip ───────────────────────────
-
-    #[test]
-    fn failure_class_labels() {
-        assert_eq!(FailureClass::Network.label(), "network");
-        assert_eq!(FailureClass::Authentication.label(), "authentication");
-        assert_eq!(FailureClass::RateLimit.label(), "rate_limit");
-        assert_eq!(FailureClass::InputValidation.label(), "input_validation");
-        assert_eq!(FailureClass::Storage.label(), "storage");
-        assert_eq!(FailureClass::Timeout.label(), "timeout");
-        assert_eq!(FailureClass::Internal.label(), "internal");
-        assert_eq!(FailureClass::Unknown.label(), "unknown");
-    }
-
-    #[test]
-    fn failure_class_round_trips_through_json() {
-        for class in &[
-            FailureClass::Network,
-            FailureClass::Authentication,
-            FailureClass::RateLimit,
-            FailureClass::InputValidation,
-            FailureClass::Storage,
-            FailureClass::Timeout,
-            FailureClass::Internal,
-            FailureClass::Unknown,
-        ] {
-            let json = serde_json::to_string(class).unwrap();
-            let parsed: FailureClass = serde_json::from_str(&json).unwrap();
-            assert_eq!(*class, parsed);
+    /// Classify a `WorkError`. `Execution` carries an opaque
+    /// shell/command string — the documented regex fallback; `Dependency` and
+    /// `Timeout` are typed directly. Expressed as a free function rather than a
+    /// `From` impl because the orphan rule forbids `impl From<&WorkError> for
+    /// FailureClass` when both `WorkError` (fluent-wvr) and `FailureClass`
+    /// (fluent-llm) are foreign to the router.
+    fn work_error_class(err: &WorkError) -> FailureClass {
+        match err {
+            WorkError::Execution(msg) => classify_error(msg),
+            WorkError::Dependency(_) => FailureClass::Internal,
+            WorkError::Timeout { .. } => FailureClass::Timeout,
         }
     }
 
@@ -376,7 +310,7 @@ mod tests {
     #[test]
     fn work_timeout_maps_directly() {
         assert_eq!(
-            FailureClass::from(&WorkError::Timeout {
+            work_error_class(&WorkError::Timeout {
                 duration_ms: 30_000,
                 unit: "x".into(),
             }),
@@ -387,13 +321,13 @@ mod tests {
     #[test]
     fn work_execution_uses_regex_fallback() {
         assert_eq!(
-            FailureClass::from(&WorkError::Execution(
+            work_error_class(&WorkError::Execution(
                 "build failed: compilation error".into()
             )),
             FailureClass::Internal
         );
         assert_eq!(
-            FailureClass::from(&WorkError::Execution("[E0425] cannot find value".into())),
+            work_error_class(&WorkError::Execution("[E0425] cannot find value".into())),
             FailureClass::Internal
         );
     }
@@ -401,7 +335,7 @@ mod tests {
     #[test]
     fn work_dependency_maps_to_internal() {
         assert_eq!(
-            FailureClass::from(&WorkError::Dependency("artifact".into())),
+            work_error_class(&WorkError::Dependency("artifact".into())),
             FailureClass::Internal
         );
     }

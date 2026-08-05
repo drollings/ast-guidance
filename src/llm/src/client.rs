@@ -144,22 +144,34 @@ impl LlmClient {
     /// when inside a tokio runtime to prevent worker-thread starvation; falls
     /// back to the process-wide fallback runtime when no runtime is active.
     pub fn chat_complete(&self, messages: &[ChatMessage]) -> Result<String, LlmError> {
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                let client = self.clone();
-                let messages = messages.to_vec();
-                tokio::task::block_in_place(move || {
-                    handle.block_on(client.chat_complete_async(&messages))
-                })
-            }
-            Err(_) => fallback_runtime().block_on(self.chat_complete_async(messages)),
-        }
+        let client = self.clone();
+        let messages = messages.to_vec();
+        block_on(client.chat_complete_async(&messages))
     }
 }
 
 impl ChatBackend for LlmClient {
     fn chat_complete(&self, messages: &[ChatMessage]) -> Result<String, LlmError> {
         self.chat_complete(messages)
+    }
+}
+
+/// Run a future to completion synchronously, reusing the canonical runtime
+/// bridging: inside a multi-threaded tokio runtime it drives the future via
+/// `tokio::task::block_in_place` (avoiding worker-thread starvation); inside a
+/// current-thread runtime (where `block_in_place` panics) and with no active
+/// runtime it falls back to plain `block_on` / the process-wide fallback
+/// runtime.
+pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+                handle.block_on(fut)
+            } else {
+                tokio::task::block_in_place(move || handle.block_on(fut))
+            }
+        }
+        Err(_) => fallback_runtime().block_on(fut),
     }
 }
 
@@ -178,12 +190,7 @@ pub async fn chat_complete_http_async(
     debug: bool,
     show_prompts: bool,
 ) -> Result<String, LlmError> {
-    let trimmed = api_base.trim_end_matches('/');
-    let url = if trimmed.ends_with("/chat/completions") {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/chat/completions")
-    };
+    let url = crate::url::chat_completions_url(api_base);
     let result = chat_complete_http_inner_async(
         &url,
         messages,
@@ -225,10 +232,7 @@ pub fn chat_complete_http(
         debug,
         show_prompts,
     );
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => handle.block_on(fut),
-        Err(_) => fallback_runtime().block_on(fut),
-    }
+    block_on(fut)
 }
 
 /// Inner async request — returns `Ok(content)` or `Ok("")` on empty.
@@ -248,28 +252,14 @@ async fn chat_complete_http_inner_async(
     debug: bool,
     show_prompts: bool,
 ) -> Result<String, LlmError> {
-    let mut body = serde_json::json!({
-        "model": model,
-        "messages": messages,
-        "stream": false,
-        "chat_template_kwargs": {"enable_thinking": false},
-    });
-
-    // Merge model-level params (can override defaults above, e.g. when
-    // `extra_body_params` contains `chat_template_kwags`).
-    if let Some(params) = extra_body_params {
-        if let Some(obj) = params.as_object() {
-            for (k, v) in obj {
-                if k != "model" && k != "messages" && k != "stream" {
-                    body[k] = v.clone();
-                }
-            }
-        }
-    }
-    // think flag from LlmConfig overrides everything.
-    if think == Some(true) {
-        body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": true});
-    }
+    let messages_json = serde_json::to_value(messages).map_err(|e| LlmError::Api(e.to_string()))?;
+    let body = crate::openai::build_openai_chat_body(
+        model,
+        &messages_json,
+        extra_body_params,
+        false,
+        think,
+    );
 
     if show_prompts {
         eprintln!("=== LLM PROMPT ===");

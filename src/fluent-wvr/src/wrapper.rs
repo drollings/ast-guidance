@@ -8,8 +8,8 @@ use internment::ArcIntern;
 use tracing::info;
 
 use crate::{
-    impl_component, Component, Describable, FieldAccess, FieldError, WorkContext, WorkError,
-    WorkOutput, WorkUnit,
+    impl_component, impl_fieldless, Component, Describable, FieldAccess, FieldError, WorkContext,
+    WorkError, WorkOutput, WorkUnit,
 };
 
 pub struct RetryResult<T> {
@@ -336,6 +336,105 @@ impl Describable for ComponentAdapter {
 }
 
 impl_component!(ComponentAdapter);
+
+/// A first-Ok-wins cascade of `Arc<dyn Component>` units.
+///
+/// Runs units in registration order and returns the first `Ok` `WorkOutput`
+/// (coral's `TierRegistry` semantics, generalized). An `Err` from a unit
+/// advances to the next one; when every unit fails, the last `Err` is
+/// returned (falling back to a descriptive error when the cascade is empty).
+///
+/// The cascade itself is a `Component`, so it can be registered, wrapped, or
+/// nested like any other unit. `depends`/`provides` are empty — the cascade
+/// is a dispatch container, not a producer of assets.
+pub struct ComponentCascade {
+    units: Vec<Arc<dyn Component>>,
+}
+
+impl ComponentCascade {
+    pub fn new() -> Self {
+        Self { units: Vec::new() }
+    }
+
+    /// Build a cascade from a pre-registered unit list.
+    pub fn with_units(units: Vec<Arc<dyn Component>>) -> Self {
+        Self { units }
+    }
+
+    /// Append a unit to the end of the cascade.
+    pub fn push(&mut self, unit: Arc<dyn Component>) {
+        self.units.push(unit);
+    }
+
+    /// Append a unit to the end of the cascade (alias for `push`).
+    pub fn register(&mut self, unit: Arc<dyn Component>) {
+        self.units.push(unit);
+    }
+
+    /// Number of units in the cascade.
+    pub fn len(&self) -> usize {
+        self.units.len()
+    }
+
+    /// `true` when the cascade holds no units.
+    pub fn is_empty(&self) -> bool {
+        self.units.is_empty()
+    }
+
+    /// Run units in order; return the first `Ok` `WorkOutput`, or the last
+    /// `Err` when all units fail.
+    pub fn execute_first_ok(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+        let mut last_err = None;
+        for unit in &self.units {
+            match unit.execute(ctx) {
+                Ok(output) => return Ok(output),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| WorkError::Execution("component cascade has no units".into())))
+    }
+}
+
+impl Default for ComponentCascade {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WorkUnit for ComponentCascade {
+    fn name(&self) -> &str {
+        "component_cascade"
+    }
+    fn depends(&self) -> &[ArcIntern<str>] {
+        &[]
+    }
+    fn provides(&self) -> &[ArcIntern<str>] {
+        &[]
+    }
+    fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+        self.execute_first_ok(ctx)
+    }
+}
+
+impl_fieldless!(ComponentCascade);
+
+impl Describable for ComponentCascade {
+    fn describe(&self) -> serde_json::Value {
+        let units: Vec<String> = self.units.iter().map(|u| u.name().to_string()).collect();
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "cascade": {
+                "first_ok": true,
+                "units": units,
+            },
+        })
+    }
+}
+
+impl_component!(ComponentCascade);
 
 /// Post-erasure Component wrapper. Unlike the newtype wrappers
 /// (`Instrumented`, `ComponentAdapter`), middleware wraps an
@@ -1101,5 +1200,89 @@ mod tests {
         assert_eq!(adapter.get_field("port").unwrap(), "9090");
         adapter.clear_field_overrides();
         assert_eq!(adapter.get_field("port").unwrap(), "8079");
+    }
+
+    // --- ComponentCascade tests ---
+
+    fn failing_unit(name: &str) -> Arc<dyn Component> {
+        Arc::new(MockUnit {
+            name: ArcIntern::from(name),
+            should_fail: true,
+            call_count: AtomicUsize::new(0),
+        })
+    }
+
+    fn ok_unit(name: &str) -> Arc<dyn Component> {
+        Arc::new(MockUnit::ok(name))
+    }
+
+    #[test]
+    fn cascade_returns_first_ok_and_short_circuits() {
+        let mut cascade = ComponentCascade::new();
+        cascade.register(failing_unit("fail-1"));
+        cascade.register(ok_unit("ok-1"));
+        let ok: Arc<dyn Component> = ok_unit("ok-2");
+        cascade.register(Arc::clone(&ok));
+
+        let result = cascade
+            .execute_first_ok(&WorkContext::default())
+            .expect("first-ok");
+        assert_eq!(result.message, "done");
+        // ok-2 must not have run (short-circuit after ok-1).
+        assert_eq!(
+            ok.as_any()
+                .downcast_ref::<MockUnit>()
+                .unwrap()
+                .call_count
+                .load(Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[test]
+    fn cascade_all_fail_returns_last_error() {
+        let mut cascade = ComponentCascade::new();
+        cascade.register(failing_unit("fail-1"));
+        cascade.register(failing_unit("fail-2"));
+        let err = cascade
+            .execute_first_ok(&WorkContext::default())
+            .expect_err("all units fail");
+        assert!(matches!(err, WorkError::Execution(_)));
+    }
+
+    #[test]
+    fn cascade_empty_returns_descriptive_error() {
+        let cascade = ComponentCascade::new();
+        let err = cascade
+            .execute_first_ok(&WorkContext::default())
+            .expect_err("empty cascade");
+        assert!(err.to_string().contains("no units"));
+    }
+
+    #[test]
+    fn cascade_len_and_is_empty() {
+        let mut cascade = ComponentCascade::new();
+        assert!(cascade.is_empty());
+        cascade.push(ok_unit("a"));
+        assert_eq!(cascade.len(), 1);
+        assert!(!cascade.is_empty());
+    }
+
+    #[test]
+    fn cascade_is_itself_a_component() {
+        let mut cascade = ComponentCascade::new();
+        cascade.register(ok_unit("a"));
+        let boxed: Box<dyn Component> = Box::new(cascade);
+        assert_eq!(boxed.name(), "component_cascade");
+        let result = boxed.execute(&WorkContext::default()).expect("delegates");
+        assert_eq!(result.message, "done");
+        let schema = boxed.describe();
+        assert_eq!(schema["cascade"]["units"][0], "a");
+    }
+
+    #[test]
+    fn cascade_executes_empty_units() {
+        let cascade = ComponentCascade::with_units(vec![failing_unit("only-fail")]);
+        assert!(cascade.execute(&WorkContext::default()).is_err());
     }
 }

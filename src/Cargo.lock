@@ -1721,8 +1721,8 @@ dependencies = [
  "coral-context",
  "fluent-dag",
  "guidance-guidance",
- "guidance-llm",
- "guidance-wasm-ipc",
+ "fluent-llm",
+ "fluent-wasm-ipc",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1769,10 +1769,10 @@ dependencies = [
  "dashmap 6.2.1",
  "extism",
  "guidance-common",
- "guidance-llm",
+ "fluent-llm",
  "guidance-ontology",
  "guidance-rdf",
- "guidance-wasm-ipc",
+ "fluent-wasm-ipc",
  "internment",
  "regex",
  "rusqlite",
@@ -1791,7 +1791,7 @@ dependencies = [
  "bitvec",
  "bon",
  "guidance-common",
- "guidance-wasm-ipc",
+ "fluent-wasm-ipc",
  "internment",
  "serde",
  "serde_json",
@@ -1809,7 +1809,7 @@ dependencies = [
  "clap",
  "dirs",
  "guidance-common",
- "guidance-llm",
+ "fluent-llm",
  "httpmock",
  "internment",
  "notify",
@@ -1829,7 +1829,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "guidance-llm"
+name = "fluent-llm"
 version = "0.1.0"
 dependencies = [
  "async-openai",
@@ -1865,7 +1865,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "guidance-wasm-ipc"
+name = "fluent-wasm-ipc"
 version = "0.1.0"
 dependencies = [
  "bitvec",

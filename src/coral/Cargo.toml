@@ -13,10 +13,9 @@ fluent-concurrency = { path = "../fluent-concurrency" }
 common-core = { path = "../common-core", features = ["sqlite"] }
 fluent-types = { path = "../types" }
 search-vector = { path = "../search-vector" }
-guidance-llm = { path = "../llm" }
+fluent-llm = { path = "../llm" }
 guidance-ontology = { path = "../ontology" }
 guidance-rdf = { path = "../rdf" }
-guidance-wasm-ipc = { path = "../wasm_ipc" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 internment = { workspace = true }
@@ -25,12 +24,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 bon = { workspace = true }
 rusqlite = { workspace = true }
-regex = { workspace = true }
 lru = { workspace = true }
 extism = { workspace = true }
 hnsw_rs = { workspace = true }
 anndists = { workspace = true }
-reqwest = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

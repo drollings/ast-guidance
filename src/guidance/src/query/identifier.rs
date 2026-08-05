@@ -1,4 +1,4 @@
-use common_core::string::contains_ignore_case;
+use common_core::string::{contains_ignore_case, detect_identifier_kind};
 use fluent_types::GuidanceDoc;
 use regex::Regex;
 
@@ -8,15 +8,10 @@ pub struct IdentifierPattern {
     pub kind: IdentifierKind,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum IdentifierKind {
-    CamelCase,
-    PascalCase,
-    SnakeCase,
-    KebabCase,
-    DottedPath,
-    Other,
-}
+/// Identifier case-style classification. Re-exported from
+/// `common_core::string` (M3.4/M7.2 promotion) so existing guidance
+/// consumers keep the same path.
+pub use common_core::string::IdentifierKind;
 
 pub fn detect_identifier_pattern(query: &str) -> Option<IdentifierPattern> {
     let trimmed = query.trim();
@@ -24,37 +19,7 @@ pub fn detect_identifier_pattern(query: &str) -> Option<IdentifierPattern> {
         return None;
     }
 
-    if trimmed.contains('.') && !trimmed.contains(' ') {
-        return Some(IdentifierPattern {
-            name: trimmed.to_string(),
-            kind: IdentifierKind::DottedPath,
-        });
-    }
-
-    let kind = if trimmed.contains('-') && !trimmed.contains(' ') {
-        IdentifierKind::KebabCase
-    } else if trimmed.contains('_')
-        && trimmed
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
-    {
-        IdentifierKind::SnakeCase
-    } else if trimmed
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_uppercase())
-        && !trimmed.contains('_')
-        && !trimmed.contains('-')
-    {
-        IdentifierKind::PascalCase
-    } else if trimmed
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_uppercase() || c.is_ascii_digit())
-    {
-        IdentifierKind::CamelCase
-    } else {
-        IdentifierKind::Other
-    };
+    let kind = detect_identifier_kind(trimmed)?;
 
     let valid_identifier = Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$")
         .ok()?

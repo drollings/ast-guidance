@@ -1,7 +1,6 @@
 pub mod edges;
 pub mod embeddings;
 pub mod hnsw;
-pub mod kv_cache;
 pub mod nodes;
 pub mod schema;
 
@@ -13,12 +12,14 @@ use std::sync::{Mutex, RwLock};
 use anndists::dist::DistCosine;
 use bitvec::vec::BitVec;
 use fluent_types::{ContentNode, NodeId};
-use guidance_llm::EmbeddingProvider;
+use fluent_llm::EmbeddingProvider;
 use hnsw_rs::hnsw::Hnsw;
 use search_vector::error::DbError;
 use thiserror::Error;
 
-pub const MAX_KNN_CANDIDATES: usize = 100_000;
+// Promoted to `common-core::constants` (ROADMAP_20260804_SHARED_CORE M4.3);
+// re-exported here so `super::{…, MAX_KNN_CANDIDATES}` imports keep working.
+pub use common_core::constants::MAX_KNN_CANDIDATES;
 
 #[derive(Error, Debug)]
 pub enum LibraryError {
@@ -32,21 +33,11 @@ pub enum LibraryError {
     DuplicateNode(String),
 }
 
-fn is_unique_violation(e: &rusqlite::Error) -> bool {
-    matches!(
-        e,
-        rusqlite::Error::SqliteFailure(ffi, _)
-            if ffi.code == rusqlite::ErrorCode::ConstraintViolation
-                // 2067 = SQLITE_CONSTRAINT_UNIQUE, 1555 = SQLITE_CONSTRAINT_PRIMARYKEY
-                && (ffi.extended_code == 2067 || ffi.extended_code == 1555)
-    )
-}
-
 impl From<rusqlite::Error> for LibraryError {
     fn from(e: rusqlite::Error) -> Self {
         // M9.2d: surface a UNIQUE-constraint violation as the typed
         // `DuplicateNode` variant instead of leaking the raw `SqliteError`.
-        if is_unique_violation(&e) {
+        if common_core::sqlite::is_unique_violation(&e) {
             return LibraryError::DuplicateNode(e.to_string());
         }
         LibraryError::Sqlite(common_core::error::SqliteError(e))
@@ -398,7 +389,7 @@ mod tests {
 
     #[test]
     fn test_hydration_pipeline() {
-        use guidance_llm::NoopEmbedding;
+        use fluent_llm::NoopEmbedding;
 
         let lib = Library::open_in_memory().expect("db");
         let embedder = Arc::new(NoopEmbedding::new(4));

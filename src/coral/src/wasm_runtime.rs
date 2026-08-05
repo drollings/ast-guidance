@@ -1,12 +1,10 @@
-use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use lru::LruCache;
+use common_core::cache::LoadCache;
 use thiserror::Error;
 
 type CachedPlugin = Arc<Mutex<Box<dyn WasmPlugin>>>;
-type PluginCache = LruCache<String, CachedPlugin>;
 
 #[derive(Error, Debug)]
 pub enum WasmError {
@@ -16,15 +14,9 @@ pub enum WasmError {
     PluginLoad(String),
     #[error("plugin call failed: {0}")]
     PluginCall(String),
-    #[error("invalid payload: {0}")]
-    InvalidPayload(String),
 }
 
-impl From<std::io::Error> for WasmError {
-    fn from(e: std::io::Error) -> Self {
-        WasmError::Io(common_core::error::IoError(e))
-    }
-}
+common_core::impl_from_io_error!(WasmError);
 
 pub trait WasmPlugin: Send {
     fn call(&mut self, payload: &[u8]) -> Result<Vec<u8>, WasmError>;
@@ -36,17 +28,19 @@ pub trait WasmPlugin: Send {
 /// same path. When the cache exceeds `max_capacity`, the least-recently-used
 /// plugin is evicted.
 pub struct PluginPool {
-    plugins: Mutex<PluginCache>,
-    runtime: Arc<dyn WasmRuntime>,
+    plugins: LoadCache<String, CachedPlugin, WasmError>,
 }
 
 impl PluginPool {
     pub fn new(runtime: Arc<dyn WasmRuntime>, max_capacity: usize) -> Self {
-        let cap = NonZeroUsize::new(max_capacity).unwrap_or(NonZeroUsize::new(1).unwrap());
-        Self {
-            plugins: Mutex::new(LruCache::new(cap)),
-            runtime,
-        }
+        let cap = max_capacity.max(1);
+        let cache = LoadCache::new(cap, move |path: &String| {
+            runtime
+                .load_plugin_from_file(Path::new(path))
+                .map(|plugin| Arc::new(Mutex::new(plugin)))
+        })
+        .expect("PluginPool capacity is non-zero");
+        Self { plugins: cache }
     }
 
     /// Return a cached plugin for `path`, or load + cache a new one.
@@ -56,24 +50,12 @@ impl PluginPool {
     /// stays valid (the caller may still hold a reference) but subsequent
     /// `get_or_load` calls for the same path will load a fresh instance.
     pub fn get_or_load(&self, path: &str) -> Result<CachedPlugin, WasmError> {
-        // Fast path: plugin already cached
-        {
-            let mut cache = self.plugins.lock().unwrap();
-            if let Some(plugin) = cache.get(path) {
-                return Ok(Arc::clone(plugin));
-            }
-        }
-        // Slow path: load from disk, insert into cache
-        let plugin = self.runtime.load_plugin_from_file(Path::new(path))?;
-        let shared = Arc::new(Mutex::new(plugin));
-        let mut cache = self.plugins.lock().unwrap();
-        cache.put(path.to_string(), Arc::clone(&shared));
-        Ok(shared)
+        self.plugins.get_or_load(path.to_string())
     }
 
     /// Number of plugins currently held in the cache.
     pub fn cache_size(&self) -> usize {
-        self.plugins.lock().unwrap().len()
+        self.plugins.len()
     }
 }
 
@@ -223,40 +205,6 @@ impl WorkUnit for WasmComponent {
             data,
         ))
     }
-}
-
-/// Decode a base64-encoded WASM binary using the extism-compatible simple decoder.
-pub fn decode_wasm_base64(b64: &str) -> Result<Vec<u8>, WasmError> {
-    // Simple base64 decode without external crate dependency
-    let bytes = b64.as_bytes();
-    let mut result = Vec::with_capacity(bytes.len() * 3 / 4);
-    let mut buf: u32 = 0;
-    let mut bits = 0;
-    for &c in bytes {
-        let val = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            b'=' => break,
-            b'\n' | b'\r' | b' ' | b'\t' => continue,
-            _ => {
-                return Err(WasmError::InvalidPayload(format!(
-                    "invalid base64 char: {}",
-                    c as char
-                )))
-            }
-        };
-        buf = (buf << 6) | u32::from(val);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            result.push((buf >> bits) as u8);
-            buf &= (1 << bits) - 1;
-        }
-    }
-    Ok(result)
 }
 
 #[cfg(test)]

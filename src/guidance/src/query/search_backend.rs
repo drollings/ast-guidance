@@ -6,7 +6,7 @@ use super::llm_filter::LlmFilter;
 use super::strategy::QueryIntent;
 use super::synthesize::{Stage, Synthesizer};
 use crate::query_engine::QueryEngineError;
-use guidance_project_knowledge::word_index::WordIndex;
+use fluent_knowledge::word_index::WordIndex;
 
 /// Shared context for search backends — avoids threading individual references
 /// through every method.
@@ -96,17 +96,15 @@ impl SearchBackend for KeywordBackend {
         let mut matched_names: Vec<String> = Vec::new();
 
         for member in &doc.members {
-            let member_lower = member.name.as_str().to_lowercase();
-            let comment_lower = member
-                .comment
-                .as_ref()
-                .map(|c| c.as_str().to_lowercase())
-                .unwrap_or_default();
+            let matches_keyword = |k: &&str| {
+                contains_ignore_case(member.name.as_str(), k)
+                    || member
+                        .comment
+                        .as_ref()
+                        .is_some_and(|c| contains_ignore_case(c.as_str(), k))
+            };
 
-            if keywords.iter().any(|k| {
-                member_lower.contains(&k.to_lowercase())
-                    || comment_lower.contains(&k.to_lowercase())
-            }) {
+            if keywords.iter().any(matches_keyword) {
                 matched_names.push(member.name.as_str().to_string());
             }
         }

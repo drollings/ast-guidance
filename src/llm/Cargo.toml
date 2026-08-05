@@ -1,5 +1,5 @@
 [package]
-name = "guidance-llm"
+name = "fluent-llm"
 version.workspace = true
 edition.workspace = true
 

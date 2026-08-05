@@ -1,5 +1,5 @@
 [package]
-name = "guidance-wasm-ipc"
+name = "fluent-wasm-ipc"
 version.workspace = true
 edition.workspace = true
 

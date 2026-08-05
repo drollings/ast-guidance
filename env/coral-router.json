@@ -5,7 +5,7 @@
             "classifier": true,
             "router": true,
             "coherence_threshold": 0.5,
-            "classifier_model": "lfm",
+            "classifier_model": "qwen3.5-4b",
             "blacklist": "env/pii-patterns.json"
         }
     },
@@ -45,9 +45,9 @@
             "retry_count": 2,
             "retry_base_interval_s": 1,
             "params": {
-                "num_ctx": 163840,
+                "num_ctx": 262144,
                 "parallel": 4,
-                "sleep_idle_seconds": 7200
+                "sleep_idle_seconds": 9800
             }
         },
         "qwen3.5-9b": {
@@ -96,8 +96,8 @@
             "cost_output": 1.8e-05,
             "cost_cached_read": 1.2e-06,
             "speed": 5,
-            "total_timeout_ms": 240000,
-            "idle_timeout_ms": 15000,
+            "total_timeout_ms": 300000,
+            "idle_timeout_ms": 30000,
             "stream": true,
             "filter_thinking": true,
             "retry_count": 1,
@@ -134,8 +134,8 @@
             "cost_output": 1.8e-05,
             "cost_cached_read": 1.2e-06,
             "speed": 5,
-            "total_timeout_ms": 240000,
-            "idle_timeout_ms": 15000,
+            "total_timeout_ms": 300000,
+            "idle_timeout_ms": 30000,
             "stream": true,
             "filter_thinking": true,
             "retry_count": 1,
@@ -282,7 +282,7 @@
     "charts": {
         "dir": "env/workflows/charts",
         "index_path": "data/workflow_library.sqlite",
-        "selector_model": "lfm",
+        "selector_model": "qwen3.5-4b",
         "max_candidates": 5,
         "min_score": 0.6,
         "entity_context": true

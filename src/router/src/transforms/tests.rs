@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn test_decompose_subtasks_with_stub_decomposer() {
-        use guidance_llm::Decomposer;
+        use fluent_llm::Decomposer;
 
         let subtasks = vec![
             "Research the topic".to_string(),
@@ -239,7 +239,7 @@ mod tests {
     #[test]
     fn test_decompose_subtasks_empty_input_returns_not_applicable() {
         struct EmptyDecomposer;
-        impl guidance_llm::Decomposer for EmptyDecomposer {
+        impl fluent_llm::Decomposer for EmptyDecomposer {
             fn decompose(&self, _task: &str) -> Vec<String> {
                 vec![]
             }
@@ -254,7 +254,7 @@ mod tests {
     #[test]
     fn test_decompose_subtasks_name() {
         struct StubDecomposer;
-        impl guidance_llm::Decomposer for StubDecomposer {
+        impl fluent_llm::Decomposer for StubDecomposer {
             fn decompose(&self, _task: &str) -> Vec<String> {
                 vec!["subtask".into()]
             }

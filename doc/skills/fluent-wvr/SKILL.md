@@ -320,8 +320,8 @@ impl WorkContext {
 use fluent_wvr::prelude::*;
 // Brings in: Component, WorkUnit, FieldAccess, Describable, FieldError,
 // WorkContext, WorkError, WorkOutput, Capability, CapabilitySet,
-// impl_component, retry_call, ComponentAdapter, ExecuteFn,
-// Instrumented, Middleware, MiddlewareChain, Pipeline,
+// impl_component, retry_call, ComponentAdapter, ComponentCascade,
+// ExecuteFn, Instrumented, Middleware, MiddlewareChain, Pipeline,
 // SuffixedComponent, MetadataValue, ArcIntern.
 ```
 
@@ -1422,6 +1422,33 @@ registry.push(adapted);
 - **`set_field` validates against the inner first, then stores.** If `Arc::get_mut(&mut self.inner)` returns `None`, the override is stored silently — the inner sees the value on the next call only if the inner has interior mutability. If the inner rejects the value, the override is *not* stored.
 - **`get_field` falls back to the inner component** when no override exists for the requested field.
 
+### ComponentCascade — first-Ok-wins fallback cascade
+
+`ComponentCascade` (`fluent_wvr::wrapper`, in the prelude) is the shared
+first-Ok-wins primitive: a sequence of `Arc<dyn Component>` units whose
+`execute_first_ok` runs each in order and returns the first `Ok(WorkOutput)`.
+An `Err`/`WorkOutput::fail` moves to the next unit; exhaustion returns the
+last error (empty cascade → `Err(WorkError::Execution("component cascade has
+no units"))`). It is itself a `Component` via `impl_component!`.
+
+```rust
+let cascade = ComponentCascade::with_units(vec![
+    Arc::new(l1_unit),
+    Arc::new(l2_unit),
+]);
+let output = cascade.execute_first_ok(&ctx)?;  // first Ok short-circuits
+```
+
+Canonical consumer: coral's `TierRegistry` (L1/L2/L3/L4 tier dispatch)
+delegates to a cascade; its `knn_k` / `l4_threshold` / `l3_max_depth`
+config and name overrides stay coral-side state that *feeds* the cascade.
+
+> **Error-boilerplate macro:** `common_core::error::impl_from_io_error!`
+> (re-exported as `common_core::impl_from_io_error!`) writes the
+> `impl From<std::io::Error> for T { fn from(e) -> Self { Self::Io(IoError(e)) } }`
+> hop for enums that already carry an `Io(#[from] IoError)` variant. Use it
+> instead of hand-copying the wrapper (9 consumer copies replaced in M6).
+
 ---
 
 ## 13. Runtime Composition: The Full Lifecycle
@@ -1619,6 +1646,17 @@ The patterns are not independently beneficial — their value multiplies when co
 **Scoped Ownership + Binary IPC** eliminates payload lifetime management. `encode_request` returns an owned `Vec<u8>`; the call takes a byte slice; the `Vec` is dropped after the call. No individual allocation to track.
 
 **Component Adapter + Middleware** enables runtime orchestration policies. An adapter can change execution behavior; middleware can add retry or rate limiting. The orchestrator composes both dynamically without recompilation.
+
+### Promotion candidates (canonical homes — compose, don't copy)
+
+These consumer-side patterns are genuine control-plane references with a
+single consumer today. They stay in place until a second consumer appears —
+at which point the *next* consumer must adopt the canonical home below
+rather than copy the consumer copy.
+
+| Pattern (current home) | Canonical home when promoted |
+|---|---|
+| `SearchBackend` + `Formatter` intent-dispatch control plane (`src/guidance/src/query/search_backend.rs:22-33`) — each backend matches one `QueryIntent` and the orchestrator iterates `matches` + `search` without branching on implementation | pattern reference, not code — this is Pattern 4 (Trait Objects) + Pattern 8 (Unit of Work) composed; reuse the pattern, promote a concrete trait only when a second consumer exists |
 
 ---
 

@@ -12,7 +12,8 @@ use std::sync::RwLock;
 
 use common_core::constants::HnswParams;
 use common_core::sqlite::{make_hnsw, open_wal};
-use guidance_llm::EmbeddingProvider;
+use common_core::sync::{lock_read, lock_write};
+use fluent_llm::EmbeddingProvider;
 use search_vector::math::{knn_brute_force, try_bytes_to_vec, vec_to_bytes};
 
 use super::{ChartDef, ChartError};
@@ -143,37 +144,22 @@ impl ChartStore {
     /// Look up a chart by name. Returns an `Arc` (the store is shared), so a
     /// callers holding the returned handle stays valid across later upserts.
     pub fn get(&self, name: &str) -> Option<Arc<ChartDef>> {
-        self.charts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(name)
-            .cloned()
+        lock_read(&self.charts).get(name).cloned()
     }
 
     /// All chart names, in insertion order (owned — the store is lock-backed).
     pub fn list(&self) -> Vec<String> {
-        self.charts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .keys()
-            .cloned()
-            .collect()
+        lock_read(&self.charts).keys().cloned().collect()
     }
 
     /// Number of loaded charts.
     pub fn len(&self) -> usize {
-        self.charts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+        lock_read(&self.charts).len()
     }
 
     /// `true` if the store holds no charts.
     pub fn is_empty(&self) -> bool {
-        self.charts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
+        lock_read(&self.charts).is_empty()
     }
 
     /// Insert or replace a chart. Used by boot loading and by M10
@@ -188,10 +174,7 @@ impl ChartStore {
             reason: format!("chart '{}' failed validation: {e}", chart.name),
         })?;
         self.reset_health(&chart.name);
-        self.charts
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(chart.name.clone(), Arc::new(chart));
+        lock_write(&self.charts).insert(chart.name.clone(), Arc::new(chart));
         self.invalidate_index();
         Ok(())
     }
@@ -234,17 +217,11 @@ impl ChartStore {
                 reason: format!("subsumed chart '{}' failed validation: {e}", subsumed.name),
             })?;
             self.mark_draft(&subsumed.name);
-            self.charts
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(existing_name.clone(), Arc::new(subsumed));
+            lock_write(&self.charts).insert(existing_name.clone(), Arc::new(subsumed));
             UpsertOutcome::Subsumed { by: existing_name }
         } else {
             self.mark_draft(&chart.name);
-            self.charts
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(chart.name.clone(), Arc::new(chart));
+            lock_write(&self.charts).insert(chart.name.clone(), Arc::new(chart));
             UpsertOutcome::Inserted
         };
         self.invalidate_index();
@@ -267,10 +244,7 @@ impl ChartStore {
     /// threshold — the caller should flag it in the audit log. `None`
     /// otherwise.
     pub fn record_rubric_result(&self, chart: &str, passed: bool) -> Option<String> {
-        let mut health = self
-            .health
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut health = lock_write(&self.health);
         let entry = health.entry(chart.to_string()).or_default();
         if passed {
             entry.stale_failures = 0;
@@ -293,36 +267,22 @@ impl ChartStore {
 
     /// Whether `chart` is demoted (excluded from selection).
     pub fn is_demoted(&self, name: &str) -> bool {
-        self.health
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(name)
-            .is_some_and(|h| h.demoted)
+        lock_read(&self.health).get(name).is_some_and(|h| h.demoted)
     }
 
     /// Whether `chart` is an auto-extracted draft awaiting rubric validation.
     pub fn is_draft(&self, name: &str) -> bool {
-        self.health
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(name)
-            .is_some_and(|h| h.draft)
+        lock_read(&self.health).get(name).is_some_and(|h| h.draft)
     }
 
     /// Snapshot of `chart`'s health, if present.
     pub fn health(&self, name: &str) -> Option<ChartHealth> {
-        self.health
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(name)
-            .cloned()
+        lock_read(&self.health).get(name).cloned()
     }
 
     /// Names of every demoted chart (audit/operator visibility).
     pub fn demoted_charts(&self) -> Vec<String> {
-        self.health
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        lock_read(&self.health)
             .iter()
             .filter(|(_, h)| h.demoted)
             .map(|(n, _)| n.clone())
@@ -331,18 +291,12 @@ impl ChartStore {
 
     /// Clear a chart's health back to the default (selectable, no streak).
     fn reset_health(&self, name: &str) {
-        self.health
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(name.to_string(), ChartHealth::default());
+        lock_write(&self.health).insert(name.to_string(), ChartHealth::default());
     }
 
     /// Mark a chart as an auto-extracted draft (not yet rubric-validated).
     fn mark_draft(&self, name: &str) {
-        let mut health = self
-            .health
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut health = lock_write(&self.health);
         let entry = health.entry(name.to_string()).or_default();
         entry.draft = true;
         entry.stale_failures = 0;
@@ -352,18 +306,13 @@ impl ChartStore {
     /// Drop the built retrieval index — the `charts` map changed, so the
     /// HNSW graph and SQLite embeddings are stale until the next build.
     fn invalidate_index(&self) {
-        *self
-            .built
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *lock_write(&self.built) = None;
     }
 
     /// Whether `name` is excluded from selection: demoted, or a draft that
     /// has not yet been rubric-validated (M10).
     fn is_excluded_from_selection(&self, name: &str) -> bool {
-        self.health
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        lock_read(&self.health)
             .get(name)
             .is_some_and(|h| h.demoted || h.draft)
     }
@@ -383,10 +332,7 @@ impl ChartStore {
     /// demoted or still-draft (M10 staleness/draft gate) — demoted and
     /// unvalidated drafts are "no longer selected".
     pub fn charts_sorted(&self) -> Vec<Arc<ChartDef>> {
-        let guard = self
-            .charts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = lock_read(&self.charts);
         let mut names: Vec<&str> = guard.keys().map(String::as_str).collect();
         names.sort_unstable();
         names
@@ -481,10 +427,7 @@ impl ChartStore {
             })?;
         }
 
-        *self
-            .built
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(ChartIndex {
+        *lock_write(&self.built) = Some(Arc::new(ChartIndex {
             embedder,
             ids,
             flat,
@@ -503,10 +446,7 @@ impl ChartStore {
     /// request (M7 step 2). Returns `(chart name, similarity in [0,1])`
     /// sorted most-similar first. An unbuilt index yields no candidates.
     pub fn search(&self, request: &str, k: usize) -> Result<Vec<(String, f32)>, ChartError> {
-        let guard = self
-            .built
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = lock_read(&self.built);
         let Some(index) = guard.as_ref() else {
             return Ok(Vec::new());
         };

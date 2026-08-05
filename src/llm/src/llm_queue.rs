@@ -1,5 +1,5 @@
 //! Default LLM request handler — wires the queue's `ResultPool` to the
-//! OpenAI-compatible HTTP transport in `guidance_llm::client`.
+//! OpenAI-compatible HTTP transport in `fluent_llm::client`.
 //!
 //! The `LlmRequestQueue` primitive lives in `fluent_concurrency::llm_queue`
 //! and is transport-agnostic (it accepts any `Fn(LlmTask) -> Future<...>`
@@ -11,7 +11,7 @@
 //! use std::sync::Arc;
 //! use fluent_concurrency::llm_queue::{LlmQueueConfig, LlmRequestQueue};
 //! use fluent_concurrency::tokio_runtime;
-//! use guidance_llm::llm_queue::default_handler;
+//! use fluent_llm::llm_queue::default_handler;
 //!
 //! # async fn run() {
 //! let queue = Arc::new(LlmRequestQueue::new(

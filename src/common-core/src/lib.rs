@@ -16,7 +16,7 @@
 //! See `ROADMAP_20260625_CONSOLIDATE.md` for the full consolidation plan.
 pub mod cache;
 
-pub use cache::{CachedResponse, ResponseCache};
+pub use cache::{CachedResponse, LoadCache, ResponseCache};
 
 pub mod config;
 pub mod constants;
@@ -33,12 +33,14 @@ pub mod io;
 pub mod jsonrpc;
 pub mod metrics;
 pub mod prelude;
+pub mod registry;
 pub mod retry;
 pub mod shell;
 pub mod shell_parser;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod string;
+pub mod sync;
 pub mod time;
 pub mod tokens;
 pub mod walk;
@@ -69,6 +71,7 @@ pub use jsonrpc::{
     METHOD_NOT_FOUND,
 };
 pub use metrics::LatencyHistogram;
+pub use registry::KeyedRegistry;
 pub use retry::{backoff_ms, retry_async};
 pub use shell::{run_capture, run_command, run_shell_capture, shell_cmd, CommandOutput};
 #[cfg(feature = "sqlite")]
@@ -77,10 +80,11 @@ pub use sqlite::{
 };
 pub use string::{
     contains_any, contains_any_word, contains_ident_word, contains_ignore_case, contains_word,
-    drain_sse_lines, find_subseq, first_comment_line, first_sentence, has_extension,
-    is_noisy_comment, is_path_token, is_test_path, looks_like_identifier, lower_into,
-    skill_name_from_ref, slugify, strip_boilerplate, strip_nl_prefix, trim_left, trim_right,
-    truncate_at_sentence, STOP_WORDS,
+    detect_identifier_kind, drain_sse_lines, filter_unsafe_chars, find_subseq, first_comment_line,
+    first_sentence, has_extension, is_noisy_comment, is_path_token, is_test_path,
+    looks_like_identifier, lower_into, skill_name_from_ref, slugify, strip_boilerplate,
+    strip_nl_prefix, trim_doc_prefix, trim_left, trim_right, truncate_at_sentence, AnsiStripper,
+    IdentifierKind, StreamingThinkFilter, STOP_WORDS,
 };
 pub use time::now_secs;
 #[allow(deprecated)]

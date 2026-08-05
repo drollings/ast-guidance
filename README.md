@@ -87,7 +87,7 @@ src/
   types/                 Shared domain types (ContentNode, NodeId, etc.)
   common-core/           General utilities (hashing, formatting, shell, string ops)
   search-vector/         SQLite hybrid search (vector + keyword + RRF fusion)
-  project-knowledge/     WordIndex, TrigramIndex, CsrGraph, QueryCache
+  knowledge/             WordIndex, TrigramIndex, CsrGraph, QueryCache
   content-node/          LOD slicing and file content annotation
   ontology/              Entity extraction, YAGO taxonomy, capability inference
   rdf/                   Turtle/N-Quads parser and normalization
@@ -117,7 +117,7 @@ System behaviors.
 | Ontology | `ontology` | YAGO taxonomy with transitive `is_a` inference for duck-typed capabilities |
 | RDF ingestion | `rdf` | Turtle/N-Quads parsing with transactional batch flush |
 | Content nodes | `content-node` | 6-level LOD pyramid (full text → keywords) for context window packing |
-| Project knowledge | `project-knowledge` | Word/trigram inverted indexes, CSR graph, frequency tables |
+| Project knowledge | `knowledge` | Word/trigram inverted indexes, CSR graph, frequency tables |
 
 ## Design philosophy
 

@@ -32,7 +32,7 @@ fn summarizer_ctx(content: &str) -> WorkContext {
     ctx
 }
 
-fn stub_client(response: &str) -> Arc<dyn guidance_llm::client::ChatBackend> {
+fn stub_client(response: &str) -> Arc<dyn fluent_llm::client::ChatBackend> {
     Arc::new(StubChatBackend::always(response))
 }
 

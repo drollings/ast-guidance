@@ -322,7 +322,7 @@ The registry layer provides shared building blocks used by both guidance and cor
 src/fluent-wvr/         ──→ Component, WorkUnit, FieldAccess, Describable traits
 src/dag/                ──→ TargetRegistry, Target, CapabilityRegistry
 src/llm/                ──→ LlmClient, EmbeddingProvider, CachedEmbeddingProvider
-src/project-knowledge/  ──→ WordIndex, TrigramIndex, CsrGraph
+src/knowledge/  ──→ WordIndex, TrigramIndex, CsrGraph
 src/search-vector/      ──→ GuidanceDb (SQLite hybrid search)
 src/common-core/        ──→ Hashing, formatting, string utilities, shell
 ```
@@ -451,7 +451,7 @@ src/
   types/               Shared domain types (GuidanceDoc, Member, FileType, etc.)
   common-core/         General utilities (hashing, formatting, shell, string ops)
   search-vector/       SQLite hybrid search (vector + keyword + RRF)
-  project-knowledge/   WordIndex, TrigramIndex, CsrGraph, QueryCache
+  knowledge/   WordIndex, TrigramIndex, CsrGraph, QueryCache
   content-node/        LOD slicing, file content annotation
   ontology/            Entity extraction, YAGO taxonomy, capability inference
   rdf/                 Turtle/N-Quads parser, normalization
@@ -473,7 +473,7 @@ src/
 7. **Fluent WVR Integration**: `WorkerPool` + `TokioRuntime` for parallel AST/DB ops
 8. **Comment In-filling**: LLM-generated comment sync to source (`comments.rs`)
 9. **Query Classification FSM**: `FsmEngine` with 8 intent types (`strategy.rs`)
-10. **WordIndex**: Inverted word index for fast keyword lookup (`project-knowledge`)
+10. **WordIndex**: Inverted word index for fast keyword lookup (`knowledge`)
 11. **Config-Driven Commands**: `test_commands`, `lint_commands`, `fmt_commands` from JSON
 12. **File Watching**: `--watch` mode with debounced filesystem events
 13. **Benchmark System**: Query accuracy scoring (relevance, completeness, navigation)
@@ -516,7 +516,7 @@ Input Query
 
 | Cache Level | Content | Hit Rate | Latency | Source |
 |-------------|---------|---------|---------|--------|
-| L1: WordIndex | Exact identifier | ~40% | <1ms | `project-knowledge::WordIndex` |
+| L1: WordIndex | Exact identifier | ~40% | <1ms | `knowledge::WordIndex` |
 | L2: FTS Keyword | Full-text search | ~15% | <10ms | SQLite LIKE + position rank |
 | L3: RRF Merge | Hybrid fusion | ~10% | <30ms | Reciprocal rank fusion |
 | L4: LLM Synthesis | Cached summaries | ~10% | <50ms | embedding_cache table |

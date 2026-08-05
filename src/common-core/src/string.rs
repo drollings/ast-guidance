@@ -1,6 +1,7 @@
 //! 20+ string utilities: case-insensitive search, slug, truncation, identifier detection.
 
 use std::collections::HashSet;
+use std::str::Chars;
 use std::sync::LazyLock;
 
 pub static STOP_WORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
@@ -343,6 +344,281 @@ pub fn strip_thinking_blocks(text: &str) -> String {
 /// `strip_thinking_blocks` which handles all known thinking-block formats.
 pub fn strip_think_block(text: &str) -> String {
     strip_thinking_blocks(text)
+}
+
+// ── Streaming think-block filter ──────────────────────────────────────
+
+/// Streaming think-block filter for token-chunked LLM output.
+///
+/// Feeds delta chunks via [`Self::push`] and returns only the text safe to
+/// emit. Trailing text that is a proper prefix of a think open/close tag
+/// (e.g. `<thi`) is held back until the next chunk completes it, so a tag
+/// split across chunk boundaries never leaks a partial tag to the client.
+/// Content inside an open think block is discarded; [`Self::finish`] returns
+/// any trailing text that never resolved into a tag (the caller decides
+/// whether to emit it at end-of-stream).
+#[derive(Default)]
+pub struct StreamingThinkFilter {
+    in_think_block: bool,
+    pending: String,
+}
+
+impl StreamingThinkFilter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one delta chunk and return the text safe to emit.
+    pub fn push(&mut self, delta: &str) -> String {
+        const OPEN_TAGS: &[&str] = &["<think>", "<thinking>"];
+        const CLOSE_TAGS: &[&str] = &["</think>", "</thinking>"];
+
+        let mut combined = String::with_capacity(self.pending.len() + delta.len());
+        combined.push_str(&self.pending);
+        combined.push_str(delta);
+        self.pending.clear();
+
+        let mut remaining: &str = &combined;
+        let mut output = String::new();
+
+        loop {
+            if self.in_think_block {
+                // Check for any closing tag in remaining.
+                let mut earliest_close: Option<(usize, &str)> = None;
+                for ct in CLOSE_TAGS {
+                    if let Some(pos) = remaining.find(ct) {
+                        if earliest_close.is_none_or(|(e, _)| pos < e) {
+                            earliest_close = Some((pos, ct));
+                        }
+                    }
+                }
+
+                if let Some((pos, ct)) = earliest_close {
+                    // Close the think block — emit nothing for its content.
+                    self.in_think_block = false;
+                    remaining = &remaining[pos + ct.len()..];
+                    continue;
+                }
+                // Still inside the block — discard the definite content but
+                // hold back a trailing close-tag prefix that may complete in
+                // the next chunk (otherwise a split `</thi` + `nk>` close
+                // would be missed and the tail would leak).
+                let hold = Self::tag_prefix_len(remaining, CLOSE_TAGS);
+                self.pending.push_str(&remaining[remaining.len() - hold..]);
+                return output;
+            }
+
+            // Not inside a think block — scan for opening tags.
+            let mut earliest_open: Option<(usize, &str)> = None;
+            for ot in OPEN_TAGS {
+                if let Some(pos) = remaining.find(ot) {
+                    if earliest_open.is_none_or(|(e, _)| pos < e) {
+                        earliest_open = Some((pos, ot));
+                    }
+                }
+            }
+
+            if let Some((pos, ot)) = earliest_open {
+                output.push_str(&remaining[..pos]);
+                self.in_think_block = true;
+                remaining = &remaining[pos + ot.len()..];
+                continue;
+            }
+
+            // No complete open tag — emit everything except a trailing run
+            // that could be the start of a tag split across chunks.
+            let hold = Self::tag_prefix_len(remaining, OPEN_TAGS);
+            output.push_str(&remaining[..remaining.len() - hold]);
+            self.pending.push_str(&remaining[remaining.len() - hold..]);
+            return output;
+        }
+    }
+
+    /// Trailing held-back text that never resolved into a tag. Call at
+    /// end-of-stream to flush (e.g. a lone `<` that was never completed).
+    pub fn finish(&self) -> String {
+        self.pending.clone()
+    }
+
+    /// Length of the longest suffix of `s` that is a proper prefix of any tag
+    /// in `tags` — i.e. a run that could grow into a full tag once the next
+    /// chunk arrives.
+    fn tag_prefix_len(s: &str, tags: &[&str]) -> usize {
+        let mut best = 0;
+        for tag in tags {
+            for len in 1..tag.len() {
+                if s.ends_with(&tag[..len]) {
+                    best = best.max(len);
+                }
+            }
+        }
+        best
+    }
+}
+
+// ── ANSI / control-character sanitizers ───────────────────────────────
+
+/// Remove unsafe control / formatting characters: C0/C1 controls, bidi
+/// overrides (U+202A–U+202E), line/paragraph separators (U+2028/U+2029),
+/// and Plane-14 tags (U+E0000–U+E007F).
+pub fn filter_unsafe_chars(text: &str) -> String {
+    text.chars().filter(|&c| is_safe_char(c)).collect()
+}
+
+fn is_safe_char(c: char) -> bool {
+    !matches!(
+        c,
+        '\u{0000}'
+            | '\u{007F}'..='\u{009F}'
+            | '\u{0001}'..='\u{0008}'
+            | '\u{000B}'..='\u{000C}'
+            | '\u{000E}'..='\u{001F}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{202A}'
+            | '\u{202B}'
+            | '\u{202C}'
+            | '\u{202D}'
+            | '\u{202E}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
+}
+
+/// Iterator that strips ANSI escape sequences (CSI control sequences, e.g.
+/// SGR color codes) from text. A lone ESC not followed by `[` is preserved.
+pub struct AnsiStripper<'a> {
+    chars: Chars<'a>,
+}
+
+impl<'a> AnsiStripper<'a> {
+    pub fn new(text: &'a str) -> Self {
+        Self {
+            chars: text.chars(),
+        }
+    }
+}
+
+impl Iterator for AnsiStripper<'_> {
+    type Item = char;
+
+    fn next(&mut self) -> Option<char> {
+        let c = self.chars.next()?;
+        if c == '\u{1B}' {
+            // Check for '[' following ESC — that starts a CSI sequence
+            if let Some('[') = self.chars.clone().next() {
+                self.chars.next(); // consume '['
+                skip_csi_params(&mut self.chars);
+                skip_csi_final(&mut self.chars);
+                // Recurse to get the next visible character
+                self.next()
+            } else {
+                // Lone ESC, not part of a CSI sequence
+                Some('\u{1B}')
+            }
+        } else {
+            Some(c)
+        }
+    }
+}
+
+fn skip_csi_params(chars: &mut Chars<'_>) {
+    // Skip parameter bytes (0x30-0x3F) and intermediate bytes (0x20-0x2F)
+    loop {
+        let mut peek = chars.clone();
+        match peek.next() {
+            Some(p)
+                if ('\u{0030}'..='\u{003F}').contains(&p)
+                    || ('\u{0020}'..='\u{002F}').contains(&p) =>
+            {
+                chars.next();
+            }
+            _ => break,
+        }
+    }
+}
+
+fn skip_csi_final(chars: &mut Chars<'_>) {
+    // Skip the final byte (0x40-0x7E) if present
+    let mut peek = chars.clone();
+    if let Some(f) = peek.next() {
+        if ('\u{0040}'..='\u{007E}').contains(&f) {
+            chars.next();
+        }
+    }
+}
+
+// ── Doc/identifier helpers ─────────────────────────────────────────────
+
+/// Strip Rust `///`, `//!`, and `#` doc-comment prefixes from every line,
+/// preserving inner indentation. The `#` arm also strips the Markdown-hidden
+/// `# ` prefix on doc examples.
+pub fn trim_doc_prefix(text: &str) -> String {
+    let mut lines: Vec<&str> = text.lines().collect();
+    for line in &mut lines {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("///") {
+            *line = rest.strip_prefix(' ').unwrap_or(rest);
+        } else if let Some(rest) = trimmed.strip_prefix("//!") {
+            *line = rest.strip_prefix(' ').unwrap_or(rest);
+        } else if let Some(rest) = trimmed.strip_prefix('#') {
+            *line = rest.strip_prefix(' ').unwrap_or(rest);
+        }
+    }
+    lines.join("\n")
+}
+
+/// Identifier case-style classification for a query string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentifierKind {
+    CamelCase,
+    PascalCase,
+    SnakeCase,
+    KebabCase,
+    DottedPath,
+    Other,
+}
+
+/// Detect the case-style of `query` without a regex. Returns `None` for empty
+/// or whitespace-only input, `Some(kind)` otherwise. The pure classification
+/// logic — callers that additionally require a syntactically valid identifier
+/// (e.g. guidance's `detect_identifier_pattern`) apply their own gate on top.
+pub fn detect_identifier_kind(query: &str) -> Option<IdentifierKind> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if trimmed.contains('.') && !trimmed.contains(' ') {
+        return Some(IdentifierKind::DottedPath);
+    }
+
+    let kind = if trimmed.contains('-') && !trimmed.contains(' ') {
+        IdentifierKind::KebabCase
+    } else if trimmed.contains('_')
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+    {
+        IdentifierKind::SnakeCase
+    } else if trimmed
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_uppercase())
+        && !trimmed.contains('_')
+        && !trimmed.contains('-')
+    {
+        IdentifierKind::PascalCase
+    } else if trimmed
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_uppercase() || c.is_ascii_digit())
+    {
+        IdentifierKind::CamelCase
+    } else {
+        IdentifierKind::Other
+    };
+    Some(kind)
 }
 
 pub fn slugify(text: &str) -> String {
@@ -957,5 +1233,210 @@ mod tests {
     #[test]
     fn truncate_chars_no_ellipsis() {
         assert_eq!(truncate_chars("abcdef", 3), "abc");
+    }
+
+    // ── StreamingThinkFilter (cross-chunk tag handling) ─────────────
+
+    #[test]
+    fn streaming_filter_passthrough() {
+        let mut f = StreamingThinkFilter::new();
+        assert_eq!(f.push("Hello world"), "Hello world");
+        assert_eq!(f.finish(), "");
+    }
+
+    #[test]
+    fn streaming_filter_open_tag_split_across_chunks() {
+        let mut f = StreamingThinkFilter::new();
+        assert_eq!(f.push("Hello <thi"), "Hello ");
+        assert_eq!(
+            f.push("nk>secret reasoning</think>the answer"),
+            "the answer"
+        );
+        assert_eq!(f.finish(), "");
+    }
+
+    #[test]
+    fn streaming_filter_close_tag_split_across_chunks() {
+        let mut f = StreamingThinkFilter::new();
+        // "A " precedes the open tag, so it is emitted; the split
+        // `</thi`+`nk>` close must not leak its tail.
+        assert_eq!(f.push("A <think>secret</thi"), "A ");
+        assert_eq!(f.push("nk>B"), "B");
+        assert_eq!(f.finish(), "");
+    }
+
+    #[test]
+    fn streaming_filter_incomplete_tag_prefix_not_emitted_partial() {
+        let mut f = StreamingThinkFilter::new();
+        // A lone `<` at a chunk boundary is held back, not emitted as a
+        // partial tag.
+        assert_eq!(f.push("value <"), "value ");
+        assert_eq!(f.push(""), "");
+        assert_eq!(f.finish(), "<", "the incomplete prefix is held back");
+        // It only resolves to real text when a non-tag continuation arrives.
+        assert_eq!(f.push("input"), "<input");
+        assert_eq!(f.finish(), "");
+    }
+
+    #[test]
+    fn streaming_filter_multiple_blocks() {
+        let mut f = StreamingThinkFilter::new();
+        assert_eq!(f.push("A"), "A");
+        assert_eq!(f.push("<thinking>skip</thinking>"), "");
+        assert_eq!(f.push("B"), "B");
+        assert_eq!(f.push("<thinking>skip2</thinking>"), "");
+        assert_eq!(f.push("C"), "C");
+    }
+
+    #[test]
+    fn streaming_filter_thinking_at_start_and_end() {
+        let mut f = StreamingThinkFilter::new();
+        assert_eq!(f.push("<thinking>reasoning</thinking>"), "");
+        assert_eq!(f.push("result"), "result");
+        assert_eq!(f.push("<think>more</think>"), "");
+    }
+
+    #[test]
+    fn streaming_filter_unclosed_thinking_discards() {
+        let mut f = StreamingThinkFilter::new();
+        assert_eq!(f.push("A "), "A ");
+        assert_eq!(f.push("<thinking>unclosed"), "");
+        assert_eq!(f.finish(), "", "unclosed think content is discarded");
+    }
+
+    // ── AnsiStripper ─────────────────────────────────────────────────
+
+    #[test]
+    fn ansi_stripper_passthrough_plain_text() {
+        let result: String = AnsiStripper::new("hello world").collect();
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn ansi_stripper_removes_sgr_color() {
+        let result: String = AnsiStripper::new("\u{1B}[31mRED\u{1B}[0m").collect();
+        assert_eq!(result, "RED");
+    }
+
+    #[test]
+    fn ansi_stripper_removes_256_color() {
+        let result: String = AnsiStripper::new("\u{1B}[38;5;196mbright").collect();
+        assert_eq!(result, "bright");
+    }
+
+    #[test]
+    fn ansi_stripper_removes_rgb_color() {
+        let result: String = AnsiStripper::new("\u{1B}[38;2;255;0;0mRGB red").collect();
+        assert_eq!(result, "RGB red");
+    }
+
+    #[test]
+    fn ansi_stripper_lone_esc_preserved() {
+        let result: String = AnsiStripper::new("a\u{1B}x").collect();
+        assert_eq!(result, "a\u{1B}x");
+    }
+
+    #[test]
+    fn ansi_stripper_cjk_preserved() {
+        let result: String = AnsiStripper::new("こんにちは").collect();
+        assert_eq!(result, "こんにちは");
+    }
+
+    #[test]
+    fn ansi_stripper_empty_input() {
+        let result: String = AnsiStripper::new("").collect();
+        assert_eq!(result, "");
+    }
+
+    // ── filter_unsafe_chars ──────────────────────────────────────────
+
+    #[test]
+    fn filter_unsafe_chars_removes_controls() {
+        assert_eq!(filter_unsafe_chars("hello\u{0000}world"), "helloworld");
+        assert_eq!(filter_unsafe_chars("a\u{0081}b"), "ab");
+        assert_eq!(filter_unsafe_chars("before\x00after"), "beforeafter");
+        assert_eq!(filter_unsafe_chars("plain text"), "plain text");
+    }
+
+    #[test]
+    fn filter_unsafe_chars_removes_bidi_and_separators() {
+        assert_eq!(filter_unsafe_chars("hello\u{202E}world"), "helloworld");
+        assert_eq!(filter_unsafe_chars("a\u{2028}b"), "ab");
+        assert_eq!(filter_unsafe_chars("a\u{2029}b"), "ab");
+    }
+
+    #[test]
+    fn filter_unsafe_chars_removes_plane14_tags() {
+        assert_eq!(filter_unsafe_chars("text\u{E0001}more"), "textmore");
+    }
+
+    // ── trim_doc_prefix ───────────────────────────────────────────────
+
+    #[test]
+    fn trim_doc_prefix_strips_triple_slash() {
+        assert_eq!(
+            trim_doc_prefix("/// Hello world\n/// more"),
+            "Hello world\nmore"
+        );
+    }
+
+    #[test]
+    fn trim_doc_prefix_strips_bang_and_hash() {
+        assert_eq!(trim_doc_prefix("//! Module\n# hidden"), "Module\nhidden");
+    }
+
+    #[test]
+    fn trim_doc_prefix_preserves_inner_indent() {
+        assert_eq!(trim_doc_prefix("///     indented"), "    indented");
+    }
+
+    #[test]
+    fn trim_doc_prefix_no_prefix_unchanged() {
+        assert_eq!(trim_doc_prefix("plain line\nsecond"), "plain line\nsecond");
+    }
+
+    // ── detect_identifier_kind ────────────────────────────────────────
+
+    #[test]
+    fn identifier_kind_cases() {
+        assert_eq!(
+            detect_identifier_kind("hello_world"),
+            Some(IdentifierKind::SnakeCase)
+        );
+        assert_eq!(
+            detect_identifier_kind("HelloWorld"),
+            Some(IdentifierKind::PascalCase)
+        );
+        assert_eq!(
+            detect_identifier_kind("helloWorld"),
+            Some(IdentifierKind::CamelCase)
+        );
+        assert_eq!(
+            detect_identifier_kind("kebab-case"),
+            Some(IdentifierKind::KebabCase)
+        );
+        assert_eq!(
+            detect_identifier_kind("a.b.c"),
+            Some(IdentifierKind::DottedPath)
+        );
+        assert_eq!(
+            detect_identifier_kind("two words"),
+            Some(IdentifierKind::Other)
+        );
+        assert_eq!(detect_identifier_kind(""), None);
+        assert_eq!(detect_identifier_kind("   "), None);
+    }
+
+    #[test]
+    fn identifier_kind_snake_allows_digits_but_not_upper() {
+        assert_eq!(
+            detect_identifier_kind("field_1"),
+            Some(IdentifierKind::SnakeCase)
+        );
+        assert_eq!(
+            detect_identifier_kind("Field_1"),
+            Some(IdentifierKind::Other),
+            "an uppercase start with underscores is not snake (guidance parity)"
+        );
     }
 }

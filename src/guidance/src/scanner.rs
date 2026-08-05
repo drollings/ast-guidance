@@ -43,91 +43,6 @@ impl NodeType {
     }
 }
 
-pub fn extract_excerpt(
-    src: &str,
-    start_line: u32,
-    node_type: NodeType,
-    max_lines: usize,
-) -> String {
-    let lines: Vec<&str> = src.lines().collect();
-    let start = (start_line as usize).saturating_sub(1);
-    if start >= lines.len() {
-        return String::new();
-    }
-    let end = (start + max_lines).min(lines.len());
-
-    let mut brace_depth: i32 = 0;
-    let mut found_open = false;
-    let mut result_lines: Vec<String> = Vec::new();
-
-    let is_function = node_type.is_function();
-    let is_container = node_type.is_container();
-
-    for line in lines.iter().take(end).skip(start) {
-        if line.trim().starts_with("// ---") {
-            continue;
-        }
-
-        let open_count = line.chars().filter(|&c| c == '{').count();
-        let close_count = line.chars().filter(|&c| c == '}').count();
-
-        if is_container && found_open && brace_depth > 0 {
-            let trimmed = line.trim();
-            if (trimmed.starts_with("struct ")
-                || trimmed.starts_with("enum ")
-                || trimmed.starts_with("union "))
-                && open_count > 0
-            {
-                brace_depth += open_count as i32 - close_count as i32;
-                continue;
-            }
-        }
-
-        if !found_open {
-            if open_count > 0 {
-                found_open = true;
-            }
-            if is_function && !found_open {
-                continue;
-            }
-        }
-
-        if is_function && !found_open {
-            let trimmed = line.trim();
-            if (trimmed.starts_with("pub ")
-                || trimmed.starts_with("fn ")
-                || trimmed.starts_with("const ")
-                || trimmed.starts_with("var ")
-                || trimmed.starts_with("test ")
-                || trimmed.starts_with("///"))
-                && !result_lines.is_empty()
-            {
-                break;
-            }
-        }
-
-        brace_depth += open_count as i32 - close_count as i32;
-        result_lines.push(line.to_string());
-
-        if found_open && brace_depth <= 0 {
-            break;
-        }
-    }
-
-    while result_lines
-        .last()
-        .is_some_and(|l| l.trim().is_empty() || l.trim().starts_with("//"))
-    {
-        result_lines.pop();
-    }
-
-    result_lines.join("\n")
-}
-
-pub fn extract_simple_excerpt(src: &str, start_line: u32, max_lines: usize) -> String {
-    extract_excerpt(src, start_line, NodeType::Other, max_lines)
-}
-
 pub fn lang_from_path(path: &str) -> &str {
     if path.ends_with(".zig") {
         "zig"
@@ -279,22 +194,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_excerpt_function_body() {
-        let src = "fn hello() {\n    return 1;\n}\n";
-        let excerpt = extract_excerpt(src, 1, NodeType::FnDecl, 10);
-        assert!(excerpt.contains("fn hello()"));
-        assert!(excerpt.contains("return 1;"));
-    }
-
-    #[test]
-    fn extract_excerpt_container() {
-        let src = "struct Foo {\n    x: i32,\n}\n";
-        let excerpt = extract_excerpt(src, 1, NodeType::StructDecl, 10);
-        assert!(excerpt.contains("struct Foo"));
-        assert!(excerpt.contains("x: i32"));
-    }
-
-    #[test]
     fn detect_ring_buffer_positive() {
         assert!(detect_ring_buffer("using a ring buffer for the queue"));
         assert!(detect_ring_buffer("circular buffer implementation"));
@@ -440,22 +339,5 @@ mod tests {
         assert_eq!(lang_from_path("foo.yml"), "yaml");
         assert_eq!(lang_from_path("foo.toml"), "toml");
         assert_eq!(lang_from_path("foo.unknown"), "unknown");
-    }
-
-    #[test]
-    fn container_with_nested_struct() {
-        let src =
-            "struct Outer {\n    inner: Inner,\n    struct Inner {\n        val: u32,\n    }\n}\n";
-        let excerpt = extract_excerpt(src, 1, NodeType::StructDecl, 10);
-        assert!(excerpt.contains("struct Outer"));
-        assert!(excerpt.contains("inner: Inner"));
-    }
-
-    #[test]
-    fn function_followed_by_another_function() {
-        let src = "fn first() {\n    return 1;\n}\n\nfn second() {\n    return 2;\n}\n";
-        let excerpt = extract_excerpt(src, 1, NodeType::FnDecl, 10);
-        assert!(excerpt.contains("first"));
-        assert!(!excerpt.contains("second"));
     }
 }

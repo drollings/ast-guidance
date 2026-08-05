@@ -307,6 +307,20 @@ pub enum LlmError { Api(String), Http(String), NoResponse, RateLimited }
 
 `LlmConfig.extra_body_params` is arbitrary JSON merged into every request body (e.g. `num_ctx`, `temperature`, `stop`); `"model"`, `"messages"`, and `"stream"` keys are ignored because those are set explicitly by the chat-completion logic. `LlmConfig::new()` is a `bon` builder (`start_fn = new`).
 
+**M9 adoption (ROADMAP_20260804_SHARED_CORE):** the queue is now load-bearing
+in consumers. Coral's `L5FrontierUnit` (coral-context) constructs a shared
+`LlmRequestQueue` via `LlmClient::with_queue_and_config` (sized from an
+opt-in `frontier_workers` reactor-config knob; default `None` = direct HTTP,
+non-regressing), so frontier LLM calls flow through the worker pool's
+`default_handler` with `timeout_ms`/`think`/`extra_body_params`/`debug`/
+`show_prompts` preserved exactly. Guidance's `Enhancer::call_llm` adopts the
+retry + metrics surface instead: the single-shot LLM call is wrapped in
+`common_core::retry::retry_async` (gated on `LlmError::is_retryable()` — only
+`Http`/`RateLimited` retry; permanent `Api`/`NoResponse` short-circuit
+byte-identically), driven through the new `fluent_llm::client::block_on`
+sync→async bridge, with optional `LatencyHistogram` timing via
+`Enhancer::with_metrics`.
+
 **`Reserve`** (`reserve.rs:7-94`) — RAII permit on a shared `Arc<AtomicUsize>`. `try_acquire(counter) -> Option<Self>` atomically decrements and returns the permit, or `None` if already at zero. `commit(self)` consumes the permit permanently; otherwise `Drop` returns it to the counter. This is a lower-level primitive than `Limiter`: it does not own the counter (the caller supplies it), and it does not run a closure. Use `Limiter` for "run this with a permit" and `Reserve` for "acquire now, release later" patterns. The crate's own tests are the only in-tree consumer today.
 
 **`AffinityScheduler<T, R, E>`** (`affinity.rs:59-191`) — wraps `PriorityResultPool` with session-aware priority boosting and starvation aging. Tracks which session is currently "affine" and gives its tasks a priority bonus (`AgingConfig::affinity_bonus`, default +10). Starved tasks (different session) periodically increase in base priority at `AgingConfig::aging_rate` (default +2 per 5s tick) up to `AgingConfig::max_priority` (default 100). `set_affinity(Option<String>)` switches the active session. `submit(task: ScheduledTask<T>, base_priority)` computes the effective priority and delegates to the pool. Designed for multi-session agent dispatch where context-switching between sessions should be minimized.

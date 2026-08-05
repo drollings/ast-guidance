@@ -22,11 +22,11 @@
 //! the router's own memory space would add unnecessary overhead and latency.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
+use common_core::cache::LoadCache;
 use common_core::now_secs;
-use lru::LruCache;
 use thiserror::Error;
 
 /// Errors produced by KV cache operations.
@@ -80,11 +80,9 @@ pub struct KvSnapshot {
 /// metadata. Entries represent sessions with KV cache state actively loaded
 /// in a llama.cpp server slot. Stores metadata only — no raw bytes.
 pub struct HotKvCache {
-    snapshots: Mutex<SnapshotLru>,
+    snapshots: LoadCache<(String, Option<String>, String), Arc<KvSnapshot>, KvCacheError>,
     max_mb: usize,
 }
-
-type SnapshotLru = LruCache<(String, Option<String>, String), Arc<KvSnapshot>>;
 
 impl HotKvCache {
     /// Creates a new hot cache with the given capacity (number of entries).
@@ -92,12 +90,16 @@ impl HotKvCache {
     /// tiny (hundreds of bytes), so `max_mb` is primarily informational for
     /// the llama.cpp server's actual slot memory budget.
     pub fn new(capacity: usize, max_mb: usize) -> Self {
-        Self {
-            snapshots: Mutex::new(LruCache::new(
-                std::num::NonZero::new(capacity.max(1)).unwrap(),
-            )),
-            max_mb,
-        }
+        let snapshots = LoadCache::new(
+            capacity.max(1),
+            |_: &(String, Option<String>, String)| -> Result<Arc<KvSnapshot>, KvCacheError> {
+                Err(KvCacheError::NotFound(
+                    "hot tier is write-through; load-on-miss is never invoked".into(),
+                ))
+            },
+        )
+        .expect("hot tier capacity is non-zero");
+        Self { snapshots, max_mb }
     }
 
     fn key(
@@ -119,10 +121,13 @@ impl HotKvCache {
             snapshot.adapter.as_deref(),
             &snapshot.session_id,
         );
-        self.snapshots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .put(key, Arc::new(snapshot));
+        self.insert_arc(key, Arc::new(snapshot));
+    }
+
+    /// Insert an already-`Arc`-wrapped snapshot (used by the two-tier promote
+    /// path in `KvCacheManager::retrieve`).
+    fn insert_arc(&self, key: (String, Option<String>, String), snapshot: Arc<KvSnapshot>) {
+        self.snapshots.insert(key, snapshot);
     }
 
     /// Get snapshot metadata from the hot cache.
@@ -132,35 +137,23 @@ impl HotKvCache {
         adapter: Option<&str>,
         session_id: &str,
     ) -> Option<Arc<KvSnapshot>> {
-        self.snapshots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&Self::key(model, adapter, session_id))
-            .cloned()
+        self.snapshots.get(&Self::key(model, adapter, session_id))
     }
 
     /// Remove snapshot metadata from the hot cache.
     pub fn remove(&self, model: &str, adapter: Option<&str>, session_id: &str) {
         self.snapshots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop(&Self::key(model, adapter, session_id));
+            .remove(&Self::key(model, adapter, session_id));
     }
 
     /// Current number of entries in the hot cache.
     pub fn len(&self) -> usize {
-        self.snapshots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+        self.snapshots.len()
     }
 
     /// Returns true if the hot cache is empty.
     pub fn is_empty(&self) -> bool {
-        self.snapshots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
+        self.snapshots.is_empty()
     }
 
     /// The max RAM budget in MB.
@@ -471,14 +464,10 @@ impl KvCacheManager {
 
         let snapshot = self.cold.load(model, adapter, session_id).await?;
         let arc = Arc::new(snapshot);
-        self.hot
-            .snapshots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .put(
-                HotKvCache::key(model, adapter, session_id),
-                Arc::clone(&arc),
-            );
+        self.hot.insert_arc(
+            HotKvCache::key(model, adapter, session_id),
+            Arc::clone(&arc),
+        );
         Ok(arc)
     }
 

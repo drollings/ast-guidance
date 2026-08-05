@@ -15,7 +15,7 @@ use crate::testing::mock::TranscriptProvider;
 use crate::testing::test_request;
 use crate::types::{RouterMessage, RouterMessageContent, RouterRequest};
 use fluent_wvr::prelude::*;
-use guidance_llm::client::ChatBackend;
+use fluent_llm::client::ChatBackend;
 
 fn make_request(text: &str) -> RouterRequest {
     let mut req = test_request(text);

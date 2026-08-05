@@ -1,12 +1,11 @@
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use fluent_wvr::prelude::*;
-use guidance_llm::client::{is_malformed_response, ChatBackend, LlmClient};
-use guidance_llm::decomposer::Decomposer;
-use guidance_llm::LlmConfig;
+use fluent_llm::client::{is_malformed_response, ChatBackend, LlmClient};
+use fluent_llm::LlmConfig;
+use fluent_llm::LlmRequestQueue;
 use internment::ArcIntern;
 
-use crate::cache::reactor::QueueReactor;
 use crate::cache_l1::{CacheTier, RoutingResult};
 use crate::cache_router::ParallelRouter;
 use crate::db::Library;
@@ -237,7 +236,7 @@ impl_component!(L3GraphUnit);
 
 pub struct L4SemanticUnit {
     pub router: Arc<ParallelRouter>,
-    pub embedder: Arc<dyn guidance_llm::EmbeddingProvider>,
+    pub embedder: Arc<dyn fluent_llm::EmbeddingProvider>,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
@@ -245,7 +244,7 @@ pub struct L4SemanticUnit {
 impl L4SemanticUnit {
     pub fn new(
         router: Arc<ParallelRouter>,
-        embedder: Arc<dyn guidance_llm::EmbeddingProvider>,
+        embedder: Arc<dyn fluent_llm::EmbeddingProvider>,
     ) -> Self {
         Self {
             router,
@@ -308,123 +307,13 @@ impl Describable for L4SemanticUnit {
 impl_component!(L4SemanticUnit);
 
 // ---------------------------------------------------------------------------
-// L4.5 — Local decomposition tier
-// ---------------------------------------------------------------------------
-
-pub struct L4_5DecomposeUnit {
-    pub decomposer: Box<dyn Decomposer>,
-    pub reactor: Weak<QueueReactor>,
-    pub max_depth: u8,
-    depends: Vec<ArcIntern<str>>,
-    provides: Vec<ArcIntern<str>>,
-}
-
-impl L4_5DecomposeUnit {
-    pub fn new(
-        decomposer: Box<dyn Decomposer>,
-        reactor: Weak<QueueReactor>,
-        max_depth: u8,
-    ) -> Self {
-        Self {
-            decomposer,
-            reactor,
-            max_depth,
-            depends: query_deps(),
-            provides: vec![ArcIntern::from("coral.tier.l4_5")],
-        }
-    }
-}
-
-impl WorkUnit for L4_5DecomposeUnit {
-    fn name(&self) -> &str {
-        "coral.l4_5.decompose"
-    }
-    fn depends(&self) -> &[ArcIntern<str>] {
-        &self.depends
-    }
-    fn provides(&self) -> &[ArcIntern<str>] {
-        &self.provides
-    }
-    fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-        let query = extract_query(ctx)?;
-        let depth: u8 = ctx
-            .metadata
-            .get("depth")
-            .and_then(|v| match v {
-                fluent_wvr::MetadataValue::String(s) => s.parse().ok(),
-                fluent_wvr::MetadataValue::Number(n) => Some(*n as u8),
-                _ => None,
-            })
-            .unwrap_or(0);
-
-        if depth >= self.max_depth {
-            return Err(WorkError::Execution(format!(
-                "max depth {} reached",
-                self.max_depth
-            )));
-        }
-
-        let reactor = self
-            .reactor
-            .upgrade()
-            .ok_or_else(|| WorkError::Execution("reactor dropped".into()))?;
-
-        let subtasks = self.decomposer.decompose(&query);
-        let mut merged_result = String::new();
-        for subtask in &subtasks {
-            if let Ok(sub_result) = reactor.route_with_depth(subtask, depth + 1) {
-                if !merged_result.is_empty() {
-                    merged_result.push_str("\n---\n");
-                }
-                merged_result.push_str(&sub_result.result);
-            }
-        }
-        if merged_result.is_empty() {
-            return Err(WorkError::Execution("all subtasks returned empty".into()));
-        }
-        make_output(&RoutingResult {
-            query,
-            result: merged_result,
-            tier: CacheTier::L4_5Decompose,
-        })
-    }
-}
-
-impl FieldAccess for L4_5DecomposeUnit {
-    fn set_field(&mut self, _name: &str, _value: &str) -> Result<(), FieldError> {
-        Err(FieldError::NotFound(
-            "L4_5DecomposeUnit has no configurable fields".into(),
-        ))
-    }
-    fn get_field(&self, _name: &str) -> Result<String, FieldError> {
-        Err(FieldError::NotFound(
-            "L4_5DecomposeUnit has no configurable fields".into(),
-        ))
-    }
-    fn field_names(&self) -> &'static [&'static str] {
-        &[]
-    }
-}
-
-impl Describable for L4_5DecomposeUnit {
-    fn describe(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {},
-            "required": []
-        })
-    }
-}
-
-impl_component!(L4_5DecomposeUnit);
-
-// ---------------------------------------------------------------------------
 // L5 — Frontier LLM fallback tier
 // ---------------------------------------------------------------------------
 
 pub struct L5FrontierUnit {
     pub config: LlmConfig,
     pub chat_backend: Option<Box<dyn ChatBackend>>,
+    pub queue: Option<Arc<LlmRequestQueue>>,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
@@ -434,6 +323,7 @@ impl L5FrontierUnit {
         Self {
             config,
             chat_backend: None,
+            queue: None,
             depends: query_deps(),
             provides: vec![ArcIntern::from("coral.tier.l5")],
         }
@@ -443,6 +333,22 @@ impl L5FrontierUnit {
         Self {
             config,
             chat_backend: Some(backend),
+            queue: None,
+            depends: query_deps(),
+            provides: vec![ArcIntern::from("coral.tier.l5")],
+        }
+    }
+
+    /// Attach a shared `LlmRequestQueue` (worker pool) so frontier calls flow
+    /// through bounded workers instead of unbounded direct HTTP. The queue's
+    /// handler is `fluent_llm::llm_queue::default_handler`, which preserves
+    /// the `LlmConfig` fields (`timeout_ms`, `think`, `extra_body_params`,
+    /// `debug`, `show_prompts`) exactly.
+    pub fn with_queue(config: LlmConfig, queue: Arc<LlmRequestQueue>) -> Self {
+        Self {
+            config,
+            chat_backend: None,
+            queue: Some(queue),
             depends: query_deps(),
             provides: vec![ArcIntern::from("coral.tier.l5")],
         }
@@ -461,13 +367,13 @@ impl WorkUnit for L5FrontierUnit {
     }
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
         let query = extract_query(ctx)?;
-        let anonymized = guidance_llm::anonymize::anonymize(&query);
+        let anonymized = fluent_llm::anonymize::anonymize(&query);
         let messages = vec![
-            guidance_llm::ChatMessage {
+            fluent_llm::ChatMessage {
                 role: "system".into(),
                 content: "You are a helpful assistant. Answer concisely.".into(),
             },
-            guidance_llm::ChatMessage {
+            fluent_llm::ChatMessage {
                 role: "user".into(),
                 content: anonymized,
             },
@@ -477,7 +383,13 @@ impl WorkUnit for L5FrontierUnit {
                 .chat_complete(&messages)
                 .map_err(|e| WorkError::Execution(format!("frontier error: {e}")))?
         } else {
-            let client = LlmClient::with_config(self.config.clone());
+            // When a shared `LlmRequestQueue` is attached, route through its
+            // worker pool (bounded concurrency) via the queued `LlmClient`;
+            // otherwise call the HTTP transport directly as before.
+            let client = match &self.queue {
+                Some(q) => LlmClient::with_queue_and_config(Arc::clone(q), self.config.clone()),
+                None => LlmClient::with_config(self.config.clone()),
+            };
             client
                 .chat_complete(&messages)
                 .map_err(|e| WorkError::Execution(format!("frontier error: {e}")))?
@@ -536,20 +448,22 @@ impl_component!(L5FrontierUnit);
 // ---------------------------------------------------------------------------
 
 pub struct TierRegistry {
-    tiers: Vec<Arc<dyn Component>>,
+    cascade: ComponentCascade,
 }
 
 impl TierRegistry {
     pub fn new(tiers: Vec<Arc<dyn Component>>) -> Self {
-        Self { tiers }
+        Self {
+            cascade: ComponentCascade::with_units(tiers),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.tiers.is_empty()
+        self.cascade.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.tiers.len()
+        self.cascade.len()
     }
 
     pub fn execute(&self, query: &str, depth: u8) -> Result<RoutingResult, WorkError> {
@@ -560,22 +474,16 @@ impl TierRegistry {
             ctx.metadata.insert("depth".into(), i64::from(depth).into());
         }
 
-        let mut last_err = None;
-        for tier in &self.tiers {
-            match tier.execute(&ctx) {
-                Ok(output) => {
-                    // M8.4: exactly one deserialize hop — the tier serialized
-                    // once via `WorkOutput::typed`, this consumes it back.
-                    return output
-                        .data_take::<RoutingResult>()
-                        .map_err(|e| WorkError::Execution(e.to_string()));
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                }
-            }
+        if self.cascade.is_empty() {
+            return Err(WorkError::Execution("no tiers configured".into()));
         }
-        Err(last_err.unwrap_or(WorkError::Execution("no tiers configured".into())))
+
+        let output = self.cascade.execute_first_ok(&ctx)?;
+        // M8.4: exactly one deserialize hop — the tier serialized once via
+        // `WorkOutput::typed`, this consumes it back.
+        output
+            .data_take::<RoutingResult>()
+            .map_err(|e| WorkError::Execution(e.to_string()))
     }
 }
 
@@ -600,6 +508,42 @@ mod tests {
         assert_eq!(unit.name(), "coral.l5.frontier");
         assert_eq!(unit.depends().len(), 1);
         assert_eq!(unit.provides().len(), 1);
+        assert!(unit.queue.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_l5_frontier_unit_with_queue_routes_through_pool() {
+        // M9: when a shared `LlmRequestQueue` is attached, frontier calls flow
+        // through the worker pool (`default_handler` HTTP transport) instead of
+        // unbounded direct HTTP. An unreachable endpoint surfaces an error from
+        // the queue, proving the wiring exists end-to-end.
+        let queue = fluent_llm::llm_queue::build_default_queue(
+            fluent_concurrency::tokio_runtime(),
+            &fluent_concurrency::llm_queue::LlmQueueConfig {
+                worker_count: 2,
+                queue_capacity: 20,
+            },
+        );
+        let unit = L5FrontierUnit::with_queue(
+            LlmConfig::new()
+                .api_url("http://127.0.0.1:1/v1".into())
+                .model("test".into())
+                .timeout_ms(100)
+                .build(),
+            queue,
+        );
+        assert_eq!(
+            unit.queue.as_ref().expect("queue attached").worker_count(),
+            2
+        );
+
+        let mut ctx = WorkContext::default();
+        ctx.metadata.insert("query".into(), "hello".into());
+        let output = unit.execute(&ctx);
+        assert!(
+            output.is_err(),
+            "unreachable endpoint must surface an error from the queued path"
+        );
     }
 
     #[test]

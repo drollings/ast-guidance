@@ -16,6 +16,14 @@ pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 30_000;
 /// Canonical base interval between retries (seconds).
 pub const DEFAULT_RETRY_INTERVAL_S: u64 = 1;
 
+/// Upper bound on KNN candidates before routing through the HNSW index
+/// (promoted from coral's `db/mod.rs` — single-consumer magic constant that
+/// reached the AGENTS.md promotion rule when a second consumer appeared).
+pub const MAX_KNN_CANDIDATES: usize = 100_000;
+/// Maximum accepted MCP request payload size, in bytes (promoted from coral's
+/// `mcp.rs` alongside `MAX_KNN_CANDIDATES`).
+pub const MAX_MCP_REQUEST_SIZE: usize = 10 * 1024 * 1024;
+
 /// Serde default helper that returns `true`.
 pub const fn default_true() -> bool {
     true
@@ -50,6 +58,12 @@ mod tests {
         assert_eq!(MAX_FILE_SIZE, 100 * 1024 * 1024);
         assert_eq!(MAX_JSON_DEPTH, 100);
         assert_eq!(MAX_EMBEDDING_DIMENSIONS, 4_096);
+    }
+
+    #[test]
+    fn promoted_constants_match_coral_originals() {
+        assert_eq!(MAX_KNN_CANDIDATES, 100_000);
+        assert_eq!(MAX_MCP_REQUEST_SIZE, 10 * 1024 * 1024);
     }
 
     #[test]
