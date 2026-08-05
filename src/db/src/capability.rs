@@ -57,6 +57,11 @@ impl Capability for DbCapability {
 impl DbCapability {
     /// Opens a database at the given path (or `:memory:` for an ephemeral
     /// in-memory pool) with the default pool configuration (5 connections).
+    ///
+    /// The `:memory:` path routes through the shared-cache in-memory pool path
+    /// (M1): all pool connections share one named in-memory database, so
+    /// concurrent checkouts are coherent rather than each seeing a private
+    /// empty DB.
     pub fn open(path: &str) -> Result<Self, DbError> {
         Self::open_with_config(path, PoolConfig::default())
     }

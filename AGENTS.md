@@ -77,7 +77,7 @@ src/
   db/                  fluent-db: canonical database-access layer (pooled/typed/async,
                        feature-gated on `sqlite`). Owns SqliteStore, SqlitePool,
                        DbError, HnswIndex, TtlCache, vector math, migrations, query
-                       helpers, DbCapability, DbWorkUnit (M2+ of ROADMAP_20260804_DB).
+                       helpers, DbCapability, DbWorkUnit.
                        Raw SQLite mechanics stay in common-core::sqlite.
   knowledge/           fluent-knowledge (WordIndex, TrigramIndex, CsrGraph, QueryCache)
   ontology/            guidance-ontology (entity extraction, YAGO taxonomy, capability inference)
@@ -130,16 +130,6 @@ doc/
 ```
 
 ---
-
-## Consolidation Contract
-
-`src/common-core` is the **only permitted zero-domain crate** in the workspace.
-It must NOT import any `guidance-*` / `coral-*` / `fluent-*` / `dag` crate
-(see `src/common-core/src/lib.rs` module doc). Generic storage backends
-(`rusqlite` behind the `sqlite` feature) and generic data utilities
-(hashing, I/O, strings, formatting, metrics, drift, interner) belong here;
-anything that knows what a "node", "session", "target", "embedding", or
-"WASM plugin" is belongs in its respective domain crate.
 
 ### Canonical Locations (single source of truth)
 
@@ -199,7 +189,4 @@ anything that knows what a "node", "session", "target", "embedding", or
 
 Cross-crate limits that currently have a single consumer stay in their
 domain crate but **must** be moved to `common-core::constants` if a second
-consumer appears. `MAX_KNN_CANDIDATES` and `MAX_MCP_REQUEST_SIZE` were
-promoted in ROADMAP_20260804_SHARED_CORE M4.3 (coral re-exports them).
-Current single-consumer limits (candidates for future promotion):
-`MAX_WASM_HOST_CALLS` in `src/wasm_ipc/src/lib.rs:17`.
+consumer appears.

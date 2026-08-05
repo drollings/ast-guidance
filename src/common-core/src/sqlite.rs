@@ -5,8 +5,9 @@
 //! zero-domain by default.
 
 use std::path::Path;
+use std::time::Duration;
 
-use rusqlite::{Connection, Result};
+use rusqlite::{Connection, OpenFlags, Result};
 
 use crate::constants::HnswParams;
 use anndists::dist::DistCosine;
@@ -30,6 +31,34 @@ pub fn open_wal(path: &Path) -> Result<Connection> {
 pub fn open_in_memory() -> Result<Connection> {
     let conn = Connection::open_in_memory()?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
+    Ok(conn)
+}
+
+/// Open a connection to a **named shared-cache in-memory** database.
+///
+/// Every connection opened with the same `name` participates in one shared
+/// in-memory database, so a pool of connections to `memdb{N}` sees the same
+/// tables and data. This is the fix for the pool-isolation bug where each
+/// checkout silently saw a different private empty DB (M1): `open_in_memory()`
+/// (and SQLite's bare `:memory:`) create a *per-connection* database, which is
+/// incoherent under concurrent pooling.
+///
+/// The database lives exactly as long as at least one connection to it stays
+/// open and is destroyed when the last connection closes — callers must keep a
+/// connection (the pool's idle set does) alive for the DB's lifetime.
+///
+/// `PRAGMA busy_timeout=5000` prevents `SQLITE_BUSY` from racing the Tokio
+/// blocking pool. `journal_mode=WAL` is deliberately **not** set: WAL is
+/// unsupported on shared-cache memory databases and errors; the default
+/// (memory) journal is correct here.
+pub fn open_shared_in_memory(name: &str) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        format!("file:{name}?mode=memory&cache=shared"),
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    conn.busy_timeout(Duration::from_millis(5000))?;
     Ok(conn)
 }
 
@@ -116,6 +145,52 @@ mod tests {
         // In-memory databases return "memory" for journal_mode — that's expected.
         // The important thing is that the connection works.
         conn.execute_batch("CREATE TABLE t (id INTEGER)").unwrap();
+    }
+
+    #[test]
+    fn open_shared_in_memory_is_shared_across_connections() {
+        // Two connections to the same named shared-cache memory DB must see the
+        // same database (M1): a write through one is visible through the other.
+        let a = open_shared_in_memory("memdb_shared_test_a").unwrap();
+        let b = open_shared_in_memory("memdb_shared_test_a").unwrap();
+        a.execute_batch("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (7)")
+            .unwrap();
+        let n: i64 = b
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "shared-cache memory connections share the same DB");
+    }
+
+    #[test]
+    fn open_shared_in_memory_names_are_isolated() {
+        // Distinct names never share a cache: a write to one is invisible to
+        // the other.
+        let a = open_shared_in_memory("memdb_isolated_a").unwrap();
+        let b = open_shared_in_memory("memdb_isolated_b").unwrap();
+        a.execute_batch("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1)")
+            .unwrap();
+        let err = b
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get::<_, i64>(0))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no such table"),
+            "different shared-cache names must be isolated, got {err}"
+        );
+    }
+
+    #[test]
+    fn open_shared_in_memory_sets_busy_timeout_not_wal() {
+        let conn = open_shared_in_memory("memdb_timeout_test").unwrap();
+        // The memory journal (not WAL) is the correct mode for a shared cache.
+        let journal: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal, "memory", "no WAL on shared-cache memory DBs");
+        // busy_timeout must be applied (5000ms default).
+        let timeout: i64 = conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5000);
     }
 
     #[test]

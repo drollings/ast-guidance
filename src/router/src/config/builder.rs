@@ -37,6 +37,37 @@ pub struct PipelineParams {
     pub blacklist: Option<String>,
     #[serde(default)]
     pub score_matrix: Option<ScoreMatrix>,
+    /// When `true` and a `score_matrix` is configured, the matrix's
+    /// top-scoring route **decides** the dispatch target (weighted selection
+    /// over the four score axes) instead of the LLM's `action`/`target` being
+    /// metadata-only. Coherence/safety thresholds and the `reject` action stay
+    /// as hard gates that run first (M5). Default `false` so existing behavior
+    /// and goldens are untouched until a deployment opts in.
+    #[serde(default)]
+    pub score_matrix_authoritative: bool,
+    /// Maximum retry attempts for the classifier when its LLM response fails
+    /// JSON parsing (`0` = disabled, the default — existing behavior is
+    /// unchanged). When `> 0`, the classifier stage is wrapped in a
+    /// `RetryClassifier` that re-executes it with escalating corrective
+    /// prompts on `metadata.fallback = true` (M6).
+    #[serde(default)]
+    pub classifier_retry_max: u32,
+    /// Escalating corrective system prompts used on each retry attempt (the
+    /// last prompt is reused when retries exceed the list length). Defaults to
+    /// two stock prompts that demand strict JSON.
+    #[serde(default = "default_classifier_retry_prompts")]
+    pub classifier_retry_prompts: Vec<String>,
+}
+
+fn default_classifier_retry_prompts() -> Vec<String> {
+    vec![
+        "Your previous output failed JSON parsing. Respond with ONLY a single valid JSON \
+         object matching the requested schema — no prose, no markdown fences, no trailing text."
+            .into(),
+        "Your previous output was still not valid JSON. Output exactly one JSON object with \
+         the required fields and nothing else."
+            .into(),
+    ]
 }
 
 impl Default for PipelineParams {
@@ -50,6 +81,9 @@ impl Default for PipelineParams {
             classifier_max_concurrency: None,
             blacklist: None,
             score_matrix: None,
+            score_matrix_authoritative: false,
+            classifier_retry_max: 0,
+            classifier_retry_prompts: default_classifier_retry_prompts(),
         }
     }
 }
@@ -163,6 +197,7 @@ impl RouterConfig {
                     routing_config,
                     params.coherence_threshold,
                     params.score_matrix.clone(),
+                    params.score_matrix_authoritative,
                     classifier_intel,
                     classifier_model,
                     limiter,
@@ -174,12 +209,37 @@ impl RouterConfig {
                     routing_config,
                     params.coherence_threshold,
                     params.score_matrix.clone(),
+                    params.score_matrix_authoritative,
                     classifier_intel,
                     classifier_model,
                     limiter,
                 )
             };
-            stages.push(Arc::new(stage));
+            // M6: when configured, wrap the classifier in the retry decorator
+            // so parse/LLM failures re-run with escalating corrective prompts.
+            // `RetryClassifier` is a `Component`, so it pushes as
+            // `Arc<dyn Component>`; it is deliberately NOT a
+            // `StageDecisionProducer`, so the orchestrator consumes it through
+            // the `WorkOutput` serialization boundary (one serialize/deserialize
+            // per request) rather than the by-reference typed path.
+            if params.classifier_retry_max > 0 {
+                let retry_max = params.classifier_retry_max as usize;
+                let retry_prompts = params.classifier_retry_prompts.clone();
+                tracing::info!(
+                    target: "router.config",
+                    pipeline = %name,
+                    classifier_retry_max = params.classifier_retry_max,
+                    retry_prompt_count = retry_prompts.len(),
+                    "classifier wrapped in RetryClassifier",
+                );
+                stages.push(Arc::new(crate::stages::retry_classifier::RetryClassifier::new(
+                    Arc::new(stage),
+                    retry_max,
+                    retry_prompts,
+                )));
+            } else {
+                stages.push(Arc::new(stage));
+            }
         } else if classifier_backend.is_some() {
             tracing::warn!(
                 target: "router.config",

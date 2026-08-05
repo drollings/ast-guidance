@@ -15,6 +15,7 @@
 //! concrete `LlmClient`, so mock/stub backends can be injected for testing
 //! without duplicating the pipeline wiring.
 
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::Arc;
 use std::time::Instant;
@@ -231,6 +232,10 @@ pub struct ClassifierStage {
     routing_config: RoutingConfig,
     coherence_threshold: f64,
     score_matrix: Option<ScoreMatrix>,
+    /// When `true` and `score_matrix` is `Some`, the matrix's top route
+    /// decides the dispatch target (M5) instead of the LLM's `action`/`target`
+    /// being metadata-only. Thresholds/`reject` still gate first.
+    score_matrix_authoritative: bool,
     classifier_intelligence: u8,
     /// Config key of the model the classifier dispatches to (e.g. "fast").
     /// Logged as structured context on every classifier LLM call so the
@@ -252,11 +257,13 @@ pub struct ClassifierStage {
 }
 
 impl ClassifierStage {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         client: Arc<dyn ChatBackend>,
         routing_config: RoutingConfig,
         coherence_threshold: f64,
         score_matrix: Option<ScoreMatrix>,
+        score_matrix_authoritative: bool,
         classifier_intelligence: u8,
         classifier_model: impl Into<String>,
         limiter: Arc<Limiter>,
@@ -267,6 +274,7 @@ impl ClassifierStage {
             routing_config,
             coherence_threshold,
             score_matrix,
+            score_matrix_authoritative,
             classifier_intelligence,
             classifier_model: classifier_model.into(),
             limiter,
@@ -287,6 +295,7 @@ impl ClassifierStage {
         routing_config: RoutingConfig,
         coherence_threshold: f64,
         score_matrix: Option<ScoreMatrix>,
+        score_matrix_authoritative: bool,
         classifier_intelligence: u8,
         classifier_model: impl Into<String>,
         limiter: Arc<Limiter>,
@@ -298,6 +307,7 @@ impl ClassifierStage {
             routing_config,
             coherence_threshold,
             score_matrix,
+            score_matrix_authoritative,
             classifier_intelligence,
             classifier_model: classifier_model.into(),
             limiter,
@@ -436,6 +446,9 @@ impl ClassifierStage {
             model = %self.classifier_model,
             input_len = messages[1].content.len(),
             system_prompt_len = messages[0].content.len(),
+            retry_attempt = ctx
+                .get::<i64>(crate::stages::retry_classifier::METADATA_RETRY_ATTEMPT)
+                .copied(),
             "classifier LLM request"
         );
 
@@ -555,6 +568,42 @@ impl ClassifierStage {
             return Ok(("rejected".into(), decision));
         }
 
+        // M5: matrix-authoritative routing. When opted in, the weighted score
+        // matrix DECIDES the route — the top-scoring route's name is resolved
+        // through the one shared dispatch path (`routing_config.routing_target`)
+        // — instead of the LLM's `action`/`target` being metadata-only. The
+        // coherence/safety thresholds and the `reject` action above run first:
+        // gating checks still protect downstream models.
+        if self.score_matrix_authoritative {
+            if let Some(sm) = &self.score_matrix {
+                let scores = Self::score_vector(&output);
+                if let Some(top) = sm.resolve(&scores).first() {
+                    tracing::info!(
+                        target: "router.pipeline.stage2",
+                        model = %self.classifier_model,
+                        matrix_route = %top.route_name,
+                        weighted_score = top.weighted_score,
+                        "score matrix decided the route"
+                    );
+                    let routing_target = if top.route_name == "respond" {
+                        // "respond" has no dispatch target — preserve a direct
+                        // response (build_decision sets the response metadata).
+                        None
+                    } else {
+                        self.routing_config
+                            .routing_target(&top.route_name, output.complexity)
+                    };
+                    return Ok(Self::build_decision(
+                        &output,
+                        routing_target.as_ref(),
+                        ok,
+                        Some(sm),
+                    ));
+                }
+                // No route matched any band — fall through to the LLM path.
+            }
+        }
+
         let routing_target = resolve_routing_target(
             &output.action,
             &output,
@@ -585,27 +634,32 @@ impl StageDecisionProducer for ClassifierStage {
 }
 
 impl ClassifierStage {
+    /// The four-axis score vector the matrix ranks over: coherence, normalized
+    /// complexity (0–1), completeness, and risk. The single source of the
+    /// vector — shared by the matrix-authoritative `decide()` path (M5) and the
+    /// `build_decision` audit metadata.
+    fn score_vector(output: &ClassifierOutput) -> HashMap<String, f64> {
+        std::collections::HashMap::from([
+            ("coherence".into(), output.coherence_score),
+            (
+                "complexity".into(),
+                f64::from(output.complexity.unwrap_or(DEFAULT_COMPLEXITY)) / COMPLEXITY_SCALE,
+            ),
+            (
+                "completeness".into(),
+                output.completeness.unwrap_or(DEFAULT_COMPLETENESS),
+            ),
+            ("risk".into(), output.risk.unwrap_or(0.0)),
+        ])
+    }
+
     fn build_decision(
         output: &ClassifierOutput,
         routing_target: Option<&RoutingTarget>,
         ok: bool,
         score_matrix: Option<&ScoreMatrix>,
     ) -> (String, StageDecision) {
-        let scored_routes = score_matrix.map(|sm| {
-            let scores = std::collections::HashMap::from([
-                ("coherence".into(), output.coherence_score),
-                (
-                    "complexity".into(),
-                    f64::from(output.complexity.unwrap_or(DEFAULT_COMPLEXITY)) / COMPLEXITY_SCALE,
-                ),
-                (
-                    "completeness".into(),
-                    output.completeness.unwrap_or(DEFAULT_COMPLETENESS),
-                ),
-                ("risk".into(), output.risk.unwrap_or(0.0)),
-            ]);
-            sm.resolve(&scores)
-        });
+        let scored_routes = score_matrix.map(|sm| sm.resolve(&Self::score_vector(output)));
 
         let mut metadata = StageMetadata::from(serde_json::json!({
             "coherence_score": output.coherence_score,

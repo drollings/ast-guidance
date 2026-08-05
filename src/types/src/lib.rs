@@ -5,6 +5,10 @@ use internment::ArcIntern;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
+pub mod knowledge;
+
+pub use knowledge::{KnowledgeCapability, KnowledgeError};
+
 pub const LOD_COUNT: usize = 6;
 
 /// A deterministic context hit — a short-circuit fact/cached answer that

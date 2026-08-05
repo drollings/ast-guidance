@@ -79,7 +79,8 @@ pub use runtime::block_on;
 pub use shell::{run_capture, run_command, run_shell_capture, shell_cmd, CommandOutput};
 #[cfg(feature = "sqlite")]
 pub use sqlite::{
-    init_embedding_cache, make_hnsw, open_in_memory, open_wal, run_batch, EMBEDDING_CACHE_SCHEMA,
+    init_embedding_cache, make_hnsw, open_in_memory, open_shared_in_memory, open_wal, run_batch,
+    EMBEDDING_CACHE_SCHEMA,
 };
 pub use string::{
     contains_any, contains_any_word, contains_ident_word, contains_ignore_case, contains_word,

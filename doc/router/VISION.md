@@ -499,6 +499,9 @@ handled a given request, why, and what it cost.
 
 ## Current status
 
+**Status as of 2026-08-05** (reconciled against the source in
+`ROADMAP_20260805_FIXES`, M3).
+
 **Foundational and stable:**
 
 - The request pipeline is the 3-stage shape `DeterministicPreFilter →
@@ -511,7 +514,11 @@ handled a given request, why, and what it cost.
 - A fast local classifier evaluates coherence, safety, and intent, and emits
   structured JSON routing verdicts rather than free text.
 - Requests route to configured model groups by intent, each with its own
-  context size, timeout, and generation profile.
+  context size, timeout, and generation profile. The `model_group` **local
+  chain** is wired: dispatch tries the group's local models in order, then
+  falls back to the cheapest model in the group when none meets the
+  classifier's complexity score (complexity-based model selection at
+  terminal dispatch, `RoutingConfig::routing_target`).
 - Session context compacts by recency past a node-count threshold; KV cache
   state spans a hot (in-memory, size-bounded) and cold (disk-backed,
   TTL/LRU-evicted) tier.
@@ -530,57 +537,72 @@ handled a given request, why, and what it cost.
   successful dispatches (`post_process.workflow_extraction`) are distilled
   into *draft* charts, upserted idempotently against near neighbors, and
   demoted after `CHART_STALE_FAILS` consecutive rubric failures.
-
-**Actively landing (near-term milestones):**
-
-- A filter taxonomy replacing flat hard-reject-only patterns: every filter
-  resolves to `hard_reject`, `soft_redirect`, or `output_filter`
+- A **filter taxonomy** replacing flat hard-reject-only patterns: every
+  filter resolves to `hard_reject`, `soft_redirect`, or `output_filter`
   (redact/anonymize/omit), scoped to where it applies and optionally gated
-  behind a secondary check.
-- An HTTP status taxonomy separating terminal rejection (never retried) from
-  transient failure (retry-eligible) from internal escalation signals.
+  behind a secondary check (`config/filters.rs` + `filters/*`).
+- An **HTTP status taxonomy** separating terminal rejection (never retried)
+  from transient failure (retry-eligible) from internal escalation signals
+  (`HttpClass`/`FailureClass` in `fluent_llm::http_class`).
 - **Nested classification tree config** replacing the flattened
   `pipelines` / `routes` / `system_prompt` / `score_matrix` quad with a
-  single self-describing tree. Each classifier node auto-generates its
-  prompt from its children; add a route to the config and it appears in
-  the prompt without manual editing.
-- Prompt auto-construction from tree children: the system builds the
-  classifier system prompt at node evaluation time, listing only the
-  actual child routes and their descriptions.
-- Two-stream logging: routine operational logs on a short rotation, and a
+  single self-describing tree (`config/classification.rs` +
+  `stages/tree.rs`). Each classifier node auto-generates its prompt from its
+  children (per-node prompt auto-construction), enforces per-node
+  coherence/safety thresholds, and supports multi-level chains (a classifier
+  node can route to another classifier node). Add a route to the config and
+  it appears in the prompt without manual editing.
+- **Two-stream logging**: routine operational logs on a short rotation, and a
   separate, durably-retained audit stream for every filter verdict, route
-  decision, and (eventually) frontier call.
-- A `ContentNode`-based ledger that sits between raw session history and the
-  orchestrator's live context, with LOD0 as the guaranteed authoritative
-  anchor.
+  decision, and frontier call (`audit.rs` + `logging.rs`).
+- **The escalation ladder** is load-bearing. `dispatch/escalation.rs`
+  implements all four engagement modes — filter, question, team, turnover —
+  as a configurable per-group sequence tried in order after the local chain
+  exhausts, with a deterministic `ContextHit` short-circuit before any
+  frontier engagement and per-mode post-processing written to the durable
+  audit stream. The `execute_frontier_mode` stub and
+  `ServerError::FrontierNotImplemented` are gone; the binary no longer emits
+  a startup warning for configured ladders. `frontier/modes.rs` defines the
+  canonical `EscalationMode { Filter, Question, Team, Turnover }` taxonomy
+  (decision D8 of `ROADMAP_20260804_DRY`).
+- The **shared, reference-counted Content Node store** (M4): `NodeStore`
+  holds nodes once behind `Arc<RwLock<ContentNode>>` with interned
+  `ArcIntern<str>` session/role index keys, durable `content_json` hydration
+  (seeded `next_id` from `MAX(node_id)` so restarts never re-issue colliding
+  ids), and LOD derived at most once and visible to every holder.
+  `ContentNodeLedger` is a thin facade over it. The `KnowledgeCapability`
+  trait (`fluent_types`) is the cross-crate read path: the router's
+  `NodeStore` and coral's `Library` both implement it behind their own
+  capability tokens, so coral's Context is reachable without the router
+  importing coral.
+- Routing quality (M5/M6): the weighted score matrix can be made the
+  **authoritative** route decision — the top-scoring route's name resolved
+  through the one shared dispatch path — behind `score_matrix_authoritative`,
+  and the `RetryClassifier` decorator is wired into the production pipeline
+  behind `classifier_retry_max`, re-executing the classifier with escalating
+  corrective prompts when its LLM response fails JSON parsing. Both are
+  default-off, so existing behavior and goldens are untouched until a
+  deployment opts in.
 
 **Designed, not yet load-bearing:**
 
-- The full six-tier LOD scheme (LOD0–LOD5), with LOD0/LOD5 eager and
-  LOD1–LOD4 lazy-and-cached, each computed directly from LOD0.
+- **Parallel and filtered ledgers over the shared store — the remaining big
+  pillar.** The shared, reference-counted store itself is real now
+  (`node_store.rs`, M4): nodes live once behind `Arc<RwLock<ContentNode>>`
+  with interned `ArcIntern<str>` session/role index keys and durable
+  `content_json` hydration, and `ContentNodeLedger` is a thin facade over it.
+  What does *not* exist yet is the VISION's view layer on top: parallel
+  ledgers holding independent default-LOD views over the same nodes, and
+  filtered ledgers as reference-only overlays (PII-anonymized frontier view,
+  rigor-route red-team view, specialist-agent narrowed view). This is the
+  largest contiguous unfinished body of work in the router; planning should
+  allocate accordingly.
 - Per-LOD-tier ledger HNSW scene graphs, dirty-tracked and lazily rebuilt.
-- The shared, reference-counted Content Node store with interned strings,
-  and parallel ledgers holding independent default-LOD views over it.
-- Filtered ledgers as reference-only overlays (PII-anonymized frontier view,
-  rigor-route red-team view, specialist-agent narrowed view).
 - Three separate library-scale HNSW indices (prior-workflow library,
   rubric/validated-answer cache, blacklist-adjacent similarity) —
   structurally scoped; the prior-workflow library is populated and wired into
   the plan route, the rubric/validated-answer cache is populated by the M9
   rubric gate, the blacklist index remains unpopulated.
-- **Escalation ladder** as a configurable per-group sequence of frontier
-  engagement modes (filter → question → team → turnover), tried in order
-  after all local models fail. Each mode is a progressively more permissive
-  policy for crossing the local-to-frontier boundary. The ladder taxonomy is
-  canonical: `frontier/modes.rs` defines `EscalationMode { Filter, Question,
-  Team, Turnover }` (decision D8 of `ROADMAP_20260804_DRY` — the old
-  `FrontierMode` "four involvement modes" enum is gone). The *runtime* is
-  forward track: `execute_frontier_mode` is a typed stub returning
-  `ServerError::FrontierNotImplemented`, and the binary emits a startup
-  warning if an escalation ladder is configured (see
-  `config/unimplemented.rs`). Per-mode local model roles (decomposer,
-  assembler, draft, judge) and parallel-classifier fan-out are specified in
-  the ladder docs but not yet backed by `ResultPool` or `Zone` supervision.
 - The `rigor` route — types and structure exist; execution is not yet wired
   to live agents.
 - Origin-typed Content Nodes and the dedicated `audit`/`concern` node
@@ -627,35 +649,13 @@ Key architectural improvements:
 
 ## Near-term direction
 
-- Finish landing the filter/HTTP/classification-tree/ledger infrastructure
-  currently in flight, closing the gap between the design spec and the
-  running system.
-- Implement `model_group` local chain dispatch: try models in the `local`
-  list in order, with per-model session profile selection and timeout/
-  retry from the model's own config.
-- Implement the escalation ladder dispatch loop: after local chain
-  exhaustion, iterate escalation stages in order, with per-stage pre/post
-  hooks and escalation-exhausted error handling.
-- Wire the `filter` escalation mode: apply deterministic redaction rules
-  from the group config before sending to frontier; validate the response
-  is clean before returning to the user.
-- Wire the `question` escalation mode: decomposer model breaks query into
-  hypotheticals, frontier answers each, assembler model synthesizes.
-- Wire the `team` escalation mode: `ResultPool`-backed parallel classifier
-  fan-out, draft model for easy steps, judge model crafts the frontier
-  prompt from gaps.
-- Implement per-node prompt auto-construction: at node evaluation time,
-  build the classifier system prompt from the node's `description`, its
-  children's keys and descriptions, and the node's threshold values.
-- Support multi-level classification: a classifier node can route to another
-  classifier node, enabling domain → subdomain → terminal chains.
-- Implement complexity-based model selection at terminal dispatch: pick the
-  cheapest model in the group whose `intelligence` meets the classifier's
-  `complexity` score.
-- Route the M10 workflow-extraction loop into Coral Context's ledger as
-  `ContentNode` entries (the router-owned `ChartStore` is the landing place
-  today; importing into coral is blocked by the import-boundary contract
-  until a shared store crate is justified by a second consumer).
+- Build the view layer over the shared store: parallel ledgers holding
+  independent default-LOD views over the same nodes, and filtered ledgers as
+  reference-only overlays (PII-anonymized frontier view, rigor-route red-team
+  view, specialist-agent narrowed view). This is the remaining big pillar (see
+  "Current status").
+- Implement per-LOD-tier ledger HNSW scene graphs, dirty-tracked and lazily
+  rebuilt, for conceptual-distance-based rendering.
 
 ## Longer-term direction
 

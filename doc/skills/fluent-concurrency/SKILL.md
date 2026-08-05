@@ -93,9 +93,6 @@ When a unit fails/panics/times out, `cancel_dependents_of(name)` (`zone.rs:189-2
 - Yields once before the first attempt so pending abort signals are processed.
 - Calls `unit.execute(&ctx)`.
 - On `Err(WorkError)`, sleeps the shared jittered-exponential backoff
-  (`common_core::retry::retry_async` with base 100ms — first retry ≈ 100ms,
-  100/200/400… — per the D5 schedule change in ROADMAP_20260804_DRY) and
-  retries up to `max_retries` times.
 - Wraps the whole thing in `tokio::time::timeout(timeout_ms, …)`; on timeout returns `Err(WorkError::Timeout { duration_ms, unit })`.
 
 **Panic propagation**: panics are *not* caught via `catch_unwind`. They propagate through `JoinSet` as `JoinError::Panic`, which `Zone::poll` intercepts (`zone.rs:256-285`) and records as `ZoneEvent::Panicked`. This is deliberate: a `catch_unwind` would lose the panic site and prevent the dependency-aware cancellation graph from firing.
@@ -121,7 +118,7 @@ CancelReason::Aborted
 - A panic in task A does **not** propagate to the parent runtime thread. It is caught as a `JoinError` by the zone's `poll` loop.
 - The zone cancels only the dependents of the failed task; independent tasks continue.
 - Neighboring zones are fully isolated because each zone owns its own `JoinSet`.
-- `WorkError::Execution` failures go to `summary.failed`; real panics go to `summary.panicked`. These are distinct buckets, by design (M3.2 contract from `ROADMAP_20260720_WVR_MORE.md`).
+- `WorkError::Execution` failures go to `summary.failed`; real panics go to `summary.panicked`.
 
 ### 3.4 `WorkerPool` — Bounded Worker Pool
 
@@ -288,7 +285,7 @@ impl<T, R, E> ResultPool<T, R, E> {
 
 There is **no** fire-and-forget variant: because the worker protocol requires a `oneshot::Sender`, every submission — even one whose result is ignored — allocates a channel. If you need true fan-out with no result, use `WorkerPool` instead.
 
-**`PriorityResultPool<T, R, E>`** (`pool.rs:433-529`) — priority-ordered variant of `ResultPool`. Jobs are submitted with `submit(job, priority)`; higher priority values are dispatched first, FIFO within the same priority. Internally it uses the `PriorityQueue` from §3.6 wrapped in a `tokio::sync::Mutex`. Workers follow the **drain-then-wait** pattern (the M9 contract from `ROADMAP_20260720_WVR_MORE.md`): on each wake they drain the entire queue before blocking on `Notify`, preventing wakeup collapse under burst. This is the right tool when some jobs are time-sensitive and others can wait.
+**`PriorityResultPool<T, R, E>`** (`pool.rs:433-529`) — priority-ordered variant of `ResultPool`. Jobs are submitted with `submit(job, priority)`; higher priority values are dispatched first, FIFO within the same priority. Internally it uses the `PriorityQueue` from §3.6 wrapped in a `tokio::sync::Mutex`. Workers follow the **drain-then-wait** pattern
 
 **`LlmRequestQueue`** (`llm_queue.rs:156-185`) — typed wrapper over `ResultPool` for LLM chat completions. The crate is transport-agnostic: the `Fn(LlmTask) -> Result<String, LlmError>` handler is supplied at construction time; the default OpenAI-compatible HTTP handler lives in `guidance-llm`. This split keeps `reqwest` out of the boundary that downstream callers care about.
 
@@ -307,20 +304,6 @@ pub enum LlmError { Api(String), Http(String), NoResponse, RateLimited }
 ```
 
 `LlmConfig.extra_body_params` is arbitrary JSON merged into every request body (e.g. `num_ctx`, `temperature`, `stop`); `"model"`, `"messages"`, and `"stream"` keys are ignored because those are set explicitly by the chat-completion logic. `LlmConfig::new()` is a `bon` builder (`start_fn = new`).
-
-**M9 adoption (ROADMAP_20260804_SHARED_CORE):** the queue is now load-bearing
-in consumers. Coral's `L5FrontierUnit` (coral-context) constructs a shared
-`LlmRequestQueue` via `LlmClient::with_queue_and_config` (sized from an
-opt-in `frontier_workers` reactor-config knob; default `None` = direct HTTP,
-non-regressing), so frontier LLM calls flow through the worker pool's
-`default_handler` with `timeout_ms`/`think`/`extra_body_params`/`debug`/
-`show_prompts` preserved exactly. Guidance's `Enhancer::call_llm` adopts the
-retry + metrics surface instead: the single-shot LLM call is wrapped in
-`common_core::retry::retry_async` (gated on `LlmError::is_retryable()` — only
-`Http`/`RateLimited` retry; permanent `Api`/`NoResponse` short-circuit
-byte-identically), driven through the new `fluent_llm::client::block_on`
-sync→async bridge, with optional `LatencyHistogram` timing via
-`Enhancer::with_metrics`.
 
 **`Reserve`** (`reserve.rs:7-94`) — RAII permit on a shared `Arc<AtomicUsize>`. `try_acquire(counter) -> Option<Self>` atomically decrements and returns the permit, or `None` if already at zero. `commit(self)` consumes the permit permanently; otherwise `Drop` returns it to the counter. This is a lower-level primitive than `Limiter`: it does not own the counter (the caller supplies it), and it does not run a closure. Use `Limiter` for "run this with a permit" and `Reserve` for "acquire now, release later" patterns. The crate's own tests are the only in-tree consumer today.
 
@@ -344,7 +327,7 @@ The `fluent-wvr` crate defines `Component`, `WorkUnit`, `FieldAccess`, `Describa
 - `ComponentAdapter` — runtime override of `name`, `execute`, and any field on a `Component`. `set_field` forwards via `Arc::get_mut` when possible and otherwise stores an override on the adapter. This is the only wrapper that handles the shared-Arc case correctly. `Instrumented` is a *transparent* wrapper: its `FieldAccess` impls delegate `set_field`/`get_field`/`field_names` straight to the inner type (requiring exclusive access to the inner or interior mutability), matching the delegation semantics of its `WorkUnit` impls.
 - `retry_call(max_attempts, base_ms, f)` — the synchronous free-function retry (explicitly blocking, never for `execute` bodies) with jittered-exponential backoff. Returns `Result<RetryResult<T>, E>` where `RetryResult` carries the attempt count. The async canonical path is `common_core::retry::retry_async`.
 
-**Retry**: there is no `WithRetry` wrapper (deleted by the M5 DRY consolidation — it slept with `std::thread::sleep` inside `execute`, violating the WorkUnit purity contract). The single jittered-exponential backoff helper lives in `common_core::retry` (`backoff_ms` / `retry_async`); `Zone` drives per-attempt timeout, `WorkError::Timeout` routing, and dependency cancellation on top of it.
+**Retry**: there is no `WithRetry` wrapper. The single jittered-exponential backoff helper lives in `common_core::retry` (`backoff_ms` / `retry_async`); `Zone` drives per-attempt timeout, `WorkError::Timeout` routing, and dependency cancellation on top of it.
 
 **Macros from `fluent-wvr`**:
 

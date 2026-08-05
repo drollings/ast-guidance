@@ -1,34 +1,49 @@
 //! Full-detail content ledger with LOD compaction (decision D6).
 //!
-//! `ContentNodeLedger` is the durable, per-session store of `ContentNode`s
-//! (the canonical `fluent_types::ContentNode`). It owns the LOD lifecycle:
+//! `ContentNodeLedger` is now a **thin facade** over the shared
+//! `NodeStore` (M4): the durable, per-session store of `ContentNode`s (the
+//! canonical `fluent_types::ContentNode`) lives in `crate::node_store`, where
+//! nodes are shared behind `Arc<RwLock<ContentNode>>` with interned
+//! session/role index keys and a durable `content_json` column. The facade
+//! keeps the server-facing surface (`record_request`, `record_result`,
+//! `record_content_node`, `get_session_nodes`, `get_session_entries`,
+//! `ensure_lod`, `compact_session`, `collapse_node`) signature-identical and
+//! delegates to the store.
+//!
+//! The LOD lifecycle is owned by the store:
 //!
 //! - **LOD0** (full text) and **LOD5** (label) are guaranteed eager at node
 //!   creation.
 //! - **LOD1–LOD4** are derived lazily, **always from LOD0 only** (never
 //!   chained from a lower tier — VISION), via the `Summarizer` WorkUnit, and
-//!   cached on the node once derived.
+//!   cached on the shared node once derived (at most once across all holders).
 //! - Compaction (`CompactionStrategy`/`RecencyCompaction`, formerly the
 //!   standalone `compaction.rs`) demotes older nodes to higher LOD levels to
 //!   stay within a context budget; the demoted text is filled in lazily.
 //!
-//! The schema stores both the flat queryable projection (used by the server's
+//! This module keeps the flat `LedgerEntry` audit projection, the `LedgerError`
+//! taxonomy, the schema migrations, and the compaction policy types. The
+//! schema stores both the flat queryable projection (used by the server's
 //! best-effort `record_request`/`record_result` logging) and a `content_json`
 //! column holding the full serialized `ContentNode` (single source of truth
 //! for LOD/role metadata).
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::Arc;
 
-use common_core::sync::lock;
 use fluent_db::error::DbError;
-use fluent_db::migrate::{ensure_column, migrate, Migration};
-use fluent_db::store::SqliteStore;
+use fluent_db::migrate::{ensure_column, Migration};
 use fluent_types::{ContentNode, NodeId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::node_store::NodeStore;
 use crate::summarization::Summarizer;
+
+/// Node-construction helper moved to `NodeStore` (M4). Re-exported here so the
+/// facade's tests keep compiling unchanged.
+#[cfg(test)]
+pub(crate) use crate::node_store::new_node;
 
 /// LOD level of the full text. Always eager at node creation.
 pub const LOD0_FULL_TEXT: u8 = 0;
@@ -73,59 +88,38 @@ pub struct LedgerEntry {
     pub created_at: u64,
 }
 
+/// The durable, per-session store of `ContentNode`s — a thin facade over the
+/// shared `Arc<NodeStore>` (M4). Every method delegates; the exact public
+/// surface is preserved so the server (`ServerDeps.ledger`) is untouched.
 pub struct ContentNodeLedger {
-    store: SqliteStore,
-    next_id: Mutex<i64>,
-    summarizer: Option<Summarizer>,
-}
-
-/// Deterministic, LLM-free LOD5 label (short descriptor), derived eagerly at
-/// node creation. Falls back to the role when no content survives truncation.
-fn derive_label(role: &str, content: &str) -> String {
-    let sentence = common_core::string::first_sentence(content);
-    let snippet = if sentence.is_empty() {
-        common_core::string::truncate_utf8(content, 64)
-    } else {
-        common_core::string::truncate_utf8(&sentence, 64)
-    };
-    if snippet.is_empty() {
-        role.to_string()
-    } else {
-        snippet
-    }
+    store: Arc<NodeStore>,
 }
 
 impl ContentNodeLedger {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, LedgerError> {
-        let db_path = path.into();
-        let store = SqliteStore::open(&db_path).map_err(|e| LedgerError::Db(e.to_string()))?;
-
-        // Versioned schema lifecycle (fluent_db::migrate): the base schema
-        // migration creates the table; the column migrations upgrade
-        // pre-LOD databases idempotently.
-        let migrations: [&dyn Migration; 4] = [
-            &LedgerBaseSchema,
-            &LedgerLabelColumn,
-            &LedgerLodColumn,
-            &LedgerContentJsonColumn,
-        ];
-        store
-            .with_conn(|conn| migrate(conn, &migrations))
-            .map_err(|e| LedgerError::Db(e.to_string()))?;
-
         Ok(Self {
-            store,
-            next_id: Mutex::new(1),
-            summarizer: None,
+            store: Arc::new(NodeStore::open(path)?),
+        })
+    }
+
+    /// Open an in-memory ledger (tests / ephemeral stores).
+    pub fn open_in_memory() -> Result<Self, LedgerError> {
+        Ok(Self {
+            store: Arc::new(NodeStore::open_in_memory()?),
         })
     }
 
     /// Attach a `Summarizer` so LOD1–LOD4 can be derived lazily from LOD0.
     /// Without one, `ensure_lod` returns `LedgerError::NoSummarizer`.
     #[must_use]
-    pub fn with_summarizer(mut self, summarizer: Summarizer) -> Self {
-        self.summarizer = Some(summarizer);
+    pub fn with_summarizer(self, summarizer: Summarizer) -> Self {
+        self.store.set_summarizer(summarizer);
         self
+    }
+
+    /// The shared store — the new shared/refcounted/interned read path.
+    pub fn node_store(&self) -> &Arc<NodeStore> {
+        &self.store
     }
 
     /// Record a user request as a new node. LOD0 (full text) and LOD5 (label)
@@ -136,15 +130,7 @@ impl ContentNodeLedger {
         request_id: &str,
         content: &str,
     ) -> Result<NodeId, LedgerError> {
-        let mut next = lock(&self.next_id);
-        let id = NodeId::from_int(*next);
-        *next += 1;
-
-        let node = new_node(
-            id, session_id, request_id, "user", content, None, // accepted set by record_result
-        );
-        self.insert_node(&node)?;
-        Ok(id)
+        self.store.record_request(session_id, request_id, content)
     }
 
     /// Update the result of a previously recorded request node: acceptance,
@@ -157,146 +143,13 @@ impl ContentNodeLedger {
         score: Option<f64>,
         content: &str,
     ) -> Result<(), LedgerError> {
-        self.with_node_mut(node_id, |node| {
-            node.accepted = Some(accepted);
-            node.acceptance_score = score;
-            if !content.is_empty() {
-                node.lod[LOD0_FULL_TEXT as usize] = content.to_string();
-                node.lod[LOD5_LABEL as usize] =
-                    derive_label(&node.role.clone().unwrap_or_default(), content);
-                node.active_lod = Some(LOD0_FULL_TEXT);
-            }
-        })?;
-        Ok(())
+        self.store.record_result(node_id, accepted, score, content)
     }
 
     /// Persist an arbitrary origin-typed `ContentNode`. LOD0/LOD5 are
     /// guaranteed present (derived from the node's text when missing).
     pub fn record_content_node(&self, node: &ContentNode) -> Result<NodeId, LedgerError> {
-        let id = node.id.unwrap_or_else(|| {
-            let mut next = lock(&self.next_id);
-            let id = NodeId::from_int(*next);
-            *next += 1;
-            id
-        });
-        let mut node = node.clone();
-        node.id = Some(id);
-        ensure_lod_eager(&mut node);
-        self.insert_node(&node)?;
-        Ok(id)
-    }
-
-    /// Record a node under a fixed NodeId (internal — avoids a second
-    /// next_id bump when the caller already allocated one).
-    fn insert_node(&self, node: &ContentNode) -> Result<(), LedgerError> {
-        let metadata = node
-            .metadata
-            .as_ref()
-            .unwrap_or(&serde_json::json!({}))
-            .to_string();
-        let lod_json =
-            serde_json::to_string(&node.lod).map_err(|e| LedgerError::Db(e.to_string()))?;
-        let content_json =
-            serde_json::to_string(node).map_err(|e| LedgerError::Db(e.to_string()))?;
-        let content = node.lod.first().map_or("", String::as_str);
-        let label = node
-            .lod
-            .get(LOD5_LABEL as usize)
-            .cloned()
-            .filter(|l| !l.is_empty())
-            .unwrap_or_else(|| derive_label(&node.role.clone().unwrap_or_default(), content));
-
-        self.store
-            .execute(
-                "INSERT INTO ledger (node_id, session_id, request_id, role, content, turn_index,
-                                     accepted, acceptance_score, active_lod, parent_id, step_id,
-                                     metadata, created_at, label, lod, content_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-                rusqlite::params![
-                    node.id.map(NodeId::as_int),
-                    node.session_id.clone().unwrap_or_default(),
-                    node.request_id.clone().unwrap_or_default(),
-                    node.role.clone().unwrap_or_default(),
-                    content,
-                    node.turn_index.unwrap_or(0) as i64,
-                    node.accepted.unwrap_or(true),
-                    node.acceptance_score,
-                    i64::from(node.active_lod.unwrap_or(LOD0_FULL_TEXT)),
-                    node.parent_id.map(NodeId::as_int),
-                    node.step_id.as_deref(),
-                    metadata,
-                    node.created_at.unwrap_or_else(common_core::now_secs) as i64,
-                    label,
-                    lod_json,
-                    content_json,
-                ],
-            )
-            .map_err(|e| LedgerError::Db(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Apply a mutation to a node and persist both the flat projection and the
-    /// `content_json` column. Single place that keeps the two views in sync.
-    fn with_node_mut<F>(&self, node_id: NodeId, f: F) -> Result<ContentNode, LedgerError>
-    where
-        F: FnOnce(&mut ContentNode),
-    {
-        let mut node = self
-            .get_node(node_id)
-            .ok_or(LedgerError::NotFound(node_id))?;
-        f(&mut node);
-        ensure_lod_eager(&mut node);
-        self.update_node(&node)?;
-        Ok(node)
-    }
-
-    /// Persist an updated node (flat projection + `content_json`).
-    fn update_node(&self, node: &ContentNode) -> Result<(), LedgerError> {
-        let metadata = node
-            .metadata
-            .as_ref()
-            .unwrap_or(&serde_json::json!({}))
-            .to_string();
-        let lod_json =
-            serde_json::to_string(&node.lod).map_err(|e| LedgerError::Db(e.to_string()))?;
-        let content_json =
-            serde_json::to_string(node).map_err(|e| LedgerError::Db(e.to_string()))?;
-        let content = node.lod.first().map_or("", String::as_str);
-        let label = node
-            .lod
-            .get(LOD5_LABEL as usize)
-            .cloned()
-            .filter(|l| !l.is_empty())
-            .unwrap_or_else(|| derive_label(&node.role.clone().unwrap_or_default(), content));
-
-        self.store
-            .execute(
-                "UPDATE ledger SET session_id = ?1, request_id = ?2, role = ?3, content = ?4,
-                                   turn_index = ?5, accepted = ?6, acceptance_score = ?7,
-                                   active_lod = ?8, parent_id = ?9, step_id = ?10, metadata = ?11,
-                                   created_at = ?12, label = ?13, lod = ?14, content_json = ?15
-                 WHERE node_id = ?16",
-                rusqlite::params![
-                    node.session_id.clone().unwrap_or_default(),
-                    node.request_id.clone().unwrap_or_default(),
-                    node.role.clone().unwrap_or_default(),
-                    content,
-                    node.turn_index.unwrap_or(0) as i64,
-                    node.accepted.unwrap_or(true),
-                    node.acceptance_score,
-                    i64::from(node.active_lod.unwrap_or(LOD0_FULL_TEXT)),
-                    node.parent_id.map(NodeId::as_int),
-                    node.step_id.as_deref(),
-                    metadata,
-                    node.created_at.unwrap_or_else(common_core::now_secs) as i64,
-                    label,
-                    lod_json,
-                    content_json,
-                    node.id.map(NodeId::as_int),
-                ],
-            )
-            .map_err(|e| LedgerError::Db(e.to_string()))?;
-        Ok(())
+        self.store.record_content_node(node)
     }
 
     /// Collapse a node: replace LOD0's content with `summary` and mark it
@@ -307,52 +160,17 @@ impl ContentNodeLedger {
         summary: &str,
         lod: u8,
     ) -> Result<(), LedgerError> {
-        self.with_node_mut(node_id, |node| {
-            node.lod[LOD0_FULL_TEXT as usize] = summary.to_string();
-            node.lod[LOD5_LABEL as usize] =
-                derive_label(&node.role.clone().unwrap_or_default(), summary);
-            node.active_lod = Some(lod);
-        })?;
-        Ok(())
+        self.store.collapse_node(node_id, summary, lod)
     }
 
     /// Derive (or return the cached) LOD level for a node, **from LOD0 only**
     /// via the `Summarizer` — never chained from a lower tier.
     ///
-    /// Only LOD1–LOD4 are lazy; LOD0/LOD5 are eager at creation.
+    /// Only LOD1–LOD4 are lazy; LOD0/LOD5 are eager at creation. The derived
+    /// tier is cached on the shared node, so a second request from any holder
+    /// hits the cache, not the LLM.
     pub fn ensure_lod(&self, node_id: NodeId, level: u8) -> Result<ContentNode, LedgerError> {
-        if !LAZY_LOD_RANGE.contains(&level) {
-            return Err(LedgerError::InvalidLod(level));
-        }
-        let node = self
-            .get_node(node_id)
-            .ok_or(LedgerError::NotFound(node_id))?;
-        let full_text = node
-            .lod
-            .first()
-            .cloned()
-            .ok_or(LedgerError::NotFound(node_id))?;
-
-        let cached = node
-            .lod
-            .get(level as usize)
-            .map_or("", String::as_str)
-            .to_string();
-        if !cached.is_empty() {
-            return Ok(node);
-        }
-
-        let summarizer = self.summarizer.as_ref().ok_or(LedgerError::NoSummarizer)?;
-        let derived = summarizer
-            .summarize_text(&full_text)
-            .map_err(|e| LedgerError::Summary(e.to_string()))?;
-
-        self.with_node_mut(node_id, |node| {
-            while node.lod.len() <= level as usize {
-                node.lod.push(String::new());
-            }
-            node.lod[level as usize] = derived;
-        })
+        self.store.ensure_lod(node_id, level)
     }
 
     /// Compact a session: demote older nodes to higher LOD levels via the
@@ -364,52 +182,16 @@ impl ContentNodeLedger {
         session_id: &str,
         max_nodes: usize,
     ) -> Result<Vec<NodeId>, LedgerError> {
-        let mut nodes = self.get_session_nodes(session_id, usize::MAX)?;
-        // `select_lod` expects chronological (oldest-first) order; the store
-        // returns newest-first.
-        nodes.reverse();
-        let lods = RecencyCompaction.select_lod(&nodes, max_nodes);
-        let mut demoted = Vec::new();
-        for (node, lod) in nodes.iter().zip(lods) {
-            let current = node.active_lod.unwrap_or(LOD0_FULL_TEXT);
-            if lod > current {
-                if let Some(id) = node.id {
-                    self.set_active_lod(id, lod)?;
-                    demoted.push(id);
-                }
-            }
-        }
-        Ok(demoted)
+        self.store.compact_session(session_id, max_nodes)
     }
 
-    /// Set a node's active LOD level (demotion), keeping `content_json` in
-    /// sync. The demoted text stays lazy — derived from LOD0 on demand.
-    fn set_active_lod(&self, node_id: NodeId, active_lod: u8) -> Result<(), LedgerError> {
-        self.with_node_mut(node_id, |node| {
-            node.active_lod = Some(active_lod);
-        })?;
-        Ok(())
-    }
-
-    /// Fetch a node by ID (canonical `ContentNode`, single source of truth
-    /// in the `content_json` column).
+    /// Fetch a node by ID (canonical `ContentNode`, single source of truth in
+    /// the shared store).
     ///
-    /// Returns `None` if the node is absent or its `content_json` fails to
-    /// parse. The pre-LOD flat-column hydration fallback was retired (M5.7):
-    /// every schema since the base migration writes `content_json` (and the
-    /// column migrations converge older databases onto it), so the canonical
-    /// read path is single-format.
+    /// Returns `None` if the node is absent. The pre-LOD flat-column hydration
+    /// fallback was retired (M5.7): the canonical read path is single-format.
     pub fn get_node(&self, node_id: NodeId) -> Option<ContentNode> {
-        let json: Option<String> = self
-            .store
-            .query_row(
-                "SELECT content_json FROM ledger WHERE node_id = ?1",
-                rusqlite::params![node_id.as_int()],
-                |r| r.get(0),
-            )
-            .ok()
-            .flatten();
-        json.and_then(|json| serde_json::from_str::<ContentNode>(&json).ok())
+        self.store.snapshot(node_id)
     }
 
     /// All nodes for a session (canonical `ContentNode`s), most recent first.
@@ -418,23 +200,7 @@ impl ContentNodeLedger {
         session_id: &str,
         limit: usize,
     ) -> Result<Vec<ContentNode>, LedgerError> {
-        let ids = self
-            .store
-            .query_rows(
-                "SELECT node_id FROM ledger WHERE session_id = ?1
-                 ORDER BY turn_index DESC LIMIT ?2",
-                rusqlite::params![session_id, limit as i64],
-                |r| Ok(NodeId::from_int(r.get(0)?)),
-            )
-            .map_err(|e| LedgerError::Db(e.to_string()))?;
-
-        let mut nodes = Vec::new();
-        for id in ids {
-            if let Some(node) = self.get_node(id) {
-                nodes.push(node);
-            }
-        }
-        Ok(nodes)
+        self.store.get_session_nodes(session_id, limit)
     }
 
     pub fn get_session_entries(
@@ -442,104 +208,14 @@ impl ContentNodeLedger {
         session_id: &str,
         limit: usize,
     ) -> Result<Vec<LedgerEntry>, LedgerError> {
-        self.store
-            .query_rows(
-                "SELECT node_id, session_id, request_id, role, content,
-                        turn_index, accepted, acceptance_score, active_lod,
-                        parent_id, step_id, metadata, created_at
-                 FROM ledger WHERE session_id = ?1
-                 ORDER BY turn_index DESC LIMIT ?2",
-                rusqlite::params![session_id, limit as i64],
-                |row| {
-                    Ok(LedgerEntry {
-                        node_id: NodeId::from_int(row.get(0)?),
-                        session_id: row.get(1)?,
-                        request_id: row.get(2)?,
-                        role: row.get(3)?,
-                        content: row.get(4)?,
-                        turn_index: row.get(5)?,
-                        accepted: row.get(6)?,
-                        acceptance_score: row.get(7)?,
-                        active_lod: row.get(8)?,
-                        parent_id: row.get::<_, Option<i64>>(9)?.map(NodeId::from_int),
-                        step_id: row.get(10)?,
-                        metadata: serde_json::from_str(row.get::<_, String>(11)?.as_str())
-                            .unwrap_or_default(),
-                        created_at: row.get(12)?,
-                    })
-                },
-            )
-            .map_err(|e| LedgerError::Db(e.to_string()))
+        self.store.get_session_entries(session_id, limit)
     }
 
-    /// Panic while holding the connection mutex (test-only): exercises the
-    /// poison-recovery path in `SqliteStore`'s `common_core::sync::lock`.
+    /// Panic while holding the durable connection mutex (test-only): exercises
+    /// the poison-recovery path in `SqliteStore`'s `common_core::sync::lock`.
     #[cfg(test)]
     fn poison_conn(&self) {
-        let _ = self.store.with_conn(|_| -> Result<(), DbError> {
-            panic!("simulated panic while holding db mutex")
-        });
-    }
-}
-
-/// Build a fresh `ContentNode` with LOD0 (full text) and LOD5 (label) eager.
-fn new_node(
-    id: NodeId,
-    session_id: &str,
-    request_id: &str,
-    role: &str,
-    content: &str,
-    accepted: Option<bool>,
-) -> ContentNode {
-    let mut node = ContentNode {
-        id: Some(id),
-        name: format!("{role}-msg-{}", id.as_int()).into(),
-        source: "session".into(),
-        lod: vec![
-            content.to_string(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-        ],
-        embedding: None,
-        capabilities: None,
-        session_id: Some(session_id.to_string()),
-        request_id: Some(request_id.to_string()),
-        role: Some(role.to_string()),
-        // Monotonic per allocation → stable `ORDER BY turn_index DESC` within
-        // a session even before a real turn counter exists.
-        turn_index: Some(id.as_int() as u64),
-        accepted,
-        acceptance_score: None,
-        active_lod: Some(LOD0_FULL_TEXT),
-        parent_id: None,
-        step_id: None,
-        step_status: None,
-        metadata: None,
-        created_at: Some(common_core::now_secs()),
-    };
-    ensure_lod_eager(&mut node);
-    node
-}
-
-/// Guarantee LOD0 (full text) and LOD5 (label) are present on a node.
-fn ensure_lod_eager(node: &mut ContentNode) {
-    while node.lod.len() < LOD5_LABEL as usize + 1 {
-        node.lod.push(String::new());
-    }
-    let content = node.lod[LOD0_FULL_TEXT as usize].clone();
-    if content.is_empty() {
-        // Nothing to derive LOD0 from — nothing to do.
-        return;
-    }
-    if node.lod[LOD5_LABEL as usize].is_empty() {
-        let role = node.role.clone().unwrap_or_default();
-        node.lod[LOD5_LABEL as usize] = derive_label(&role, &content);
-    }
-    if node.active_lod.is_none() {
-        node.active_lod = Some(LOD0_FULL_TEXT);
+        self.store.poison_conn();
     }
 }
 
@@ -549,6 +225,18 @@ fn ensure_lod_eager(node: &mut ContentNode) {
 /// three LOD-era columns (`label`, `lod`, `content_json`) that pre-LOD
 /// databases lack. Each column migration is a no-op when the column already
 /// exists, so a fresh database and an upgraded one converge.
+///
+/// Shared with `NodeStore` (4B), which owns the durable backing now — the
+/// schema stays here as the single source of truth.
+pub(crate) fn ledger_migrations() -> [&'static dyn Migration; 4] {
+    [
+        &LedgerBaseSchema,
+        &LedgerLabelColumn,
+        &LedgerLodColumn,
+        &LedgerContentJsonColumn,
+    ]
+}
+
 struct LedgerBaseSchema;
 
 impl Migration for LedgerBaseSchema {
@@ -720,9 +408,10 @@ mod tests {
         // but `content_json` is still the '{}' placeholder. The canonical
         // read (`get_node`) must return `None` — the dual-format hydration
         // fallback is retired (M5.7); only `get_session_entries` (the flat
-        // audit view) reads columns directly.
-        ledger
-            .store
+        // audit view) reads columns directly. The row is inserted after
+        // hydration, so the in-memory maps never see it.
+        let store = ledger.node_store().durable().unwrap();
+        store
             .execute(
                 "INSERT INTO ledger (node_id, session_id, request_id, role, content,
                                      turn_index, accepted, active_lod, metadata, created_at,

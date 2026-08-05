@@ -7,6 +7,7 @@ use thiserror::Error;
 use crate::capability::CapabilitySet;
 use crate::metadata::MetadataValue;
 use crate::runtime::{NoopRuntime, Runtime};
+use crate::store::OutputStore;
 use crate::traits::WorkUnit;
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
@@ -119,22 +120,46 @@ impl std::fmt::Display for WorkOutput {
 /// Execution context passed to `WorkUnit::execute`. Carries configuration
 /// (dry-run, retries, timeout), typed metadata, a runtime, and a capability set.
 ///
+/// # Data channels — the decision rule
+///
+/// A `WorkContext` exposes four data channels with different typing fidelity.
+/// The rule for choosing between them is:
+///
+/// 1. **`outputs` (the typed store, [`OutputStore`])** — the *primary* channel
+///    for in-process handoff between stages / work units. Values are written
+///    with [`WorkContext::set::<T>`] and read with [`WorkContext::get::<T>`],
+///    so the type is pinned at the call site and no serialize/deserialize
+///    round-trip happens between producers and consumers in the same process.
+/// 2. **`WorkOutput.data` (`serde_json::Value`)** — reserved exclusively for
+///    payloads that genuinely cross a serialization boundary: WASM units,
+///    network dispatch, and a `WorkUnit`'s output consumed by a generic
+///    orchestrator. Do not use it for same-process handoffs.
+/// 3. **`metadata` (`HashMap<String, MetadataValue>`)** — only for genuinely
+///    dynamic / stringly-typed fields such as debug annotations, where the
+///    value's type is not known at the call site.
+/// 4. **`structured` (`HashMap<String, serde_json::Value>`)** — the JSON
+///    handoff channel for payloads that are natively `serde_json::Value`-shaped
+///    (e.g. a serialized `RouterRequest`). Prefer `outputs` whenever the type
+///    is known at compile time.
+///
 /// # Examples
 ///
 /// ```no_run
 /// use fluent_wvr::{WorkContext, CapabilitySet, NoopRuntime};
 /// use std::sync::Arc;
 ///
-/// let ctx = WorkContext {
+/// let mut ctx = WorkContext {
 ///     dry_run: true,
 ///     max_retries: 3,
 ///     timeout_ms: 10_000,
 ///     metadata: Default::default(),
 ///     structured: Default::default(),
+///     outputs: Default::default(),
 ///     rt: Arc::new(NoopRuntime),
 ///     caps: CapabilitySet::new(),
 /// };
-/// assert!(ctx.dry_run);
+/// ctx.set("attempt", 2_i32);
+/// assert_eq!(ctx.get::<i32>("attempt"), Some(&2));
 /// ```
 #[derive(Clone)]
 pub struct WorkContext {
@@ -148,7 +173,16 @@ pub struct WorkContext {
     /// `RouterRequest` (`"request"`), bound chart entities (`"entities"`),
     /// and per-stage outputs (`"stage.{id}"`). Crosses crate boundaries as
     /// `serde_json::Value` only (never a domain type).
+    ///
+    /// Prefer the typed store (`outputs`) whenever the payload type is known
+    /// at compile time — see the decision rule above.
     pub structured: HashMap<String, serde_json::Value>,
+    /// Typed in-process handoff accumulator (the primary inter-unit channel).
+    ///
+    /// Write with [`WorkContext::set::<T>`] / [`OutputStore::set`], read with
+    /// [`WorkContext::get::<T>`] / [`OutputStore::get`]. See the struct-level
+    /// decision rule for when this is preferred over `data`/`metadata`.
+    pub outputs: OutputStore,
     pub rt: Arc<dyn Runtime>,
     pub caps: CapabilitySet,
 }
@@ -161,6 +195,7 @@ impl std::fmt::Debug for WorkContext {
             .field("timeout_ms", &self.timeout_ms)
             .field("metadata", &self.metadata)
             .field("structured", &self.structured)
+            .field("outputs", &self.outputs)
             .field("rt", &"<dyn Runtime>")
             .field("caps", &self.caps)
             .finish()
@@ -175,6 +210,7 @@ impl Default for WorkContext {
             timeout_ms: 30_000,
             metadata: HashMap::new(),
             structured: HashMap::new(),
+            outputs: OutputStore::default(),
             rt: Arc::new(NoopRuntime),
             caps: CapabilitySet::new(),
         }
@@ -191,9 +227,27 @@ impl WorkContext {
             timeout_ms: unit.default_timeout_ms(),
             metadata: HashMap::new(),
             structured: HashMap::new(),
+            outputs: OutputStore::default(),
             rt: Arc::new(NoopRuntime),
             caps,
         }
+    }
+
+    /// Store a typed value for in-process handoff under `key`.
+    ///
+    /// The canonical writer for the typed store — equivalent to
+    /// `self.outputs.set::<T>(key, value)`. No serialization is performed.
+    pub fn set<T: Send + Sync + 'static>(&mut self, key: impl Into<String>, value: T) {
+        self.outputs.set(key, value);
+    }
+
+    /// Read a typed value previously written with [`WorkContext::set`].
+    ///
+    /// Returns `None` if `key` is absent or holds a different type. This is
+    /// the canonical reader for the typed store; no deserialization is
+    /// performed.
+    pub fn get<T: 'static>(&self, key: &str) -> Option<&T> {
+        self.outputs.get::<T>(key)
     }
 
     /// Read a structured value by key, deserializing it to a typed value.
@@ -247,6 +301,34 @@ mod tests {
         let ctx = WorkContext::default();
         assert!(!ctx.dry_run);
         assert_eq!(ctx.timeout_ms, 30000);
+        assert!(ctx.outputs.is_empty());
+    }
+
+    #[test]
+    fn work_context_typed_channel_handoff() {
+        let mut ctx = WorkContext::default();
+        ctx.set("stage", "deterministic".to_string());
+        ctx.set("attempt", 1_i32);
+
+        assert_eq!(ctx.get::<String>("stage"), Some(&"deterministic".to_string()));
+        assert_eq!(ctx.get::<i32>("attempt"), Some(&1));
+        assert_eq!(ctx.get::<u32>("attempt"), None, "wrong type reads None");
+        assert_eq!(ctx.get::<i32>("absent"), None);
+
+        let clone = ctx.clone();
+        assert_eq!(
+            clone.get::<String>("stage"),
+            Some(&"deterministic".to_string()),
+            "clone shares the typed allocation"
+        );
+    }
+
+    #[test]
+    fn work_context_typed_channel_overwrite() {
+        let mut ctx = WorkContext::default();
+        ctx.set("verdict", "passed".to_string());
+        ctx.set("verdict", "rerouted".to_string());
+        assert_eq!(ctx.get::<String>("verdict"), Some(&"rerouted".to_string()));
     }
 
     #[test]

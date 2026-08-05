@@ -293,11 +293,26 @@ pub struct WorkContext {
     pub max_retries: u32,                // 0 = no retry; >0 = Zone retries this many times
     pub timeout_ms: u64,                 // per-attempt wall-clock budget
     pub metadata: HashMap<String, MetadataValue>,
+    pub outputs: OutputStore,            // typed inter-unit channel
     pub rt: Arc<dyn Runtime>,            // pluggable: TokioRuntime, TestRuntime, NoopRuntime
     pub caps: CapabilitySet,             // type-erased capability tokens
 }
+```
 
-impl Default for WorkContext { /* dry_run=false, max_retries=0, timeout_ms=30_000, NoopRuntime */ }
+**Channel decision rule). ** Three channels coexist on `WorkContext`
+(and `WorkOutput`); pick the narrowest one that fits:
+
+| Channel | Purpose | Example |
+|---|---|---|
+| `outputs` (`OutputStore`, typed `HashMap<String, Arc<dyn Any + Send + Sync>>`) | **Primary** in-process handoff between units and stages. `set::<T>(key, value)` / `get::<T>(key) -> Option<&T>`; clone shares arcs. No serialize/deserialize. | `StageDecision`, retry-attempt counter (`i64`) |
+| `WorkOutput.data: serde_json::Value` | **Only** for serialization boundaries (process/RPC/JSON handoff) and the final unit return value. `typed::<T>()` / `data_take::<T>()` | PipelineResult returned to the HTTP handler |
+| `metadata: HashMap<String, MetadataValue>` | Only for genuinely stringly-typed / dynamic annotations that must survive serialization. | `classifier_system_prompt` (external config key), tags |
+
+Use `outputs` for concrete, typed handoffs; fall back to `data`/`metadata`
+only where the boundary truly requires serialization.
+
+```rust
+impl Default for WorkContext { /* dry_run=false, max_retries=0, timeout_ms=30_000, outputs: OutputStore::default(), NoopRuntime */ }
 
 impl WorkContext {
     /// Build a context for a single unit, using its `default_timeout_ms()`.
@@ -311,6 +326,12 @@ impl WorkContext {
         zone_caps: &CapabilitySet,
         mutate: impl FnOnce(&mut WorkContext),
     ) -> Self;
+
+    /// Store a typed value under `key` for in-process handoff
+    pub fn set<T: Send + Sync + 'static>(&mut self, key: impl Into<String>, value: T);
+
+    /// Borrow a typed value by `key`; `None` if absent or of a different type.
+    pub fn get<T: Send + Sync + 'static>(&self, key: &str) -> Option<&T>;
 }
 ```
 
@@ -319,7 +340,7 @@ impl WorkContext {
 ```rust
 use fluent_wvr::prelude::*;
 // Brings in: Component, WorkUnit, FieldAccess, Describable, FieldError,
-// WorkContext, WorkError, WorkOutput, Capability, CapabilitySet,
+// WorkContext, WorkError, WorkOutput, OutputStore, Capability, CapabilitySet,
 // impl_component, retry_call, ComponentAdapter, ComponentCascade,
 // ExecuteFn, Instrumented, Middleware, MiddlewareChain, Pipeline,
 // SuffixedComponent, MetadataValue, ArcIntern.
@@ -700,12 +721,6 @@ impl_component!(generic (U: Component + 'static) for Instrumented<U>);
 The wrapper also implements `FieldAccess` (delegating `set_field`/`get_field`/`field_names` to the inner) and `Describable` (delegates to inner). `set_field` is *not* rejected — it forwards to the inner type, which requires exclusive access to the inner (`&mut U`) or interior mutability inside the implementation. The `name()` call passes through to the inner type — `Instrumented` does not rename the unit; it only adds observability.
 
 ### Retry
-
-There is **no** `WithRetry` newtype wrapper anymore. A `WorkUnit::execute`
-body MUST NOT block (the WorkUnit purity contract — see the `WorkUnit` doc
-comment) — the old `WithRetry` slept with `std::thread::sleep` inside
-`execute`, which blocked tokio worker threads and was removed by the M5
-consolidation (ROADMAP_20260804_DRY). Retry lives in two canonical homes:
 
 - **Async transport retry**: `common_core::retry::retry_async(max_attempts,
   base_ms, jitter_pct, is_retryable, op)` — used by `RetryChatBackend` and the
@@ -1288,10 +1303,7 @@ The middleware crate does **not** redefine its own wrapper types — it
 composes the canonical ones. The actual
 `TimingMiddleware::with_histogram(histogram)` constructor takes an
 `Arc<LatencyHistogram>`; without one, it produces an `Instrumented`
-that logs via `tracing::info!` only. `RetryMiddleware` was deleted by the
-M5 consolidation (its `WithRetry` wrapper slept inside `execute`, violating
-the WorkUnit purity contract); async retry composes `common_core::retry`
-or the `Zone` supervisor instead.
+that logs via `tracing::info!` only.
 
 ### Stacking middleware
 
@@ -1883,7 +1895,7 @@ let plan = self.tier_registry.execute(query, depth)?;
 // Each tier's execute() receives the prior miss as its trigger via WorkContext
 ```
 
-**Why it's wrong:** The orchestrator encodes domain knowledge about tier ordering, retry policy, and error propagation — violating the "orchestrator never branches on implementation type" principle (§10). The fix (M3 of `ROADMAP_REFINE.md`) wraps each tier as a `WorkUnit` in a `TierRegistry`.
+**Why it's wrong:** The orchestrator encodes domain knowledge about tier ordering, retry policy, and error propagation — violating the "orchestrator never branches on implementation type" principle (§10).
 
 ---
 

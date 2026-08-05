@@ -313,12 +313,18 @@ where
 /// Spawn `cap` workers for `PriorityResultPool` (M5.3). Each worker pops one
 /// job under the queue mutex and, when empty, waits for a submit notification
 /// or shutdown (drain-then-wait).
+///
+/// Shutdown is signaled through a `watch` channel rather than a `Notify`
+/// because `Notify::notify_waiters` does **not** store a permit: a worker that
+/// re-registers its shutdown future *after* `notify_waiters` would miss the
+/// wake and park forever. `watch::Receiver::changed()` is sticky — a receiver
+/// that registers after the send sees it immediately (M2).
 fn spawn_priority_workers<T, R, E, H, HFut>(
     runtime: Arc<dyn Runtime>,
     cap: usize,
     queue: &Arc<PriorityJobQueue<T, R, E>>,
     notify: &Arc<Notify>,
-    shutdown: &Arc<Notify>,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
     handle: H,
 ) -> Vec<JoinHandle<()>>
 where
@@ -334,22 +340,36 @@ where
         {
             let queue = Arc::clone(queue);
             let notify = Arc::clone(notify);
-            let shutdown = Arc::clone(shutdown);
+            let shutdown = shutdown.clone();
             move || {
                 let queue = Arc::clone(&queue);
                 let notify = Arc::clone(&notify);
-                let shutdown = Arc::clone(&shutdown);
+                let mut shutdown = shutdown.clone();
                 async move {
                     loop {
+                        // Register interest in the submit-notify BEFORE taking
+                        // the queue mutex, mirroring `Queue::pop`'s
+                        // anti-missed-wakeup discipline (M2): a submitter that
+                        // pushes between the empty pop and this `select!` would
+                        // otherwise notify a worker that isn't listening yet,
+                        // and the worker would sleep until the next submit.
+                        let notified = notify.notified();
                         {
                             let mut pq = queue.lock().await;
                             if let Some(wrapped) = pq.pop() {
                                 return Some(wrapped);
                             }
                         }
+                        let shutdown = shutdown.changed();
+                        tokio::pin!(shutdown);
+                        // `biased` so a shutdown that is already pending (a
+                        // leftover job-wake permit, or a send that landed while
+                        // this worker was mid-loop) is never shadowed by the
+                        // job notify.
                         tokio::select! {
-                            () = shutdown.notified() => return None,
-                            () = notify.notified() => {},
+                            biased;
+                            _ = &mut shutdown => return None,
+                            () = notified => {},
                         }
                     }
                 }
@@ -543,8 +563,8 @@ where
 {
     queue: Arc<PriorityJobQueue<T, R, E>>,
     notify: Arc<Notify>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
     workers: Vec<JoinHandle<()>>,
-    shutdown: Arc<Notify>,
 }
 
 impl<T, R, E> PriorityResultPool<T, R, E>
@@ -563,7 +583,7 @@ where
     {
         let queue: Arc<PriorityJobQueue<T, R, E>> =
             Arc::new(tokio::sync::Mutex::new(crate::queue::PriorityQueue::new()));
-        let shutdown = Arc::new(Notify::new());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let notify = Arc::new(Notify::new());
         let handler = Arc::new(handler);
         let workers = spawn_priority_workers(
@@ -571,7 +591,7 @@ where
             cap,
             &queue,
             &notify,
-            &shutdown,
+            &shutdown_rx,
             {
                 let handler = Arc::clone(&handler);
                 move |wrapped: WrappedJob<T, R, E>| {
@@ -587,8 +607,8 @@ where
         Self {
             queue,
             notify,
+            shutdown_tx,
             workers,
-            shutdown,
         }
     }
 
@@ -601,16 +621,24 @@ where
             let mut pq = self.queue.lock().await;
             pq.push(wrapped, priority);
         }
-        // Wake workers to drain the queue.
-        self.notify.notify_waiters();
+        // Wake a worker to drain the queue. `notify_one` (not `notify_waiters`,
+        // which wakes every worker for one job): one push needs at most one
+        // wake, and `Notify` stores a permit when no worker is currently
+        // parked, so a sleeping worker is never missed — without the
+        // thundering herd.
+        self.notify.notify_one();
         rx.await
             .map_err(|_| ResultPoolError::Canceled)?
             .map_err(ResultPoolError::Inner)
     }
 
-    /// Shuts down the pool: notifies workers, and awaits their completion.
+    /// Shuts down the pool: signals shutdown to every worker (sticky — a
+    /// worker that is mid-loop when shutdown lands sees it on its next park),
+    /// then awaits their completion. The watch sender keeps the receivers
+    /// alive; workers that outlive an explicit `shutdown` also exit when the
+    /// pool (and thus the sender) is dropped.
     pub async fn shutdown(self) {
-        self.shutdown.notify_waiters();
+        let _ = self.shutdown_tx.send(true);
         for w in self.workers {
             let _ = w.await;
         }
@@ -694,6 +722,57 @@ mod priority_pool_tests {
         assert_eq!(r2.await.unwrap(), 4);
         assert_eq!(r3.await.unwrap(), 6);
 
+        pool.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_priority_pool_single_submit_wakes_sleeper() {
+        // M2 regression: a job submitted while every worker is parked (queue
+        // observed empty) must always wake one worker. The pre-fix worker
+        // registered its `notified()` future only *after* releasing the queue
+        // mutex, so a submit landing in that window notified nobody and the
+        // job sat until the next submit. Multi-threaded + repeated so the race
+        // window has a real chance to be exercised; on the fixed code every
+        // iteration completes within the timeout.
+        let rt = tokio_runtime();
+        for i in 0..64 {
+            let pool = PriorityResultPool::<i32, i32, String>::new(
+                Arc::clone(&rt) as Arc<dyn Runtime>,
+                2,
+                |job: i32| async move { Ok(job) },
+            );
+            // Give the workers a chance to pop-empty and park in the select.
+            tokio::task::yield_now().await;
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                pool.submit(i, 0),
+            )
+            .await
+            .expect("single submit to an idle pool must wake a sleeping worker")
+            .expect("handler must not error");
+            assert_eq!(result, i);
+            pool.shutdown().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_priority_pool_single_submit_paused_time() {
+        // Deterministic variant under virtual time: the worker parks before the
+        // submit, so the pre-registered `notified()` future (created before the
+        // queue mutex is taken) is what the submit's `notify_one` fires.
+        tokio::time::resume();
+        let rt = tokio_runtime();
+        let pool = PriorityResultPool::<i32, i32, String>::new(
+            Arc::clone(&rt) as Arc<dyn Runtime>,
+            1,
+            |job: i32| async move { Ok(job) },
+        );
+        tokio::task::yield_now().await;
+        let result = tokio::time::timeout(Duration::from_secs(5), pool.submit(7, 0))
+            .await
+            .expect("single submit must resolve")
+            .unwrap();
+        assert_eq!(result, 7);
         pool.shutdown().await;
     }
 }

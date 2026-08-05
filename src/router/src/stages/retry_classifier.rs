@@ -10,8 +10,11 @@ use std::sync::Arc;
 
 use fluent_wvr::prelude::*;
 
-/// Maximum number of attempts metadata key.  Injected into `WorkContext`
-/// so the inner stage can include it in tracing/logging.
+/// Maximum number of attempts key.  Injected into the `WorkContext` typed
+/// store (`ctx.set::<i64>(METADATA_RETRY_ATTEMPT, attempt)`) so the inner
+/// stage can include it in tracing/logging. The attempt number is a concrete
+/// `i64`, so it lives in the typed store rather than the stringly-typed
+/// `metadata` channel (see the `WorkContext` decision rule).
 pub const METADATA_RETRY_ATTEMPT: &str = "classifier_retry_attempt";
 /// Parse error from the previous attempt, injected into `WorkContext`.
 pub const METADATA_PARSE_ERROR: &str = "classifier_parse_error";
@@ -74,10 +77,7 @@ impl RetryClassifier {
         parse_error: &str,
     ) -> WorkContext {
         let mut ctx = base.clone();
-        ctx.metadata.insert(
-            METADATA_RETRY_ATTEMPT.into(),
-            MetadataValue::Number(retry_index as i64),
-        );
+        ctx.set(METADATA_RETRY_ATTEMPT, retry_index as i64);
         ctx.metadata.insert(
             METADATA_PARSE_ERROR.into(),
             MetadataValue::String(parse_error.to_string()),
@@ -263,10 +263,7 @@ mod tests {
         let base = WorkContext::default();
         let ctx = retry.build_retry_context(&base, 1, "test error");
 
-        assert_eq!(
-            ctx.metadata.get(METADATA_RETRY_ATTEMPT),
-            Some(&MetadataValue::Number(1))
-        );
+        assert_eq!(ctx.get::<i64>(METADATA_RETRY_ATTEMPT), Some(&1));
         assert_eq!(
             ctx.metadata.get(METADATA_PARSE_ERROR),
             Some(&MetadataValue::String("test error".into()))

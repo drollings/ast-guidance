@@ -55,6 +55,16 @@ impl PoolConfig {
     }
 }
 
+/// Where the pool's connections point, so a replacement opened after a
+/// health-check failure targets the *same* database (M1).
+enum Backing {
+    /// A file-backed database (WAL mode).
+    File(PathBuf),
+    /// A named shared-cache in-memory database (all `config.size` connections
+    /// share one DB — see `common_core::sqlite::open_shared_in_memory`).
+    Memory(Arc<str>),
+}
+
 /// A pool of `rusqlite::Connection` objects sharing one SQLite database file.
 ///
 /// The `Semaphore` bounds the number of concurrent checkouts to `size`; the
@@ -65,8 +75,9 @@ pub struct SqlitePool {
     pub(crate) connections: Mutex<Vec<Connection>>,
     semaphore: Arc<Semaphore>,
     /// Where to reopen a fresh connection when a returned one fails its health
-    /// check (`None` = in-memory pool).
-    path: Option<PathBuf>,
+    /// check — the same database the pool was opened against, so a replaced
+    /// connection never silently becomes a fresh private one.
+    backing: Backing,
     /// Sizing / timeout config, retained so replacements are opened with the
     /// same busy timeout as the original connections.
     config: PoolConfig,
@@ -75,7 +86,15 @@ pub struct SqlitePool {
 impl SqlitePool {
     /// Open (or create) a pool of `config.size` connections to `path` with WAL
     /// mode enabled and a busy timeout.
+    ///
+    /// A literal `:memory:` path is SQLite's *per-connection* private in-memory
+    /// database — `config.size` independent empty DBs, so writes vanish across
+    /// checkouts. It is routed to the shared-name path so an in-memory pool is
+    /// coherent (M1).
     pub fn open(path: &Path, config: &PoolConfig) -> Result<Self, DbError> {
+        if path == Path::new(":memory:") {
+            return Self::open_in_memory(config);
+        }
         let mut connections = Vec::with_capacity(config.size);
         for _ in 0..config.size {
             connections.push(Self::open_wal_configured(path, config)?);
@@ -83,21 +102,33 @@ impl SqlitePool {
         Ok(Self {
             connections: Mutex::new(connections),
             semaphore: Arc::new(Semaphore::new(config.size)),
-            path: Some(path.to_path_buf()),
+            backing: Backing::File(path.to_path_buf()),
             config: *config,
         })
     }
 
     /// Open a pool of in-memory connections (tests / ephemeral stores).
+    ///
+    /// All `config.size` connections are opened to one process-unique
+    /// shared-cache in-memory database (`memdb{N}`), so concurrent checkouts
+    /// see the *same* data. The shared cache lives as long as at least one
+    /// connection to it stays open — the idle set keeps `config.size`
+    /// connections alive for the pool's lifetime.
+    ///
+    /// **Writer serialization:** a shared cache has one write lock across all
+    /// connections. The semaphore (at most `size` concurrent checkouts) plus
+    /// the `busy_timeout` (5s before `SQLITE_BUSY`) already mitigate this for
+    /// the pool's traffic; do not re-architect around it.
     pub fn open_in_memory(config: &PoolConfig) -> Result<Self, DbError> {
+        let name = shared_memory_name();
         let mut connections = Vec::with_capacity(config.size);
         for _ in 0..config.size {
-            connections.push(Self::open_in_memory_configured(config)?);
+            connections.push(Self::open_shared_in_memory_configured(&name, config)?);
         }
         Ok(Self {
             connections: Mutex::new(connections),
             semaphore: Arc::new(Semaphore::new(config.size)),
-            path: None,
+            backing: Backing::Memory(name),
             config: *config,
         })
     }
@@ -112,9 +143,13 @@ impl SqlitePool {
         Ok(conn)
     }
 
-    /// Open a single in-memory connection with the pool's busy timeout.
-    fn open_in_memory_configured(config: &PoolConfig) -> Result<Connection, DbError> {
-        let conn = common_core::sqlite::open_in_memory().map_err(DbError::from)?;
+    /// Open a single connection to the pool's named shared-cache in-memory
+    /// database with the pool's busy timeout.
+    fn open_shared_in_memory_configured(
+        name: &str,
+        config: &PoolConfig,
+    ) -> Result<Connection, DbError> {
+        let conn = common_core::sqlite::open_shared_in_memory(name).map_err(DbError::from)?;
         if config.busy_timeout_ms > 0 {
             conn.busy_timeout(Duration::from_millis(config.busy_timeout_ms))
                 .map_err(DbError::from)?;
@@ -124,9 +159,9 @@ impl SqlitePool {
 
     /// Open a fresh connection matching this pool's backing store.
     fn open_connection(&self) -> Result<Connection, DbError> {
-        match &self.path {
-            Some(path) => Self::open_wal_configured(path, &self.config),
-            None => Self::open_in_memory_configured(&self.config),
+        match &self.backing {
+            Backing::File(path) => Self::open_wal_configured(path, &self.config),
+            Backing::Memory(name) => Self::open_shared_in_memory_configured(name, &self.config),
         }
     }
 
@@ -179,10 +214,19 @@ impl SqlitePool {
             lock(&self.connections).push(conn);
         } else {
             tracing::warn!("discarding unhealthy pooled connection");
-            drop(conn);
+            // Open the replacement BEFORE dropping the unhealthy connection: a
+            // shared-cache in-memory database lives exactly as long as at least
+            // one connection to it stays open, so dropping the last holder
+            // first would destroy the very DB the replacement must reopen.
             match self.open_connection() {
-                Ok(fresh) => lock(&self.connections).push(fresh),
-                Err(e) => tracing::error!("failed to open replacement connection: {e}"),
+                Ok(fresh) => {
+                    lock(&self.connections).push(fresh);
+                    drop(conn);
+                }
+                Err(e) => {
+                    tracing::error!("failed to open replacement connection: {e}");
+                    drop(conn);
+                }
             }
         }
     }
@@ -385,6 +429,16 @@ impl SqlitePool {
     {
         crate::query::query_rows_from_iter(conn, sql, params, map)
     }
+}
+
+/// Allocate a process-unique shared-cache in-memory database name (`memdb{N}`).
+///
+/// Two independent pools never share a cache by accident — the name is unique
+/// per pool *instance*, not per class.
+fn shared_memory_name() -> Arc<str> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    Arc::from(format!("memdb{}", NEXT.fetch_add(1, Ordering::Relaxed)).as_str())
 }
 
 /// A connection checked out from the pool.
@@ -858,5 +912,170 @@ mod tests {
         )
         .unwrap();
         assert_eq!(val, None);
+    }
+
+    // ── M1: in-memory pool isolation ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn in_memory_pool_concurrent_visibility() {
+        // A size-3 in-memory pool must expose ONE shared database: a write on
+        // one checkout is visible on a later checkout AND on a checkout that
+        // was awaited concurrently. On the pre-fix code each checkout saw its
+        // own private empty DB and this test failed.
+        CURRENT_CAPS
+            .scope(db_caps(), async {
+                let pool = Arc::new(SqlitePool::open_in_memory(&PoolConfig::new(3)).unwrap());
+
+                // Checkout A writes the schema + a row.
+                {
+                    let conn = pool.acquire().await.unwrap();
+                    conn.execute_batch(
+                        "CREATE TABLE t (id INTEGER, name TEXT);
+                         INSERT INTO t (id, name) VALUES (1, 'hello')",
+                    )
+                    .unwrap();
+                }
+
+                // Checkout B (sequential) must see the row.
+                let seen = pool
+                    .query_rows(
+                        "SELECT name FROM t",
+                        Vec::<rusqlite::types::Value>::new(),
+                        |row| row.get::<_, String>(0),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(seen, vec!["hello".to_string()]);
+
+                // Checkout C, held concurrently with the SELECT, must also see
+                // the row — this is the case that silently lost data before.
+                // The spawned task acquires ungated: `tokio::spawn` does not
+                // inherit the `CURRENT_CAPS` task-local from the outer scope.
+                let c_handle = {
+                    let pool = Arc::clone(&pool);
+                    tokio::spawn(async move {
+                        let conn = pool.acquire_ungated().await.unwrap();
+                        conn.query_row("SELECT name FROM t WHERE id = 1", [], |r| {
+                            r.get::<_, String>(0)
+                        })
+                        .ok()
+                    })
+                };
+                let query_read = pool
+                    .query_row(
+                        "SELECT name FROM t WHERE id = 1",
+                        Vec::<rusqlite::types::Value>::new(),
+                        |row| row.get::<_, String>(0),
+                    )
+                    .await
+                    .unwrap();
+                let c_read = c_handle.await.unwrap();
+                assert_eq!(c_read.as_deref(), Some("hello"));
+                assert_eq!(query_read.as_deref(), Some("hello"));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_pool_replacement_preserves_data() {
+        // Poison one connection (health check fails on return) and verify a
+        // fresh checkout — backed by a replacement connection — still sees the
+        // original schema/data.
+        use rusqlite::hooks::Authorization;
+
+        CURRENT_CAPS
+            .scope(db_caps(), async {
+                let pool = Arc::new(SqlitePool::open_in_memory(&PoolConfig::new(3)).unwrap());
+                {
+                    let conn = pool.acquire().await.unwrap();
+                    conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+                        .unwrap();
+                    conn.execute(
+                        "INSERT INTO t (id, name) VALUES (?1, ?2)",
+                        rusqlite::params![1, "original"],
+                    )
+                    .unwrap();
+                }
+                {
+                    let conn = pool.acquire().await.unwrap();
+                    conn.authorizer(Some(|_: rusqlite::hooks::AuthContext<'_>| {
+                        Authorization::Deny
+                    }));
+                } // dropped -> health check fails -> replacement connection opened
+
+                let name = pool
+                    .query_row(
+                        "SELECT name FROM t WHERE id = 1",
+                        Vec::<rusqlite::types::Value>::new(),
+                        |row| row.get::<_, String>(0),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    name.as_deref(),
+                    Some("original"),
+                    "replacement connection must reopen the same shared DB"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_pools_are_name_isolated() {
+        // Two independent pools must NOT share data — each has its own
+        // process-unique shared-cache name.
+        CURRENT_CAPS
+            .scope(db_caps(), async {
+                let pool_a = Arc::new(SqlitePool::open_in_memory(&PoolConfig::new(2)).unwrap());
+                let pool_b = Arc::new(SqlitePool::open_in_memory(&PoolConfig::new(2)).unwrap());
+
+                pool_a
+                    .execute_batch("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1)")
+                    .await
+                    .unwrap();
+
+                let err = pool_b
+                    .query_rows("SELECT id FROM t", Vec::<rusqlite::types::Value>::new(), |r| {
+                        r.get::<_, i64>(0)
+                    })
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err, DbError::Sqlite(_)),
+                    "pool B must not see pool A's table, got {err:?}"
+                );
+
+                // And pool A still sees its own data.
+                let rows = pool_a
+                    .query_rows("SELECT id FROM t", Vec::<rusqlite::types::Value>::new(), |r| {
+                        r.get::<_, i64>(0)
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(rows, vec![1]);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn open_literal_memory_path_is_shared() {
+        // `SqlitePool::open(":memory:")` (the DbCapability::open(":memory:")
+        // route) must produce a coherent pool, not `config.size` private DBs.
+        CURRENT_CAPS
+            .scope(db_caps(), async {
+                let pool = Arc::new(
+                    SqlitePool::open(std::path::Path::new(":memory:"), &PoolConfig::new(3))
+                        .unwrap(),
+                );
+                pool.execute_batch("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (5)")
+                    .await
+                    .unwrap();
+                let conn = pool.acquire().await.unwrap();
+                let n: i64 = conn
+                    .query_row("SELECT id FROM t", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(n, 5, "open(\":memory:\") must share one DB across checkouts");
+            })
+            .await;
     }
 }

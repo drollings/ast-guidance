@@ -21,6 +21,7 @@ pub mod capability;
 pub mod macros;
 pub mod metadata;
 pub mod runtime;
+pub mod store;
 pub mod traits;
 pub mod work;
 
@@ -32,6 +33,7 @@ pub use fluent_wvr_macros::{Describable, FieldAccess};
 pub use internment::ArcIntern;
 pub use metadata::MetadataValue;
 pub use runtime::{NoopRuntime, Runtime};
+pub use store::OutputStore;
 pub use traits::{
     component_downcast_mut, component_downcast_ref, Component, ComponentArcExt, Describable,
     FieldAccess, FieldError, FieldSchema, PersistableComponent, SchemaProvider, WorkUnit,

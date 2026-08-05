@@ -15,6 +15,7 @@ pub mod cache_router;
 pub mod db;
 pub mod error;
 pub mod ingest;
+pub mod knowledge;
 pub mod mcp;
 pub mod packer;
 pub mod tier_units;

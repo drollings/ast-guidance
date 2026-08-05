@@ -113,6 +113,15 @@ pub struct PipelineOrchestrator {
     provides: Vec<ArcIntern<str>>,
 }
 
+/// Typed-store key under which `PipelineOrchestrator` publishes each stage's
+/// `StageDecision` for in-process handoff. `handle_stage_verdict` reads the
+/// decision back from the typed store (by reference — no
+/// `WorkOutput.data`/`data_take` round-trip), and any downstream stage or
+/// handler can read it the same way. See the decision-rule doc on
+/// `WorkContext`: the typed store is the primary inter-unit channel; `data`
+/// is reserved for serialization boundaries.
+pub const STAGE_DECISION_KEY: &str = "stage.decision";
+
 impl PipelineOrchestrator {
     pub fn new(stages: Vec<Arc<dyn Component>>) -> Self {
         Self {
@@ -134,16 +143,23 @@ impl PipelineOrchestrator {
         ctx
     }
 
+    /// Apply a stage verdict to the running pipeline state, reading the
+    /// current `StageDecision` from the typed store (published by `execute`
+    /// under `STAGE_DECISION_KEY`) rather than re-deserializing it from
+    /// `WorkOutput.data`. Returns `Some(WorkOutput)` when the pipeline should
+    /// short-circuit (rejected / error); `None` otherwise.
     fn handle_stage_verdict(
-        verdict: &StageVerdict,
+        ctx: &WorkContext,
         stage_name: PipelineStage,
-        decision: &StageDecision,
         current_request: &mut serde_json::Value,
         routing_target: &mut Option<RoutingTarget>,
         classifier_response: &mut Option<String>,
     ) -> Option<Result<WorkOutput, WorkError>> {
+        // Typed handoff: the orchestrator published the decision to the store,
+        // so we read it by reference — no per-stage JSON round-trip.
+        let decision = ctx.get::<StageDecision>(STAGE_DECISION_KEY)?;
         let metadata = StageMetadata::from(decision.metadata.clone());
-        match verdict {
+        match decision.verdict {
             StageVerdict::Passed | StageVerdict::Skipped => {
                 if stage_name == PipelineStage::Classifier {
                     if let Some(resp) = metadata.response() {
@@ -308,19 +324,27 @@ impl WorkUnit for PipelineOrchestrator {
         let mut routing_target: Option<RoutingTarget> = None;
         let mut classifier_response: Option<String> = None;
 
+        // The running accumulator clones the caller's context so each stage's
+        // decision can be published to the typed store (`outputs`) and read by
+        // reference — by `handle_stage_verdict` and by later stages. The typed
+        // store, not `WorkOutput.data`, is the in-process handoff channel.
+        let mut running = ctx.clone();
+
         for stage in &self.stages {
-            let stage_ctx = Self::build_stage_context(ctx, &current_request);
+            let stage_ctx = Self::build_stage_context(&running, &current_request);
             let start = Instant::now();
 
             let stage_name_human = stage.name().to_string();
             tracing::debug!(target: "router.pipeline", stage = %stage_name_human, "stage entering");
 
-            // M5.4: typed handoff. The known stages implement
+            // M5.4 typed handoff. The known stages implement
             // `StageDecisionProducer`, so their `StageDecision` is produced by
             // a direct method call with the running decision accumulator
             // passed by reference — no per-stage serialize→deserialize through
             // `WorkOutput.data`. Arbitrary components (test stubs, pipeline
-            // refs) fall back to the `WorkOutput` channel unchanged.
+            // refs) fall back to the `WorkOutput` channel, which is a genuine
+            // serialization boundary: their serialized decision is
+            // deserialized exactly once here and published to the typed store.
             let decision = if let Some(producer) = as_producer(stage.as_ref()) {
                 producer.evaluate(&stage_ctx, &decisions)
             } else {
@@ -354,10 +378,15 @@ impl WorkUnit for PipelineOrchestrator {
 
                     decisions.push(decision.clone());
 
+                    // Publish the typed decision to the store — the primary
+                    // in-process handoff. `handle_stage_verdict` reads it back
+                    // by reference instead of `data_take()`, and any downstream
+                    // stage can do the same via `STAGE_DECISION_KEY`.
+                    running.set(STAGE_DECISION_KEY, decision);
+
                     if let Some(early_return) = Self::handle_stage_verdict(
-                        &verdict,
+                        &running,
                         stage_name,
-                        &decision,
                         &mut current_request,
                         &mut routing_target,
                         &mut classifier_response,

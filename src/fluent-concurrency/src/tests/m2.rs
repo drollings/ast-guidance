@@ -362,6 +362,60 @@ async fn test_zone_retry_with_max_retries() {
     assert_eq!(counter.load(Ordering::SeqCst), 3);
 }
 
+/// Regression: with the default `is_retryable` predicate
+/// (`WorkError::is_retryable`), a *permanent* `Execution` failure must fail
+/// fast — exactly one attempt, no retry loop — even when `max_retries` is
+/// non-zero. This guards the M5.1 taxonomy: `Execution` is permanent,
+/// `Dependency`/`Timeout` are transient.
+#[tokio::test(start_paused = true)]
+async fn test_zone_permanent_error_does_not_retry() {
+    tokio::time::resume();
+    let runtime = crate::tokio_runtime();
+    let caps = CapabilitySet::new();
+    let mut zone = Zone::new(Arc::clone(&runtime), caps.clone());
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = Arc::clone(&counter);
+
+    struct PermanentFail {
+        name: String,
+        counter: Arc<AtomicUsize>,
+    }
+    impl WorkUnit for PermanentFail {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn depends(&self) -> &[ArcIntern<str>] {
+            &[]
+        }
+        fn provides(&self) -> &[ArcIntern<str>] {
+            &[]
+        }
+        fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+            self.counter.fetch_add(1, Ordering::SeqCst);
+            Err(WorkError::Execution("permanent failure".into()))
+        }
+    }
+    impl_component_for_test!(PermanentFail);
+
+    let unit = Arc::new(PermanentFail {
+        name: "permanent_fail".into(),
+        counter: counter_clone,
+    });
+    let ctx = WorkContext {
+        max_retries: 5,
+        ..WorkContext::default()
+    };
+    zone.register_with_context(unit, ctx).unwrap();
+    let summary: ZoneSummary = (&mut zone).await;
+    assert_eq!(summary.completed.len(), 0);
+    assert_eq!(summary.failed.len(), 1);
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "permanent Execution failure must fail fast without retrying"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn test_zone_real_panic() {
     let runtime = crate::tokio_runtime();
