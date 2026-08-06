@@ -10,16 +10,36 @@
         }
     },
     "models": {
+        "lfm2.5-1.2b": {
+            "endpoint": "http://localhost:8080/v1/chat/completions",
+            "name": "unsloth/lfm2.5-1.2b-instruct",
+            "intelligence": 1,
+            "cost_input": 1e-06,
+            "cost_output": 6e-06,
+            "cost_cached_read": 4e-07,
+            "speed": 8,
+            "total_timeout_ms": 40000,
+            "idle_timeout_ms": 8000,
+            "stream": true,
+            "filter_thinking": true,
+            "retry_count": 2,
+            "retry_base_interval_s": 1,
+            "params": {
+                "num_ctx": 65536,
+                "parallel": 2,
+                "sleep_idle_seconds": 7200
+            }
+        },
         "swarm": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
-            "name": "bartowski/liquidai_lfm2.5-2.6b",
+            "name": "abiray/lfm2.5-2.6b-heretic-abliterated",
             "intelligence": 2,
             "cost_input": 1e-06,
             "cost_output": 6e-06,
             "cost_cached_read": 4e-07,
             "speed": 8,
-            "total_timeout_ms": 30000,
-            "idle_timeout_ms": 6000,
+            "total_timeout_ms": 20000,
+            "idle_timeout_ms": 3000,
             "stream": true,
             "filter_thinking": true,
             "retry_count": 2,
@@ -45,10 +65,10 @@
                 }
             }
         },
-        "qwen3.5-9b": {
+        "lamarck": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
-            "name": "unsloth/qwen3.5-9b-mtp",
-            "intelligence": 4,
+            "name": "lamarck-14b",
+            "intelligence": 3,
             "cost_input": 3e-06,
             "cost_output": 1.8e-05,
             "cost_cached_read": 1.2e-06,
@@ -66,6 +86,27 @@
                 "sleep_idle_seconds": 600
             }
         },
+        "qwen3.6-9b": {
+            "endpoint": "http://localhost:8080/v1/chat/completions",
+            "name": "code",
+            "intelligence": 3,
+            "cost_input": 3e-07,
+            "cost_output": 1.8e-06,
+            "cost_cached_read": 1.2e-07,
+            "speed": 5,
+            "total_timeout_ms": 100000,
+            "idle_timeout_ms": 10000,
+            "stream": true,
+            "filter_thinking": true,
+            "retry_count": 1,
+            "retry_base_interval_s": 2,
+            "params": {
+                "num_ctx": 65536,
+                "repeat_penalty": 1.05,
+                "temperature": 0.7,
+                "sleep_idle_seconds": 600
+            }
+        },
         "qwen3.6-27b": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
             "name": "vinpix/ternary-bonsai-27b-stock-mtp",
@@ -73,7 +114,7 @@
             "cost_input": 3e-06,
             "cost_output": 1.8e-05,
             "cost_cached_read": 1.2e-06,
-            "speed": 5,
+            "speed": 3,
             "total_timeout_ms": 300000,
             "idle_timeout_ms": 30000,
             "stream": true,
@@ -87,10 +128,10 @@
                 "sleep_idle_seconds": 600
             }
         },
-        "prose": {
+        "gemma4-12b": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
             "name": "mradermacher/limn-alpha-12b-i1",
-            "intelligence": 3,
+            "intelligence": 2,
             "cost_input": 3e-06,
             "cost_output": 1.8e-05,
             "cost_cached_read": 1.2e-06,
@@ -102,8 +143,8 @@
             "retry_count": 1,
             "retry_base_interval_s": 2,
             "params": {
-                "num_ctx": 16384,
-                "sleep_idle_seconds": 600,
+                "num_ctx": 32768,
+                "sleep_idle_seconds": 300,
                 "temperature": 0.6
             }
         },
@@ -150,59 +191,59 @@
     },
     "routes": {
         "local": {
-            "group": "question",
+            "group": "default",
             "pipelines": ["default"],
-            "description": "General Q&A, simple questions, research queries"
-        },
-        "chat": {
-            "group": "chitchat",
-            "pipelines": ["default"],
-            "description": "Chit-chat, personal banter"
+            "description": "General Q&A, simple questions, chitchat, research queries"
         },
         "prose": {
             "group": "prose",
             "pipelines": ["default"],
-            "description": "Creative writing, stories, poems, essays, letters, correspondence, novel-writing"
+            "description": "Write a story, poem, essay, or letter"
         },
         "code": {
             "group": "code",
             "pipelines": ["default"],
-            "description": "Programming, software development, dev-ops, debugging, and technical implementation"
+            "description": "Programming, software development, Linux, bash, Python, Rust, dev-ops, debugging, and technical implementation"
+        },
+        "extract": {
+            "group": "extract",
+            "pipelines": ["default"],
+            "description": "Entity recognition, structured data extraction, database lookups"
+        },
+        "summarize": {
+            "group": "summarize",
+            "pipelines": ["default"],
+            "description": "Summarize or condense text"
         },
         "translation": {
             "group": "translation",
             "pipelines": ["default"],
-            "description": "Translation between different languages"
+            "description": "Translate between different languages"
         }
     },
-    "_comment_model_groups": "Each model_group is an ordered target-matching ladder (VISION 'Target selection within a group'): the cheapest candidate self-assesses the request's complexity first and defers to the next, more-intelligent member when the assessed complexity exceeds its `intelligence`. Single-member groups resolve statically. Controlled per pipeline via `pipelines.<name>.target_match` (\"self_assess\" default | \"static\") and `target_match_timeout_ms`.",
+    "_comment_model_groups": "Each model_group is an ordered target-matching ladder (VISION 'Target selection within a group'): the cheapest candidate self-assesses the request's complexity first and defers to the next, more-intelligent member when the assessed complexity exceeds its `intelligence`. E.g. `default` = [swarm (intelligence 2), qwen3.6-27b (intelligence 6)]: swarm answers unless it assesses the request above complexity 2, in which case qwen3.6-27b re-classifies and answers. Single-member groups resolve statically. Controlled per pipeline via `pipelines.<name>.target_match` (\"self_assess\" default | \"static\") and `target_match_timeout_ms`.",
     "model_groups": {
-        "classifier": [
+        "default": [
+            "swarm",
+            "qwen3.6-27b"
+        ],
+        "extract": [
             "swarm"
         ],
-        "question": [
-            "swarm"
-        ],
-        "command": [
+        "summarize": [
             "swarm"
         ],
         "code": [
             "qwen3.6-27b"
         ],
-        "chitchat": [
-            "swarm"
-        ],
-        "psychology": [
+        "reasoning": [
             "qwen3.6-27b"
         ],
         "translation": [
-            "translation"
+            "qwen3.6-27b"
         ],
         "prose": [
-            "prose"
-        ],
-        "ledger": [
-            "swarm"
+            "gemma4-12b"
         ]
     },
     "system_prompt": "You are Coral, a query classifier and safety router based on an amalgam of edge language models. Analyze the user's message and output JSON only.",
