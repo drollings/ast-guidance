@@ -31,7 +31,6 @@ use crate::server::responses::{ResponseBody, ServerStats};
 use crate::server::serve_http;
 use crate::testing::mock::{MockDispatchContext, MockTranscriptEntry, TranscriptProvider};
 use fluent_llm::client::ChatBackend;
-use tracing_subscriber::layer::SubscriberExt;
 
 /// Upstream responder: given the parsed request body, produce an HTTP response.
 type UpstreamRespond = Arc<dyn Fn(&Value) -> hyper::Response<ResponseBody> + Send + Sync>;
@@ -132,6 +131,18 @@ async fn spawn_test_server_with_sessions(
     mock: Option<MockDispatchContext>,
     sessions: Option<std::sync::Arc<crate::dag_session::SessionRegistry>>,
 ) -> TestServer {
+    spawn_test_server_with_ledger(config, mock, sessions, None).await
+}
+
+/// `spawn_test_server` with an optional `SessionRegistry` and/or ledger
+/// (M5 answer-recording tests wire both). A `Some` ledger makes the matched
+/// target's answer read-back via `ContentNodeLedger::get_node` load-bearing.
+async fn spawn_test_server_with_ledger(
+    config: RouterConfig,
+    mock: Option<MockDispatchContext>,
+    sessions: Option<std::sync::Arc<crate::dag_session::SessionRegistry>>,
+    ledger: Option<Arc<crate::ledger::ContentNodeLedger>>,
+) -> TestServer {
     let provider = TranscriptProvider::new(HashMap::new());
     let backend: Arc<dyn ChatBackend> = Arc::new(provider);
     let pipelines = Arc::new(config.build_all_pipelines_with_backend(Some(&backend)));
@@ -142,15 +153,7 @@ async fn spawn_test_server_with_sessions(
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
 
-    let deps = test_deps(
-        pipelines,
-        &config,
-        mock,
-        sessions,
-        None,
-        HashMap::new(),
-        None,
-    );
+    let deps = test_deps_with_ledger(pipelines, &config, mock, sessions, ledger);
     let handle = tokio::spawn(async move {
         if let Err(e) = serve_http(listener, deps).await {
             tracing::error!(target: "router.test", error = %e, "test server failed");
@@ -158,6 +161,33 @@ async fn spawn_test_server_with_sessions(
     });
 
     TestServer { addr, handle }
+}
+
+/// `test_deps` with a session registry and/or ledger wired (M5).
+fn test_deps_with_ledger(
+    pipelines: Arc<std::collections::HashMap<String, Arc<crate::pipeline::PipelineOrchestrator>>>,
+    config: &RouterConfig,
+    mock: Option<Arc<MockDispatchContext>>,
+    sessions: Option<Arc<crate::dag_session::SessionRegistry>>,
+    ledger: Option<Arc<crate::ledger::ContentNodeLedger>>,
+) -> ServerDeps {
+    ServerDeps {
+        pipelines,
+        routes: Arc::new(config.routes.clone()),
+        models: Arc::new(config.models.clone()),
+        stats: Arc::new(ServerStats::new()),
+        max_payload: config.server.max_payload,
+        classifier: None,
+        mock_dispatch: mock,
+        ledger,
+        cache: None,
+        plan_route: None,
+        rigor_route: None,
+        sessions,
+        http_client: Arc::new(reqwest::Client::new()),
+        ladders: HashMap::new(),
+        context_cache: None,
+    }
 }
 
 /// Spawn a server with a plan route (M8 interview round-trip tests). The
@@ -390,6 +420,188 @@ async fn session_step_recorded_and_completed_on_dispatch_path() {
     let step = session.get_step(&step_id).unwrap();
     assert_eq!(step.status, StepStatus::Completed);
     assert!(step.result.as_ref().unwrap().accepted);
+}
+
+// ── M5: matched target's answer recorded in ledger + session ──────────────
+
+/// An upstream that answers every buffered dispatch with `content`.
+async fn upstream_answering(content: &'static str) -> String {
+    spawn_mock_upstream(Arc::new(move |_req: &Value| {
+        let body = json!({
+            "id": "cmpl-m5",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "fast",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": content}
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+        });
+        let s = serde_json::to_string(&body).expect("serialize");
+        hyper::Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(s)).boxed_unsync())
+            .expect("build response")
+    }))
+    .await
+}
+
+/// Read the session's only node and return its LOD0 (full text) content.
+fn session_lod0(ledger: &crate::ledger::ContentNodeLedger, session_id: &str) -> Option<String> {
+    let nodes = ledger.get_session_nodes(session_id, 10).ok()?;
+    nodes.first().map(|n| n.lod[0].clone())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routed_dispatch_answer_recorded_in_ledger_lod0() {
+    use crate::ledger::ContentNodeLedger;
+
+    // Real upstream dispatch (buffered): the transcript classifier routes to
+    // `fast` and the mock upstream answers with a fixed content.
+    let upstream = upstream_answering("the ledger answer").await;
+    let config = make_config(&upstream, false, false, 5000, 2000);
+    let ledger = Arc::new(ContentNodeLedger::open_in_memory().unwrap());
+    let server = spawn_test_server_with_ledger(config, None, None, Some(Arc::clone(&ledger)))
+        .await;
+
+    let body = json!({
+        "model": "fast",
+        "messages": [{"role": "user", "content": "What is 2+2?"}],
+        "session_id": "sess-m5-routed"
+    });
+    let response = post_chat(&server.base_url(), body, 5000)
+        .await
+        .expect("request must complete");
+    assert_eq!(response.status(), 200);
+    let value: Value = response.json().await.expect("response json");
+    assert_eq!(value["choices"][0]["message"]["content"], "the ledger answer");
+
+    let nodes = ledger
+        .get_session_nodes("sess-m5-routed", 10)
+        .expect("session nodes");
+    assert_eq!(nodes.len(), 1, "request + result recorded as one node");
+    assert_eq!(
+        nodes[0].lod[0], "the ledger answer",
+        "matched target's answer must be durably recorded at LOD0"
+    );
+    assert_eq!(nodes[0].accepted, Some(true));
+    assert_eq!(nodes[0].acceptance_score, Some(1.0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mock_dispatch_path_records_answer_in_ledger() {
+    use crate::ledger::ContentNodeLedger;
+
+    // Mock dispatch path: the canned `dispatch_response` is the answer and
+    // must land in the ledger LOD0 (previously only a "mock response" marker
+    // was recorded).
+    let config = make_config(
+        "http://upstream.test:8080/v1/chat/completions",
+        false,
+        false,
+        5000,
+        2000,
+    );
+    let ledger = Arc::new(ContentNodeLedger::open_in_memory().unwrap());
+    let server = spawn_test_server_with_ledger(
+        config,
+        Some(mock_for("What is 2+2?", "mock answer")),
+        None,
+        Some(Arc::clone(&ledger)),
+    )
+    .await;
+
+    let body = json!({
+        "model": "fast",
+        "messages": [{"role": "user", "content": "What is 2+2?"}],
+        "session_id": "sess-m5-mock"
+    });
+    let response = post_chat(&server.base_url(), body, 5000)
+        .await
+        .expect("request must complete");
+    assert_eq!(response.status(), 200);
+
+    assert_eq!(
+        session_lod0(&ledger, "sess-m5-mock").as_deref(),
+        Some("mock answer"),
+        "mock dispatch path must record the real answer, not a marker"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routed_stream_dispatch_answer_recorded_on_completion() {
+    use crate::ledger::ContentNodeLedger;
+
+    // Real upstream SSE stream: the assembled content is finalized once the
+    // stream ends and recorded to the ledger (best-effort content).
+    let upstream = spawn_mock_upstream(Arc::new(|_req: &Value| {
+        let (mut tx, rx) =
+            http_body_util::channel::Channel::<Bytes, std::convert::Infallible>::new(4);
+        tokio::spawn(async move {
+            let events = [
+                r#"data: {"choices":[{"delta":{"content":"streamed "}}]}"#,
+                r#"data: {"choices":[{"delta":{"content":"ledger answer"}}]}"#,
+                "data: [DONE]",
+            ];
+            for event in events {
+                if tx
+                    .send_data(Bytes::from(format!("{event}\n\n")))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        hyper::Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .body(rx.boxed_unsync())
+            .expect("build response")
+    }))
+    .await;
+
+    let config = make_config(&upstream, true, false, 5000, 2000);
+    let ledger = Arc::new(ContentNodeLedger::open_in_memory().unwrap());
+    let server = spawn_test_server_with_ledger(config, None, None, Some(Arc::clone(&ledger)))
+        .await;
+
+    let body = json!({
+        "model": "fast",
+        "messages": [{"role": "user", "content": "stream to me"}],
+        "stream": true,
+        "session_id": "sess-m5-stream"
+    });
+    let response = post_chat(&server.base_url(), body, 5000)
+        .await
+        .expect("request must complete");
+    assert_eq!(response.status(), 200);
+    let text = response.text().await.expect("read SSE body");
+    let joined: String = sse_delta_content(&text).concat();
+    assert_eq!(
+        joined, "streamed ledger answer",
+        "stream must carry the dispatched content"
+    );
+
+    // The stream finalizer runs in a detached task — poll the ledger until
+    // the assembled answer lands (bounded), then assert.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut recorded = None;
+    while tokio::time::Instant::now() < deadline {
+        if session_lod0(&ledger, "sess-m5-stream").as_deref() == Some("streamed ledger answer") {
+            recorded = Some(true);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        recorded.is_some(),
+        "streamed answer must be finalized into the ledger LOD0"
+    );
 }
 
 // ── Scenario 2: SSE stream ───────────────────────────────────────────────
@@ -973,45 +1185,12 @@ async fn successful_dispatch_distills_a_draft_chart() {
 
 // ── M3: escalation ladder — integration ───────────────────────────────────
 
-/// A capture writer + global subscriber that records every formatted tracing
-/// line into a process-wide buffer. Installed exactly once (`OnceLock`); the
-/// escalation tests assert on the `router.audit` lines it captures. No other
-/// test in this binary sets a global subscriber, so first-wins is safe.
-#[derive(Clone, Default)]
-struct AuditCapture(Arc<Mutex<Vec<String>>>);
-
-impl std::io::Write for AuditCapture {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        lock(&self.0).push(String::from_utf8_lossy(buf).into_owned());
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl tracing_subscriber::fmt::MakeWriter<'_> for AuditCapture {
-    type Writer = Self;
-    fn make_writer(&self) -> Self::Writer {
-        self.clone()
-    }
-}
-
+/// Install (once) the process-wide global subscriber and return its capture
+/// buffer. The escalation tests assert on the `router.audit` lines it
+/// records; the buffer is shared with `test_support::capture_logs` so the
+/// once-only `set_global_default` can never starve either consumer.
 fn install_audit_capture() -> Arc<Mutex<Vec<String>>> {
-    static CAPTURE: std::sync::OnceLock<Arc<Mutex<Vec<String>>>> = std::sync::OnceLock::new();
-    CAPTURE
-        .get_or_init(|| {
-            let capture = Arc::new(Mutex::new(Vec::<String>::new()));
-            let subscriber = tracing_subscriber::registry().with(
-                tracing_subscriber::fmt::layer()
-                    .with_writer(AuditCapture(capture.clone()))
-                    .with_ansi(false)
-                    .with_target(true),
-            );
-            let _ = tracing::subscriber::set_global_default(subscriber);
-            capture
-        })
-        .clone()
+    crate::test_support::install_global_subscriber()
 }
 
 /// A config whose `fast` group carries an escalation ladder (turnover) pointed

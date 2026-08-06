@@ -11,17 +11,31 @@ use crate::dispatch::backend::OpenAiChatBackend;
 use crate::dispatch::backend::RetryChatBackend;
 use crate::dispatch::escalation::{EscalationContext, EscalationLadder};
 use crate::dispatch::frontier::DispatchError;
-use crate::ledger::ContentNodeLedger;
 use crate::pipeline::RoutingTarget;
+use crate::server::responses::answer_text;
 use crate::server::responses::completion_to_response;
 use crate::server::responses::fallback_completion;
 use crate::server::responses::HyperResponse;
 use crate::server::responses::ServerStats;
+use crate::streaming::StreamAnswer;
 use crate::testing::mock::MockDispatchContext;
 use crate::types::{RouterMessageContent, RouterRequest, RouterResponse};
 use common_core::string::strip_thinking_blocks;
 
 use crate::charts::extract::WorkflowExtractor;
+
+/// Outcome of a dispatch: the HTTP response plus the matched target's answer
+/// text when it is known synchronously (buffered path). For the streaming
+/// path the answer is assembled asynchronously and surfaced via
+/// [`DispatchOutcome::stream_answer`].
+///
+/// M5: the handler records `answer_text` (or the finalized stream content)
+/// into the session ledger + session step.
+pub struct DispatchOutcome {
+    pub response: HyperResponse,
+    pub answer_text: Option<String>,
+    pub stream_answer: Option<StreamAnswer>,
+}
 
 #[allow(clippy::implicit_hasher)]
 pub async fn handle_dispatch(
@@ -32,15 +46,13 @@ pub async fn handle_dispatch(
     mock_dispatch: Option<&Arc<MockDispatchContext>>,
     http_client: &reqwest::Client,
     is_stream: bool,
-    ledger_node_id: Option<fluent_types::NodeId>,
-    ledger: Option<&Arc<ContentNodeLedger>>,
     cache: Option<&Arc<ResponseCache>>,
     stats: &ServerStats,
     extractor: Option<Arc<WorkflowExtractor>>,
     ladders: &HashMap<String, Arc<EscalationLadder>>,
     context_cache: Option<&Arc<dyn fluent_types::ContextCache>>,
     session: Option<&Arc<Mutex<DependencySession>>>,
-) -> Result<HyperResponse, std::convert::Infallible> {
+) -> Result<DispatchOutcome, std::convert::Infallible> {
     let target_streams = is_stream && rt.stream;
 
     if !target_streams {
@@ -80,12 +92,16 @@ pub async fn handle_dispatch(
                         }
                     }
                 }
-                return Ok(completion_to_response(
-                    &response,
-                    model_name,
-                    false,
-                    Some(&response.model),
-                ));
+                return Ok(DispatchOutcome {
+                    response: completion_to_response(
+                        &response,
+                        model_name,
+                        false,
+                        Some(&response.model),
+                    ),
+                    answer_text: answer_text(&response),
+                    stream_answer: None,
+                });
             }
             stats
                 .cache_misses
@@ -114,21 +130,12 @@ pub async fn handle_dispatch(
                 .await;
             }
             tracing::info!(target: "router.server", model = %model_name, "mock canned response");
-            crate::server::handler::record_ledger_result(
-                ledger,
-                ledger_node_id,
-                true,
-                Some(1.0),
-                "mock response".to_string(),
-            )
-            .await;
             let completion = mock.dispatch_response(entry, model_name);
-            return Ok(completion_to_response(
-                &completion,
-                model_name,
-                is_stream,
-                None,
-            ));
+            return Ok(DispatchOutcome {
+                response: completion_to_response(&completion, model_name, is_stream, None),
+                answer_text: answer_text(&completion),
+                stream_answer: None,
+            });
         }
         tracing::debug!(target: "router.server", model = %model_name, transcript_found = false, "no transcript entry — real dispatch fallback");
     }
@@ -201,7 +208,7 @@ pub(crate) fn render_prompt(router_request: &RouterRequest) -> String {
 /// Try dispatching to a single target.  `is_primary` controls cache write;
 /// `is_fallback` (an index > 0 in the dispatch chain) controls M10b
 /// extraction scope.
-/// Returns `Ok(HyperResponse)` on success or `Err(DispatchError)` on failure.
+/// Returns `Ok(DispatchOutcome)` on success or `Err(DispatchError)` on failure.
 async fn dispatch_to_single_target(
     target: &RoutingTarget,
     router_request: &RouterRequest,
@@ -212,7 +219,7 @@ async fn dispatch_to_single_target(
     is_fallback: bool,
     user_text: &str,
     extractor: Option<Arc<WorkflowExtractor>>,
-) -> Result<HyperResponse, DispatchError> {
+) -> Result<DispatchOutcome, DispatchError> {
     let backend = make_backend(http_client, target);
 
     if stream {
@@ -233,7 +240,11 @@ async fn dispatch_to_single_target(
             hyper::header::HeaderValue::from_static("text/event-stream"),
         );
         crate::server::responses::add_cors_headers(resp.headers_mut());
-        return Ok(resp);
+        return Ok(DispatchOutcome {
+            response: resp,
+            answer_text: None,
+            stream_answer: result.answer,
+        });
     }
 
     let filter_thinking = target.filter_thinking;
@@ -271,22 +282,22 @@ async fn dispatch_to_single_target(
     // distill it into a draft chart (best-effort, never fails the request).
     // M10a: record the *real* rendered prompt; M10b: the extractor gates on
     // `is_fallback` + its configured mode (frontier-assisted by default).
+    let answer = answer_text(&completion).unwrap_or_default();
     if let Some(extractor) = extractor {
-        let answer = completion
-            .choices
-            .first()
-            .map(|c| c.message.content.to_string_lossy())
-            .unwrap_or_default();
         let prompt = render_prompt(router_request);
         extractor.record_success(user_text, &prompt, &target.model, &answer, is_fallback);
     }
 
-    Ok(completion_to_response(
-        &completion,
-        "",
-        false,
-        Some(&target.model),
-    ))
+    Ok(DispatchOutcome {
+        response: completion_to_response(
+            &completion,
+            "",
+            false,
+            Some(&target.model),
+        ),
+        answer_text: answer_text(&completion),
+        stream_answer: None,
+    })
 }
 
 #[allow(clippy::implicit_hasher)]
@@ -302,7 +313,7 @@ pub async fn dispatch_real(
     ladders: &HashMap<String, Arc<EscalationLadder>>,
     context_cache: Option<&Arc<dyn fluent_types::ContextCache>>,
     session: Option<&Arc<Mutex<DependencySession>>>,
-) -> Result<HyperResponse, std::convert::Infallible> {
+) -> Result<DispatchOutcome, std::convert::Infallible> {
     let all_targets = std::iter::once(rt)
         .chain(rt.fallbacks.iter())
         .collect::<Vec<_>>();
@@ -337,7 +348,7 @@ pub async fn dispatch_real(
         )
         .await
         {
-            Ok(resp) => {
+            Ok(outcome) => {
                 crate::audit::emit(
                     "route",
                     serde_json::json!({
@@ -350,7 +361,7 @@ pub async fn dispatch_real(
                         "outcome": "success",
                     }),
                 );
-                return Ok(resp);
+                return Ok(outcome);
             }
             Err(e) => {
                 let attempt_latency_ms = attempt_start.elapsed().as_millis() as u64;
@@ -392,7 +403,7 @@ pub async fn dispatch_real(
     // M3 escalation: only after the local chain is exhausted do we engage the
     // frontier ladder. The ladder is resolved from the resolved route's group
     // (`RoutingTarget.group`); direct-model targets (no group) get `None`.
-    if let Some(ladder) = rt.group.as_deref().and_then(|g| ladders.get(g)) {
+        if let Some(ladder) = rt.group.as_deref().and_then(|g| ladders.get(g)) {
         tracing::info!(
             target: "router.server",
             group = ?rt.group,
@@ -408,7 +419,11 @@ pub async fn dispatch_real(
             session,
         };
         if let Some(resp) = ladder.try_escalate(&esc_ctx).await {
-            return Ok(resp);
+            return Ok(DispatchOutcome {
+                response: resp,
+                answer_text: None,
+                stream_answer: None,
+            });
         }
     }
 
@@ -418,10 +433,14 @@ pub async fn dispatch_real(
         "all dispatch targets failed, returning fallback response"
     );
     let completion = fallback_completion(model_name);
-    Ok(completion_to_response(
-        &completion,
-        model_name,
-        stream,
-        None,
-    ))
+    Ok(DispatchOutcome {
+        response: completion_to_response(
+            &completion,
+            model_name,
+            stream,
+            None,
+        ),
+        answer_text: answer_text(&completion),
+        stream_answer: None,
+    })
 }

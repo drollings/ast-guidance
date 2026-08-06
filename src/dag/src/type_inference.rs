@@ -146,7 +146,7 @@ impl TypeInference {
         false
     }
 
-    /// Number of classes registered during [`build`].
+    /// Number of classes registered during [`TypeInference::build`].
     pub fn class_count(&self) -> usize {
         self.class_count
     }

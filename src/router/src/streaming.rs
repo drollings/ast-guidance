@@ -1,9 +1,60 @@
 //! SSE streaming handler — translates RouterResponse chunks into
 //! OpenAI-compatible streaming delta chunks.
 
+use std::sync::{Arc, Mutex};
+
 use common_core::string::StreamingThinkFilter;
+use common_core::sync::lock;
 
 use crate::types::RouterChoice;
+
+/// Best-effort stream finalization sink (M5). The streaming backend's task
+/// writes the assembled answer here once the stream ends; the HTTP handler
+/// waits on it (bounded) and records the content into the ledger + session
+/// step. `finalize` is idempotent in effect — the last writer wins.
+#[derive(Clone)]
+pub struct StreamAnswer {
+    content: Arc<Mutex<Option<String>>>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl StreamAnswer {
+    pub fn new() -> Self {
+        Self {
+            content: Arc::new(Mutex::new(None)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Finalize with the assembled content, waking any waiter.
+    pub fn finalize(&self, content: String) {
+        *lock(&self.content) = Some(content);
+        self.notify.notify_waiters();
+    }
+
+    /// The finalized content, if the stream has completed.
+    pub fn get(&self) -> Option<String> {
+        lock(&self.content).clone()
+    }
+
+    /// Wait up to `timeout` for the stream to finalize, then return the
+    /// assembled content (or `None` on timeout).
+    pub async fn wait(&self, timeout: std::time::Duration) -> Option<String> {
+        if let Some(content) = self.get() {
+            return Some(content);
+        }
+        tokio::time::timeout(timeout, self.notify.notified())
+            .await
+            .ok()?;
+        self.get()
+    }
+}
+
+impl Default for StreamAnswer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// SSE streaming handler. Translates RouterChoice chunks into
 /// OpenAI-compatible streaming delta chunks.
@@ -134,6 +185,37 @@ mod tests {
     use super::*;
     use crate::types::{RouterChoice, RouterMessage, RouterMessageContent};
     use common_core::string::strip_thinking_blocks;
+
+    #[test]
+    fn stream_answer_finalizes_content() {
+        let answer = StreamAnswer::new();
+        assert_eq!(answer.get(), None);
+        answer.finalize("assembled".into());
+        assert_eq!(answer.get().as_deref(), Some("assembled"));
+    }
+
+    #[tokio::test]
+    async fn stream_answer_wait_returns_after_finalize() {
+        let answer = StreamAnswer::new();
+        let waiter = answer.clone();
+        let task = tokio::spawn(async move {
+            waiter
+                .wait(std::time::Duration::from_millis(2000))
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        answer.finalize("done".into());
+        assert_eq!(task.await.expect("waiter completes").as_deref(), Some("done"));
+    }
+
+    #[tokio::test]
+    async fn stream_answer_wait_times_out_without_finalize() {
+        let answer = StreamAnswer::new();
+        let content = answer
+            .wait(std::time::Duration::from_millis(50))
+            .await;
+        assert_eq!(content, None);
+    }
 
     #[test]
     fn format_single_chunk() {

@@ -14,6 +14,25 @@ use fluent_wvr::prelude::Component;
 use super::{default_true, RejectPatterns, RouterConfig};
 use crate::pipeline::PipelineOrchestrator;
 use crate::score_matrix::ScoreMatrix;
+use crate::target_match::{TargetBackends, TargetMatcher};
+
+/// In-group target-matching policy for a pipeline (§4.6 of the routing
+/// roadmap). `SelfAssess` (default) runs the VISION ladder: each candidate
+/// target self-assesses the prompt and defers to the next, more-intelligent
+/// group member when the assessed complexity exceeds its `intelligence`.
+/// `Static` restores today's behavior — the cheapest qualifying model is
+/// picked at route-resolution time with no self-assessment calls.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TargetMatchMode {
+    /// Run the per-candidate self-assessment ladder for 2+ member groups
+    /// (single-member groups resolve statically, byte-identical to today).
+    #[default]
+    #[serde(rename = "self_assess")]
+    SelfAssess,
+    /// Pick the cheapest qualifying model at resolution time (no LLM calls).
+    #[serde(rename = "static")]
+    Static,
+}
 
 /// Named pipeline parameters. Pipelines are stored as a map keyed by name.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -57,6 +76,19 @@ pub struct PipelineParams {
     /// two stock prompts that demand strict JSON.
     #[serde(default = "default_classifier_retry_prompts")]
     pub classifier_retry_prompts: Vec<String>,
+    /// In-group target-matching policy (§4.6). `SelfAssess` (default) runs the
+    /// target-matching ladder for 2+ member groups; `Static` restores today's
+    /// cheapest-qualifying pick.
+    #[serde(default)]
+    pub target_match: TargetMatchMode,
+    /// Per-self-assessment wall-clock budget for the target-matching ladder.
+    /// Defaults to `DEFAULT_TOTAL_TIMEOUT_MS` (the shared timeout constant).
+    #[serde(default = "default_target_match_timeout_ms")]
+    pub target_match_timeout_ms: u64,
+}
+
+fn default_target_match_timeout_ms() -> u64 {
+    common_core::constants::DEFAULT_TOTAL_TIMEOUT_MS
 }
 
 fn default_classifier_retry_prompts() -> Vec<String> {
@@ -84,6 +116,8 @@ impl Default for PipelineParams {
             score_matrix_authoritative: false,
             classifier_retry_max: 0,
             classifier_retry_prompts: default_classifier_retry_prompts(),
+            target_match: TargetMatchMode::SelfAssess,
+            target_match_timeout_ms: default_target_match_timeout_ms(),
         }
     }
 }
@@ -173,10 +207,47 @@ impl RouterConfig {
             let limiter = Arc::new(fluent_concurrency::pool::Limiter::new(max_concurrency));
             tracing::debug!(target: "router.config", pipeline = %name, classifier_max_concurrency = max_concurrency, "classifier concurrency limiter constructed");
 
+            // M3 target-matching ladder: built only when the pipeline opts in
+            // (`target_match: "self_assess"`). The injected mock/transcript
+            // backend is the matcher's `default` covering every key absent from
+            // the per-key map (test mode: the map is empty, so every candidate
+            // routes through the injected backend); real mode builds one
+            // dedicated `LlmClient` per group member via the single `local_backend`
+            // factory (DIP) and uses the classifier client as defense-in-depth
+            // default for keys outside all groups.
+            let target_matcher = if params.target_match == TargetMatchMode::SelfAssess {
+                let backends = if injected_backend {
+                    TargetBackends::new(HashMap::new(), Arc::clone(&client))
+                } else {
+                    TargetBackends::new(self.target_backends(), Arc::clone(&client))
+                };
+                tracing::debug!(
+                    target: "router.config",
+                    pipeline = %name,
+                    target_backends = backends.len(),
+                    target_match_timeout_ms = params.target_match_timeout_ms,
+                    "target-matching ladder enabled (self-assess)",
+                );
+                Some(TargetMatcher::new(
+                    backends,
+                    Arc::clone(&limiter),
+                    params.target_match_timeout_ms,
+                ))
+            } else {
+                tracing::debug!(
+                    target: "router.config",
+                    pipeline = %name,
+                    "target-matching ladder disabled (static)",
+                );
+                None
+            };
+
             let stage = if let Some(tree) = &self.classification {
                 // M4: classification tree drives the classifier stage. The
                 // injected backend (mock/transcript) is always the default
                 // client; per-node model backends are only built in real mode.
+                // The target-matching ladder is shared with the flat path —
+                // the engine resolves 2+ member group terminals through it.
                 let engine = build_classification_engine(
                     self,
                     tree,
@@ -185,6 +256,7 @@ impl RouterConfig {
                     Arc::clone(&limiter),
                     params.coherence_threshold,
                     !injected_backend,
+                    target_matcher.clone(),
                 );
                 tracing::info!(
                     target: "router.config",
@@ -202,6 +274,7 @@ impl RouterConfig {
                     classifier_model,
                     limiter,
                     Arc::new(engine),
+                    target_matcher,
                 )
             } else {
                 crate::stages::classifier::ClassifierStage::new(
@@ -213,6 +286,7 @@ impl RouterConfig {
                     classifier_intel,
                     classifier_model,
                     limiter,
+                    target_matcher,
                 )
             };
             // M6: when configured, wrap the classifier in the retry decorator
@@ -373,6 +447,7 @@ fn build_classification_engine(
     limiter: Arc<fluent_concurrency::pool::Limiter>,
     coherence_threshold: f64,
     use_per_node_backends: bool,
+    target_matcher: Option<TargetMatcher>,
 ) -> crate::stages::tree::ClassificationEngine {
     let default_params = PipelineParams::default();
     let default_model_key = resolve_classifier_model_key(config, &default_params);
@@ -394,6 +469,7 @@ fn build_classification_engine(
         clients,
         limiter,
         coherence_threshold,
+        target_matcher,
     )
 }
 
@@ -477,6 +553,28 @@ impl RouterConfig {
             .build();
         Some(Arc::new(LlmClient::with_config(llm_config)))
     }
+
+    /// Build the target-matching ladder's per-candidate backend set (DIP —
+    /// reuses the private `local_backend` helper, the single `LlmClient`
+    /// factory; no second construction site).
+    ///
+    /// Iterates every model key referenced by any `model_groups` member and
+    /// maps it to its dedicated `ChatBackend`. The matcher's `default` (for
+    /// keys absent from the map) is supplied by the caller: the injected
+    /// mock/transcript backend when one is provided, otherwise a real client
+    /// (defense in depth — every real group member has a dedicated backend,
+    /// so the default is only reached for a key outside all groups).
+    pub fn target_backends(&self) -> HashMap<String, Arc<dyn ChatBackend>> {
+        let mut backends = HashMap::new();
+        for group in self.model_groups.values() {
+            for key in group.models() {
+                if let Some(backend) = self.local_backend(key) {
+                    backends.insert(key.clone(), backend);
+                }
+            }
+        }
+        backends
+    }
 }
 
 /// A reqwest client for the frontier backend: the shared client by default,
@@ -508,50 +606,15 @@ fn frontier_api_client(shared: &reqwest::Client, api_key_env: Option<&str>) -> r
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use std::sync::Mutex;
-    use tracing_subscriber::layer::SubscriberExt;
 
     use common_core::sync::lock;
 
     use crate::charts::binding::Entity;
     use crate::charts::{ChartDef, ChartError};
     use crate::test_stubs::StubChatBackend;
+    use crate::test_support::capture_logs;
     use fluent_concurrency::pool::Limiter;
-
-    /// A `MakeWriter` that captures formatted log lines for assertions.
-    #[derive(Clone, Default)]
-    struct LogCapture(Arc<Mutex<Vec<String>>>);
-
-    impl Write for LogCapture {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            lock(&self.0).push(String::from_utf8_lossy(buf).into_owned());
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
-        type Writer = Self;
-        fn make_writer(&self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
-        let capture = LogCapture::default();
-        let subscriber = tracing_subscriber::registry().with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(capture.clone())
-                .with_ansi(false)
-                .with_target(true),
-        );
-        let result = tracing::subscriber::with_default(subscriber, f);
-        let logs = lock(&capture.0).clone();
-        (result, logs)
-    }
 
     fn config_with_unresolvable_classifier() -> RouterConfig {
         // `classifier` is enabled but no `classifier_model`, no root
@@ -615,6 +678,77 @@ mod tests {
         assert!(
             !joined.contains("some configured pipelines were not built"),
             "no aggregate error expected, logs:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn target_backends_builds_every_group_member_key() {
+        let config: RouterConfig = serde_json::from_str(
+            r#"{
+                "models": {
+                    "swarm": {"endpoint": "http://a/v1/chat/completions", "name": "swarm", "intelligence": 2, "cost_input": 1.0, "cost_output": 1.0, "cost_cached_read": 0.4, "speed": 8},
+                    "qwen3.6-27b": {"endpoint": "http://b/v1/chat/completions", "name": "qwen3.6-27b", "intelligence": 6, "cost_input": 3.0, "cost_output": 3.0, "cost_cached_read": 1.0, "speed": 4},
+                    "unused": {"endpoint": "http://c/v1/chat/completions", "name": "unused", "intelligence": 9, "cost_input": 9.0, "cost_output": 9.0, "cost_cached_read": 3.0, "speed": 2}
+                },
+                "model_groups": {
+                    "default": ["swarm", "qwen3.6-27b"],
+                    "translation": {"models": ["qwen3.6-27b"]}
+                }
+            }"#,
+        )
+        .expect("valid config");
+
+        let backends = config.target_backends();
+        // Exactly the model keys referenced by any model_groups member are
+        // built (deduplicated across groups) — `unused` is not a group member.
+        let mut keys: Vec<&str> = backends.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["qwen3.6-27b", "swarm"]);
+    }
+
+    #[test]
+    fn builder_threads_target_match_timeout_ms_into_matcher() {
+        // `target_match_timeout_ms` must flow from PipelineParams into the
+        // TargetMatcher's per-assessment budget (M6). The builder logs the
+        // value it passes on the self-assess path; assert it is the configured
+        // knob, not the hardcoded constant.
+        let config: RouterConfig = serde_json::from_str(
+            r#"{
+                "pipelines": {
+                    "default": {
+                        "classifier": true,
+                        "classifier_model": "fast",
+                        "target_match": "self_assess",
+                        "target_match_timeout_ms": 4321
+                    }
+                },
+                "models": {
+                    "fast": {"endpoint": "http://a/v1/chat/completions", "name": "fast", "intelligence": 1, "cost_input": 1.0, "cost_output": 1.0, "cost_cached_read": 0.4, "speed": 10},
+                    "swarm": {"endpoint": "http://b/v1/chat/completions", "name": "swarm", "intelligence": 2, "cost_input": 1.0, "cost_output": 1.0, "cost_cached_read": 0.4, "speed": 9},
+                    "qwen3.6-27b": {"endpoint": "http://c/v1/chat/completions", "name": "qwen3.6-27b", "intelligence": 6, "cost_input": 5.0, "cost_output": 5.0, "cost_cached_read": 2.0, "speed": 4}
+                },
+                "model_groups": {
+                    "default": ["swarm", "qwen3.6-27b"]
+                },
+                "routes": {
+                    "code": {"group": "default", "pipelines": ["default"]}
+                },
+                "default_route": "fast"
+            }"#,
+        )
+        .expect("valid config");
+        let backend: Arc<dyn ChatBackend> = Arc::new(StubChatBackend::always("{}"));
+
+        let (pipeline, logs) = capture_logs(|| {
+            config
+                .build_named_pipeline_with_backend("default", Some(Arc::clone(&backend)))
+                .expect("pipeline builds")
+        });
+        let _ = pipeline;
+        let joined = logs.join("\n");
+        assert!(
+            joined.contains("target_match_timeout_ms=4321"),
+            "builder must thread the configured per-assessment timeout, got:\n{joined}"
         );
     }
 

@@ -37,6 +37,20 @@ pub struct RoutingConfig {
 }
 
 impl RoutingConfig {
+    /// The `model_group` a route resolves through — the route's own `RouteRef`
+    /// group, or the default route's group when the route is unknown (mirrors
+    /// the `resolve_route` lookup at the top of [`Self::resolve_route`]).
+    ///
+    /// The target-matching ladder uses this to find the ordered candidate
+    /// list for a resolved route; `None` when neither the route nor the
+    /// default route has a group entry.
+    pub fn route_group(&self, route: &str) -> Option<&str> {
+        self.routes
+            .get(route)
+            .or_else(|| self.routes.get(&self.default_route))
+            .map(|r| r.group.as_str())
+    }
+
     /// Resolve a route name to a fully-populated typed `RoutingTarget`.
     ///
     /// Reuses `resolve_route` (cheapest model in the route's group whose

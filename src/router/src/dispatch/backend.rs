@@ -23,6 +23,10 @@ use crate::types::{RouterRequest, RouterResponse};
 pub struct StreamResult {
     pub model: String,
     pub body: http_body_util::channel::Channel<Bytes, std::convert::Infallible>,
+    /// M5: best-effort finalization sink for the assembled answer text.
+    /// The streaming task writes `filtered_content()` here when the stream
+    /// ends; `None` for backends/stubs that don't accumulate content.
+    pub answer: Option<crate::streaming::StreamAnswer>,
 }
 
 // ---------------------------------------------------------------------------
@@ -285,11 +289,20 @@ impl ChatBackend for OpenAiChatBackend {
 
             let (mut tx, rx) = http_body_util::channel::Channel::new(32);
 
+            // M5: assemble the streamed answer and finalize it when the stream
+            // ends so the handler can record it into the ledger + session step.
+            let answer = crate::streaming::StreamAnswer::new();
+            let answer_for_task = answer.clone();
+
             tokio::spawn(async move {
                 let mut handler = StreamingHandler::new(&request_id, &model_for_task)
                     .with_filter_thinking(filter_thinking);
                 let mut buf = Vec::new();
                 let mut sent_first_chunk = false;
+
+                let finalize = |handler: &StreamingHandler| {
+                    answer_for_task.finalize(handler.filtered_content());
+                };
 
                 loop {
                     let chunk = match with_total_timeout(
@@ -315,6 +328,7 @@ impl ChatBackend for OpenAiChatBackend {
                                 idle_timeout_ms = idle_timeout_ms,
                                 "stream read error or idle timeout"
                             );
+                            finalize(&handler);
                             if sent_first_chunk {
                                 let _ = tx.send_data(Bytes::from(handler.format_done())).await;
                             }
@@ -329,6 +343,7 @@ impl ChatBackend for OpenAiChatBackend {
                         }
                         if trimmed == "data: [DONE]" {
                             let _ = tx.send_data(Bytes::from(handler.format_done())).await;
+                            finalize(&handler);
                             return;
                         }
                         if let Some(data) = trimmed.strip_prefix("data: ") {
@@ -344,6 +359,7 @@ impl ChatBackend for OpenAiChatBackend {
                                     let _ = tx.send_data(Bytes::from(s)).await;
                                 }
                                 let _ = tx.send_data(Bytes::from(handler.format_done())).await;
+                                finalize(&handler);
                                 return;
                             }
                             let s = handler.format_chunk(&delta.delta, None);
@@ -363,12 +379,17 @@ impl ChatBackend for OpenAiChatBackend {
                         }
                     }
                 }
+                finalize(&handler);
                 if sent_first_chunk {
                     let _ = tx.send_data(Bytes::from(handler.format_done())).await;
                 }
             });
 
-            Ok(StreamResult { model, body: rx })
+            Ok(StreamResult {
+                model,
+                body: rx,
+                answer: Some(answer),
+            })
         })
     }
 }
@@ -659,6 +680,7 @@ mod tests {
                         Ok(StreamResult {
                             model: "test".into(),
                             body: rx,
+                            answer: None,
                         })
                     }
                     Err(e) => Err(e),

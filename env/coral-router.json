@@ -107,6 +107,27 @@
                 "sleep_idle_seconds": 600
             }
         },
+        "qwen3.6-9b": {
+            "endpoint": "http://localhost:8080/v1/chat/completions",
+            "name": "code",
+            "intelligence": 3,
+            "cost_input": 3e-07,
+            "cost_output": 1.8e-06,
+            "cost_cached_read": 1.2e-07,
+            "speed": 5,
+            "total_timeout_ms": 100000,
+            "idle_timeout_ms": 10000,
+            "stream": true,
+            "filter_thinking": true,
+            "retry_count": 1,
+            "retry_base_interval_s": 2,
+            "params": {
+                "num_ctx": 65536,
+                "repeat_penalty": 1.05,
+                "temperature": 0.7,
+                "sleep_idle_seconds": 600
+            }
+        },
         "qwen3.6-27b": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
             "name": "vinpix/ternary-bonsai-27b-stock-mtp",
@@ -114,7 +135,7 @@
             "cost_input": 3e-06,
             "cost_output": 1.8e-05,
             "cost_cached_read": 1.2e-06,
-            "speed": 5,
+            "speed": 3,
             "total_timeout_ms": 300000,
             "idle_timeout_ms": 30000,
             "stream": true,
@@ -216,6 +237,7 @@
             "description": "Translate between different languages"
         }
     },
+    "_comment_model_groups": "Each model_group is an ordered target-matching ladder (VISION 'Target selection within a group'): the cheapest candidate self-assesses the request's complexity first and defers to the next, more-intelligent member when the assessed complexity exceeds its `intelligence`. E.g. `default` = [swarm (intelligence 2), qwen3.6-27b (intelligence 6)]: swarm answers unless it assesses the request above complexity 2, in which case qwen3.6-27b re-classifies and answers. Single-member groups resolve statically. Controlled per pipeline via `pipelines.<name>.target_match` (\"self_assess\" default | \"static\") and `target_match_timeout_ms`.",
     "model_groups": {
         "default": [
             "swarm",

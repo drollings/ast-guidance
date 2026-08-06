@@ -8,7 +8,7 @@ pub mod filters;
 pub mod routing;
 
 pub use self::addr::{hosts_equivalent, parse_bind_addr, validate_no_self_routing};
-pub use self::builder::PipelineParams;
+pub use self::builder::{PipelineParams, TargetMatchMode};
 pub use self::classification::{ClassificationChild, ClassificationNode, ClassificationTree};
 pub use self::escalation::{EscalationLadderConfig, FrontierConfig, ModelGroup};
 pub use self::filters::{
@@ -779,5 +779,80 @@ mod tests {
         cfg.system_prompt = "custom preamble".into();
         let routing = cfg.routing_config();
         assert_eq!(routing.system_prompt, "custom preamble");
+    }
+
+    // ── M6: in-group target-matching knob (PipelineParams) ────────────────
+
+    #[test]
+    fn pipeline_params_target_match_defaults() {
+        let defaults = builder::PipelineParams::default();
+        assert_eq!(
+            defaults.target_match,
+            builder::TargetMatchMode::SelfAssess,
+            "the self-assess ladder is the default policy (§4.6)"
+        );
+        assert_eq!(
+            defaults.target_match_timeout_ms,
+            common_core::constants::DEFAULT_TOTAL_TIMEOUT_MS,
+            "per-self-assessment budget defaults to the shared total-timeout constant"
+        );
+    }
+
+    #[test]
+    fn pipeline_params_target_match_absent_fields_deserialize_to_defaults() {
+        // A pipeline that omits both knob fields must deserialize to the same
+        // defaults (mirror the `classifier_retry_max` pattern) — existing
+        // configs stay byte-identical.
+        let cfg: RouterConfig = serde_json::from_str(
+            r#"{
+                "pipelines": {"default": {"classifier": true, "classifier_model": "fast"}}
+            }"#,
+        )
+        .expect("valid config");
+        let params = &cfg.pipelines["default"];
+        assert_eq!(params.target_match, builder::TargetMatchMode::SelfAssess);
+        assert_eq!(
+            params.target_match_timeout_ms,
+            common_core::constants::DEFAULT_TOTAL_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn pipeline_params_target_match_parses_both_variants() {
+        let self_assess: builder::TargetMatchMode =
+            serde_json::from_str(r#""self_assess""#).expect("self_assess parses");
+        assert_eq!(self_assess, builder::TargetMatchMode::SelfAssess);
+
+        let static_mode: builder::TargetMatchMode =
+            serde_json::from_str(r#""static""#).expect("static parses");
+        assert_eq!(static_mode, builder::TargetMatchMode::Static);
+
+        assert!(
+            serde_json::from_str::<builder::TargetMatchMode>(r#""bogus""#).is_err(),
+            "unknown policy must be rejected, not silently defaulted"
+        );
+    }
+
+    #[test]
+    fn pipeline_params_target_match_round_trips() {
+        // Non-default values survive a serialize → deserialize cycle.
+        let cfg: RouterConfig = serde_json::from_value(serde_json::json!({
+            "pipelines": {
+                "default": {
+                    "classifier": true,
+                    "classifier_model": "fast",
+                    "target_match": "static",
+                    "target_match_timeout_ms": 12345
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(cfg.pipelines["default"].target_match, builder::TargetMatchMode::Static);
+        assert_eq!(cfg.pipelines["default"].target_match_timeout_ms, 12345);
+
+        let serialized = serde_json::to_string(&cfg).unwrap();
+        let back: RouterConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(back.pipelines["default"].target_match, builder::TargetMatchMode::Static);
+        assert_eq!(back.pipelines["default"].target_match_timeout_ms, 12345);
     }
 }

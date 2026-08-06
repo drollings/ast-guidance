@@ -35,6 +35,7 @@ use crate::pipeline_types::{
 use crate::score_matrix::ScoreMatrix;
 use crate::stages::common::{coerce_float, coerce_string, coerce_u8, extract_user_message};
 use crate::stages::tree::ClassificationEngine;
+use crate::target_match::TargetMatcher;
 
 const DEFAULT_COMPLEXITY: u8 = 5;
 const COMPLEXITY_SCALE: f64 = 10.0;
@@ -178,6 +179,58 @@ fn check_thresholds(
     })
 }
 
+/// Resolve a route to a typed `RoutingTarget` through the target-matching
+/// ladder when one is available, falling back to the static
+/// cheapest-qualifying pick.
+///
+/// The ladder only runs for 2+ member groups (a single-member group has
+/// nothing to climb — it resolves statically, byte-identical to today, with no
+/// extra LLM call). The matcher never fails hard: on absence, an unresolvable
+/// group, an empty candidate list, or an internal `None`, the static
+/// `routing_target` path runs (defense in depth).
+///
+/// This is the one selection algorithm shared by the LLM-driven flat path and
+/// the matrix-authoritative branch (DRY — §4.3 of the roadmap).
+fn resolve_via_matcher(
+    routing_config: &RoutingConfig,
+    matcher: Option<&TargetMatcher>,
+    route: &str,
+    complexity: Option<u8>,
+    user_text: &str,
+) -> Option<RoutingTarget> {
+    if let Some(matcher) = matcher {
+        if let Some(group) = routing_config.route_group(route) {
+            let candidates = crate::target_match::candidates_for_group(routing_config, group);
+            if candidates.len() >= 2 {
+                if let Some(tm) = matcher.match_target(
+                    route,
+                    group,
+                    routing_config,
+                    &candidates,
+                    complexity,
+                    user_text,
+                ) {
+                    tracing::info!(
+                        target: "router.pipeline.stage2",
+                        route = %route,
+                        group = %group,
+                        model = %tm.primary.model,
+                        assessments = tm.assessments.len(),
+                        "routing target resolved via self-assessment ladder",
+                    );
+                    return Some(tm.primary);
+                }
+                tracing::warn!(
+                    target: "router.pipeline.stage2",
+                    route = %route,
+                    "target-matching ladder produced no target — static fallback",
+                );
+            }
+        }
+    }
+    routing_config.routing_target(route, complexity)
+}
+
 /// Resolve a classifier output to a typed `RoutingTarget`.
 ///
 /// Only the three standard `action` values are honored:
@@ -188,11 +241,14 @@ fn check_thresholds(
 /// The M4.5 cleanup deleted `normalize_classifier_action`'s route-name
 /// guessing from `action`/`intent` strings — route selection is the
 /// classification tree's job now. Complexity-based model selection still flows
-/// through `RoutingConfig::routing_target` → `resolve_route`.
+/// through the shared target resolver (`resolve_via_matcher`), which runs the
+/// M3 self-assessment ladder when the pipeline opts in.
 fn resolve_routing_target(
     action: &str,
     output: &ClassifierOutput,
     routing_config: &RoutingConfig,
+    matcher: Option<&TargetMatcher>,
+    user_text: &str,
 ) -> Option<RoutingTarget> {
     if action == "respond" {
         tracing::info!(target: "router.pipeline.stage2", "direct response — no dispatch");
@@ -209,7 +265,7 @@ fn resolve_routing_target(
         &routing_config.default_route
     };
 
-    if let Some(rt) = routing_config.routing_target(route, output.complexity) {
+    if let Some(rt) = resolve_via_matcher(routing_config, matcher, route, output.complexity, user_text) {
         tracing::info!(target: "router.pipeline.stage2",
             route = %route,
             model = %rt.model,
@@ -254,6 +310,11 @@ pub struct ClassifierStage {
     /// The M4 classification-tree engine. `Some` short-circuits `execute` into
     /// tree evaluation; the flat path below is then unused (M4.5).
     tree_engine: Option<Arc<ClassificationEngine>>,
+    /// The M3 target-matching ladder. `Some` (pipeline `target_match:
+    /// "self_assess"`) resolves routes through per-candidate self-assessment;
+    /// `None` (`target_match: "static"`) keeps today's cheapest-qualifying
+    /// pick. The tree engine (M4) shares the same matcher via this field.
+    target_matcher: Option<TargetMatcher>,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
@@ -269,6 +330,7 @@ impl ClassifierStage {
         classifier_intelligence: u8,
         classifier_model: impl Into<String>,
         limiter: Arc<Limiter>,
+        target_matcher: Option<TargetMatcher>,
     ) -> Self {
         Self {
             name: ArcIntern::from("pipeline.stage2.classifier"),
@@ -281,6 +343,7 @@ impl ClassifierStage {
             classifier_model: classifier_model.into(),
             limiter,
             tree_engine: None,
+            target_matcher,
             depends: vec![ArcIntern::from("pipeline.stage1.output")],
             provides: vec![ArcIntern::from("pipeline.stage2.output")],
         }
@@ -301,6 +364,7 @@ impl ClassifierStage {
         classifier_model: impl Into<String>,
         limiter: Arc<Limiter>,
         tree_engine: Arc<ClassificationEngine>,
+        target_matcher: Option<TargetMatcher>,
     ) -> Self {
         Self {
             name: ArcIntern::from("pipeline.stage2.classifier.tree"),
@@ -313,6 +377,7 @@ impl ClassifierStage {
             classifier_model: classifier_model.into(),
             limiter,
             tree_engine: Some(tree_engine),
+            target_matcher,
             depends: vec![ArcIntern::from("pipeline.stage1.output")],
             provides: vec![ArcIntern::from("pipeline.stage2.output")],
         }
@@ -438,7 +503,7 @@ impl ClassifierStage {
             },
             ChatMessage {
                 role: "user".into(),
-                content: input,
+                content: input.clone(),
             },
         ];
 
@@ -498,8 +563,13 @@ impl ClassifierStage {
                     completeness: None,
                     risk: None,
                 };
-                let fallback_rt =
-                    resolve_routing_target(&output.action, &output, &self.routing_config);
+                let fallback_rt = resolve_routing_target(
+                    &output.action,
+                    &output,
+                    &self.routing_config,
+                    self.target_matcher.as_ref(),
+                    &input,
+                );
                 return Ok(Self::build_decision(
                     &output,
                     fallback_rt.as_ref(),
@@ -588,8 +658,13 @@ impl ClassifierStage {
                         // response (build_decision sets the response metadata).
                         None
                     } else {
-                        self.routing_config
-                            .routing_target(&top.route_name, output.complexity)
+                        resolve_via_matcher(
+                            &self.routing_config,
+                            self.target_matcher.as_ref(),
+                            &top.route_name,
+                            output.complexity,
+                            &input,
+                        )
                     };
                     return Ok(Self::build_decision(
                         &output,
@@ -602,7 +677,13 @@ impl ClassifierStage {
             }
         }
 
-        let routing_target = resolve_routing_target(&output.action, &output, &self.routing_config);
+        let routing_target = resolve_routing_target(
+            &output.action,
+            &output,
+            &self.routing_config,
+            self.target_matcher.as_ref(),
+            &input,
+        );
 
         Ok(Self::build_decision(
             &output,

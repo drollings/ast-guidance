@@ -10,6 +10,7 @@ mod tests {
     use crate::pipeline::PipelineOrchestrator;
     use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
     use crate::stages::deterministic::DeterministicPreFilter;
+    use crate::test_support::capture_logs;
 
     fn make_pii_filter() -> DeterministicPreFilter {
         let patterns = RejectPatterns {
@@ -375,6 +376,7 @@ mod tests {
             1,
             "fast",
             limiter,
+            None,
         );
 
         std::thread::scope(|scope| {
@@ -823,44 +825,6 @@ mod tests {
 
     // ── M6: RetryClassifier wired into the production builder ──────────────
 
-    /// A `MakeWriter` that captures formatted log lines for assertions.
-    #[derive(Clone, Default)]
-    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-    impl std::io::Write for LogCapture {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap()
-                .push(String::from_utf8_lossy(buf).into_owned());
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
-        type Writer = Self;
-        fn make_writer(&self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
-        use tracing_subscriber::layer::SubscriberExt;
-        let capture = LogCapture::default();
-        let subscriber = tracing_subscriber::registry().with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(capture.clone())
-                .with_ansi(false)
-                .with_target(true),
-        );
-        let result = tracing::subscriber::with_default(subscriber, f);
-        let logs = capture.0.lock().unwrap().clone();
-        (result, logs)
-    }
-
     /// A `ChatBackend` that fails JSON parsing the first two calls (garbage
     /// output) then returns the supplied valid classifier response, recording
     /// every system prompt it receives.
@@ -1091,5 +1055,217 @@ mod tests {
             .routing_target
             .expect("tree engine must produce a target");
         assert_eq!(rt.model, "code-model");
+    }
+
+    // ── M3: target-matching ladder wired into the flat classifier path ───────
+
+    /// A flat config whose `code` route resolves to the 2-member group
+    /// `[swarm, qwen3.6-27b]` — the shipped ladder shape. `target_match` is
+    /// configurable so the static-preserves-today test shares the same shape.
+    fn ladder_config(target_match: &str) -> crate::config::RouterConfig {
+        serde_json::from_str(&format!(
+            r#"{{
+                "pipelines": {{
+                    "default": {{
+                        "classifier": true,
+                        "classifier_model": "fast",
+                        "target_match": "{target_match}"
+                    }}
+                }},
+                "classifier_model": "fast",
+                "models": {{
+                    "fast": {{ "endpoint": "http://upstream.test:8080/v1/chat/completions", "name": "fast", "intelligence": 1, "cost_input": 0.0, "cost_output": 0.0, "cost_cached_read": 0.0, "speed": 10 }},
+                    "swarm": {{ "endpoint": "http://upstream.test:8080/v1/chat/completions", "name": "swarm", "intelligence": 2, "cost_input": 1.0, "cost_output": 1.0, "cost_cached_read": 0.4, "speed": 9 }},
+                    "qwen3.6-27b": {{ "endpoint": "http://upstream.test:8080/v1/chat/completions", "name": "qwen3.6-27b", "intelligence": 6, "cost_input": 5.0, "cost_output": 5.0, "cost_cached_read": 2.0, "speed": 4 }}
+                }},
+                "model_groups": {{
+                    "code": ["swarm", "qwen3.6-27b"]
+                }},
+                "routes": {{
+                    "code": {{ "group": "code", "pipelines": ["default"] }}
+                }},
+                "default_route": "fast"
+            }}"#
+        ))
+        .expect("valid ladder config")
+    }
+
+    /// Run the flat pipeline with a queued `StubChatBackend`. The first
+    /// response is the classifier verdict; the remaining ones are the
+    /// per-candidate self-assessments, consumed in order by the ladder.
+    fn run_ladder_pipeline(
+        config: &crate::config::RouterConfig,
+        responses: Vec<String>,
+    ) -> crate::pipeline::PipelineResult {
+        let backend: Arc<dyn fluent_llm::client::ChatBackend> =
+            Arc::new(crate::test_stubs::StubChatBackend::new(responses));
+        let pipeline = config
+            .build_named_pipeline_with_backend("default", Some(backend))
+            .expect("ladder pipeline should build");
+        let mut ctx = WorkContext::default();
+        ctx.set_structured(
+            "request",
+            &serde_json::json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "help me write a sort"}],
+            }),
+        );
+        let output = pipeline.execute(&ctx).expect("pipeline executes");
+        output.data_as().expect("pipeline result")
+    }
+
+    fn classifier_verdict(complexity: u8, target: &str) -> String {
+        serde_json::json!({
+            "action": "route",
+            "target": target,
+            "coherence_score": 0.9,
+            "safety_score": 0.9,
+            "complexity": complexity,
+            "completeness": 0.9,
+            "risk": 0.1,
+            "reason": "code request",
+        })
+        .to_string()
+    }
+
+    fn assessment(complexity: u8, reason: &str) -> String {
+        serde_json::json!({
+            "complexity": complexity,
+            "reason": reason,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn target_match_ladder_climbs_to_more_intelligent_member() {
+        // Classifier routes to "code" with complexity 1 (start index 0 →
+        // swarm self-assesses first). Swarm reports 7 > its intelligence 2 →
+        // escalate; qwen3.6-27b reports 5 <= 6 → match. The matched target is
+        // the more-intelligent member, exactly 2 self-assessment calls made.
+        let config = ladder_config("self_assess");
+        let result = run_ladder_pipeline(
+            &config,
+            vec![
+                classifier_verdict(1, "code"),
+                assessment(7, "hard"),
+                assessment(5, "ok"),
+            ],
+        );
+        assert!(!result.rejected);
+        let rt = result.routing_target.expect("must dispatch");
+        assert_eq!(rt.target_name.as_deref(), Some("code"));
+        assert_eq!(rt.group.as_deref(), Some("code"));
+        assert_eq!(rt.model, "qwen3.6-27b");
+        // Mechanical-failure fallbacks = the group tail (empty after the last
+        // member) plus any `all_dispatch_targets` entries not already included
+        // — here the primary group's other member, preserving today's
+        // cross-group resilience list (M2 semantics).
+        let fb: Vec<&str> = rt.fallbacks.iter().map(|f| f.model.as_str()).collect();
+        assert_eq!(fb, vec!["swarm"]);
+    }
+
+    #[test]
+    fn target_match_ladder_matches_first_qualifying_member() {
+        // Swarm self-assesses 1 <= 2 → matches immediately. The single
+        // assessment is enough to prove exactly one self-assessment call: an
+        // unexpected second call would pop `None` from the queue and escalate
+        // conservatively to qwen (last member), changing the result.
+        let config = ladder_config("self_assess");
+        let result = run_ladder_pipeline(
+            &config,
+            vec![classifier_verdict(1, "code"), assessment(1, "easy")],
+        );
+        assert!(!result.rejected);
+        let rt = result.routing_target.expect("must dispatch");
+        assert_eq!(rt.model, "swarm");
+        assert_eq!(rt.target_name.as_deref(), Some("code"));
+        // The group tail becomes the mechanical-failure fallback list.
+        let fb: Vec<&str> = rt.fallbacks.iter().map(|f| f.model.as_str()).collect();
+        assert_eq!(fb, vec!["qwen3.6-27b"]);
+    }
+
+    #[test]
+    fn target_match_static_reproduces_todays_cheapest_qualifying_pick() {
+        // `target_match: "static"` disables the ladder entirely: the cheapest
+        // qualifying model (swarm) is picked at resolution time, and only the
+        // single classifier response is consumed — no self-assessment calls.
+        let config = ladder_config("static");
+        let result = run_ladder_pipeline(&config, vec![classifier_verdict(1, "code")]);
+        assert!(!result.rejected);
+        let rt = result.routing_target.expect("must dispatch");
+        assert_eq!(rt.model, "swarm");
+        assert_eq!(rt.target_name.as_deref(), Some("code"));
+        assert_eq!(rt.group.as_deref(), Some("code"));
+    }
+
+    #[test]
+    fn target_match_single_member_group_skips_ladder() {
+        // Default `self_assess` with a single-member group: nothing to climb,
+        // so it resolves statically (no extra LLM call). An extra call would
+        // pop `None` and — if the ladder erroneously ran — land on the sole
+        // member anyway; the audit/assessment path must stay silent. We assert
+        // via the queued response count: exactly the one classifier call.
+        let mut config = ladder_config("self_assess");
+        config.model_groups.insert(
+            "code".into(),
+            crate::config::ModelGroup::Array(vec!["qwen3.6-27b".into()]),
+        );
+        let result = run_ladder_pipeline(&config, vec![classifier_verdict(1, "code")]);
+        assert!(!result.rejected);
+        let rt = result.routing_target.expect("must dispatch");
+        assert_eq!(rt.model, "qwen3.6-27b");
+    }
+
+    #[test]
+    fn target_match_ladder_applies_to_matrix_authoritative_branch() {
+        // The matrix-decides route is resolved through the same ladder (DRY):
+        // the matrix's top route "code" climbs its 2-member group, escalating
+        // swarm (reports 7 > 2) and matching qwen (reports 5 <= 6).
+        let config = serde_json::from_str(
+            r#"{
+                "pipelines": {
+                    "default": {
+                        "classifier": true,
+                        "classifier_model": "fast",
+                        "target_match": "self_assess",
+                        "score_matrix": {
+                            "dimensions": ["coherence", "complexity", "completeness", "risk"],
+                            "weights": [0.3, 0.2, 0.3, 0.2],
+                            "routes": {
+                                "code": { "bands": { "completeness": [0.0, 1.0] } }
+                            }
+                        },
+                        "score_matrix_authoritative": true
+                    }
+                },
+                "classifier_model": "fast",
+                "models": {
+                    "fast": { "endpoint": "http://upstream.test:8080/v1/chat/completions", "name": "fast", "intelligence": 1, "cost_input": 0.0, "cost_output": 0.0, "cost_cached_read": 0.0, "speed": 10 },
+                    "swarm": { "endpoint": "http://upstream.test:8080/v1/chat/completions", "name": "swarm", "intelligence": 2, "cost_input": 1.0, "cost_output": 1.0, "cost_cached_read": 0.4, "speed": 9 },
+                    "qwen3.6-27b": { "endpoint": "http://upstream.test:8080/v1/chat/completions", "name": "qwen3.6-27b", "intelligence": 6, "cost_input": 5.0, "cost_output": 5.0, "cost_cached_read": 2.0, "speed": 4 }
+                },
+                "model_groups": {
+                    "code": ["swarm", "qwen3.6-27b"]
+                },
+                "routes": {
+                    "code": { "group": "code", "pipelines": ["default"] }
+                },
+                "default_route": "fast"
+            }"#,
+        )
+        .expect("valid matrix ladder config");
+
+        let result = run_ladder_pipeline(
+            &config,
+            vec![
+                classifier_verdict(1, "code"),
+                assessment(7, "hard"),
+                assessment(5, "ok"),
+            ],
+        );
+        assert!(!result.rejected);
+        let rt = result.routing_target.expect("must dispatch");
+        assert_eq!(rt.target_name.as_deref(), Some("code"));
+        assert_eq!(rt.model, "qwen3.6-27b");
     }
 }

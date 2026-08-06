@@ -155,6 +155,19 @@ pub fn fallback_completion(model_name: &str) -> RouterResponse {
     }
 }
 
+/// The assistant's answer text from a completion (first choice), or `None`
+/// when the response carries no choices.
+///
+/// M5: the single extraction used by the dispatch path (M10 workflow
+/// extractor, `server/dispatch.rs`) and by the handler when it records the
+/// matched target's answer into the ledger + session step.
+pub fn answer_text(completion: &RouterResponse) -> Option<String> {
+    completion
+        .choices
+        .first()
+        .map(|c| c.message.content.to_string_lossy())
+}
+
 pub fn make_error_completion(model_name: &str, error: &str) -> RouterResponse {
     make_text_completion(model_name, &format!("ERROR: {error}"))
 }
@@ -195,5 +208,34 @@ mod tests {
         let r = fallback_completion("test");
         assert_eq!(r.choices.len(), 1);
         assert_eq!(r.choices[0].finish_reason, "stop");
+    }
+
+    #[test]
+    fn answer_text_extracts_first_choice() {
+        let c = make_text_completion("fast", "the answer");
+        assert_eq!(answer_text(&c).as_deref(), Some("the answer"));
+    }
+
+    #[test]
+    fn answer_text_is_none_without_choices() {
+        let c = RouterResponse {
+            id: String::new(),
+            object: "chat.completion".into(),
+            created: 0,
+            model: "fast".into(),
+            choices: vec![],
+            usage: Usage::default(),
+        };
+        assert_eq!(answer_text(&c), None);
+    }
+
+    #[test]
+    fn answer_text_concatenates_text_parts() {
+        let mut c = make_text_completion("fast", "ignored");
+        c.choices[0].message.content = RouterMessageContent::Parts(vec![
+            crate::types::ContentPart::Text { text: "hello".into() },
+            crate::types::ContentPart::Text { text: "world".into() },
+        ]);
+        assert_eq!(answer_text(&c).as_deref(), Some("hello world"));
     }
 }

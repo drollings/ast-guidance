@@ -45,6 +45,7 @@ pub mod session;
 pub mod stages;
 pub mod streaming;
 pub mod summarization;
+pub mod target_match;
 pub mod telemetry;
 pub mod transforms;
 pub mod types;
@@ -60,6 +61,8 @@ mod server_http_tests;
 mod server_tests;
 #[cfg(test)]
 mod stage_tests;
+#[cfg(test)]
+pub(crate) mod test_support;
 #[cfg(test)]
 pub(crate) mod test_stubs;
 #[cfg(test)]

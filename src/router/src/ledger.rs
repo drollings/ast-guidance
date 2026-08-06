@@ -443,45 +443,7 @@ impl CompactionStrategy for NoopCompaction {
 mod tests {
     use super::*;
     use common_core::hash::uuid_v4;
-    use common_core::sync::lock;
-    use std::io::Write;
-    use std::sync::Mutex;
-    use tracing_subscriber::layer::SubscriberExt;
-
-    /// A `MakeWriter` that captures formatted log lines for audit assertions
-    /// (mirrors the capture helper in `config::builder` tests).
-    #[derive(Clone, Default)]
-    struct LogCapture(Arc<Mutex<Vec<String>>>);
-
-    impl Write for LogCapture {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            lock(&self.0).push(String::from_utf8_lossy(buf).into_owned());
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
-        type Writer = Self;
-        fn make_writer(&self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
-        let capture = LogCapture::default();
-        let subscriber = tracing_subscriber::registry().with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(capture.clone())
-                .with_ansi(false)
-                .with_target(true),
-        );
-        let result = tracing::subscriber::with_default(subscriber, f);
-        let logs = lock(&capture.0).clone();
-        (result, logs)
-    }
+    use crate::test_support::capture_logs;
 
     fn temp_ledger() -> ContentNodeLedger {
         let dir = std::env::temp_dir().join(format!("coral-router-ledger-{}", uuid_v4()));

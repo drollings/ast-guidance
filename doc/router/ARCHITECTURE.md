@@ -354,9 +354,13 @@ coral's Context a reachable read path without the router importing coral.
    the structured JSON verdict (action, target, coherence/safety/complexity
    scores, reason). Checks coherence and safety thresholds. Resolves the route
    via `RoutingConfig::resolve_route()` with complexity-gated model selection
-   and optional score-matrix ranking. Emits a `StageDecision` carrying
-   `metadata.response` (direct answer), `metadata.routing_target` (dispatch
-   instructions), or a rejection verdict.
+   and optional score-matrix ranking — or, when the pipeline opts in
+   (`target_match: "self_assess"`), via the shared `TargetMatcher`, which runs
+   the in-group target-matching ladder (each candidate self-assesses the
+   prompt; the first whose `intelligence` meets its assessed complexity — or
+   the last member — becomes the primary target). Emits a `StageDecision`
+   carrying `metadata.response` (direct answer), `metadata.routing_target`
+   (dispatch instructions), or a rejection verdict.
 6. **Server** (post-pipeline): `server/handler.rs` reads `PipelineResult` — if
    `classifier_response` exists, responds directly; if `routing_target` exists,
    calls `server/dispatch.rs::handle_dispatch`, which walks the primary target
@@ -369,9 +373,13 @@ coral's Context a reachable read path without the router importing coral.
    (`try_escalate`) runs its configured modes, short-circuiting on a
    `ContextCache` hit.
 7. **Ledger** (post-pipeline): `ContentNodeLedger::record_result()` updates the
-   ledger entry with acceptance score and metadata. If a `session_id` is
-   present, the request is tracked as a step in the session registry's
-   `DependencySession`.
+   ledger entry with acceptance score and metadata, and — on the routed and
+   classifier-fallback dispatch branches — the matched target's answer text is
+   recorded into the ledger node (LOD0) via `record_ledger_result` and into the
+   session step via `SessionStepHandle::complete` (best-effort; streaming
+   records whatever content is available at stream finalization). If a
+   `session_id` is present, the request is tracked as a step in the session
+   registry's `DependencySession`.
 
 ## Config-driven pipeline assembly
 
@@ -387,11 +395,17 @@ Each pipeline entry controls:
             "classifier_model": "fast",
             "coherence_threshold": 0.70,
             "blacklist": "env/pii-patterns.json",
-            "score_matrix": { … }
+            "score_matrix": { … },
+            "target_match": "self_assess",
+            "target_match_timeout_ms": 300000
         }
     }
 }
 ```
+
+`target_match` (`"self_assess"` default | `"static"`) selects the in-group
+target-matching policy (§"Model-group target selection"); `target_match_timeout_ms`
+(default `DEFAULT_TOTAL_TIMEOUT_MS`) bounds each self-assessment call.
 
 `RouterConfig::build_named_pipeline_with_backend()` constructs the pipeline
 from config, optionally injecting a mock `ChatBackend` for testing. The
@@ -399,36 +413,54 @@ deterministic pre-filter uses `DeterministicPreFilter::from_config()` when a
 blacklist path is present, or `DeterministicPreFilter::new()` (which includes
 built-in PII patterns) when no blacklist is configured.
 
-## Model-group target selection: fallbacks are targets, not classifier backups
+## Model-group target selection: an in-group target-matching ladder
 
 `env/coral-router.json` gives every model an `intelligence` score (0–10) and
 every `model_group` an ordered list of model keys (e.g. `"default":
-["swarm", "qwen3.6-27b"]`). Selection within a group is complexity-gated at
-route-resolution time:
+["swarm", "qwen3.6-27b"]`). Selection within a group is complexity-gated, in
+one of two modes controlled per pipeline by `pipelines.<name>.target_match`:
 
-- `RoutingConfig::resolve_route` (`config/routing.rs`) picks the cheapest
-  model in the route's group whose `intelligence` meets the classifier's
-  `complexity` score; if none qualifies, it picks the cheapest in the group.
-- `RoutingConfig::routing_target` then populates `RoutingTarget.fallbacks`
-  via `all_dispatch_targets` — every model across the group, ordered by
-  intelligence proximity to the request complexity (primary group first,
-  cost as tie-break). These are *target* candidates, and a `fallback` tree
-  child resolves through the same path.
-- `dispatch_real` (`server/dispatch.rs`) walks the primary target plus its
-  `fallbacks` in order when a target fails (rate limit, timeout, parse
-  error); non-retryable 4xx errors short-circuit the chain. Only after the
-  whole local chain is exhausted does the per-group `EscalationLadder`
-  engage (`dispatch/escalation.rs`).
+- **`target_match: "self_assess"`** (default) — the VISION ladder. At
+  route-resolution time inside the classifier stage, `TargetMatcher`
+  (`target_match.rs`) climbs the group: each candidate target self-assesses
+  the request's complexity via its own `ChatBackend` call (the same shape as a
+  classifier call, bounded by `target_match_timeout_ms` under the shared
+  `Limiter`). The first candidate whose assessed complexity does not exceed its
+  `intelligence` — or the last member of the group — is the matched target.
+  The classifier's own complexity estimate only seeds the *start* index (§4.1
+  of the roadmap): the cheapest candidate whose `intelligence` meets the
+  estimate self-assesses first, so the climb never skips a candidate the
+  classifier already ruled out as too weak. The ladder is DRY-shared between
+  the flat classifier path and the classification-tree engine, and runs only
+  for 2+ member groups (single-member groups and `"static"` resolve
+  byte-identically to today). Every self-assessment and the final match emit a
+  `kind = "target_match"` audit record.
+- **`target_match: "static"`** — today's behavior. `RoutingConfig::resolve_route`
+  picks the cheapest model in the route's group whose `intelligence` meets the
+  classifier's `complexity` score; if none qualifies, it picks the cheapest in
+  the group.
+
+In both modes, `RoutingConfig::routing_target` populates `RoutingTarget.fallbacks`
+via `all_dispatch_targets` — every model across the group, ordered by
+intelligence proximity to the request complexity (primary group first, cost as
+tie-break). The ladder reorders the primary/first fallbacks: the matched
+target becomes the primary and its more-intelligent group tail `G[i+1..=n]`
+leads the fallback list (mechanical-failure walk, in order), followed by any
+cross-group models from `all_dispatch_targets` not already included. These are
+*target* candidates, and a `fallback` tree child resolves through the same
+path. `dispatch_real` (`server/dispatch.rs`) walks the primary target plus its
+`fallbacks` in order when a target fails (rate limit, timeout, parse error);
+non-retryable 4xx errors short-circuit the chain. Only after the whole local
+chain is exhausted does the per-group `EscalationLadder` engage
+(`dispatch/escalation.rs`).
 
 Every model in the chain is a candidate to answer the request — a fallback
 *target*. None of them backs up the classifier: the classifier stage runs on
 its own `classifier_model`, and when the pipeline produces no target the
 handler dispatches to that classifier model as a fallback target
-(`server/handler.rs`) rather than to a classifier backup. The aspirational
-refinement — each candidate target self-classifies the prompt and defers to
-the next, more-intelligent model in the group when complexity exceeds its
-`intelligence`, with the matching model's answer written to the session
-ledger — is described in `VISION.md` §"Target selection within a group".
+(`server/handler.rs`) rather than to a classifier backup. The matched
+target's answer is recorded in the session ledger and session step after
+dispatch (§"Pipeline data flow detail", step 7).
 
 ## Session profiles on models
 

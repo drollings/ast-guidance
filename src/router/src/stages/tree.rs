@@ -31,6 +31,7 @@ use crate::config::{ClassificationNode, ClassificationTree, RoutingConfig};
 use crate::pipeline::RoutingTarget;
 use crate::pipeline_types::{PipelineStage, StageDecision, StageMetadata, StageVerdict};
 use crate::stages::common::{coerce_float, coerce_string, coerce_u8};
+use crate::target_match::{candidates_for_group, AssessmentRecord, TargetMatcher};
 
 /// The three-axis verdict a classifier node's LLM call must return.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -94,6 +95,12 @@ pub struct ClassificationEngine {
     limiter: Arc<Limiter>,
     /// Coherence threshold for classifier nodes that don't set their own.
     default_coherence_threshold: f64,
+    /// The M3 target-matching ladder, shared with the flat classifier path
+    /// (DRY — one climbing implementation). `Some` (pipeline `target_match:
+    /// "self_assess"`) resolves terminals with 2+ member groups through
+    /// per-candidate self-assessment; `None` keeps the static
+    /// cheapest-qualifying pick.
+    target_matcher: Option<TargetMatcher>,
 }
 
 impl ClassificationEngine {
@@ -105,6 +112,7 @@ impl ClassificationEngine {
         clients: HashMap<String, Arc<dyn ChatBackend>>,
         limiter: Arc<Limiter>,
         default_coherence_threshold: f64,
+        target_matcher: Option<TargetMatcher>,
     ) -> Self {
         Self {
             tree,
@@ -113,6 +121,7 @@ impl ClassificationEngine {
             clients,
             limiter,
             default_coherence_threshold,
+            target_matcher,
         }
     }
 
@@ -173,6 +182,7 @@ impl ClassificationEngine {
                 group.as_deref(),
                 description,
                 complexity,
+                user_text,
                 visited,
             )),
             ClassificationNode::Filter {
@@ -371,33 +381,29 @@ impl ClassificationEngine {
         Ok(TreeOutcome::Reject(reason))
     }
 
-    /// Terminal node: resolve a dispatch target. Complexity-based model
-    /// selection flows through `RoutingConfig::resolve_route`.
+    /// Terminal node: resolve a dispatch target. When the pipeline opts into
+    /// target-matching (`target_match: "self_assess"`), a 2+ member group
+    /// resolves through the shared self-assessment ladder
+    /// (`crate::target_match::TargetMatcher`); otherwise the static
+    /// cheapest-qualifying pick runs (`RoutingConfig::routing_target` /
+    /// [`Self::resolve_group_target`]).
     fn evaluate_terminal(
         &self,
         route: &str,
         group: Option<&str>,
         description: &str,
         complexity: Option<u8>,
+        user_text: &str,
         visited: &mut Vec<StageDecision>,
     ) -> TreeOutcome {
         // Strict resolution: a terminal names an explicit route. Unknown route
         // names must not silently divert to the default route — `resolve_route`
         // would fall back; check the flat map first.
         if self.routing.routes.contains_key(route) {
-            if let Some(rt) = self.routing.routing_target(route, complexity) {
-                visited.push(node_decision(
-                    "terminal",
-                    description,
-                    StageVerdict::Passed,
-                    format!("terminal resolved to route '{route}'"),
-                    serde_json::json!({
-                        "route": route,
-                        "group": rt.group,
-                        "model": rt.model,
-                        "complexity": complexity,
-                    }),
-                ));
+            if let Some((rt, assessments)) =
+                self.resolve_route_with_matcher(route, complexity, user_text)
+            {
+                visited.push(terminal_decision(description, &rt, complexity, assessments));
                 return TreeOutcome::Route(rt);
             }
         }
@@ -405,19 +411,10 @@ impl ClassificationEngine {
         // The terminal carries its own `group`: resolve directly through the
         // group's models (the flat routes map has no entry for this route).
         if let Some(group) = group {
-            if let Some(rt) = self.resolve_group_target(route, group, complexity) {
-                visited.push(node_decision(
-                    "terminal",
-                    description,
-                    StageVerdict::Passed,
-                    format!("terminal resolved to group '{group}'"),
-                    serde_json::json!({
-                        "route": route,
-                        "group": group,
-                        "model": rt.model,
-                        "complexity": complexity,
-                    }),
-                ));
+            if let Some((rt, assessments)) =
+                self.resolve_group_target(route, group, complexity, user_text)
+            {
+                visited.push(terminal_decision(description, &rt, complexity, assessments));
                 return TreeOutcome::Route(rt);
             }
         }
@@ -433,15 +430,66 @@ impl ClassificationEngine {
         TreeOutcome::Reject(reason)
     }
 
+    /// Flat-route terminal resolution through the shared target-matching
+    /// ladder when available, falling back to the static
+    /// `RoutingConfig::routing_target` (defense-in-depth — never fails harder
+    /// than today). Single-member groups skip the ladder entirely.
+    fn resolve_route_with_matcher(
+        &self,
+        route: &str,
+        complexity: Option<u8>,
+        user_text: &str,
+    ) -> Option<(RoutingTarget, Option<Vec<AssessmentRecord>>)> {
+        if let Some(matcher) = &self.target_matcher {
+            if let Some(group) = self.routing.route_group(route) {
+                let candidates = candidates_for_group(&self.routing, group);
+                if candidates.len() >= 2 {
+                    if let Some(tm) = matcher.match_target(
+                        route,
+                        group,
+                        &self.routing,
+                        &candidates,
+                        complexity,
+                        user_text,
+                    ) {
+                        return Some((tm.primary, Some(tm.assessments)));
+                    }
+                }
+            }
+        }
+        self.routing
+            .routing_target(route, complexity)
+            .map(|rt| (rt, None))
+    }
+
     /// Resolve a terminal's own `model_group` when no flat `routes` entry
-    /// exists: cheapest model in the group whose `intelligence` meets the
-    /// request complexity, else cheapest in the group.
+    /// exists. When the target-matching ladder is available and the group has
+    /// 2+ members, runs the self-assessment climb; otherwise picks the
+    /// cheapest model in the group whose `intelligence` meets the request
+    /// complexity (else cheapest in the group) — today's static behavior.
     fn resolve_group_target(
         &self,
         route: &str,
         group: &str,
         min_complexity: Option<u8>,
-    ) -> Option<RoutingTarget> {
+        user_text: &str,
+    ) -> Option<(RoutingTarget, Option<Vec<AssessmentRecord>>)> {
+        if let Some(matcher) = &self.target_matcher {
+            let candidates = candidates_for_group(&self.routing, group);
+            if candidates.len() >= 2 {
+                if let Some(tm) = matcher.match_target(
+                    route,
+                    group,
+                    &self.routing,
+                    &candidates,
+                    min_complexity,
+                    user_text,
+                ) {
+                    return Some((tm.primary, Some(tm.assessments)));
+                }
+            }
+        }
+
         let model_keys = self.routing.model_groups.get(group)?.models();
         let candidates: Vec<&String> = model_keys
             .iter()
@@ -467,7 +515,7 @@ impl ClassificationEngine {
         let mut rt = RoutingTarget::from_model_entry(&name, entry);
         rt.group = Some(group.to_string());
         rt.target_name = Some(route.to_string());
-        Some(rt)
+        Some((rt, None))
     }
 
     /// Filter node: deterministic short-circuit over the user message.
@@ -697,6 +745,38 @@ fn fallback_child(
         .find(|c| matches!(c.node, ClassificationNode::Fallback { .. }))
 }
 
+/// Build the `tree_path` decision for a resolved terminal. Additive over the
+/// existing `route`/`group`/`model`/`complexity` fields: when the
+/// target-matching ladder ran, the walk's self-assessment records and a
+/// `matched_via` marker are appended (M4 — auditability by construction).
+fn terminal_decision(
+    description: &str,
+    rt: &RoutingTarget,
+    complexity: Option<u8>,
+    assessments: Option<Vec<AssessmentRecord>>,
+) -> StageDecision {
+    let mut extra = serde_json::json!({
+        "route": rt.target_name,
+        "group": rt.group,
+        "model": rt.model,
+        "complexity": complexity,
+    });
+    if let Some(assessments) = assessments {
+        extra["matched_via"] = serde_json::json!("self_assess");
+        extra["assessments"] = serde_json::json!(assessments);
+    }
+    node_decision(
+        "terminal",
+        description,
+        StageVerdict::Passed,
+        format!(
+            "terminal resolved to route '{}'",
+            rt.target_name.as_deref().unwrap_or("?")
+        ),
+        extra,
+    )
+}
+
 /// Build a per-node `StageDecision` for the `tree_path` audit trail.
 fn node_decision(
     node_type: &'static str,
@@ -764,7 +844,8 @@ mod tests {
     use crate::config::{ModelEntry, ModelGroup, RouteRef, RoutingConfig};
     use crate::pipeline::RoutingTarget;
     use crate::pipeline_types::StageMetadata;
-    use crate::test_stubs::StubChatBackend;
+    use crate::target_match::{TargetBackends, TargetMatcher};
+    use crate::test_stubs::{CountingBackend, StubChatBackend};
 
     use super::*;
 
@@ -852,13 +933,31 @@ mod tests {
     }
 
     fn engine(tree: &ClassificationTree, backend: Arc<dyn ChatBackend>) -> ClassificationEngine {
+        engine_with_matcher(tree, backend, None)
+    }
+
+    fn engine_with_matcher(
+        tree: &ClassificationTree,
+        backend: Arc<dyn ChatBackend>,
+        matcher: Option<TargetMatcher>,
+    ) -> ClassificationEngine {
+        engine_with_routing(tree, backend, test_routing(), matcher)
+    }
+
+    fn engine_with_routing(
+        tree: &ClassificationTree,
+        backend: Arc<dyn ChatBackend>,
+        routing: RoutingConfig,
+        matcher: Option<TargetMatcher>,
+    ) -> ClassificationEngine {
         ClassificationEngine::new(
             tree.clone(),
-            test_routing(),
+            routing,
             backend,
             HashMap::new(),
             Arc::new(Limiter::new(4)),
             0.5,
+            matcher,
         )
     }
 
@@ -871,6 +970,29 @@ mod tests {
             "reason": "test verdict",
         }))
         .unwrap()
+    }
+
+    /// A canned self-assessment response for the target-matching ladder.
+    fn self_assessment(complexity: u8, reason: &str) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "complexity": complexity,
+            "reason": reason,
+        }))
+        .unwrap()
+    }
+
+    /// A ladder matcher whose default backend serves the queued self-assessment
+    /// responses (empty per-key map → every candidate routes through the
+    /// default, mirroring mock/transcript injection).
+    fn ladder_matcher(responses: Vec<String>) -> TargetMatcher {
+        TargetMatcher::new(
+            TargetBackends::new(
+                HashMap::new(),
+                Arc::new(StubChatBackend::new(responses)),
+            ),
+            Arc::new(Limiter::new(4)),
+            0,
+        )
     }
 
     fn routed_target(decision: &StageDecision) -> RoutingTarget {
@@ -967,6 +1089,169 @@ mod tests {
         assert_eq!(rt.target_name.as_deref(), Some("fresh"));
         // Cheapest in "fast" group meeting no-complexity: fast (cost 1e-6 vs small 2e-6).
         assert_eq!(rt.model, "fast");
+    }
+
+    #[test]
+    fn terminal_group_ladder_self_assesses_and_matches() {
+        // The "fast" group has 2 members (fast intelligence 1, small
+        // intelligence 2). A root terminal on that group climbs: fast
+        // self-assesses above its intelligence, small matches.
+        let tree: ClassificationTree = serde_json::from_value(serde_json::json!({
+            "root": { "type": "terminal", "route": "fresh", "group": "fast" }
+        }))
+        .unwrap();
+        let matcher = ladder_matcher(vec![
+            self_assessment(7, "too hard for fast"),
+            self_assessment(1, "easy for small"),
+        ]);
+        let engine = engine_with_matcher(
+            &tree,
+            Arc::new(StubChatBackend::always("{}")),
+            Some(matcher),
+        );
+        let decision = engine.evaluate("some task").unwrap().decision;
+        assert_eq!(decision.verdict, StageVerdict::Passed);
+        let rt = routed_target(&decision);
+        assert_eq!(
+            rt.model, "small",
+            "ladder climbs past the too-weak cheap member",
+        );
+        assert_eq!(rt.target_name.as_deref(), Some("fresh"));
+        assert_eq!(rt.group.as_deref(), Some("fast"));
+
+        // The terminal's tree_path audit carries the ladder walk (additive over
+        // the existing route/group/model/complexity fields).
+        let path = decision.metadata["tree_path"].as_array().expect("tree_path");
+        let terminal = path
+            .iter()
+            .find(|d| d["metadata"]["node_type"] == "terminal")
+            .expect("terminal node decision");
+        assert_eq!(terminal["metadata"]["matched_via"], "self_assess");
+        let assessments = terminal["metadata"]["assessments"]
+            .as_array()
+            .expect("assessments");
+        assert_eq!(assessments.len(), 2);
+        assert_eq!(assessments[0]["model_name"], "fast");
+        assert_eq!(assessments[0]["assessed"], serde_json::json!(7));
+        assert_eq!(assessments[0]["matched"], serde_json::json!(false));
+        assert_eq!(assessments[1]["model_name"], "small");
+        assert_eq!(assessments[1]["assessed"], serde_json::json!(1));
+        assert_eq!(assessments[1]["matched"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn terminal_flat_route_ladder_matches_within_group() {
+        // The route's own group ("code" is a single-member group — static).
+        // Use a 2-member group via a flat route: "local" → group "question"
+        // is single-member too. Build a flat route on the 2-member "fast"
+        // group to exercise the resolve_route_with_matcher path.
+        let mut routing = test_routing();
+        routing.routes.insert(
+            "fresh".into(),
+            RouteRef {
+                group: "fast".into(),
+                pipelines: vec!["default".into()],
+                description: "fresh".into(),
+            },
+        );
+        let tree: ClassificationTree = serde_json::from_value(serde_json::json!({
+            "root": { "type": "terminal", "route": "fresh" }
+        }))
+        .unwrap();
+
+        // fast self-assesses 2 > intelligence 1 → escalate to small, which
+        // matches at 2 <= 2.
+        let matcher = ladder_matcher(vec![
+            self_assessment(2, "above fast"),
+            self_assessment(2, "ok for small"),
+        ]);
+        let engine = engine_with_routing(
+            &tree,
+            Arc::new(StubChatBackend::always("{}")),
+            routing,
+            Some(matcher),
+        );
+        let decision = engine.evaluate("a task").unwrap().decision;
+        assert_eq!(decision.verdict, StageVerdict::Passed);
+        let rt = routed_target(&decision);
+        assert_eq!(rt.model, "small");
+        assert_eq!(rt.target_name.as_deref(), Some("fresh"));
+        assert_eq!(rt.group.as_deref(), Some("fast"));
+
+        let path = decision.metadata["tree_path"].as_array().expect("tree_path");
+        let terminal = path
+            .iter()
+            .find(|d| d["metadata"]["node_type"] == "terminal")
+            .expect("terminal node decision");
+        assert_eq!(
+            terminal["metadata"]["assessments"].as_array().map(Vec::len),
+            Some(2),
+        );
+    }
+
+    #[test]
+    fn terminal_single_member_group_never_self_assesses() {
+        // A single-member group ("code") has nothing to climb — the ladder is
+        // skipped entirely and no self-assessment call is made, even with a
+        // matcher present (byte-identical to today's static pick).
+        let tree: ClassificationTree = serde_json::from_value(serde_json::json!({
+            "root": { "type": "terminal", "route": "code", "group": "code" }
+        }))
+        .unwrap();
+        let counting = Arc::new(CountingBackend::new("{}"));
+        let matcher = TargetMatcher::new(
+            TargetBackends::new(HashMap::new(), Arc::clone(&counting) as Arc<dyn ChatBackend>),
+            Arc::new(Limiter::new(4)),
+            0,
+        );
+        let engine = engine_with_matcher(
+            &tree,
+            Arc::new(StubChatBackend::always("{}")),
+            Some(matcher),
+        );
+        let decision = engine.evaluate("hello").unwrap().decision;
+        assert_eq!(decision.verdict, StageVerdict::Passed);
+        assert_eq!(routed_target(&decision).model, "code-model");
+        assert_eq!(
+            counting.calls(),
+            0,
+            "single-member group must not run the ladder",
+        );
+    }
+
+    #[test]
+    fn terminal_ladder_assessment_failure_escalates_to_last_member() {
+        // The "fast" group: fast's self-assessment is unparseable (conservative
+        // escalate), small matches as the last member regardless.
+        let tree: ClassificationTree = serde_json::from_value(serde_json::json!({
+            "root": { "type": "terminal", "route": "fresh", "group": "fast" }
+        }))
+        .unwrap();
+        let matcher = ladder_matcher(vec![
+            "not json at all".into(),
+            self_assessment(9, "hard even for small"),
+        ]);
+        let engine = engine_with_matcher(
+            &tree,
+            Arc::new(StubChatBackend::always("{}")),
+            Some(matcher),
+        );
+        let decision = engine.evaluate("some task").unwrap().decision;
+        assert_eq!(decision.verdict, StageVerdict::Passed);
+        assert_eq!(routed_target(&decision).model, "small");
+
+        let path = decision.metadata["tree_path"].as_array().expect("tree_path");
+        let terminal = path
+            .iter()
+            .find(|d| d["metadata"]["node_type"] == "terminal")
+            .expect("terminal node decision");
+        let assessments = terminal["metadata"]["assessments"]
+            .as_array()
+            .expect("assessments");
+        assert_eq!(assessments[0]["assessed"], serde_json::Value::Null);
+        assert!(assessments[0]["error"].as_str().is_some());
+        assert_eq!(assessments[0]["matched"], serde_json::json!(false));
+        assert_eq!(assessments[1]["matched"], serde_json::json!(true));
     }
 
     // ── Filter nodes ───────────────────────────────────────────────────

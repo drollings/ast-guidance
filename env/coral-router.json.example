@@ -175,6 +175,7 @@
             "description": "Translation between different languages"
         }
     },
+    "_comment_model_groups": "Each model_group is an ordered target-matching ladder (VISION 'Target selection within a group'): the cheapest candidate self-assesses the request's complexity first and defers to the next, more-intelligent member when the assessed complexity exceeds its `intelligence`. Single-member groups resolve statically. Controlled per pipeline via `pipelines.<name>.target_match` (\"self_assess\" default | \"static\") and `target_match_timeout_ms`.",
     "model_groups": {
         "classifier": [
             "swarm"
