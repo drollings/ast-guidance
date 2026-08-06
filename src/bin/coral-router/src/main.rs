@@ -10,6 +10,7 @@ use fluent_router::config::{validate_no_self_routing, RouterConfig};
 use fluent_router::hnsw::HnswIndexHandle;
 use fluent_router::logging::init_router_logging;
 use fluent_router::routes::plan::PlanRoute;
+use fluent_router::routes::rigor::RigorRoute;
 use fluent_router::server::RouterServer;
 use fluent_router::testing::{
     load_transcript_file, transcript_provider_from_entries, MockDispatchContext,
@@ -179,14 +180,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // file — a half-loaded library must not serve), attach the shared store
     // to the plan route. A missing directory is tolerated (empty store).
     let plan_route = Arc::new(build_plan_route(&config));
+    let rigor_route = Arc::new(build_rigor_route(&config));
 
     // M3 escalation ladders: one per `model_groups[g].escalation` config.
     let http_client = reqwest::Client::new();
     let ladders = config.build_escalation_ladders(&http_client);
 
-    let mut server = RouterServer::new(pipelines, routes, config.models, &config.server, classifier)
-        .with_plan_route(plan_route)
-        .with_ladders(ladders);
+    let mut server =
+        RouterServer::new(pipelines, routes, config.models, &config.server, classifier)
+            .with_plan_route(plan_route)
+            .with_rigor_route(rigor_route)
+            .with_ladders(ladders);
 
     if let Some(ctx) = mock_dispatch {
         server = server.with_mock(ctx);
@@ -374,6 +378,58 @@ fn default_adjudicator_backend(config: &RouterConfig) -> Option<Arc<dyn ChatBack
 /// over the HNSW candidates before adjudication (`None` skips the stage).
 fn default_reranker_backend(config: &RouterConfig) -> Option<Arc<dyn ChatBackend>> {
     let key = config.reranker_model.as_deref()?;
+    let entry = config.models.get(key)?;
+    let model_name = entry.name.as_deref().unwrap_or(key);
+    let llm_config = LlmConfig::new()
+        .api_url(entry.endpoint.clone())
+        .model(model_name.to_string())
+        .timeout_ms(entry.total_timeout_ms)
+        .maybe_extra_body_params(entry.params.clone())
+        .build();
+    Some(Arc::new(LlmClient::with_config(llm_config)))
+}
+
+/// Build the rigor route (M3) from `config.rigor`, mirroring `build_plan_route`.
+///
+/// Each role backend is DIP-constructed exactly once from its model key via
+/// `default_rigor_backend`. With no `rigor` section (or missing keys), the
+/// route is present but unconfigured — requests return an explicit
+/// `Unconfigured` error, never a crash (`env/coral-router.json` ships without
+/// a `rigor` section).
+fn build_rigor_route(config: &RouterConfig) -> RigorRoute {
+    let Some(cfg) = &config.rigor else {
+        return RigorRoute::new();
+    };
+    let mut route = RigorRoute::new().with_config(cfg.clone());
+    if cfg.kv_cache_enabled {
+        route = route.with_kv_cache();
+    }
+    if let Some(backend) = default_rigor_backend(config, cfg.blue_model.as_deref()) {
+        route = route.with_blue_backend(backend);
+    }
+    if let Some(backend) = default_rigor_backend(config, cfg.red_model.as_deref()) {
+        route = route.with_red_backend(backend);
+    }
+    if let Some(backend) = default_rigor_backend(config, cfg.judge_model.as_deref()) {
+        route = route.with_judge_backend(backend);
+    }
+    tracing::info!(
+        target: "coral-router",
+        blue_model = ?cfg.blue_model,
+        red_model = ?cfg.red_model,
+        judge_model = ?cfg.judge_model,
+        kv_cache_enabled = cfg.kv_cache_enabled,
+        max_passes = cfg.max_passes,
+        "rigor route configured",
+    );
+    route
+}
+
+/// Build one rigor role backend from a model key, if derivable. Mirrors
+/// `default_adjudicator_backend`: exactly one `LlmClient` construction site
+/// for rigor's role backends (DIP).
+fn default_rigor_backend(config: &RouterConfig, key: Option<&str>) -> Option<Arc<dyn ChatBackend>> {
+    let key = key?;
     let entry = config.models.get(key)?;
     let model_name = entry.name.as_deref().unwrap_or(key);
     let llm_config = LlmConfig::new()

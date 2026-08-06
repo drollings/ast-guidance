@@ -301,7 +301,14 @@ impl DependencySession {
     /// (promoted to the hot tier by `KvCacheManager::retrieve`) and returned
     /// to the caller, which passes its `file_path` to the next dispatch's
     /// slot-restore. Returns `None` when no snapshot exists.
-    pub async fn rewind_to_checkpoint(
+    ///
+    /// Synchronous by design: the caller holds a `std::sync::MutexGuard`
+    /// around the session (`Arc<Mutex<DependencySession>>`), and holding that
+    /// guard across an `.await` would make the surrounding future non-`Send`.
+    /// The KV restore is pure `tokio::fs` async, so it is bridged through
+    /// `common_core::runtime::block_on` (blocking is the established pattern
+    /// in the router's request path).
+    pub fn rewind_to_checkpoint(
         &mut self,
         checkpoint_name: &str,
     ) -> Result<Option<Arc<KvSnapshot>>, DagError> {
@@ -359,7 +366,7 @@ impl DependencySession {
             return Ok(None);
         };
 
-        Ok(self.restore_kv_snapshot(model).await)
+        Ok(self.restore_kv_snapshot(model))
     }
 
     /// Retrieve + restore the KV cache snapshot for this session: the
@@ -367,12 +374,13 @@ impl DependencySession {
     /// by `KvCacheManager::retrieve`) and returned so the caller can pass its
     /// `file_path` to the next dispatch's slot-restore. `None` when no
     /// snapshot exists.
-    async fn restore_kv_snapshot(&self, model: &str) -> Option<Arc<KvSnapshot>> {
+    fn restore_kv_snapshot(&self, model: &str) -> Option<Arc<KvSnapshot>> {
         let kv = self.kv_cache.as_ref()?;
-        match kv
-            .retrieve(model, self.adapter.as_deref(), &self.session_id)
-            .await
-        {
+        match common_core::runtime::block_on(kv.retrieve(
+            model,
+            self.adapter.as_deref(),
+            &self.session_id,
+        )) {
             Ok(snapshot) => {
                 tracing::info!(
                     session_id = %self.session_id,
@@ -704,7 +712,7 @@ mod tests {
         assert_eq!(session.completed_count(), 2);
 
         // Rewind to checkpoint "a"
-        session.rewind_to_checkpoint("a").await.unwrap();
+        session.rewind_to_checkpoint("a").unwrap();
 
         // "a" is reset, "b" is reset
         assert_eq!(session.get_step("a").unwrap().status, StepStatus::Pending);
@@ -717,7 +725,7 @@ mod tests {
     #[tokio::test]
     async fn test_rewind_missing_checkpoint() {
         let mut session = DependencySession::new("sess-1");
-        let result = session.rewind_to_checkpoint("nonexistent").await;
+        let result = session.rewind_to_checkpoint("nonexistent");
         assert!(matches!(result, Err(DagError::CheckpointNotFound(_))));
     }
 
@@ -799,7 +807,7 @@ mod tests {
         session
             .complete_step("a", ok_result("important result"))
             .unwrap();
-        session.rewind_to_checkpoint("a").await.unwrap();
+        session.rewind_to_checkpoint("a").unwrap();
 
         let step = session.get_step("a").unwrap();
         assert_eq!(step.status, StepStatus::Pending);
@@ -830,7 +838,7 @@ mod tests {
         assert_eq!(session.step_count(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_rewind_restores_kv_snapshot_for_real() {
         use crate::kv_cache::KvSnapshot;
 
@@ -883,7 +891,6 @@ mod tests {
         // feeds the next dispatch's slot-restore), not a log-only no-op.
         let restored = session
             .rewind_to_checkpoint("a")
-            .await
             .unwrap()
             .expect("snapshot should be restored");
         assert_eq!(restored.session_id, "sess-1");
@@ -909,7 +916,7 @@ mod tests {
             .unwrap();
         session.complete_step("a", ok_result("a done")).unwrap();
 
-        let restored = session.rewind_to_checkpoint("a").await.unwrap();
+        let restored = session.rewind_to_checkpoint("a").unwrap();
         assert!(restored.is_none(), "no model → no snapshot keyed → None");
     }
 

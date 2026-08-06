@@ -13,7 +13,7 @@ pub const LOD_COUNT: usize = 6;
 
 /// A deterministic context hit — a short-circuit fact/cached answer that
 /// lets the escalation ladder avoid a frontier call.  `content` is the
-/// verified answer/fact; `source` names the cache that produced it (e.g. 
+/// verified answer/fact; `source` names the cache that produced it (e.g.
 /// "coral-context" or "ledger") for audit provenance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextHit {
@@ -610,8 +610,8 @@ mod tests {
     }
     #[test]
     fn context_hit_defaults_metadata_to_none() {
-        let hit: ContextHit = serde_json::from_str(r#"{"source":"c","content":"x","score":0.5}"#)
-            .unwrap();
+        let hit: ContextHit =
+            serde_json::from_str(r#"{"source":"c","content":"x","score":0.5}"#).unwrap();
         assert!(hit.metadata.is_none());
         assert!((hit.score - 0.5).abs() < f32::EPSILON);
     }

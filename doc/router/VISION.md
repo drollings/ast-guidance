@@ -582,28 +582,44 @@ handled a given request, why, and what it cost.
   corrective prompts when its LLM response fails JSON parsing. Both are
   default-off, so existing behavior and goldens are untouched until a
   deployment opts in.
+- **The ledger view layer** (M2): `Lod` (0..=5), the `LedgerView` trait whose
+  provided `render()` is the single text-exit from the store, `ParallelLedger`
+  (independent default-LOD views over the same shared `Arc<NodeStore>` with
+  per-node overrides), and `FilteredLedger<V>` (reference-only exclusion set +
+  optional render transform — the PII frontier view via M1's
+  `scrub_for_ledger`). Rendering degrades to LOD0 when a lazy tier is
+  un-derivable rather than erroring. This is the concrete mechanism the
+  `rigor` route's red-team view and the PII-anonymized frontier view are built
+  on.
+- **The Content Node write path is checked** (M1): `ContentNodeLedger` (the
+  facade) scrubs every write through the builtin filter engine with the
+  `ContentNodeWrite` scope active before reaching `NodeStore`, so the durable
+  ledger can never cache text matching a builtin PII pattern — irreversible,
+  on by default, audited (`write_path: true`). Direct `NodeStore` writes are
+  the documented bypass (production writes route through the facade).
+- **The `rigor` route is wired to live backends** (M3): the fixed-pass
+  blue/red/judge protocol runs against DIP-injected `Arc<dyn ChatBackend>`
+  role backends, with a real `DependencySession` checkpoint (`rigor.blue`)
+  between blue and red and a real `rewind_to_checkpoint` on a material
+  rejection. The red team reads the session through M2's `FilteredLedger` at
+  `Lod::LOD0` (dead ends excluded), the judge emits a structured verdict with
+  confidence, and a final rejection resolves to a targeted interview (≤ 3
+  questions) — escalating to frontier only on low judge confidence (an
+  explicit config value). Round count is fixed at `max_passes` (default 2);
+  `/v1/rigor` serves executed/clarify responses and is present-but-unconfigured
+  in the shipped config (explicit 503, never a crash).
 
 **Designed, not yet load-bearing:**
 
-- **Parallel and filtered ledgers over the shared store — the remaining big
-  pillar.** The shared, reference-counted store itself is real now
-  (`node_store.rs`): nodes live once behind `Arc<RwLock<ContentNode>>`
-  with interned `ArcIntern<str>` session/role index keys and durable
-  `content_json` hydration, and `ContentNodeLedger` is a thin facade over it.
-  What does *not* exist yet is the VISION's view layer on top: parallel
-  ledgers holding independent default-LOD views over the same nodes, and
-  filtered ledgers as reference-only overlays (PII-anonymized frontier view,
-  rigor-route red-team view, specialist-agent narrowed view). This is the
-  largest contiguous unfinished body of work in the router; planning should
-  allocate accordingly.
 - Per-LOD-tier ledger HNSW scene graphs, dirty-tracked and lazily rebuilt.
+- The specialist-agent narrowed-view consumer of filtered ledgers (the PII
+  frontier view and rigor's red-team view — the other two consumers — are
+  load-bearing now).
 - Three separate library-scale HNSW indices (prior-workflow library,
   rubric/validated-answer cache, blacklist-adjacent similarity) —
   structurally scoped; the prior-workflow library is populated and wired into
   the plan route, the rubric/validated-answer cache is populated by the
   rubric gate, the blacklist index remains unpopulated.
-- The `rigor` route — types and structure exist; execution is not yet wired
-  to live agents.
 - Origin-typed Content Nodes and the dedicated `audit`/`concern` node
   convention.
 
@@ -613,19 +629,15 @@ handled a given request, why, and what it cost.
   model) — being resolved by collapsing duplicate-weight model entries into
   one resident model with named session profiles.
 - An adapter registry that exists in configuration but is unpopulated.
-- Guardrail coverage limited to frontier-bound traffic; neither local agent
-  calls nor the Content Node write path are yet checked.
+- Guardrail coverage limited to frontier-bound traffic and the Content Node
+  write path (now checked, M1); **local agent calls** are the remaining
+  unchecked surface.
 - llama.cpp parallel-slot / continuous-batching wiring for classifier
   fan-out is not yet the confirmed execution model for `ResultPool`-backed
   classifier calls.
 
 ## Near-term direction
 
-- Build the view layer over the shared store: parallel ledgers holding
-  independent default-LOD views over the same nodes, and filtered ledgers as
-  reference-only overlays (PII-anonymized frontier view, rigor-route red-team
-  view, specialist-agent narrowed view). This is the remaining big pillar (see
-  "Current status").
 - Implement per-LOD-tier ledger HNSW scene graphs, dirty-tracked and lazily
   rebuilt, for conceptual-distance-based rendering.
 

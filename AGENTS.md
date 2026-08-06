@@ -96,7 +96,20 @@ src/
       ledger.rs                ContentNodeLedger — canonical ContentNode store;
                                LOD0/LOD5 eager, LOD1–4 lazy from LOD0 via
                                Summarizer; CompactionStrategy/RecencyCompaction
-                               (folded in from deleted compaction.rs)
+                               (folded in from deleted compaction.rs); facade
+                               owns the M1 write-path guard (scrub before write)
+      ledger_guard.rs          Irreversible write-path scrubber (M1): evaluates
+                               the builtin filter engine with the
+                               ContentNodeWrite scope; also the `transform` hook
+                               impl for the PII frontier view (M2)
+      views.rs                 Reference-only view layer over NodeStore (M2):
+                               Lod newtype (0..=5), LedgerView trait (render is
+                               the single text-exit), ParallelLedger,
+                               FilteredLedger<V>, pii_redacted helper
+      node_store.rs            Shared Arc<RwLock<ContentNode>> store + interned
+                               session/role indices + durable content_json;
+                               ensure_tier/lod_text/session_node_ids render
+                               primitives
       stages/
         deterministic.rs       Stage 1: command dispatch, PII detection
         classifier.rs          Stage 2: single LLM call that subsumes the former

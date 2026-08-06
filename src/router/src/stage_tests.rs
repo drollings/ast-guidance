@@ -954,7 +954,9 @@ mod tests {
                 }),
             );
             let output = pipeline.execute(&ctx).expect("pipeline executes");
-            output.data_as::<crate::pipeline::PipelineResult>().expect("pipeline result")
+            output
+                .data_as::<crate::pipeline::PipelineResult>()
+                .expect("pipeline result")
         });
 
         // Final decision is non-fallback and dispatched through the LLM target.
@@ -1055,7 +1057,11 @@ mod tests {
         // produces the final decision.
         let config = tree_test_config();
         let mut with_retry = config;
-        with_retry.pipelines.get_mut("default").unwrap().classifier_retry_max = 2;
+        with_retry
+            .pipelines
+            .get_mut("default")
+            .unwrap()
+            .classifier_retry_max = 2;
         let backend: Arc<dyn fluent_llm::client::ChatBackend> = Arc::new(TreeRecordingBackend {
             prompts: Arc::new(std::sync::Mutex::new(Vec::new())),
             response: serde_json::json!({
@@ -1081,7 +1087,9 @@ mod tests {
         let output = pipeline.execute(&ctx).expect("pipeline executes");
         let result: crate::pipeline::PipelineResult = output.data_as().expect("pipeline result");
         assert!(!result.rejected);
-        let rt = result.routing_target.expect("tree engine must produce a target");
+        let rt = result
+            .routing_target
+            .expect("tree engine must produce a target");
         assert_eq!(rt.model, "code-model");
     }
 }

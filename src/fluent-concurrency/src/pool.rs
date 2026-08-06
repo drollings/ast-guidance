@@ -168,16 +168,10 @@ impl<T: Send + Sync + 'static> WorkerPool<T> {
         let queue = Arc::new(Queue::new(queue_capacity));
         let shutdown = Arc::new(Notify::new());
         let handler = Arc::new(handler);
-        let workers = spawn_queue_workers(
-            runtime,
-            cap,
-            &queue,
-            &shutdown,
-            move |job: T| {
-                let handler = Arc::clone(&handler);
-                async move { handler(job).await }
-            },
-        );
+        let workers = spawn_queue_workers(runtime, cap, &queue, &shutdown, move |job: T| {
+            let handler = Arc::clone(&handler);
+            async move { handler(job).await }
+        });
 
         Self {
             queue,
@@ -415,22 +409,16 @@ where
         let queue: Arc<Queue<WrappedJob<T, R, E>>> = Arc::new(Queue::new(queue_capacity));
         let shutdown = Arc::new(Notify::new());
         let handler = Arc::new(handler);
-        let workers = spawn_queue_workers(
-            runtime,
-            cap,
-            &queue,
-            &shutdown,
-            {
+        let workers = spawn_queue_workers(runtime, cap, &queue, &shutdown, {
+            let handler = Arc::clone(&handler);
+            move |wrapped: WrappedJob<T, R, E>| {
                 let handler = Arc::clone(&handler);
-                move |wrapped: WrappedJob<T, R, E>| {
-                    let handler = Arc::clone(&handler);
-                    async move {
-                        let WrappedJob { job, result_tx } = wrapped;
-                        let _ = result_tx.send(handler(job).await);
-                    }
+                async move {
+                    let WrappedJob { job, result_tx } = wrapped;
+                    let _ = result_tx.send(handler(job).await);
                 }
-            },
-        );
+            }
+        });
 
         Self {
             queue,
@@ -586,23 +574,16 @@ where
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let notify = Arc::new(Notify::new());
         let handler = Arc::new(handler);
-        let workers = spawn_priority_workers(
-            runtime,
-            cap,
-            &queue,
-            &notify,
-            &shutdown_rx,
-            {
+        let workers = spawn_priority_workers(runtime, cap, &queue, &notify, &shutdown_rx, {
+            let handler = Arc::clone(&handler);
+            move |wrapped: WrappedJob<T, R, E>| {
                 let handler = Arc::clone(&handler);
-                move |wrapped: WrappedJob<T, R, E>| {
-                    let handler = Arc::clone(&handler);
-                    async move {
-                        let WrappedJob { job, result_tx } = wrapped;
-                        let _ = result_tx.send(handler(job).await);
-                    }
+                async move {
+                    let WrappedJob { job, result_tx } = wrapped;
+                    let _ = result_tx.send(handler(job).await);
                 }
-            },
-        );
+            }
+        });
 
         Self {
             queue,
@@ -743,13 +724,10 @@ mod priority_pool_tests {
             );
             // Give the workers a chance to pop-empty and park in the select.
             tokio::task::yield_now().await;
-            let result = tokio::time::timeout(
-                Duration::from_secs(5),
-                pool.submit(i, 0),
-            )
-            .await
-            .expect("single submit to an idle pool must wake a sleeping worker")
-            .expect("handler must not error");
+            let result = tokio::time::timeout(Duration::from_secs(5), pool.submit(i, 0))
+                .await
+                .expect("single submit to an idle pool must wake a sleeping worker")
+                .expect("handler must not error");
             assert_eq!(result, i);
             pool.shutdown().await;
         }

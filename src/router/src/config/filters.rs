@@ -45,6 +45,8 @@ pub enum FilterScope {
     Any,
     #[serde(rename = "frontier_bound")]
     FrontierBound,
+    #[serde(rename = "content_node_write")]
+    ContentNodeWrite,
 }
 
 // ── Pattern entries ─────────────────────────────────────────────────────

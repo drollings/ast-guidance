@@ -421,8 +421,8 @@ fn test_e2e_tree_config_routes_to_terminal() {
     let mut entries = HashMap::new();
     entries.insert("help me debug rust".into(), tree_verdict("code", 6));
     let pipeline = make_tree_pipeline(TranscriptProvider::new(entries));
-    let result = route(&pipeline, &make_request("help me debug rust"))
-        .expect("pipeline should complete");
+    let result =
+        route(&pipeline, &make_request("help me debug rust")).expect("pipeline should complete");
 
     assert!(!result.rejected, "tree should route, not reject");
     let rt = result
@@ -438,8 +438,7 @@ fn test_e2e_tree_config_unknown_route_uses_fallback() {
     let mut entries = HashMap::new();
     entries.insert("hello there".into(), tree_verdict("does-not-exist", 2));
     let pipeline = make_tree_pipeline(TranscriptProvider::new(entries));
-    let result = route(&pipeline, &make_request("hello there"))
-        .expect("pipeline should complete");
+    let result = route(&pipeline, &make_request("hello there")).expect("pipeline should complete");
 
     assert!(!result.rejected);
     let rt = result
@@ -464,10 +463,13 @@ fn test_e2e_tree_config_rejects_incoherent() {
         .unwrap(),
     );
     let pipeline = make_tree_pipeline(TranscriptProvider::new(entries));
-    let result = route(&pipeline, &make_request("asdfghjkl qwerty"))
-        .expect("pipeline should complete");
+    let result =
+        route(&pipeline, &make_request("asdfghjkl qwerty")).expect("pipeline should complete");
 
-    assert!(result.rejected, "below-threshold tree verdict should reject");
+    assert!(
+        result.rejected,
+        "below-threshold tree verdict should reject"
+    );
     assert!(
         result
             .reject_reason
@@ -525,7 +527,7 @@ async fn test_e2e_dag_session_checkpoint_rewind() {
         .complete_step("step3", ok("Implementation complete"))
         .expect("complete step3");
 
-    session.rewind_to_checkpoint("step3").await.expect("rewind");
+    session.rewind_to_checkpoint("step3").expect("rewind");
 
     assert_eq!(
         session.get_step("step3").map(|s| s.status),

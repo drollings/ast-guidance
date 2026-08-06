@@ -4,7 +4,7 @@
 //! wrapped in markdown code fences or padded with prose.  This module owns
 //! the single tolerant parse pipeline — strip fence → parse → extract first
 //! balanced JSON value — so every caller (classifier, chart adjudicator,
-//! reranker, rubric judge, chart-stage output) shares one implementation. 
+//! reranker, rubric judge, chart-stage output) shares one implementation.
 //! It is string-only: no LLM protocol types, so it stays a pure helper on
 //! top of `serde_json`.
 use serde_json::Value;

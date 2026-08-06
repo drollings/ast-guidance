@@ -27,9 +27,7 @@ use fluent_wvr::prelude::*;
 use regex::Regex;
 
 use crate::config::filters::FilterOutcome;
-use crate::config::{
-    ClassificationNode, ClassificationTree, RoutingConfig,
-};
+use crate::config::{ClassificationNode, ClassificationTree, RoutingConfig};
 use crate::pipeline::RoutingTarget;
 use crate::pipeline_types::{PipelineStage, StageDecision, StageMetadata, StageVerdict};
 use crate::stages::common::{coerce_float, coerce_string, coerce_u8};
@@ -123,13 +121,8 @@ impl ClassificationEngine {
     pub fn evaluate(&self, user_text: &str) -> Result<TreeEvaluation, WorkError> {
         let mut visited: Vec<StageDecision> = Vec::new();
         let siblings = HashMap::new();
-        let outcome = self.evaluate_node(
-            &self.tree.root,
-            &siblings,
-            user_text,
-            None,
-            &mut visited,
-        )?;
+        let outcome =
+            self.evaluate_node(&self.tree.root, &siblings, user_text, None, &mut visited)?;
 
         for d in &visited {
             crate::audit::emit(
@@ -547,13 +540,7 @@ impl ClassificationEngine {
                             format!("soft redirect to '{target}'"),
                             serde_json::json!({ "outcome": "soft_redirect", "redirect_to": target }),
                         ));
-                        return self.evaluate_node(
-                            node,
-                            siblings,
-                            user_text,
-                            complexity,
-                            visited,
-                        );
+                        return self.evaluate_node(node, siblings, user_text, complexity, visited);
                     }
                     tracing::warn!(
                         target: "router.pipeline.stage2.tree",
@@ -656,10 +643,11 @@ fn cost(entry: &crate::config::ModelEntry) -> f64 {
 /// embedding every visited node's decision in `metadata.tree_path`.
 fn final_decision(outcome: TreeOutcome, visited: Vec<StageDecision>) -> StageDecision {
     // The final decision's score is the last classifier node's coherence.
-    let score = visited
-        .iter()
-        .rev()
-        .find_map(|d| d.metadata.get("coherence").and_then(serde_json::Value::as_f64));
+    let score = visited.iter().rev().find_map(|d| {
+        d.metadata
+            .get("coherence")
+            .and_then(serde_json::Value::as_f64)
+    });
 
     // Consume `visited` explicitly (`json!` would borrow via `to_value(&..)`).
     let tree_path: serde_json::Value = serde_json::Value::Array(
@@ -761,9 +749,8 @@ fn parse_tree_verdict(response: &str) -> Result<TreeClassifierVerdict, WorkError
     coerce_float(&mut obj, "safety", 1.0);
     coerce_u8(&mut obj, "complexity", 5);
     coerce_string(&mut obj, "reason", "");
-    serde_json::from_value(serde_json::Value::Object(obj)).map_err(|e| {
-        WorkError::Execution(format!("tree classifier verdict parse error: {e}"))
-    })
+    serde_json::from_value(serde_json::Value::Object(obj))
+        .map_err(|e| WorkError::Execution(format!("tree classifier verdict parse error: {e}")))
 }
 
 #[cfg(test)]
@@ -1010,8 +997,14 @@ mod tests {
             }
         }))
         .unwrap();
-        let engine = engine(&tree, Arc::new(StubChatBackend::always(verdict("code", 0.9, 0.9, 3))));
-        let decision = engine.evaluate("this is a harmful pattern test").unwrap().decision;
+        let engine = engine(
+            &tree,
+            Arc::new(StubChatBackend::always(verdict("code", 0.9, 0.9, 3))),
+        );
+        let decision = engine
+            .evaluate("this is a harmful pattern test")
+            .unwrap()
+            .decision;
         assert_eq!(decision.verdict, StageVerdict::Rejected);
         assert!(decision.reason.contains("blocked"));
     }
@@ -1038,10 +1031,16 @@ mod tests {
             }
         }))
         .unwrap();
-        let engine = engine(&tree, Arc::new(StubChatBackend::always(verdict("code", 0.9, 0.9, 3))));
+        let engine = engine(
+            &tree,
+            Arc::new(StubChatBackend::always(verdict("code", 0.9, 0.9, 3))),
+        );
         let decision = engine.evaluate("write a function").unwrap().decision;
         assert_eq!(decision.verdict, StageVerdict::Passed);
-        assert_eq!(routed_target(&decision).target_name.as_deref(), Some("code"));
+        assert_eq!(
+            routed_target(&decision).target_name.as_deref(),
+            Some("code")
+        );
     }
 
     #[test]
@@ -1074,7 +1073,10 @@ mod tests {
         let engine = engine(&tree, Arc::new(StubChatBackend::always("{}")));
         let decision = engine.evaluate("anything at all").unwrap().decision;
         assert_eq!(decision.verdict, StageVerdict::Passed);
-        assert_eq!(routed_target(&decision).target_name.as_deref(), Some("code"));
+        assert_eq!(
+            routed_target(&decision).target_name.as_deref(),
+            Some("code")
+        );
     }
 
     #[test]
@@ -1099,10 +1101,19 @@ mod tests {
             }
         }))
         .unwrap();
-        let engine = engine(&tree, Arc::new(StubChatBackend::always(verdict("code", 0.9, 0.9, 3))));
-        let decision = engine.evaluate("my ssn is 123-45-6789 and I need code").unwrap().decision;
+        let engine = engine(
+            &tree,
+            Arc::new(StubChatBackend::always(verdict("code", 0.9, 0.9, 3))),
+        );
+        let decision = engine
+            .evaluate("my ssn is 123-45-6789 and I need code")
+            .unwrap()
+            .decision;
         assert_eq!(decision.verdict, StageVerdict::Passed);
-        assert_eq!(routed_target(&decision).target_name.as_deref(), Some("code"));
+        assert_eq!(
+            routed_target(&decision).target_name.as_deref(),
+            Some("code")
+        );
     }
 
     // ── Classifier nodes ───────────────────────────────────────────────
@@ -1114,7 +1125,10 @@ mod tests {
         let engine = engine(&tree, backend);
         let decision = engine.evaluate("help me debug rust").unwrap().decision;
         assert_eq!(decision.verdict, StageVerdict::Passed);
-        assert_eq!(routed_target(&decision).target_name.as_deref(), Some("code"));
+        assert_eq!(
+            routed_target(&decision).target_name.as_deref(),
+            Some("code")
+        );
     }
 
     #[test]
@@ -1144,7 +1158,10 @@ mod tests {
         let engine = engine(&tree, backend);
         let decision = engine.evaluate("hello").unwrap().decision;
         assert_eq!(decision.verdict, StageVerdict::Passed);
-        assert_eq!(routed_target(&decision).target_name.as_deref(), Some("local"));
+        assert_eq!(
+            routed_target(&decision).target_name.as_deref(),
+            Some("local")
+        );
     }
 
     #[test]
@@ -1154,7 +1171,10 @@ mod tests {
         let engine = engine(&tree, backend);
         let decision = engine.evaluate("hello").unwrap().decision;
         assert_eq!(decision.verdict, StageVerdict::Passed);
-        assert_eq!(routed_target(&decision).target_name.as_deref(), Some("local"));
+        assert_eq!(
+            routed_target(&decision).target_name.as_deref(),
+            Some("local")
+        );
     }
 
     #[test]
@@ -1252,17 +1272,25 @@ mod tests {
         let engine = engine(&tree, backend);
         let decision = engine.evaluate("my program segfaults").unwrap().decision;
         assert_eq!(decision.verdict, StageVerdict::Passed);
-        assert_eq!(routed_target(&decision).target_name.as_deref(), Some("code"));
+        assert_eq!(
+            routed_target(&decision).target_name.as_deref(),
+            Some("code")
+        );
 
         // Both visited node types appear in the tree_path.
-        let path = decision.metadata["tree_path"].as_array().expect("tree_path");
+        let path = decision.metadata["tree_path"]
+            .as_array()
+            .expect("tree_path");
         let types: Vec<&str> = path
             .iter()
             .filter_map(|d| d["metadata"]["node_type"].as_str())
             .collect();
         assert!(types.contains(&"classifier"));
         assert!(types.contains(&"terminal"));
-        assert!(path.len() >= 3, "root + sub + terminal decisions, got {path:?}");
+        assert!(
+            path.len() >= 3,
+            "root + sub + terminal decisions, got {path:?}"
+        );
     }
 
     // ── Prompt auto-construction ───────────────────────────────────────

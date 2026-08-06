@@ -30,8 +30,8 @@ use fluent_types::{ContentNode, KnnHit, NodeId};
 use fluent_wvr::ArcIntern;
 
 use crate::ledger::{
-    CompactionStrategy, RecencyCompaction, LOD0_FULL_TEXT, LOD5_LABEL, LAZY_LOD_RANGE, LedgerEntry,
-    LedgerError,
+    CompactionStrategy, LedgerEntry, LedgerError, RecencyCompaction, LAZY_LOD_RANGE,
+    LOD0_FULL_TEXT, LOD5_LABEL,
 };
 use crate::summarization::Summarizer;
 
@@ -265,11 +265,17 @@ impl NodeStore {
         };
         if let Some(session) = session {
             let key = ArcIntern::from(session.as_str());
-            lock_write(&self.by_session).entry(key).or_default().push(node_id);
+            lock_write(&self.by_session)
+                .entry(key)
+                .or_default()
+                .push(node_id);
         }
         if let Some(role) = role {
             let key = ArcIntern::from(role.as_str());
-            lock_write(&self.by_role).entry(key).or_default().push(node_id);
+            lock_write(&self.by_role)
+                .entry(key)
+                .or_default()
+                .push(node_id);
         }
     }
 
@@ -284,8 +290,10 @@ impl NodeStore {
             .as_ref()
             .unwrap_or(&serde_json::json!({}))
             .to_string();
-        let lod_json = serde_json::to_string(&node.lod).map_err(|e| LedgerError::Db(e.to_string()))?;
-        let content_json = serde_json::to_string(&*node).map_err(|e| LedgerError::Db(e.to_string()))?;
+        let lod_json =
+            serde_json::to_string(&node.lod).map_err(|e| LedgerError::Db(e.to_string()))?;
+        let content_json =
+            serde_json::to_string(&*node).map_err(|e| LedgerError::Db(e.to_string()))?;
         let content = node.lod.first().map_or("", String::as_str);
         let label = node
             .lod
@@ -333,8 +341,10 @@ impl NodeStore {
             .as_ref()
             .unwrap_or(&serde_json::json!({}))
             .to_string();
-        let lod_json = serde_json::to_string(&node.lod).map_err(|e| LedgerError::Db(e.to_string()))?;
-        let content_json = serde_json::to_string(node).map_err(|e| LedgerError::Db(e.to_string()))?;
+        let lod_json =
+            serde_json::to_string(&node.lod).map_err(|e| LedgerError::Db(e.to_string()))?;
+        let content_json =
+            serde_json::to_string(node).map_err(|e| LedgerError::Db(e.to_string()))?;
         let content = node.lod.first().map_or("", String::as_str);
         let label = node
             .lod
@@ -380,7 +390,9 @@ impl NodeStore {
     where
         F: FnOnce(&mut ContentNode),
     {
-        let arc = self.get_node(node_id).ok_or(LedgerError::NotFound(node_id))?;
+        let arc = self
+            .get_node(node_id)
+            .ok_or(LedgerError::NotFound(node_id))?;
         let mut guard = lock_write(&arc);
         f(&mut guard);
         ensure_lod_eager(&mut guard);
@@ -414,10 +426,23 @@ impl NodeStore {
     /// tier is cached on the shared node, so a second request from any holder
     /// hits the cache, not the LLM.
     pub fn ensure_lod(&self, node_id: NodeId, level: u8) -> Result<ContentNode, LedgerError> {
+        self.ensure_tier(node_id, level)?;
+        self.snapshot(node_id).ok_or(LedgerError::NotFound(node_id))
+    }
+
+    /// Derive a lazy LOD tier (1..=4) for a node if it is not already cached,
+    /// from LOD0 only via the `Summarizer`. Returns `()` — the tier text is
+    /// read back by the caller. The **snapshot-then-derive** shape: hold a
+    /// read guard only long enough to copy LOD0 + the cached tier, drop it,
+    /// derive via the `Summarizer`, then write-cache under a fresh guard. No
+    /// guard is held across an LLM call (R7).
+    fn ensure_tier(&self, node_id: NodeId, level: u8) -> Result<(), LedgerError> {
         if !LAZY_LOD_RANGE.contains(&level) {
             return Err(LedgerError::InvalidLod(level));
         }
-        let arc = self.get_node(node_id).ok_or(LedgerError::NotFound(node_id))?;
+        let arc = self
+            .get_node(node_id)
+            .ok_or(LedgerError::NotFound(node_id))?;
 
         let (full_text, cached) = {
             let guard = lock_read(&arc);
@@ -434,7 +459,7 @@ impl NodeStore {
             (full_text, cached)
         };
         if !cached.is_empty() {
-            return Ok(lock_read(&arc).clone());
+            return Ok(());
         }
 
         let derived = {
@@ -450,7 +475,51 @@ impl NodeStore {
                 node.lod.push(String::new());
             }
             node.lod[level as usize] = derived;
-        })
+        })?;
+        Ok(())
+    }
+
+    /// Read a single LOD tier's text — the **only** method through which a
+    /// view's text leaves the store (M2, D4). Eager tiers (LOD0/LOD5) are
+    /// returned directly; lazy tiers (LOD1–LOD4) are derived on demand via
+    /// `ensure_tier` and then re-read. A read guard is held only long enough
+    /// to copy the string out.
+    pub fn lod_text(&self, node_id: NodeId, level: u8) -> Result<String, LedgerError> {
+        if level == LOD0_FULL_TEXT || level == LOD5_LABEL {
+            let arc = self
+                .get_node(node_id)
+                .ok_or(LedgerError::NotFound(node_id))?;
+            let text = lock_read(&arc)
+                .lod
+                .get(level as usize)
+                .cloned()
+                .unwrap_or_default();
+            return Ok(text);
+        }
+        if !LAZY_LOD_RANGE.contains(&level) {
+            return Err(LedgerError::InvalidLod(level));
+        }
+        self.ensure_tier(node_id, level)?;
+        let arc = self
+            .get_node(node_id)
+            .ok_or(LedgerError::NotFound(node_id))?;
+        let text = lock_read(&arc)
+            .lod
+            .get(level as usize)
+            .cloned()
+            .unwrap_or_default();
+        Ok(text)
+    }
+
+    /// All node ids for a session (interned index, insertion order). The
+    /// zero-copy list path for views: no `ContentNode` clones, unlike
+    /// `get_session_nodes`.
+    pub fn session_node_ids(&self, session_id: &str) -> Vec<NodeId> {
+        let key = ArcIntern::from(session_id);
+        lock_read(&self.by_session)
+            .get(&key)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Compact a session: demote older nodes to higher LOD levels via the
@@ -596,10 +665,7 @@ impl NodeStore {
         );
         let mut results = Vec::with_capacity(hits.len());
         for (node_id, distance) in hits {
-            let name = self
-                .snapshot(node_id)
-                .map(|n| n.name)
-                .unwrap_or_default();
+            let name = self.snapshot(node_id).map(|n| n.name).unwrap_or_default();
             results.push(KnnHit {
                 node_id,
                 distance,
@@ -703,7 +769,7 @@ fn ensure_lod_eager(node: &mut ContentNode) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_stubs::StubChatBackend;
+    use crate::test_stubs::{CountingBackend, StubChatBackend};
 
     fn temp_store() -> NodeStore {
         let dir = std::env::temp_dir().join(format!(
@@ -821,5 +887,68 @@ mod tests {
         let id = store.record_request("s", "r1", "x").unwrap();
         assert!(store.get_node(id).is_some());
         assert!(store.get_session_entries("s", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn lod_text_returns_eager_tiers_directly() {
+        let store = temp_store();
+        let id = store
+            .record_request("s", "r1", "Full text for eager tiers.")
+            .unwrap();
+        assert_eq!(store.lod_text(id, 0).unwrap(), "Full text for eager tiers.");
+        assert_eq!(store.lod_text(id, 5).unwrap(), "Full text for eager tiers.");
+    }
+
+    #[test]
+    fn lod_text_derives_lazy_tier_exactly_once() {
+        let backend = Arc::new(CountingBackend::new("lazy tier text"));
+        let summarizer = Summarizer::new(backend.clone(), 20);
+        let store = temp_store().with_summarizer(summarizer);
+        let id = store
+            .record_request("s", "r1", "The full text that must be summarized once.")
+            .unwrap();
+
+        let first = store.lod_text(id, 2).unwrap();
+        assert_eq!(first, "lazy tier text");
+        assert_eq!(backend.calls(), 1, "exactly one derivation");
+
+        let second = store.lod_text(id, 2).unwrap();
+        assert_eq!(second, "lazy tier text");
+        assert_eq!(backend.calls(), 1, "second read hits the cache");
+    }
+
+    #[test]
+    fn lod_text_without_summarizer_returns_no_summarizer() {
+        let store = temp_store();
+        let id = store.record_request("s", "r1", "text").unwrap();
+        assert!(matches!(
+            store.lod_text(id, 2),
+            Err(LedgerError::NoSummarizer)
+        ));
+        assert!(matches!(
+            store.lod_text(id, 9),
+            Err(LedgerError::InvalidLod(9))
+        ));
+    }
+
+    #[test]
+    fn session_node_ids_returns_ids_without_node_clones() {
+        let store = temp_store();
+        let id1 = store.record_request("sess", "r1", "one").unwrap();
+        let id2 = store.record_request("sess", "r2", "two").unwrap();
+        store.record_request("other", "r3", "three").unwrap();
+
+        let ids = store.session_node_ids("sess");
+        assert_eq!(ids, vec![id1, id2], "insertion order, ids only");
+        assert!(store.session_node_ids("absent").is_empty());
+    }
+
+    #[test]
+    fn lod_text_not_found_returns_not_found() {
+        let store = temp_store();
+        assert!(matches!(
+            store.lod_text(NodeId::from_int(9999), 0),
+            Err(LedgerError::NotFound(_))
+        ));
     }
 }

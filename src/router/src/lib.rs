@@ -30,10 +30,11 @@ pub mod hnsw;
 pub mod knowledge;
 pub mod kv_cache;
 pub mod ledger;
+pub mod ledger_guard;
 pub mod logging;
 pub mod metrics;
-pub mod normalize;
 pub mod node_store;
+pub mod normalize;
 pub mod pipeline;
 pub mod pipeline_types;
 pub mod routes;
@@ -47,6 +48,7 @@ pub mod summarization;
 pub mod telemetry;
 pub mod transforms;
 pub mod types;
+pub mod views;
 
 /// Testing utilities — available in all build profiles for use by
 /// downstream crates' test code (e.g., E2E tests in coral-context).

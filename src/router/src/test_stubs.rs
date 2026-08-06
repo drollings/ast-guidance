@@ -31,6 +31,34 @@ impl ChatBackend for StubChatBackend {
     }
 }
 
+/// A `ChatBackend` that counts every call and always returns a canned response.
+/// The count-calls pattern (mirrors `config::builder::tests::RecordingBackend`)
+/// for asserting "derived exactly once" in LOD/view tests.
+pub struct CountingBackend {
+    calls: std::sync::atomic::AtomicUsize,
+    response: String,
+}
+
+impl CountingBackend {
+    pub fn new(response: impl Into<String>) -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            response: response.into(),
+        }
+    }
+
+    pub fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl ChatBackend for CountingBackend {
+    fn chat_complete(&self, _messages: &[ChatMessage]) -> Result<String, LlmError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self.response.clone())
+    }
+}
+
 // ── Test stage stubs for DAG pipeline tests ──────────────────────────────
 
 /// A minimal `WorkUnit` stage that always passes, returning a

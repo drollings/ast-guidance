@@ -196,7 +196,11 @@ impl ClassificationNode {
         let _ = writeln!(prompt);
         let keys: Vec<&str> = routeable.iter().map(|c| c.key.as_str()).collect();
         let _ = writeln!(prompt, "You must output exactly one JSON object with:");
-        let _ = writeln!(prompt, "  \"route\": \"<exactly one of: {}>\"", keys.join(", "));
+        let _ = writeln!(
+            prompt,
+            "  \"route\": \"<exactly one of: {}>\"",
+            keys.join(", ")
+        );
         let _ = writeln!(
             prompt,
             "  \"coherence\": 0.0-1.0 (how well-formed and coherent the query is)"
@@ -209,7 +213,10 @@ impl ClassificationNode {
             prompt,
             "  \"complexity\": 0-10 (0 = trivial, 10 = requires most capable model)"
         );
-        let _ = writeln!(prompt, "  \"reason\": \"brief explanation for the routing decision\"");
+        let _ = writeln!(
+            prompt,
+            "  \"reason\": \"brief explanation for the routing decision\""
+        );
         let _ = writeln!(prompt);
         let _ = writeln!(
             prompt,
@@ -226,7 +233,9 @@ impl ClassificationNode {
         out: &mut Vec<String>,
     ) {
         match self {
-            ClassificationNode::Classifier { model, children, .. } => {
+            ClassificationNode::Classifier {
+                model, children, ..
+            } => {
                 if seen.insert(model.clone()) {
                     out.push(model.clone());
                 }
@@ -325,10 +334,22 @@ mod tests {
         assert_eq!(*coherence_threshold, Some(0.6));
         assert_eq!(*safety_threshold, Some(0.4));
         assert_eq!(children.len(), 4);
-        assert!(matches!(children[0].node, ClassificationNode::Terminal { .. }));
-        assert!(matches!(children[1].node, ClassificationNode::Terminal { .. }));
-        assert!(matches!(children[2].node, ClassificationNode::Filter { .. }));
-        assert!(matches!(children[3].node, ClassificationNode::Fallback { .. }));
+        assert!(matches!(
+            children[0].node,
+            ClassificationNode::Terminal { .. }
+        ));
+        assert!(matches!(
+            children[1].node,
+            ClassificationNode::Terminal { .. }
+        ));
+        assert!(matches!(
+            children[2].node,
+            ClassificationNode::Filter { .. }
+        ));
+        assert!(matches!(
+            children[3].node,
+            ClassificationNode::Fallback { .. }
+        ));
     }
 
     #[test]
@@ -337,10 +358,23 @@ mod tests {
         let serialized = serde_json::to_string(&tree).unwrap();
         let back: ClassificationTree = serde_json::from_str(&serialized).unwrap();
         match (&tree.root, &back.root) {
-            (ClassificationNode::Classifier { children: a, .. }, ClassificationNode::Classifier { children: b, .. }) => {
+            (
+                ClassificationNode::Classifier { children: a, .. },
+                ClassificationNode::Classifier { children: b, .. },
+            ) => {
                 assert_eq!(a.len(), b.len());
                 assert_eq!(a[0].key, b[0].key);
-                assert_eq!(&a[3].node, &ClassificationNode::Fallback { description: Some("default branch".into()), node: Box::new(ClassificationNode::Terminal { route: "local".into(), group: Some("question".into()), description: String::new() }) });
+                assert_eq!(
+                    &a[3].node,
+                    &ClassificationNode::Fallback {
+                        description: Some("default branch".into()),
+                        node: Box::new(ClassificationNode::Terminal {
+                            route: "local".into(),
+                            group: Some("question".into()),
+                            description: String::new()
+                        })
+                    }
+                );
             }
             _ => panic!("round-trip changed the root type"),
         }
@@ -407,7 +441,10 @@ mod tests {
             }
         }"#;
         let tree: ClassificationTree = serde_json::from_str(json).unwrap();
-        assert_eq!(tree.classifier_model_keys(), vec!["fast".to_string(), "small".to_string()]);
+        assert_eq!(
+            tree.classifier_model_keys(),
+            vec!["fast".to_string(), "small".to_string()]
+        );
     }
 
     #[test]
@@ -420,7 +457,11 @@ mod tests {
             vec![
                 ("code".into(), Some("code".into()), String::new()),
                 ("local".into(), Some("question".into()), String::new()),
-                ("translation".into(), Some("translation".into()), String::new()),
+                (
+                    "translation".into(),
+                    Some("translation".into()),
+                    String::new()
+                ),
             ]
         );
     }

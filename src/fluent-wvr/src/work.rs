@@ -310,7 +310,10 @@ mod tests {
         ctx.set("stage", "deterministic".to_string());
         ctx.set("attempt", 1_i32);
 
-        assert_eq!(ctx.get::<String>("stage"), Some(&"deterministic".to_string()));
+        assert_eq!(
+            ctx.get::<String>("stage"),
+            Some(&"deterministic".to_string())
+        );
         assert_eq!(ctx.get::<i32>("attempt"), Some(&1));
         assert_eq!(ctx.get::<u32>("attempt"), None, "wrong type reads None");
         assert_eq!(ctx.get::<i32>("absent"), None);

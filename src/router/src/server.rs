@@ -19,6 +19,7 @@ use crate::dispatch::escalation::EscalationLadder;
 use crate::ledger::ContentNodeLedger;
 use crate::pipeline::PipelineOrchestrator;
 use crate::routes::plan::PlanRoute;
+use crate::routes::rigor::RigorRoute;
 use crate::testing::mock::MockDispatchContext;
 
 pub struct RouterServer {
@@ -34,6 +35,9 @@ pub struct RouterServer {
     cache: Option<Arc<ResponseCache>>,
     /// Chart store + selector host (boot-loaded; M7/M8 dispatch to it).
     plan_route: Option<Arc<PlanRoute>>,
+    /// Rigor route (M3): blue/red/judge protocol. `None` → `/v1/rigor`
+    /// returns an explicit "not configured" response.
+    rigor_route: Option<Arc<RigorRoute>>,
     /// Per-`session_id` `DependencySession` registry (D6 canonical session).
     sessions: Option<Arc<SessionRegistry>>,
     /// Per-model-group escalation ladders (M3).
@@ -64,6 +68,7 @@ impl RouterServer {
             ledger: None,
             cache: None,
             plan_route: None,
+            rigor_route: None,
             sessions: None,
             ladders: HashMap::new(),
             context_cache: None,
@@ -90,6 +95,14 @@ impl RouterServer {
         self
     }
 
+    /// Attach the rigor route (M3). `None` (default) leaves `/v1/rigor`
+    /// present but unconfigured — requests return an explicit error.
+    #[must_use]
+    pub fn with_rigor_route(mut self, rigor_route: Arc<RigorRoute>) -> Self {
+        self.rigor_route = Some(rigor_route);
+        self
+    }
+
     /// Attach the per-session `DependencySession` registry (D6 canonical
     /// session). Each chat-completion request then tracks a step in the
     /// session keyed by its `session_id`.
@@ -113,7 +126,10 @@ impl RouterServer {
 
     /// Attach the deterministic context cache consulted before escalating (M3).
     #[must_use]
-    pub fn with_context_cache(mut self, context_cache: Arc<dyn fluent_types::ContextCache>) -> Self {
+    pub fn with_context_cache(
+        mut self,
+        context_cache: Arc<dyn fluent_types::ContextCache>,
+    ) -> Self {
         tracing::info!(
             target: "router.server",
             "context cache attached — escalation short-circuits on hits",
@@ -145,6 +161,7 @@ impl RouterServer {
             has_ledger = self.ledger.is_some(),
             has_cache = self.cache.is_some(),
             has_plan_route = self.plan_route.is_some(),
+            has_rigor_route = self.rigor_route.is_some(),
             chart_count = chart_count,
             ladder_count = self.ladders.len(),
             "serving HTTP"
@@ -160,15 +177,14 @@ impl RouterServer {
             ledger: self.ledger.clone(),
             cache: self.cache.clone(),
             plan_route: self.plan_route.clone(),
+            rigor_route: self.rigor_route.clone(),
             sessions: self.sessions.clone(),
             http_client: Arc::new(
                 reqwest::Client::builder()
                     .connect_timeout(Duration::from_secs(10))
                     .build()
                     .map_err(|e| {
-                        crate::error::ServerError::Http(format!(
-                            "HTTP client build failed: {e}"
-                        ))
+                        crate::error::ServerError::Http(format!("HTTP client build failed: {e}"))
                     })?,
             ),
             ladders: self.ladders.clone(),
@@ -203,6 +219,7 @@ impl WorkUnit for RouterServer {
             ledger: self.ledger.clone(),
             cache: self.cache.clone(),
             plan_route: self.plan_route.clone(),
+            rigor_route: self.rigor_route.clone(),
             sessions: self.sessions.clone(),
             http_client: Arc::new(reqwest::Client::new()),
             ladders: self.ladders.clone(),

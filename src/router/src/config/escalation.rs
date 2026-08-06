@@ -160,7 +160,10 @@ mod tests {
             ]
         );
         let front = ladder.frontier.as_ref().unwrap();
-        assert_eq!(front.endpoint, "https://frontier.example/v1/chat/completions");
+        assert_eq!(
+            front.endpoint,
+            "https://frontier.example/v1/chat/completions"
+        );
         assert_eq!(front.model, "claude-sonnet");
         assert_eq!(front.api_key_env.as_deref(), Some("ANTHROPIC_KEY"));
         assert_eq!(ladder.decomposer_model.as_deref(), Some("fast"));

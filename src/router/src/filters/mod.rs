@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::FilterAction;
+use crate::config::{FilterAction, FilterScope};
 
 /// A single regex match with positional info for codeword substitution (M4.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,9 +47,40 @@ pub enum FilterDecision {
 }
 
 /// Context passed to every filter at evaluation time.
+///
+/// `active_scopes` carries the set of scopes active for the current
+/// evaluation; a filter applies when its declared `scopes` intersect the
+/// active set. The constructor helpers keep the call sites readable.
 pub struct FilterContext {
     pub user_message: String,
-    pub is_frontier_bound: bool,
+    pub active_scopes: &'static [FilterScope],
+}
+
+impl FilterContext {
+    /// The default pipeline scope: every `[Any]` filter applies.
+    pub fn pipeline(user_message: String) -> Self {
+        Self {
+            user_message,
+            active_scopes: &[FilterScope::Any],
+        }
+    }
+
+    /// The escalation-ladder output re-scan: adds the `FrontierBound` scope.
+    pub fn frontier(user_message: String) -> Self {
+        Self {
+            user_message,
+            active_scopes: &[FilterScope::Any, FilterScope::FrontierBound],
+        }
+    }
+
+    /// The ledger write path: adds the `ContentNodeWrite` scope so the builtin
+    /// PII engine always scrubs durable content (D1).
+    pub fn ledger_write(user_message: String) -> Self {
+        Self {
+            user_message,
+            active_scopes: &[FilterScope::Any, FilterScope::ContentNodeWrite],
+        }
+    }
 }
 
 pub trait Filter: Send + Sync {

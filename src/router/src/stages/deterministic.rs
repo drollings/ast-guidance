@@ -70,10 +70,7 @@ impl DeterministicPreFilter {
     /// (`dispatch::escalation`.  `None` means the output is clean
     /// (accepted).
     pub(crate) fn scan_output(&self, text: &str) -> Option<FilterDecision> {
-        let ctx = FilterContext {
-            user_message: text.to_string(),
-            is_frontier_bound: true,
-        };
+        let ctx = FilterContext::frontier(text.to_string());
         self.filter_engine.evaluate(&ctx)
     }
 
@@ -304,10 +301,7 @@ impl DeterministicPreFilter {
                 }
 
                 // Check filter engine for commands that matched pattern
-                let filter_ctx = FilterContext {
-                    user_message: trimmed.to_string(),
-                    is_frontier_bound: false,
-                };
+                let filter_ctx = FilterContext::pipeline(trimmed.to_string());
                 if let Some(FilterDecision::HardReject { pattern, message }) =
                     self.filter_engine.evaluate(&filter_ctx)
                 {
@@ -358,10 +352,7 @@ impl DeterministicPreFilter {
         }
 
         // Run filter engine on the input
-        let filter_ctx = FilterContext {
-            user_message: input.clone(),
-            is_frontier_bound: false,
-        };
+        let filter_ctx = FilterContext::pipeline(input.clone());
         if let Some(decision) = self.filter_engine.evaluate(&filter_ctx) {
             match decision {
                 FilterDecision::HardReject { pattern, message } => {

@@ -10,6 +10,15 @@
 //! `ensure_lod`, `compact_session`, `collapse_node`) signature-identical and
 //! delegates to the store.
 //!
+//! The facade also owns the **write-path guard** (M1, decision D1): every
+//! write delegate scrubs its text through `crate::ledger_guard::scrub_for_ledger`
+//! before reaching `NodeStore`, so the durable ledger can never cache text
+//! matching the builtin filter engine (on by default, no config flag). The
+//! scrub is irreversible. `NodeStore` itself stays policy-free; the only
+//! documented bypass is the `KnowledgeCapability` impl directly on `NodeStore`
+//! (`crate::knowledge`), which is a trait-object boundary that cannot route
+//! through the facade — production server writes all flow through here.
+//!
 //! The LOD lifecycle is owned by the store:
 //!
 //! - **LOD0** (full text) and **LOD5** (label) are guaranteed eager at node
@@ -37,8 +46,11 @@ use fluent_types::{ContentNode, NodeId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::ledger_guard::scrub_for_ledger;
 use crate::node_store::NodeStore;
 use crate::summarization::Summarizer;
+use crate::views::LedgerView;
+use crate::views::{Lod, ParallelLedger};
 
 /// Node-construction helper moved to `NodeStore` (M4). Re-exported here so the
 /// facade's tests keep compiling unchanged.
@@ -124,18 +136,27 @@ impl ContentNodeLedger {
 
     /// Record a user request as a new node. LOD0 (full text) and LOD5 (label)
     /// are written eagerly; LOD1–LOD4 stay empty until derived lazily.
+    ///
+    /// The write-path guard (M1) scrubs `content` against the builtin filter
+    /// engine before persisting; flagged writes emit an audit record.
     pub fn record_request(
         &self,
         session_id: &str,
         request_id: &str,
         content: &str,
     ) -> Result<NodeId, LedgerError> {
-        self.store.record_request(session_id, request_id, content)
+        let s = scrub_for_ledger(content);
+        if s.flagged {
+            emit_write_audit(s.pattern.as_deref());
+        }
+        self.store.record_request(session_id, request_id, &s.text)
     }
 
     /// Update the result of a previously recorded request node: acceptance,
     /// score, and final content. Keeps the flat projection and the
     /// `content_json` node in sync (LOD0/LOD5 are recomputed eagerly).
+    ///
+    /// The write-path guard (M1) scrubs `content` before persisting.
     pub fn record_result(
         &self,
         node_id: NodeId,
@@ -143,13 +164,30 @@ impl ContentNodeLedger {
         score: Option<f64>,
         content: &str,
     ) -> Result<(), LedgerError> {
-        self.store.record_result(node_id, accepted, score, content)
+        let s = scrub_for_ledger(content);
+        if s.flagged {
+            emit_write_audit(s.pattern.as_deref());
+        }
+        self.store.record_result(node_id, accepted, score, &s.text)
     }
 
     /// Persist an arbitrary origin-typed `ContentNode`. LOD0/LOD5 are
     /// guaranteed present (derived from the node's text when missing).
+    ///
+    /// The write-path guard (M1) scrubs the node's LOD0 text and clears LOD5
+    /// so the store re-derives the label from the scrubbed text.
     pub fn record_content_node(&self, node: &ContentNode) -> Result<NodeId, LedgerError> {
-        self.store.record_content_node(node)
+        let mut node = node.clone();
+        let s = scrub_for_ledger(node.lod.first().map_or("", String::as_str));
+        if s.flagged {
+            while node.lod.len() < LOD5_LABEL as usize + 1 {
+                node.lod.push(String::new());
+            }
+            node.lod[LOD0_FULL_TEXT as usize] = s.text;
+            node.lod[LOD5_LABEL as usize].clear();
+            emit_write_audit(s.pattern.as_deref());
+        }
+        self.store.record_content_node(&node)
     }
 
     /// Collapse a node: replace LOD0's content with `summary` and mark it
@@ -211,12 +249,35 @@ impl ContentNodeLedger {
         self.store.get_session_entries(session_id, limit)
     }
 
+    /// Render a session through a `ParallelLedger` at `default_lod` (M2). The
+    /// view's single `render()` exit. A compacted (collapsed) node renders its
+    /// collapsed LOD0 — compaction mutates LOD0, so the view's fidelity policy
+    /// never "defeats" compaction.
+    pub fn render_session(&self, session_id: &str, default_lod: Lod) -> String {
+        let view = ParallelLedger::for_session(Arc::clone(&self.store), session_id)
+            .with_default_lod(default_lod);
+        view.render()
+    }
+
     /// Panic while holding the durable connection mutex (test-only): exercises
     /// the poison-recovery path in `SqliteStore`'s `common_core::sync::lock`.
     #[cfg(test)]
     fn poison_conn(&self) {
         self.store.poison_conn();
     }
+}
+
+/// Emit the M1 write-path audit record: a builtin-filter match flagged on a
+/// durable ledger write.
+fn emit_write_audit(pattern: Option<&str>) {
+    crate::audit::emit(
+        "filter",
+        serde_json::json!({
+            "write_path": true,
+            "pattern": pattern,
+            "node_scrubbed": true,
+        }),
+    );
 }
 
 /// Versioned ledger schema lifecycle (fluent_db::migrate, M6.2).
@@ -382,6 +443,45 @@ impl CompactionStrategy for NoopCompaction {
 mod tests {
     use super::*;
     use common_core::hash::uuid_v4;
+    use common_core::sync::lock;
+    use std::io::Write;
+    use std::sync::Mutex;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    /// A `MakeWriter` that captures formatted log lines for audit assertions
+    /// (mirrors the capture helper in `config::builder` tests).
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<String>>>);
+
+    impl Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            lock(&self.0).push(String::from_utf8_lossy(buf).into_owned());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
+        type Writer = Self;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(capture.clone())
+                .with_ansi(false)
+                .with_target(true),
+        );
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let logs = lock(&capture.0).clone();
+        (result, logs)
+    }
 
     fn temp_ledger() -> ContentNodeLedger {
         let dir = std::env::temp_dir().join(format!("coral-router-ledger-{}", uuid_v4()));
@@ -628,5 +728,124 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    // ── M1 write-path guard (facade scrub) ────────────────────────────────
+
+    #[test]
+    fn record_request_scrubs_email_and_emits_audit() {
+        let ledger = temp_ledger();
+        let (id, logs) = capture_logs(|| {
+            ledger
+                .record_request("sess-guard", "r1", "Contact user@example.com now")
+                .unwrap()
+        });
+        let _ = id;
+        let joined = logs.join("\n");
+        assert!(
+            joined.contains("router.audit")
+                && joined.contains("write_path")
+                && joined.contains("email"),
+            "flagged write must emit a write-path audit, logs:\n{joined}"
+        );
+
+        let entries = ledger.get_session_entries("sess-guard", 10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "Contact [REDACTED:email] now");
+        assert!(
+            !entries[0].content.contains("user@example.com"),
+            "durable content must be scrubbed"
+        );
+    }
+
+    #[test]
+    fn record_result_scrubs_phone() {
+        let ledger = temp_ledger();
+        let id = ledger
+            .record_request("sess-guard-r", "r1", "What number?")
+            .unwrap();
+        ledger
+            .record_result(id, true, Some(1.0), "Call 555-123-4567 to reach us.")
+            .unwrap();
+
+        let node = ledger.get_node(id).unwrap();
+        assert_eq!(node.lod[0], "Call [REDACTED:phone] to reach us.");
+        let entries = ledger.get_session_entries("sess-guard-r", 10).unwrap();
+        assert_eq!(entries[0].content, "Call [REDACTED:phone] to reach us.");
+    }
+
+    #[test]
+    fn record_content_node_scrubs_api_key_to_reject_marker() {
+        let ledger = temp_ledger();
+        let mut node = new_node(
+            NodeId::from_int(101),
+            "sess-guard-c",
+            "r1",
+            "assistant",
+            "the token is api_key = super_secret_value_123",
+            Some(true),
+        );
+        node.acceptance_score = Some(0.9);
+        let id = ledger.record_content_node(&node).unwrap();
+
+        let fetched = ledger.get_node(id).unwrap();
+        assert_eq!(fetched.lod[0], "[rejected: api_key]");
+        assert_eq!(fetched.acceptance_score, Some(0.9));
+    }
+
+    #[test]
+    fn clean_write_is_not_flagged() {
+        let ledger = temp_ledger();
+        let (_, logs) = capture_logs(|| {
+            ledger
+                .record_request("sess-guard-clean", "r1", "plain text, no pii")
+                .unwrap()
+        });
+        let joined = logs.join("\n");
+        assert!(
+            !joined.contains("write_path"),
+            "clean writes must not emit a write-path audit, logs:\n{joined}"
+        );
+        let entries = ledger.get_session_entries("sess-guard-clean", 10).unwrap();
+        assert_eq!(entries[0].content, "plain text, no pii");
+    }
+
+    #[test]
+    fn render_session_renders_three_nodes_as_three_lines() {
+        let ledger = temp_ledger();
+        ledger
+            .record_request("sess-render", "r1", "first node text")
+            .unwrap();
+        ledger
+            .record_request("sess-render", "r2", "second node text")
+            .unwrap();
+        ledger
+            .record_request("sess-render", "r3", "third node text")
+            .unwrap();
+
+        let rendered = ledger.render_session("sess-render", Lod::LOD0);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 3, "3 nodes -> 3 lines, got: {rendered}");
+        assert!(lines.contains(&"first node text"));
+        assert!(lines.contains(&"second node text"));
+        assert!(lines.contains(&"third node text"));
+    }
+
+    #[test]
+    fn render_session_renders_collapsed_node_lod0() {
+        let ledger = temp_ledger();
+        let id = ledger
+            .record_request("sess-collapse", "r1", "original long content")
+            .unwrap();
+        ledger
+            .collapse_node(id, "collapsed summary", LOD0_FULL_TEXT)
+            .unwrap();
+
+        // Compaction mutates LOD0, so a LOD0 view shows the collapsed text —
+        // the fidelity policy never "defeats" compaction.
+        assert_eq!(
+            ledger.render_session("sess-collapse", Lod::LOD0),
+            "collapsed summary"
+        );
     }
 }

@@ -200,7 +200,10 @@ fn resolve_routing_target(
     }
 
     let route = if action == "route" {
-        output.target.as_deref().unwrap_or(&routing_config.default_route)
+        output
+            .target
+            .as_deref()
+            .unwrap_or(&routing_config.default_route)
     } else {
         tracing::warn!(target: "router.pipeline.stage2", action = %action, fallback_route = %routing_config.default_route, "unknown action, falling back to default route");
         &routing_config.default_route
@@ -495,11 +498,8 @@ impl ClassifierStage {
                     completeness: None,
                     risk: None,
                 };
-                let fallback_rt = resolve_routing_target(
-                    &output.action,
-                    &output,
-                    &self.routing_config,
-                );
+                let fallback_rt =
+                    resolve_routing_target(&output.action, &output, &self.routing_config);
                 return Ok(Self::build_decision(
                     &output,
                     fallback_rt.as_ref(),
@@ -602,11 +602,7 @@ impl ClassifierStage {
             }
         }
 
-        let routing_target = resolve_routing_target(
-            &output.action,
-            &output,
-            &self.routing_config,
-        );
+        let routing_target = resolve_routing_target(&output.action, &output, &self.routing_config);
 
         Ok(Self::build_decision(
             &output,

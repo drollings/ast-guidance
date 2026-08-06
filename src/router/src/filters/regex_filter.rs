@@ -61,12 +61,9 @@ impl Filter for RegexFilter {
     }
 
     fn evaluate(&self, ctx: &FilterContext) -> Option<FilterDecision> {
-        // Scope check: if filter is frontier_bound only and this isn't
-        // a frontier-bound request, skip.
-        let scope_ok = self.scopes.iter().any(|s| match s {
-            FilterScope::Any => true,
-            FilterScope::FrontierBound => ctx.is_frontier_bound,
-        });
+        // Scope check: a filter applies only when its declared scopes
+        // intersect the context's active scope set.
+        let scope_ok = self.scopes.iter().any(|s| ctx.active_scopes.contains(s));
         if !scope_ok {
             return None;
         }

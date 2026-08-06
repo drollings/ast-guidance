@@ -25,6 +25,7 @@ use tokio::net::TcpListener;
 
 use crate::config::RouterConfig;
 use crate::routes::plan::PlanRoute;
+use crate::routes::rigor::RigorRoute;
 use crate::server::handler::ServerDeps;
 use crate::server::responses::{ResponseBody, ServerStats};
 use crate::server::serve_http;
@@ -58,6 +59,7 @@ fn test_deps(
         ledger: None,
         cache: None,
         plan_route,
+        rigor_route: None,
         sessions,
         http_client: Arc::new(reqwest::Client::new()),
         ladders,
@@ -140,7 +142,15 @@ async fn spawn_test_server_with_sessions(
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
 
-    let deps = test_deps(pipelines, &config, mock, sessions, None, HashMap::new(), None);
+    let deps = test_deps(
+        pipelines,
+        &config,
+        mock,
+        sessions,
+        None,
+        HashMap::new(),
+        None,
+    );
     let handle = tokio::spawn(async move {
         if let Err(e) = serve_http(listener, deps).await {
             tracing::error!(target: "router.test", error = %e, "test server failed");
@@ -1179,5 +1189,193 @@ async fn context_cache_short_circuits_before_frontier_integration() {
     assert!(
         lines.contains("\"mode\":\"context\"") && lines.contains("\"source\":\"test-cache\""),
         "context short-circuit must be audited with the cache source, got:\n{lines}"
+    );
+}
+
+// ── M3.6: /v1/rigor server round-trip ────────────────────────────────────
+
+/// Assemble `ServerDeps` with a rigor route + session registry + ledger wired
+/// (checkpoint/rewind + red-team view are load-bearing in the server path).
+fn rigor_test_deps(
+    pipelines: Arc<std::collections::HashMap<String, Arc<crate::pipeline::PipelineOrchestrator>>>,
+    config: &RouterConfig,
+    rigor_route: Option<Arc<RigorRoute>>,
+    sessions: Option<Arc<crate::dag_session::SessionRegistry>>,
+    ledger: Option<Arc<crate::ledger::ContentNodeLedger>>,
+) -> ServerDeps {
+    ServerDeps {
+        pipelines,
+        routes: Arc::new(config.routes.clone()),
+        models: Arc::new(config.models.clone()),
+        stats: Arc::new(ServerStats::new()),
+        max_payload: config.server.max_payload,
+        classifier: None,
+        mock_dispatch: None,
+        ledger,
+        cache: None,
+        plan_route: None,
+        rigor_route,
+        sessions,
+        http_client: Arc::new(reqwest::Client::new()),
+        ladders: HashMap::new(),
+        context_cache: None,
+    }
+}
+
+/// Spawn a server with a rigor route whose three role backends are stubs.
+async fn spawn_rigor_server(blue: Vec<&str>, red: Vec<&str>, judge: Vec<&str>) -> TestServer {
+    use crate::test_stubs::StubChatBackend;
+
+    let rigor_route = Arc::new(
+        RigorRoute::new()
+            .with_blue_backend(Arc::new(StubChatBackend::new(
+                blue.into_iter().map(ToOwned::to_owned).collect(),
+            )))
+            .with_red_backend(Arc::new(StubChatBackend::new(
+                red.into_iter().map(ToOwned::to_owned).collect(),
+            )))
+            .with_judge_backend(Arc::new(StubChatBackend::new(
+                judge.into_iter().map(ToOwned::to_owned).collect(),
+            ))),
+    );
+    let config = make_config("http://127.0.0.1:1", false, false, 5000, 2000);
+    let pipelines = Arc::new(config.build_all_pipelines_with_backend(None));
+    let sessions = Arc::new(crate::dag_session::SessionRegistry::new(None));
+    let ledger = Arc::new(crate::ledger::ContentNodeLedger::open_in_memory().unwrap());
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+
+    let deps = rigor_test_deps(
+        pipelines,
+        &config,
+        Some(rigor_route),
+        Some(sessions),
+        Some(ledger),
+    );
+    let handle = tokio::spawn(async move {
+        if let Err(e) = serve_http(listener, deps).await {
+            tracing::error!(target: "router.test", error = %e, "rigor test server failed");
+        }
+    });
+    TestServer { addr, handle }
+}
+
+/// POST a rigor request, bounded by an overall timeout.
+async fn post_rigor(
+    base_url: &str,
+    body: Value,
+    timeout_ms: u64,
+) -> Result<reqwest::Response, String> {
+    let client = reqwest::Client::new();
+    tokio::time::timeout(
+        Duration::from_millis(timeout_ms),
+        client
+            .post(format!("{base_url}/v1/rigor"))
+            .json(&body)
+            .send(),
+    )
+    .await
+    .map_err(|_| "rigor request timed out".to_string())?
+    .map_err(|e| format!("rigor request failed: {e}"))
+}
+
+const RED_OBJECTIONS: &str =
+    r#"[{"category": "factual", "description": "unsupported claim", "severity": 0.9}]"#;
+const ACCEPT_VERDICT: &str =
+    r#"{"verdict": "accept", "caveats": [], "reasons": [], "confidence": 0.9}"#;
+const REJECT_VERDICT: &str =
+    r#"{"verdict": "reject", "caveats": [], "reasons": ["x"], "confidence": 0.8}"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rigor_route_judge_accepts_returns_executed_and_audits() {
+    let capture = install_audit_capture();
+    let server = spawn_rigor_server(
+        vec!["the rigorous answer"],
+        vec![RED_OBJECTIONS],
+        vec![ACCEPT_VERDICT],
+    )
+    .await;
+    let resp = post_rigor(
+        &server.base_url(),
+        json!({"message": "prove this claim", "session_id": "sess-rigor-http"}),
+        10000,
+    )
+    .await
+    .expect("rigor request");
+    assert_eq!(resp.status(), 200, "judge accepts -> executed");
+    let body: Value = resp.json().await.expect("rigor response json");
+    assert_eq!(body["status"], "executed");
+    assert_eq!(body["answer"], "the rigorous answer");
+    assert_eq!(body["verdict"], "accept");
+    assert_eq!(body["rewound"], false);
+
+    let lines = lock(&capture).join("\n");
+    assert!(
+        lines.contains("router.audit") && lines.contains("kind=\"rigor\""),
+        "rigor execution must emit an audit record, got:\n{lines}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rigor_route_material_rejection_returns_clarify() {
+    let server = spawn_rigor_server(
+        vec!["first answer", "second answer"],
+        vec![RED_OBJECTIONS, RED_OBJECTIONS],
+        vec![REJECT_VERDICT, REJECT_VERDICT],
+    )
+    .await;
+    let resp = post_rigor(
+        &server.base_url(),
+        json!({"message": "high-stakes claim"}),
+        10000,
+    )
+    .await
+    .expect("rigor request");
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.expect("rigor response json");
+    assert_eq!(
+        body["status"], "clarify",
+        "a final rejection resolves to clarify"
+    );
+    assert_eq!(body["rewound"], true, "material rejection rewound for real");
+    assert!(
+        body["questions"].as_array().is_some_and(|q| !q.is_empty()),
+        "targeted interview questions must be populated: {body:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rigor_route_unconfigured_returns_explicit_error() {
+    // No rigor route wired: /v1/rigor degrades to an explicit error, never a
+    // crash (the shipped env/coral-router.json has no `rigor` section).
+    let config = make_config("http://127.0.0.1:1", false, false, 5000, 2000);
+    let pipelines = Arc::new(config.build_all_pipelines_with_backend(None));
+    let deps = rigor_test_deps(pipelines, &config, None, None, None);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let handle = tokio::spawn(async move {
+        if let Err(e) = serve_http(listener, deps).await {
+            tracing::error!(target: "router.test", error = %e, "rigor test server failed");
+        }
+    });
+    let server = TestServer { addr, handle };
+
+    let resp = post_rigor(&server.base_url(), json!({"message": "x"}), 10000)
+        .await
+        .expect("rigor request");
+    assert_eq!(
+        resp.status(),
+        hyper::StatusCode::SERVICE_UNAVAILABLE,
+        "unconfigured rigor route -> explicit 503"
+    );
+    let text = resp.text().await.unwrap_or_default();
+    assert!(
+        text.contains("rigor route not configured"),
+        "error body must explain, got: {text}"
     );
 }

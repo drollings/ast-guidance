@@ -73,6 +73,11 @@ pub struct RouterConfig {
     /// of the server needs flat views.
     #[serde(default)]
     pub classification: Option<ClassificationTree>,
+    /// Rigor-route configuration (M3). `None` (the default) leaves the route
+    /// present but unconfigured — requests return an explicit `Unconfigured`
+    /// error, never a crash.
+    #[serde(default)]
+    pub rigor: Option<RigorConfig>,
 }
 
 impl Default for RouterConfig {
@@ -97,6 +102,7 @@ impl Default for RouterConfig {
             charts: ChartsConfig::default(),
             post_process: PostProcessConfig::default(),
             classification: None,
+            rigor: None,
         }
     }
 }
@@ -310,6 +316,72 @@ const fn default_charts_max_candidates() -> usize {
     5
 }
 
+// ── Rigor (M3) configuration ──────────────────────────────────────────────
+
+/// Rigor-route configuration — the `rigor` section of `RouterConfig`.
+///
+/// Model keys select entries from `config.models`; backends are built **only**
+/// in `coral-router`'s `build_rigor_route` (DIP, mirroring
+/// `build_plan_route`/`default_adjudicator_backend`). `None` at the
+/// `RouterConfig` level leaves `/v1/rigor` present but unconfigured.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RigorConfig {
+    /// Model key for the blue-team candidate-answer backend.
+    #[serde(default)]
+    pub blue_model: Option<String>,
+    /// Model key for the red-team objections backend.
+    #[serde(default)]
+    pub red_model: Option<String>,
+    /// Model key for the judge backend.
+    #[serde(default)]
+    pub judge_model: Option<String>,
+    /// Whether the route expects KV-cache checkpoint/rewind to be load-bearing
+    /// (a `DependencySession` with a `KvCacheManager`). Rewind always resets
+    /// steps; this flag only gates the KV-restore expectation.
+    #[serde(default)]
+    pub kv_cache_enabled: bool,
+    /// Max blue/red/judge passes. Fixed round count (VISION: terminate, don't
+    /// loop); a material rejection triggers **at most one** re-run of
+    /// blue+judge. Default 2.
+    #[serde(default = "default_rigor_max_passes")]
+    pub max_passes: usize,
+    /// Objection severity at/above which a judge rejection is **material**
+    /// (triggers rewind + the second blue pass). Default 0.7.
+    #[serde(default = "default_rigor_severity_threshold")]
+    pub severity_threshold: f64,
+    /// Judge confidence below which a final rejection escalates to frontier.
+    /// An explicit config value — never "red scored a point" (M3.5).
+    /// Default 0.4.
+    #[serde(default = "default_rigor_escalation_confidence")]
+    pub escalation_confidence: f64,
+}
+
+impl Default for RigorConfig {
+    fn default() -> Self {
+        Self {
+            blue_model: None,
+            red_model: None,
+            judge_model: None,
+            kv_cache_enabled: false,
+            max_passes: default_rigor_max_passes(),
+            severity_threshold: default_rigor_severity_threshold(),
+            escalation_confidence: default_rigor_escalation_confidence(),
+        }
+    }
+}
+
+const fn default_rigor_max_passes() -> usize {
+    2
+}
+
+const fn default_rigor_severity_threshold() -> f64 {
+    0.7
+}
+
+const fn default_rigor_escalation_confidence() -> f64 {
+    0.4
+}
+
 const fn default_charts_min_score() -> f64 {
     0.6
 }
@@ -382,6 +454,63 @@ mod tests {
         assert!(cfg.dir.is_none());
         assert!(cfg.index_path.is_none());
         assert!(cfg.selector_model.is_none());
+    }
+
+    // ── M3 rigor-route configuration ─────────────────────────────────────
+
+    #[test]
+    fn rigor_config_defaults() {
+        let cfg = RigorConfig::default();
+        assert_eq!(cfg.max_passes, 2);
+        assert_eq!(cfg.severity_threshold, 0.7);
+        assert_eq!(cfg.escalation_confidence, 0.4);
+        assert!(!cfg.kv_cache_enabled);
+        assert!(cfg.blue_model.is_none());
+        assert!(cfg.red_model.is_none());
+        assert!(cfg.judge_model.is_none());
+    }
+
+    #[test]
+    fn router_config_absent_rigor_section_defaults_to_none() {
+        // The shipped env/coral-router.json has no `rigor` section; the route
+        // stays present-but-unconfigured (None), never a crash.
+        let cfg: RouterConfig =
+            serde_json::from_str(r#"{"server": {"bind_addr": "127.0.0.1:0"}}"#).unwrap();
+        assert!(cfg.rigor.is_none());
+    }
+
+    #[test]
+    fn rigor_config_round_trip() {
+        let json = serde_json::json!({
+            "rigor": {
+                "blue_model": "fast",
+                "red_model": "code",
+                "judge_model": "code",
+                "kv_cache_enabled": true,
+                "max_passes": 3,
+                "severity_threshold": 0.8,
+                "escalation_confidence": 0.3,
+            }
+        });
+        let cfg: RouterConfig = serde_json::from_value(json).unwrap();
+        let rigor = cfg.rigor.expect("rigor section parsed");
+        assert_eq!(rigor.blue_model.as_deref(), Some("fast"));
+        assert_eq!(rigor.red_model.as_deref(), Some("code"));
+        assert_eq!(rigor.judge_model.as_deref(), Some("code"));
+        assert!(rigor.kv_cache_enabled);
+        assert_eq!(rigor.max_passes, 3);
+        assert_eq!(rigor.severity_threshold, 0.8);
+        assert_eq!(rigor.escalation_confidence, 0.3);
+
+        // Partial section still round-trips with defaults for the rest.
+        let partial: RouterConfig = serde_json::from_value(serde_json::json!({
+            "rigor": {"blue_model": "fast"}
+        }))
+        .unwrap();
+        let partial_cfg = partial.rigor.expect("rigor parsed");
+        assert_eq!(partial_cfg.blue_model.as_deref(), Some("fast"));
+        assert_eq!(partial_cfg.max_passes, 2, "absent fields default");
+        assert_eq!(partial_cfg.severity_threshold, 0.7);
     }
 
     #[test]

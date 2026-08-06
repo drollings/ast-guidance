@@ -232,11 +232,13 @@ impl RouterConfig {
                     retry_prompt_count = retry_prompts.len(),
                     "classifier wrapped in RetryClassifier",
                 );
-                stages.push(Arc::new(crate::stages::retry_classifier::RetryClassifier::new(
-                    Arc::new(stage),
-                    retry_max,
-                    retry_prompts,
-                )));
+                stages.push(Arc::new(
+                    crate::stages::retry_classifier::RetryClassifier::new(
+                        Arc::new(stage),
+                        retry_max,
+                        retry_prompts,
+                    ),
+                ));
             } else {
                 stages.push(Arc::new(stage));
             }

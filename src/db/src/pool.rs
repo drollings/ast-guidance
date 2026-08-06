@@ -1035,9 +1035,11 @@ mod tests {
                     .unwrap();
 
                 let err = pool_b
-                    .query_rows("SELECT id FROM t", Vec::<rusqlite::types::Value>::new(), |r| {
-                        r.get::<_, i64>(0)
-                    })
+                    .query_rows(
+                        "SELECT id FROM t",
+                        Vec::<rusqlite::types::Value>::new(),
+                        |r| r.get::<_, i64>(0),
+                    )
                     .await
                     .unwrap_err();
                 assert!(
@@ -1047,9 +1049,11 @@ mod tests {
 
                 // And pool A still sees its own data.
                 let rows = pool_a
-                    .query_rows("SELECT id FROM t", Vec::<rusqlite::types::Value>::new(), |r| {
-                        r.get::<_, i64>(0)
-                    })
+                    .query_rows(
+                        "SELECT id FROM t",
+                        Vec::<rusqlite::types::Value>::new(),
+                        |r| r.get::<_, i64>(0),
+                    )
                     .await
                     .unwrap();
                 assert_eq!(rows, vec![1]);
@@ -1074,7 +1078,10 @@ mod tests {
                 let n: i64 = conn
                     .query_row("SELECT id FROM t", [], |r| r.get(0))
                     .unwrap();
-                assert_eq!(n, 5, "open(\":memory:\") must share one DB across checkouts");
+                assert_eq!(
+                    n, 5,
+                    "open(\":memory:\") must share one DB across checkouts"
+                );
             })
             .await;
     }

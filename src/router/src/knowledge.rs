@@ -46,7 +46,8 @@ impl KnowledgeCapability for NodeStore {
         if check_capability(&RouterKnowledgeCapability).is_err() {
             return Vec::new();
         }
-        self.get_session_nodes(session_id, limit).unwrap_or_default()
+        self.get_session_nodes(session_id, limit)
+            .unwrap_or_default()
     }
 
     fn insert_node(&self, node: &ContentNode) -> Result<NodeId, KnowledgeError> {
@@ -67,9 +68,9 @@ impl KnowledgeCapability for NodeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use fluent_wvr::capability::CURRENT_CAPS;
     use fluent_wvr::CapabilitySet;
+    use std::sync::Arc;
 
     fn caps() -> CapabilitySet {
         CapabilitySet::new().with(RouterKnowledgeCapability)
@@ -111,7 +112,9 @@ mod tests {
         let store = Arc::new(temp_store());
         CURRENT_CAPS
             .scope(caps(), async {
-                let id = store.record_request("sess", "req-1", "hello knowledge").unwrap();
+                let id = store
+                    .record_request("sess", "req-1", "hello knowledge")
+                    .unwrap();
                 // get_node: shared snapshot path.
                 let node = KnowledgeCapability::get_node(&*store, id).unwrap();
                 assert_eq!(node.lod[0], "hello knowledge");

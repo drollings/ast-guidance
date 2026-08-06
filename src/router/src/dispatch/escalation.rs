@@ -127,7 +127,12 @@ impl EscalationLadder {
                     &serde_json::json!({ "source": hit.source, "score": hit.score }),
                 );
                 let completion = make_text_completion(ctx.model_name, &hit.content);
-                return Some(completion_to_response(&completion, ctx.model_name, false, None));
+                return Some(completion_to_response(
+                    &completion,
+                    ctx.model_name,
+                    false,
+                    None,
+                ));
             }
         }
 
@@ -223,7 +228,14 @@ impl EscalationLadder {
         } else {
             "response re-flagged by stage-1 filters"
         };
-        Self::emit_audit("filter", accepted, &payload, &raw, trigger, &serde_json::json!({}));
+        Self::emit_audit(
+            "filter",
+            accepted,
+            &payload,
+            &raw,
+            trigger,
+            &serde_json::json!({}),
+        );
 
         if accepted {
             Ok(Some(completion_to_response(
@@ -246,9 +258,10 @@ impl EscalationLadder {
         let Some(front) = &self.config.frontier else {
             return Ok(None);
         };
-        let (Some(decomposer), Some(assembler)) =
-            (self.backends.decomposer.clone(), self.backends.assembler.clone())
-        else {
+        let (Some(decomposer), Some(assembler)) = (
+            self.backends.decomposer.clone(),
+            self.backends.assembler.clone(),
+        ) else {
             return Ok(None);
         };
 
@@ -407,8 +420,7 @@ impl EscalationLadder {
             self.backends.classifier.clone(),
             self.backends.draft.clone(),
             self.backends.judge.clone(),
-        )
-        else {
+        ) else {
             return Ok(None);
         };
         let slots = self.config.classifier_parallel.max(1);
@@ -419,18 +431,14 @@ impl EscalationLadder {
         // temperature at construction; `classifier_parallel` instances of the
         // same model are simulated by varied prompts).
         let votes: Vec<String> = {
-            let pool = ResultPool::new(
-                fluent_concurrency::tokio_runtime(),
-                slots,
-                slots,
-                {
-                    let backend = classifier.clone();
+            let pool = ResultPool::new(fluent_concurrency::tokio_runtime(), slots, slots, {
+                let backend = classifier.clone();
+                let user_text = user_text.clone();
+                move |task: ClassifierSlot| {
+                    let backend = backend.clone();
                     let user_text = user_text.clone();
-                    move |task: ClassifierSlot| {
-                        let backend = backend.clone();
-                        let user_text = user_text.clone();
-                        async move {
-                            let messages = vec![
+                    async move {
+                        let messages = vec![
                                 ChatMessage {
                                     role: "system".into(),
                                     content: format!(
@@ -445,11 +453,10 @@ impl EscalationLadder {
                                     content: user_text,
                                 },
                             ];
-                            backend.chat_complete(&messages)
-                        }
+                        backend.chat_complete(&messages)
                     }
-                },
-            );
+                }
+            });
 
             let mut out = Vec::new();
             for index in 0..slots {
@@ -1035,12 +1042,16 @@ mod tests {
 
     impl fluent_types::ContextCache for MapContextCache {
         fn lookup(&self, query: &str) -> Option<ContextHit> {
-            self.map.lock().unwrap().get(query).map(|content| ContextHit {
-                source: "test-cache".into(),
-                content: content.clone(),
-                score: 0.99,
-                metadata: None,
-            })
+            self.map
+                .lock()
+                .unwrap()
+                .get(query)
+                .map(|content| ContextHit {
+                    source: "test-cache".into(),
+                    content: content.clone(),
+                    score: 0.99,
+                    metadata: None,
+                })
         }
     }
 
@@ -1197,7 +1208,11 @@ mod tests {
         };
         let resp = ladder.try_escalate(&ctx).await.expect("turnover accepted");
         assert_eq!(read_body_text(resp).await, "escalated answer");
-        assert_eq!(frontier.received_texts().len(), 2, "both modes hit frontier");
+        assert_eq!(
+            frontier.received_texts().len(),
+            2,
+            "both modes hit frontier"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1242,14 +1257,17 @@ mod tests {
         };
         let resp = ladder.try_escalate(&ctx).await.expect("accepted");
         assert_eq!(read_body_text(resp).await, "assembled final answer");
-        assert_eq!(frontier.received_texts().len(), 2, "one frontier call per hypothetical");
+        assert_eq!(
+            frontier.received_texts().len(),
+            2,
+            "one frontier call per hypothetical"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn team_mode_accepts_after_judge_verdict() {
-        let classifier = func_backend(|_| {
-            Ok(r#"{"approach": "decompose", "confidence": 0.9}"#.into())
-        });
+        let classifier =
+            func_backend(|_| Ok(r#"{"approach": "decompose", "confidence": 0.9}"#.into()));
         let draft = func_backend(|_| Ok(r#"["subtask A", "subtask B"]"#.into()));
         let judge = func_backend(|messages| {
             let msg = last_user_message(messages);
@@ -1333,7 +1351,10 @@ mod tests {
             context_cache: None,
             session: None,
         };
-        assert!(ladder.try_escalate(&ctx).await.is_none(), "judge reject → no acceptance");
+        assert!(
+            ladder.try_escalate(&ctx).await.is_none(),
+            "judge reject → no acceptance"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

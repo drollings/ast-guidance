@@ -66,7 +66,8 @@ impl KnowledgeCapability for Library {
         if check_capability(&CoralKnowledgeCapability).is_err() {
             return Err(denied());
         }
-        self.knn_search(embedding, k, None).map_err(library_to_knowledge)
+        self.knn_search(embedding, k, None)
+            .map_err(library_to_knowledge)
     }
 }
 

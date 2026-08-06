@@ -106,7 +106,9 @@ mod tests {
 
     #[test]
     fn knowledge_error_variants_display() {
-        assert!(KnowledgeError::NotFound(NodeId::from_int(7)).to_string().contains("7"));
+        assert!(KnowledgeError::NotFound(NodeId::from_int(7))
+            .to_string()
+            .contains("7"));
         assert_eq!(
             KnowledgeError::NoEmbedding.to_string(),
             "node has no embedding"

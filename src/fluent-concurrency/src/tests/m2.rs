@@ -701,8 +701,12 @@ fn test_zone_config_traits() {
 #[test]
 fn test_zone_config_default_retry_predicate() {
     let config = ZoneConfig::default();
-    assert!(!(config.is_retryable)(&WorkError::Execution("permanent".into())));
-    assert!((config.is_retryable)(&WorkError::Dependency("transient".into())));
+    assert!(!(config.is_retryable)(&WorkError::Execution(
+        "permanent".into()
+    )));
+    assert!((config.is_retryable)(&WorkError::Dependency(
+        "transient".into()
+    )));
     assert!((config.is_retryable)(&WorkError::Timeout {
         duration_ms: 1,
         unit: "u".into()
@@ -735,7 +739,11 @@ async fn test_zone_custom_retry_predicate_retries_execution() {
     zone.register_with_context(Arc::new(unit), ctx).unwrap();
     let summary: ZoneSummary = (&mut zone).await;
     assert_eq!(summary.failed.len(), 1);
-    assert_eq!(counter.load(Ordering::SeqCst), 3, "custom predicate retries");
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        3,
+        "custom predicate retries"
+    );
 }
 
 /// ZoneConfig with poll_budget=1: the minimum valid budget works.

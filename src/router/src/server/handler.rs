@@ -13,6 +13,7 @@ use crate::ledger::ContentNodeLedger;
 use crate::normalize;
 use crate::pipeline::{PipelineOrchestrator, RoutingTarget};
 use crate::routes::plan::PlanRoute;
+use crate::routes::rigor::{RigorContext, RigorError, RigorRoute};
 use crate::server::dispatch::handle_dispatch;
 use crate::server::responses::completion_to_response;
 use crate::server::responses::empty_response;
@@ -24,7 +25,7 @@ use crate::server::responses::ServerStats;
 use crate::testing::mock::MockDispatchContext;
 use crate::types::RouterRequest;
 
-/// The request-context dependency bundle handed to every HTTP handler. 
+/// The request-context dependency bundle handed to every HTTP handler.
 /// Collapses the former 12-`Option` parameter list so escalation
 /// (`ladders`, `context_cache`) and future concerns thread through one
 /// struct instead of a growing signature.
@@ -40,6 +41,7 @@ pub struct ServerDeps {
     pub ledger: Option<Arc<ContentNodeLedger>>,
     pub cache: Option<Arc<ResponseCache>>,
     pub plan_route: Option<Arc<PlanRoute>>,
+    pub rigor_route: Option<Arc<RigorRoute>>,
     pub sessions: Option<Arc<SessionRegistry>>,
     pub http_client: Arc<reqwest::Client>,
     /// Per-model-group escalation ladders (M3). Keyed by
@@ -174,6 +176,7 @@ async fn handle_chat_completion(
         ledger,
         cache,
         plan_route,
+        rigor_route: _,
         sessions,
         http_client,
         ladders,
@@ -279,10 +282,7 @@ async fn handle_chat_completion(
     // M3.7 bypass: a session the turnover mode marked frontier-owned skips
     // the local pipeline and goes straight to the frontier.
     if let Some(step) = &session_step {
-        let frontier_owned = step
-            .session
-            .lock()
-            .is_ok_and(|s| s.is_frontier_owned());
+        let frontier_owned = step.session.lock().is_ok_and(|s| s.is_frontier_owned());
         if frontier_owned {
             let group = routes.get(&model_name).map(|r| r.group.as_str());
             if let Some(ladder) = group.and_then(|g| ladders.get(g)) {
@@ -632,6 +632,152 @@ fn plan_executed_response(
     executed
 }
 
+/// Handle `POST /v1/rigor` — the fixed-pass blue/red/judge protocol (M3).
+///
+/// Body: `{ "message", "session_id"?, "entities"? }`. A configured route with
+/// all three role backends executes and returns `executed` (accepted answer)
+/// or `clarify` (a material rejection resolved to a targeted interview). An
+/// unconfigured route (no `rigor` section / missing backends) returns an
+/// explicit error — never a crash.
+async fn handle_rigor_request(
+    req: hyper::Request<hyper::body::Incoming>,
+    deps: ServerDeps,
+) -> Result<HyperResponse, std::convert::Infallible> {
+    let ServerDeps {
+        stats,
+        max_payload,
+        rigor_route,
+        sessions,
+        ledger,
+        classifier,
+        ..
+    } = &deps;
+    let Some(route) = rigor_route else {
+        stats.errors.fetch_add(1, Ordering::Relaxed);
+        return Ok(crate::server::responses::error_response(
+            hyper::StatusCode::SERVICE_UNAVAILABLE,
+            "rigor route not configured",
+        ));
+    };
+
+    let body_bytes = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            stats.errors.fetch_add(1, Ordering::Relaxed);
+            return Ok(crate::server::responses::error_response(
+                hyper::StatusCode::BAD_REQUEST,
+                &format!("body read error: {e}"),
+            ));
+        }
+    };
+    if body_bytes.len() > *max_payload {
+        return Ok(empty_response(hyper::StatusCode::PAYLOAD_TOO_LARGE));
+    }
+    let body: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            stats.errors.fetch_add(1, Ordering::Relaxed);
+            return Ok(crate::server::responses::error_response(
+                hyper::StatusCode::BAD_REQUEST,
+                &format!("invalid JSON: {e}"),
+            ));
+        }
+    };
+
+    let message = body
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if message.is_empty() {
+        return Ok(crate::server::responses::error_response(
+            hyper::StatusCode::BAD_REQUEST,
+            "missing 'message'",
+        ));
+    }
+    let session_id = body
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(uuid_v4, ToOwned::to_owned);
+
+    // The session model key: the classifier model when known, else a stable
+    // placeholder (KV snapshot keying needs *a* model, `dag_session.rs:354`).
+    let model_endpoint = classifier
+        .as_ref()
+        .map_or_else(|| "fast".into(), |(name, _)| name.clone());
+
+    // D5/D6: thread the registry session + shared ledger into the context so
+    // checkpoint/rewind and the red-team LOD0 view are load-bearing.
+    let session = sessions.as_ref().map(|s| s.get_or_create(&session_id));
+    let ledger = ledger.clone();
+
+    let ctx = RigorContext {
+        user_message: message.to_string(),
+        session_id,
+        model_endpoint,
+        session,
+        ledger,
+    };
+
+    match route.execute(&ctx).await {
+        Ok(result) => {
+            let response = if matches!(
+                &result.judge_verdict,
+                crate::routes::rigor::JudgeVerdict::Reject { .. }
+            ) {
+                // A final rejection resolves to a targeted interview.
+                serde_json::json!({
+                    "status": "clarify",
+                    "questions": result.interview_questions,
+                    "rewound": result.rewound,
+                })
+            } else {
+                let mut executed = serde_json::json!({
+                    "status": "executed",
+                    "answer": result.blue_answer,
+                    "verdict": verdict_tag(&result.judge_verdict),
+                    "rewound": result.rewound,
+                });
+                if let crate::routes::rigor::JudgeVerdict::AcceptWithCaveats { ref caveats } =
+                    result.judge_verdict
+                {
+                    executed["caveats"] = serde_json::to_value(caveats).unwrap_or_default();
+                }
+                if result.frontier_escalation {
+                    executed["frontier_escalation"] = serde_json::json!(true);
+                }
+                executed
+            };
+            Ok(crate::server::responses::json_response(
+                hyper::StatusCode::OK,
+                &response,
+            ))
+        }
+        Err(RigorError::Unconfigured(name)) => {
+            stats.errors.fetch_add(1, Ordering::Relaxed);
+            Ok(crate::server::responses::error_response(
+                hyper::StatusCode::SERVICE_UNAVAILABLE,
+                &format!("rigor role backend not configured: {name}"),
+            ))
+        }
+        Err(e) => {
+            stats.errors.fetch_add(1, Ordering::Relaxed);
+            Ok(crate::server::responses::error_response(
+                hyper::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ))
+        }
+    }
+}
+
+/// Audit-tag form of a judge verdict for the `executed`/`clarify` response.
+fn verdict_tag(verdict: &crate::routes::rigor::JudgeVerdict) -> &'static str {
+    match verdict {
+        crate::routes::rigor::JudgeVerdict::Accept => "accept",
+        crate::routes::rigor::JudgeVerdict::AcceptWithCaveats { .. } => "accept_with_caveats",
+        crate::routes::rigor::JudgeVerdict::Reject { .. } => "reject",
+    }
+}
+
 #[allow(clippy::implicit_hasher)]
 pub async fn handle_request(
     req: hyper::Request<hyper::body::Incoming>,
@@ -693,6 +839,10 @@ pub async fn handle_request(
         ("POST", "/v1/plan") => {
             stats.requests.fetch_add(1, Ordering::Relaxed);
             handle_plan_request(req, deps.plan_route.clone(), deps.max_payload, stats).await
+        }
+        ("POST", "/v1/rigor") => {
+            stats.requests.fetch_add(1, Ordering::Relaxed);
+            handle_rigor_request(req, deps).await
         }
         _ => {
             if method == hyper::Method::DELETE && path.starts_with("/admin/cache/") {
