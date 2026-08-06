@@ -9,7 +9,7 @@
 //! and descriptions, enforces per-node coherence/safety thresholds, and emits a
 //! `StageDecision` per visited node plus a durable audit record. The flat path
 //! below no longer guesses route names from classifier `action`/`intent`
-//! strings (ROADMAP_20260805_REVIEW M4.5) — route selection is the tree's job.
+//! strings — route selection is the tree's job.
 //!
 //! The LLM backend is injected as `Arc<dyn ChatBackend>` rather than a
 //! concrete `LlmClient`, so mock/stub backends can be injected for testing
@@ -47,8 +47,7 @@ const DEFAULT_COMPLETENESS: f64 = 0.5;
 ///
 /// The field-coercion lives in the shared `stages::common` helpers (the
 /// "surviving normalization" both this stage and the M4 tree engine use).
-/// Route-name guessing is gone — the classification tree replaces it
-/// (ROADMAP_20260805_REVIEW M4.5).
+/// Route-name guessing is gone — the classification tree replaces it.
 fn sanitize_classifier_json(mut v: serde_json::Value) -> serde_json::Value {
     if let Some(obj) = v.as_object_mut() {
         coerce_float(obj, "coherence_score", 1.0);
@@ -284,11 +283,10 @@ impl ClassifierStage {
         }
     }
 
-    /// Construct the stage in classification-tree mode (ROADMAP_20260805_REVIEW
-    /// M4). The engine owns the tree, the routing table, the per-node backends,
-    /// and the auto-constructed prompts; this stage only extracts the user
-    /// message and converts the engine's final `StageDecision` into a
-    /// `WorkOutput`.
+    /// Construct the stage in classification-tree mode.  The engine owns
+    /// the tree, the routing table, the per-node backends, and the
+    /// auto-constructed prompts; this stage only extracts the user message
+    /// and converts the engine's final `StageDecision` into a `WorkOutput`.
     #[allow(clippy::too_many_arguments)]
     pub fn with_tree(
         client: Arc<dyn ChatBackend>,

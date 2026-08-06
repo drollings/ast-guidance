@@ -1,5 +1,5 @@
 //! Chart selection — deterministic capability match → HNSW retrieval → LLM
-//! adjudication (ROADMAP M7).
+//! adjudication.
 //!
 //! Given a raw request, the selector picks the best chart, cheapest step
 //! first (VISION: deterministic before probabilistic):

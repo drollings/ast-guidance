@@ -44,8 +44,7 @@ impl RoutingConfig {
     /// the group) and attaches the resolved group, the `target_name`, and the
     /// ordered `fallbacks`. This is the canonical target builder shared by the
     /// flat classifier stage and the M4 classification-tree engine — a
-    /// terminal node dispatches through it unchanged (ROADMAP_20260805_REVIEW
-    /// M4.3).
+    /// terminal node dispatches through it unchanged
     pub fn routing_target(&self, route: &str, min_complexity: Option<u8>) -> Option<RoutingTarget> {
         let (entry, model_name) = self.resolve_route(route, min_complexity)?;
         let group = self

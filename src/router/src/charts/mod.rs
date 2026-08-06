@@ -10,7 +10,7 @@
 //!
 //! This module defines the declarative chart schema (`ChartDef`/`ChartTarget`/
 //! `DepSpec`/`EntityPredicate`) and its validation. No I/O, no rendering,
-//! no LLM. See `ROADMAP_20260802_DAG_WORKFLOW.md` M1.
+//! no LLM.
 
 use std::collections::HashSet;
 

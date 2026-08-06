@@ -185,11 +185,10 @@ fn make_backend(http_client: &reqwest::Client, target: &RoutingTarget) -> Arc<dy
 /// `normalize::messages_to_json`, so this assembly — the role-prefixed text
 /// of every message, system first — is faithful to what the model received.
 /// This is the *reconstructed* prompt (the exact rendered JSON body is not
-/// recoverable at the call site); the choice is documented in
-/// `ROADMAP_20260804_M3_CHECKLIST.md`.
+/// recoverable at the call site).
 ///
 /// `pub(crate)` so the escalation ladder (`dispatch::escalation`) can reuse
-/// it for its `payload` audit field (ROADMAP_20260805_REVIEW M3.8).
+/// it for its `payload` audit field.
 pub(crate) fn render_prompt(router_request: &RouterRequest) -> String {
     router_request
         .messages

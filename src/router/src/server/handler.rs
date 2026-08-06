@@ -24,10 +24,10 @@ use crate::server::responses::ServerStats;
 use crate::testing::mock::MockDispatchContext;
 use crate::types::RouterRequest;
 
-/// The request-context dependency bundle handed to every HTTP handler
-/// (ROADMAP_20260805_REVIEW M3.0). Collapses the former 12-`Option` parameter
-/// list so escalation (`ladders`, `context_cache`) and future concerns thread
-/// through one struct instead of a growing signature.
+/// The request-context dependency bundle handed to every HTTP handler. 
+/// Collapses the former 12-`Option` parameter list so escalation
+/// (`ladders`, `context_cache`) and future concerns thread through one
+/// struct instead of a growing signature.
 #[derive(Clone)]
 pub struct ServerDeps {
     pub pipelines: Arc<HashMap<String, Arc<PipelineOrchestrator>>>,

@@ -12,9 +12,9 @@ pub use knowledge::{KnowledgeCapability, KnowledgeError};
 pub const LOD_COUNT: usize = 6;
 
 /// A deterministic context hit — a short-circuit fact/cached answer that
-/// lets the escalation ladder avoid a frontier call (ROADMAP_20260805_REVIEW
-/// M3). `content` is the verified answer/fact; `source` names the cache that
-/// produced it (e.g. "coral-context" or "ledger") for audit provenance.
+/// lets the escalation ladder avoid a frontier call.  `content` is the
+/// verified answer/fact; `source` names the cache that produced it (e.g. 
+/// "coral-context" or "ledger") for audit provenance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextHit {
     pub source: String,

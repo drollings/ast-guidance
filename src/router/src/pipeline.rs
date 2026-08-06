@@ -76,9 +76,6 @@ impl RoutingTarget {
 }
 
 /// Canonical timeout/retry defaults, centralized in `common_core::constants`.
-/// **D7 behavior change (ROADMAP_20260804_DRY M7.2):** the `RoutingTarget`
-/// serde path moves from 120s/10s to the `config.rs` values 300s/30s — the
-/// divergence was a latent bug. Both modules now read the same constant.
 fn default_retry_interval() -> u64 {
     common_core::constants::DEFAULT_RETRY_INTERVAL_S
 }

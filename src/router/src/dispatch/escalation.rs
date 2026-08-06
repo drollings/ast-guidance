@@ -1,4 +1,4 @@
-//! Escalation-ladder dispatch loop (ROADMAP_20260805_REVIEW M3).
+//! Escalation-ladder dispatch loop
 //!
 //! Implements VISION §"The escalation ladder": after every local model in a
 //! `model_group` chain fails, the request escalates through the configured

@@ -1,7 +1,5 @@
 //! LLM Router & Agent Orchestration Framework
 //!
-//! See `ROADMAP_20260722_CORAL_ROUTER.md` for the full architecture.
-//!
 //! ## Modules
 //! - `pipeline_types` — `StageDecision`, `PipelineStage`, `StageVerdict`
 //! - `types` — `RouterRequest`, `RouterResponse`, `RouterMessage`, etc.

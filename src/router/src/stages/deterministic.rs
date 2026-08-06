@@ -67,8 +67,8 @@ impl DeterministicPreFilter {
 
     /// Run the stage-1 filter engine over output text — the response
     /// re-scan used by the escalation ladder's filter mode
-    /// (`dispatch::escalation`, ROADMAP_20260805_REVIEW M3.4). `None` means
-    /// the output is clean (accepted).
+    /// (`dispatch::escalation`.  `None` means the output is clean
+    /// (accepted).
     pub(crate) fn scan_output(&self, text: &str) -> Option<FilterDecision> {
         let ctx = FilterContext {
             user_message: text.to_string(),
@@ -118,8 +118,7 @@ impl Default for DeterministicPreFilter {
 
 /// The stage-1 filter engine over the builtin PII/injection patterns — the
 /// canonical engine shared by `DeterministicPreFilter::new` and the
-/// escalation ladder's filter-mode response re-scan
-/// (ROADMAP_20260805_REVIEW M3.4).
+/// escalation ladder's filter-mode response re-scan.
 pub(crate) fn builtin_filter_engine() -> DeterministicFilterEngine {
     use crate::config::{PatternEntry, RejectPatterns};
 

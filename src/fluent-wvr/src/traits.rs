@@ -69,7 +69,7 @@ pub trait SchemaProvider {
 /// context but expects `execute` itself to return promptly. Violations
 /// defeat the supervisor's timeout and retry invariants.
 ///
-/// See: `ROADMAP_REFINE.md#M5` and `AGENTS.md` "Refinement contract" §3.
+/// See: `AGENTS.md` "Refinement contract" §3.
 ///
 /// # Examples
 ///

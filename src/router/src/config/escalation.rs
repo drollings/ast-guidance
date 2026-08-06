@@ -1,4 +1,4 @@
-//! Escalation-ladder configuration (ROADMAP_20260805_REVIEW M3.1/M3.2).
+//! Escalation-ladder configuration
 //!
 //! `model_groups[group]` accepts either the shipped array form
 //! (`["fast", "small"]`) or a new object form

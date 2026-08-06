@@ -403,7 +403,6 @@ impl RouterConfig {
     ///
     /// The ladders are keyed by group name; `RoutingTarget.group` resolves
     /// which one a failed local chain escalates through
-    /// (ROADMAP_20260805_REVIEW M3.9).
     pub fn build_escalation_ladders(
         &self,
         http_client: &reqwest::Client,

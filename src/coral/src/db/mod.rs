@@ -16,7 +16,7 @@ use fluent_llm::EmbeddingProvider;
 use fluent_types::{ContentNode, NodeId};
 use thiserror::Error;
 
-// Promoted to `common-core::constants` (ROADMAP_20260804_SHARED_CORE M4.3);
+// Promoted to `common-core::constants`
 // re-exported here so `super::{…, MAX_KNN_CANDIDATES}` imports keep working.
 pub use common_core::constants::MAX_KNN_CANDIDATES;
 

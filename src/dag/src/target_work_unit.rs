@@ -4,11 +4,11 @@
 //! capabilities) adapted to the fluent-wvr [`Component`] world so the
 //! resolver's `ExecutionPlan` can run under `Zone` / `WorkUnit` semantics.
 //!
-//! This module replaces the pruned `DagExecutor` (see
-//! `ROADMAP_20260804_DRY.md` M2). Its `execute` mirrors `CommandUnit`'s
-//! semantics exactly via the shared `run_shell_command` helper — sequential
-//! determinism comes from walking `ExecutionPlan::order`, and per-target
-//! result linkage is preserved via `Target::id`.
+//! This module replaces the pruned `DagExecutor` Its `execute` mirrors
+//! `CommandUnit`'s semantics exactly via the shared `run_shell_command`
+//! helper — sequential determinism comes from walking
+//! `ExecutionPlan::order`, and per-target result linkage is preserved via
+//! `Target::id`.
 
 use crate::target::{CapabilityRegistry, Target};
 use crate::work_unit::run_shell_command;

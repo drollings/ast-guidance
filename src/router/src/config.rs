@@ -67,10 +67,10 @@ pub struct RouterConfig {
     /// Post-processing configuration (M10 learning loop).
     #[serde(default)]
     pub post_process: PostProcessConfig,
-    /// Nested classification tree (ROADMAP_20260805_REVIEW M4). `Some` switches
-    /// the classifier stage into tree-driven mode; the flat pipeline
-    /// sections remain for backward compatibility and are derived from the
-    /// tree where the rest of the server needs flat views.
+    /// Nested classification tree.  `Some` switches the classifier stage
+    /// into tree-driven mode; the flat pipeline sections remain for
+    /// backward compatibility and are derived from the tree where the rest
+    /// of the server needs flat views.
     #[serde(default)]
     pub classification: Option<ClassificationTree>,
 }
@@ -108,8 +108,7 @@ impl RouterConfig {
     /// configured, every `terminal` node whose route has no explicit entry gets
     /// a synthesized `RouteRef` (routed through the terminal's own `group`, or
     /// the route name when no group is given) so `RoutingConfig::resolve_route`
-    /// and `resolve_pipeline` work with no structural change to the server
-    /// (ROADMAP_20260805_REVIEW M4.4).
+    /// and `resolve_pipeline` work with no structural change to the server.
     pub fn routes_view(&self) -> HashMap<String, RouteRef> {
         let mut routes = self.routes.clone();
         if let Some(tree) = &self.classification {

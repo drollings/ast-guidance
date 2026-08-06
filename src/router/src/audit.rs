@@ -1,4 +1,4 @@
-//! Canonical durable-audit surface for the router (ROADMAP_20260805_REVIEW M1).
+//! Canonical durable-audit surface for the router
 //!
 //! The audit layer (`logging::audit_layer`) subscribes to a single `tracing`
 //! target, [`AUDIT_TARGET`], and every audit producer — chart target runs,
@@ -33,8 +33,6 @@ impl AuditRecord {
 ///
 /// `fields` is the event's JSON payload. The `kind` field distinguishes the
 /// record class (e.g. `"chart_target"`, `"filter"`, `"route"`, `"escalation"`).
-// Signature is prescribed by ROADMAP_20260805_REVIEW M1.2; the payload is
-// deliberately owned so callers can build it inline with `serde_json::json!`.
 #[allow(clippy::needless_pass_by_value)]
 pub fn emit(kind: &'static str, fields: serde_json::Value) {
     tracing::info!(

@@ -13,8 +13,6 @@
 //! not here. The sole exceptions are generic storage backends (`rusqlite`
 //! behind the `sqlite` feature) and generic data utilities (hashing, I/O,
 //! strings, formatting, metrics, drift, interner, watchdogs).
-//!
-//! See `ROADMAP_20260625_CONSOLIDATE.md` for the full consolidation plan.
 pub mod cache;
 
 pub use cache::{CachedResponse, LoadCache, ResponseCache};

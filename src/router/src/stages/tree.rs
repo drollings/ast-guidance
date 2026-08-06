@@ -1,4 +1,4 @@
-//! Classification-tree engine (ROADMAP_20260805_REVIEW M4).
+//! Classification-tree engine
 //!
 //! Evaluates a [`ClassificationTree`] recursively:
 //!

@@ -8,8 +8,7 @@ pub const MAX_EMBEDDING_DIMENSIONS: usize = 4_096;
 pub const MAX_LOG_MESSAGE_LEN: usize = 120;
 
 /// Canonical per-dispatch wall-clock budget for a full LLM request (ms).
-/// `RoutingTarget` (serde) and `ModelEntry` (serde) both read this constant
-/// (ROADMAP_20260804_DRY M7.2 — the values were divergent at 120s vs 300s).
+/// `RoutingTarget` (serde) and `ModelEntry` (serde) both read this constant.
 pub const DEFAULT_TOTAL_TIMEOUT_MS: u64 = 300_000;
 /// Canonical per-chunk idle budget for a streaming LLM response (ms).
 pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 30_000;

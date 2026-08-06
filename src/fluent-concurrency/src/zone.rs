@@ -349,15 +349,6 @@ async fn execute_with_timeout_and_retry(
     // executing the synchronous work unit body.
     tokio::task::yield_now().await;
     let fut = async {
-        // D5 (ROADMAP_20260804_DRY): the retry schedule is the canonical
-        // jittered-exponential helper from `common-core::retry`. Base 100ms
-        // keeps the first retry ≈ 100ms (deliberate schedule change from the
-        // old linear 100ms*attempt — documented in the roadmap checklist).
-        // `max_retries` counts retries after the first attempt, so the helper
-        // runs `max_retries + 1` attempts total. M5.1: the retry predicate is
-        // configurable per zone; the default (`WorkError::is_retryable`) treats
-        // permanent `WorkError::Execution` failures as non-retryable so they
-        // don't burn backoff budget.
         common_core::retry::retry_async(
             max_retries.saturating_add(1).max(1),
             100,

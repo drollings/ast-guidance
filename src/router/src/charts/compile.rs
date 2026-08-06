@@ -1,6 +1,6 @@
 //! Chart compiler — turns a validated, fully-bound `ChartDef` into a list of
 //! executable stage components (`CompiledTarget`s) ready for the Zone-supervised
-//! `ChartExecutionPlan` (the single chart executor, ROADMAP M4).
+//! `ChartExecutionPlan` (the single chart executor).
 //!
 //! Compilation is deterministic and fail-fast: a chart whose deps are not
 //! fully satisfiable (unmatched required dep, or ambiguous binding) returns

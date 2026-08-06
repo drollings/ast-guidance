@@ -1,4 +1,4 @@
-//! Classification-tree configuration (ROADMAP_20260805_REVIEW M4).
+//! Classification-tree configuration
 //!
 //! `RouterConfig.classification = Some(tree)` switches the classifier stage
 //! into tree-driven mode: instead of the flat single-LLM-call

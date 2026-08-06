@@ -236,8 +236,8 @@ Before escalation even begins, a `model_group` has an ordered `local` chain:
 
 ```
 local:
-  1. qwythos-9b (session=code)     ← primary model for this domain
-  2. fast (session=compact)         ← fallback if primary is unavailable or overloaded
+  1. qwen3.6-27b (session=code)     ← primary model for this domain
+  2. lfm2.5-2.6b (session=compact)  ← fallback if primary is unavailable or overloaded
 ```
 
 Dispatch tries each local entry in order. Only if all local entries fail
@@ -499,8 +499,7 @@ handled a given request, why, and what it cost.
 
 ## Current status
 
-**Status as of 2026-08-05** (reconciled against the source in
-`ROADMAP_20260805_FIXES`, M3).
+**Status as of 2026-08-05**
 
 **Foundational and stable:**
 
@@ -533,7 +532,7 @@ handled a given request, why, and what it cost.
   adjudication, and the matched chart is compiled into executable stages,
   run under `Zone` supervision (timeout/retry/cancel-dependents), and gated
   by per-target and chart-level rubrics. A one-round interview closes
-  `Partial` fits before blank-slate planning. The M10 learning loop is wired:
+  `Partial` fits before blank-slate planning. The learning loop is wired:
   successful dispatches (`post_process.workflow_extraction`) are distilled
   into *draft* charts, upserted idempotently against near neighbors, and
   demoted after `CHART_STALE_FAILS` consecutive rubric failures.
@@ -575,7 +574,7 @@ handled a given request, why, and what it cost.
   `NodeStore` and coral's `Library` both implement it behind their own
   capability tokens, so coral's Context is reachable without the router
   importing coral.
-- Routing quality (M5/M6): the weighted score matrix can be made the
+- Routing quality: the weighted score matrix can be made the
   **authoritative** route decision — the top-scoring route's name resolved
   through the one shared dispatch path — behind `score_matrix_authoritative`,
   and the `RetryClassifier` decorator is wired into the production pipeline
@@ -588,7 +587,7 @@ handled a given request, why, and what it cost.
 
 - **Parallel and filtered ledgers over the shared store — the remaining big
   pillar.** The shared, reference-counted store itself is real now
-  (`node_store.rs`, M4): nodes live once behind `Arc<RwLock<ContentNode>>`
+  (`node_store.rs`): nodes live once behind `Arc<RwLock<ContentNode>>`
   with interned `ArcIntern<str>` session/role index keys and durable
   `content_json` hydration, and `ContentNodeLedger` is a thin facade over it.
   What does *not* exist yet is the VISION's view layer on top: parallel
@@ -601,7 +600,7 @@ handled a given request, why, and what it cost.
 - Three separate library-scale HNSW indices (prior-workflow library,
   rubric/validated-answer cache, blacklist-adjacent similarity) —
   structurally scoped; the prior-workflow library is populated and wired into
-  the plan route, the rubric/validated-answer cache is populated by the M9
+  the plan route, the rubric/validated-answer cache is populated by the
   rubric gate, the blacklist index remains unpopulated.
 - The `rigor` route — types and structure exist; execution is not yet wired
   to live agents.
@@ -619,33 +618,6 @@ handled a given request, why, and what it cost.
 - llama.cpp parallel-slot / continuous-batching wiring for classifier
   fan-out is not yet the confirmed execution model for `ResultPool`-backed
   classifier calls.
-
-**SOLID/DRY refactoring (2026-07-29):**
-
-Core modules decomposed for Single Responsibility:
-
-- `router/src/config/` — builder.rs, filters.rs, routing.rs, addr.rs
-- `router/src/server/` — handler.rs, dispatch.rs, responses.rs
-- `coral/src/db/` — schema.rs, nodes.rs, edges.rs, hnsw.rs, embeddings.rs, kv_cache.rs
-- `coral/src/cache/` — reactor.rs, stats.rs
-
-Key architectural improvements:
-- `ResultScorer`, `Summarizer` now accept `Arc<dyn ChatBackend>` (DIP). (`OrchestratorSession` also did at the time; it was folded into `ContentNodeLedger` by the D6 session/ledger consolidation on 2026-08-04.)
-- `ClassifierStage` also takes `Arc<dyn ChatBackend>` (DIP)
-- PII regex patterns centralized in `fluent_llm::pii_patterns` (DRY)
-- Think-block stripping canonical in `common_core::string` (DRY)
-- `strip_html` canonical in `common_core::string` (DRY)
-- Pipeline verdict handling extracted to `handle_stage_verdict` (SRP)
-- Magic numbers replaced with named constants (Code Quality)
-- OpenAI-compatible dispatch core is canonical in `fluent_llm`:
-  `openai::build_openai_chat_body` (carries the `chat_template_kwargs:
-  {"enable_thinking": false}` default), `openai::parse_openai_stream_delta`,
-  `url::{chat_completions_url, derive_embeddings_url}`, and the OpenAI-format
-  normalization (`normalize_request`/`normalize_response`/`messages_to_json`).
-  `dispatch/backend.rs` and `dispatch/frontier.rs` are thin adapters over it
-  (ROADMAP_20260804_SHARED_CORE M1, D1); the HTTP-status failure taxonomy
-  (`HttpClass`/`FailureClass`) is canonical in `fluent_llm::http_class`
-  (M2, D2).
 
 ## Near-term direction
 
@@ -679,10 +651,6 @@ Key architectural improvements:
 - Reversible, session-scoped codeword anonymization for content that needs
   to cross a frontier round-trip and come back reconciled into local context
   without ever exposing the anonymized values upstream.
-- Optional: a stream-native local orchestrator model, instruction-tuned on
-  parallel role streams, evaluated as a standalone R&D track against the
-  existing single-stream orchestrator rather than as a replacement
-  requirement.
 
 ## What this project deliberately is not
 

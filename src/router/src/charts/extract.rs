@@ -1,4 +1,4 @@
-//! Chart auto-extraction from dispatch audit transcripts (ROADMAP M10).
+//! Chart auto-extraction from dispatch audit transcripts.
 //!
 //! A successful high-capability (frontier/local) solution is distilled into a
 //! named chart — each LLM call / transform becomes a `ChartTarget` with a

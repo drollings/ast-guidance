@@ -194,7 +194,7 @@ pub fn init_router_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::er
 
 /// Ops-stream filter: `info` (or `RUST_LOG`) with the durable audit target
 /// excluded — the audit layer owns `router.audit` exclusively so the ops and
-/// audit streams stay disjoint (ROADMAP_20260805_REVIEW M1.5).
+/// audit streams stay disjoint.
 fn ops_filter() -> EnvFilter {
     EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"))

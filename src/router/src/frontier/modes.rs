@@ -1,12 +1,12 @@
 //! Frontier escalation ladder — VISION §"The escalation ladder".
 //!
-//! `EscalationMode` is the canonical taxonomy of frontier-engagement stages
-//! (decision D8 — replaces the old `FrontierMode` "four involvement modes"
-//! enum, which never matched the VISION ladder). Stages are tried in order
-//! (filter → question → team → turnover) after every local model in a
-//! `model_group` fails. The ladder *runtime* lives in
-//! `crate::dispatch::escalation` (ROADMAP_20260805_REVIEW M3); this module
-//! owns the taxonomy plus the audit types it writes to.
+//!  `EscalationMode` is the canonical taxonomy of frontier-engagement
+//! stages (decision D8 — replaces the old `FrontierMode` "four involvement
+//! modes" enum, which never matched the VISION ladder).  Stages are tried
+//! in order (filter → question → team → turnover) after every local model
+//! in a `model_group` fails.  The ladder *runtime* lives in
+//! `crate::dispatch::escalation`; this module owns the taxonomy plus the
+//! audit types it writes to.
 
 use serde::{Deserialize, Serialize};
 
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 /// progressively more expensive, never all-or-nothing.
 ///
 /// `serde` is derived so a configured `model_groups[g].escalation.modes`
-/// list deserializes from config (ROADMAP_20260805_REVIEW M3.2).
+/// list deserializes from config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EscalationMode {

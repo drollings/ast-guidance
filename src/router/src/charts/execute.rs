@@ -1,4 +1,4 @@
-//! Zone-supervised execution of a compiled chart (ROADMAP M9).
+//! Zone-supervised execution of a compiled chart.
 //!
 //! The M9 supervisor runs a compiled chart's targets through a `Zone` in
 //! topo-order waves:

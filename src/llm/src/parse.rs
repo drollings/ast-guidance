@@ -1,13 +1,12 @@
 //! Tolerant JSON parsing for LLM outputs.
 //!
-//! LLM responses that are *supposed* to be JSON routinely come back wrapped
-//! in markdown code fences or padded with prose. This module owns the single
-//! tolerant parse pipeline — strip fence → parse → extract first balanced
-//! JSON value — so every caller (classifier, chart adjudicator, reranker,
-//! rubric judge, chart-stage output) shares one implementation
-//! (ROADMAP_20260804_DRY M7.4). It is string-only: no LLM protocol types,
-//! so it stays a pure helper on top of `serde_json`.
-
+//! LLM responses that are *supposed* to be JSON routinely come back
+//! wrapped in markdown code fences or padded with prose.  This module owns
+//! the single tolerant parse pipeline — strip fence → parse → extract first
+//! balanced JSON value — so every caller (classifier, chart adjudicator,
+//! reranker, rubric judge, chart-stage output) shares one implementation. 
+//! It is string-only: no LLM protocol types, so it stays a pure helper on
+//! top of `serde_json`.
 use serde_json::Value;
 
 /// Errors produced by [`parse_json_response`].

@@ -6,10 +6,10 @@ use crate::types::{
 };
 
 // Provider request/response builders, reserved for the frontier escalation
-// ladder (forward track — see ROADMAP_20260804_DRY §0.5). The production
-// dispatch path is `ChatBackend` in `dispatch::backend`; this module only
-// owns the wire-format build/parse logic for the OpenAI- and Anthropic-style
-// Messages APIs that the ladder will compose.
+// ladder (forward track.  The production dispatch path is `ChatBackend` in
+// `dispatch::backend`; this module only owns the wire-format build/parse
+// logic for the OpenAI- and Anthropic-style Messages APIs that the ladder
+// will compose.
 
 impl DispatchError {
     pub fn is_retryable(&self) -> bool {
@@ -193,7 +193,7 @@ impl OpenAiBackend {
 }
 
 /// Anthropic Messages-API builders, reserved for the frontier escalation
-/// ladder (forward track — see ROADMAP_20260804_DRY §0.5).
+/// ladder
 pub struct Anthropic;
 
 impl Anthropic {

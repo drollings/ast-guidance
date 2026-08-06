@@ -1,4 +1,4 @@
-//! Rubric acceptance gate for chart target outputs (ROADMAP M9).
+//! Rubric acceptance gate for chart target outputs.
 //!
 //! Before a chart target's output is promoted to `provides`, a cheap
 //! deterministic field-presence rule must pass; an optional LLM judge is

@@ -120,9 +120,9 @@ pub struct DependencySession {
     checkpoints: HashMap<String, usize>,
     kv_cache: Option<KvCacheManager>,
     step_order: Vec<String>,
-    /// Set when the escalation ladder's turnover mode hands the session to a
-    /// frontier model (ROADMAP_20260805_REVIEW M3.7). Subsequent requests in
-    /// the session bypass the local pipeline and go straight to frontier.
+    /// Set when the escalation ladder's turnover mode hands the session to
+    /// a frontier model.  Subsequent requests in the session bypass the
+    /// local pipeline and go straight to frontier.
     frontier_owned: bool,
 }
 
@@ -159,7 +159,7 @@ impl DependencySession {
 
     /// Whether the escalation ladder's turnover mode handed this session to a
     /// frontier model. The server routes such sessions' requests straight to
-    /// the frontier (ROADMAP_20260805_REVIEW M3.7).
+    /// the frontier.
     pub fn is_frontier_owned(&self) -> bool {
         self.frontier_owned
     }

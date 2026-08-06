@@ -14,7 +14,7 @@
 //! closure against its `Mutex<Connection>`; `Arc<SqlitePool>` acquires a
 //! pooled connection via the unified sync→async bridge
 //! (`common_core::runtime::block_on`, the workspace's single canonical
-//! bridge — the private copy was deleted by ROADMAP_20260804_DB_FOLLOWUP M1).
+//! bridge.
 
 use std::sync::Arc;
 
@@ -310,8 +310,7 @@ mod tests {
     async fn slow_db_op_does_not_starve_executor() {
         // A genuinely slow DbWorkUnit op runs on a dedicated blocking thread
         // (`block_in_place`), so the async executor keeps making progress while
-        // the DB work is in flight — the property the roadmap's "without
-        // blocking the executor" guarantee requires.
+        // the DB work is in flight.
         //
         // Note: a Zone's `tokio::time::timeout` cannot *preempt* a single
         // blocking `execute` (block_in_place parks the worker until the op

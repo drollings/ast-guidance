@@ -9,7 +9,7 @@ use thiserror::Error;
 use crate::cache::reactor::QueueReactor;
 use crate::db::Library;
 
-// Promoted to `common-core::constants` (ROADMAP_20260804_SHARED_CORE M4.3).
+// Promoted to `common-core::constants`.
 use common_core::constants::MAX_MCP_REQUEST_SIZE;
 
 #[derive(Error, Debug)]
