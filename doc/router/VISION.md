@@ -1,8 +1,9 @@
 # Coral Router — Vision
 
-*This document is the stable, high-level briefing — read it first,
-then the spec for mechanism, then the roadmap for what's actually landed
-versus still a stub.*
+*This document is the aspirational brief: the goals of Coral Router and its
+ideal finished design. It deliberately does not track what is landed today —
+that lives in [`ARCHITECTURE.md`](./ARCHITECTURE.md), which describes the
+current implementation and which pieces are load-bearing.*
 
 ## Mission
 
@@ -11,7 +12,7 @@ OpenAI-compatible endpoint that decides, for every request, the cheapest and
 safest way to answer it — deterministic logic where possible, a small local
 model where sufficient, larger local models where warranted, and frontier
 providers only when genuinely necessary. To anything calling it, it behaves
-like one coherent, capable model. Underneath, it's a disciplined mixture of
+like one coherent, capable model. Underneath, it is a disciplined mixture of
 deterministic filters, small classifiers, local reasoning models, and
 occasional frontier calls, none of which are consulted unless a cheaper stage
 has already failed to resolve the request.
@@ -20,7 +21,7 @@ has already failed to resolve the request.
 
 - **Deterministic before probabilistic.** Anything decidable by a regex or a
   fixed rule should never reach a model call. This is a cost and latency
-  floor, not an optimization — it also gives the system a layer that's fully
+  floor, not an optimization — it also gives the system a layer that is fully
   unit-testable with no model in the loop.
 
 - **Cheap before expensive.** Every model carries its own cost and speed
@@ -69,7 +70,7 @@ has already failed to resolve the request.
   Content entering the system carries a role — user, system, tool result,
   subagent, self — and that role should be visible in the ledger's structure,
   not just implied by prompt formatting. This is cheap instruction-hierarchy
-  hardening: it doesn't require a stream-native model to pay off, only
+  hardening: it does not require a stream-native model to pay off, only
   consistent typing of Content Nodes by origin at write time.
 
 - **Auditable by construction.** Every filter, classification, route, and
@@ -101,7 +102,7 @@ Every node in the tree is one of four types:
 | **`classifier`** | An LLM call that picks one child branch. The prompt is auto-generated from the children's descriptions. | Yes (small local model) |
 | **`terminal`** | A dispatch target. Resolves to a model from a named `model_group`, optionally with a specific `session` profile. | No — terminal is where the routed model takes over |
 | **`filter`** | A deterministic check (regex, prefix match, PII pattern). Produces `hard_reject`, `soft_redirect`, or `output_filter`. | No |
-| **`fallback`** | A child of a classifier node, used when the LLM picks no named child or the LLM call itself fails. | Only if the fallback is itself a classifier |
+| **`fallback`** | A child of a classifier node that resolves to a fallback dispatch *target* — used when the classifier picks no named child, its LLM call fails, or the chosen branch's target cannot resolve. A fallback always lands on a model that will answer the request; it is never a backup for the classifier's own classification job. | Only if the wrapped node is itself a classifier (in which case it routes onward, still to a target) |
 
 ### Prompt auto-construction
 
@@ -139,13 +140,19 @@ updates automatically. No manual prompt maintenance. No stale route names.
    is rejected (policy violation). These are the gating checks that
    protect downstream models from garbage or harmful input.
 
-3. **Complexity** — each model carries an `intelligence` field (0–10).
-   When a terminal node dispatches to a `model_group`, the system picks
-   the cheapest model in that group whose `intelligence` meets or exceeds
-   the classifier's `complexity` score. If no model qualifies, it falls
-   back to the cheapest model in the group. This is a dispatch-time
-   filter, not a separate config section — complexity-driven model
-   selection is automatic for every terminal node.
+3. **Complexity** — each model carries an `intelligence` field (0–10),
+   configured in `env/coral-router.json`. A `model_group` is an ordered
+   list of target models, and the classifier's job is to choose the
+   best-matching *target* within that group. The current candidate target
+   is prompted to classify the prompt, and if the complexity exceeds that
+   model's configured `intelligence` — while a more intelligent model
+   exists in the group — the request falls back to the next model in the
+   group, which re-classifies. The first target whose `intelligence` meets
+   or exceeds the complexity is the one that actually answers, and its
+   answer is recorded in the session's ledger. The group's chain is a
+   target-matching ladder, not a failure fallback and never a backup for
+   the classifier. This is automatic for every terminal node, not a
+   separate config section.
 
 ### Pre-filters: deterministic before probabilistic
 
@@ -230,20 +237,29 @@ the draft model's prompt as a structured signal. This avoids the config
 complexity of managing N different classifier models while still getting
 diversity through stochastic variation.
 
-### Local model chain (per group)
+### Target selection within a group (per group)
 
-Before escalation even begins, a `model_group` has an ordered `local` chain:
+Before escalation even begins, a `model_group` is an ordered `local` chain
+of target models:
 
 ```
-local:
-  1. qwen3.6-27b (session=code)     ← primary model for this domain
-  2. lfm2.5-2.6b (session=compact)  ← fallback if primary is unavailable or overloaded
+default:
+  1. swarm (intelligence 2)          ← cheapest target; self-assesses the prompt
+  2. qwen3.6-27b (intelligence 6)    ← next target if complexity exceeds swarm's
 ```
 
-Dispatch tries each local entry in order. Only if all local entries fail
-(unreachable, timeout, incoherent output) does the escalation ladder engage.
-This means the frontier is never consulted when a local model can handle
-the query — even the "backup" local model gets a shot first.
+The chain is a complexity-matching ladder for *targets*. The classifier
+resolves a route to a group; within the group, the current target model is
+prompted to classify the prompt, and if the complexity exceeds that model's
+configured `intelligence` — and a more intelligent model exists in the
+group — the request falls back to the next model in the group, which
+re-classifies. The target that matches the complexity actually answers the
+request, and its answer is added to the session's ledger. Only if every
+local target fails for a mechanical reason (unreachable, timeout, incoherent
+output) does the escalation ladder engage. The frontier is never consulted
+when a local target can handle the query — even the smallest local target
+gets its self-assessment shot first. Fallback models are always target
+models; none of them backs up the classifier's own classification job.
 
 ### Post-processing: audit + workflow extraction
 
@@ -256,16 +272,16 @@ entry to the durable audit log recording:
 - Total cost incurred
 
 Per-group `post_process.workflow_extraction` controls whether successful
-frontier-aided solutions that are **not** already in the Coral Context cache
-get processed into reusable DAG workflows:
+frontier-aided solutions that are **not** already in the context cache get
+processed into reusable DAG workflows:
 
 1. The full `query → local_attempts → escalation_stage → frontier_call →
    assembly` chain is decomposed into discrete steps.
 2. Each step becomes a `Target` node in a DAG, with `depends` / `provides`
    edges capturing the dependency structure (e.g., "the frontier response
    depends on the judge's crafted prompt").
-3. The workflow DAG is stored as `ContentNode` entries in Coral Context's
-   graph database, keyed by an embedding of the original query.
+3. The workflow DAG is stored as `ContentNode` entries in the ledger's graph
+   database, keyed by an embedding of the original query.
 4. When a future query has a near-neighbor embedding, the cache reactor
    can replay the DAG steps — skipping the frontier call entirely when
    the same decomposition structure applies.
@@ -281,8 +297,7 @@ applied to semantic text. A `ContentNode` is the canonical type (defined in
 `fluent_types`) that unifies durable storage fields with session-scoped
 metadata — no separate `ContextNode` / `SessionNode` split. The 6-tier LOD
 scheme is defined here (as routing policy); storage and rendering of
-individual tiers is delegated to Coral Context's `ContentNode` in
-`packer.rs`:
+individual tiers is delegated to the `ContentNode` store:
 
 | Tier | Description | Bound |
 |------|-------------|-------|
@@ -294,8 +309,8 @@ individual tiers is delegated to Coral Context's `ContentNode` in
 | LOD5 | Name / label | brief, for listings and identification |
 
 **Computation and caching.** LOD0 and LOD5 are guaranteed filled at node
-creation — LOD0 because it's the authoritative anchor everything else derives
-from, LOD5 because cheap identification and listing (directory-style
+creation — LOD0 because it is the authoritative anchor everything else
+derives from, LOD5 because cheap identification and listing (directory-style
 browsing of the ledger, dependency-graph node names, audit-log references)
 needs a label to exist unconditionally. LOD1–LOD4 are computed lazily, on
 first access, directly from LOD0 (never from each other), by a small local
@@ -336,10 +351,10 @@ five index concerns, kept apart, each with its own acceptable error rate and
 its own dirty/rebuild cadence.
 
 All five HNSW index instances (one per LOD tier, three library-scale) are
-built using the same `common_core::sqlite::make_hnsw()` factory and stored
-in Coral Context's SQLite database. Coral Context owns the HNSW
-implementation and storage layer; Coral Router owns the index scoping and
-the decision of which index to query for a given routing or cache operation.
+built using the same shared HNSW factory (`fluent-db::hnsw` /
+`common_core::sqlite::make_hnsw`) and stored in the router's SQLite store.
+Coral Router owns the index scoping and the decision of which index to query
+for a given routing or cache operation.
 
 ## Shared Content Nodes and parallel ledgers
 
@@ -452,8 +467,13 @@ available.
 resident weights — evaluates intent, coherence, safety, and complexity, and
 resolves the result through a weighted score matrix rather than nested
 thresholds. Most requests are fully decided by this point: answered
-trivially, routed to a specific local model, or rejected, all without
-touching the system's larger models.
+trivially, rejected, or routed to a specific local model, all without
+touching the system's larger models. Routing lands on the best-matching
+*target* within a target model group: the current target self-classifies
+the prompt, and when the complexity exceeds that model's `intelligence` the
+request falls to the next, more intelligent model in the group; the target
+that matches the complexity answers, and its answer is recorded to the
+session's ledger.
 
 **The Ledger** — nested Content Nodes, HNSW-scened per level, shared and
 reference-counted across parallel and filtered views — replaces a large
@@ -496,173 +516,6 @@ never has to pay frontier cost twice.
 The system as a whole should feel, from the outside, like a single capable
 assistant. From the inside, it should be legible at every step: which rung
 handled a given request, why, and what it cost.
-
-## Current status
-
-**Status as of 2026-08-05**
-
-**Foundational and stable:**
-
-- The request pipeline is the 3-stage shape `DeterministicPreFilter →
-  Classifier → Router` (`PipelineStage` in `pipeline_types.rs`). The
-  classifier is a single LLM call that subsumes the former quality-gate,
-  planning-refinement, and guardrail stages; it returns a direct response, a
-  routing target, or a rejection.
-- Deterministic pre-filtering (regex-based rejection and PII detection) runs
-  before any model is invoked.
-- A fast local classifier evaluates coherence, safety, and intent, and emits
-  structured JSON routing verdicts rather than free text.
-- Requests route to configured model groups by intent, each with its own
-  context size, timeout, and generation profile. The `model_group` **local
-  chain** is wired: dispatch tries the group's local models in order, then
-  falls back to the cheapest model in the group when none meets the
-  classifier's complexity score (complexity-based model selection at
-  terminal dispatch, `RoutingConfig::routing_target`).
-- Session context compacts by recency past a node-count threshold; KV cache
-  state spans a hot (in-memory, size-bounded) and cold (disk-backed,
-  TTL/LRU-evicted) tier.
-- Dependency-graph logic is consolidated behind one generic
-  `DependencyGraph<K>` rather than maintained as parallel hand-rolled
-  implementations in the execution supervisor and the router's own session
-  logic.
-- The **DAG workflow chart library** is load-bearing and owned by
-  `fluent-router`: human-authored chart JSON files load at boot into a
-  `ChartStore`, a request is matched against the library by deterministic
-  capability match → HNSW retrieval (`workflow_library` index) → LLM
-  adjudication, and the matched chart is compiled into executable stages,
-  run under `Zone` supervision (timeout/retry/cancel-dependents), and gated
-  by per-target and chart-level rubrics. A one-round interview closes
-  `Partial` fits before blank-slate planning. The learning loop is wired:
-  successful dispatches (`post_process.workflow_extraction`) are distilled
-  into *draft* charts, upserted idempotently against near neighbors, and
-  demoted after `CHART_STALE_FAILS` consecutive rubric failures.
-- A **filter taxonomy** replacing flat hard-reject-only patterns: every
-  filter resolves to `hard_reject`, `soft_redirect`, or `output_filter`
-  (redact/anonymize/omit), scoped to where it applies and optionally gated
-  behind a secondary check (`config/filters.rs` + `filters/*`).
-- An **HTTP status taxonomy** separating terminal rejection (never retried)
-  from transient failure (retry-eligible) from internal escalation signals
-  (`HttpClass`/`FailureClass` in `fluent_llm::http_class`).
-- **Nested classification tree config** replacing the flattened
-  `pipelines` / `routes` / `system_prompt` / `score_matrix` quad with a
-  single self-describing tree (`config/classification.rs` +
-  `stages/tree.rs`). Each classifier node auto-generates its prompt from its
-  children (per-node prompt auto-construction), enforces per-node
-  coherence/safety thresholds, and supports multi-level chains (a classifier
-  node can route to another classifier node). Add a route to the config and
-  it appears in the prompt without manual editing.
-- **Two-stream logging**: routine operational logs on a short rotation, and a
-  separate, durably-retained audit stream for every filter verdict, route
-  decision, and frontier call (`audit.rs` + `logging.rs`).
-- **The escalation ladder** is load-bearing. `dispatch/escalation.rs`
-  implements all four engagement modes — filter, question, team, turnover —
-  as a configurable per-group sequence tried in order after the local chain
-  exhausts, with a deterministic `ContextHit` short-circuit before any
-  frontier engagement and per-mode post-processing written to the durable
-  audit stream. The `execute_frontier_mode` stub and
-  `ServerError::FrontierNotImplemented` are gone; the binary no longer emits
-  a startup warning for configured ladders. `frontier/modes.rs` defines the
-  canonical `EscalationMode { Filter, Question, Team, Turnover }` taxonomy
-  (decision D8 of `ROADMAP_20260804_DRY`).
-- The **shared, reference-counted Content Node store** (M4): `NodeStore`
-  holds nodes once behind `Arc<RwLock<ContentNode>>` with interned
-  `ArcIntern<str>` session/role index keys, durable `content_json` hydration
-  (seeded `next_id` from `MAX(node_id)` so restarts never re-issue colliding
-  ids), and LOD derived at most once and visible to every holder.
-  `ContentNodeLedger` is a thin facade over it. The `KnowledgeCapability`
-  trait (`fluent_types`) is the cross-crate read path: the router's
-  `NodeStore` and coral's `Library` both implement it behind their own
-  capability tokens, so coral's Context is reachable without the router
-  importing coral.
-- Routing quality: the weighted score matrix can be made the
-  **authoritative** route decision — the top-scoring route's name resolved
-  through the one shared dispatch path — behind `score_matrix_authoritative`,
-  and the `RetryClassifier` decorator is wired into the production pipeline
-  behind `classifier_retry_max`, re-executing the classifier with escalating
-  corrective prompts when its LLM response fails JSON parsing. Both are
-  default-off, so existing behavior and goldens are untouched until a
-  deployment opts in.
-- **The ledger view layer** (M2): `Lod` (0..=5), the `LedgerView` trait whose
-  provided `render()` is the single text-exit from the store, `ParallelLedger`
-  (independent default-LOD views over the same shared `Arc<NodeStore>` with
-  per-node overrides), and `FilteredLedger<V>` (reference-only exclusion set +
-  optional render transform — the PII frontier view via M1's
-  `scrub_for_ledger`). Rendering degrades to LOD0 when a lazy tier is
-  un-derivable rather than erroring. This is the concrete mechanism the
-  `rigor` route's red-team view and the PII-anonymized frontier view are built
-  on.
-- **The Content Node write path is checked** (M1): `ContentNodeLedger` (the
-  facade) scrubs every write through the builtin filter engine with the
-  `ContentNodeWrite` scope active before reaching `NodeStore`, so the durable
-  ledger can never cache text matching a builtin PII pattern — irreversible,
-  on by default, audited (`write_path: true`). Direct `NodeStore` writes are
-  the documented bypass (production writes route through the facade).
-- **The `rigor` route is wired to live backends** (M3): the fixed-pass
-  blue/red/judge protocol runs against DIP-injected `Arc<dyn ChatBackend>`
-  role backends, with a real `DependencySession` checkpoint (`rigor.blue`)
-  between blue and red and a real `rewind_to_checkpoint` on a material
-  rejection. The red team reads the session through M2's `FilteredLedger` at
-  `Lod::LOD0` (dead ends excluded), the judge emits a structured verdict with
-  confidence, and a final rejection resolves to a targeted interview (≤ 3
-  questions) — escalating to frontier only on low judge confidence (an
-  explicit config value). Round count is fixed at `max_passes` (default 2);
-  `/v1/rigor` serves executed/clarify responses and is present-but-unconfigured
-  in the shipped config (explicit 503, never a crash).
-
-**Designed, not yet load-bearing:**
-
-- Per-LOD-tier ledger HNSW scene graphs, dirty-tracked and lazily rebuilt.
-- The specialist-agent narrowed-view consumer of filtered ledgers (the PII
-  frontier view and rigor's red-team view — the other two consumers — are
-  load-bearing now).
-- Three separate library-scale HNSW indices (prior-workflow library,
-  rubric/validated-answer cache, blacklist-adjacent similarity) —
-  structurally scoped; the prior-workflow library is populated and wired into
-  the plan route, the rubric/validated-answer cache is populated by the
-  rubric gate, the blacklist index remains unpopulated.
-- Origin-typed Content Nodes and the dedicated `audit`/`concern` node
-  convention.
-
-**Still open, carried forward:**
-
-- A real, distinct orchestrator role (previously aliased to the `code`
-  model) — being resolved by collapsing duplicate-weight model entries into
-  one resident model with named session profiles.
-- An adapter registry that exists in configuration but is unpopulated.
-- Guardrail coverage limited to frontier-bound traffic and the Content Node
-  write path (now checked, M1); **local agent calls** are the remaining
-  unchecked surface.
-- llama.cpp parallel-slot / continuous-batching wiring for classifier
-  fan-out is not yet the confirmed execution model for `ResultPool`-backed
-  classifier calls.
-
-## Near-term direction
-
-- Implement per-LOD-tier ledger HNSW scene graphs, dirty-tracked and lazily
-  rebuilt, for conceptual-distance-based rendering.
-
-## Longer-term direction
-
-- `plan` and `rigor` routes fully implemented and load-bearing, with `rigor`
-  specifically able to dereference LOD0 rather than any cached summary when
-  reviewing high-stakes reasoning.
-- Ledger-internal per-LOD-tier HNSW scenes fully wired for conceptual-
-  distance-based rendering, kept structurally distinct from the three
-  library-scale indices.
-- All three library-scale HNSW indices populated and load-bearing.
-- All four frontier involvement modes fully implemented and writing back
-  into the reusable local artifact stores, so frontier usage amortizes
-  rather than recurs at a constant rate.
-- Populate the adapter registry and move agent specialization from
-  model-per-role to adapter-per-role on shared base models.
-- A session model that behaves like a build graph: dependency-tracked steps,
-  checkpoint/rewind to a prior point, and levels-of-detail compaction that
-  goes beyond recency — resolved or abandoned work collapses to a short
-  summary node rather than aging out uniformly, with the full record
-  retained in storage even after it leaves the live session.
-- Reversible, session-scoped codeword anonymization for content that needs
-  to cross a frontier round-trip and come back reconciled into local context
-  without ever exposing the anonymized values upstream.
 
 ## What this project deliberately is not
 

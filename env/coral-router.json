@@ -205,6 +205,11 @@
             "pipelines": ["default"],
             "description": "Programming, software development, Linux, bash, Python, Rust, dev-ops, debugging, and technical implementation"
         },
+        "extract": {
+            "group": "extract",
+            "pipelines": ["default"],
+            "description": "Entity recognition, structured data extraction, database lookups"
+        },
         "translation": {
             "group": "translation",
             "pipelines": ["default"],
@@ -213,18 +218,23 @@
     },
     "model_groups": {
         "default": [
-            "swarm"
+            "swarm",
+            "qwen3.6-27b"
         ],
         "code": [
             "qwen3.6-27b"
         ],
         "reasoning": [
+            "swarm",
             "qwen3.6-27b"
         ],
         "translation": [
-            "translation"
+            "swarm",
+            "translation",
+            "qwen3.6-27b"
         ],
         "prose": [
+            "swarm",
             "prose"
         ]
     },
