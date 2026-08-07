@@ -180,6 +180,7 @@ exactly once and published to the same typed store.
 | `server/responses.rs` | OpenAI-completion response builders, SSE/CORS headers, `ServerStats` counters |
 | `streaming.rs` | `StreamingHandler` — SSE delta formatting for OpenAI-compatible streaming chunks; cross-chunk think-block filtering via `StreamingThinkFilter` |
 | `kv_cache.rs` | Two-tier: `HotKvCache` (RAM LRU over `common_core::cache::LoadCache`, metadata only) + `ColdKvCache` (disk tree `model/adapter/session`); `KvCacheManager` composes both; the router never reads/writes raw KV bytes — it manages filesystem layout + sidecar metadata for llama.cpp slot save/restore |
+| `instances.rs` | Instance-pool grammar generation + validation (`instance_grammar_string`, `validate_instances`) and the M4 sidecar: `InstanceClient` (fork management API over raw `reqwest`, `HttpClass`-classified) + `InstanceManager` (boot reconcile, `/memory` residency loop with LRU eviction, allocate-on-503) |
 | `scheduler.rs` | Re-exports `AffinityScheduler` / `ScheduledTask` / `AgingConfig` from `fluent_concurrency::affinity` |
 | `summarization.rs` | `ResultScorer` + `Summarizer` — `WorkUnit` impls that call an LLM (via `Arc<dyn ChatBackend>`) to score/condense responses; feeds the ledger's lazy LOD tiers |
 | `score_matrix.rs` | `ScoreMatrix` — multi-dimensional weighted scoring (coherence/complexity/completeness/risk) with per-route dimension bands |
@@ -462,14 +463,59 @@ handler dispatches to that classifier model as a fallback target
 target's answer is recorded in the session ledger and session step after
 dispatch (§"Pipeline data flow detail", step 7).
 
-## Session profiles on models
+## Instance pools and the sidecar
 
-`ModelEntry` supports a `sessions` field: a map of named session profiles with
-per-profile `num_ctx`, `sleep_idle_seconds`, and `params` overrides. Example:
-`qwythos-9b` exposes three profiles — `orchestrator` (large context, never
-sleep), `code` (medium context), `compact` (small context, short idle
-timeout). Callers select a profile by constructing the appropriate model config
-for the session type.
+`ModelEntry` supports an `instances` field (the old `sessions` key is a serde
+alias): a map of `InstanceProfile`s declaring the fork's shared-weight
+instances for that model. The fork's `llama-server` (see
+`LLAMA_CPP_SERVER_INSTANCES.md` at the repo root) loads a `(base, variant)`
+weight pool once and serves many named instances — separate KV + compute
+buffers sharing those weights. Requests route to an instance by the model-id
+grammar (`<base>`, `<base>:<group>`, `<base>:<instance>`, ...). The fork no
+longer reads `num_ctx`/`parallel`/`sleep_idle_seconds` from the request body;
+those are declaration-only and coral-router strips them from dispatched bodies.
+
+A profile declares `count` sibling instances (reinterpreted from the old
+`parallel`), each with its own KV. For `count > 1` the profile expands to
+`<name>0..<name>{count-1}` sharing the profile's `group`. Example: the `swarm`
+model declares three 16384-ctx instances in group `swarm`, plus a pinned
+131072-ctx `ledger` instance (the default dispatch point, targeted by a bare
+`<base>` request) and a 131072-ctx `scratch` instance that auto-sleeps after
+30s idle. The dispatch grammar generator
+(`instances::instance_grammar_string`) emits the exact `--instance` flags the
+operator hands to `llama-server`, matching the fork's
+`common_instances_to_string` byte-for-byte:
+
+```
+--instance "swarm0:group=swarm:ctx=16384:sleep=0" \
+--instance "swarm1:group=swarm:ctx=16384:sleep=0" \
+--instance "swarm2:group=swarm:ctx=16384:sleep=0" \
+--instance "ledger:ctx=131072:pinned:default" \
+--instance "scratch:ctx=131072:sleep=30"
+```
+
+Dispatch is encoded through the model id: `RoutingTarget::from_model_entry`
+qualifies `model` to `<base>:<qualifier>` (the `default` profile's group, else
+the single shared group, else bare `<base>`). `RoutingTarget::from_model_entry_instance`
+targets a named point (`<base>:ledger`, `<base>:scratch`) for callers like the
+ledger summarizer and any on-demand scratch route. `snapshot`/`id_slot`/
+`instance` travel as explicit top-level request fields (`build_chat_body` adds
+them only when set).
+
+**Sidecar.** coral-router acts as the sidecar the fork's docs describe
+(`config.sidecar`). At boot each model endpoint that declares an instance pool
+gets an `InstanceManager` (`instances.rs`) that reconciles configured
+instances against `GET /instances`, creating missing ones (`POST /instances`),
+resizing `n_ctx` drift, and tolerating a 409 duplicate. A residency loop polls
+`GET /memory` and, when free VRAM drops below `vram_low_watermark_bytes`,
+evicts up to `evict_batch` least-recently-used unpinned instances
+(`DELETE /instances/:name`; `pinned` instances are never evicted). On a 503
+`"no free instance in group"` group-miss, dispatch calls
+`InstanceManager::ensure_group` to allocate a fresh `<group>-<uuid>` instance
+before retrying once. `config.sidecar.slot_save_path` feeds the `KvSnapshot`
+`file_path` derivation so the router's snapshot metadata and the server's
+`--slot-save-path` layout agree. The management client reuses the raw-reqwest
+pattern of `OpenAiChatBackend` with `HttpClass`-classified errors.
 
 ## Ledger: condensed context architecture
 

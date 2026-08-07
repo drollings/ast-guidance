@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use common_core::constants::default_true;
 
-use crate::config::ModelEntry;
+use crate::config::{strip_declaration_params, ModelEntry};
 use crate::pipeline_types::{
     PipelineStage, StageDecision, StageDecisionProducer, StageMetadata, StageVerdict,
 };
@@ -26,6 +26,15 @@ pub struct RoutingTarget {
     /// Model inference params to merge into the request body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
+    /// Instance or group name to route to (explicit request field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
+    /// KV snapshot to switch into the target slot before serving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+    /// Slot to target for snapshot switching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_slot: Option<i32>,
     /// Whether to filter thinking blocks from idle timeout.
     #[serde(default)]
     pub filter_thinking: bool,
@@ -51,19 +60,62 @@ pub struct RoutingTarget {
     pub fallbacks: Vec<RoutingTarget>,
 }
 
+/// The model id grammar on the wire: `<base>` qualified with a group or exact
+/// instance as `<base>:<qualifier>`. The fork resolves the default instance of
+/// a `default: true` profile, else a group's first available member.
 impl RoutingTarget {
     /// Build a routing target from a configured model entry — the canonical
     /// mapping used by every dispatch path (direct-model requests and the
-    /// classifier fallback) so any call to a model carries its configured
-    /// `params` (e.g. `num_ctx`/`parallel`/`sleep_idle_seconds` for llama.cpp
-    /// slot sizing) plus its timeout/retry/streaming profile.
+    /// classifier fallback). For a model with an instance pool the `model` id
+    /// is qualified to the default dispatch point (`<base>:<qualifier>`), and
+    /// declaration-only params (`num_ctx`/`parallel`/`sleep_idle_seconds`/
+    /// `rope_freq_base`) are stripped from the body (the fork owns them via the
+    /// instance grammar).
     pub fn from_model_entry(model_key: &str, entry: &ModelEntry) -> Self {
+        let base = entry.name.clone().unwrap_or_else(|| model_key.to_string());
+        let model = match entry.default_dispatch_qualifier() {
+            Some(qualifier) => format!("{base}:{qualifier}"),
+            None => base,
+        };
         Self {
             url: entry.endpoint.clone(),
-            model: entry.name.clone().unwrap_or_else(|| model_key.to_string()),
+            model,
             group: None,
             target_name: Some(model_key.to_string()),
-            params: entry.params.clone(),
+            params: entry.params.clone().map(strip_declaration_params),
+            instance: None,
+            snapshot: None,
+            id_slot: None,
+            filter_thinking: entry.filter_thinking,
+            retry_count: entry.retry_count,
+            retry_base_interval_s: entry.retry_base_interval_s,
+            stream: entry.stream,
+            idle_timeout_ms: entry.idle_timeout_ms,
+            total_timeout_ms: entry.total_timeout_ms,
+            fallbacks: vec![],
+        }
+    }
+
+    /// Build a routing target for a specific named inference point
+    /// (`<base>:<instance_or_group>`), used by callers that must target a
+    /// particular instance (e.g. the ledger summarizer or on-demand scratch).
+    /// The `instance` field is set so the request explicitly names the point.
+    pub fn from_model_entry_instance(
+        model_key: &str,
+        entry: &ModelEntry,
+        instance_or_group: &str,
+    ) -> Self {
+        let base = entry.name.clone().unwrap_or_else(|| model_key.to_string());
+        let model = format!("{base}:{instance_or_group}");
+        Self {
+            url: entry.endpoint.clone(),
+            model,
+            group: None,
+            target_name: Some(model_key.to_string()),
+            params: entry.params.clone().map(strip_declaration_params),
+            instance: Some(instance_or_group.to_string()),
+            snapshot: None,
+            id_slot: None,
             filter_thinking: entry.filter_thinking,
             retry_count: entry.retry_count,
             retry_base_interval_s: entry.retry_base_interval_s,
@@ -479,32 +531,101 @@ mod tests {
     }
 
     #[test]
-    fn from_model_entry_forwards_configured_params_and_profile() {
+    fn from_model_entry_strips_declaration_only_params() {
         let rt = RoutingTarget::from_model_entry("lfm", &test_entry());
 
         assert_eq!(rt.url, "http://localhost:8080/v1/chat/completions");
         assert_eq!(rt.model, "unsloth/lfm2.5-1.2b-instruct");
         assert_eq!(rt.target_name.as_deref(), Some("lfm"));
-        // The llama.cpp slot args must reach the request body unchanged —
-        // dropping them yields a default-context slot and a second model line.
-        assert_eq!(
-            rt.params.as_ref().and_then(|p| p.get("num_ctx")),
-            Some(&serde_json::json!(98304))
-        );
-        assert_eq!(
-            rt.params.as_ref().and_then(|p| p.get("parallel")),
-            Some(&serde_json::json!(3))
-        );
-        assert_eq!(
-            rt.params.as_ref().and_then(|p| p.get("sleep_idle_seconds")),
-            Some(&serde_json::json!(7200))
-        );
+        // The declaration-only llama.cpp keys are stripped — they are owned by
+        // the instance grammar, not the request body.
+        let params = rt.params.expect("params present");
+        assert!(params.get("num_ctx").is_none());
+        assert!(params.get("parallel").is_none());
+        assert!(params.get("sleep_idle_seconds").is_none());
         assert!(rt.filter_thinking);
         assert_eq!(rt.retry_count, 2);
         assert_eq!(rt.retry_base_interval_s, 1);
         assert!(rt.stream);
         assert_eq!(rt.idle_timeout_ms, 8000);
         assert_eq!(rt.total_timeout_ms, 40000);
+    }
+
+    #[test]
+    fn from_model_entry_keeps_sampling_params() {
+        let mut entry = test_entry();
+        entry.params = Some(serde_json::json!({
+            "num_ctx": 98304,
+            "temperature": 0.1,
+            "repeat_penalty": 1.1,
+            "chat_template_kwargs": {"enable_thinking": false},
+        }));
+        let rt = RoutingTarget::from_model_entry("lfm", &entry);
+        let params = rt.params.expect("params present");
+        assert!(params.get("num_ctx").is_none());
+        assert_eq!(params.get("temperature"), Some(&serde_json::json!(0.1)));
+        assert_eq!(params.get("repeat_penalty"), Some(&serde_json::json!(1.1)));
+        assert!(params.get("chat_template_kwargs").is_some());
+    }
+
+    fn entry_with_instances(instances: serde_json::Value) -> ModelEntry {
+        serde_json::from_value(serde_json::json!({
+            "endpoint": "http://localhost:8080/v1/chat/completions",
+            "name": "abiray/lfm2.5-2.6b-heretic-abliterated",
+            "intelligence": 2,
+            "cost_input": 1e-6, "cost_output": 6e-6, "cost_cached_read": 4e-7,
+            "speed": 8,
+            "instances": instances,
+        }))
+        .expect("valid ModelEntry")
+    }
+
+    #[test]
+    fn from_model_entry_qualifies_single_shared_group() {
+        // swarm: count 3, all in group "swarm", no explicit default -> group.
+        let entry = entry_with_instances(serde_json::json!({
+            "swarm": { "count": 3, "group": "swarm", "num_ctx": 16384, "warm": true }
+        }));
+        let rt = RoutingTarget::from_model_entry("swarm", &entry);
+        assert_eq!(
+            rt.model,
+            "abiray/lfm2.5-2.6b-heretic-abliterated:swarm"
+        );
+    }
+
+    #[test]
+    fn from_model_entry_qualifies_default_profile() {
+        // ledger: pinned + default -> its group ("ledger").
+        let entry = entry_with_instances(serde_json::json!({
+            "ledger": { "num_ctx": 131072, "pinned": true, "default": true }
+        }));
+        let rt = RoutingTarget::from_model_entry("ledger", &entry);
+        assert_eq!(
+            rt.model,
+            "abiray/lfm2.5-2.6b-heretic-abliterated:ledger"
+        );
+    }
+
+    #[test]
+    fn from_model_entry_no_instances_leaves_bare_base() {
+        let rt = RoutingTarget::from_model_entry("lfm", &test_entry());
+        assert_eq!(rt.model, "unsloth/lfm2.5-1.2b-instruct");
+    }
+
+    #[test]
+    fn from_model_entry_instance_targets_named_point() {
+        let entry = entry_with_instances(serde_json::json!({
+            "ledger": { "num_ctx": 131072, "pinned": true, "default": true },
+            "scratch": { "num_ctx": 131072, "sleep_idle_seconds": 30 }
+        }));
+        let rt = RoutingTarget::from_model_entry_instance("swarm", &entry, "scratch");
+        assert_eq!(
+            rt.model,
+            "abiray/lfm2.5-2.6b-heretic-abliterated:scratch"
+        );
+        assert_eq!(rt.instance.as_deref(), Some("scratch"));
+        assert_eq!(rt.snapshot, None);
+        assert_eq!(rt.id_slot, None);
     }
 
     #[test]

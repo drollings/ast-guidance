@@ -111,6 +111,45 @@ fn dispatch_url(endpoint_url: &str) -> String {
     fluent_llm::url::chat_completions_url(endpoint_url)
 }
 
+/// Extract the group name from the fork's 503 group-miss payload
+/// (`unavailable_error` "no free instance in group '<group>'"). `None` when the
+/// body is not a group-miss (a generic 503).
+fn parse_group_miss(body: &str) -> Option<String> {
+    let marker = "no free instance in group '";
+    let idx = body.find(marker)?;
+    let rest = &body[idx + marker.len()..];
+    let end = rest.find('\'')?;
+    Some(rest[..end].to_string())
+}
+
+/// Merge the routing request fields (`instance`/`snapshot`/`id_slot`) into the
+/// params object that becomes the outgoing OpenAI body. These are top-level
+/// request fields the fork reads (the body wins over the query string); they
+/// are only added when set, so a bare dispatch leaves the body unchanged.
+pub(crate) fn params_with_routing_fields(
+    params: Option<Value>,
+    instance: Option<&str>,
+    snapshot: Option<&str>,
+    id_slot: Option<i32>,
+) -> Option<Value> {
+    if instance.is_none() && snapshot.is_none() && id_slot.is_none() {
+        return params;
+    }
+    let mut obj = params.unwrap_or_else(|| Value::Object(Default::default()));
+    if let Value::Object(map) = &mut obj {
+        if let Some(v) = instance {
+            map.insert("instance".into(), Value::String(v.into()));
+        }
+        if let Some(v) = snapshot {
+            map.insert("snapshot".into(), Value::String(v.into()));
+        }
+        if let Some(v) = id_slot {
+            map.insert("id_slot".into(), Value::Number(v.into()));
+        }
+    }
+    Some(obj)
+}
+
 /// Wrap a fallible HTTP future in a timeout. Collapses the repeated
 /// `tokio::time::timeout(...)` + `map_err` shapes used by both the buffered
 /// and streaming dispatch paths; `label` distinguishes a total-budget expiry
@@ -175,7 +214,21 @@ impl ChatBackend for OpenAiChatBackend {
 
                 let status = response.status();
                 if !status.is_success() {
-                    let class = HttpClass::from_status(status.as_u16());
+                    let status_u16 = status.as_u16();
+                    // A 503 with the fork's group-miss payload means the pool
+                    // had no free member; surface it as a dedicated error so
+                    // the sidecar can allocate fresh KV and retry once.
+                    if status_u16 == 503 {
+                        let body = response
+                            .text()
+                            .await
+                            .unwrap_or_else(|_| String::new());
+                        if let Some(group) = parse_group_miss(&body) {
+                            return Err(DispatchError::InstanceGroupMiss { group });
+                        }
+                        return Err(DispatchError::RateLimited);
+                    }
+                    let class = HttpClass::from_status(status_u16);
                     return if class.is_retryable() {
                         Err(DispatchError::RateLimited)
                     } else {
@@ -269,7 +322,18 @@ impl ChatBackend for OpenAiChatBackend {
 
             let status = response.status();
             if !status.is_success() {
-                let class = HttpClass::from_status(status.as_u16());
+                let status_u16 = status.as_u16();
+                if status_u16 == 503 {
+                    let body = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| String::new());
+                    if let Some(group) = parse_group_miss(&body) {
+                        return Err(DispatchError::InstanceGroupMiss { group });
+                    }
+                    return Err(DispatchError::RateLimited);
+                }
+                let class = HttpClass::from_status(status_u16);
                 return if class.is_retryable() {
                     Err(DispatchError::RateLimited)
                 } else {
@@ -698,6 +762,42 @@ mod tests {
             choices: vec![],
             usage: crate::types::Usage::default(),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Routing-fields body builder (instance/snapshot/id_slot)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn routing_fields_reach_outgoing_body_only_when_set() {
+        let request = make_test_request("hi");
+
+        // None set -> no routing fields in the body.
+        let params = params_with_routing_fields(None, None, None, None);
+        let body = build_chat_body(&request, "m", params.as_ref(), false, false).unwrap();
+        let obj = body.as_object().unwrap();
+        assert!(obj.get("instance").is_none());
+        assert!(obj.get("snapshot").is_none());
+        assert!(obj.get("id_slot").is_none());
+
+        // All set -> present in the outgoing body.
+        let params = params_with_routing_fields(None, Some("ledger"), Some("readfiles"), Some(3));
+        let body = build_chat_body(&request, "m", params.as_ref(), false, false).unwrap();
+        let obj = body.as_object().unwrap();
+        assert_eq!(obj["instance"], "ledger");
+        assert_eq!(obj["snapshot"], "readfiles");
+        assert_eq!(obj["id_slot"], 3);
+    }
+
+    #[test]
+    fn routing_fields_merge_into_existing_params() {
+        let params = serde_json::json!({"temperature": 0.2});
+        let merged = params_with_routing_fields(Some(params), Some("scratch"), None, Some(0));
+        let obj = merged.expect("merged params");
+        assert_eq!(obj["temperature"], 0.2);
+        assert_eq!(obj["instance"], "scratch");
+        assert_eq!(obj["id_slot"], 0);
+        assert!(obj.get("snapshot").is_none());
     }
 
     // -----------------------------------------------------------------------

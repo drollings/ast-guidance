@@ -454,6 +454,9 @@ impl TargetMatcher {
                 group: None,
                 target_name: Some(candidate.model_key.clone()),
                 params: None,
+                instance: None,
+                snapshot: None,
+                id_slot: None,
                 filter_thinking: false,
                 retry_count: 0,
                 retry_base_interval_s: 1,
@@ -552,7 +555,7 @@ mod tests {
             retry_count: 0,
             retry_base_interval_s: 1,
             params: None,
-            sessions: None,
+            instances: None,
         }
     }
 

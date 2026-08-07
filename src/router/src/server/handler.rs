@@ -49,6 +49,9 @@ pub struct ServerDeps {
     pub ladders: HashMap<String, Arc<EscalationLadder>>,
     /// Deterministic-fact cache consulted before escalating (M3).
     pub context_cache: Option<Arc<dyn fluent_types::ContextCache>>,
+    /// Sidecar instance managers (M4), keyed by model endpoint. Consulted on a
+    /// 503 group-miss to allocate fresh KV before retrying.
+    pub instance_managers: HashMap<String, Arc<crate::instances::InstanceManager>>,
 }
 
 impl ServerDeps {
@@ -236,6 +239,7 @@ async fn handle_chat_completion(
         http_client,
         ladders,
         context_cache,
+        instance_managers,
     } = deps;
     // M10: the dispatch post-processing hook (workflow extraction), if the
     // operator configured it. Passed through to successful dispatches only.
@@ -459,6 +463,7 @@ async fn handle_chat_completion(
             &ladders,
             context_cache.as_ref(),
             session_step.as_ref().map(|s| &s.session),
+            &instance_managers,
         )
         .await?;
         let status = outcome.response.status();
@@ -497,6 +502,7 @@ async fn handle_chat_completion(
             &ladders,
             context_cache.as_ref(),
             session_step.as_ref().map(|s| &s.session),
+            &instance_managers,
         )
         .await?;
         let status = outcome.response.status();

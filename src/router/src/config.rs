@@ -78,6 +78,12 @@ pub struct RouterConfig {
     /// error, never a crash.
     #[serde(default)]
     pub rigor: Option<RigorConfig>,
+    /// Sidecar instance-management policy (M4). Governs the sidecar task that
+    /// reconciles the fork's shared-weight instances against the configured
+    /// profiles, polls `/memory`, and evicts/allocates KV + compute only (the
+    /// weights stay loaded in `llama-server`).
+    #[serde(default)]
+    pub sidecar: SidecarConfig,
 }
 
 impl Default for RouterConfig {
@@ -103,6 +109,7 @@ impl Default for RouterConfig {
             post_process: PostProcessConfig::default(),
             classification: None,
             rigor: None,
+            sidecar: SidecarConfig::default(),
         }
     }
 }
@@ -175,17 +182,127 @@ pub struct ModelEntry {
     pub retry_base_interval_s: u64,
     #[serde(default)]
     pub params: Option<serde_json::Value>,
-    #[serde(default)]
-    pub sessions: Option<HashMap<String, SessionProfile>>,
+    /// Instance-pool declaration for the fork's shared-weight instances. The
+    /// old `sessions` key is accepted as an alias during the transition.
+    #[serde(default, alias = "sessions")]
+    pub instances: Option<HashMap<String, InstanceProfile>>,
 }
 
+/// One config-declared instance profile. The map key on `ModelEntry.instances`
+/// provides the default instance name; `count > 1` expands into sibling
+/// instances sharing the profile's group. Sampling `params` are merged into the
+/// request body for dispatches through these instances; declaration-only keys
+/// (`num_ctx`/`parallel`/`sleep_idle_seconds`) are stripped before dispatch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionProfile {
-    pub num_ctx: u64,
+pub struct InstanceProfile {
+    /// Instance name; default = the map key (expanded `<name><i>` for count > 1).
     #[serde(default)]
-    pub sleep_idle_seconds: Option<u64>,
+    pub name: Option<String>,
+    /// Group; default = instance name. count > 1 instances share this group.
+    #[serde(default)]
+    pub group: Option<String>,
+    /// Number of sibling instances this profile expands to (1 = single instance).
+    #[serde(default = "default_instance_count")]
+    pub count: u32,
+    /// Context size in tokens.
+    pub num_ctx: u64,
+    /// Slots per instance; default = inherit server global.
+    #[serde(default)]
+    pub parallel: Option<u32>,
+    /// Exempt from auto-sleep and in-process eviction; implies no_sleep.
+    #[serde(default)]
+    pub pinned: bool,
+    /// Never auto-sleep (stays warm); the fork grammar's sleep=0. `warm` is a
+    /// friendly serde alias for the same flag.
+    #[serde(default, alias = "warm")]
+    pub no_sleep: bool,
+    /// >0 = per-instance idle timeout seconds; -1 = inherit global; None = inherit.
+    #[serde(default)]
+    pub sleep_idle_seconds: Option<i32>,
+    /// Target of a bare `<base>` request.
+    #[serde(default)]
+    pub default: bool,
+    /// Sampling params merged into the request body for dispatches through this
+    /// instance.
     #[serde(default)]
     pub params: Option<serde_json::Value>,
+}
+
+fn default_instance_count() -> u32 {
+    1
+}
+
+impl ModelEntry {
+    /// The expanded flat list of `InstanceProfile`s for this model: applies
+    /// `count` expansion (naming each sibling `<name><i>`) and resolves the
+    /// name/group defaults (name = map key, group = name when absent). Empty
+    /// when no instances are configured.
+    pub fn instance_profiles(&self) -> Vec<InstanceProfile> {
+        let Some(instances) = &self.instances else {
+            return Vec::new();
+        };
+        let mut keys: Vec<&String> = instances.keys().collect();
+        keys.sort();
+        let mut out = Vec::new();
+        for key in keys {
+            let profile = &instances[key];
+            let base_name = profile.name.clone().unwrap_or_else(|| key.clone());
+            let count = profile.count.max(1);
+            // All siblings share the profile's group (default = base name).
+            let group = profile.group.clone().unwrap_or_else(|| base_name.clone());
+            for i in 0..count {
+                let name = if count > 1 {
+                    format!("{base_name}{i}")
+                } else {
+                    base_name.clone()
+                };
+                let mut p = profile.clone();
+                p.name = Some(name);
+                p.group = Some(group.clone());
+                out.push(p);
+            }
+        }
+        out
+    }
+
+    /// The dispatch qualifier for the model's default inference point: the
+    /// `default: true` profile's group, else the single shared group across all
+    /// profiles, else `None` (bare `<base>`). `None` also when no instances are
+    /// configured. Encoded as `model = "<base>:<qualifier>"`.
+    pub fn default_dispatch_qualifier(&self) -> Option<String> {
+        let profiles = self.instance_profiles();
+        if profiles.is_empty() {
+            return None;
+        }
+        if let Some(d) = profiles.iter().find(|p| p.default) {
+            return d.group.clone();
+        }
+        let first = profiles[0].group.clone()?;
+        if profiles.iter().all(|p| p.group.as_deref() == Some(first.as_str())) {
+            Some(first)
+        } else {
+            None
+        }
+    }
+}
+
+/// Declaration-only request-body keys the fork ignores: the instance grammar
+/// owns them (`ctx`/`parallel`/`sleep`), so they must not leak into the body.
+pub const DECLARATION_PARAM_KEYS: [&str; 4] =
+    ["num_ctx", "parallel", "sleep_idle_seconds", "rope_freq_base"];
+
+/// Remove declaration-only keys from a params object, keeping sampling params
+/// (`temperature`, `repeat_penalty`, `chat_template_kwargs`, ...). Non-object
+/// params are returned unchanged.
+pub fn strip_declaration_params(params: serde_json::Value) -> serde_json::Value {
+    let Some(obj) = params.as_object() else {
+        return params;
+    };
+    let mut out = obj.clone();
+    for k in DECLARATION_PARAM_KEYS {
+        out.remove(k);
+    }
+    serde_json::Value::Object(out)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -380,6 +497,63 @@ const fn default_rigor_severity_threshold() -> f64 {
 
 const fn default_rigor_escalation_confidence() -> f64 {
     0.4
+}
+
+/// Sidecar instance-management policy (M4).
+///
+/// The sidecar task is the external VRAM-policy owner the fork's docs
+/// describe: it boot-reconciles configured instance profiles against
+/// `GET /instances`, polls `/memory`, and evicts least-recently-used unpinned
+/// instances when free device VRAM drops below the watermark. It only ever
+/// allocates or frees KV + compute buffers — the shared weights stay loaded in
+/// `llama-server`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SidecarConfig {
+    /// How often the residency loop polls `/memory`, in seconds.
+    #[serde(default = "default_sidecar_poll_interval_s")]
+    pub poll_interval_s: u64,
+    /// Free-VRAM threshold (bytes) below which the residency loop evicts.
+    #[serde(default = "default_sidecar_watermark")]
+    pub vram_low_watermark_bytes: u64,
+    /// Max unpinned instances evicted per low-VRAM pass.
+    #[serde(default = "default_sidecar_evict_batch")]
+    pub evict_batch: usize,
+    /// Device VRAM ceiling (bytes). `None` disables residency eviction (the
+    /// loop still polls and logs) because free VRAM cannot be computed.
+    #[serde(default)]
+    pub vram_total_bytes: Option<u64>,
+    /// Slot-save directory the fork writes KV snapshots under
+    /// (`<slot_save_path>/<model_key>/`). Feeds M3 snapshot-path derivation.
+    #[serde(default)]
+    pub slot_save_path: Option<String>,
+    /// Env var naming the management API key sent as `Authorization: Bearer`.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+}
+
+impl Default for SidecarConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_s: default_sidecar_poll_interval_s(),
+            vram_low_watermark_bytes: default_sidecar_watermark(),
+            evict_batch: default_sidecar_evict_batch(),
+            vram_total_bytes: None,
+            slot_save_path: None,
+            api_key_env: None,
+        }
+    }
+}
+
+const fn default_sidecar_poll_interval_s() -> u64 {
+    5
+}
+
+const fn default_sidecar_watermark() -> u64 {
+    1073741824
+}
+
+const fn default_sidecar_evict_batch() -> usize {
+    1
 }
 
 const fn default_charts_min_score() -> f64 {
@@ -854,5 +1028,139 @@ mod tests {
         let back: RouterConfig = serde_json::from_str(&serialized).unwrap();
         assert_eq!(back.pipelines["default"].target_match, builder::TargetMatchMode::Static);
         assert_eq!(back.pipelines["default"].target_match_timeout_ms, 12345);
+    }
+
+    // ── M1 instance-pool declaration ─────────────────────────────────────
+
+    fn profile_json(name: &str, count: u32, group: &str, num_ctx: u64) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "count": count,
+            "group": group,
+            "num_ctx": num_ctx,
+        })
+    }
+
+    #[test]
+    fn instances_count_expansion_names_siblings_in_shared_group() {
+        let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+            "endpoint": "http://x/v1/chat/completions",
+            "intelligence": 2,
+            "cost_input": 1e-06, "cost_output": 6e-06, "cost_cached_read": 4e-07,
+            "speed": 8,
+            "instances": {
+                "swarm": profile_json("swarm", 3, "swarm", 16384),
+                "ledger": { "num_ctx": 131072, "pinned": true, "default": true }
+            }
+        }))
+        .unwrap();
+
+        let profiles = entry.instance_profiles();
+        assert_eq!(profiles.len(), 4);
+        // Profiles are emitted in sorted map-key order: ledger < swarm.
+        assert_eq!(profiles[0].name.as_deref(), Some("ledger"));
+        assert_eq!(profiles[0].group.as_deref(), Some("ledger"));
+        assert!(profiles[0].pinned);
+        assert!(profiles[0].default);
+        assert_eq!(profiles[1].name.as_deref(), Some("swarm0"));
+        assert_eq!(profiles[1].group.as_deref(), Some("swarm"));
+        assert_eq!(profiles[2].name.as_deref(), Some("swarm1"));
+        assert_eq!(profiles[3].name.as_deref(), Some("swarm2"));
+        assert_eq!(profiles[3].group.as_deref(), Some("swarm"));
+        assert_eq!(profiles[3].num_ctx, 16384);
+    }
+
+    #[test]
+    fn instances_single_profile_defaults_name_to_map_key() {
+        let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+            "endpoint": "http://x/v1/chat/completions",
+            "intelligence": 1,
+            "cost_input": 0.0, "cost_output": 0.0, "cost_cached_read": 0.0,
+            "speed": 1,
+            "instances": { "scratch": { "num_ctx": 131072, "sleep_idle_seconds": 30 } }
+        }))
+        .unwrap();
+        let profiles = entry.instance_profiles();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name.as_deref(), Some("scratch"));
+        assert_eq!(profiles[0].group.as_deref(), Some("scratch"));
+        assert_eq!(profiles[0].sleep_idle_seconds, Some(30));
+        assert_eq!(profiles[0].count, 1);
+    }
+
+    #[test]
+    fn old_sessions_key_still_parses_as_instances() {
+        let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+            "endpoint": "http://x/v1/chat/completions",
+            "intelligence": 1,
+            "cost_input": 0.0, "cost_output": 0.0, "cost_cached_read": 0.0,
+            "speed": 1,
+            "sessions": { "ctx16384": { "num_ctx": 16384 } }
+        }))
+        .unwrap();
+        let instances = entry.instances.expect("sessions alias maps into instances");
+        assert_eq!(instances.len(), 1);
+        assert!(instances.contains_key("ctx16384"));
+    }
+
+    #[test]
+    fn no_instances_yields_empty_profile_list() {
+        let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+            "endpoint": "http://x/v1/chat/completions",
+            "intelligence": 1,
+            "cost_input": 0.0, "cost_output": 0.0, "cost_cached_read": 0.0,
+            "speed": 1,
+        }))
+        .unwrap();
+        assert!(entry.instance_profiles().is_empty());
+    }
+
+    #[test]
+    fn warm_alias_maps_to_no_sleep() {
+        let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+            "endpoint": "http://x/v1/chat/completions",
+            "intelligence": 1,
+            "cost_input": 0.0, "cost_output": 0.0, "cost_cached_read": 0.0,
+            "speed": 1,
+            "instances": { "swarm": { "num_ctx": 16384, "warm": true } }
+        }))
+        .unwrap();
+        let profiles = entry.instance_profiles();
+        assert!(profiles[0].no_sleep);
+    }
+
+    // ── M4 sidecar policy ───────────────────────────────────────────────
+
+    #[test]
+    fn sidecar_absent_section_defaults_cleanly() {
+        let cfg: RouterConfig =
+            serde_json::from_str(r#"{"server": {"bind_addr": "127.0.0.1:0"}}"#).unwrap();
+        assert_eq!(cfg.sidecar.poll_interval_s, 5);
+        assert_eq!(cfg.sidecar.vram_low_watermark_bytes, 1073741824);
+        assert_eq!(cfg.sidecar.evict_batch, 1);
+        assert!(cfg.sidecar.vram_total_bytes.is_none());
+        assert!(cfg.sidecar.slot_save_path.is_none());
+        assert!(cfg.sidecar.api_key_env.is_none());
+    }
+
+    #[test]
+    fn sidecar_section_round_trips() {
+        let cfg: RouterConfig = serde_json::from_value(serde_json::json!({
+            "sidecar": {
+                "poll_interval_s": 10,
+                "vram_low_watermark_bytes": 536870912,
+                "evict_batch": 2,
+                "vram_total_bytes": 1048576,
+                "slot_save_path": "/srv/slots",
+                "api_key_env": "LLAMA_API_KEY",
+            }
+        }))
+        .unwrap();
+        assert_eq!(cfg.sidecar.poll_interval_s, 10);
+        assert_eq!(cfg.sidecar.vram_low_watermark_bytes, 536870912);
+        assert_eq!(cfg.sidecar.evict_batch, 2);
+        assert_eq!(cfg.sidecar.vram_total_bytes, Some(1048576));
+        assert_eq!(cfg.sidecar.slot_save_path.as_deref(), Some("/srv/slots"));
+        assert_eq!(cfg.sidecar.api_key_env.as_deref(), Some("LLAMA_API_KEY"));
     }
 }

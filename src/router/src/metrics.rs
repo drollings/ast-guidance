@@ -65,7 +65,9 @@ pub fn classify_error(message: &str) -> FailureClass {
 impl From<&DispatchError> for FailureClass {
     fn from(err: &DispatchError) -> Self {
         match err {
-            DispatchError::RateLimited => FailureClass::RateLimit,
+            DispatchError::RateLimited | DispatchError::InstanceGroupMiss { .. } => {
+                FailureClass::RateLimit
+            }
             DispatchError::Http(msg) => classify_http_status(msg),
             DispatchError::RequestBuild(_)
             | DispatchError::ResponseParse(_)

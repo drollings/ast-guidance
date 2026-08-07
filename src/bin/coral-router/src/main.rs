@@ -4,7 +4,7 @@ use std::sync::Arc;
 use clap::Parser;
 use common_core::config::load_json_or_default;
 use fluent_llm::client::ChatBackend;
-use fluent_llm::{create_embedding_provider, EmbeddingProvider, LlmClient, LlmConfig};
+use fluent_llm::{create_embedding_provider, EmbeddingProvider};
 use fluent_router::charts::store::ChartStore;
 use fluent_router::config::{validate_no_self_routing, RouterConfig};
 use fluent_router::hnsw::HnswIndexHandle;
@@ -186,11 +186,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_client = reqwest::Client::new();
     let ladders = config.build_escalation_ladders(&http_client);
 
+    // M4 sidecar: build one instance manager per endpoint that declares an
+    // instance pool. The server owns their reconcile + residency tasks.
+    let instance_managers = fluent_router::instances::build_instance_managers(&config);
+
     let mut server =
         RouterServer::new(pipelines, routes, config.models, &config.server, classifier)
             .with_plan_route(plan_route)
             .with_rigor_route(rigor_route)
             .with_ladders(ladders);
+
+    if !instance_managers.is_empty() {
+        server = server.with_instance_managers(instance_managers);
+    }
 
     if let Some(ctx) = mock_dispatch {
         server = server.with_mock(ctx);
@@ -360,15 +368,7 @@ fn default_chart_embedder(config: &RouterConfig) -> Option<Arc<dyn EmbeddingProv
 /// place constructs a concrete `LlmClient` for the selector).
 fn default_adjudicator_backend(config: &RouterConfig) -> Option<Arc<dyn ChatBackend>> {
     let key = config.charts.selector_model.as_deref()?;
-    let entry = config.models.get(key)?;
-    let model_name = entry.name.as_deref().unwrap_or(key);
-    let llm_config = LlmConfig::new()
-        .api_url(entry.endpoint.clone())
-        .model(model_name.to_string())
-        .timeout_ms(entry.total_timeout_ms)
-        .maybe_extra_body_params(entry.params.clone())
-        .build();
-    Some(Arc::new(LlmClient::with_config(llm_config)))
+    config.local_backend(key)
 }
 
 /// Build the chart-candidate reranker backend (M7 step 2.5) from the
@@ -378,15 +378,7 @@ fn default_adjudicator_backend(config: &RouterConfig) -> Option<Arc<dyn ChatBack
 /// over the HNSW candidates before adjudication (`None` skips the stage).
 fn default_reranker_backend(config: &RouterConfig) -> Option<Arc<dyn ChatBackend>> {
     let key = config.reranker_model.as_deref()?;
-    let entry = config.models.get(key)?;
-    let model_name = entry.name.as_deref().unwrap_or(key);
-    let llm_config = LlmConfig::new()
-        .api_url(entry.endpoint.clone())
-        .model(model_name.to_string())
-        .timeout_ms(entry.total_timeout_ms)
-        .maybe_extra_body_params(entry.params.clone())
-        .build();
-    Some(Arc::new(LlmClient::with_config(llm_config)))
+    config.local_backend(key)
 }
 
 /// Build the rigor route (M3) from `config.rigor`, mirroring `build_plan_route`.
@@ -430,15 +422,7 @@ fn build_rigor_route(config: &RouterConfig) -> RigorRoute {
 /// for rigor's role backends (DIP).
 fn default_rigor_backend(config: &RouterConfig, key: Option<&str>) -> Option<Arc<dyn ChatBackend>> {
     let key = key?;
-    let entry = config.models.get(key)?;
-    let model_name = entry.name.as_deref().unwrap_or(key);
-    let llm_config = LlmConfig::new()
-        .api_url(entry.endpoint.clone())
-        .model(model_name.to_string())
-        .timeout_ms(entry.total_timeout_ms)
-        .maybe_extra_body_params(entry.params.clone())
-        .build();
-    Some(Arc::new(LlmClient::with_config(llm_config)))
+    config.local_backend(key)
 }
 
 /// Load `env/coral-router.json` relative to the crate root (test helper).

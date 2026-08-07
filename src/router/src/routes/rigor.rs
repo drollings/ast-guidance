@@ -280,8 +280,9 @@ impl RigorRoute {
 
     /// Rewind to `rigor.blue` (real `rewind_to_checkpoint`). Steps are reset
     /// to `Pending` with result data preserved for audit; the KV snapshot, if
-    /// restored, is logged (`file_path` feeds a future dispatch slot-restore —
-    /// recorded here, never dispatched). Returns whether a rewind ran.
+    /// restored, is logged and carried on the session (`pending_kv_fields`) so
+    /// the next dispatch sets the fork's `snapshot`/`instance`/`id_slot`
+    /// request fields. Returns whether a rewind ran.
     fn rewind_to_blue(&self, ctx: &RigorContext) -> bool {
         let Some(session) = &ctx.session else {
             return false;
@@ -292,9 +293,11 @@ impl RigorRoute {
                 if let Some(snap) = snapshot {
                     tracing::info!(
                         target: "router.rigor",
-                        file_path = %snap.file_path.display(),
+                        snapshot_name = %snap.snapshot_name,
+                        instance = ?snap.instance,
+                        id_slot = 0,
                         kv_cache_enabled = self.kv_cache_enabled,
-                        "kv cache snapshot restored on rigor rewind — file_path recorded, not dispatched"
+                        "kv cache snapshot restored on rigor rewind — snapshot/instance passed to next dispatch"
                     );
                 }
                 true
@@ -997,6 +1000,8 @@ mod tests {
             model: "model-x".into(),
             adapter: None,
             session_id: "sess-rigor".into(),
+            snapshot_name: "readfiles".into(),
+            instance: Some("scratch".into()),
             file_path: src_file,
             token_count: Some(42),
             created_at: common_core::now_secs(),
@@ -1005,7 +1010,6 @@ mod tests {
             model_quant: None,
             base_model_hash: Some("abc".into()),
         })
-        .await
         .unwrap();
         hot.remove("model-x", None, "sess-rigor");
 

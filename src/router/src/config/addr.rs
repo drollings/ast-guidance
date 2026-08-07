@@ -167,7 +167,7 @@ mod tests {
                 retry_count: 0,
                 retry_base_interval_s: 1,
                 params: None,
-                sessions: None,
+                instances: None,
             },
         );
         assert!(validate_no_self_routing("0.0.0.0:8079", &models).is_ok());
@@ -193,7 +193,7 @@ mod tests {
                 retry_count: 0,
                 retry_base_interval_s: 1,
                 params: None,
-                sessions: None,
+                instances: None,
             },
         );
         let err = validate_no_self_routing("127.0.0.1:8079", &models)
@@ -224,7 +224,7 @@ mod tests {
                 retry_count: 0,
                 retry_base_interval_s: 1,
                 params: None,
-                sessions: None,
+                instances: None,
             },
         );
         let err = validate_no_self_routing("127.0.0.1:8079", &models)
@@ -252,7 +252,7 @@ mod tests {
                 retry_count: 0,
                 retry_base_interval_s: 1,
                 params: None,
-                sessions: None,
+                instances: None,
             },
         );
         // Different port (8080 vs 8079) should be OK

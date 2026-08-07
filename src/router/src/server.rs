@@ -44,6 +44,8 @@ pub struct RouterServer {
     ladders: HashMap<String, Arc<EscalationLadder>>,
     /// Deterministic-fact cache consulted before escalating (M3).
     context_cache: Option<Arc<dyn fluent_types::ContextCache>>,
+    /// Sidecar instance managers (M4), keyed by model endpoint.
+    instance_managers: HashMap<String, Arc<crate::instances::InstanceManager>>,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
@@ -72,6 +74,7 @@ impl RouterServer {
             sessions: None,
             ladders: HashMap::new(),
             context_cache: None,
+            instance_managers: HashMap::new(),
             depends: vec![],
             provides: vec![ArcIntern::from("http.endpoint")],
         }
@@ -138,6 +141,25 @@ impl RouterServer {
         self
     }
 
+    /// Attach the sidecar instance managers (M4), keyed by model endpoint.
+    /// `serve` runs each manager's boot reconciliation and residency loop as
+    /// a task; dispatch consults them on a 503 group-miss to allocate KV.
+    #[must_use]
+    pub fn with_instance_managers(
+        mut self,
+        instance_managers: HashMap<String, Arc<crate::instances::InstanceManager>>,
+    ) -> Self {
+        if !instance_managers.is_empty() {
+            tracing::info!(
+                target: "router.server",
+                manager_count = instance_managers.len(),
+                "sidecar instance managers attached",
+            );
+        }
+        self.instance_managers = instance_managers;
+        self
+    }
+
     #[must_use]
     pub fn with_mock(mut self, mock_dispatch: MockDispatchContext) -> Self {
         tracing::info!(
@@ -189,7 +211,27 @@ impl RouterServer {
             ),
             ladders: self.ladders.clone(),
             context_cache: self.context_cache.clone(),
+            instance_managers: self.instance_managers.clone(),
         };
+
+        // M4 sidecar: reconcile configured instances at boot, then run each
+        // manager's residency loop (poll /memory, evict LRU unpinned on low
+        // free VRAM) for the life of the server. Best-effort: a failed
+        // reconcile/residency poll logs and continues.
+        for manager in self.instance_managers.values() {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                if let Err(e) = manager.reconcile().await {
+                    tracing::warn!(
+                        target: "router.server",
+                        error = %e,
+                        "instance boot reconcile failed (sidecar degraded)",
+                    );
+                }
+                manager.run_residency().await;
+            });
+        }
+
         run_http(&self.bind_addr, deps).await
     }
 }
@@ -224,6 +266,7 @@ impl WorkUnit for RouterServer {
             http_client: Arc::new(reqwest::Client::new()),
             ladders: self.ladders.clone(),
             context_cache: self.context_cache.clone(),
+            instance_managers: self.instance_managers.clone(),
         };
         let rt = ctx.rt.clone();
 

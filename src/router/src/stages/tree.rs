@@ -62,8 +62,9 @@ fn default_five() -> u8 {
 #[derive(Debug)]
 pub enum TreeOutcome {
     /// Resolved dispatch target (a `terminal` node, possibly reached via
-    /// `soft_redirect`).
-    Route(RoutingTarget),
+    /// `soft_redirect`). Boxed to keep the enum small (the target carries
+    /// per-model routing fields).
+    Route(Box<RoutingTarget>),
     /// The request is rejected with a human-readable reason.
     Reject(String),
     /// The node produced no decision (e.g. a filter with no match); the caller
@@ -404,7 +405,7 @@ impl ClassificationEngine {
                 self.resolve_route_with_matcher(route, complexity, user_text)
             {
                 visited.push(terminal_decision(description, &rt, complexity, assessments));
-                return TreeOutcome::Route(rt);
+                return TreeOutcome::Route(Box::new(rt));
             }
         }
 
@@ -415,7 +416,7 @@ impl ClassificationEngine {
                 self.resolve_group_target(route, group, complexity, user_text)
             {
                 visited.push(terminal_decision(description, &rt, complexity, assessments));
-                return TreeOutcome::Route(rt);
+                return TreeOutcome::Route(Box::new(rt));
             }
         }
 
@@ -713,7 +714,7 @@ fn final_decision(outcome: TreeOutcome, visited: Vec<StageDecision>) -> StageDec
 
     let (verdict, reason) = match outcome {
         TreeOutcome::Route(rt) => {
-            metadata.set_routing_target(&rt);
+            metadata.set_routing_target(rt.as_ref());
             let name = rt.target_name.as_deref().unwrap_or(&rt.model);
             (
                 StageVerdict::Passed,
@@ -865,7 +866,7 @@ mod tests {
             retry_count: 0,
             retry_base_interval_s: 1,
             params: None,
-            sessions: None,
+            instances: None,
         }
     }
 

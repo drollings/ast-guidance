@@ -27,6 +27,7 @@ pub mod error;
 pub mod filters;
 pub mod frontier;
 pub mod hnsw;
+pub mod instances;
 pub mod knowledge;
 pub mod kv_cache;
 pub mod ledger;

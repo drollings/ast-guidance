@@ -11,7 +11,7 @@ use fluent_llm::client::ChatBackend;
 use fluent_llm::{LlmClient, LlmConfig};
 use fluent_wvr::prelude::Component;
 
-use super::{default_true, RejectPatterns, RouterConfig};
+use super::{default_true, strip_declaration_params, RejectPatterns, RouterConfig};
 use crate::pipeline::PipelineOrchestrator;
 use crate::score_matrix::ScoreMatrix;
 use crate::target_match::{TargetBackends, TargetMatcher};
@@ -541,15 +541,45 @@ impl RouterConfig {
     /// Build a sync local-model `ChatBackend` from a `models` key — the single
     /// `LlmClient` construction site shared by the classifier and the
     /// escalation ladder's local roles (DIP: exactly one concrete
-    /// `ChatBackend` factory in the crate).
-    fn local_backend(&self, key: &str) -> Option<Arc<dyn ChatBackend>> {
+    /// `ChatBackend` factory in the crate). The model id is qualified to the
+    /// entry's default dispatch point and declaration-only params are stripped.
+    pub fn local_backend(&self, key: &str) -> Option<Arc<dyn ChatBackend>> {
         let entry = self.models.get(key)?;
-        let model_name = entry.name.as_deref().unwrap_or(key);
+        let base = entry.name.as_deref().unwrap_or(key);
+        let model = match entry.default_dispatch_qualifier() {
+            Some(qualifier) => format!("{base}:{qualifier}"),
+            None => base.to_string(),
+        };
+        let params = entry.params.clone().map(strip_declaration_params);
         let llm_config = LlmConfig::new()
             .api_url(entry.endpoint.clone())
-            .model(model_name.to_string())
+            .model(model)
             .timeout_ms(entry.total_timeout_ms)
-            .maybe_extra_body_params(entry.params.clone())
+            .maybe_extra_body_params(params)
+            .build();
+        Some(Arc::new(LlmClient::with_config(llm_config)))
+    }
+
+    /// Build a `ChatBackend` for a specific named inference point
+    /// (`<base>:<instance_or_group>`) of a `models` key, reusing the single
+    /// `LlmClient` factory (DIP — same construction site as `local_backend`).
+    /// Used by the ledger summarizer (`<base>:ledger`) and any on-demand
+    /// scratch route (`<base>:scratch`), which must target a named instance
+    /// rather than the entry's default dispatch point.
+    pub fn local_backend_for_instance(
+        &self,
+        key: &str,
+        instance_or_group: &str,
+    ) -> Option<Arc<dyn ChatBackend>> {
+        let entry = self.models.get(key)?;
+        let base = entry.name.as_deref().unwrap_or(key);
+        let model = format!("{base}:{instance_or_group}");
+        let params = entry.params.clone().map(strip_declaration_params);
+        let llm_config = LlmConfig::new()
+            .api_url(entry.endpoint.clone())
+            .model(model)
+            .timeout_ms(entry.total_timeout_ms)
+            .maybe_extra_body_params(params)
             .build();
         Some(Arc::new(LlmClient::with_config(llm_config)))
     }
@@ -679,6 +709,51 @@ mod tests {
             !joined.contains("some configured pipelines were not built"),
             "no aggregate error expected, logs:\n{joined}"
         );
+    }
+
+    #[test]
+    fn local_backend_for_instance_builds_ledger_and_scratch_backends() {
+        // M5: the ledger summarizer and on-demand scratch route must dispatch
+        // to their named instances. `local_backend_for_instance` builds an
+        // `LlmClient` for the `models` key qualified to `<base>:<instance>`,
+        // and `RoutingTarget::from_model_entry_instance` mirrors the model id.
+        let config: RouterConfig = serde_json::from_value(serde_json::json!({
+            "models": {
+                "swarm": {
+                    "endpoint": "http://x/v1/chat/completions",
+                    "name": "abiray/lfm2.5-2.6b-heretic-abliterated",
+                    "intelligence": 2,
+                    "cost_input": 1.0, "cost_output": 6.0, "cost_cached_read": 0.4,
+                    "speed": 8,
+                    "instances": {
+                        "ledger": { "num_ctx": 131072, "pinned": true, "default": true },
+                        "scratch": { "num_ctx": 131072, "sleep_idle_seconds": 30 }
+                    }
+                }
+            }
+        })).expect("valid config");
+
+        // The named-instance backends build (single LlmClient factory).
+        assert!(config.local_backend_for_instance("swarm", "ledger").is_some());
+        assert!(config.local_backend_for_instance("swarm", "scratch").is_some());
+
+        // The canonical target builder confirms the exact model id each point
+        // resolves to on the wire.
+        let entry = config.models.get("swarm").expect("swarm");
+        let ledger_rt =
+            crate::pipeline::RoutingTarget::from_model_entry_instance("swarm", entry, "ledger");
+        assert_eq!(
+            ledger_rt.model,
+            "abiray/lfm2.5-2.6b-heretic-abliterated:ledger"
+        );
+        assert_eq!(ledger_rt.instance.as_deref(), Some("ledger"));
+        let scratch_rt =
+            crate::pipeline::RoutingTarget::from_model_entry_instance("swarm", entry, "scratch");
+        assert_eq!(
+            scratch_rt.model,
+            "abiray/lfm2.5-2.6b-heretic-abliterated:scratch"
+        );
+        assert_eq!(scratch_rt.instance.as_deref(), Some("scratch"));
     }
 
     #[test]

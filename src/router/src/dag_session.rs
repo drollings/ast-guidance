@@ -120,6 +120,10 @@ pub struct DependencySession {
     checkpoints: HashMap<String, usize>,
     kv_cache: Option<KvCacheManager>,
     step_order: Vec<String>,
+    /// The most recently restored KV snapshot on a rewind, carried so the next
+    /// dispatch can set the fork's `snapshot`/`instance`/`id_slot` request
+    /// fields. `None` before any rewind restored a snapshot.
+    pending_snapshot: Option<KvSnapshot>,
     /// Set when the escalation ladder's turnover mode hands the session to
     /// a frontier model.  Subsequent requests in the session bypass the
     /// local pipeline and go straight to frontier.
@@ -139,6 +143,7 @@ impl DependencySession {
             checkpoints: HashMap::new(),
             kv_cache: None,
             step_order: Vec::new(),
+            pending_snapshot: None,
             frontier_owned: false,
         }
     }
@@ -296,18 +301,19 @@ impl DependencySession {
     ///
     /// Steps are reset to `Pending` but their result data is preserved
     /// for audit (it is not deleted). If a `KvCacheManager` is attached and
-    /// a model name has been set, the KV cache snapshot is **actually
-    /// restored**: the metadata record is retrieved from the cold tier
-    /// (promoted to the hot tier by `KvCacheManager::retrieve`) and returned
-    /// to the caller, which passes its `file_path` to the next dispatch's
-    /// slot-restore. Returns `None` when no snapshot exists.
+    /// a model name has been set, the KV cache snapshot metadata is **actually
+    /// restored**: the record is retrieved from the cold tier (promoted to the
+    /// hot tier by `KvCacheManager::retrieve`) and returned to the caller, which
+    /// passes its fork-facing identity (`snapshot_name`/`instance`/`id_slot`) to
+    /// the next dispatch as request fields. Returns `None` when no snapshot
+    /// exists. The restored snapshot is also stored on the session for the next
+    /// dispatch (`pending_kv_fields`).
     ///
     /// Synchronous by design: the caller holds a `std::sync::MutexGuard`
     /// around the session (`Arc<Mutex<DependencySession>>`), and holding that
     /// guard across an `.await` would make the surrounding future non-`Send`.
-    /// The KV restore is pure `tokio::fs` async, so it is bridged through
-    /// `common_core::runtime::block_on` (blocking is the established pattern
-    /// in the router's request path).
+    /// The KV restore is synchronous (the two tiers are in-memory metadata
+    /// indices; the fork owns the KV bytes).
     pub fn rewind_to_checkpoint(
         &mut self,
         checkpoint_name: &str,
@@ -358,7 +364,7 @@ impl DependencySession {
         // Restore the KV cache snapshot for real. A session with no model
         // name cannot key a snapshot (the key is `(model, adapter, session)`),
         // so the restore is skipped — never a fabricated `"unknown"` lookup.
-        let Some(model) = self.model.as_deref() else {
+        let Some(model) = self.model.clone() else {
             tracing::debug!(
                 session_id = %self.session_id,
                 "no model name on session — skipping kv cache restore"
@@ -366,29 +372,29 @@ impl DependencySession {
             return Ok(None);
         };
 
-        Ok(self.restore_kv_snapshot(model))
+        Ok(self.restore_kv_snapshot(&model))
     }
 
     /// Retrieve + restore the KV cache snapshot for this session: the
     /// metadata record is loaded from the cold tier (promoted to the hot tier
     /// by `KvCacheManager::retrieve`) and returned so the caller can pass its
-    /// `file_path` to the next dispatch's slot-restore. `None` when no
-    /// snapshot exists.
-    fn restore_kv_snapshot(&self, model: &str) -> Option<Arc<KvSnapshot>> {
+    /// fork-facing identity to the next dispatch. `None` when no snapshot
+    /// exists. The restored snapshot is also stored on the session so the next
+    /// dispatch can set the `snapshot`/`instance`/`id_slot` request fields.
+    fn restore_kv_snapshot(&mut self, model: &str) -> Option<Arc<KvSnapshot>> {
         let kv = self.kv_cache.as_ref()?;
-        match common_core::runtime::block_on(kv.retrieve(
-            model,
-            self.adapter.as_deref(),
-            &self.session_id,
-        )) {
+        match kv.retrieve(model, self.adapter.as_deref(), &self.session_id) {
             Ok(snapshot) => {
                 tracing::info!(
                     session_id = %self.session_id,
                     model = %model,
+                    snapshot_name = %snapshot.snapshot_name,
+                    instance = ?snapshot.instance,
                     file_path = %snapshot.file_path.display(),
                     token_count = snapshot.token_count.unwrap_or(0),
-                    "kv cache snapshot restored for rewind — pass file_path to next dispatch"
+                    "kv cache snapshot restored for rewind — pass snapshot/instance to next dispatch"
                 );
+                self.pending_snapshot = Some((*snapshot).clone());
                 Some(snapshot)
             }
             Err(KvCacheError::NotFound(_)) => {
@@ -407,6 +413,15 @@ impl DependencySession {
                 None
             }
         }
+    }
+
+    /// The fork-facing snapshot identity to send on the next dispatch after a
+    /// rewind: `(snapshot_name, instance, id_slot)`. `id_slot` defaults to 0
+    /// (the fork's default slot target). `None` when no snapshot was restored.
+    pub fn pending_kv_fields(&self) -> Option<(String, Option<String>, i32)> {
+        self.pending_snapshot
+            .as_ref()
+            .map(|s| (s.snapshot_name.clone(), s.instance.clone(), 0))
     }
 
     /// Set a step's status to InProgress (only if currently Pending).
@@ -861,6 +876,8 @@ mod tests {
             model: "model-x".into(),
             adapter: None,
             session_id: "sess-1".into(),
+            snapshot_name: "readfiles".into(),
+            instance: Some("scratch".into()),
             file_path: src_file,
             token_count: Some(42),
             created_at: common_core::now_secs(),
@@ -869,7 +886,7 @@ mod tests {
             model_quant: None,
             base_model_hash: Some("abc".into()),
         };
-        kv.store(snapshot).await.unwrap();
+        kv.store(snapshot).unwrap();
         // Force a cold-tier hit so rewind exercises the reload-into-hot-tier
         // path rather than a hot-tier cache hit.
         hot.remove("model-x", None, "sess-1");
@@ -887,21 +904,30 @@ mod tests {
         session.complete_step("a", ok_result("a done")).unwrap();
         session.complete_step("b", ok_result("b done")).unwrap();
 
-        // Real restore: the snapshot is returned to the caller (its file_path
-        // feeds the next dispatch's slot-restore), not a log-only no-op.
+        // Real restore: the snapshot is returned to the caller (its fork-facing
+        // identity feeds the next dispatch's snapshot/instance request fields).
         let restored = session
             .rewind_to_checkpoint("a")
             .unwrap()
             .expect("snapshot should be restored");
         assert_eq!(restored.session_id, "sess-1");
+        assert_eq!(restored.snapshot_name, "readfiles");
+        assert_eq!(restored.instance.as_deref(), Some("scratch"));
+        // The derived path matches the fork layout
+        // `<slot_save_path>/<model_key>/<snapshot_name>.bin`; the router never
+        // copies KV bytes, so no file is materialized.
         assert_eq!(
             restored.file_path,
-            dir.path().join("model-x/sess-1/sess-1.kv")
+            dir.path().join("model-x").join("readfiles.bin")
         );
-        assert!(restored.file_path.exists());
-        // M6.2: the cold tier does NOT fabricate an unknown token count —
-        // a raw reload without a sidecar reports `None`.
-        assert_eq!(restored.token_count, None);
+        assert!(!restored.file_path.exists());
+        // Metadata is preserved (it was recorded, not re-derived from a file).
+        assert_eq!(restored.token_count, Some(42));
+        // The session carries the pending fields for the next dispatch.
+        let pending = session.pending_kv_fields();
+        assert_eq!(pending.as_ref().map(|(n, _, _)| n.as_str()), Some("readfiles"));
+        assert_eq!(pending.as_ref().and_then(|(_, i, _)| i.as_deref()), Some("scratch"));
+        assert_eq!(pending.map(|(_, _, s)| s), Some(0));
 
         // Steps were still reset (data preserved for audit).
         assert_eq!(session.get_step("a").unwrap().status, StepStatus::Pending);

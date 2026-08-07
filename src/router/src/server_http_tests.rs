@@ -63,6 +63,7 @@ fn test_deps(
         http_client: Arc::new(reqwest::Client::new()),
         ladders,
         context_cache,
+        instance_managers: HashMap::new(),
     }
 }
 
@@ -187,6 +188,7 @@ fn test_deps_with_ledger(
         http_client: Arc::new(reqwest::Client::new()),
         ladders: HashMap::new(),
         context_cache: None,
+        instance_managers: HashMap::new(),
     }
 }
 
@@ -1398,6 +1400,7 @@ fn rigor_test_deps(
         http_client: Arc::new(reqwest::Client::new()),
         ladders: HashMap::new(),
         context_cache: None,
+        instance_managers: HashMap::new(),
     }
 }
 

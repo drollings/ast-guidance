@@ -31,6 +31,8 @@ pub enum DispatchError {
     StreamParse(String),
     #[error("rate limited")]
     RateLimited,
+    #[error("no free instance in group: {group}")]
+    InstanceGroupMiss { group: String },
     #[error("all backends failed")]
     AllBackendsFailed,
 }
