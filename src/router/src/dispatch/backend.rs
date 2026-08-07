@@ -18,7 +18,7 @@ use crate::types::{RouterRequest, RouterResponse};
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Streaming result — a channel that receives SSE-formatted response data
+/// Streaming result - a channel that receives SSE-formatted response data
 /// in a spawned background task.
 pub struct StreamResult {
     pub model: String,
@@ -30,7 +30,7 @@ pub struct StreamResult {
 }
 
 // ---------------------------------------------------------------------------
-// Trait — abstraction over LLM chat completion providers
+// Trait - abstraction over LLM chat completion providers
 // ---------------------------------------------------------------------------
 
 /// Object-safe for `Arc<dyn ChatBackend>`. Provider config established at
@@ -114,10 +114,32 @@ fn dispatch_url(endpoint_url: &str) -> String {
 /// Extract the group name from the fork's 503 group-miss payload
 /// (`unavailable_error` "no free instance in group '<group>'"). `None` when the
 /// body is not a group-miss (a generic 503).
+///
+/// D10: the fork's real payload is JSON
+/// (`{"error":{"message":"no free instance in group 'X'"}}`), so parse that
+/// shape first; fall back to the raw substring scan so a non-JSON body (or an
+/// older wire format) never regresses.
 fn parse_group_miss(body: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        if let Some(msg) = value
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(Value::as_str)
+        {
+            if let Some(group) = group_from_message(msg) {
+                return Some(group);
+            }
+        }
+    }
+    group_from_message(body)
+}
+
+/// Extract the group name from a message carrying the group-miss marker. `None`
+/// when the marker is absent (a generic 503, not a group miss).
+fn group_from_message(msg: &str) -> Option<String> {
     let marker = "no free instance in group '";
-    let idx = body.find(marker)?;
-    let rest = &body[idx + marker.len()..];
+    let idx = msg.find(marker)?;
+    let rest = &msg[idx + marker.len()..];
     let end = rest.find('\'')?;
     Some(rest[..end].to_string())
 }
@@ -165,7 +187,7 @@ async fn with_total_timeout<T>(
 }
 
 // ---------------------------------------------------------------------------
-// OpenAiChatBackend — single-attempt OpenAI-compatible HTTP backend
+// OpenAiChatBackend - single-attempt OpenAI-compatible HTTP backend
 // ---------------------------------------------------------------------------
 
 pub struct OpenAiChatBackend {
@@ -459,7 +481,7 @@ impl ChatBackend for OpenAiChatBackend {
 }
 
 // ---------------------------------------------------------------------------
-// RetryChatBackend — wraps a ChatBackend with exponential-backoff retry
+// RetryChatBackend - wraps a ChatBackend with exponential-backoff retry
 // ---------------------------------------------------------------------------
 
 pub struct RetryChatBackend {
@@ -563,7 +585,7 @@ impl ChatBackend for RetryChatBackend {
 }
 
 // ---------------------------------------------------------------------------
-// FallbackChatBackend — tries backends in order
+// FallbackChatBackend - tries backends in order
 // ---------------------------------------------------------------------------
 
 pub struct FallbackChatBackend {
@@ -700,7 +722,7 @@ mod tests {
     }
 
     impl StubBackend {
-        // Returns a trait object, not Self — the retry decorator needs the
+        // Returns a trait object, not Self - the retry decorator needs the
         // erased backend. Scoped-allow: clippy's new_ret_no_self false positive.
         #[allow(clippy::new_ret_no_self)]
         fn new(responses: Vec<Result<RouterResponse, DispatchError>>) -> Arc<dyn ChatBackend> {
@@ -1024,6 +1046,91 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(total_timeout_ms + 2000),
             "complete() returned after {elapsed:?}, expected ~{total_timeout_ms}ms"
+        );
+    }
+
+    #[test]
+    fn parse_group_miss_fork_json_shape() {
+        // D10: the fork's real 503 payload is JSON with `error.message`.
+        let body = r#"{"error":{"code":503,"message":"no free instance in group 'swarm'","type":"unavailable_error"}}"#;
+        assert_eq!(parse_group_miss(body).as_deref(), Some("swarm"));
+    }
+
+    #[test]
+    fn parse_group_miss_raw_marker_fallback() {
+        // A non-JSON body carrying the marker still resolves via the substring
+        // fallback (no regression).
+        let body = "upstream 503: no free instance in group 'fast'";
+        assert_eq!(parse_group_miss(body).as_deref(), Some("fast"));
+    }
+
+    #[test]
+    fn parse_group_miss_generic_503_returns_none() {
+        // A generic 503 without the group-miss marker -> None.
+        assert_eq!(parse_group_miss(r#"{"error":{"message":"oom"}}"#), None);
+        assert_eq!(parse_group_miss("Internal Server Error"), None);
+    }
+
+    #[tokio::test]
+    async fn stream_group_miss_yields_instance_group_miss() {
+        // The streaming 503 branch shares `parse_group_miss`: a fork-shaped
+        // JSON group-miss on the stream connection yields `InstanceGroupMiss`.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = r#"{"error":{"code":503,"message":"no free instance in group 'swarm'","type":"unavailable_error"}}"#;
+        let body_len = body.len();
+        let body_owned = body.to_string();
+        let _server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let body_owned = body_owned.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).await.is_err() {
+                        return;
+                    }
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.is_err() {
+                            return;
+                        }
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some(v) = line.to_lowercase().strip_prefix("content-length:") {
+                            content_length = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut buf = vec![0u8; content_length];
+                    if content_length > 0 && reader.read_exact(&mut buf).await.is_err() {
+                        return;
+                    }
+                    let resp = format!(
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n{body_owned}"
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+
+        let backend = OpenAiChatBackend::new(reqwest::Client::new(), format!("http://{addr}"));
+        let result = backend
+            .stream_complete(make_test_request("hi"), "m".into(), None, 5000, 30000, false)
+            .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("streaming group-miss must error"),
+        };
+        assert!(
+            matches!(&err, DispatchError::InstanceGroupMiss { group } if group == "swarm"),
+            "expected InstanceGroupMiss(swarm), got: {err}"
         );
     }
 }

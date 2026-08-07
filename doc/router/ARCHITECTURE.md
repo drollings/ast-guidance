@@ -494,28 +494,65 @@ operator hands to `llama-server`, matching the fork's
 --instance "scratch:ctx=131072:sleep=30"
 ```
 
-Dispatch is encoded through the model id: `RoutingTarget::from_model_entry`
-qualifies `model` to `<base>:<qualifier>` (the `default` profile's group, else
-the single shared group, else bare `<base>`). `RoutingTarget::from_model_entry_instance`
-targets a named point (`<base>:ledger`, `<base>:scratch`) for callers like the
-ledger summarizer and any on-demand scratch route. `snapshot`/`id_slot`/
-`instance` travel as explicit top-level request fields (`build_chat_body` adds
-them only when set).
+Dispatch is encoded through the model id. There are two distinct qualifier
+intents, resolved by separate methods so they never conflate:
+
+- `ModelEntry::default_dispatch_qualifier()`  - the fork's **default instance**
+  (`:ledger`), used by `RoutingTarget::from_model_entry` for client-facing
+  bare-`<base>` dispatch. Byte-identical to earlier behavior.
+- `ModelEntry::pool_qualifier()`  - the router's **internal work group** (the
+  pool, `:swarm`): the largest non-default `count` profile's group, else the
+  default profile's group, else the single shared group, else `None` (bare
+  `<base>`). `local_backend` (the single DIP `LlmClient` factory behind the
+  classifier, chart selector/adjudicator/reranker, target-matching ladder, and
+  rigor roles) routes internal work through this pool so those calls spread
+  across the shared-weight instances instead of pinning to the default.
+
+`RoutingTarget::from_model_entry_instance` targets a named point
+(`<base>:ledger`, `<base>:scratch`) for callers like the ledger summarizer and
+any on-demand scratch route; `local_backend_for_instance` merges the named
+instance profile's `params` over the entry `params` (profile wins) and strips
+declaration-only keys, so instance-level sampling knobs (e.g. `scratch`'s
+`temperature: 0.4`) actually reach the body. `snapshot`/`id_slot`/`instance`
+travel as explicit top-level request fields (`build_chat_body` adds them only
+when set).
 
 **Sidecar.** coral-router acts as the sidecar the fork's docs describe
 (`config.sidecar`). At boot each model endpoint that declares an instance pool
-gets an `InstanceManager` (`instances.rs`) that reconciles configured
-instances against `GET /instances`, creating missing ones (`POST /instances`),
-resizing `n_ctx` drift, and tolerating a 409 duplicate. A residency loop polls
-`GET /memory` and, when free VRAM drops below `vram_low_watermark_bytes`,
-evicts up to `evict_batch` least-recently-used unpinned instances
-(`DELETE /instances/:name`; `pinned` instances are never evicted). On a 503
-`"no free instance in group"` group-miss, dispatch calls
+gets an `InstanceManager` (`instances.rs`); the combined pool grammar is
+validated (`validate_instances`, fail-fast on duplicate names / group-name
+collisions) and the generated `instance_grammar_string` is logged. Each manager
+reconciles configured instances against `GET /instances`, creating missing ones
+(`POST /instances`), resizing `n_ctx` drift, and tolerating a 409 duplicate. A
+residency loop **always** polls `GET /memory` and logs free/used; eviction is
+gated on `sidecar.vram_total_bytes` (when set, and free VRAM drops below
+`vram_low_watermark_bytes`, evicts up to `evict_batch` least-recently-used
+unpinned instances via `DELETE /instances/:name`; `pinned` instances are never
+evicted). On a 503 `"no free instance in group"` group-miss, dispatch calls
 `InstanceManager::ensure_group` to allocate a fresh `<group>-<uuid>` instance
 before retrying once. `config.sidecar.slot_save_path` feeds the `KvSnapshot`
 `file_path` derivation so the router's snapshot metadata and the server's
 `--slot-save-path` layout agree. The management client reuses the raw-reqwest
 pattern of `OpenAiChatBackend` with `HttpClass`-classified errors.
+
+**KV snapshot fork round-trip.** `KvCacheManager` may hold an optional
+`InstanceClient` handle (`with_fork_io`). `save_snapshot` then POSTs the
+snapshot to the fork (`POST /instances/:name/snapshot`) via the shared
+`common_core::runtime::block_on` bridge and records the metadata locally;
+`list_snapshots`/`delete_snapshot` delegate to the fork. Rigor's blue-pass
+completion triggers the save, so the subsequent blue->rewind->red flow sends a
+real `snapshot`/`instance`/`id_slot` on the next dispatch. Without the handle
+these degrade to metadata-only no-ops.
+
+**Boot composition (`ledger`/`session` sections).** When `config.ledger` is
+present, `main.rs` opens a `ContentNodeLedger` (path, or in-memory with a
+`warn!`) and attaches the DIP `Summarizer` backend via
+`RouterConfig::summarizer_for_ledger()` (targeting `<base>:ledger`). When
+`config.session` is present it builds a `SessionRegistry` mapped to the
+`session.root` KV root. Both attach to the server (`with_ledger` /
+`with_sessions`), so rigor rewind and ledger LOD derivation exist at runtime.
+Both sections are default-absent: existing deployments are byte-identical until
+they opt in.
 
 ## Ledger: condensed context architecture
 

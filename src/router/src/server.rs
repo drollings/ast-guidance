@@ -214,21 +214,15 @@ impl RouterServer {
             instance_managers: self.instance_managers.clone(),
         };
 
-        // M4 sidecar: reconcile configured instances at boot, then run each
-        // manager's residency loop (poll /memory, evict LRU unpinned on low
-        // free VRAM) for the life of the server. Best-effort: a failed
-        // reconcile/residency poll logs and continues.
+        // Reconcile configured instances at boot (retrying until the fork's
+        // management API is reachable), then run each manager's residency
+        // loop (poll /memory, evict LRU unpinned on low free VRAM) for the
+        // life of the server.  Best-effort: a failed reconcile/residency
+        // poll logs and continues.
         for manager in self.instance_managers.values() {
             let manager = manager.clone();
             tokio::spawn(async move {
-                if let Err(e) = manager.reconcile().await {
-                    tracing::warn!(
-                        target: "router.server",
-                        error = %e,
-                        "instance boot reconcile failed (sidecar degraded)",
-                    );
-                }
-                manager.run_residency().await;
+                manager.bootstrap().await;
             });
         }
 

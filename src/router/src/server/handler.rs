@@ -3,6 +3,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use common_core::hash::uuid_v4;
+use common_core::sync::lock;
 use common_core::ResponseCache;
 use http_body_util::BodyExt;
 
@@ -56,8 +57,8 @@ pub struct ServerDeps {
 
 impl ServerDeps {
     /// The escalation ladder for a model's route group, if the group
-    /// configured one. Direct-model requests (no route → no group) get `None`
-    /// — they never escalate.
+    /// configured one. Direct-model requests (no route - no group) get `None`
+    /// - they never escalate.
     pub fn ladder_for_model(&self, model_name: &str) -> Option<&Arc<EscalationLadder>> {
         let group = self.routes.get(model_name).map(|r| &r.group)?;
         self.ladders.get(group)
@@ -109,7 +110,7 @@ pub(crate) async fn record_ledger_result(
 /// Streaming dispatches assemble the answer as the client consumes the body,
 /// so the record is deferred to a detached task that waits on the
 /// [`StreamAnswer`](crate::streaming::StreamAnswer) finalizer (bounded by the
-/// target's total timeout) and then records — never delaying the HTTP response.
+/// target's total timeout) and then records - never delaying the HTTP response.
 /// `label` is the fallback content when no answer is available (escalation,
 /// empty body), preserving the pre-M5 status-style recording.
 async fn record_dispatch_outcome(
@@ -160,7 +161,7 @@ async fn record_dispatch_outcome(
 /// Per-request handle into a `DependencySession` step (D6). Holds the session
 /// `Arc` and the request's step id so the outcome can be recorded exactly once
 /// from whichever terminal branch the request takes. Locking is scoped to the
-/// `complete` call — never held across an await.
+/// `complete` call - never held across an await.
 #[derive(Clone)]
 struct SessionStepHandle {
     session: Arc<Mutex<DependencySession>>,
@@ -348,7 +349,7 @@ async fn handle_chat_completion(
                 tracing::info!(
                     target: "router.server",
                     session_id = %session_id,
-                    "session is frontier-owned — bypassing local pipeline"
+                    "session is frontier-owned - bypassing local pipeline"
                 );
                 let esc_ctx = EscalationContext {
                     request: &router_request,
@@ -486,7 +487,7 @@ async fn handle_chat_completion(
             target: "router.server",
             model = %rt_for_fallback.model,
             fallback_url = %rt_for_fallback.url,
-            "no routing target — dispatching to classifier fallback"
+            "no routing target - dispatching to classifier fallback"
         );
         let outcome = handle_dispatch(
             &rt_for_fallback,
@@ -522,7 +523,7 @@ async fn handle_chat_completion(
     tracing::warn!(
         target: "router.server",
         model = %model_name,
-        "no routing target, no classifier response, no classifier url — returning fallback"
+        "no routing target, no classifier response, no classifier url - returning fallback"
     );
     record_ledger_result(
         ledger.as_ref(),
@@ -547,16 +548,16 @@ async fn handle_chat_completion(
 /// The `plan` route's HTTP surface (M8): a single targeted interview round.
 ///
 /// The request body carries the user message and an optional entity list
-/// (the client's answers to a prior clarification, serialized as entities —
+/// (the client's answers to a prior clarification, serialized as entities -
 /// the same shape stored under structured `entities`). The response is
 /// structured JSON, never free-form chat:
 ///
-/// - `{"status": "clarify", "questions": [...], "gaps": [...]}` — the chart
+/// - `{"status": "clarify", "questions": [...], "gaps": [...]}` - the chart
 ///   needs one round of targeted answers; the client replies with `entities`
 ///   plus `retry: true` and the echoed `gaps`.
 /// - `{"status": "executed", "workflow": {...}, "source": ..., "gaps_filled":
-///   [...]}` — the chart is bound and compiled.
-/// - `{"status": "fresh_draft", "source": "fresh_draft"}` — no chart fit;
+///   [...]}` - the chart is bound and compiled.
+/// - `{"status": "fresh_draft", "source": "fresh_draft"}` - no chart fit;
 ///   planning falls through to a blank slate.
 ///
 /// A `retry` request that still leaves gaps terminates as `fresh_draft`
@@ -695,13 +696,13 @@ fn plan_executed_response(
     executed
 }
 
-/// Handle `POST /v1/rigor` — the fixed-pass blue/red/judge protocol (M3).
+/// Handle `POST /v1/rigor` - the fixed-pass blue/red/judge protocol (M3).
 ///
 /// Body: `{ "message", "session_id"?, "entities"? }`. A configured route with
 /// all three role backends executes and returns `executed` (accepted answer)
 /// or `clarify` (a material rejection resolved to a targeted interview). An
 /// unconfigured route (no `rigor` section / missing backends) returns an
-/// explicit error — never a crash.
+/// explicit error - never a crash.
 async fn handle_rigor_request(
     req: hyper::Request<hyper::body::Incoming>,
     deps: ServerDeps,
@@ -713,6 +714,7 @@ async fn handle_rigor_request(
         sessions,
         ledger,
         classifier,
+        models,
         ..
     } = &deps;
     let Some(route) = rigor_route else {
@@ -771,6 +773,16 @@ async fn handle_rigor_request(
     // D5/D6: thread the registry session + shared ledger into the context so
     // checkpoint/rewind and the red-team LOD0 view are load-bearing.
     let session = sessions.as_ref().map(|s| s.get_or_create(&session_id));
+    // M3/D7: the session model is set so KV snapshot save/rewind can key by it
+    // (`dag_session.rs` refuses to key without a model). The blue instance is
+    // the model's internal work group (the pool).
+    if let Some(session) = &session {
+        let mut s = lock(session);
+        s.set_model(model_endpoint.clone());
+    }
+    let kv_instance = models
+        .get(&model_endpoint)
+        .and_then(crate::config::ModelEntry::pool_qualifier);
     let ledger = ledger.clone();
 
     let ctx = RigorContext {
@@ -779,6 +791,7 @@ async fn handle_rigor_request(
         model_endpoint,
         session,
         ledger,
+        kv_instance,
     };
 
     match route.execute(&ctx).await {

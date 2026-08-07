@@ -195,7 +195,7 @@ fn test_deps_with_ledger(
 /// Spawn a server with a plan route (M8 interview round-trip tests). The
 /// chart store is seeded with `bug_triage`; no selector backend is attached,
 /// so the deterministic/HNSW binding is the sole authority on executability.
-/// An execution backend feeds the two chart targets (reproduce → root_cause)
+/// An execution backend feeds the two chart targets (reproduce - root_cause)
 /// so an exact hit executes server-side (M4/D3).
 async fn spawn_plan_server() -> TestServer {
     use crate::charts::store::{chart_from_str, ChartStore};
@@ -353,7 +353,7 @@ fn sse_delta_content(body: &str) -> Vec<String> {
         .collect()
 }
 
-// ── Scenario 1: buffered happy path ──────────────────────────────────────
+// -- Scenario 1: buffered happy path --------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn buffered_happy_path_returns_200_with_choices() {
@@ -380,7 +380,7 @@ async fn buffered_happy_path_returns_200_with_choices() {
     assert_eq!(value["choices"][0]["finish_reason"], "stop");
 }
 
-// ── D6: session-step recording on the dispatch path ──────────────────────
+// -- D6: session-step recording on the dispatch path ----------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_step_recorded_and_completed_on_dispatch_path() {
@@ -424,7 +424,7 @@ async fn session_step_recorded_and_completed_on_dispatch_path() {
     assert!(step.result.as_ref().unwrap().accepted);
 }
 
-// ── M5: matched target's answer recorded in ledger + session ──────────────
+// -- M5: matched target's answer recorded in ledger + session --------------
 
 /// An upstream that answers every buffered dispatch with `content`.
 async fn upstream_answering(content: &'static str) -> String {
@@ -491,6 +491,66 @@ async fn routed_dispatch_answer_recorded_in_ledger_lod0() {
     );
     assert_eq!(nodes[0].accepted, Some(true));
     assert_eq!(nodes[0].acceptance_score, Some(1.0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ledger_with_summarizer_attached_derives_lod() {
+    use crate::ledger::{ContentNodeLedger, LedgerError};
+    use crate::summarization::Summarizer;
+
+    // M2: a ledger wired with a `Summarizer` must derive lazy LOD levels at
+    // runtime - `ensure_lod` returns `Ok` (with the summary) instead of
+    // `LedgerError::NoSummarizer`. The routed answer is recorded at LOD0 and
+    // the lazy tier is derived from LOD0 only.
+    let upstream = upstream_answering("the summarized ledger answer").await;
+    let config = make_config(&upstream, false, false, 5000, 2000);
+
+    let backend: Arc<dyn ChatBackend> =
+        Arc::new(crate::test_stubs::StubChatBackend::always("lazy summary"));
+    let summarizer = Summarizer::new(backend, 20);
+    let ledger = Arc::new(
+        ContentNodeLedger::open_in_memory()
+            .unwrap()
+            .with_summarizer(summarizer),
+    );
+    let server = spawn_test_server_with_ledger(config, None, None, Some(Arc::clone(&ledger)))
+        .await;
+
+    let body = json!({
+        "model": "fast",
+        "messages": [{"role": "user", "content": "What is 2+2?"}],
+        "session_id": "sess-m2-summarizer"
+    });
+    let response = post_chat(&server.base_url(), body, 5000)
+        .await
+        .expect("request must complete");
+    assert_eq!(response.status(), 200);
+
+    let nodes = ledger
+        .get_session_nodes("sess-m2-summarizer", 10)
+        .expect("session nodes");
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(
+        nodes[0].lod[0], "the summarized ledger answer",
+        "answer durably recorded at LOD0"
+    );
+
+    // The Summarizer is attached: ensure_lod succeeds and derives from LOD0.
+    let derived = ledger
+        .ensure_lod(nodes[0].id.expect("node id"), 2)
+        .expect("lazy LOD derivation succeeds (Summarizer attached)");
+    assert_eq!(derived.lod[2], "lazy summary");
+
+    // Without a Summarizer the same call would return NoSummarizer - assert
+    // the plain ledger still reports it, proving the wiring is load-bearing.
+    let bare = Arc::new(ContentNodeLedger::open_in_memory().unwrap());
+    let id = bare
+        .record_request("sess-m2-bare", "r1", "some text")
+        .unwrap();
+    assert!(matches!(
+        bare.ensure_lod(id, 2),
+        Err(LedgerError::NoSummarizer)
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -589,7 +649,7 @@ async fn routed_stream_dispatch_answer_recorded_on_completion() {
         "stream must carry the dispatched content"
     );
 
-    // The stream finalizer runs in a detached task — poll the ledger until
+    // The stream finalizer runs in a detached task - poll the ledger until
     // the assembled answer lands (bounded), then assert.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut recorded = None;
@@ -606,7 +666,7 @@ async fn routed_stream_dispatch_answer_recorded_on_completion() {
     );
 }
 
-// ── Scenario 2: SSE stream ───────────────────────────────────────────────
+// -- Scenario 2: SSE stream -----------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn streaming_request_returns_sse_data_lines() {
@@ -654,7 +714,7 @@ async fn streaming_request_returns_sse_data_lines() {
     );
 }
 
-// ── Scenario 3: malformed JSON → 400 ─────────────────────────────────────
+// -- Scenario 3: malformed JSON - 400 -------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_json_returns_400() {
@@ -682,7 +742,7 @@ async fn malformed_json_returns_400() {
     assert_eq!(response.status(), 400);
 }
 
-// ── Scenario 4: oversized payload → 413 ──────────────────────────────────
+// -- Scenario 4: oversized payload - 413 ----------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_payload_returns_413() {
@@ -706,7 +766,7 @@ async fn oversized_payload_returns_413() {
     assert_eq!(response.status(), 413);
 }
 
-// ── Scenario 5: M1.1 regression — multi-byte UTF-8 at the 120-byte boundary
+// -- Scenario 5: M1.1 regression - multi-byte UTF-8 at the 120-byte boundary
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multibyte_utf8_message_at_120_byte_boundary_returns_200() {
@@ -740,7 +800,7 @@ async fn multibyte_utf8_message_at_120_byte_boundary_returns_200() {
     assert_eq!(value["choices"][0]["message"]["content"], "ok");
 }
 
-// ── Scenario 6: M2 regression — never-responding upstream times out ──────
+// -- Scenario 6: M2 regression - never-responding upstream times out ------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn never_responding_upstream_times_out() {
@@ -788,7 +848,7 @@ async fn never_responding_upstream_times_out() {
     );
 }
 
-// ── Scenario 7a: filter_thinking — buffered strip ────────────────────────
+// -- Scenario 7a: filter_thinking - buffered strip ------------------------
 
 /// Spawn an in-process mock upstream that answers every request via `respond`.
 async fn spawn_mock_upstream(respond: UpstreamRespond) -> String {
@@ -876,7 +936,7 @@ async fn filter_thinking_stripped_from_buffered_response() {
     );
 }
 
-// ── Scenario 7b: filter_thinking — no partial tag leak across chunks ─────
+// -- Scenario 7b: filter_thinking - no partial tag leak across chunks -----
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn filter_thinking_never_leaks_partial_tag_in_stream() {
@@ -942,14 +1002,14 @@ async fn filter_thinking_never_leaks_partial_tag_in_stream() {
     );
 }
 
-// ── M8: plan route interview round-trip ──────────────────────────────────
+// -- M8: plan route interview round-trip ----------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plan_route_responds_with_targeted_clarification_then_executes() {
     let server = spawn_plan_server().await;
     let request = "Please bug_triage this report";
 
-    // Round 1: no report entity → structured clarification (never free chat).
+    // Round 1: no report entity - structured clarification (never free chat).
     let body = json!({ "message": request });
     let resp = post_plan(&server.base_url(), body, 5000)
         .await
@@ -973,7 +1033,7 @@ async fn plan_route_responds_with_targeted_clarification_then_executes() {
     assert_eq!(gaps, vec!["report".to_string()]);
 
     // Round 2: the answer arrives as an entity (kind = gap dep name) plus the
-    // echoed gaps and retry=true → the chart is bound and compiled.
+    // echoed gaps and retry=true - the chart is bound and compiled.
     let answer = json!({
         "message": request,
         "entities": [{
@@ -1031,7 +1091,7 @@ async fn plan_route_second_failure_terminates_as_fresh_draft() {
         .collect();
 
     // Round 2 answers with an entity that does NOT satisfy the report
-    // predicate → still Partial → the interview terminates as fresh_draft.
+    // predicate - still Partial - the interview terminates as fresh_draft.
     let answer = json!({
         "message": request,
         "entities": [{
@@ -1065,7 +1125,7 @@ async fn plan_route_unconfigured_returns_service_unavailable() {
     assert_eq!(resp.status(), 503);
 }
 
-// ── M10: dispatch post-processing — workflow extraction ───────────────────
+// -- M10: dispatch post-processing - workflow extraction -------------------
 
 /// Spawn the real server with a plan route (M10 extraction hook over a
 /// boot-loaded chart store).
@@ -1169,8 +1229,8 @@ async fn successful_dispatch_distills_a_draft_chart() {
         "the auto-extracted chart is a draft until rubric-validated"
     );
     // M10a LOD0 fidelity: the draft's template captures the real prompt shape
-    // (the role-prefixed message) — not the synthesized "Solve the following
-    // request…" wrapper.
+    // (the role-prefixed message) - not the synthesized "Solve the following
+    // request-" wrapper.
     let chart = store.get(name).expect("chart exists");
     let template = &chart.targets[0].template;
     assert!(
@@ -1185,7 +1245,7 @@ async fn successful_dispatch_distills_a_draft_chart() {
     assert!(!store.charts_sorted().iter().any(|c| c.name == name));
 }
 
-// ── M3: escalation ladder — integration ───────────────────────────────────
+// -- M3: escalation ladder - integration -----------------------------------
 
 /// Install (once) the process-wide global subscriber and return its capture
 /// buffer. The escalation tests assert on the `router.audit` lines it
@@ -1299,7 +1359,7 @@ async fn escalation_ladder_responds_after_local_chain_fails() {
     );
 
     // Every escalation interaction wrote a `kind = "escalation"` audit record
-    // with the mode and acceptance — captured by the global subscriber.
+    // with the mode and acceptance - captured by the global subscriber.
     let lines = lock(&capture).join("\n");
     assert!(
         lines.contains("router.audit"),
@@ -1317,7 +1377,7 @@ async fn context_cache_short_circuits_before_frontier_integration() {
     lock(&capture).clear();
 
     // A context hit must be returned without any frontier contact, so the
-    // upstream is not even spawned — point it at a dead address.
+    // upstream is not even spawned - point it at a dead address.
     let config = escalated_config("http://127.0.0.1:1");
     let http_client = reqwest::Client::new();
     let ladders = config.build_escalation_ladders(&http_client);
@@ -1373,7 +1433,7 @@ async fn context_cache_short_circuits_before_frontier_integration() {
     );
 }
 
-// ── M3.6: /v1/rigor server round-trip ────────────────────────────────────
+// -- M3.6: /v1/rigor server round-trip ------------------------------------
 
 /// Assemble `ServerDeps` with a rigor route + session registry + ledger wired
 /// (checkpoint/rewind + red-team view are load-bearing in the server path).

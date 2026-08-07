@@ -1,4 +1,4 @@
-//! Rigor route — the fixed-pass blue/red/judge protocol (M3).
+//! Rigor route - the fixed-pass blue/red/judge protocol (M3).
 //!
 //! `RigorRoute` wires the VISION's high-stakes verification loop to live
 //! backends:
@@ -17,12 +17,12 @@
 //! 6. If still rejected, the route resolves to a **targeted interview**
 //!    (<= 3 questions derived from the objection descriptions) and, only when
 //!    judge confidence is low, marks `frontier_escalation` (an explicit
-//!    config value — never "red scored a point").
+//!    config value - never "red scored a point").
 //!
 //! Round count is fixed at `max_passes` (default 2): never a third pass
 //! (VISION: terminate, don't loop). Backends are DIP-injected
 //! `Arc<dyn ChatBackend>` built exactly once in `main.rs`. There is **no**
-//! `Interviewable` trait — the targeted interview is a third, distinct shape
+//! `Interviewable` trait - the targeted interview is a third, distinct shape
 //! from plan's binding-gap closure loop (D5).
 
 use std::collections::HashSet;
@@ -53,6 +53,10 @@ pub struct RigorContext {
     /// The shared `ContentNodeLedger` whose store the red team reads at LOD0
     /// (D6). `None` degrades the red pass to the blue answer only.
     pub ledger: Option<Arc<ContentNodeLedger>>,
+    /// The named instance the blue pass served on (M3/D7). `Some` lets the
+    /// blue-pass completion record a fork KV snapshot on it; `None` skips the
+    /// save (degrade, never a crash).
+    pub kv_instance: Option<String>,
 }
 
 pub struct RigorRoute {
@@ -176,7 +180,7 @@ impl RigorRoute {
 
         // Pass 1: blue.
         let mut answer = blue_answer(&blue, &ctx.user_message).await?;
-        Self::complete_blue_step(ctx, &answer);
+        self.complete_blue_step(ctx, &answer);
 
         // Red + judge over the (no-dead-end) view.
         let objections = Self::red_pass(ctx, &red, &answer).await?;
@@ -192,7 +196,7 @@ impl RigorRoute {
             rewound = self.rewind_to_blue(ctx);
             let refocused = blue_retry_prompt(&ctx.user_message, &answer, &objections);
             answer = blue_answer(&blue, &refocused).await?;
-            Self::complete_blue_step(ctx, &answer);
+            self.complete_blue_step(ctx, &answer);
             let objections2 = Self::red_pass(ctx, &red, &answer).await?;
             let (v2, c2) = Self::judge_pass(&judge, &answer, &objections2).await?;
             verdict = v2;
@@ -229,7 +233,7 @@ impl RigorRoute {
     }
 
     /// Register the rigor steps on the session idempotently (`add_step`
-    /// returns `DuplicateNode` — only add when absent), and set the model if
+    /// returns `DuplicateNode` - only add when absent), and set the model if
     /// unset (KV snapshot keying requires one, `dag_session.rs:354-363`).
     fn register_steps(ctx: &RigorContext) {
         let Some(session) = &ctx.session else {
@@ -259,7 +263,11 @@ impl RigorRoute {
     }
 
     /// Complete `rigor.blue` (records the checkpoint via `complete_step`).
-    fn complete_blue_step(ctx: &RigorContext, answer: &str) {
+    /// When KV-cache is enabled this also saves a fork snapshot on the blue
+    /// instance so the subsequent `rewind_to_checkpoint("rigor.blue")` finds
+    /// real metadata (D7). The save is best-effort - it logs and never fails
+    /// the request.
+    fn complete_blue_step(&self, ctx: &RigorContext, answer: &str) {
         let Some(session) = &ctx.session else {
             return;
         };
@@ -275,6 +283,44 @@ impl RigorRoute {
                     error: None,
                 },
             );
+        }
+        if self.kv_cache_enabled {
+            Self::save_blue_snapshot(ctx, &mut s);
+        }
+    }
+
+    /// Save the blue-pass KV snapshot (D7): record a snapshot named after the
+    /// blue step on `ctx.kv_instance` so a later `rewind_to_checkpoint` finds
+    /// real metadata. Requires a session carrying a `KvCacheManager` (with a
+    /// fork handle), a model name for keying, and a `kv_instance`; any missing
+    /// piece degrades to a logged no-op - never a crash, never a fabricated
+    /// lookup.
+    fn save_blue_snapshot(ctx: &RigorContext, s: &mut DependencySession) {
+        let Some(kv) = s.kv_cache() else {
+            return;
+        };
+        let Some(instance) = &ctx.kv_instance else {
+            return;
+        };
+        let Some(model) = s.model.clone() else {
+            return;
+        };
+        let name = "rigor-blue-rigor.blue";
+        match kv.save_snapshot(&model, s.adapter.as_deref(), &s.session_id, name, instance) {
+            Ok(()) => tracing::info!(
+                target: "router.rigor",
+                snapshot = %name,
+                instance = %instance,
+                model = %model,
+                "kv cache snapshot saved for blue pass",
+            ),
+            Err(e) => tracing::warn!(
+                target: "router.rigor",
+                snapshot = %name,
+                instance = %instance,
+                error = %e,
+                "kv cache snapshot save failed - continuing (never fails the request)",
+            ),
         }
     }
 
@@ -297,7 +343,7 @@ impl RigorRoute {
                         instance = ?snap.instance,
                         id_slot = 0,
                         kv_cache_enabled = self.kv_cache_enabled,
-                        "kv cache snapshot restored on rigor rewind — snapshot/instance passed to next dispatch"
+                        "kv cache snapshot restored on rigor rewind - snapshot/instance passed to next dispatch"
                     );
                 }
                 true
@@ -306,7 +352,7 @@ impl RigorRoute {
                 tracing::warn!(
                     target: "router.rigor",
                     error = %e,
-                    "rigor rewind failed — continuing with current answer"
+                    "rigor rewind failed - continuing with current answer"
                 );
                 false
             }
@@ -395,7 +441,7 @@ impl RigorRoute {
     }
 
     /// Whether any objection is material (severity >= the configured
-    /// threshold) — the trigger for rewind, not "the judge rejected".
+    /// threshold) - the trigger for rewind, not "the judge rejected".
     fn material_rejection(&self, objections: &[RedObjection]) -> bool {
         objections
             .iter()
@@ -445,7 +491,7 @@ async fn blue_answer(blue: &LocalBackend, user_message: &str) -> Result<String, 
 
 /// Run one blocking `ChatBackend::chat_complete` off the executor.
 ///
-/// The role backends are synchronous (the codebase's DIP pattern — the same
+/// The role backends are synchronous (the codebase's DIP pattern - the same
 /// `Arc<dyn ChatBackend>` used by dispatch). `RigorRoute::execute` is async by
 /// locked decision D5, so the blocking calls are offloaded via
 /// `spawn_blocking` and awaited, honoring the WorkUnit purity contract (never
@@ -640,7 +686,7 @@ fn dead_end_node_ids(ctx: &RigorContext) -> HashSet<NodeId> {
 
 /// The targeted-interview fallback: the <= 3 highest-severity objections,
 /// turned into direct clarification questions (VISION: "a targeted interview
-/// with the user — not silent escalation").
+/// with the user - not silent escalation").
 fn derive_interview(objections: &[RedObjection]) -> Vec<String> {
     let mut ranked: Vec<&RedObjection> = objections.iter().collect();
     ranked.sort_by(|a, b| {
@@ -653,7 +699,7 @@ fn derive_interview(objections: &[RedObjection]) -> Vec<String> {
         .take(3)
         .map(|o| {
             format!(
-                "{} — {}. Could you clarify this concern?",
+                "{} - {}. Could you clarify this concern?",
                 o.category, o.description
             )
         })
@@ -686,6 +732,7 @@ mod tests {
             model_endpoint: "model-x".into(),
             session: None,
             ledger: None,
+            kv_instance: None,
         }
     }
 
@@ -727,7 +774,7 @@ mod tests {
         r#"{"verdict": "reject", "caveats": [], "reasons": ["x"], "confidence": 0.8}"#
     }
 
-    // ── M3.2: prompts + parse ────────────────────────────────────────────
+    // -- M3.2: prompts + parse --------------------------------------------
 
     #[tokio::test]
     async fn blue_returns_plain_string() {
@@ -809,7 +856,7 @@ mod tests {
         assert!(parse_judge(r#"{"verdict": "maybe", "confidence": 0.5}"#).is_err());
     }
 
-    // ── M3.5: bounded pass loop ──────────────────────────────────────────
+    // -- M3.5: bounded pass loop ------------------------------------------
 
     #[tokio::test]
     async fn judge_accepts_first_pass_no_rewind_no_interview() {
@@ -923,7 +970,7 @@ mod tests {
         ));
     }
 
-    // ── M3.3: session steps + real rewind ────────────────────────────────
+    // -- M3.3: session steps + real rewind --------------------------------
 
     #[tokio::test]
     async fn material_rejection_resets_rigor_steps_to_pending() {
@@ -1031,7 +1078,139 @@ mod tests {
         );
     }
 
-    // ── M3.4: red-team filtered view at LOD0 ─────────────────────────────
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blue_save_then_rewind_produces_pending_kv_fields() {
+        // M3/D7: the blue-pass completion saves a fork snapshot on the blue
+        // instance (stub fork receives the POST), then the material-rejection
+        // rewind finds real metadata and the session carries pending KV fields
+        // (`snapshot`/`instance`/`id_slot`) for the next dispatch.
+        use crate::instances::stub::StubServer;
+        use crate::instances::InstanceClient;
+        use crate::kv_cache::{ColdKvCache, HotKvCache, KvCacheManager};
+
+        // Stub fork: answer the snapshot save + any /instances reads.
+        let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
+            |method, path, _body| {
+                if method == "POST" && path == "/instances/scratch/snapshot" {
+                    (200, "{}".into())
+                } else {
+                    (200, "[]".into())
+                }
+            },
+        );
+        let stub = StubServer::start(handler);
+        let fork = Arc::new(InstanceClient::new(
+            reqwest::Client::new(),
+            stub.base_url(),
+            None,
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let hot = Arc::new(HotKvCache::new(10, 1024));
+        let kv = KvCacheManager::new(
+            Arc::clone(&hot),
+            Arc::new(ColdKvCache::new(
+                dir.path(),
+                1024,
+                86400,
+                crate::config::EvictionPolicy::Lru,
+            )),
+        )
+        .with_fork_io(fork);
+
+        let session = Arc::new(Mutex::new(
+            DependencySession::new("sess-rigor")
+                .with_model("model-x")
+                .with_kv_cache(kv),
+        ));
+        let route = route_with_judge(vec![reject_verdict(), accept_verdict()])
+            .with_kv_cache();
+        let mut ctx = ctx("question");
+        ctx.session = Some(Arc::clone(&session));
+        ctx.kv_instance = Some("scratch".into());
+
+        let result = route.execute(&ctx).await.unwrap();
+        assert!(result.rewound, "material rejection must rewind");
+
+        // The fork received the snapshot-save POST.
+        let recorded = stub.recorded();
+        assert!(
+            recorded
+                .iter()
+                .any(|(m, p, _)| m == "POST" && p == "/instances/scratch/snapshot"),
+            "blue completion must POST the fork snapshot save, got: {recorded:?}"
+        );
+
+        // The rewind restored the just-saved snapshot: pending fields carry the
+        // snapshot name + instance for the next dispatch.
+        let s = lock(&session);
+        let pending = s.pending_kv_fields().expect("pending fields set");
+        assert_eq!(pending.0, "rigor-blue-rigor.blue");
+        assert_eq!(pending.1.as_deref(), Some("scratch"));
+        assert_eq!(pending.2, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blue_save_without_kv_instance_is_a_no_op() {
+        // M3/D7 degradation: with a kv manager + fork but no `kv_instance`,
+        // the blue save is skipped (never a crash) and the stub sees no POST.
+        use crate::instances::stub::StubServer;
+        use crate::instances::InstanceClient;
+        use crate::kv_cache::{ColdKvCache, HotKvCache, KvCacheManager};
+
+        let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
+            |method, _path, _body| {
+                if method == "POST" {
+                    (200, "{}".into())
+                } else {
+                    (200, "[]".into())
+                }
+            },
+        );
+        let stub = StubServer::start(handler);
+        let fork = Arc::new(InstanceClient::new(
+            reqwest::Client::new(),
+            stub.base_url(),
+            None,
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let hot = Arc::new(HotKvCache::new(10, 1024));
+        let kv = KvCacheManager::new(
+            Arc::clone(&hot),
+            Arc::new(ColdKvCache::new(
+                dir.path(),
+                1024,
+                86400,
+                crate::config::EvictionPolicy::Lru,
+            )),
+        )
+        .with_fork_io(fork);
+
+        let session = Arc::new(Mutex::new(
+            DependencySession::new("sess-rigor")
+                .with_model("model-x")
+                .with_kv_cache(kv),
+        ));
+        let route = route_with_judge(vec![reject_verdict(), accept_verdict()])
+            .with_kv_cache();
+        let mut ctx = ctx("question");
+        ctx.session = Some(Arc::clone(&session));
+        // kv_instance is None -> save skipped.
+
+        let result = route.execute(&ctx).await.unwrap();
+        assert!(result.rewound);
+        assert!(
+            stub.recorded().is_empty(),
+            "no kv_instance -> no fork snapshot save",
+        );
+        let s = lock(&session);
+        assert!(
+            s.pending_kv_fields().is_none(),
+            "no metadata saved -> no pending fields"
+        );
+    }
+
+    // -- M3.4: red-team filtered view at LOD0 -----------------------------
 
     /// A recording backend that captures the user message it receives (the red
     /// prompt) so the test can assert on the rendered view material.

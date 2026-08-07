@@ -1,4 +1,4 @@
-//! Router configuration types — deserialized from JSON via `common_core::config`.
+//! Router configuration types - deserialized from JSON via `common_core::config`.
 
 pub mod addr;
 pub mod builder;
@@ -53,7 +53,7 @@ pub struct RouterConfig {
     #[serde(default)]
     pub embedding_model: Option<String>,
     /// Chart-candidate reranker model key (M7 step 2.5). Selects an entry
-    /// from `models`. `None` skips the rerank stage (Step 2 → Step 3
+    /// from `models`. `None` skips the rerank stage (Step 2 - Step 3
     /// directly).
     #[serde(default)]
     pub reranker_model: Option<String>,
@@ -61,7 +61,7 @@ pub struct RouterConfig {
     pub mock: Option<MockConfig>,
     #[serde(default)]
     pub score_matrix: Option<ScoreMatrix>,
-    /// Chart store configuration (DAG workflow library). See M6–M10.
+    /// Chart store configuration (DAG workflow library). See M6-M10.
     #[serde(default)]
     pub charts: ChartsConfig,
     /// Post-processing configuration (M10 learning loop).
@@ -74,7 +74,7 @@ pub struct RouterConfig {
     #[serde(default)]
     pub classification: Option<ClassificationTree>,
     /// Rigor-route configuration (M3). `None` (the default) leaves the route
-    /// present but unconfigured — requests return an explicit `Unconfigured`
+    /// present but unconfigured - requests return an explicit `Unconfigured`
     /// error, never a crash.
     #[serde(default)]
     pub rigor: Option<RigorConfig>,
@@ -84,6 +84,18 @@ pub struct RouterConfig {
     /// weights stay loaded in `llama-server`).
     #[serde(default)]
     pub sidecar: SidecarConfig,
+    /// Ledger composition section (M2). `Some` opts the boot path into opening
+    /// a `ContentNodeLedger` (with a real `Summarizer` backend targeting
+    /// `<base>:ledger`) so LOD derivation exists at runtime. `None` (the
+    /// default) leaves today's behavior - no ledger at boot.
+    #[serde(default)]
+    pub ledger: Option<LedgerConfig>,
+    /// Session composition section (M2). `Some` opts the boot path into a
+    /// `SessionRegistry` (D6 canonical session home) so rigor rewind and
+    /// checkpoint/rewind state exist at runtime. `None` (the default) leaves
+    /// today's behavior - no session registry at boot.
+    #[serde(default)]
+    pub session: Option<SessionConfig>,
 }
 
 impl Default for RouterConfig {
@@ -110,12 +122,14 @@ impl Default for RouterConfig {
             classification: None,
             rigor: None,
             sidecar: SidecarConfig::default(),
+            ledger: None,
+            session: None,
         }
     }
 }
 
 impl RouterConfig {
-    /// The flat `routes` view the server consumes (model → pipeline mapping).
+    /// The flat `routes` view the server consumes (model - pipeline mapping).
     ///
     /// Flat configs return `routes` unchanged. When a classification tree is
     /// configured, every `terminal` node whose route has no explicit entry gets
@@ -284,6 +298,51 @@ impl ModelEntry {
             None
         }
     }
+
+    /// The dispatch qualifier for the router's *internal work group* (the
+    /// "pool"): the classifier, chart selector/adjudicator/reranker,
+    /// target-matching ladder, and rigor role backends spread across the
+    /// instance pool rather than pinning to the client-facing default instance.
+    /// This is a distinct intent from `default_dispatch_qualifier`, which
+    /// resolves the fork's *default instance* for client-facing bare-`<base>`
+    /// dispatch. Resolution order (D1), deterministic:
+    ///
+    /// 1. The group of the `default: false` profile with the largest `count`
+    ///    (the "work pool"; for the reference config this is `swarm`).
+    /// 2. Else the `default: true` profile's group.
+    /// 3. Else the single group shared by all profiles.
+    /// 4. Else `None` (bare `<base>`, upstream models unchanged).
+    pub fn pool_qualifier(&self) -> Option<String> {
+        let profiles = self.instance_profiles();
+        if profiles.is_empty() {
+            return None;
+        }
+        // 1. The non-default profile with the largest sibling count (ties
+        //    resolve to the first encountered in deterministic map order).
+        let mut best: Option<&InstanceProfile> = None;
+        let mut best_count: u32 = 0;
+        for p in profiles.iter().filter(|p| !p.default) {
+            let c = p.count.max(1);
+            if best.is_none() || c > best_count {
+                best = Some(p);
+                best_count = c;
+            }
+        }
+        if let Some(b) = best {
+            return b.group.clone();
+        }
+        // 2. The default profile's group.
+        if let Some(d) = profiles.iter().find(|p| p.default) {
+            return d.group.clone();
+        }
+        // 3. The single group shared by all profiles.
+        let first = profiles[0].group.clone()?;
+        if profiles.iter().all(|p| p.group.as_deref() == Some(first.as_str())) {
+            Some(first)
+        } else {
+            None
+        }
+    }
 }
 
 /// Declaration-only request-body keys the fork ignores: the instance grammar
@@ -303,6 +362,42 @@ pub fn strip_declaration_params(params: serde_json::Value) -> serde_json::Value 
         out.remove(k);
     }
     serde_json::Value::Object(out)
+}
+
+/// Merge a model entry's top-level sampling `params` with a specific
+/// instance profile's `params` (profile wins), returning the merged object.
+/// Non-object params degrade to an empty object (nothing to merge). This is
+/// the single canonical merge for per-instance sampling knobs; the profile is
+/// looked up by name-or-group so both the exact-instance and group dispatch
+/// paths reach the same value.
+pub(crate) fn merge_sampling_params(
+    entry: Option<&serde_json::Value>,
+    profile: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut merged = serde_json::Map::new();
+    if let Some(v) = entry.and_then(serde_json::Value::as_object) {
+        merged.extend(v.clone());
+    }
+    if let Some(v) = profile.and_then(serde_json::Value::as_object) {
+        merged.extend(v.clone());
+    }
+    serde_json::Value::Object(merged)
+}
+
+impl ModelEntry {
+    /// Resolve the sampling params to send when dispatching to `qualifier`
+    /// (an instance name or group of this model's pool): the matching
+    /// profile's `params` overlaid onto the entry's top-level `params`
+    /// (profile wins), declaration-only keys stripped. `None` when no profile
+    /// matches `qualifier` — callers fall back to the entry's bare params.
+    pub fn instance_params_for(&self, qualifier: &str) -> Option<serde_json::Value> {
+        let profile = self.instance_profiles().into_iter().find(|p| {
+            p.name.as_deref() == Some(qualifier) || p.group.as_deref() == Some(qualifier)
+        })?;
+        let merged =
+            merge_sampling_params(self.params.as_ref(), profile.params.as_ref());
+        Some(strip_declaration_params(merged))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -384,9 +479,9 @@ fn default_fast_route() -> String {
     "fast".into()
 }
 
-// ── Charts (DAG workflow library) configuration ──────────────────────────
+// -- Charts (DAG workflow library) configuration --------------------------
 
-/// Chart store configuration — the `charts` section of `RouterConfig`.
+/// Chart store configuration - the `charts` section of `RouterConfig`.
 ///
 /// The store is owned by `fluent-router` (see `coral-router`/`charts/`): a
 /// directory of human-authored chart JSON files (`D3`), a router-side
@@ -394,7 +489,7 @@ fn default_fast_route() -> String {
 /// used by chart-selection LLM adjudication.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChartsConfig {
-    /// Directory of `*.json` chart files loaded at boot. `None` → empty
+    /// Directory of `*.json` chart files loaded at boot. `None` - empty
     /// store (a missing directory is tolerated with a `warn!`).
     #[serde(default)]
     pub dir: Option<String>,
@@ -433,9 +528,9 @@ const fn default_charts_max_candidates() -> usize {
     5
 }
 
-// ── Rigor (M3) configuration ──────────────────────────────────────────────
+// -- Rigor (M3) configuration ----------------------------------------------
 
-/// Rigor-route configuration — the `rigor` section of `RouterConfig`.
+/// Rigor-route configuration - the `rigor` section of `RouterConfig`.
 ///
 /// Model keys select entries from `config.models`; backends are built **only**
 /// in `coral-router`'s `build_rigor_route` (DIP, mirroring
@@ -467,7 +562,7 @@ pub struct RigorConfig {
     #[serde(default = "default_rigor_severity_threshold")]
     pub severity_threshold: f64,
     /// Judge confidence below which a final rejection escalates to frontier.
-    /// An explicit config value — never "red scored a point" (M3.5).
+    /// An explicit config value - never "red scored a point" (M3.5).
     /// Default 0.4.
     #[serde(default = "default_rigor_escalation_confidence")]
     pub escalation_confidence: f64,
@@ -499,13 +594,66 @@ const fn default_rigor_escalation_confidence() -> f64 {
     0.4
 }
 
+/// Default cap on the ledger `Summarizer`'s summary length (tokens). Only a
+/// named constant - `LedgerConfig.max_summary_tokens` defaults to it.
+pub const DEFAULT_LEDGER_MAX_SUMMARY_TOKENS: u32 = 200;
+
+/// Ledger composition section (M2) - the `ledger` block of `RouterConfig`.
+///
+/// `Some` opts the composition root (`main.rs`) into opening a
+/// `ContentNodeLedger` and attaching a `Summarizer` backend targeting the
+/// named `ledger` instance. `None` (absent) keeps today's behavior - no
+/// ledger at boot - so existing deployments are untouched until they opt in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerConfig {
+    /// Durable store path. `None` falls back to an in-memory ledger with a
+    /// `warn!` (ephemeral, still functional for LOD derivation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Model key for the ledger `Summarizer`. `None` falls back to the
+    /// classifier model key, then to no summarizer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Max summary length (tokens) for LOD1-LOD4 derivation.
+    #[serde(default = "default_ledger_max_summary_tokens")]
+    pub max_summary_tokens: u32,
+}
+
+const fn default_ledger_max_summary_tokens() -> u32 {
+    DEFAULT_LEDGER_MAX_SUMMARY_TOKENS
+}
+
+impl Default for LedgerConfig {
+    fn default() -> Self {
+        Self {
+            path: None,
+            model: None,
+            max_summary_tokens: DEFAULT_LEDGER_MAX_SUMMARY_TOKENS,
+        }
+    }
+}
+
+/// Session composition section (M2) - the `session` block of `RouterConfig`.
+///
+/// `Some` opts the composition root into a `SessionRegistry` (D6 canonical
+/// session home) so checkpoint/rewind state and rigor rewind exist at runtime.
+/// `None` (absent) keeps today's behavior - no session registry at boot.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SessionConfig {
+    /// Cold-tier mountpoint for KV cache snapshots, mapped to
+    /// `SessionRegistry::new`'s `kv_root`. `None` uses a process-local temp
+    /// directory (durable across requests, ephemeral across restarts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+}
+
 /// Sidecar instance-management policy (M4).
 ///
 /// The sidecar task is the external VRAM-policy owner the fork's docs
 /// describe: it boot-reconciles configured instance profiles against
 /// `GET /instances`, polls `/memory`, and evicts least-recently-used unpinned
 /// instances when free device VRAM drops below the watermark. It only ever
-/// allocates or frees KV + compute buffers — the shared weights stay loaded in
+/// allocates or frees KV + compute buffers - the shared weights stay loaded in
 /// `llama-server`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SidecarConfig {
@@ -564,23 +712,23 @@ const fn default_charts_entity_context() -> bool {
     true
 }
 
-// ── Post-processing (M10 learning loop) configuration ─────────────────────
+// -- Post-processing (M10 learning loop) configuration ---------------------
 
-/// Post-processing configuration — the `post_process` section of
+/// Post-processing configuration - the `post_process` section of
 /// `RouterConfig`.
 ///
 /// Controls the VISION learning loop: whether a *successful* dispatch is
-/// distilled into a reusable draft chart (M10). Per VISION §"Post-processing:
+/// distilled into a reusable draft chart (M10). Per VISION -"Post-processing:
 /// audit + workflow extraction", extraction is opt-in and the produced chart
 /// is a draft that only becomes selectable after a rubric-validated run.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PostProcessConfig {
     /// Whether successful dispatches are decomposed into draft charts
-    /// automatically. Default `false` — the operator opts in.
+    /// automatically. Default `false` - the operator opts in.
     #[serde(default)]
     pub workflow_extraction: bool,
     /// Which successful dispatches are distilled into draft charts.
-    /// Default `"frontier"` — the VISION learning loop learns from
+    /// Default `"frontier"` - the VISION learning loop learns from
     /// frontier-assisted (escalated/fallback) solutions, not the common
     /// local-primary path. `"all"` restores the blanket behavior by
     /// explicit opt-in.
@@ -615,7 +763,7 @@ fn default_retry_interval() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    // Tests assert float config values against literal defaults — deliberate.
+    // Tests assert float config values against literal defaults - deliberate.
     #![allow(clippy::float_cmp)]
     use super::*;
 
@@ -630,7 +778,7 @@ mod tests {
         assert!(cfg.selector_model.is_none());
     }
 
-    // ── M3 rigor-route configuration ─────────────────────────────────────
+    // -- M3 rigor-route configuration -------------------------------------
 
     #[test]
     fn rigor_config_defaults() {
@@ -760,7 +908,7 @@ mod tests {
         assert_eq!(cfg.charts.min_score, 0.6, "unset field keeps its default");
     }
 
-    // ── Post-process (M10 learning loop) ────────────────────────────────
+    // -- Post-process (M10 learning loop) --------------------------------
 
     #[test]
     fn post_process_defaults_to_disabled() {
@@ -875,7 +1023,7 @@ mod tests {
         );
     }
 
-    // ── M4 classification-tree derived flat views ────────────────────────
+    // -- M4 classification-tree derived flat views ------------------------
 
     fn tree_section() -> serde_json::Value {
         serde_json::json!({
@@ -955,7 +1103,7 @@ mod tests {
         assert_eq!(routing.system_prompt, "custom preamble");
     }
 
-    // ── M6: in-group target-matching knob (PipelineParams) ────────────────
+    // -- M6: in-group target-matching knob (PipelineParams) ----------------
 
     #[test]
     fn pipeline_params_target_match_defaults() {
@@ -963,7 +1111,7 @@ mod tests {
         assert_eq!(
             defaults.target_match,
             builder::TargetMatchMode::SelfAssess,
-            "the self-assess ladder is the default policy (§4.6)"
+            "the self-assess ladder is the default policy (-4.6)"
         );
         assert_eq!(
             defaults.target_match_timeout_ms,
@@ -975,7 +1123,7 @@ mod tests {
     #[test]
     fn pipeline_params_target_match_absent_fields_deserialize_to_defaults() {
         // A pipeline that omits both knob fields must deserialize to the same
-        // defaults (mirror the `classifier_retry_max` pattern) — existing
+        // defaults (mirror the `classifier_retry_max` pattern) - existing
         // configs stay byte-identical.
         let cfg: RouterConfig = serde_json::from_str(
             r#"{
@@ -1009,7 +1157,7 @@ mod tests {
 
     #[test]
     fn pipeline_params_target_match_round_trips() {
-        // Non-default values survive a serialize → deserialize cycle.
+        // Non-default values survive a serialize - deserialize cycle.
         let cfg: RouterConfig = serde_json::from_value(serde_json::json!({
             "pipelines": {
                 "default": {
@@ -1030,7 +1178,7 @@ mod tests {
         assert_eq!(back.pipelines["default"].target_match_timeout_ms, 12345);
     }
 
-    // ── M1 instance-pool declaration ─────────────────────────────────────
+    // -- M1 instance-pool declaration -------------------------------------
 
     fn profile_json(name: &str, count: u32, group: &str, num_ctx: u64) -> serde_json::Value {
         serde_json::json!({
@@ -1129,7 +1277,90 @@ mod tests {
         assert!(profiles[0].no_sleep);
     }
 
-    // ── M4 sidecar policy ───────────────────────────────────────────────
+    // -- M1 pool vs default qualifier (D1) -------------------------------
+
+    /// The reference swarm entry: a count=3 non-default `swarm` work pool, a
+    /// pinned `default: true` ledger, and a non-default scratch profile.
+    fn reference_swarm_entry() -> ModelEntry {
+        serde_json::from_value(serde_json::json!({
+            "endpoint": "http://x/v1/chat/completions",
+            "name": "abiray/lfm2.5-2.6b-heretic-abliterated",
+            "intelligence": 2,
+            "cost_input": 1e-06, "cost_output": 6e-06, "cost_cached_read": 4e-07,
+            "speed": 8,
+            "instances": {
+                "swarm": profile_json("swarm", 3, "swarm", 16384),
+                "ledger": { "num_ctx": 131072, "pinned": true, "default": true },
+                "scratch": { "num_ctx": 131072, "sleep_idle_seconds": 30 }
+            }
+        }))
+        .expect("reference swarm entry parses")
+    }
+
+    #[test]
+    fn pool_qualifier_reference_config_targets_swarm() {
+        let entry = reference_swarm_entry();
+        assert_eq!(
+            entry.pool_qualifier().as_deref(),
+            Some("swarm"),
+            "the largest non-default profile (count=3) is the work pool"
+        );
+    }
+
+    #[test]
+    fn pool_qualifier_vs_default_qualifier_two_intents_two_answers() {
+        // The two intents must diverge on the same entry: pool = swarm (the
+        // work group), default = ledger (the client-facing default instance).
+        let entry = reference_swarm_entry();
+        assert_eq!(entry.pool_qualifier().as_deref(), Some("swarm"));
+        assert_eq!(
+            entry.default_dispatch_qualifier().as_deref(),
+            Some("ledger")
+        );
+    }
+
+    #[test]
+    fn pool_qualifier_ledger_only_defaults_to_ledger() {
+        let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+            "endpoint": "http://x/v1/chat/completions",
+            "intelligence": 1,
+            "cost_input": 0.0, "cost_output": 0.0, "cost_cached_read": 0.0,
+            "speed": 1,
+            "instances": { "ledger": { "num_ctx": 131072, "default": true } }
+        }))
+        .unwrap();
+        assert_eq!(entry.pool_qualifier().as_deref(), Some("ledger"));
+    }
+
+    #[test]
+    fn pool_qualifier_single_shared_group() {
+        let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+            "endpoint": "http://x/v1/chat/completions",
+            "intelligence": 1,
+            "cost_input": 0.0, "cost_output": 0.0, "cost_cached_read": 0.0,
+            "speed": 1,
+            "instances": {
+                "a": { "num_ctx": 8192, "group": "shared" },
+                "b": { "num_ctx": 8192, "group": "shared" }
+            }
+        }))
+        .unwrap();
+        assert_eq!(entry.pool_qualifier().as_deref(), Some("shared"));
+    }
+
+    #[test]
+    fn pool_qualifier_no_instances_is_none() {
+        let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+            "endpoint": "http://x/v1/chat/completions",
+            "intelligence": 1,
+            "cost_input": 0.0, "cost_output": 0.0, "cost_cached_read": 0.0,
+            "speed": 1,
+        }))
+        .unwrap();
+        assert!(entry.pool_qualifier().is_none());
+    }
+
+    // -- M4 sidecar policy -----------------------------------------------
 
     #[test]
     fn sidecar_absent_section_defaults_cleanly() {
@@ -1162,5 +1393,69 @@ mod tests {
         assert_eq!(cfg.sidecar.vram_total_bytes, Some(1048576));
         assert_eq!(cfg.sidecar.slot_save_path.as_deref(), Some("/srv/slots"));
         assert_eq!(cfg.sidecar.api_key_env.as_deref(), Some("LLAMA_API_KEY"));
+    }
+
+    // -- M2 ledger + session composition sections ------------------------
+
+    #[test]
+    fn router_config_absent_ledger_and_session_sections_default_to_none() {
+        let cfg: RouterConfig =
+            serde_json::from_str(r#"{"server": {"bind_addr": "127.0.0.1:0"}}"#).unwrap();
+        assert!(
+            cfg.ledger.is_none(),
+            "absent ledger section -> no ledger at boot (byte-identical behavior)"
+        );
+        assert!(
+            cfg.session.is_none(),
+            "absent session section -> no session registry at boot (byte-identical behavior)"
+        );
+    }
+
+    #[test]
+    fn ledger_and_session_sections_round_trip() {
+        let cfg: RouterConfig = serde_json::from_value(serde_json::json!({
+            "ledger": {
+                "path": "data/ledger.sqlite",
+                "model": "swarm",
+                "max_summary_tokens": 300,
+            },
+            "session": { "root": "data/sessions" },
+        }))
+        .unwrap();
+
+        let ledger = cfg.ledger.as_ref().expect("ledger section parsed");
+        assert_eq!(ledger.path.as_deref(), Some("data/ledger.sqlite"));
+        assert_eq!(ledger.model.as_deref(), Some("swarm"));
+        assert_eq!(ledger.max_summary_tokens, 300);
+
+        let session = cfg.session.as_ref().expect("session section parsed");
+        assert_eq!(session.root.as_deref(), Some("data/sessions"));
+
+        let serialized = serde_json::to_string(&cfg).unwrap();
+        let back: RouterConfig = serde_json::from_str(&serialized).unwrap();
+        let back_ledger = back.ledger.expect("ledger round-trips");
+        assert_eq!(back_ledger.path, ledger.path);
+        assert_eq!(back_ledger.model, ledger.model);
+        assert_eq!(back_ledger.max_summary_tokens, ledger.max_summary_tokens);
+        assert_eq!(back.session.unwrap().root, session.root);
+    }
+
+    #[test]
+    fn ledger_section_partial_defaults_max_summary_tokens() {
+        // A ledger section that omits `max_summary_tokens` gets the named
+        // constant default; the shipped config round-trips cleanly.
+        let cfg: RouterConfig =
+            serde_json::from_value(serde_json::json!({ "ledger": { "model": "swarm" } })).unwrap();
+        let ledger = cfg.ledger.as_ref().expect("ledger parsed");
+        assert_eq!(ledger.max_summary_tokens, DEFAULT_LEDGER_MAX_SUMMARY_TOKENS);
+        assert_eq!(ledger.model.as_deref(), Some("swarm"));
+        assert!(ledger.path.is_none());
+
+        let serialized = serde_json::to_string(&cfg).unwrap();
+        let back: RouterConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(
+            back.ledger.unwrap().max_summary_tokens,
+            DEFAULT_LEDGER_MAX_SUMMARY_TOKENS
+        );
     }
 }

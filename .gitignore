@@ -29,6 +29,8 @@ doc/Legacy
 bin/guidance-cpp
 data/
 
+env/coral-router.json
+
 # Zig
 zig/zig-*
 

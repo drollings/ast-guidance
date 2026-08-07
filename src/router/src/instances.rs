@@ -6,7 +6,7 @@
 //!
 //! `name[:group=G][:ctx=N][:parallel=M][:pinned][:sleep=0|N][:default]`
 //!
-//! The router never reads the raw KV bytes — it only declares instances; the
+//! The router never reads the raw KV bytes - it only declares instances; the
 //! fork owns the weights and the instance pool.
 //!
 //! This module also hosts the sidecar: [`InstanceClient`] wraps the fork's
@@ -77,6 +77,16 @@ fn render_one(profile: &InstanceProfile) -> String {
     s
 }
 
+/// The per-instance idle-sleep value to send to the fork on create: `0` when
+/// pinned or `warm`/`no_sleep` (never auto-sleep), else the explicit positive
+/// timeout. `None` = inherit the fork's global sleep (no field sent).
+fn effective_sleep(profile: &InstanceProfile) -> Option<i32> {
+    if profile.pinned || profile.no_sleep {
+        return Some(0);
+    }
+    profile.sleep_idle_seconds.filter(|s| *s >= 0)
+}
+
 /// Validate a flat instance list the way the fork's parser does: no duplicate
 /// names, and no instance's group colliding with another instance's name.
 /// The group==own-name default is permitted.
@@ -101,7 +111,7 @@ pub fn validate_instances(profiles: &[InstanceProfile]) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// Management client — the fork's management API over raw reqwest
+// Management client - the fork's management API over raw reqwest
 // ---------------------------------------------------------------------------
 
 /// Derive the management base URL from a model's chat-completions endpoint:
@@ -123,14 +133,14 @@ pub fn management_base_url(endpoint: &str) -> String {
 /// cares about.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InstanceError {
-    /// 429/503/504/507/other 5xx — transient; a 507/503 also signals an
+    /// 429/503/504/507/other 5xx - transient; a 507/503 also signals an
     /// allocation/eviction trigger.
     #[error("transient management error: {status} {body}")]
     Transient { status: u16, body: String },
-    /// 409 duplicate name — tolerated during reconciliation.
+    /// 409 duplicate name - tolerated during reconciliation.
     #[error("duplicate instance (409)")]
     Duplicate,
-    /// Permanent 4xx (except 409) — no retry.
+    /// Permanent 4xx (except 409) - no retry.
     #[error("management request rejected: {status} {body}")]
     Rejected { status: u16, body: String },
     /// Transport / network failure before an HTTP status was received.
@@ -231,6 +241,10 @@ pub struct InstanceClient {
     client: reqwest::Client,
     base_url: String,
     api_key: Option<String>,
+    /// Base model (pool) these management calls target. Carried as `model` in
+    /// `POST /instances` and as `?model=` on per-instance operations so the
+    /// llama.cpp ROUTER routes them to the child that hosts this model's pool.
+    model: String,
 }
 
 impl InstanceClient {
@@ -243,11 +257,31 @@ impl InstanceClient {
             client,
             base_url: base_url.into(),
             api_key,
+            model: String::new(),
         }
+    }
+
+    /// Builder: associate this client with a base model so the router routes
+    /// management calls to the correct child pool.
+    #[must_use]
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
     }
 
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Append `?model=` (or `&model=`) to a management path so the llama.cpp
+    /// router can route a per-instance operation to the owning child. The child
+    /// ignores the extra query parameter. No-op when no model is set.
+    fn with_model_query(&self, path: &str) -> String {
+        if self.model.is_empty() {
+            return path.to_string();
+        }
+        let sep = if path.contains('?') { '&' } else { '?' };
+        format!("{path}{sep}model={}", self.model)
     }
 
     /// Issue a management request, classify the status, and return the parsed
@@ -303,17 +337,24 @@ impl InstanceClient {
         }
     }
 
-    /// `GET /instances` — the current instance set.
+    /// `GET /instances` - the current instance set.
     pub async fn list(&self) -> Result<Vec<InstanceInfo>, InstanceError> {
         let value = self
             .request(reqwest::Method::GET, "/instances", None)
             .await?;
-        serde_json::from_value(value)
+        // The fork returns the list under an `instances` key; tolerate a bare
+        // array too.
+        let arr = value.get("instances").cloned().unwrap_or(value);
+        serde_json::from_value(arr)
             .map_err(|e| InstanceError::Other(format!("list: {e}")))
     }
 
-    /// `POST /instances` — allocate a fresh context from the shared weights.
+    /// `POST /instances` - allocate a fresh context from the shared weights.
     /// Only KV + compute are allocated; the model weights stay loaded.
+    /// `POST /instances` - allocate a new context from the shared weights.
+    /// `sleep` (per-instance idle seconds; `0` = never auto-sleep, `None` =
+    /// inherit global) and `default` (target of a bare `<base>` request) are
+    /// optional; both are honored by the fork's instance manager.
     pub async fn create(
         &self,
         name: &str,
@@ -321,22 +362,32 @@ impl InstanceClient {
         ctx_size: u64,
         parallel: Option<u32>,
         pinned: bool,
+        sleep: Option<i32>,
+        is_default: bool,
     ) -> Result<(), InstanceError> {
         let mut body = serde_json::json!({
             "name": name,
             "group": group,
             "ctx_size": ctx_size,
             "pinned": pinned,
+            "default": is_default,
         });
+        if !self.model.is_empty() {
+            // the llama.cpp router routes POST /instances to the child pool by `model`.
+            body["model"] = Value::String(self.model.clone());
+        }
         if let Some(parallel) = parallel {
             body["parallel"] = Value::Number(parallel.into());
+        }
+        if let Some(sleep) = sleep {
+            body["sleep"] = Value::Number(sleep.into());
         }
         self.request(reqwest::Method::POST, "/instances", Some(&body))
             .await
             .map(|_| ())
     }
 
-    /// `DELETE /instances/:name` — free KV + compute (the primary eviction
+    /// `DELETE /instances/:name` - free KV + compute (the primary eviction
     /// path). `force` overrides `pinned`.
     pub async fn destroy(&self, name: &str, force: bool) -> Result<(), InstanceError> {
         let path = if force {
@@ -344,46 +395,46 @@ impl InstanceClient {
         } else {
             format!("/instances/{name}")
         };
-        self.request(reqwest::Method::DELETE, &path, None)
+        self.request(reqwest::Method::DELETE, &self.with_model_query(&path), None)
             .await
             .map(|_| ())
     }
 
-    /// `POST /instances/:name/pin` — protect residency.
+    /// `POST /instances/:name/pin` - protect residency.
     pub async fn pin(&self, name: &str) -> Result<(), InstanceError> {
         self.request(
             reqwest::Method::POST,
-            &format!("/instances/{name}/pin"),
+            &self.with_model_query(&format!("/instances/{name}/pin")),
             None,
         )
         .await
         .map(|_| ())
     }
 
-    /// `POST /instances/:name/unpin` — release residency protection.
+    /// `POST /instances/:name/unpin` - release residency protection.
     pub async fn unpin(&self, name: &str) -> Result<(), InstanceError> {
         self.request(
             reqwest::Method::POST,
-            &format!("/instances/{name}/unpin"),
+            &self.with_model_query(&format!("/instances/{name}/unpin")),
             None,
         )
         .await
         .map(|_| ())
     }
 
-    /// `POST /instances/:name/resize` — re-create the context at a new size.
+    /// `POST /instances/:name/resize` - re-create the context at a new size.
     pub async fn resize(&self, name: &str, ctx_size: u64) -> Result<(), InstanceError> {
         let body = serde_json::json!({ "ctx_size": ctx_size });
         self.request(
             reqwest::Method::POST,
-            &format!("/instances/{name}/resize"),
+            &self.with_model_query(&format!("/instances/{name}/resize")),
             Some(&body),
         )
         .await
         .map(|_| ())
     }
 
-    /// `GET /memory` — per-instance + total VRAM (shared weights counted once).
+    /// `GET /memory` - per-instance + total VRAM (shared weights counted once).
     pub async fn memory(&self) -> Result<MemoryReport, InstanceError> {
         let value = self
             .request(reqwest::Method::GET, "/memory", None)
@@ -392,24 +443,24 @@ impl InstanceClient {
             .map_err(|e| InstanceError::Other(format!("memory: {e}")))
     }
 
-    /// `POST /instances/:name/snapshot` — save the slot-0 KV to a named snapshot.
+    /// `POST /instances/:name/snapshot` - save the slot-0 KV to a named snapshot.
     pub async fn save_snapshot(&self, instance: &str, name: &str) -> Result<(), InstanceError> {
         let body = serde_json::json!({ "name": name });
         self.request(
             reqwest::Method::POST,
-            &format!("/instances/{instance}/snapshot"),
+            &self.with_model_query(&format!("/instances/{instance}/snapshot")),
             Some(&body),
         )
         .await
         .map(|_| ())
     }
 
-    /// `GET /instances/:name/snapshots` — list the instance's snapshots.
+    /// `GET /instances/:name/snapshots` - list the instance's snapshots.
     pub async fn list_snapshots(&self, instance: &str) -> Result<Vec<SnapshotInfo>, InstanceError> {
         let value = self
             .request(
                 reqwest::Method::GET,
-                &format!("/instances/{instance}/snapshots"),
+                &self.with_model_query(&format!("/instances/{instance}/snapshots")),
                 None,
             )
             .await?;
@@ -417,7 +468,7 @@ impl InstanceClient {
             .map_err(|e| InstanceError::Other(format!("list_snapshots: {e}")))
     }
 
-    /// `DELETE /instances/:name/snapshot/:snapshot` — remove a snapshot file.
+    /// `DELETE /instances/:name/snapshot/:snapshot` - remove a snapshot file.
     pub async fn delete_snapshot(
         &self,
         instance: &str,
@@ -434,7 +485,7 @@ impl InstanceClient {
 }
 
 // ---------------------------------------------------------------------------
-// InstanceManager — sidecar: reconcile, residency, allocate-on-503
+// InstanceManager - sidecar: reconcile, residency, allocate-on-503
 // ---------------------------------------------------------------------------
 
 /// The sidecar owner of instance lifecycle. Holds the management client, the
@@ -475,7 +526,7 @@ impl InstanceManager {
                     target: "router.instances",
                     base_url = %self.client.base_url(),
                     error = %e,
-                    "instance reconcile aborted — management API unreachable",
+                    "instance reconcile aborted - management API unreachable",
                 );
                 return Err(e);
             }
@@ -535,7 +586,19 @@ impl InstanceManager {
                         }
                     }
                 }
-                None => match self.client.create(name, group, profile.num_ctx, profile.parallel, profile.pinned).await {
+                None => match self
+                    .client
+                    .create(
+                        name,
+                        group,
+                        profile.num_ctx,
+                        profile.parallel,
+                        profile.pinned,
+                        effective_sleep(profile),
+                        profile.default,
+                    )
+                    .await
+                {
                     Ok(()) => {
                         created += 1;
                         tracing::info!(
@@ -571,19 +634,65 @@ impl InstanceManager {
         Ok(())
     }
 
-    /// One residency pass: poll `/memory`, and when free VRAM (device ceiling
-    /// minus used) drops below the watermark, evict up to `evict_batch`
-    /// least-recently-used unpinned instances. Pinned instances are never
-    /// evicted. A missing `vram_total_bytes` ceiling disables eviction (the
-    /// pass still polls and logs).
+    /// Boot orchestration: reconcile the configured instances against the
+    /// fork, retrying until the management API is reachable (the container may
+    /// come up after the router), then run the residency loop forever. This is
+    /// the task the server spawns per manager.
+    pub async fn bootstrap(&self) {
+        let base = Duration::from_secs(self.policy.poll_interval_s.max(1));
+        let mut failures = 0u32;
+        loop {
+            match self.reconcile().await {
+                Ok(()) => break,
+                Err(e) => {
+                    failures += 1;
+                    if failures == 1 {
+                        tracing::info!(
+                            target: "router.instances",
+                            error = %e,
+                            "instance reconcile deferred - management API not ready, retrying",
+                        );
+                    } else {
+                        tracing::debug!(
+                            target: "router.instances",
+                            error = %e,
+                            failures = failures,
+                            "instance reconcile still deferred, retrying",
+                        );
+                    }
+                    tokio::time::sleep(Self::residency_backoff(base, failures)).await;
+                }
+            }
+        }
+        self.run_residency().await;
+    }
+
+    /// One residency pass: poll `/memory` always and report free/used so the
+    /// loop is observable even when no ceiling is configured. Only when a
+    /// `vram_total_bytes` ceiling is present does the pass attempt eviction:
+    /// when free VRAM (ceiling minus used) drops below the watermark, evict up
+    /// to `evict_batch` least-recently-used unpinned instances. Pinned
+    /// instances are never evicted.
     pub async fn residency_cycle(&self) -> Result<(), InstanceError> {
-        let Some(vram_total) = self.policy.vram_total_bytes else {
-            return Ok(());
-        };
         let mem = self.client.memory().await?;
         let used = mem.total.total;
+        let Some(vram_total) = self.policy.vram_total_bytes else {
+            tracing::info!(
+                target: "router.instances",
+                used_bytes = used,
+                "residency: no vram_total_bytes ceiling - polling memory without eviction",
+            );
+            return Ok(());
+        };
         let free = vram_total.saturating_sub(used);
         if free >= self.policy.vram_low_watermark_bytes {
+            tracing::info!(
+                target: "router.instances",
+                free_bytes = free,
+                used_bytes = used,
+                watermark_bytes = self.policy.vram_low_watermark_bytes,
+                "free VRAM above watermark - no eviction this pass",
+            );
             return Ok(());
         }
         tracing::warn!(
@@ -591,7 +700,7 @@ impl InstanceManager {
             free_bytes = free,
             used_bytes = used,
             watermark_bytes = self.policy.vram_low_watermark_bytes,
-            "free VRAM below watermark — evicting LRU unpinned instances",
+            "free VRAM below watermark - evicting LRU unpinned instances",
         );
         let infos = self.client.list().await?;
         let mut candidates: Vec<&InstanceInfo> = infos.iter().filter(|i| !i.pinned).collect();
@@ -633,18 +742,57 @@ impl InstanceManager {
 
     /// The residency loop: poll `/memory` every `poll_interval_s`, evicting on
     /// low free VRAM, forever. Runs as a spawned task owned by the server.
+    ///
+    /// A persistently unavailable management API (e.g. a 404 from a fork that
+    /// does not serve `/memory`) must not spam a warning every poll: the loop
+    /// warns once on the first consecutive failure, then degrades to `debug!`
+    /// and backs off up to a cap until a poll succeeds (fail-safe, never a
+    /// crash).
+    ///
+    /// Without a `vram_total_bytes` ceiling eviction is impossible, so the loop
+    /// is a no-op: polling `/memory` and logging every interval would only be
+    /// noise. It notes the disabled eviction once and exits.
     pub async fn run_residency(&self) {
-        let interval = Duration::from_secs(self.policy.poll_interval_s.max(1));
-        loop {
-            if let Err(e) = self.residency_cycle().await {
-                tracing::warn!(
-                    target: "router.instances",
-                    error = %e,
-                    "residency poll failed (retrying next interval)",
-                );
-            }
-            tokio::time::sleep(interval).await;
+        if self.policy.vram_total_bytes.is_none() {
+            tracing::info!(
+                target: "router.instances",
+                "residency eviction disabled - no vram_total_bytes ceiling configured (set sidecar.vram_total_bytes to enable)",
+            );
+            return;
         }
+        let base = Duration::from_secs(self.policy.poll_interval_s.max(1));
+        let mut consecutive_failures = 0u32;
+        loop {
+            match self.residency_cycle().await {
+                Ok(()) => consecutive_failures = 0,
+                Err(e) => {
+                    consecutive_failures += 1;
+                    if consecutive_failures == 1 {
+                        tracing::warn!(
+                            target: "router.instances",
+                            error = %e,
+                            "residency poll failed - backing off (retrying with backoff)",
+                        );
+                    } else {
+                        tracing::debug!(
+                            target: "router.instances",
+                            error = %e,
+                            consecutive_failures = consecutive_failures,
+                            "residency poll still failing - backing off",
+                        );
+                    }
+                }
+            }
+            tokio::time::sleep(Self::residency_backoff(base, consecutive_failures)).await;
+        }
+    }
+
+    /// Compute the sleep delay for the residency loop after
+    /// `consecutive_failures` consecutive failed polls (0 = healthy). Progresses
+    /// from the base interval up to a 12x cap so a persistently unavailable
+    /// management API backs off without spamming a warning every poll.
+    fn residency_backoff(base: Duration, consecutive_failures: u32) -> Duration {
+        base.saturating_mul(consecutive_failures.saturating_add(1).min(12))
     }
 
     /// Allocate a fresh instance for `group` on a 503 group-miss. Uses the
@@ -660,7 +808,7 @@ impl InstanceManager {
             tracing::debug!(
                 target: "router.instances",
                 group = %group,
-                "no configured profile for group — nothing to allocate",
+                "no configured profile for group - nothing to allocate",
             );
             return Ok(());
         };
@@ -668,7 +816,15 @@ impl InstanceManager {
         let profile_group = profile.group.as_deref().unwrap_or(group);
         let result = self
             .client
-            .create(&name, profile_group, profile.num_ctx, profile.parallel, profile.pinned)
+            .create(
+                &name,
+                profile_group,
+                profile.num_ctx,
+                profile.parallel,
+                profile.pinned,
+                effective_sleep(profile),
+                profile.default,
+            )
             .await;
         if result.is_ok() {
             tracing::info!(
@@ -686,22 +842,53 @@ impl InstanceManager {
 /// instance pool, grouping that endpoint's expanded profiles under a single
 /// manager. The management base URL is derived from each endpoint. Empty when
 /// no model declares instances (the sidecar is inactive).
+///
+/// Fails fast (`Err`) when an endpoint's combined profiles fail
+/// [`validate_instances`] (a malformed grammar must abort boot loudly rather
+/// than POST a broken instance set). On success logs each pool's generated
+/// grammar string for operability.
+/// Build the HTTP client for the fork's management API (`/instances`, `/memory`).
+///
+/// The llama.cpp router (cpp-httplib) closes idle keep-alive connections after
+/// ~5s (`CPPHTTPLIB_KEEPALIVE_TIMEOUT_SECOND`), but reqwest's default pool
+/// retains idle connections far longer. The residency loop polls every
+/// `poll_interval_s`, so a poll that falls just past the router's idle cutoff
+/// reuses a connection the router already closed, surfacing as an intermittent
+/// `management network error: error sending request`. Disabling idle pooling
+/// (no connection is kept for reuse) makes each management call open a fresh
+/// connection, eliminating the stale-connection resets.
+fn management_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .expect("management http client build")
+}
+
 pub fn build_instance_managers(
     config: &crate::config::RouterConfig,
-) -> HashMap<String, Arc<InstanceManager>> {
-    // endpoint -> (profiles, model keys with instances at that endpoint)
-    let mut per_endpoint: HashMap<String, Vec<InstanceProfile>> = HashMap::new();
-    for entry in config.models.values() {
+) -> Result<HashMap<String, Arc<InstanceManager>>, String> {
+    // One manager per model that declares an instance pool. Instances belong to
+    // a single (base, variant) pool, and the llama.cpp router routes management
+    // calls to the child pool by `model` — so each manager carries its model name.
+    let mut managers = HashMap::new();
+    for (key, entry) in &config.models {
         let profiles = entry.instance_profiles();
         if profiles.is_empty() {
             continue;
         }
-        per_endpoint.entry(entry.endpoint.clone()).or_default().extend(profiles);
-    }
-
-    let mut managers = HashMap::new();
-    for (endpoint, profiles) in per_endpoint {
-        let base_url = management_base_url(&endpoint);
+        validate_instances(&profiles).map_err(|e| {
+            format!("model {key}: invalid instance grammar: {e}")
+        })?;
+        let model = entry.name.as_deref().unwrap_or(key);
+        tracing::info!(
+            target: "router.instances",
+            endpoint = %entry.endpoint,
+            model = %model,
+            grammar = instance_grammar_string(&profiles),
+            "instance pool grammar",
+        );
+        let base_url = management_base_url(&entry.endpoint);
         let api_key = config
             .sidecar
             .api_key_env
@@ -709,15 +896,16 @@ pub fn build_instance_managers(
             .map(std::env::var)
             .and_then(Result::ok)
             .filter(|k| !k.is_empty());
-        let client = InstanceClient::new(reqwest::Client::new(), base_url, api_key);
+        let client =
+            InstanceClient::new(management_http_client(), base_url, api_key).with_model(model);
         let manager = Arc::new(InstanceManager::new(
             client,
             profiles,
             config.sidecar.clone(),
         ));
-        managers.insert(endpoint, manager);
+        managers.insert(model.to_string(), manager);
     }
-    managers
+    Ok(managers)
 }
 
 /// A tiny HTTP/1.1 stub that records every request and answers from a shared
@@ -1055,7 +1243,7 @@ mod tests {
         assert!(validate_instances(&[a, b]).is_ok());
     }
 
-    // ── M4 sidecar ─────────────────────────────────────────────────────────
+    // -- M4 sidecar ---------------------------------------------------------
 
     fn sidecar_policy() -> crate::config::SidecarConfig {
         crate::config::SidecarConfig {
@@ -1163,7 +1351,7 @@ mod tests {
         let client = InstanceClient::new(reqwest::Client::new(), stub.base_url(), None);
 
         client
-            .create("work", "swarm", 32768, Some(2), true)
+            .create("work", "swarm", 32768, Some(2), true, Some(0), true)
             .await
             .expect("create");
         client.destroy("work", false).await.expect("destroy");
@@ -1216,7 +1404,7 @@ mod tests {
         let stub = StubServer::start(handler);
         let client = InstanceClient::new(reqwest::Client::new(), stub.base_url(), None);
 
-        let dup = client.create("dup", "g", 16384, None, false).await;
+        let dup = client.create("dup", "g", 16384, None, false, None, false).await;
         assert!(dup.unwrap_err().is_duplicate());
 
         let transient = client.destroy("boom", false).await.unwrap_err();
@@ -1225,6 +1413,54 @@ mod tests {
 
         let rejected = client.destroy("missing", false).await.unwrap_err();
         assert!(matches!(rejected, InstanceError::Rejected { .. }));
+    }
+
+    #[tokio::test]
+    async fn client_sends_model_for_router_routing() {
+        // The llama.cpp router routes management calls to the owning child pool
+        // by `model`; the client must carry it in the create body and as a query
+        // parameter on per-instance ops (the child ignores the extra query key).
+        let seen: Arc<std::sync::Mutex<Vec<(String, String, String)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
+            move |method, path, body| {
+                seen2.lock().unwrap().push((method.into(), path.into(), body.into()));
+                (200, "{}".into())
+            },
+        );
+        let stub = StubServer::start(handler);
+        let model = "abiray/lfm2.5-2.6b-heretic-abliterated";
+        let client =
+            InstanceClient::new(reqwest::Client::new(), stub.base_url(), None).with_model(model);
+
+        client.create("swarm0", "swarm", 16384, Some(1), false, Some(0), false).await.unwrap();
+        client.destroy("swarm0", false).await.unwrap();
+        client.resize("swarm0", 32768).await.unwrap();
+
+        let rec = seen.lock().unwrap();
+        let create = rec
+            .iter()
+            .find(|(m, p, _)| m == "POST" && p == "/instances")
+            .expect("create recorded");
+        let body: Value = serde_json::from_str(&create.2).unwrap();
+        assert_eq!(
+            body["model"].as_str(),
+            Some(model),
+            "create body carries the pool model for router routing"
+        );
+        assert!(
+            rec.iter().any(|(m, p, _)| m == "DELETE"
+                && p.starts_with("/instances/swarm0")
+                && p.contains("model=abiray/")),
+            "destroy carries ?model= for router routing"
+        );
+        assert!(
+            rec.iter().any(|(m, p, _)| m == "POST"
+                && p.starts_with("/instances/swarm0/resize")
+                && p.contains("model=abiray/")),
+            "resize carries ?model= for router routing"
+        );
     }
 
     #[tokio::test]
@@ -1314,6 +1550,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_accepts_wrapped_instances_object() {
+        // The fork returns GET /instances as {"instances":[...]}; list() must
+        // unwrap it (it also tolerates a bare array).
+        let existing = [
+            instance_info("ledger", "ledger", true, 1),
+            instance_info("swarm0", "swarm", false, 5),
+        ];
+        let payload = serde_json::json!({ "instances": existing });
+        let payload_str = payload.to_string();
+        let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> =
+            Arc::new(move |method, path, _body| {
+                if method == "GET" && path == "/instances" {
+                    (200, payload_str.clone())
+                } else {
+                    (404, "{}".into())
+                }
+            });
+        let stub = StubServer::start(handler);
+        let client = InstanceClient::new(reqwest::Client::new(), stub.base_url(), None);
+        let list = client.list().await.expect("list parses wrapped shape");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, "ledger");
+    }
+
+    #[tokio::test]
     async fn reconcile_tolerates_duplicate_create() {
         let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
             |method, path, _body| {
@@ -1342,7 +1603,7 @@ mod tests {
             params: None,
         }];
         let manager = InstanceManager::new(client, profiles, sidecar_policy());
-        // A 409 during reconcile is tolerated — reconcile completes Ok.
+        // A 409 during reconcile is tolerated - reconcile completes Ok.
         manager.reconcile().await.expect("reconcile tolerates 409");
     }
 
@@ -1460,5 +1721,143 @@ mod tests {
         assert_eq!(body["ctx_size"], 16384);
         let name = body["name"].as_str().unwrap();
         assert!(name.starts_with("swarm-"), "unique name generated: {name}");
+    }
+
+    #[tokio::test]
+    async fn residency_polls_without_ceiling_and_never_evicts() {
+        // vram_total_bytes: None - the pass must still GET /memory and report,
+        // but must never DELETE (eviction is gated on a configured ceiling).
+        let memory = serde_json::json!({
+            "slots": [],
+            "total": { "model": 5000, "context": 2000, "compute": 2000, "total": 9000 }
+        });
+        let memory = memory.to_string();
+        let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
+            move |method, path, _body| {
+                if method == "GET" && path == "/memory" {
+                    (200, memory.clone())
+                } else {
+                    (200, "{}".into())
+                }
+            },
+        );
+        let stub = StubServer::start(handler);
+        let client = InstanceClient::new(reqwest::Client::new(), stub.base_url(), None);
+        let mut policy = sidecar_policy();
+        policy.vram_total_bytes = None;
+        let manager = InstanceManager::new(client, Vec::new(), policy);
+        manager.residency_cycle().await.expect("residency");
+        let recorded = stub.recorded();
+        assert!(
+            recorded.iter().any(|(m, p, _)| m == "GET" && p == "/memory"),
+            "memory is always polled, ceiling or not"
+        );
+        assert!(
+            recorded.iter().all(|(m, _, _)| m != "DELETE"),
+            "no eviction without a vram ceiling"
+        );
+    }
+
+    #[test]
+    fn build_instance_managers_rejects_duplicate_name_within_model() {
+        // Two profiles in ONE model resolve to the same instance name: the
+        // profile key `swarm0` and another profile whose explicit `name` is
+        // also `swarm0`. The pool grammar is invalid and boot fails fast.
+        let config: crate::config::RouterConfig =
+            serde_json::from_value(serde_json::json!({
+                "models": {
+                    "a": {
+                        "endpoint": "http://x/v1/chat/completions",
+                        "intelligence": 1,
+                        "cost_input": 0.0, "cost_output": 0.0, "cost_cached_read": 0.0, "speed": 1,
+                        "instances": {
+                            "swarm0": { "num_ctx": 16384 },
+                            "x": { "name": "swarm0", "num_ctx": 32768 }
+                        }
+                    }
+                }
+            }))
+            .unwrap();
+        let err = match build_instance_managers(&config) {
+            Err(e) => e,
+            Ok(_) => panic!("duplicate-name config must fail validation"),
+        };
+        assert!(
+            err.contains("duplicate instance name 'swarm0'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn residency_backoff_progresses_and_caps() {
+        let base = Duration::from_secs(5);
+        // Healthy -> base interval.
+        assert_eq!(InstanceManager::residency_backoff(base, 0), Duration::from_secs(5));
+        // First failure -> 2x; second -> 3x; ... capped at 12x.
+        assert_eq!(InstanceManager::residency_backoff(base, 1), Duration::from_secs(10));
+        assert_eq!(InstanceManager::residency_backoff(base, 2), Duration::from_secs(15));
+        assert_eq!(
+            InstanceManager::residency_backoff(base, 11),
+            Duration::from_secs(60),
+            "cap at 12x base"
+        );
+        assert_eq!(
+            InstanceManager::residency_backoff(base, 100),
+            Duration::from_secs(60),
+            "capped regardless of further failures"
+        );
+    }
+
+    #[test]
+    fn effective_sleep_maps_profile_to_fork_value() {
+        use crate::config::InstanceProfile;
+        let mut base = InstanceProfile {
+            name: None,
+            group: None,
+            count: 1,
+            num_ctx: 16384,
+            parallel: None,
+            pinned: false,
+            no_sleep: false,
+            sleep_idle_seconds: None,
+            default: false,
+            params: None,
+        };
+        // No sleep knobs -> inherit global (omit field).
+        assert_eq!(effective_sleep(&base), None);
+        // Explicit positive timeout -> sent as-is.
+        base.sleep_idle_seconds = Some(30);
+        assert_eq!(effective_sleep(&base), Some(30));
+        // Explicit 0 (never sleep) -> sent as 0.
+        base.sleep_idle_seconds = Some(0);
+        assert_eq!(effective_sleep(&base), Some(0));
+        // no_sleep/warm -> 0 regardless.
+        base.sleep_idle_seconds = None;
+        base.no_sleep = true;
+        assert_eq!(effective_sleep(&base), Some(0));
+        // pinned implies 0.
+        base.no_sleep = false;
+        base.pinned = true;
+        assert_eq!(effective_sleep(&base), Some(0));
+    }
+
+    #[test]
+    fn build_instance_managers_ok_on_valid_config() {
+        let config: crate::config::RouterConfig =
+            serde_json::from_value(serde_json::json!({
+                "models": {
+                    "a": {
+                        "endpoint": "http://x/v1/chat/completions",
+                        "intelligence": 1,
+                        "cost_input": 0.0, "cost_output": 0.0, "cost_cached_read": 0.0, "speed": 1,
+                        "instances": { "swarm": { "num_ctx": 16384, "count": 2 } }
+                    }
+                }
+            }))
+            .unwrap();
+        let managers = build_instance_managers(&config).expect("valid config builds managers");
+        assert_eq!(managers.len(), 1);
+        // keyed by the model (base) name, since the entry has no explicit name
+        assert!(managers.contains_key("a"));
     }
 }

@@ -1,9 +1,9 @@
-//! KV cache snapshot management — two-tier index (hot RAM + cold metadata).
+//! KV cache snapshot management - two-tier index (hot RAM + cold metadata).
 //!
 //! The fork owns the KV cache bytes: it loads one shared weight pool and serves
 //! many instances, and it persists snapshots under `--slot-save-path` itself
 //! (see `LLAMA_CPP_SERVER_INSTANCES.md`). This module is the router's *index*
-//! into those snapshots — it never reads or writes the raw KV bytes.
+//! into those snapshots - it never reads or writes the raw KV bytes.
 //!
 //! # Hot tier
 //! In-process, RAM-resident. Tracks which sessions have KV cache state actively
@@ -12,7 +12,7 @@
 //! # Cold tier
 //! Records snapshot *metadata* (name, instance, n_ctx_seq, size, mtime) keyed by
 //! `(model, adapter, session)` so a rewind can find which fork snapshot to
-//! switch into a slot. It does not copy KV bytes into its own tree — the fork's
+//! switch into a slot. It does not copy KV bytes into its own tree - the fork's
 //! `--slot-save-path` owns the bytes. The derived `file_path`
 //! (`<slot_save_path>/<model_key>/<snapshot_name>.bin`) matches the fork's
 //! layout byte-for-byte.
@@ -62,7 +62,7 @@ pub fn kv_snapshot_path(slot_save_path: &Path, model: &str, snapshot_name: &str)
         .join(format!("{snapshot_name}.bin"))
 }
 
-/// A KV cache snapshot — metadata and the fork-layout filesystem path only.
+/// A KV cache snapshot - metadata and the fork-layout filesystem path only.
 ///
 /// The actual KV bytes live in the fork's slot memory and on disk under
 /// `--slot-save-path`; the router records this metadata record pointing at the
@@ -74,15 +74,15 @@ pub struct KvSnapshot {
     pub model: String,
     pub adapter: Option<String>,
     pub session_id: String,
-    /// Fork-side snapshot name — the `snapshot` request field and
+    /// Fork-side snapshot name - the `snapshot` request field and
     /// `<snapshot_name>.bin`.
     pub snapshot_name: String,
-    /// Instance whose slot owns the snapshot — the `instance` request field.
+    /// Instance whose slot owns the snapshot - the `instance` request field.
     pub instance: Option<String>,
     /// Derived path `<slot_save_path>/<model_key>/<snapshot_name>.bin`.
     pub file_path: PathBuf,
     /// Token count, when the caller records it. `None` where the value is
-    /// unknowable — never a fabricated default.
+    /// unknowable - never a fabricated default.
     pub token_count: Option<usize>,
     pub created_at: u64,
     pub last_used_at: u64,
@@ -95,7 +95,7 @@ pub struct KvSnapshot {
 
 /// Hot tier: in-process, RAM-resident LRU cache of recently-used snapshot
 /// metadata. Entries represent sessions with KV cache state actively loaded in
-/// a fork slot. Stores metadata only — no raw bytes.
+/// a fork slot. Stores metadata only - no raw bytes.
 pub struct HotKvCache {
     snapshots: LoadCache<(String, Option<String>, String), Arc<KvSnapshot>, KvCacheError>,
     max_mb: usize,
@@ -103,7 +103,7 @@ pub struct HotKvCache {
 
 impl HotKvCache {
     /// Creates a new hot cache with the given capacity (number of entries).
-    /// The `max_mb` limit is a soft budget — individual snapshot metadata is
+    /// The `max_mb` limit is a soft budget - individual snapshot metadata is
     /// tiny (hundreds of bytes), so `max_mb` is primarily informational for
     /// the fork's actual slot memory budget.
     pub fn new(capacity: usize, max_mb: usize) -> Self {
@@ -187,7 +187,7 @@ impl HotKvCache {
 /// switch it back into a slot.
 pub struct ColdKvCache {
     /// The fork's `--slot-save-path`. When `None`, snapshots are recorded as
-    /// metadata only (no server-owned store) — never a crash.
+    /// metadata only (no server-owned store) - never a crash.
     slot_save_path: Option<PathBuf>,
     /// Metadata index keyed by `(model, adapter, session)`.
     entries: Mutex<HashMap<SnapshotKey, KvSnapshot>>,
@@ -243,7 +243,7 @@ impl ColdKvCache {
         Ok(())
     }
 
-    /// Load snapshot metadata from the cold tier. Does not read the KV bytes —
+    /// Load snapshot metadata from the cold tier. Does not read the KV bytes -
     /// callers pass the returned `snapshot_name`/`instance` to the next dispatch
     /// as request fields for the fork to switch in.
     pub fn load(
@@ -299,11 +299,29 @@ impl ColdKvCache {
 pub struct KvCacheManager {
     hot: Arc<HotKvCache>,
     cold: Arc<ColdKvCache>,
+    /// Optional fork management client (M4 sidecar). When present, snapshot
+    /// save/list/delete round-trip through the fork's management API; without
+    /// one they degrade to metadata-only no-ops (never a crash).
+    fork: Option<Arc<crate::instances::InstanceClient>>,
 }
 
 impl KvCacheManager {
     pub fn new(hot: Arc<HotKvCache>, cold: Arc<ColdKvCache>) -> Self {
-        Self { hot, cold }
+        Self {
+            hot,
+            cold,
+            fork: None,
+        }
+    }
+
+    /// Attach the fork management client (D6) so `save_snapshot`/`list_snapshots`
+    /// /`delete_snapshot` round-trip through the fork's snapshot API. Optional,
+    /// post-construction; without it the manager keeps today's metadata-only
+    /// behavior. Reuses the single `InstanceClient` (no second HTTP client).
+    #[must_use]
+    pub fn with_fork_io(mut self, fork: Arc<crate::instances::InstanceClient>) -> Self {
+        self.fork = Some(fork);
+        self
     }
 
     /// Record snapshot metadata in both tiers and promote to the hot tier.
@@ -318,7 +336,7 @@ impl KvCacheManager {
     /// Retrieve snapshot metadata: hot tier first, cold tier as fallback.
     /// On cold-tier hit, the metadata is promoted to the hot tier.
     ///
-    /// Returns metadata only — callers pass the returned `snapshot_name` and
+    /// Returns metadata only - callers pass the returned `snapshot_name` and
     /// `instance` to the next dispatch as the fork's `snapshot`/`instance`
     /// request fields.
     pub fn retrieve(
@@ -345,34 +363,146 @@ impl KvCacheManager {
         self.cold.evict()
     }
 
-    /// Record (server-side) that a snapshot named `name` was saved for
-    /// `instance`. Without an attached M4 sidecar client this only records
-    /// metadata and never dispatches — a no-op, never a crash.
+    /// Record (server-side) that a snapshot named `name` was saved on `instance`
+    /// for the given `(model, adapter, session)` key.
+    ///
+    /// With an attached fork handle (D6) this round-trips the fork's
+    /// `POST /instances/:instance/snapshot` (through the shared
+    /// `common_core::runtime::block_on` bridge - never a hand-rolled runtime)
+    /// and then records the metadata in both tiers so a rewind finds it. Without
+    /// a fork handle it is a metadata-only no-op returning `Ok(())` (today's
+    /// behavior). A fork failure logs and returns `KvCacheError::Db` - it never
+    /// panics.
     pub fn save_snapshot(
         &self,
-        _name: &str,
-        _instance: &str,
+        model: &str,
+        adapter: Option<&str>,
+        session_id: &str,
+        name: &str,
+        instance: &str,
     ) -> Result<(), KvCacheError> {
-        Ok(())
+        let Some(fork) = &self.fork else {
+            return Ok(()); // no fork handle: metadata-only no-op (today's behavior)
+        };
+        let fork = Arc::clone(fork);
+        let instance = instance.to_string();
+        let name = name.to_string();
+        let fork_instance = instance.clone();
+        let fork_name = name.clone();
+        let result = common_core::runtime::block_on(async move {
+            fork.save_snapshot(&fork_instance, &fork_name).await
+        });
+        if let Err(e) = result {
+            tracing::warn!(
+                target: "router.kv_cache",
+                instance = %instance,
+                name = %name,
+                error = %e,
+                "kv snapshot save on fork failed - degrading to metadata-only",
+            );
+            return Err(KvCacheError::Db(format!("fork snapshot save failed: {e}")));
+        }
+        // Record the metadata index (both tiers) under the session key so a
+        // rewind can restore it.
+        let snapshot = KvSnapshot {
+            model: model.to_string(),
+            adapter: adapter.map(String::from),
+            session_id: session_id.to_string(),
+            snapshot_name: name.clone(),
+            instance: Some(instance),
+            // Derived to the fork layout by the cold tier's `store`.
+            file_path: PathBuf::new(),
+            token_count: None,
+            created_at: now_secs(),
+            last_used_at: now_secs(),
+            llama_cpp_version: None,
+            model_quant: None,
+            base_model_hash: None,
+        };
+        self.store(snapshot)
     }
 
-    /// List the fork's snapshots for `instance`. Without an attached M4 sidecar
-    /// client this returns the locally-recorded metadata (possibly empty).
+    /// List the fork's snapshots for `instance`. With an attached fork handle
+    /// this delegates to `GET /instances/:instance/snapshots` and maps each
+    /// `SnapshotInfo` to a `KvSnapshot` (best effort, `file_path` empty). Without
+    /// a handle it returns `vec![]` (today's behavior).
     pub fn list_snapshots(&self, instance: &str) -> Vec<KvSnapshot> {
-        // Local metadata is keyed by session; with no sidecar there is no
-        // server list. Scope to the cold tier's session list as a best effort.
-        let _ = instance;
-        vec![]
+        let Some(fork) = &self.fork else {
+            return vec![];
+        };
+        let fork = Arc::clone(fork);
+        let instance = instance.to_string();
+        let fork_instance = instance.clone();
+        match common_core::runtime::block_on(async move {
+            fork.list_snapshots(&fork_instance).await
+        })
+        {
+            Ok(infos) => infos
+                .into_iter()
+                .map(|info| KvSnapshot {
+                    model: instance.clone(),
+                    adapter: None,
+                    session_id: instance.clone(),
+                    snapshot_name: info.name,
+                    instance: Some(instance.clone()),
+                    file_path: PathBuf::new(),
+                    token_count: if info.size > 0 {
+                        usize::try_from(info.size).ok()
+                    } else {
+                        None
+                    },
+                    created_at: 0,
+                    last_used_at: 0,
+                    llama_cpp_version: None,
+                    model_quant: None,
+                    base_model_hash: None,
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(
+                    target: "router.kv_cache",
+                    instance = %instance,
+                    error = %e,
+                    "kv snapshot list on fork failed - returning empty",
+                );
+                vec![]
+            }
+        }
     }
 
-    /// Delete a fork snapshot `name` for `instance`. Without an attached M4
-    /// sidecar client this is a no-op — never a crash.
+    /// Delete a fork snapshot `name` for `instance`. With an attached fork
+    /// handle this delegates to `DELETE /instances/:instance/snapshot/:name`;
+    /// without one it is a no-op returning `Ok(())` - never a crash.
     pub fn delete_snapshot(
         &self,
-        _name: &str,
-        _instance: &str,
+        instance: &str,
+        name: &str,
     ) -> Result<(), KvCacheError> {
-        Ok(())
+        let Some(fork) = &self.fork else {
+            return Ok(());
+        };
+        let fork = Arc::clone(fork);
+        let instance = instance.to_string();
+        let name = name.to_string();
+        let fork_instance = instance.clone();
+        let fork_name = name.clone();
+        match common_core::runtime::block_on(async move {
+            fork.delete_snapshot(&fork_instance, &fork_name).await
+        }) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    target: "router.kv_cache",
+                    instance = %instance,
+                    name = %name,
+                    error = %e,
+                    "kv snapshot delete on fork failed",
+                );
+                Err(KvCacheError::Db(format!(
+                    "fork snapshot delete failed: {e}"
+                )))
+            }
+        }
     }
 }
 
@@ -556,5 +686,133 @@ mod tests {
         let loaded = cold.load("test-model", None, "sess-meta").unwrap();
         // No server-owned store: the derived path is empty, never a crash.
         assert!(loaded.file_path.as_os_str().is_empty());
+    }
+
+    // -- M3: fork round-trip via the optional InstanceClient handle --------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn save_snapshot_with_fork_records_metadata_and_posts() {
+        use crate::instances::stub::StubServer;
+        use crate::instances::InstanceClient;
+
+        let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
+            |method, path, _body| {
+                if method == "POST" && path == "/instances/scratch/snapshot" {
+                    (200, "{}".into())
+                } else {
+                    (200, "[]".into())
+                }
+            },
+        );
+        let stub = StubServer::start(handler);
+        let fork = Arc::new(InstanceClient::new(
+            reqwest::Client::new(),
+            stub.base_url(),
+            None,
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let hot = Arc::new(HotKvCache::new(10, 1024));
+        let kv = KvCacheManager::new(
+            Arc::clone(&hot),
+            Arc::new(ColdKvCache::new(
+                dir.path(),
+                1024,
+                86400,
+                crate::config::EvictionPolicy::Lru,
+            )),
+        )
+        .with_fork_io(fork);
+
+        kv.save_snapshot("model-x", None, "sess-1", "readfiles", "scratch")
+            .expect("save succeeds");
+
+        // The fork received the snapshot POST.
+        assert!(
+            stub.recorded()
+                .iter()
+                .any(|(m, p, _)| m == "POST" && p == "/instances/scratch/snapshot"),
+            "stub fork must receive the snapshot save"
+        );
+
+        // Metadata was recorded under the session key: a rewind can find it.
+        let retrieved = kv.retrieve("model-x", None, "sess-1").expect("retrieve");
+        assert_eq!(retrieved.snapshot_name, "readfiles");
+        assert_eq!(retrieved.instance.as_deref(), Some("scratch"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn save_snapshot_without_fork_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = Arc::new(HotKvCache::new(10, 1024));
+        let kv = KvCacheManager::new(
+            Arc::clone(&hot),
+            Arc::new(ColdKvCache::new(
+                dir.path(),
+                1024,
+                86400,
+                crate::config::EvictionPolicy::Lru,
+            )),
+        );
+
+        // No fork handle -> metadata-only no-op returning Ok, nothing recorded.
+        kv.save_snapshot("model-x", None, "sess-1", "readfiles", "scratch")
+            .expect("no-op save returns Ok");
+        assert!(
+            kv.retrieve("model-x", None, "sess-1").is_err(),
+            "no metadata recorded without a fork handle"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_and_delete_delegate_to_fork_when_present() {
+        use crate::instances::stub::StubServer;
+        use crate::instances::InstanceClient;
+
+        let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
+            |method, path, _body| {
+                if method == "GET" && path == "/instances/scratch/snapshots" {
+                    (
+                        200,
+                        serde_json::json!([
+                            { "name": "readfiles", "size": 512, "mtime": "x" }
+                        ])
+                        .to_string(),
+                    )
+                } else {
+                    (200, "{}".into())
+                }
+            },
+        );
+        let stub = StubServer::start(handler);
+        let fork = Arc::new(InstanceClient::new(
+            reqwest::Client::new(),
+            stub.base_url(),
+            None,
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let hot = Arc::new(HotKvCache::new(10, 1024));
+        let kv = KvCacheManager::new(
+            Arc::clone(&hot),
+            Arc::new(ColdKvCache::new(
+                dir.path(),
+                1024,
+                86400,
+                crate::config::EvictionPolicy::Lru,
+            )),
+        )
+        .with_fork_io(fork);
+
+        let listed = kv.list_snapshots("scratch");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].snapshot_name, "readfiles");
+
+        kv.delete_snapshot("scratch", "readfiles").expect("delete");
+        assert!(
+            stub.recorded()
+                .iter()
+                .any(|(m, p, _)| m == "DELETE" && p == "/instances/scratch/snapshot/readfiles"),
+            "fork must receive the snapshot delete"
+        );
     }
 }

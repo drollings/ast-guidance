@@ -23,12 +23,7 @@
             "stream": true,
             "filter_thinking": true,
             "retry_count": 2,
-            "retry_base_interval_s": 1,
-            "params": {
-                "num_ctx": 65536,
-                "parallel": 2,
-                "sleep_idle_seconds": 7200
-            }
+            "retry_base_interval_s": 1
         },
         "swarm": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
@@ -44,67 +39,25 @@
             "filter_thinking": true,
             "retry_count": 2,
             "retry_base_interval_s": 1,
-            "params": {
-                "num_ctx": 163840,
-                "parallel": 2,
-                "sleep_idle_seconds": 7200
-            },
-            "sessions": {
+            "instances": {
+                "swarm": {
+                    "count": 3,
+                    "group": "swarm",
+                    "num_ctx": 16384,
+                    "warm": true,
+                    "params": { "temperature": 0.1 }
+                },
                 "ledger": {
-                    "num_ctx": 81920,
-                    "params": {
-                        "temperature": 0.1
-                    }
+                    "num_ctx": 131072,
+                    "pinned": true,
+                    "default": true,
+                    "params": { "temperature": 0.1 }
                 },
                 "scratch": {
-                    "num_ctx": 81920,
-                    "params": {
-                        "temperature": 0.4,
-                        "sleep_idle_seconds": 0
-                    }
+                    "num_ctx": 131072,
+                    "sleep_idle_seconds": 30,
+                    "params": { "temperature": 0.4 }
                 }
-            }
-        },
-        "lamarck": {
-            "endpoint": "http://localhost:8080/v1/chat/completions",
-            "name": "lamarck-14b",
-            "intelligence": 3,
-            "cost_input": 3e-06,
-            "cost_output": 1.8e-05,
-            "cost_cached_read": 1.2e-06,
-            "speed": 5,
-            "total_timeout_ms": 120000,
-            "idle_timeout_ms": 10000,
-            "stream": true,
-            "filter_thinking": true,
-            "retry_count": 1,
-            "retry_base_interval_s": 2,
-            "params": {
-                "num_ctx": 65536,
-                "repeat_penalty": 1.05,
-                "temperature": 0.6,
-                "sleep_idle_seconds": 600
-            }
-        },
-        "qwen3.6-9b": {
-            "endpoint": "http://localhost:8080/v1/chat/completions",
-            "name": "code",
-            "intelligence": 3,
-            "cost_input": 3e-07,
-            "cost_output": 1.8e-06,
-            "cost_cached_read": 1.2e-07,
-            "speed": 5,
-            "total_timeout_ms": 100000,
-            "idle_timeout_ms": 10000,
-            "stream": true,
-            "filter_thinking": true,
-            "retry_count": 1,
-            "retry_base_interval_s": 2,
-            "params": {
-                "num_ctx": 65536,
-                "repeat_penalty": 1.05,
-                "temperature": 0.7,
-                "sleep_idle_seconds": 600
             }
         },
         "qwen3.6-27b": {
@@ -122,10 +75,9 @@
             "retry_count": 1,
             "retry_base_interval_s": 2,
             "params": {
-                "num_ctx": 32768,
+                "num_ctx": 65536,
                 "repeat_penalty": 1.05,
-                "temperature": 0.7,
-                "sleep_idle_seconds": 600
+                "temperature": 0.7
             }
         },
         "gemma4-12b": {
@@ -143,28 +95,6 @@
             "retry_count": 1,
             "retry_base_interval_s": 2,
             "params": {
-                "num_ctx": 32768,
-                "sleep_idle_seconds": 300,
-                "temperature": 0.6
-            }
-        },
-        "translation": {
-            "endpoint": "http://localhost:8080/v1/chat/completions",
-            "name": "unsloth/hy-mt2-7b",
-            "intelligence": 3,
-            "cost_input": 3e-06,
-            "cost_output": 1.8e-05,
-            "cost_cached_read": 1.2e-06,
-            "speed": 5,
-            "total_timeout_ms": 120000,
-            "idle_timeout_ms": 10000,
-            "stream": true,
-            "filter_thinking": true,
-            "retry_count": 1,
-            "retry_base_interval_s": 2,
-            "params": {
-                "num_ctx": 16384,
-                "sleep_idle_seconds": 600,
                 "temperature": 0.6
             }
         },
@@ -181,12 +111,7 @@
             "stream": true,
             "filter_thinking": false,
             "retry_count": 2,
-            "retry_base_interval_s": 1,
-            "params": {
-                "num_ctx": 8192,
-                "parallel": 1,
-                "sleep_idle_seconds": 15
-            }
+            "retry_base_interval_s": 1
         }
     },
     "routes": {
@@ -240,7 +165,7 @@
             "qwen3.6-27b"
         ],
         "translation": [
-            "qwen3.6-27b"
+            "gemma4-12b"
         ],
         "prose": [
             "gemma4-12b"
@@ -264,6 +189,14 @@
     "server": {
         "bind_addr": "127.0.0.1:8079",
         "max_payload": 1048576
+    },
+    "sidecar": {
+        "poll_interval_s": 5,
+        "vram_low_watermark_bytes": 1073741824,
+        "evict_batch": 1,
+        "vram_total_bytes": null,
+        "slot_save_path": "/srv/slots",
+        "api_key_env": null
     },
     "logging": {
         "log_dir": "logs",

@@ -1,7 +1,7 @@
 //! Dependency-aware session with DAG step tracking, checkpoint/rewind,
 //! and cancellation propagation.
 //!
-//! Composes `fluent_dag::dep_graph::DependencyGraph<K>` — does **not**
+//! Composes `fluent_dag::dep_graph::DependencyGraph<K>` - does **not**
 //! re-implement graph algorithms (no hand-rolled `HashMap` dependents index,
 //! no manual topo sort, no manual transitive DFS).
 //!
@@ -102,9 +102,9 @@ impl SessionStep {
 /// session.add_step(SessionStep::new("execute", "Execute plan")
 ///     .with_depends(vec!["plan".into()]));
 ///
-/// let ready = session.next_ready(); // → vec!["plan"]
+/// let ready = session.next_ready(); // - vec!["plan"]
 /// session.complete_step("plan", StepResult { ... });
-/// let ready = session.next_ready(); // → vec!["execute"]
+/// let ready = session.next_ready(); // - vec!["execute"]
 /// ```
 pub struct DependencySession {
     pub session_id: String,
@@ -186,6 +186,13 @@ impl DependencySession {
     pub fn with_kv_cache(mut self, cache: KvCacheManager) -> Self {
         self.kv_cache = Some(cache);
         self
+    }
+
+    /// The attached `KvCacheManager` (M3), when present. Lets rigor's blue-pass
+    /// completion record a fork snapshot via `save_snapshot` so a later rewind
+    /// finds real metadata.
+    pub fn kv_cache(&self) -> Option<&KvCacheManager> {
+        self.kv_cache.as_ref()
     }
 
     /// Add a step to the session, registering it in the dependency graph.
@@ -363,11 +370,11 @@ impl DependencySession {
 
         // Restore the KV cache snapshot for real. A session with no model
         // name cannot key a snapshot (the key is `(model, adapter, session)`),
-        // so the restore is skipped — never a fabricated `"unknown"` lookup.
+        // so the restore is skipped - never a fabricated `"unknown"` lookup.
         let Some(model) = self.model.clone() else {
             tracing::debug!(
                 session_id = %self.session_id,
-                "no model name on session — skipping kv cache restore"
+                "no model name on session - skipping kv cache restore"
             );
             return Ok(None);
         };
@@ -392,7 +399,7 @@ impl DependencySession {
                     instance = ?snapshot.instance,
                     file_path = %snapshot.file_path.display(),
                     token_count = snapshot.token_count.unwrap_or(0),
-                    "kv cache snapshot restored for rewind — pass snapshot/instance to next dispatch"
+                    "kv cache snapshot restored for rewind - pass snapshot/instance to next dispatch"
                 );
                 self.pending_snapshot = Some((*snapshot).clone());
                 Some(snapshot)
@@ -792,7 +799,7 @@ mod tests {
             .add_step(SessionStep::new("c", "Step C").with_depends(vec!["b".into()]))
             .unwrap();
 
-        // This should not panic — DependencyGraph handles cycles
+        // This should not panic - DependencyGraph handles cycles
         let deps = session.graph().dependents_of(&"a".to_string());
         // In a cycle, the result is partial but non-panicking
         assert!(!deps.is_empty() || deps.is_empty()); // Just verify it returns
@@ -943,7 +950,76 @@ mod tests {
         session.complete_step("a", ok_result("a done")).unwrap();
 
         let restored = session.rewind_to_checkpoint("a").unwrap();
-        assert!(restored.is_none(), "no model → no snapshot keyed → None");
+        assert!(restored.is_none(), "no model - no snapshot keyed - None");
+    }
+
+    #[test]
+    fn test_pending_kv_fields_only_when_metadata_exists() {
+        // M3: `pending_kv_fields` is set only when a snapshot was actually
+        // restored. A session with a kv manager but no stored snapshot has no
+        // pending fields; once a snapshot is stored + rewind runs, they appear.
+        use crate::kv_cache::{ColdKvCache, HotKvCache, KvCacheManager, KvSnapshot};
+
+        let dir = tempfile::tempdir().unwrap();
+        let hot = Arc::new(HotKvCache::new(10, 1024));
+        let kv = KvCacheManager::new(
+            Arc::clone(&hot),
+            Arc::new(ColdKvCache::new(
+                dir.path(),
+                1024,
+                86400,
+                crate::config::EvictionPolicy::Lru,
+            )),
+        );
+
+        let mut session = DependencySession::new("sess-1")
+            .with_model("model-x")
+            .with_kv_cache(kv);
+        session
+            .add_step(SessionStep::new("a", "Step A").with_checkpoint())
+            .unwrap();
+        session
+            .add_step(SessionStep::new("b", "Step B").with_depends(vec!["a".into()]))
+            .unwrap();
+        session.complete_step("a", ok_result("a done")).unwrap();
+
+        // No snapshot metadata yet -> rewind restores nothing -> no pending fields.
+        let restored = session.rewind_to_checkpoint("a").unwrap();
+        assert!(restored.is_none());
+        assert!(session.pending_kv_fields().is_none());
+
+        // Now record a snapshot and re-run: rewind finds it -> pending fields.
+        let src_dir = tempfile::tempdir().unwrap();
+        let src_file = src_dir.path().join("readfiles.kv");
+        std::fs::write(&src_file, b"kv").unwrap();
+        session
+            .kv_cache()
+            .unwrap()
+            .store(KvSnapshot {
+                model: "model-x".into(),
+                adapter: None,
+                session_id: "sess-1".into(),
+                snapshot_name: "readfiles".into(),
+                instance: Some("scratch".into()),
+                file_path: src_file,
+                token_count: Some(1),
+                created_at: common_core::now_secs(),
+                last_used_at: common_core::now_secs(),
+                llama_cpp_version: None,
+                model_quant: None,
+                base_model_hash: None,
+            })
+            .unwrap();
+        // Re-run the blue pass: the checkpoint step is Pending again (rewind
+        // preserves steps) so completing it re-registers the checkpoint.
+        session.complete_step("a", ok_result("a done")).unwrap();
+
+        let restored = session.rewind_to_checkpoint("a").unwrap();
+        assert!(restored.is_some(), "snapshot exists -> restore succeeds");
+        let pending = session.pending_kv_fields().expect("pending fields set");
+        assert_eq!(pending.0, "readfiles");
+        assert_eq!(pending.1.as_deref(), Some("scratch"));
+        assert_eq!(pending.2, 0);
     }
 
     #[test]

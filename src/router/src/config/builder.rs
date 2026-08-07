@@ -1,4 +1,4 @@
-//! Pipeline builder — constructs pipeline stages from `RouterConfig`.
+//! Pipeline builder - constructs pipeline stages from `RouterConfig`.
 //! Separated from `config.rs` to keep the configuration types focused
 //! on data definition rather than orchestration.
 
@@ -16,11 +16,11 @@ use crate::pipeline::PipelineOrchestrator;
 use crate::score_matrix::ScoreMatrix;
 use crate::target_match::{TargetBackends, TargetMatcher};
 
-/// In-group target-matching policy for a pipeline (§4.6 of the routing
+/// In-group target-matching policy for a pipeline (-4.6 of the routing
 /// roadmap). `SelfAssess` (default) runs the VISION ladder: each candidate
 /// target self-assesses the prompt and defers to the next, more-intelligent
 /// group member when the assessed complexity exceeds its `intelligence`.
-/// `Static` restores today's behavior — the cheapest qualifying model is
+/// `Static` restores today's behavior - the cheapest qualifying model is
 /// picked at route-resolution time with no self-assessment calls.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TargetMatchMode {
@@ -65,7 +65,7 @@ pub struct PipelineParams {
     #[serde(default)]
     pub score_matrix_authoritative: bool,
     /// Maximum retry attempts for the classifier when its LLM response fails
-    /// JSON parsing (`0` = disabled, the default — existing behavior is
+    /// JSON parsing (`0` = disabled, the default - existing behavior is
     /// unchanged). When `> 0`, the classifier stage is wrapped in a
     /// `RetryClassifier` that re-executes it with escalating corrective
     /// prompts on `metadata.fallback = true` (M6).
@@ -76,7 +76,7 @@ pub struct PipelineParams {
     /// two stock prompts that demand strict JSON.
     #[serde(default = "default_classifier_retry_prompts")]
     pub classifier_retry_prompts: Vec<String>,
-    /// In-group target-matching policy (§4.6). `SelfAssess` (default) runs the
+    /// In-group target-matching policy (-4.6). `SelfAssess` (default) runs the
     /// target-matching ladder for 2+ member groups; `Static` restores today's
     /// cheapest-qualifying pick.
     #[serde(default)]
@@ -94,7 +94,7 @@ fn default_target_match_timeout_ms() -> u64 {
 fn default_classifier_retry_prompts() -> Vec<String> {
     vec![
         "Your previous output failed JSON parsing. Respond with ONLY a single valid JSON \
-         object matching the requested schema — no prose, no markdown fences, no trailing text."
+         object matching the requested schema - no prose, no markdown fences, no trailing text."
             .into(),
         "Your previous output was still not valid JSON. Output exactly one JSON object with \
          the required fields and nothing else."
@@ -246,7 +246,7 @@ impl RouterConfig {
                 // M4: classification tree drives the classifier stage. The
                 // injected backend (mock/transcript) is always the default
                 // client; per-node model backends are only built in real mode.
-                // The target-matching ladder is shared with the flat path —
+                // The target-matching ladder is shared with the flat path -
                 // the engine resolves 2+ member group terminals through it.
                 let engine = build_classification_engine(
                     self,
@@ -354,7 +354,7 @@ impl RouterConfig {
                     pipeline = %name,
                     configured_classifier = ?params.classifier_model.as_deref(),
                     resolved_classifier = ?resolve_classifier_model_key(self, params),
-                    "pipeline not built — classifier model unresolved or invalid",
+                    "pipeline not built - classifier model unresolved or invalid",
                 );
             }
         }
@@ -381,7 +381,7 @@ impl RouterConfig {
 /// Resolve the classifier model key from config, following the priority:
 /// 1. Pipeline-level `classifier_model`
 /// 2. Root-level `classifier_model`
-/// 3. Root `classification` classifier node's `model` (M4.1 — tree configs
+/// 3. Root `classification` classifier node's `model` (M4.1 - tree configs
 ///    boot without a flat classifier key)
 /// 4. First model in the `fast` model group
 fn resolve_classifier_model_key<'a>(
@@ -435,7 +435,7 @@ fn build_classifier_client(
 ///
 /// `default_client` (the injected mock/transcript backend or the real
 /// classifier client) serves every classifier node whose `model` key has no
-/// dedicated backend. When `use_per_node_backends` is true (real mode only —
+/// dedicated backend. When `use_per_node_backends` is true (real mode only -
 /// never when a backend was injected for mock/transcript runs), a dedicated
 /// `LlmClient` is built for each distinct classifier-node model key that
 /// differs from the resolved classifier model.
@@ -476,7 +476,7 @@ fn build_classification_engine(
 impl RouterConfig {
     /// Build the escalation ladder for every model group that configures one
     /// (`model_groups[g].escalation`). Groups without a ladder (or without a
-    /// frontier endpoint) are absent — dispatch falls back to
+    /// frontier endpoint) are absent - dispatch falls back to
     /// `fallback_completion` as before.
     ///
     /// The ladders are keyed by group name; `RoutingTarget.group` resolves
@@ -538,19 +538,28 @@ impl RouterConfig {
         ladders
     }
 
-    /// Build a sync local-model `ChatBackend` from a `models` key — the single
+    /// Build a sync local-model `ChatBackend` from a `models` key - the single
     /// `LlmClient` construction site shared by the classifier and the
     /// escalation ladder's local roles (DIP: exactly one concrete
     /// `ChatBackend` factory in the crate). The model id is qualified to the
-    /// entry's default dispatch point and declaration-only params are stripped.
+    /// entry's *internal work group* (the pool); client-facing default dispatch
+    /// keeps `default_dispatch_qualifier` via `from_model_entry`. When
+    /// `pool_qualifier()` is `None` the id is bare `<base>` (upstream models,
+    /// byte-identical to today). Declaration-only params are stripped.
     pub fn local_backend(&self, key: &str) -> Option<Arc<dyn ChatBackend>> {
         let entry = self.models.get(key)?;
         let base = entry.name.as_deref().unwrap_or(key);
-        let model = match entry.default_dispatch_qualifier() {
+        let qualifier = entry.pool_qualifier();
+        let model = match &qualifier {
             Some(qualifier) => format!("{base}:{qualifier}"),
             None => base.to_string(),
         };
-        let params = entry.params.clone().map(strip_declaration_params);
+        // D4: the pool is an instance/group of the model, so its sampling
+        // params (e.g. the swarm work pool's temperature) reach the body.
+        let params = qualifier
+            .as_deref()
+            .and_then(|q| entry.instance_params_for(q))
+            .or_else(|| entry.params.clone().map(strip_declaration_params));
         let llm_config = LlmConfig::new()
             .api_url(entry.endpoint.clone())
             .model(model)
@@ -562,29 +571,61 @@ impl RouterConfig {
 
     /// Build a `ChatBackend` for a specific named inference point
     /// (`<base>:<instance_or_group>`) of a `models` key, reusing the single
-    /// `LlmClient` factory (DIP — same construction site as `local_backend`).
+    /// `LlmClient` factory (DIP - same construction site as `local_backend`).
     /// Used by the ledger summarizer (`<base>:ledger`) and any on-demand
     /// scratch route (`<base>:scratch`), which must target a named instance
     /// rather than the entry's default dispatch point.
+    ///
+    /// D4 param merging: the matching instance profile's `params` are overlaid
+    /// onto the entry `params` (profile wins) so instance-level sampling knobs
+    /// (e.g. `scratch`'s `temperature: 0.4`) actually reach the body; the
+    /// merged object is then `strip_declaration_params`'d. Returns `None` when
+    /// the key is unknown or the named instance does not exist.
     pub fn local_backend_for_instance(
         &self,
         key: &str,
         instance_or_group: &str,
     ) -> Option<Arc<dyn ChatBackend>> {
         let entry = self.models.get(key)?;
+        // Resolve the named profile; an unknown instance name -> None.
+        entry
+            .instance_profiles()
+            .into_iter()
+            .find(|p| p.name.as_deref() == Some(instance_or_group))?;
         let base = entry.name.as_deref().unwrap_or(key);
         let model = format!("{base}:{instance_or_group}");
-        let params = entry.params.clone().map(strip_declaration_params);
+        let params = entry
+            .instance_params_for(instance_or_group)
+            .unwrap_or_else(|| strip_declaration_params(serde_json::Value::Null));
         let llm_config = LlmConfig::new()
             .api_url(entry.endpoint.clone())
             .model(model)
             .timeout_ms(entry.total_timeout_ms)
-            .maybe_extra_body_params(params)
+            .maybe_extra_body_params(Some(params))
             .build();
         Some(Arc::new(LlmClient::with_config(llm_config)))
     }
 
-    /// Build the target-matching ladder's per-candidate backend set (DIP —
+    /// Build the ledger `Summarizer`'s DIP backend (M2) - the ledger
+    /// Summarizer's only construction site. Resolves the ledger model key
+    /// (the `ledger` section's `model`, else the classifier model key), then
+    /// targets the named `ledger` instance via `local_backend_for_instance`.
+    /// Returns `None` when no ledger section is configured, no model key
+    /// resolves, or the `ledger` instance is unknown.
+    pub fn summarizer_for_ledger(&self) -> Option<crate::summarization::Summarizer> {
+        let ledger = self.ledger.as_ref()?;
+        let key = ledger
+            .model
+            .as_deref()
+            .or(self.classifier_model.as_deref())?;
+        let backend = self.local_backend_for_instance(key, "ledger")?;
+        Some(crate::summarization::Summarizer::new(
+            backend,
+            ledger.max_summary_tokens,
+        ))
+    }
+
+    /// Build the target-matching ladder's per-candidate backend set (DIP -
     /// reuses the private `local_backend` helper, the single `LlmClient`
     /// factory; no second construction site).
     ///
@@ -592,7 +633,7 @@ impl RouterConfig {
     /// maps it to its dedicated `ChatBackend`. The matcher's `default` (for
     /// keys absent from the map) is supplied by the caller: the injected
     /// mock/transcript backend when one is provided, otherwise a real client
-    /// (defense in depth — every real group member has a dedicated backend,
+    /// (defense in depth - every real group member has a dedicated backend,
     /// so the default is only reached for a key outside all groups).
     pub fn target_backends(&self) -> HashMap<String, Arc<dyn ChatBackend>> {
         let mut backends = HashMap::new();
@@ -618,7 +659,7 @@ fn frontier_api_client(shared: &reqwest::Client, api_key_env: Option<&str>) -> r
         tracing::warn!(
             target: "router.config",
             env = %env,
-            "frontier api_key_env set but unreadable — falling back to shared client (no auth header)",
+            "frontier api_key_env set but unreadable - falling back to shared client (no auth header)",
         );
         return shared.clone();
     };
@@ -712,6 +753,91 @@ mod tests {
     }
 
     #[test]
+    fn local_backend_uses_pool_qualifier_while_from_model_entry_keeps_default() {
+        // M1: router-internal work (local_backend) targets the pool group
+        // (swarm), while the client-facing canonical target builder
+        // (from_model_entry) still resolves the fork's default instance
+        // (ledger). Two intents, two answers on the same entry.
+        let config: RouterConfig = serde_json::from_value(serde_json::json!({
+            "models": {
+                "swarm": {
+                    "endpoint": "http://x/v1/chat/completions",
+                    "name": "abiray/lfm2.5-2.6b-heretic-abliterated",
+                    "intelligence": 2,
+                    "cost_input": 1.0, "cost_output": 6.0, "cost_cached_read": 0.4,
+                    "speed": 8,
+                    "instances": {
+                        "swarm": { "count": 3, "group": "swarm", "num_ctx": 16384 },
+                        "ledger": { "num_ctx": 131072, "pinned": true, "default": true },
+                        "scratch": { "num_ctx": 131072, "sleep_idle_seconds": 30 }
+                    }
+                }
+            }
+        })).expect("valid config");
+
+        // local_backend builds (is_some) and routes to the pool group.
+        assert!(config.local_backend("swarm").is_some());
+        let entry = config.models.get("swarm").expect("swarm");
+        assert_eq!(entry.pool_qualifier().as_deref(), Some("swarm"));
+        assert_eq!(entry.default_dispatch_qualifier().as_deref(), Some("ledger"));
+
+        // The canonical target builder keeps bare-base default dispatch: :ledger.
+        let rt = crate::pipeline::RoutingTarget::from_model_entry("swarm", entry);
+        assert_eq!(
+            rt.model,
+            "abiray/lfm2.5-2.6b-heretic-abliterated:ledger",
+            "client-facing default dispatch is unchanged (goldens preserved)"
+        );
+    }
+
+    #[test]
+    fn summarizer_for_ledger_builds_when_ledger_section_present() {
+        // M2: the ledger Summarizer's DIP construction site. With a `ledger`
+        // section and a swarm entry declaring a `ledger` instance, the backend
+        // builds; without a ledger section it is `None`.
+        let config: RouterConfig = serde_json::from_value(serde_json::json!({
+            "classifier_model": "swarm",
+            "ledger": { "model": "swarm", "max_summary_tokens": 300 },
+            "models": {
+                "swarm": {
+                    "endpoint": "http://x/v1/chat/completions",
+                    "name": "abiray/lfm2.5-2.6b-heretic-abliterated",
+                    "intelligence": 2,
+                    "cost_input": 1.0, "cost_output": 6.0, "cost_cached_read": 0.4,
+                    "speed": 8,
+                    "instances": {
+                        "ledger": { "num_ctx": 131072, "pinned": true, "default": true },
+                        "swarm": { "count": 3, "group": "swarm", "num_ctx": 16384 }
+                    }
+                }
+            }
+        })).expect("valid config");
+
+        let summarizer = config.summarizer_for_ledger();
+        assert!(summarizer.is_some(), "ledger section + ledger instance -> Some");
+    }
+
+    #[test]
+    fn summarizer_for_ledger_none_without_ledger_section() {
+        let config: RouterConfig = serde_json::from_value(serde_json::json!({
+            "classifier_model": "swarm",
+            "models": {
+                "swarm": {
+                    "endpoint": "http://x/v1/chat/completions",
+                    "name": "swarm",
+                    "intelligence": 2,
+                    "cost_input": 1.0, "cost_output": 6.0, "cost_cached_read": 0.4,
+                    "speed": 8
+                }
+            }
+        })).expect("valid config");
+        assert!(
+            config.summarizer_for_ledger().is_none(),
+            "no ledger section -> no summarizer"
+        );
+    }
+
+    #[test]
     fn local_backend_for_instance_builds_ledger_and_scratch_backends() {
         // M5: the ledger summarizer and on-demand scratch route must dispatch
         // to their named instances. `local_backend_for_instance` builds an
@@ -757,6 +883,99 @@ mod tests {
     }
 
     #[test]
+    fn local_backend_for_instance_merges_profile_params_over_entry_params() {
+        // D4: scratch's profile `params` (temperature 0.4) overlay the entry
+        // `params` (repeat_penalty 1.05); declaration-only keys are stripped so
+        // the merged body carries both sampling params and nothing else.
+        let config: RouterConfig = serde_json::from_value(serde_json::json!({
+            "models": {
+                "swarm": {
+                    "endpoint": "http://x/v1/chat/completions",
+                    "name": "abiray/lfm2.5-2.6b-heretic-abliterated",
+                    "intelligence": 2,
+                    "cost_input": 1.0, "cost_output": 6.0, "cost_cached_read": 0.4,
+                    "speed": 8,
+                    "params": { "repeat_penalty": 1.05, "num_ctx": 0 },
+                    "instances": {
+                        "scratch": {
+                            "num_ctx": 131072,
+                            "sleep_idle_seconds": 30,
+                            "params": { "temperature": 0.4, "num_ctx": 99999 }
+                        }
+                    }
+                }
+            }
+        })).expect("valid config");
+
+        let merged = config
+            .models
+            .get("swarm")
+            .unwrap()
+            .instance_params_for("scratch")
+            .expect("scratch profile resolves");
+        let stripped = strip_declaration_params(merged);
+        let obj = stripped.as_object().expect("merged params object");
+        // Profile wins for temperature; entry key preserved.
+        assert_eq!(obj["temperature"].as_f64(), Some(0.4));
+        assert_eq!(obj["repeat_penalty"].as_f64(), Some(1.05));
+        // Declaration-only keys are stripped from the merged object.
+        assert!(obj.get("num_ctx").is_none(), "declaration key stripped");
+        assert!(obj.get("sleep_idle_seconds").is_none(), "declaration key stripped");
+    }
+
+    #[test]
+    fn local_backend_for_instance_none_for_unknown_instance() {
+        let config: RouterConfig = serde_json::from_value(serde_json::json!({
+            "models": {
+                "swarm": {
+                    "endpoint": "http://x/v1/chat/completions",
+                    "name": "swarm",
+                    "intelligence": 2,
+                    "cost_input": 1.0, "cost_output": 6.0, "cost_cached_read": 0.4,
+                    "speed": 8,
+                    "instances": { "scratch": { "num_ctx": 131072 } }
+                }
+            }
+        })).expect("valid config");
+        // A named instance that does not exist -> None (no fabricated lookup).
+        assert!(config.local_backend_for_instance("swarm", "ghost").is_none());
+        // An unknown model key -> None.
+        assert!(config.local_backend_for_instance("missing", "scratch").is_none());
+    }
+
+    #[test]
+    fn local_backend_for_instance_entry_params_unchanged_without_profile_params() {
+        // No profile `params` -> the merged body is exactly the entry params
+        // (sampling params preserved, declaration keys stripped).
+        let config: RouterConfig = serde_json::from_value(serde_json::json!({
+            "models": {
+                "swarm": {
+                    "endpoint": "http://x/v1/chat/completions",
+                    "name": "swarm",
+                    "intelligence": 2,
+                    "cost_input": 1.0, "cost_output": 6.0, "cost_cached_read": 0.4,
+                    "speed": 8,
+                    "params": { "repeat_penalty": 1.05, "num_ctx": 0 },
+                    "instances": { "scratch": { "num_ctx": 131072 } }
+                }
+            }
+        })).expect("valid config");
+        let merged = config
+            .models
+            .get("swarm")
+            .unwrap()
+            .instance_params_for("scratch")
+            .expect("scratch profile resolves");
+        let stripped = strip_declaration_params(merged);
+        let obj = stripped.as_object().expect("merged params object");
+        assert_eq!(obj["repeat_penalty"].as_f64(), Some(1.05));
+        assert!(obj.get("num_ctx").is_none(), "declaration key stripped");
+        assert_eq!(obj.len(), 1, "no profile params to add");
+        // The backend itself still builds for the valid named instance.
+        assert!(config.local_backend_for_instance("swarm", "scratch").is_some());
+    }
+
+    #[test]
     fn target_backends_builds_every_group_member_key() {
         let config: RouterConfig = serde_json::from_str(
             r#"{
@@ -775,7 +994,7 @@ mod tests {
 
         let backends = config.target_backends();
         // Exactly the model keys referenced by any model_groups member are
-        // built (deduplicated across groups) — `unused` is not a group member.
+        // built (deduplicated across groups) - `unused` is not a group member.
         let mut keys: Vec<&str> = backends.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(keys, vec!["qwen3.6-27b", "swarm"]);
@@ -938,7 +1157,7 @@ mod tests {
             .await
             .expect("chart executes under Zone supervision");
 
-        // Topo order: reproduce → root_cause → fix_plan (3 completed targets).
+        // Topo order: reproduce - root_cause - fix_plan (3 completed targets).
         assert_eq!(summary.completed.len(), 3);
         assert!(summary.failed.is_empty());
         assert!(summary.accepted);
@@ -981,7 +1200,7 @@ mod tests {
     fn chart_compile_rejects_unbound_chart_at_build_time() {
         let backend: Arc<dyn ChatBackend> = Arc::new(StubChatBackend::always("{}"));
         let limiter = Arc::new(Limiter::new(4));
-        // No entities → root_cause's required `report` dep is unmatched.
+        // No entities - root_cause's required `report` dep is unmatched.
         let Err(err) =
             crate::charts::compile::compile_chart_stages(&triage_chart(), &[], &backend, &limiter)
         else {

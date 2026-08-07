@@ -73,16 +73,23 @@ impl RoutingTarget {
     /// instance grammar).
     pub fn from_model_entry(model_key: &str, entry: &ModelEntry) -> Self {
         let base = entry.name.clone().unwrap_or_else(|| model_key.to_string());
-        let model = match entry.default_dispatch_qualifier() {
-            Some(qualifier) => format!("{base}:{qualifier}"),
+        let qualifier = entry.default_dispatch_qualifier();
+        let model = match &qualifier {
+            Some(q) => format!("{base}:{q}"),
             None => base,
         };
+        // D4: when dispatch is qualified to an instance/group, overlay that
+        // profile's sampling params (profile wins); otherwise use entry params.
+        let params = qualifier
+            .as_deref()
+            .and_then(|q| entry.instance_params_for(q))
+            .or_else(|| entry.params.clone().map(strip_declaration_params));
         Self {
             url: entry.endpoint.clone(),
             model,
             group: None,
             target_name: Some(model_key.to_string()),
-            params: entry.params.clone().map(strip_declaration_params),
+            params,
             instance: None,
             snapshot: None,
             id_slot: None,
@@ -112,7 +119,9 @@ impl RoutingTarget {
             model,
             group: None,
             target_name: Some(model_key.to_string()),
-            params: entry.params.clone().map(strip_declaration_params),
+            params: entry
+                .instance_params_for(instance_or_group)
+                .or_else(|| entry.params.clone().map(strip_declaration_params)),
             instance: Some(instance_or_group.to_string()),
             snapshot: None,
             id_slot: None,
@@ -626,6 +635,39 @@ mod tests {
         assert_eq!(rt.instance.as_deref(), Some("scratch"));
         assert_eq!(rt.snapshot, None);
         assert_eq!(rt.id_slot, None);
+    }
+
+    #[test]
+    fn from_model_entry_merges_instance_profile_params() {
+        // The reference swarm config: the default profile (ledger) carries
+        // temperature 0.1, scratch carries 0.4. Those must reach the body for
+        // the qualifier each builder resolves.
+        let entry = entry_with_instances(serde_json::json!({
+            "swarm": { "count": 3, "group": "swarm", "num_ctx": 16384, "warm": true,
+                       "params": { "temperature": 0.1 } },
+            "ledger": { "num_ctx": 131072, "pinned": true, "default": true,
+                        "params": { "temperature": 0.1 } },
+            "scratch": { "num_ctx": 131072, "sleep_idle_seconds": 30,
+                         "params": { "temperature": 0.4 } }
+        }));
+
+        // from_model_entry resolves the default profile (ledger, temp 0.1).
+        let rt = RoutingTarget::from_model_entry("swarm", &entry);
+        assert_eq!(rt.model, "abiray/lfm2.5-2.6b-heretic-abliterated:ledger");
+        assert_eq!(
+            rt.params.as_ref().and_then(|p| p.get("temperature")),
+            Some(&serde_json::json!(0.1)),
+            "default profile sampling params reach the dispatch body"
+        );
+
+        // from_model_entry_instance targets scratch (temp 0.4).
+        let rt = RoutingTarget::from_model_entry_instance("swarm", &entry, "scratch");
+        assert_eq!(rt.model, "abiray/lfm2.5-2.6b-heretic-abliterated:scratch");
+        assert_eq!(
+            rt.params.as_ref().and_then(|p| p.get("temperature")),
+            Some(&serde_json::json!(0.4)),
+            "named-instance sampling params reach the dispatch body"
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ use fluent_llm::{create_embedding_provider, EmbeddingProvider};
 use fluent_router::charts::store::ChartStore;
 use fluent_router::config::{validate_no_self_routing, RouterConfig};
 use fluent_router::hnsw::HnswIndexHandle;
+use fluent_router::ledger::ContentNodeLedger;
 use fluent_router::logging::init_router_logging;
 use fluent_router::routes::plan::PlanRoute;
 use fluent_router::routes::rigor::RigorRoute;
@@ -187,14 +188,102 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ladders = config.build_escalation_ladders(&http_client);
 
     // M4 sidecar: build one instance manager per endpoint that declares an
-    // instance pool. The server owns their reconcile + residency tasks.
-    let instance_managers = fluent_router::instances::build_instance_managers(&config);
+    // instance pool. The server owns their reconcile + residency tasks. A
+    // malformed instance grammar (duplicate name / group-name collision)
+    // fails fast so boot aborts loudly.
+    let instance_managers = match fluent_router::instances::build_instance_managers(&config) {
+        Ok(managers) => managers,
+        Err(e) => {
+            tracing::error!(
+                target: "coral-router",
+                error = %e,
+                "fatal: instance pool grammar validation failed",
+            );
+            eprintln!("FATAL: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // M2 composition: when the operator opts in via the `ledger`/`session`
+    // sections, open a `ContentNodeLedger` (with a real `Summarizer` backend
+    // targeting `<base>:ledger`) and/or a `SessionRegistry`, and attach both
+    // to the server so rigor rewind and ledger LOD derivation exist at runtime.
+    // Both are default-absent, so existing deployments are untouched.
+    let ledger = if let Some(ledger_cfg) = &config.ledger {
+        let opened = match &ledger_cfg.path {
+            Some(path) => ContentNodeLedger::open(path),
+            None => {
+                tracing::warn!(
+                    target: "coral-router",
+                    "ledger section has no path - using an in-memory ledger (ephemeral)",
+                );
+                ContentNodeLedger::open_in_memory()
+            }
+        };
+        let ledger = match opened {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(
+                    target: "coral-router",
+                    error = %e,
+                    "fatal: ledger open failed",
+                );
+                eprintln!("FATAL: ledger open failed: {e}");
+                std::process::exit(1);
+            }
+        };
+        match config.summarizer_for_ledger() {
+            Some(summarizer) => {
+                let model_key = ledger_cfg
+                    .model
+                    .clone()
+                    .or_else(|| config.classifier_model.clone());
+                tracing::info!(
+                    target: "coral-router",
+                    ledger_model = ?model_key,
+                    summarizer = true,
+                    "ledger summarizer attached",
+                );
+                Some(Arc::new(ledger.with_summarizer(summarizer)))
+            }
+            None => {
+                tracing::warn!(
+                    target: "coral-router",
+                    "ledger section present but no summarizer derivable - ledger attached without LOD derivation",
+                );
+                Some(Arc::new(ledger))
+            }
+        }
+    } else {
+        None
+    };
+
+    let sessions = if let Some(session_cfg) = &config.session {
+        let kv_root = session_cfg.root.as_ref().map(std::path::PathBuf::from);
+        let sessions =
+            Arc::new(fluent_router::dag_session::SessionRegistry::new(kv_root));
+        tracing::info!(
+            target: "coral-router",
+            session_root = ?session_cfg.root,
+            "session registry attached",
+        );
+        Some(sessions)
+    } else {
+        None
+    };
 
     let mut server =
         RouterServer::new(pipelines, routes, config.models, &config.server, classifier)
             .with_plan_route(plan_route)
             .with_rigor_route(rigor_route)
             .with_ladders(ladders);
+
+    if let Some(ledger) = ledger {
+        server = server.with_ledger(ledger);
+    }
+    if let Some(sessions) = sessions {
+        server = server.with_sessions(sessions);
+    }
 
     if !instance_managers.is_empty() {
         server = server.with_instance_managers(instance_managers);
