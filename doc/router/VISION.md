@@ -345,6 +345,46 @@ the owning server.
   group miss. It may retire a server process after its last instance is
   evicted; the weights are freed either way.
 
+### VRAM residency: load on demand, evict by LRU and size
+
+The fleet will not fit in device memory all at once, so residency is an
+explicit, first-class goal rather than an accident of whatever fits:
+
+- **Only pinned instances boot.** A model is spawned at boot only when it
+  declares at least one pinned instance profile (e.g. `swarm:ledger`,
+  `swarm:swarm`). Everything else — whole models with no pinned instance, and
+  unpinned context windows within a booted model — is loaded on demand at first
+  dispatch and is a candidate for eviction.
+
+- **Weights load on demand and are unloaded again.** The supervisor spawns a
+  lazy model's `llama-server` on its first routed request (`ensure_running`)
+  and waits for `/health` before dispatching. When the sidecar evicts the
+  model's last context, the server is stopped and its weights freed
+  (`unload`); the next request reloads it. No model stays resident merely
+  because it was once used.
+
+- **Contexts load on demand too.** Unpinned instances (e.g. `swarm:scratch`)
+  are not declared at spawn; a request targeting one creates it via
+  `POST /instances` and it becomes an eviction candidate like any other.
+
+- **Eviction is LRU, weighted by size.** The residency loop enforces an
+  allocation budget of `device_total - minimum_remaining_vram` (device total
+  from `sidecar.vram_total_bytes` or auto-detected from ROCm
+  `mem_info_vram_total`; floor from `sidecar.minimum_remaining_vram`). When
+  the budget is exceeded it evicts the least-recently-used **largest** unpinned
+  context first — freeing the most VRAM from the coldest window — across every
+  managed server on the device, not per server. Pinned instances are never
+  evicted.
+
+- **A model with no contexts is a model that leaves.** After evicting a
+  model's last context window, the router unloads that model's weights rather
+  than letting them sit idle; residency is measured by how few weights and
+  contexts stay resident when they are not earning their VRAM.
+
+This is what makes the fleet coherent: the router keeps the fastest, most
+relevant model resident for the traffic it actually serves, and spends the
+rest of device memory the moment a request earns it — never before.
+
 - **Routing fields.** Every generation request may carry `model`, `instance`,
   `snapshot`, and `id_slot` from the JSON body or the query string (the body
   wins). Coral Router resolves the model id to its owning server and forwards

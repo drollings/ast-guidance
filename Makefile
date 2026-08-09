@@ -152,7 +152,7 @@ install: $(CARGO_BIN) $(CORAL_ROUTER_BIN)
 # ── Router Targets ────────────────────────────────────────────────────────────
 
 .PHONY: router
-router: $(CORAL_ROUTER_BIN) ## Build coral-router
+router: $(CORAL_ROUTER_BIN) ## Build coral-router (fast, no run; the base for every other router target)
 
 # Kill any running coral-router and wait for it to actually exit before the
 # caller starts a fresh one. The router is the process owner of its spawned
@@ -169,8 +169,16 @@ endef
 router-stop: ## Stop coral-router (SIGTERM, so it stops its managed llama-servers first)
 	$(stop-router)
 
+# ── Router Benchmark ──────────────────────────────────────────────────────────
+
+CORAL_ROUTER_TEST_SCRIPT := bin/coral-router-test.py
+
+.PHONY: router-benchmark
+router-benchmark: router-start ## Score the live router (routing accuracy, TTFT, VRAM) via bin/coral-router-test.py; reads env/coral-router.json for routes + expectations
+	$(Q)python3 $(CORAL_ROUTER_TEST_SCRIPT) --config $(CORAL_ROUTER_CONFIG)
+
 .PHONY: router-test
-router-test: $(CORAL_ROUTER_BIN) ## Run all router unit, golden, and e2e mock tests; validate the built binary
+router-test: $(CORAL_ROUTER_BIN) ## Run fluent-router unit/golden/e2e tests + a --help dry-run of the built binary (stops a running router first)
 	$(stop-router)
 	$(Q)echo "Running fluent-router unit + golden + e2e mock tests"
 	$(Q)cargo test -p fluent-router
@@ -178,7 +186,7 @@ router-test: $(CORAL_ROUTER_BIN) ## Run all router unit, golden, and e2e mock te
 	$(Q)$(CORAL_ROUTER_BIN) --help > /dev/null && echo "All router tests passed." || echo "ERRROR: coral-router did NOT successfully run."
 
 .PHONY: router-test-all
-router-test-all: $(CORAL_ROUTER_BIN) ## Run all router tests + HNSW benchmarks (large, slow)
+router-test-all: $(CORAL_ROUTER_BIN) ## router-test + coral-context HNSW benchmarks (large, slow; stops a running router first)
 	$(stop-router)
 	$(Q)echo "Running fluent-router unit + golden + e2e mock tests"
 	$(Q)cargo test -p fluent-router
@@ -190,14 +198,14 @@ router-test-all: $(CORAL_ROUTER_BIN) ## Run all router tests + HNSW benchmarks (
 ROUTER_MOCK_TEST_SCRIPT := bin/router-mock-tests.sh
 
 .PHONY: router-start
-router-start: $(CORAL_ROUTER_BIN) ## Build (if needed) and (re)start coral-router, waiting for /health
+router-start: $(CORAL_ROUTER_BIN) ## Build (if needed), (re)start coral-router in real mode on :8079, and wait for /health (stops the old tree first)
 	$(stop-router)
 	$(Q)echo "Starting coral-router"
 	$(Q)nohup $(CORAL_ROUTER_BIN) -c $(CORAL_ROUTER_CONFIG) > $(ROUTER_LOG) 2>&1 &
 	$(Q)bash $(ROUTER_WAIT_SCRIPT) $(CORAL_ROUTER_HEALTH_URL) $(ROUTER_START_TIMEOUT_S) $(ROUTER_LOG)
 
 .PHONY: router-mock
-router-mock: $(CORAL_ROUTER_BIN) $(ROUTER_MOCK_TEST_SCRIPT) ## Build, start with mock backend, run curl smoke-tests (leaves server running on :8078)
+router-mock: $(CORAL_ROUTER_BIN) $(ROUTER_MOCK_TEST_SCRIPT) ## Build, start a mock router on :8078, run the 29 curl smoke-tests (leaves that server running)
 	$(stop-router)
 	$(Q)nohup $(CORAL_ROUTER_BIN) -c $(CORAL_ROUTER_CONFIG) --host 127.0.0.1 --port 8078 --mock env/mock-transcripts.json > $(ROUTER_MOCK_LOG) 2>&1 &
 	$(Q)bash $(ROUTER_WAIT_SCRIPT) $(CORAL_ROUTER_MOCK_HEALTH_URL) $(ROUTER_MOCK_TIMEOUT_S) $(ROUTER_MOCK_LOG)
