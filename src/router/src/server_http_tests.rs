@@ -1680,7 +1680,7 @@ async fn spawn_instances_server(
             SidecarConfig::default(),
         )),
     );
-    let pool = InstancePool::from_managers(managers);
+    let pool = InstancePool::from_managers(managers, None);
 
     let config = make_config("http://127.0.0.1:1", false, false, 5000, 2000);
     let pipelines = Arc::new(config.build_all_pipelines_with_backend(None));

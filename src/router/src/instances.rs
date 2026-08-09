@@ -527,11 +527,20 @@ impl InstanceManager {
         &self.profiles
     }
 
-    /// Boot reconciliation: create configured instances missing from
+    /// Boot reconciliation: create **pinned** configured instances missing from
     /// `GET /instances`, resize `n_ctx` mismatches, and warn on
     /// `parallel`/`pinned` drift. A duplicate-create (409) is tolerated.
-    /// Emits an audit record of the result.
+    /// Unpinned instances are NOT created here — they are created on demand by
+    /// [`Self::ensure_instance`] (the residency goal is that only pinned
+    /// instances stay resident). Emits an audit record of the result.
+    ///
+    /// A plain model (no instance profiles) has nothing to reconcile — returns
+    /// `Ok` without touching the management API (a plain server exposes no
+    /// `/instances`).
     pub async fn reconcile(&self) -> Result<(), InstanceError> {
+        if self.profiles.is_empty() {
+            return Ok(());
+        }
         let existing = match self.client.list().await {
             Ok(envelope) => envelope,
             Err(e) => {
@@ -553,6 +562,9 @@ impl InstanceManager {
         let mut created = 0usize;
         let mut resized = 0usize;
         for profile in &self.profiles {
+            if !profile.pinned {
+                continue;
+            }
             let name = profile.name.as_deref().unwrap_or("");
             if name.is_empty() {
                 continue;
@@ -649,10 +661,88 @@ impl InstanceManager {
         Ok(())
     }
 
-    /// Boot orchestration: reconcile the configured instances against the
-    /// fork, retrying until the management API is reachable (the container may
-    /// come up after the router), then run the residency loop forever. This is
-    /// the task the server spawns per manager.
+    /// Create a configured instance on demand if it is not already present.
+    /// Used by the dispatch path when a request targets a specific instance
+    /// (e.g. `<base>:scratch`) that is unpinned and therefore absent after
+    /// boot. No-op when the name has no configured profile (nothing to create)
+    /// or already exists.
+    pub async fn ensure_instance(&self, name: &str) -> Result<(), InstanceError> {
+        if name.is_empty() || self.profiles.is_empty() {
+            return Ok(());
+        }
+        let existing = match self.client.list().await {
+            Ok(envelope) => envelope,
+            Err(e) => return Err(e),
+        };
+        let present = existing
+            .instances
+            .iter()
+            .any(|i| instance_name_from_server_id(&i.id) == name);
+        if present {
+            return Ok(());
+        }
+        let Some(profile) = self
+            .profiles
+            .iter()
+            .find(|p| p.name.as_deref() == Some(name))
+        else {
+            tracing::debug!(
+                target: "router.instances",
+                instance = %name,
+                "no configured profile for on-demand instance - nothing to create",
+            );
+            return Ok(());
+        };
+        let group = profile.group.as_deref().unwrap_or(name);
+        match self
+            .client
+            .create(
+                name,
+                group,
+                profile.num_ctx,
+                profile.parallel,
+                profile.pinned,
+                profile.default,
+            )
+            .await
+        {
+            Ok(info) => {
+                tracing::info!(
+                    target: "router.instances",
+                    instance = %name,
+                    group = %group,
+                    n_ctx = info.n_ctx,
+                    "instance created on demand",
+                );
+                crate::audit::emit(
+                    "instances",
+                    serde_json::json!({
+                        "action": "create_on_demand",
+                        "instance": name,
+                        "group": group,
+                        "base_url": self.client.base_url(),
+                    }),
+                );
+                Ok(())
+            }
+            Err(InstanceError::Duplicate) => Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    target: "router.instances",
+                    instance = %name,
+                    error = %e,
+                    "on-demand instance create failed",
+                );
+                Err(e)
+            }
+        }
+    }
+
+    /// Boot orchestration: reconcile the configured pinned instances against
+    /// the fork, retrying until the management API is reachable (the container
+    /// may come up after the router). Residency is pool-wide
+    /// ([`InstancePool::run_residency`]), so this task stops after a
+    /// successful reconcile.
     pub async fn bootstrap(&self) {
         let base = Duration::from_secs(self.policy.poll_interval_s.max(1));
         let mut failures = 0u32;
@@ -679,159 +769,12 @@ impl InstanceManager {
                 }
             }
         }
-        self.run_residency().await;
     }
 
-    /// One residency pass: poll `GET /instances` always and report free/used
-    /// (the envelope's `total` is the VRAM signal) so the loop is observable
-    /// even when no ceiling is configured. Only when a `vram_total_bytes`
-    /// ceiling is present does the pass attempt eviction: when free VRAM
-    /// (ceiling minus used) drops below the watermark, evict up to
-    /// `evict_batch` unpinned instances, preferring short-idle profiles
-    /// (a `sleep_idle_seconds` hint) then least-recently-used. Pinned
-    /// instances are never evicted.
-    pub async fn residency_cycle(&self) -> Result<(), InstanceError> {
-        let envelope = self.client.list().await?;
-        let used = envelope.total.total;
-        let Some(vram_total) = self.policy.vram_total_bytes else {
-            tracing::info!(
-                target: "router.instances",
-                used_bytes = used,
-                "residency: no vram_total_bytes ceiling - polling /instances without eviction",
-            );
-            return Ok(());
-        };
-        let free = vram_total.saturating_sub(used);
-        if free >= self.policy.vram_low_watermark_bytes {
-            tracing::info!(
-                target: "router.instances",
-                free_bytes = free,
-                used_bytes = used,
-                watermark_bytes = self.policy.vram_low_watermark_bytes,
-                "free VRAM above watermark - no eviction this pass",
-            );
-            return Ok(());
-        }
-        tracing::warn!(
-            target: "router.instances",
-            free_bytes = free,
-            used_bytes = used,
-            watermark_bytes = self.policy.vram_low_watermark_bytes,
-            "free VRAM below watermark - evicting LRU unpinned instances",
-        );
-        let mut candidates: Vec<(&InstanceInfo, u8)> = envelope
-            .instances
-            .iter()
-            .filter(|i| !i.pinned)
-            // Eviction-priority hint (config `sleep_idle_seconds`, NOT
-            // forwarded to the server): a short idle timeout marks a good
-            // eviction candidate (0 = prefer, 1 = normal).
-            .map(|i| {
-                let name = instance_name_from_server_id(&i.id);
-                (i, self.eviction_priority(name))
-            })
-            .collect();
-        // Primary: eviction priority (short-idle first); tie-break: LRU.
-        candidates.sort_by_key(|(i, priority)| (*priority, i.last_used));
-        let mut evicted = 0usize;
-        for (info, _priority) in candidates {
-            if evicted >= self.policy.evict_batch {
-                break;
-            }
-            let name = instance_name_from_server_id(&info.id);
-            match self.client.destroy(name, false).await {
-                Ok(()) => {
-                    evicted += 1;
-                    tracing::info!(
-                        target: "router.instances",
-                        instance = %info.id,
-                        last_used = info.last_used,
-                        vram_bytes = info.vram_bytes,
-                        "unpinned instance evicted for low VRAM",
-                    );
-                    crate::audit::emit(
-                        "instances",
-                        serde_json::json!({
-                            "action": "evict",
-                            "instance": info.id,
-                            "reason": "low_vram",
-                        }),
-                    );
-                }
-                Err(e) => tracing::warn!(
-                    target: "router.instances",
-                    instance = %info.id,
-                    error = %e,
-                    "instance eviction failed",
-                ),
-            }
-        }
-        Ok(())
-    }
-
-    /// The eviction-priority hint for an instance by name: `0` (prefer to
-    /// evict) when its configured profile declares a positive
-    /// `sleep_idle_seconds`, else `1`. Runtime-created instances with no
-    /// configured profile are normal-priority.
-    fn eviction_priority(&self, name: &str) -> u8 {
-        u8::from(
-            !self.profiles.iter().any(|p| {
-                p.name.as_deref() == Some(name) && p.sleep_idle_seconds.unwrap_or(-1) > 0
-            }),
-        )
-    }
-
-    /// The residency loop: poll `GET /instances` every `poll_interval_s`,
-    /// evicting on low free VRAM, forever. Runs as a spawned task owned by the
-    /// server.
-    ///
-    /// A persistently unavailable management API must not spam a warning every
-    /// poll: the loop warns once on the first consecutive failure, then
-    /// degrades to `debug!` and backs off up to a cap until a poll succeeds
-    /// (fail-safe, never a crash).
-    ///
-    /// Without a `vram_total_bytes` ceiling eviction is impossible, so the loop
-    /// is a no-op: polling and logging every interval would only be noise. It
-    /// notes the disabled eviction once and exits.
-    pub async fn run_residency(&self) {
-        if self.policy.vram_total_bytes.is_none() {
-            tracing::info!(
-                target: "router.instances",
-                "residency eviction disabled - no vram_total_bytes ceiling configured (set sidecar.vram_total_bytes to enable)",
-            );
-            return;
-        }
-        let base = Duration::from_secs(self.policy.poll_interval_s.max(1));
-        let mut consecutive_failures = 0u32;
-        loop {
-            match self.residency_cycle().await {
-                Ok(()) => consecutive_failures = 0,
-                Err(e) => {
-                    consecutive_failures += 1;
-                    if consecutive_failures == 1 {
-                        tracing::warn!(
-                            target: "router.instances",
-                            error = %e,
-                            "residency poll failed - backing off (retrying with backoff)",
-                        );
-                    } else {
-                        tracing::debug!(
-                            target: "router.instances",
-                            error = %e,
-                            consecutive_failures = consecutive_failures,
-                            "residency poll still failing - backing off",
-                        );
-                    }
-                }
-            }
-            tokio::time::sleep(Self::residency_backoff(base, consecutive_failures)).await;
-        }
-    }
-
-    /// Compute the sleep delay for the residency loop after
-    /// `consecutive_failures` consecutive failed polls (0 = healthy). Progresses
-    /// from the base interval up to a 12x cap so a persistently unavailable
-    /// management API backs off without spamming a warning every poll.
+    /// Compute the sleep delay for a retry loop after `consecutive_failures`
+    /// consecutive failures (0 = healthy). Progresses from the base interval up
+    /// to a 12x cap so a persistently unavailable management API backs off
+    /// without spamming a warning every poll.
     fn residency_backoff(base: Duration, consecutive_failures: u32) -> Duration {
         base.saturating_mul(consecutive_failures.saturating_add(1).min(12))
     }
@@ -901,7 +844,13 @@ fn management_http_client() -> reqwest::Client {
 /// `instances` declared), keyed by the Coral Router model id. Each manager's
 /// client points DIRECTLY at that model's spawned `llama-server` (the config
 /// `endpoint` must already have been rewritten to the server's address by the
-/// supervisor at boot). Empty when no model declares instances.
+/// supervisor at boot).
+///
+/// A manager is created for EVERY managed model — even plain weights-only
+/// models with no instance pool — so the pool can drive on-demand loading for
+/// any lazy model (see [`InstancePool::ensure_target_ready`]): it resolves the
+/// dispatch URL to the owning manager and loads the model's server when the
+/// target is not resident.
 ///
 /// Fails fast (`Err`) when a model's combined profiles fail
 /// [`validate_instances`] (a malformed grammar must abort boot loudly rather
@@ -909,26 +858,29 @@ fn management_http_client() -> reqwest::Client {
 /// grammar string for operability.
 pub fn build_instance_managers(
     config: &crate::config::RouterConfig,
+    supervisor: Option<Arc<crate::supervisor::LlamaServerSupervisor>>,
 ) -> Result<InstancePool, String> {
     // One manager per managed model. Instances belong to a single model pool,
     // and each model now owns its own server, so the manager talks directly to
     // that server (no `model` routing).
     let mut managers = HashMap::new();
     for (key, entry) in &config.models {
-        let profiles = entry.instance_profiles();
-        if profiles.is_empty() {
+        if !entry.is_managed() {
             continue;
         }
+        let profiles = entry.instance_profiles();
         validate_instances(&profiles)
             .map_err(|e| format!("model {key}: invalid instance grammar: {e}"))?;
         let model_name = entry.llama_model_name(key);
-        tracing::info!(
-            target: "router.instances",
-            endpoint = %entry.endpoint,
-            model = %model_name,
-            grammar = instance_grammar_string(&profiles),
-            "instance pool grammar",
-        );
+        if !profiles.is_empty() {
+            tracing::info!(
+                target: "router.instances",
+                endpoint = %entry.endpoint,
+                model = %model_name,
+                grammar = instance_grammar_string(&profiles),
+                "instance pool grammar",
+            );
+        }
         let base_url = management_base_url(&entry.endpoint);
         let api_key = config
             .sidecar
@@ -946,7 +898,7 @@ pub fn build_instance_managers(
         ));
         managers.insert(key.clone(), manager);
     }
-    Ok(InstancePool::from_managers(managers))
+    Ok(InstancePool::from_managers(managers, supervisor))
 }
 
 /// The instance NAME within a server-reported id: the segment after the last
@@ -972,17 +924,38 @@ pub struct InstancePool {
     managers: HashMap<String, Arc<InstanceManager>>,
     /// management base URL -> model key (for dispatch-time manager lookup).
     by_base: HashMap<String, String>,
+    /// The llama-server supervisor, used to load lazy models on demand and to
+    /// unload a model whose last context was evicted (freeing its weights).
+    supervisor: Option<Arc<crate::supervisor::LlamaServerSupervisor>>,
+    /// Sidecar residency policy (device budget, poll interval, evict batch).
+    policy: crate::config::SidecarConfig,
 }
 
 impl InstancePool {
     /// Build a pool from an existing manager set, indexing each manager by its
     /// client's management base URL for dispatch-time lookup.
-    pub fn from_managers(managers: HashMap<String, Arc<InstanceManager>>) -> Self {
+    pub fn from_managers(
+        managers: HashMap<String, Arc<InstanceManager>>,
+        supervisor: Option<Arc<crate::supervisor::LlamaServerSupervisor>>,
+    ) -> Self {
         let by_base = managers
             .iter()
             .map(|(key, m)| (management_base_url(m.client().base_url()), key.clone()))
             .collect();
-        Self { managers, by_base }
+        // The policy is shared across managers (it is cloned from the config
+        // into each); take the first manager's as the pool-wide residency
+        // policy. An empty pool has no policy needs.
+        let policy = managers
+            .values()
+            .next()
+            .map(|m| m.policy.clone())
+            .unwrap_or_default();
+        Self {
+            managers,
+            by_base,
+            supervisor,
+            policy,
+        }
     }
 
     /// Whether any model is managed (the sidecar is active).
@@ -1004,9 +977,241 @@ impl InstancePool {
         self.managers.get(key)
     }
 
+    /// The supervisor (present when any model is managed).
+    pub fn supervisor(&self) -> Option<&Arc<crate::supervisor::LlamaServerSupervisor>> {
+        self.supervisor.as_ref()
+    }
+
     /// Iterate the managers (the server spawns each manager's sidecar task).
     pub fn managers_iter(&self) -> impl Iterator<Item = &Arc<InstanceManager>> {
         self.managers.values()
+    }
+
+    /// Ensure the model behind a dispatch endpoint is loaded: spawn its
+    /// `llama-server` on demand if it is lazy (no pinned instance at boot) and
+    /// currently unloaded. Also ensures a specifically-targeted instance
+    /// (e.g. `<base>:scratch`) is created on demand. Best-effort: a failure to
+    /// load degrades to the caller's normal dispatch error path.
+    pub async fn ensure_target_ready(&self, endpoint_url: &str, instance: Option<&str>) {
+        let Some(manager) = self.manager_for_url(endpoint_url) else {
+            return;
+        };
+        let model_key = manager.model_key();
+        if let Some(sup) = &self.supervisor {
+            if sup.is_running(model_key) != Some(true) {
+                if let Err(e) = sup.ensure_running(model_key).await {
+                    tracing::warn!(
+                        target: "router.instances",
+                        model = %model_key,
+                        error = %e,
+                        "on-demand model load failed",
+                    );
+                }
+            }
+        }
+        if let Some(instance) = instance {
+            if let Err(e) = manager.ensure_instance(instance).await {
+                tracing::warn!(
+                    target: "router.instances",
+                    model = %model_key,
+                    instance = %instance,
+                    error = %e,
+                    "on-demand instance create failed",
+                );
+            }
+        }
+    }
+
+    /// One device-wide residency pass. The pool owns VRAM residency for the
+    /// whole device (all managed servers share it), so this aggregates every
+    /// manager's `/instances` into a device `used` total and compares it to
+    /// the allocation budget (`device_total - minimum_remaining_vram`).
+    ///
+    /// When the budget is exceeded, evicts up to `evict_batch` least-recently
+    /// used **largest** unpinned instances across all managers (the residency
+    /// goal: free the most VRAM from the coldest context), then unloads any
+    /// model whose server is left with zero contexts (its weights are freed).
+    /// Pinned instances are never evicted.
+    pub async fn residency_cycle(&self) -> Result<(), InstanceError> {
+        let Some(budget) = self.policy.allocation_limit() else {
+            tracing::info!(
+                target: "router.instances",
+                "residency: no allocation budget (set sidecar.minimum_remaining_vram or vram_total_bytes)",
+            );
+            return Ok(());
+        };
+        let mut used: u64 = 0;
+        let mut candidates: Vec<(InstanceInfo, &InstanceManager)> = Vec::new();
+        for manager in self.managers.values() {
+            let envelope = match manager.client().list().await {
+                Ok(e) => e,
+                Err(e) => {
+                    // A down server (lazy model not yet loaded) contributes 0
+                    // VRAM and no candidates; report at debug to avoid noise.
+                    tracing::debug!(
+                        target: "router.instances",
+                        model = %manager.model_key(),
+                        error = %e,
+                        "residency poll skipped - server down",
+                    );
+                    continue;
+                }
+            };
+            used = used.saturating_add(envelope.total.total);
+            for info in envelope.instances {
+                if !info.pinned {
+                    candidates.push((info, manager));
+                }
+            }
+        }
+        if used <= budget {
+            tracing::debug!(
+                target: "router.instances",
+                used_bytes = used,
+                budget_bytes = budget,
+                "device VRAM within budget - no eviction this pass",
+            );
+            return Ok(());
+        }
+        tracing::warn!(
+            target: "router.instances",
+            used_bytes = used,
+            budget_bytes = budget,
+            "device VRAM over budget - evicting LRU-largest unpinned instances",
+        );
+        // LRU first (last_used asc), then largest (vram_bytes desc) so each
+        // eviction frees the most VRAM from the coldest context.
+        candidates.sort_by(|(a, _), (b, _)| {
+            a.last_used
+                .cmp(&b.last_used)
+                .then_with(|| b.vram_bytes.cmp(&a.vram_bytes))
+        });
+        let mut evicted = 0usize;
+        for (info, manager) in candidates {
+            if evicted >= self.policy.evict_batch {
+                break;
+            }
+            let name = instance_name_from_server_id(&info.id);
+            match manager.client().destroy(name, false).await {
+                Ok(()) => {
+                    evicted += 1;
+                    tracing::info!(
+                        target: "router.instances",
+                        model = %manager.model_key(),
+                        instance = %info.id,
+                        last_used = info.last_used,
+                        vram_bytes = info.vram_bytes,
+                        "unpinned instance evicted for over-budget VRAM",
+                    );
+                    crate::audit::emit(
+                        "instances",
+                        serde_json::json!({
+                            "action": "evict",
+                            "instance": info.id,
+                            "reason": "over_budget",
+                        }),
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    target: "router.instances",
+                    instance = %info.id,
+                    error = %e,
+                    "instance eviction failed",
+                ),
+            }
+        }
+        // Unload any model whose server now has zero contexts: its weights are
+        // freed, restoring VRAM that instance-level eviction cannot.
+        self.unload_empty_models().await;
+        Ok(())
+    }
+
+    /// Unload managed models whose servers report zero contexts (all their
+    /// instances were evicted). Frees the weights. Never touches models still
+    /// holding contexts (pinned instances keep their models resident). Plain
+    /// models (no instance pool) report no `/instances` and are skipped — their
+    /// on-demand lifecycle is driven by `ensure_target_ready`/residency eviction
+    /// at the model level instead.
+    pub async fn unload_empty_models(&self) {
+        let Some(sup) = &self.supervisor else {
+            return;
+        };
+        let mut keys: Vec<String> = self.managers.keys().cloned().collect();
+        keys.sort();
+        for key in keys {
+            let Some(manager) = self.managers.get(&key) else {
+                continue;
+            };
+            if manager.profiles.is_empty() {
+                continue;
+            }
+            let empty = match manager.client().list().await {
+                Ok(envelope) => envelope.instances.is_empty(),
+                Err(_) => continue,
+            };
+            if empty {
+                tracing::info!(
+                    target: "router.instances",
+                    model = %key,
+                    "model has no contexts left - unloading weights",
+                );
+                crate::audit::emit(
+                    "instances",
+                    serde_json::json!({
+                        "action": "unload_model",
+                        "model": key,
+                        "reason": "no_contexts",
+                    }),
+                );
+                sup.unload(&key).await;
+            }
+        }
+    }
+
+    /// The residency loop: poll device VRAM every `poll_interval_s`, evicting
+    /// LRU-largest unpinned instances when over budget, forever. Runs as a
+    /// spawned task owned by the server. Without an allocation budget
+    /// eviction is impossible, so the loop notes the disabled eviction once
+    /// and exits.
+    pub async fn run_residency(&self) {
+        if self.policy.allocation_limit().is_none() {
+            tracing::info!(
+                target: "router.instances",
+                "residency eviction disabled - no allocation budget (set sidecar.minimum_remaining_vram or vram_total_bytes)",
+            );
+            return;
+        }
+        let base = Duration::from_secs(self.policy.poll_interval_s.max(1));
+        let mut consecutive_failures = 0u32;
+        loop {
+            match self.residency_cycle().await {
+                Ok(()) => consecutive_failures = 0,
+                Err(e) => {
+                    consecutive_failures += 1;
+                    if consecutive_failures == 1 {
+                        tracing::warn!(
+                            target: "router.instances",
+                            error = %e,
+                            "residency poll failed - backing off (retrying with backoff)",
+                        );
+                    } else {
+                        tracing::debug!(
+                            target: "router.instances",
+                            error = %e,
+                            consecutive_failures = consecutive_failures,
+                            "residency poll still failing - backing off",
+                        );
+                    }
+                }
+            }
+            tokio::time::sleep(Self::residency_backoff(base, consecutive_failures)).await;
+        }
+    }
+
+    /// Compute the sleep delay for the residency loop after
+    /// `consecutive_failures` consecutive failed polls (0 = healthy).
+    fn residency_backoff(base: Duration, consecutive_failures: u32) -> Duration {
+        base.saturating_mul(consecutive_failures.saturating_add(1).min(12))
     }
 
     /// Resolve the public instance id grammar `<model_id>:<name>` (or a bare
@@ -1584,6 +1789,7 @@ mod tests {
             vram_low_watermark_bytes: 1024,
             evict_batch: 2,
             vram_total_bytes: Some(10000),
+            minimum_remaining_vram: Some(2000),
             slot_save_path: Some("/srv/slots".into()),
             api_key_env: None,
         }
@@ -1778,12 +1984,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_creates_missing_and_resizes_n_ctx_drift() {
+    async fn reconcile_creates_missing_pinned_and_resizes_n_ctx_drift() {
         // Server already has ledger (correct) and swarm0 (wrong n_ctx); swarm1
         // is missing entirely.
         let existing = [
             instance_info("ledger", "ledger", true, 1),
-            instance_info("swarm0", "swarm", false, 5),
+            instance_info("swarm0", "swarm", true, 5),
         ];
         let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
             move |method, path, _body| {
@@ -1797,7 +2003,8 @@ mod tests {
         let stub = StubServer::start(handler);
         let client = InstanceClient::new(reqwest::Client::new(), stub.base_url(), None);
 
-        // Profiles: ledger (pinned, n_ctx 131072), swarm0 + swarm1 (group swarm, n_ctx 16384).
+        // Profiles: ledger (pinned, n_ctx 131072), swarm0 + swarm1 (group swarm,
+        // n_ctx 16384). swarm1 is unpinned -> deferred to on-demand creation.
         let profiles = vec![
             InstanceProfile {
                 name: Some("ledger".into()),
@@ -1817,7 +2024,7 @@ mod tests {
                 count: 1,
                 num_ctx: 16384,
                 parallel: None,
-                pinned: false,
+                pinned: true,
                 no_sleep: true,
                 sleep_idle_seconds: None,
                 default: false,
@@ -1840,7 +2047,8 @@ mod tests {
         manager.reconcile().await.expect("reconcile");
 
         let recorded = stub.recorded();
-        // One POST /instances (swarm1 missing) and one resize (swarm0 ctx drift).
+        // One resize (swarm0 ctx drift). No POST: swarm1 is unpinned and
+        // deferred, and every pinned profile already exists.
         let creates = recorded
             .iter()
             .filter(|(m, p, _)| m == "POST" && p == "/instances")
@@ -1849,18 +2057,97 @@ mod tests {
             .iter()
             .filter(|(_, p, _)| p.ends_with("/resize"))
             .count();
-        assert_eq!(creates, 1, "exactly one missing profile is created");
+        assert_eq!(creates, 0, "unpinned swarm1 deferred to on-demand creation");
         assert_eq!(resizes, 1, "n_ctx drift triggers exactly one resize");
-        let create_body: serde_json::Value = serde_json::from_str(
-            &recorded
+        assert_eq!(
+            recorded
                 .iter()
-                .find(|(m, p, _)| m == "POST" && p == "/instances")
-                .unwrap()
-                .2,
-        )
-        .unwrap();
-        assert_eq!(create_body["name"], "swarm1");
-        assert_eq!(create_body["group"], "swarm");
+                .filter(|(_, p, _)| p.ends_with("/resize"))
+                .map(|(_, p, _)| p.as_str())
+                .next(),
+            Some("/instances/ledger/resize"),
+            "ledger's n_ctx drift (131072 profile vs 16384 present) is resized"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_instance_creates_missing_unpinned_on_demand() {
+        // Server is empty; `scratch` is configured but unpinned -> absent at
+        // boot, created on demand by ensure_instance.
+        let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
+            move |method, path, _body| {
+                if method == "GET" && path == "/instances" {
+                    (200, r#"{"instances":[],"snapshots":[],"total":{"total":0}}"#.into())
+                } else {
+                    (201, "{}".into())
+                }
+            },
+        );
+        let stub = StubServer::start(handler);
+        let client = InstanceClient::new(reqwest::Client::new(), stub.base_url(), None);
+        let profiles = vec![InstanceProfile {
+            name: Some("scratch".into()),
+            group: Some("scratch".into()),
+            count: 1,
+            num_ctx: 131072,
+            parallel: None,
+            pinned: false,
+            no_sleep: false,
+            sleep_idle_seconds: Some(1),
+            default: false,
+            params: None,
+        }];
+        let manager = InstanceManager::new("base", client, profiles, sidecar_policy());
+        manager.ensure_instance("scratch").await.expect("ensure_instance");
+
+        let recorded = stub.recorded();
+        let creates: Vec<&(String, String, String)> = recorded
+            .iter()
+            .filter(|(m, p, _)| m == "POST" && p == "/instances")
+            .collect();
+        assert_eq!(creates.len(), 1, "scratch created on demand");
+        let body: serde_json::Value = serde_json::from_str(&creates[0].2).unwrap();
+        assert_eq!(body["name"], "scratch");
+        assert_eq!(body["group"], "scratch");
+    }
+
+    #[tokio::test]
+    async fn ensure_instance_skips_when_already_present_or_unknown() {
+        let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
+            move |method, path, _body| {
+                if method == "GET" && path == "/instances" {
+                    (200, serde_json::to_string(&[instance_info("scratch", "scratch", false, 7)]).unwrap())
+                } else {
+                    (200, "{}".into())
+                }
+            },
+        );
+        let stub = StubServer::start(handler);
+        let client = InstanceClient::new(reqwest::Client::new(), stub.base_url(), None);
+        let profiles = vec![InstanceProfile {
+            name: Some("scratch".into()),
+            group: Some("scratch".into()),
+            count: 1,
+            num_ctx: 131072,
+            parallel: None,
+            pinned: false,
+            no_sleep: false,
+            sleep_idle_seconds: None,
+            default: false,
+            params: None,
+        }];
+        let manager = InstanceManager::new("base", client, profiles, sidecar_policy());
+        // Already present -> no create.
+        manager.ensure_instance("scratch").await.expect("present");
+        // Unknown name -> nothing to create, no error.
+        manager.ensure_instance("nope").await.expect("unknown is a no-op");
+        let recorded = stub.recorded();
+        assert!(
+            recorded
+                .iter()
+                .all(|(m, _, _)| m != "POST"),
+            "no create when already present or unknown: {recorded:?}"
+        );
     }
 
     #[tokio::test]
@@ -1923,8 +2210,7 @@ mod tests {
 
     #[tokio::test]
     async fn residency_evicts_lru_unpinned_and_never_pinned() {
-        // Free VRAM is far below the watermark: ceiling 10000 - used 9000 = 1000 < 1024.
-        // The envelope's `total` is the VRAM signal (no separate /memory).
+        // Device budget = 10000 - 2000 = 8000; used 9000 -> over budget.
         let envelope = serde_json::json!({
             "instances": [
                 instance_info("pinned", "g", true, 0),    // exempt
@@ -1935,20 +2221,11 @@ mod tests {
             "snapshots": [],
             "total": { "model": 5000, "context": 2000, "compute": 2000, "total": 9000 }
         });
-        let envelope = envelope.to_string();
-        let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
-            move |method, path, _body| {
-                if method == "GET" && path == "/instances" {
-                    (200, envelope.clone())
-                } else {
-                    (200, "{}".into())
-                }
-            },
-        );
-        let stub = StubServer::start(handler);
-        let client = InstanceClient::new(reqwest::Client::new(), stub.base_url(), None);
-        let manager = InstanceManager::new("base", client, Vec::new(), sidecar_policy());
-        manager.residency_cycle().await.expect("residency");
+        let stub = residency_stub(envelope);
+        let mut managers = HashMap::new();
+        managers.insert("base".into(), manager_for_stub(&stub));
+        let pool = InstancePool::from_managers(managers, None);
+        pool.residency_cycle().await.expect("residency");
 
         // evict_batch = 2: the two oldest unpinned (lru1, lru2) are deleted;
         // pinned is never touched.
@@ -1965,87 +2242,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn residency_eviction_prefers_short_idle_profiles() {
-        // Free VRAM is below the watermark, so eviction runs. `scratch` (a
-        // short-idle hint) is evicted before the older `work` instance.
+    async fn residency_eviction_frees_largest_lru_context_first() {
+        // Two candidates with the same last_used: the one with more VRAM is
+        // evicted first (freeing the most VRAM from the coldest context).
+        let mut big = instance_info("big", "g", false, 100);
+        big.vram_bytes = 5000;
+        let mut small = instance_info("small", "g", false, 100);
+        small.vram_bytes = 1000;
         let envelope = serde_json::json!({
-            "instances": [
-                instance_info("work", "g", false, 100),     // older
-                instance_info("scratch", "g", false, 9000), // newer but hinted
-            ],
+            "instances": [ small, big ],
             "snapshots": [],
             "total": { "model": 5000, "context": 2000, "compute": 2000, "total": 9000 }
         });
-        let envelope = envelope.to_string();
-        let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
-            move |method, path, _body| {
-                if method == "GET" && path == "/instances" {
-                    (200, envelope.clone())
-                } else {
-                    (200, "{}".into())
-                }
-            },
-        );
-        let stub = StubServer::start(handler);
-        let client = InstanceClient::new(reqwest::Client::new(), stub.base_url(), None);
-        // `scratch` declares a short idle hint (prefer to evict); `work` has no
-        // profile (normal priority).
-        let profiles = vec![InstanceProfile {
-            name: Some("scratch".into()),
-            group: Some("g".into()),
-            count: 1,
-            num_ctx: 131072,
-            parallel: None,
-            pinned: false,
-            no_sleep: false,
-            sleep_idle_seconds: Some(1),
-            default: false,
-            params: None,
-        }];
+        let stub = residency_stub(envelope);
         let mut policy = sidecar_policy();
         policy.evict_batch = 1;
-        let manager = InstanceManager::new("base", client, profiles, policy);
-        manager.residency_cycle().await.expect("residency");
+        let manager = Arc::new(InstanceManager::new(
+            "base",
+            InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
+            Vec::new(),
+            policy,
+        ));
+        let mut managers = HashMap::new();
+        managers.insert("base".into(), manager);
+        let pool = InstancePool::from_managers(managers, None);
+        pool.residency_cycle().await.expect("residency");
 
-        let recorded = stub.recorded();
-        let deletes: Vec<&str> = recorded
+        let deletes: Vec<String> = stub
+            .recorded()
             .iter()
             .filter(|(m, _, _)| m == "DELETE")
-            .map(|(_, p, _)| p.as_str())
+            .map(|(_, p, _)| p.clone())
             .collect();
-        assert!(
-            deletes.contains(&"/instances/scratch"),
-            "hinted instance evicted first: {deletes:?}"
-        );
+        assert_eq!(deletes, vec!["/instances/big"], "largest LRU context evicted first");
     }
 
     #[tokio::test]
-    async fn residency_no_eviction_when_free_vram_above_watermark() {
+    async fn residency_no_eviction_when_free_vram_within_budget() {
         let envelope = serde_json::json!({
             "instances": [],
             "snapshots": [],
             "total": { "model": 1000, "context": 200, "compute": 200, "total": 1400 }
         });
-        // free = 10000 - 1400 = 8600 >= 1024 watermark -> no eviction.
-        let envelope = envelope.to_string();
-        let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
-            move |method, path, _body| {
-                if method == "GET" && path == "/instances" {
-                    (200, envelope.clone())
-                } else {
-                    (200, "{}".into())
-                }
-            },
-        );
-        let stub = StubServer::start(handler);
-        let client = InstanceClient::new(reqwest::Client::new(), stub.base_url(), None);
-        let manager = InstanceManager::new("base", client, Vec::new(), sidecar_policy());
-        manager.residency_cycle().await.expect("residency");
+        // used 1400 <= budget 8000 -> no eviction.
+        let stub = residency_stub(envelope);
+        let mut managers = HashMap::new();
+        managers.insert("base".into(), manager_for_stub(&stub));
+        let pool = InstancePool::from_managers(managers, None);
+        pool.residency_cycle().await.expect("residency");
         assert!(
             stub.recorded()
                 .iter()
                 .all(|(m, _, _)| m != "DELETE"),
-            "no eviction above the watermark"
+            "no eviction within budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn residency_polls_without_budget_and_never_evicts() {
+        // No vram_total_bytes and no minimum_remaining_vram -> no budget; the
+        // pass must still GET /instances and report, but must never DELETE.
+        let envelope = serde_json::json!({
+            "instances": [],
+            "snapshots": [],
+            "total": { "model": 5000, "context": 2000, "compute": 2000, "total": 9000 }
+        });
+        let stub = residency_stub(envelope);
+        let mut policy = sidecar_policy();
+        policy.vram_total_bytes = None;
+        policy.minimum_remaining_vram = None;
+        let manager = Arc::new(InstanceManager::new(
+            "base",
+            InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
+            Vec::new(),
+            policy,
+        ));
+        let mut managers = HashMap::new();
+        managers.insert("base".into(), manager);
+        let pool = InstancePool::from_managers(managers, None);
+        pool.residency_cycle().await.expect("residency");
+        let recorded = stub.recorded();
+        assert!(
+            recorded.iter().any(|(m, p, _)| m == "GET" && p == "/instances"),
+            "instances are always polled, budget or not"
+        );
+        assert!(
+            recorded.iter().all(|(m, _, _)| m != "DELETE"),
+            "no eviction without a budget"
         );
     }
 
@@ -2088,81 +2371,6 @@ mod tests {
         assert_eq!(body["ctx_size"], 16384);
         let name = body["name"].as_str().unwrap();
         assert!(name.starts_with("swarm-"), "unique name generated: {name}");
-    }
-
-    #[tokio::test]
-    async fn residency_polls_without_ceiling_and_never_evicts() {
-        // vram_total_bytes: None - the pass must still GET /instances and
-        // report, but must never DELETE (eviction is gated on a configured
-        // ceiling).
-        let envelope = serde_json::json!({
-            "instances": [],
-            "snapshots": [],
-            "total": { "model": 5000, "context": 2000, "compute": 2000, "total": 9000 }
-        });
-        let envelope = envelope.to_string();
-        let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
-            move |method, path, _body| {
-                if method == "GET" && path == "/instances" {
-                    (200, envelope.clone())
-                } else {
-                    (200, "{}".into())
-                }
-            },
-        );
-        let stub = StubServer::start(handler);
-        let client = InstanceClient::new(reqwest::Client::new(), stub.base_url(), None);
-        let mut policy = sidecar_policy();
-        policy.vram_total_bytes = None;
-        let manager = InstanceManager::new("base", client, Vec::new(), policy);
-        manager.residency_cycle().await.expect("residency");
-        let recorded = stub.recorded();
-        assert!(
-            recorded.iter().any(|(m, p, _)| m == "GET" && p == "/instances"),
-            "instances are always polled, ceiling or not"
-        );
-        assert!(
-            recorded.iter().all(|(m, _, _)| m != "DELETE"),
-            "no eviction without a vram ceiling"
-        );
-    }
-
-    #[test]
-    fn eviction_priority_marks_short_idle_profiles() {
-        use crate::config::InstanceProfile;
-        let base = InstanceProfile {
-            name: None,
-            group: None,
-            count: 1,
-            num_ctx: 16384,
-            parallel: None,
-            pinned: false,
-            no_sleep: false,
-            sleep_idle_seconds: None,
-            default: false,
-            params: None,
-        };
-        let manager = InstanceManager::new("base", InstanceClient::new(reqwest::Client::new(), "http://x", None), vec![base.clone()], sidecar_policy());
-        // A profile with no hint -> normal priority (1).
-        assert_eq!(manager.eviction_priority("a"), 1);
-        // An unknown (runtime-created) instance -> normal priority (1).
-        assert_eq!(manager.eviction_priority("runtime-created"), 1);
-        // A profile declaring a positive idle hint -> prefer to evict (0).
-        let hinted = InstanceProfile {
-            name: Some("scratch".into()),
-            sleep_idle_seconds: Some(1),
-            ..base.clone()
-        };
-        let manager = InstanceManager::new("base", InstanceClient::new(reqwest::Client::new(), "http://x", None), vec![hinted], sidecar_policy());
-        assert_eq!(manager.eviction_priority("scratch"), 0);
-        // A pinned ledger with no hint -> normal priority.
-        let pinned = InstanceProfile {
-            name: Some("ledger".into()),
-            pinned: true,
-            ..base.clone()
-        };
-        let manager = InstanceManager::new("base", InstanceClient::new(reqwest::Client::new(), "http://x", None), vec![pinned], sidecar_policy());
-        assert_eq!(manager.eviction_priority("ledger"), 1);
     }
 
     #[tokio::test]
@@ -2234,7 +2442,7 @@ mod tests {
                 sidecar_policy(),
             )),
         );
-        let pool = InstancePool::from_managers(managers);
+        let pool = InstancePool::from_managers(managers, None);
 
         let agg = pool.aggregate(None).await.expect("aggregate");
         let instances = agg["instances"].as_array().unwrap();
@@ -2299,7 +2507,7 @@ mod tests {
                 sidecar_policy(),
             )),
         );
-        let pool = InstancePool::from_managers(managers);
+        let pool = InstancePool::from_managers(managers, None);
         let agg = pool.aggregate(Some("swarm")).await.expect("scoped aggregate");
         assert_eq!(agg["instances"].as_array().unwrap().len(), 1);
         let unknown = pool.aggregate(Some("nope")).await.expect("unknown scope");
@@ -2307,6 +2515,125 @@ mod tests {
         assert!(pool.resolve_instance_id("swarm:ledger").is_some());
         assert!(pool.resolve_instance_id("swarm:ledger:x").is_none());
         assert!(pool.resolve_instance_id("nope:x").is_none());
+    }
+
+    /// Build a stub server that serves a fixed `/instances` envelope and
+    /// records destroys; DELETE answers 200.
+    fn residency_stub(envelope: serde_json::Value) -> StubServer {
+        let envelope = envelope.to_string();
+        let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
+            move |method, path, _body| {
+                if method == "GET" && path == "/instances" {
+                    (200, envelope.clone())
+                } else {
+                    (200, "{}".into())
+                }
+            },
+        );
+        StubServer::start(handler)
+    }
+
+    fn manager_for_stub(stub: &StubServer) -> Arc<InstanceManager> {
+        Arc::new(InstanceManager::new(
+            "swarm",
+            InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
+            Vec::new(),
+            sidecar_policy(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn pool_residency_evicts_lru_largest_unpinned_across_managers() {
+        // Device budget = 10000 (vram_total) - 2000 (minimum_remaining) = 8000.
+        // Both managers together report used 9000 -> over budget. The coldest
+        // largest unpinned context (old) is evicted first; pinned never is.
+        let env_a = serde_json::json!({
+            "instances": [
+                instance_info("pinned", "g", true, 0),    // exempt
+                instance_info("old", "g", false, 100),    // LRU, vram 1000
+                instance_info("big", "g", false, 200),    // larger vram 1000
+            ],
+            "snapshots": [],
+            "total": { "model": 5000, "context": 2000, "compute": 2000, "total": 9000 }
+        });
+        let env_b = serde_json::json!({
+            "instances": [],
+            "snapshots": [],
+            "total": { "model": 0, "context": 0, "compute": 0, "total": 0 }
+        });
+        let stub_a = residency_stub(env_a);
+        let stub_b = residency_stub(env_b);
+        let mut managers = HashMap::new();
+        managers.insert("swarm".into(), manager_for_stub(&stub_a));
+        managers.insert("other".into(), manager_for_stub(&stub_b));
+        let pool = InstancePool::from_managers(managers, None);
+
+        pool.residency_cycle().await.expect("residency");
+
+        let deletes_a = stub_a
+            .recorded()
+            .iter()
+            .filter(|(m, _, _)| m == "DELETE")
+            .map(|(_, p, _)| p.clone())
+            .collect::<Vec<_>>();
+        // evict_batch = 2 (sidecar_policy) -> both unpinned candidates go,
+        // ordered LRU (old) before big; pinned never is.
+        assert_eq!(deletes_a.len(), 2, "evict_batch = 2 per pass");
+        assert!(deletes_a[0].ends_with("/old"), "LRU evicted first: {deletes_a:?}");
+        assert!(
+            !deletes_a.iter().any(|p| p.contains("pinned")),
+            "pinned instance never evicted"
+        );
+        assert!(
+            stub_b.recorded().iter().all(|(m, _, _)| m != "DELETE"),
+            "other manager has no unpinned candidates"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_residency_no_eviction_within_budget() {
+        // used 5000 <= budget 8000 -> no eviction.
+        let env = serde_json::json!({
+            "instances": [ instance_info("warm", "g", false, 1) ],
+            "snapshots": [],
+            "total": { "model": 4000, "context": 500, "compute": 500, "total": 5000 }
+        });
+        let stub = residency_stub(env);
+        let mut managers = HashMap::new();
+        managers.insert("swarm".into(), manager_for_stub(&stub));
+        let pool = InstancePool::from_managers(managers, None);
+        pool.residency_cycle().await.expect("residency");
+        assert!(
+            stub.recorded().iter().all(|(m, _, _)| m != "DELETE"),
+            "no eviction within budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_residency_without_budget_never_evicts() {
+        let mut policy = sidecar_policy();
+        policy.minimum_remaining_vram = None;
+        policy.vram_total_bytes = None;
+        let env = serde_json::json!({
+            "instances": [ instance_info("warm", "g", false, 1) ],
+            "snapshots": [],
+            "total": { "model": 4000, "context": 500, "compute": 500, "total": 5000 }
+        });
+        let stub = residency_stub(env);
+        let manager = Arc::new(InstanceManager::new(
+            "swarm",
+            InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
+            Vec::new(),
+            policy,
+        ));
+        let mut managers = HashMap::new();
+        managers.insert("swarm".into(), manager);
+        let pool = InstancePool::from_managers(managers, None);
+        pool.residency_cycle().await.expect("residency");
+        assert!(
+            stub.recorded().iter().all(|(m, _, _)| m != "DELETE"),
+            "no budget -> no eviction"
+        );
     }
 
     #[test]
@@ -2329,7 +2656,7 @@ mod tests {
                 }
             }))
             .unwrap();
-        let err = match build_instance_managers(&config) {
+        let err = match build_instance_managers(&config, None) {
             Err(e) => e,
             Ok(_) => panic!("duplicate-name config must fail validation"),
         };
@@ -2373,7 +2700,7 @@ mod tests {
                 }
             }))
             .unwrap();
-        let pool = build_instance_managers(&config).expect("valid config builds managers");
+        let pool = build_instance_managers(&config, None).expect("valid config builds managers");
         assert_eq!(pool.managers_iter().count(), 1);
         // Keyed by the Coral Router model id.
         assert!(pool.manager("a").is_some());
@@ -2392,7 +2719,7 @@ mod tests {
                 }
             }))
             .unwrap();
-        let pool = build_instance_managers(&config).expect("no managers");
+        let pool = build_instance_managers(&config, None).expect("no managers");
         assert!(pool.is_empty());
     }
 }

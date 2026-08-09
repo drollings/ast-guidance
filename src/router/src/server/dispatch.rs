@@ -393,6 +393,15 @@ pub async fn dispatch_real(
             "dispatch attempt"
         );
 
+        // On-demand residency: ensure the target's managed model is loaded
+        // (spawn its llama-server if it is lazy and currently unloaded) and
+        // that a specifically-targeted instance exists. Best-effort — a load
+        // failure surfaces as the target's own dispatch error below.
+        if let Some(pool) = instance_pool {
+            pool.ensure_target_ready(&target.url, target.instance.as_deref())
+                .await;
+        }
+
         let attempt_start = Instant::now();
         match dispatch_to_single_target(
             target,
@@ -648,7 +657,7 @@ mod tests {
         ));
         let mut managers = std::collections::HashMap::new();
         managers.insert("base".into(), manager);
-        let pool = InstancePool::from_managers(managers);
+        let pool = InstancePool::from_managers(managers, None);
 
         let request = crate::types::RouterRequest {
             model: "base".into(),

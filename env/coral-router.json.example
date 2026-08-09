@@ -195,8 +195,23 @@
         "vram_low_watermark_bytes": 1073741824,
         "evict_batch": 1,
         "vram_total_bytes": null,
-        "slot_save_path": "/srv/slots",
+        "minimum_remaining_vram": 2147483648,
+        "slot_save_path": "data/slots",
         "api_key_env": null
+    },
+    "default_params": {
+        "num_ctx": 16384,
+        "batch_size": 4096,
+        "ubatch_size": 1024,
+        "cache_type_k": "q8_0",
+        "cache_type_v": "q8_0",
+        "flash_attn": "on",
+        "n_gpu_layers": 999,
+        "n_cpu_moe": 0,
+        "sleep_idle_seconds": 15,
+        "stream": true,
+        "filter_thinking": true,
+        "params": { "temperature": 0.4 }
     },
     "logging": {
         "log_dir": "logs",

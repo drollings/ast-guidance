@@ -57,6 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     let mut config: RouterConfig = load_json_or_default(args.config.as_ref());
+    config.apply_defaults();
 
     // CLI overrides take priority over config file
     let bind_addr = match (args.host.as_deref(), args.port) {
@@ -234,7 +235,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // instance pool. The server owns their reconcile + residency tasks. A
     // malformed instance grammar (duplicate name / group-name collision)
     // fails fast so boot aborts loudly.
-    let instance_pool = match fluent_router::instances::build_instance_managers(&config) {
+    let instance_pool = match fluent_router::instances::build_instance_managers(
+        &config,
+        _supervisor.clone(),
+    ) {
         Ok(pool) => pool,
         Err(e) => {
             tracing::error!(

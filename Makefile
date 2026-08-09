@@ -160,9 +160,14 @@ router: $(CORAL_ROUTER_BIN) ## Build coral-router
 # so a plain kill never orphans serving processes.
 define stop-router
 	$(Q)echo "Stopping any running coral-router"
-	$(Q)pkill -x coral-router 2>/dev/null || true
-	$(Q)for i in $$(seq 1 25); do pgrep -x coral-router >/dev/null 2>&1 || break; sleep 0.2; done
+	$(Q)#pkill -x coral-router 2>/dev/null || true
+	$(Q)#for i in $$(seq 1 5); do pgrep -x coral-router >/dev/null 2>&1 || break; sleep 0.2; done
+	$(Q)killall coral-router 2>/dev/null || true
 endef
+
+.PHONY: router-stop
+router-stop: ## Stop coral-router (SIGTERM, so it stops its managed llama-servers first)
+	$(stop-router)
 
 .PHONY: router-test
 router-test: $(CORAL_ROUTER_BIN) ## Run all router unit, golden, and e2e mock tests; validate the built binary
@@ -187,6 +192,7 @@ ROUTER_MOCK_TEST_SCRIPT := bin/router-mock-tests.sh
 .PHONY: router-start
 router-start: $(CORAL_ROUTER_BIN) ## Build (if needed) and (re)start coral-router, waiting for /health
 	$(stop-router)
+	$(Q)echo "Starting coral-router"
 	$(Q)nohup $(CORAL_ROUTER_BIN) -c $(CORAL_ROUTER_CONFIG) > $(ROUTER_LOG) 2>&1 &
 	$(Q)bash $(ROUTER_WAIT_SCRIPT) $(CORAL_ROUTER_HEALTH_URL) $(ROUTER_START_TIMEOUT_S) $(ROUTER_LOG)
 

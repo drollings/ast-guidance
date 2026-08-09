@@ -226,11 +226,12 @@ impl RouterServer {
             api_key_env_name: self.api_key_env_name.clone(),
         };
 
-        // Reconcile configured instances at boot (retrying until the managed
-        // server's management API is reachable), then run each manager's
-        // residency loop (poll /instances, evict LRU unpinned on low free
-        // VRAM) for the life of the server. Best-effort: a failed
-        // reconcile/residency poll logs and continues.
+        // Reconcile configured pinned instances at boot (retrying until the
+        // managed server's management API is reachable) per manager, then run
+        // one device-wide residency loop (poll all /instances, evict
+        // LRU-largest unpinned when over the VRAM budget, unload empty
+        // models). Best-effort: a failed reconcile/residency poll logs and
+        // continues.
         if let Some(pool) = &self.instance_pool {
             for manager in pool.managers_iter() {
                 let manager = manager.clone();
@@ -238,6 +239,10 @@ impl RouterServer {
                     manager.bootstrap().await;
                 });
             }
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                pool.run_residency().await;
+            });
         }
 
         run_http(&self.bind_addr, deps).await

@@ -96,6 +96,10 @@ pub struct RouterConfig {
     /// today's behavior - no session registry at boot.
     #[serde(default)]
     pub session: Option<SessionConfig>,
+    /// Default "how a model is run" parameters (the `default_params` block).
+    /// Applied to every managed model that does not declare the key itself.
+    #[serde(default)]
+    pub default_params: DefaultModelParams,
 }
 
 impl Default for RouterConfig {
@@ -124,11 +128,37 @@ impl Default for RouterConfig {
             sidecar: SidecarConfig::default(),
             ledger: None,
             session: None,
+            default_params: DefaultModelParams::default(),
         }
     }
 }
 
 impl RouterConfig {
+    /// Merge the `default_params` sampling defaults into every model entry that
+    /// does not declare its own values (per-model values win). Call once after
+    /// config load so the rest of the crate sees fully-materialized params.
+    ///
+    /// Only the sampling `params` object is merged here — the server-launch
+    /// defaults (`batch_size`, KV cache types, GPU offload, context size) are
+    /// consumed directly by the supervisor (`build_server_args`).
+    pub fn apply_defaults(&mut self) {
+        let Some(default_params) = self.default_params.params.clone() else {
+            return;
+        };
+        let serde_json::Value::Object(defaults) = default_params else {
+            return;
+        };
+        for entry in self.models.values_mut() {
+            let Some(serde_json::Value::Object(existing)) = entry.params.as_mut() else {
+                entry.params = Some(serde_json::Value::Object(defaults.clone()));
+                continue;
+            };
+            for (key, value) in &defaults {
+                existing.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+    }
+
     /// The flat `routes` view the server consumes (model - pipeline mapping).
     ///
     /// Flat configs return `routes` unchanged. When a classification tree is
@@ -673,6 +703,105 @@ impl Default for LedgerConfig {
 /// `Some` opts the composition root into a `SessionRegistry` (D6 canonical
 /// session home) so checkpoint/rewind state and rigor rewind exist at runtime.
 /// `None` (absent) keeps today's behavior - no session registry at boot.
+/// Default model run parameters - the top-level `default_params` block.
+///
+/// Supplies the "how a model is run" defaults applied to every managed model
+/// that does not declare the key itself: the `llama-server` launch knobs
+/// (`--batch-size`, `--ubatch-size`, `--cache-type-k/v`, `--flash-attn`,
+/// `--n-gpu-layers`, `--n-cpu-moe`, `--sleep-idle-seconds`, `--ctx-size`) and
+/// the sampling `params` merged into dispatch bodies (per-model values win).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DefaultModelParams {
+    /// Default context size in tokens (`--ctx-size`; also `ctx_size` alias).
+    #[serde(default = "default_num_ctx", alias = "ctx_size")]
+    pub num_ctx: u64,
+    /// Logical maximum batch size (`--batch-size`).
+    #[serde(default = "default_batch_size")]
+    pub batch_size: u64,
+    /// Physical maximum batch size (`--ubatch-size`).
+    #[serde(default = "default_ubatch_size")]
+    pub ubatch_size: u64,
+    /// KV cache data type for K (`--cache-type-k`).
+    #[serde(default = "default_cache_type")]
+    pub cache_type_k: String,
+    /// KV cache data type for V (`--cache-type-v`).
+    #[serde(default = "default_cache_type")]
+    pub cache_type_v: String,
+    /// Flash attention mode (`--flash-attn on|off|auto`); `None` keeps the
+    /// fork default.
+    #[serde(default)]
+    pub flash_attn: Option<String>,
+    /// Max layers stored in VRAM (`--n-gpu-layers`).
+    #[serde(default = "default_n_gpu_layers")]
+    pub n_gpu_layers: i32,
+    /// MoE expert layers kept in CPU RAM (`--n-cpu-moe`).
+    #[serde(default)]
+    pub n_cpu_moe: i32,
+    /// Idle timeout after which the fork sleeps an instance
+    /// (`--sleep-idle-seconds`). Only emitted for plain (no-instance) models;
+    /// instance pools own residency through the sidecar.
+    #[serde(default = "default_sleep_idle_seconds")]
+    pub sleep_idle_seconds: i32,
+    /// Whether dispatches through models without an explicit `stream` stream.
+    #[serde(default = "default_true")]
+    pub stream: bool,
+    /// Whether dispatches through models without an explicit `filter_thinking`
+    /// strip thinking blocks.
+    #[serde(default)]
+    pub filter_thinking: bool,
+    /// Default sampling params merged into dispatch bodies (per-model wins).
+    #[serde(default)]
+    pub params: Option<serde_json::Value>,
+}
+
+impl Default for DefaultModelParams {
+    fn default() -> Self {
+        Self {
+            num_ctx: default_num_ctx(),
+            batch_size: default_batch_size(),
+            ubatch_size: default_ubatch_size(),
+            cache_type_k: default_cache_type(),
+            cache_type_v: default_cache_type(),
+            flash_attn: None,
+            n_gpu_layers: default_n_gpu_layers(),
+            n_cpu_moe: 0,
+            sleep_idle_seconds: default_sleep_idle_seconds(),
+            stream: default_true(),
+            filter_thinking: false,
+            params: None,
+        }
+    }
+}
+
+const fn default_num_ctx() -> u64 {
+    16384
+}
+
+const fn default_batch_size() -> u64 {
+    4096
+}
+
+const fn default_ubatch_size() -> u64 {
+    1024
+}
+
+fn default_cache_type() -> String {
+    "q8_0".into()
+}
+
+const fn default_n_gpu_layers() -> i32 {
+    999
+}
+
+const fn default_sleep_idle_seconds() -> i32 {
+    15
+}
+
+/// Session composition section (M2) - the `session` block of `RouterConfig`.
+///
+/// `Some` opts the composition root into a `SessionRegistry` (D6 canonical
+/// session home) so checkpoint/rewind state and rigor rewind exist at runtime.
+/// `None` (absent) keeps today's behavior - no session registry at boot.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionConfig {
     /// Cold-tier mountpoint for KV cache snapshots, mapped to
@@ -705,6 +834,13 @@ pub struct SidecarConfig {
     /// loop still polls and logs) because free VRAM cannot be computed.
     #[serde(default)]
     pub vram_total_bytes: Option<u64>,
+    /// Free-VRAM floor (bytes) that must remain unallocated: the effective
+    /// allocation limit is `device_total - minimum_remaining_vram`. When
+    /// `vram_total_bytes` is `None`, the device total is detected at boot
+    /// (ROCm `mem_info_vram_total`); `minimum_remaining_vram` then alone
+    /// enables the residency eviction budget.
+    #[serde(default)]
+    pub minimum_remaining_vram: Option<u64>,
     /// Slot-save directory the fork writes KV snapshots under
     /// (`<slot_save_path>/<model_key>/`). Feeds M3 snapshot-path derivation.
     #[serde(default)]
@@ -721,6 +857,7 @@ impl Default for SidecarConfig {
             vram_low_watermark_bytes: default_sidecar_watermark(),
             evict_batch: default_sidecar_evict_batch(),
             vram_total_bytes: None,
+            minimum_remaining_vram: None,
             slot_save_path: None,
             api_key_env: None,
         }
@@ -737,6 +874,41 @@ const fn default_sidecar_watermark() -> u64 {
 
 const fn default_sidecar_evict_batch() -> usize {
     1
+}
+
+/// Detect the device VRAM total (bytes) from the ROCm sysfs interface. Returns
+/// the first non-zero `mem_info_vram_total` found under `/sys/class/drm`. Used
+/// when `sidecar.vram_total_bytes` is unset so a `minimum_remaining_vram`
+/// budget alone can drive the residency loop. `None` when the interface is
+/// absent (non-ROCm hosts).
+pub fn detect_device_vram_total() -> Option<u64> {
+    let entries = std::fs::read_dir("/sys/class/drm").ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path().join("device/mem_info_vram_total");
+        let text = std::fs::read_to_string(path).ok()?;
+        let total = text.trim().parse::<u64>().ok()?;
+        if total > 0 {
+            return Some(total);
+        }
+    }
+    None
+}
+
+impl SidecarConfig {
+    /// The device VRAM total: the explicit `vram_total_bytes` ceiling first,
+    /// else the ROCm sysfs detection. `None` when neither is available.
+    pub fn device_total_bytes(&self) -> Option<u64> {
+        self.vram_total_bytes.or_else(detect_device_vram_total)
+    }
+
+    /// The effective VRAM allocation budget: `device_total - minimum_remaining
+    /// _vram`. `None` when no device total is available, or when neither a
+    /// ceiling nor a minimum-remaining floor is configured (eviction off).
+    pub fn allocation_limit(&self) -> Option<u64> {
+        let total = self.device_total_bytes()?;
+        let min_remaining = self.minimum_remaining_vram.unwrap_or(0);
+        Some(total.saturating_sub(min_remaining))
+    }
 }
 
 const fn default_charts_min_score() -> f64 {
@@ -1406,6 +1578,7 @@ mod tests {
         assert_eq!(cfg.sidecar.vram_low_watermark_bytes, 1073741824);
         assert_eq!(cfg.sidecar.evict_batch, 1);
         assert!(cfg.sidecar.vram_total_bytes.is_none());
+        assert!(cfg.sidecar.minimum_remaining_vram.is_none());
         assert!(cfg.sidecar.slot_save_path.is_none());
         assert!(cfg.sidecar.api_key_env.is_none());
     }
@@ -1418,6 +1591,7 @@ mod tests {
                 "vram_low_watermark_bytes": 536870912,
                 "evict_batch": 2,
                 "vram_total_bytes": 1048576,
+                "minimum_remaining_vram": 2147483648u64,
                 "slot_save_path": "/srv/slots",
                 "api_key_env": "LLAMA_API_KEY",
             }
@@ -1427,8 +1601,97 @@ mod tests {
         assert_eq!(cfg.sidecar.vram_low_watermark_bytes, 536870912);
         assert_eq!(cfg.sidecar.evict_batch, 2);
         assert_eq!(cfg.sidecar.vram_total_bytes, Some(1048576));
+        assert_eq!(cfg.sidecar.minimum_remaining_vram, Some(2147483648));
         assert_eq!(cfg.sidecar.slot_save_path.as_deref(), Some("/srv/slots"));
         assert_eq!(cfg.sidecar.api_key_env.as_deref(), Some("LLAMA_API_KEY"));
+    }
+
+    #[test]
+    fn sidecar_allocation_limit_from_minimum_remaining() {
+        // With a ceiling configured, the budget is ceiling - minimum remaining.
+        let cfg: RouterConfig = serde_json::from_value(serde_json::json!({
+            "sidecar": { "vram_total_bytes": 10000, "minimum_remaining_vram": 2000 }
+        }))
+        .unwrap();
+        assert_eq!(cfg.sidecar.allocation_limit(), Some(8000));
+    }
+
+    #[test]
+    fn sidecar_allocation_limit_without_ceiling_falls_back_to_detection() {
+        // No explicit ceiling: the budget is computed from the detected total.
+        // The host has a ROCm device (mem_info_vram_total > 0), so the limit is
+        // detection - minimum_remaining; a missing floor yields the full total.
+        let cfg: RouterConfig = serde_json::from_value(serde_json::json!({
+            "sidecar": { "minimum_remaining_vram": 2147483648u64 }
+        }))
+        .unwrap();
+        let detected = super::detect_device_vram_total();
+        assert!(
+            detected.is_some(),
+            "ROCm sysfs mem_info_vram_total present on this host"
+        );
+        assert_eq!(
+            cfg.sidecar.allocation_limit(),
+            detected.map(|t| t.saturating_sub(2147483648))
+        );
+    }
+
+    #[test]
+    fn default_params_absent_section_defaults_cleanly() {
+        let cfg: RouterConfig =
+            serde_json::from_str(r#"{"server": {"bind_addr": "127.0.0.1:0"}}"#).unwrap();
+        assert_eq!(cfg.default_params.num_ctx, 16384);
+        assert_eq!(cfg.default_params.batch_size, 4096);
+        assert_eq!(cfg.default_params.n_gpu_layers, 999);
+        assert!(cfg.default_params.params.is_none());
+    }
+
+    #[test]
+    fn default_params_section_round_trips() {
+        let cfg: RouterConfig = serde_json::from_value(serde_json::json!({
+            "default_params": {
+                "num_ctx": 8192,
+                "batch_size": 512,
+                "ubatch_size": 256,
+                "cache_type_k": "f16",
+                "cache_type_v": "f16",
+                "flash_attn": "off",
+                "n_gpu_layers": 0,
+                "n_cpu_moe": 4,
+                "sleep_idle_seconds": 30,
+                "stream": false,
+                "filter_thinking": true,
+                "params": { "temperature": 0.2 }
+            }
+        }))
+        .unwrap();
+        assert_eq!(cfg.default_params.num_ctx, 8192);
+        assert_eq!(cfg.default_params.batch_size, 512);
+        assert_eq!(cfg.default_params.ubatch_size, 256);
+        assert_eq!(cfg.default_params.cache_type_k, "f16");
+        assert_eq!(cfg.default_params.cache_type_v, "f16");
+        assert_eq!(cfg.default_params.flash_attn.as_deref(), Some("off"));
+        assert_eq!(cfg.default_params.n_gpu_layers, 0);
+        assert_eq!(cfg.default_params.n_cpu_moe, 4);
+        assert_eq!(cfg.default_params.sleep_idle_seconds, 30);
+        assert!(!cfg.default_params.stream);
+        assert!(cfg.default_params.filter_thinking);
+        assert_eq!(
+            cfg.default_params
+                .params
+                .as_ref()
+                .and_then(|p| p.get("temperature")),
+            Some(&serde_json::json!(0.2))
+        );
+    }
+
+    #[test]
+    fn default_params_ctx_size_alias_parses() {
+        let cfg: RouterConfig = serde_json::from_value(serde_json::json!({
+            "default_params": { "ctx_size": 32768 }
+        }))
+        .unwrap();
+        assert_eq!(cfg.default_params.num_ctx, 32768);
     }
 
     // -- M2 ledger + session composition sections ------------------------
