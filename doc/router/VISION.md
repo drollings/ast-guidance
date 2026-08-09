@@ -17,6 +17,14 @@ deterministic filters, small classifiers, local reasoning models, and
 occasional frontier calls, none of which are consulted unless a cheaper stage
 has already failed to resolve the request.
 
+Coral Router is also the process owner of the local inference fleet and the
+routing element between it and everything else: it spawns and supervises one
+`llama-server` process per model weights file, serves the `/instances`
+management contract at its own address, and is the single router between those
+llama-server tasks and every other OpenAI-compatible endpoint. A dispatch is a
+direct call to the owning server; a frontier or remote call is the same request
+routed onward after the local ladder has failed.
+
 ## Design principles
 
 - **Deterministic before probabilistic.** Anything decidable by a regex or a
@@ -78,6 +86,15 @@ has already failed to resolve the request.
   to a durably-retained audit stream distinct from routine operational logs.
   A rejected, redirected, or escalated request should be explainable after
   the fact without guesswork.
+
+- **Own the serving processes, route everything else.** Coral Router spawns
+  and supervises one `llama-server` per model weights file — found on `$PATH`
+  — on a free localhost port, and talks to each directly. The llama.cpp router
+  mode is never used; Coral Router is the only orchestrator and the single
+  routing element between its own llama-server tasks and every other
+  OpenAI-compatible endpoint. It owns all VRAM policy through the `/instances`
+  management API it serves at its own address, so the servers bind to
+  `127.0.0.1` and are never exposed directly.
 
 - **Reuse infrastructure, extend it, don't parallel-build it.** Enforced by
   explicit import-boundary rules and a documented DRY convention, not just
@@ -289,6 +306,51 @@ processed into reusable DAG workflows:
 This is the "neurosymbolic learning loop": the frontier path becomes a
 one-time cost that amortizes across similar queries.
 
+## The Serving Layer: owned llama-server processes
+
+Local models are not reached through a third-party gateway: Coral Router owns
+the serving processes. It spawns and supervises one `llama-server` process per
+model weights file, assigns each a free localhost port, and keeps it under
+supervision — restarting with backoff if it dies. It is the routing element
+between those llama-server tasks and every other OpenAI-compatible endpoint,
+and it never reaches a llama.cpp router: a dispatch is a direct HTTP call to
+the owning server.
+
+- **One process, one pool.** A model's weights are loaded exactly once per
+  `llama-server`. From those weights the server allocates named context
+  windows ("instances"), each an independent window of exactly its own
+  `ctx_size`; `parallel` slots share that one window and never multiply or
+  divide it. To run N full-size contexts the operator declares N instances
+  (`count: N`), never `parallel: N`.
+
+- **Declarative pools.** `models.<id>.instances` is the instance spec: a
+  `count: N` profile expands to N sibling instances named `<key>-0` ..
+  `<key>-{N-1}` in a shared group. Coral Router materializes the pool at boot
+  and reconciles drift through the management API.
+
+- **Model id translation.** Config keys are the public model ids; llama.cpp
+  model names are internal. Coral Router translates between them when it
+  proxies a request or a management call, so a client addresses an instance as
+  `<model_id>:<instance>` while the server sees `<llama-name>:<instance>`.
+
+- **Direct management.** The `/instances` contract — create, destroy, pin,
+  resize, snapshot — is served at Coral Router's own address as the single
+  sidecar entry point, aggregated across every managed model under
+  `<model_id>:<name>` ids with 64-bit-summed memory. The managed servers bind
+  to `127.0.0.1` only and are never exposed directly.
+
+- **VRAM policy lives in the router.** The sidecar polls the aggregate
+  `/instances` envelope, evicts least-recently-used unpinned instances when
+  free device memory drops below a watermark, and allocates fresh KV on a 503
+  group miss. It may retire a server process after its last instance is
+  evicted; the weights are freed either way.
+
+- **Routing fields.** Every generation request may carry `model`, `instance`,
+  `snapshot`, and `id_slot` from the JSON body or the query string (the body
+  wins). Coral Router resolves the model id to its owning server and forwards
+  the remainder, so a conversation can switch KV snapshots in and out of a
+  slot without re-prefilling.
+
 ## The Ledger: Content Nodes and levels of detail
 
 Every paragraph, prompt, tool result, or intermediate artifact is stored as a
@@ -453,6 +515,16 @@ model:
 A request arrives and passes through a strict escalation ladder, spending as
 little as possible at each rung before the next is even considered.
 
+**The serving layer is already there.** At boot Coral Router finds
+`llama-server` on `$PATH` and spawns one process per model weights file on a
+free localhost port, loading each model's weights exactly once. It materializes
+the configured instance pool, then supervises every process for the life of
+the installation. A routed local dispatch is a direct HTTP call to the owning
+server carrying the translated model id and any `instance`/`snapshot`/`id_slot`
+fields; a management call goes through Coral Router's own `/instances` API,
+which aggregates every pool into one memory surface. No llama.cpp router is
+involved at any point.
+
 **Deterministic filters** run first, with no model in the loop, resolving to
 one of three outcomes: a hard rejection that ends the request outright, a
 soft redirect that sends it down a different path, or an output filter that
@@ -540,3 +612,10 @@ handled a given request, why, and what it cost.
   every additional model call — local or frontier — as something a prior,
   cheaper stage must have failed to resolve first. Quality comes from
   routing and verification discipline, not from brute-force ensembling.
+
+- Not a re-implementation of llama.cpp's router mode. Coral Router never
+  reaches a llama.cpp router; it spawns and supervises the `llama-server`
+  processes itself, talks to each directly, and owns the `/instances`
+  management contract at its own address. Building a second router on top of
+  the llama.cpp router would parallel-build exactly the orchestration this
+  project exists to provide.

@@ -23,6 +23,16 @@ pub struct RouterRequest {
     pub agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter: Option<String>,
+    /// Instance or group to route to (forwarded to the owning llama-server).
+    /// Overrides any instance component of `model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
+    /// KV snapshot to switch into the target slot before serving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+    /// Slot to target for snapshot switching (defaults to 0 on the server).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_slot: Option<i32>,
     /// Internal pipeline metadata (anonymize map, routing annotations, etc.)
     /// Not sent to frontier providers. Serialized as empty object when absent.
     #[serde(default)]

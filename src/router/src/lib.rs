@@ -46,6 +46,7 @@ pub mod session;
 pub mod stages;
 pub mod streaming;
 pub mod summarization;
+pub mod supervisor;
 pub mod target_match;
 pub mod telemetry;
 pub mod transforms;

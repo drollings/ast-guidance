@@ -200,13 +200,48 @@ pub struct ModelEntry {
     /// old `sessions` key is accepted as an alias during the transition.
     #[serde(default, alias = "sessions")]
     pub instances: Option<HashMap<String, InstanceProfile>>,
+    /// Local GGUF weights file path. When set (or when `hf_repo` or `instances`
+    /// is set), Coral Router is the process owner: it spawns and supervises a
+    /// dedicated `llama-server` for this model on a free localhost port and
+    /// rewrites `endpoint` to it at boot. Passed to the server as `--model`.
+    #[serde(default)]
+    pub weights: Option<String>,
+    /// HuggingFace repo to load (`-hf <repo>[:quant]`), the on-demand
+    /// alternative to `weights`. The repo name also becomes the server's
+    /// primary model alias when `name` is unset.
+    #[serde(default)]
+    pub hf_repo: Option<String>,
+    /// HuggingFace file within `hf_repo` (`-hff <file>`); optional, overrides
+    /// the quant default.
+    #[serde(default)]
+    pub hf_file: Option<String>,
+}
+
+impl ModelEntry {
+    /// Whether Coral Router manages a dedicated `llama-server` process for this
+    /// model (the model declares a weights source or an instance pool). Managed
+    /// models are spawned on a free localhost port at boot and their `endpoint`
+    /// is rewritten to the spawned server.
+    pub fn is_managed(&self) -> bool {
+        self.weights.is_some() || self.hf_repo.is_some() || self.instances.is_some()
+    }
+
+    /// The model name handed to the spawned `llama-server` (`--alias`): the
+    /// configured llama.cpp model name, else the HF repo, else the config key.
+    pub fn llama_model_name(&self, model_key: &str) -> String {
+        self.name
+            .clone()
+            .or_else(|| self.hf_repo.clone())
+            .unwrap_or_else(|| model_key.to_string())
+    }
 }
 
 /// One config-declared instance profile. The map key on `ModelEntry.instances`
 /// provides the default instance name; `count > 1` expands into sibling
-/// instances sharing the profile's group. Sampling `params` are merged into the
-/// request body for dispatches through these instances; declaration-only keys
-/// (`num_ctx`/`parallel`/`sleep_idle_seconds`) are stripped before dispatch.
+/// instances named `<key>-0` .. `<key>-{count-1}` sharing the profile's group.
+/// Sampling `params` are merged into the request body for dispatches through
+/// these instances; declaration-only keys (`num_ctx`/`parallel`/
+/// `sleep_idle_seconds`) are stripped before dispatch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstanceProfile {
     /// Instance name; default = the map key (expanded `<name><i>` for count > 1).
@@ -248,9 +283,9 @@ fn default_instance_count() -> u32 {
 
 impl ModelEntry {
     /// The expanded flat list of `InstanceProfile`s for this model: applies
-    /// `count` expansion (naming each sibling `<name><i>`) and resolves the
-    /// name/group defaults (name = map key, group = name when absent). Empty
-    /// when no instances are configured.
+    /// `count` expansion (naming each sibling `<key>-0` .. `<key>-{count-1}`)
+    /// and resolves the name/group defaults (name = map key, group = name when
+    /// absent). Empty when no instances are configured.
     pub fn instance_profiles(&self) -> Vec<InstanceProfile> {
         let Some(instances) = &self.instances else {
             return Vec::new();
@@ -266,7 +301,7 @@ impl ModelEntry {
             let group = profile.group.clone().unwrap_or_else(|| base_name.clone());
             for i in 0..count {
                 let name = if count > 1 {
-                    format!("{base_name}{i}")
+                    format!("{base_name}-{i}")
                 } else {
                     base_name.clone()
                 };
@@ -1210,10 +1245,11 @@ mod tests {
         assert_eq!(profiles[0].group.as_deref(), Some("ledger"));
         assert!(profiles[0].pinned);
         assert!(profiles[0].default);
-        assert_eq!(profiles[1].name.as_deref(), Some("swarm0"));
+        // count: 3 -> `<key>-0` .. `<key>-2` in the shared group.
+        assert_eq!(profiles[1].name.as_deref(), Some("swarm-0"));
         assert_eq!(profiles[1].group.as_deref(), Some("swarm"));
-        assert_eq!(profiles[2].name.as_deref(), Some("swarm1"));
-        assert_eq!(profiles[3].name.as_deref(), Some("swarm2"));
+        assert_eq!(profiles[2].name.as_deref(), Some("swarm-1"));
+        assert_eq!(profiles[3].name.as_deref(), Some("swarm-2"));
         assert_eq!(profiles[3].group.as_deref(), Some("swarm"));
         assert_eq!(profiles[3].num_ctx, 16384);
     }

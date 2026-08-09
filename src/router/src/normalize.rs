@@ -10,8 +10,21 @@ use crate::types::{RouterRequest, RouterResponse, Usage};
 pub use fluent_llm::openai::NormalizeError;
 
 /// Normalize an OpenAI-compatible chat completion request JSON into a RouterRequest.
+///
+/// The shared `fluent_llm` normalizer strips non-OpenAI fields; the routing
+/// fields the owning llama-server reads (`instance`/`snapshot`/`id_slot`) are
+/// re-attached from the original body so they survive into the dispatch target.
 pub fn normalize_request(body: serde_json::Value) -> Result<RouterRequest, NormalizeError> {
-    let value = fluent_llm::openai::normalize_request(body)?;
+    let routing: Vec<(String, serde_json::Value)> = ["instance", "snapshot", "id_slot"]
+        .iter()
+        .filter_map(|key| body.get(key).map(|v| ((*key).to_string(), v.clone())))
+        .collect();
+    let mut value = fluent_llm::openai::normalize_request(body)?;
+    if let serde_json::Value::Object(ref mut obj) = value {
+        for (key, value) in routing {
+            obj.insert(key, value);
+        }
+    }
     serde_json::from_value(value).map_err(|e| NormalizeError::Parse(e.to_string()))
 }
 
@@ -95,6 +108,36 @@ mod tests {
         });
         let req = normalize_request(body).unwrap();
         assert_eq!(req.session_id.as_deref(), Some("sess-123"));
+    }
+
+    #[test]
+    fn normalize_request_preserves_routing_fields() {
+        // The routing fields the owning llama-server reads survive the
+        // normalizer (the shared normalizer strips non-OpenAI keys).
+        let body = serde_json::json!({
+            "model": "swarm:ledger",
+            "messages": [{"role": "user", "content": "hi"}],
+            "instance": "scratch",
+            "snapshot": "readfiles",
+            "id_slot": 3,
+        });
+        let req = normalize_request(body).unwrap();
+        assert_eq!(req.model, "swarm:ledger");
+        assert_eq!(req.instance.as_deref(), Some("scratch"));
+        assert_eq!(req.snapshot.as_deref(), Some("readfiles"));
+        assert_eq!(req.id_slot, Some(3));
+    }
+
+    #[test]
+    fn normalize_request_absent_routing_fields_stay_none() {
+        let body = serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = normalize_request(body).unwrap();
+        assert!(req.instance.is_none());
+        assert!(req.snapshot.is_none());
+        assert!(req.id_slot.is_none());
     }
 
     #[test]
@@ -183,6 +226,9 @@ mod tests {
             session_id: None,
             agent_id: None,
             adapter: None,
+            instance: None,
+            snapshot: None,
+            id_slot: None,
             metadata: Default::default(),
         };
         let json = messages_to_json(&request).expect("messages serialize");
@@ -211,6 +257,9 @@ mod tests {
             session_id: None,
             agent_id: None,
             adapter: None,
+            instance: None,
+            snapshot: None,
+            id_slot: None,
             metadata: Default::default(),
         };
         let json = messages_to_json(&request).expect("messages serialize");

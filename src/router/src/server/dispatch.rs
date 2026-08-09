@@ -52,18 +52,35 @@ pub async fn handle_dispatch(
     ladders: &HashMap<String, Arc<EscalationLadder>>,
     context_cache: Option<&Arc<dyn fluent_types::ContextCache>>,
     session: Option<&Arc<Mutex<DependencySession>>>,
-    instance_managers: &HashMap<String, Arc<crate::instances::InstanceManager>>,
+    instance_pool: Option<&crate::instances::InstancePool>,
 ) -> Result<DispatchOutcome, std::convert::Infallible> {
     // A rewind may have restored a KV snapshot; carry its fork-facing identity
     // (snapshot/instance/id_slot) into the outgoing body via the target's
     // request fields so the next dispatch switches that snapshot into its slot.
     let pending = session.and_then(|s| common_core::sync::lock(s).pending_kv_fields());
-    let pending_rt: RoutingTarget;
-    let rt: &RoutingTarget = if let Some((snapshot, instance, id_slot)) = pending {
-        pending_rt = apply_pending_snapshot(rt, snapshot, instance, id_slot);
-        &pending_rt
+    // The client's explicit routing fields (`instance`/`snapshot`/`id_slot`)
+    // override any the target derived from config; pending rewind fields take
+    // precedence over the request's.
+    let needs_overlay = router_request.instance.is_some()
+        || router_request.snapshot.is_some()
+        || router_request.id_slot.is_some()
+        || pending.is_some();
+    let owned_rt = if needs_overlay {
+        let mut t = crate::server::instances_api::apply_request_routing_fields(rt, router_request);
+        if let Some((snapshot, instance, id_slot)) = pending {
+            t.snapshot = Some(snapshot);
+            if t.instance.is_none() {
+                t.instance = instance;
+            }
+            t.id_slot = Some(id_slot);
+        }
+        Some(t)
     } else {
-        rt
+        None
+    };
+    let rt: &RoutingTarget = match &owned_rt {
+        Some(v) => v,
+        None => rt,
     };
     let target_streams = is_stream && rt.stream;
 
@@ -94,7 +111,7 @@ pub async fn handle_dispatch(
                         ladders,
                         context_cache,
                         session,
-                        instance_managers,
+                        instance_pool,
                     )
                     .await;
                 };
@@ -139,7 +156,7 @@ pub async fn handle_dispatch(
                     ladders,
                     context_cache,
                     session,
-                    instance_managers,
+                    instance_pool,
                 )
                 .await;
             }
@@ -179,7 +196,7 @@ pub async fn handle_dispatch(
         ladders,
         context_cache,
         session,
-        instance_managers,
+        instance_pool,
     )
     .await
 }
@@ -203,6 +220,7 @@ fn make_backend(http_client: &reqwest::Client, target: &RoutingTarget) -> Arc<dy
 /// Apply a restored KV snapshot's fork-facing identity to a target so the
 /// next dispatch sends `snapshot`/`id_slot` (and `instance` when the target
 /// has none) as request fields.
+#[cfg(test)]
 fn apply_pending_snapshot(
     target: &RoutingTarget,
     snapshot: String,
@@ -353,7 +371,7 @@ pub async fn dispatch_real(
     ladders: &HashMap<String, Arc<EscalationLadder>>,
     context_cache: Option<&Arc<dyn fluent_types::ContextCache>>,
     session: Option<&Arc<Mutex<DependencySession>>>,
-    instance_managers: &HashMap<String, Arc<crate::instances::InstanceManager>>,
+    instance_pool: Option<&crate::instances::InstancePool>,
 ) -> Result<DispatchOutcome, std::convert::Infallible> {
     let all_targets = std::iter::once(rt)
         .chain(rt.fallbacks.iter())
@@ -409,7 +427,9 @@ pub async fn dispatch_real(
                 // member. Ask the sidecar to allocate fresh KV for the group
                 // (weights already loaded), then retry this target once.
                 if let DispatchError::InstanceGroupMiss { group } = &e {
-                    if let Some(mgr) = instance_managers.get(&target.url) {
+                    if let Some(mgr) =
+                        instance_pool.and_then(|pool| pool.manager_for_url(&target.url))
+                    {
                         if mgr.ensure_group(group).await.is_ok() {
                             crate::audit::emit(
                                 "instances",
@@ -566,7 +586,7 @@ mod tests {
     #[tokio::test]
     async fn allocate_on_503_creates_instance_and_retries_once() {
         use crate::instances::stub::StubServer;
-        use crate::instances::{management_base_url, InstanceClient, InstanceManager};
+        use crate::instances::{management_base_url, InstanceClient, InstanceManager, InstancePool};
         use crate::config::InstanceProfile;
         use std::sync::Arc as StdArc;
         use std::sync::Mutex;
@@ -621,12 +641,14 @@ mod tests {
             params: None,
         };
         let manager = Arc::new(InstanceManager::new(
+            "base",
             client,
             vec![profile],
             crate::config::SidecarConfig::default(),
         ));
         let mut managers = std::collections::HashMap::new();
-        managers.insert(endpoint.clone(), manager);
+        managers.insert("base".into(), manager);
+        let pool = InstancePool::from_managers(managers);
 
         let request = crate::types::RouterRequest {
             model: "base".into(),
@@ -644,6 +666,9 @@ mod tests {
             session_id: None,
             agent_id: None,
             adapter: None,
+            instance: None,
+            snapshot: None,
+            id_slot: None,
             metadata: Default::default(),
         };
         let outcome = dispatch_real(
@@ -658,7 +683,7 @@ mod tests {
             &std::collections::HashMap::new(),
             None,
             None,
-            &managers,
+            Some(&pool),
         )
         .await
         .expect("dispatch_real is infallible");

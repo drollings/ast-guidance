@@ -99,6 +99,9 @@ fn make_request_with_messages(messages: Vec<RouterMessage>) -> RouterRequest {
         session_id: Some("e2e-test-session".into()),
         agent_id: None,
         adapter: None,
+        instance: None,
+        snapshot: None,
+        id_slot: None,
         metadata: Default::default(),
     }
 }

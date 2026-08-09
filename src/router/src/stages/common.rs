@@ -131,6 +131,9 @@ mod tests {
             session_id: None,
             agent_id: None,
             adapter: None,
+            instance: None,
+            snapshot: None,
+            id_slot: None,
             metadata: Default::default(),
         };
         let mut ctx = WorkContext::default();

@@ -556,6 +556,9 @@ mod tests {
             retry_base_interval_s: 1,
             params: None,
             instances: None,
+            weights: None,
+            hf_repo: None,
+            hf_file: None,
         }
     }
 

@@ -50,9 +50,11 @@ pub struct ServerDeps {
     pub ladders: HashMap<String, Arc<EscalationLadder>>,
     /// Deterministic-fact cache consulted before escalating (M3).
     pub context_cache: Option<Arc<dyn fluent_types::ContextCache>>,
-    /// Sidecar instance managers (M4), keyed by model endpoint. Consulted on a
-    /// 503 group-miss to allocate fresh KV before retrying.
-    pub instance_managers: HashMap<String, Arc<crate::instances::InstanceManager>>,
+    /// Sidecar instance pool (M4): aggregates the public `/instances` API and
+    /// is consulted on a 503 group-miss to allocate fresh KV before retrying.
+    pub instance_pool: Option<Arc<crate::instances::InstancePool>>,
+    /// Env var naming the management API key (enforced on `/instances`).
+    pub api_key_env_name: Option<String>,
 }
 
 impl ServerDeps {
@@ -240,13 +242,16 @@ async fn handle_chat_completion(
         http_client,
         ladders,
         context_cache,
-        instance_managers,
+        instance_pool,
+        api_key_env_name: _,
     } = deps;
     // M10: the dispatch post-processing hook (workflow extraction), if the
     // operator configured it. Passed through to successful dispatches only.
     let workflow_extractor = plan_route
         .as_ref()
         .and_then(|p| p.workflow_extractor().cloned());
+    // The query string is captured before the body is consumed.
+    let query_string = req.uri().query().map(ToOwned::to_owned);
     let body_bytes = match req.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
@@ -268,7 +273,7 @@ async fn handle_chat_completion(
     }
 
     let body_str = std::str::from_utf8(&body_bytes).unwrap_or("");
-    let body_json: serde_json::Value = match serde_json::from_str(body_str) {
+    let mut body_json: serde_json::Value = match serde_json::from_str(body_str) {
         Ok(v) => v,
         Err(e) => {
             stats.errors.fetch_add(1, Ordering::Relaxed);
@@ -278,6 +283,31 @@ async fn handle_chat_completion(
             ));
         }
     };
+
+    // The routing fields (`model`/`instance`/`snapshot`/`id_slot`) are read
+    // from BOTH the JSON body and the query string, body wins. Merge query
+    // values only for keys the body does not define.
+    if let Some(query) = query_string.as_deref() {
+        for (key, value) in crate::server::instances_api::parse_query(query) {
+            if !matches!(key.as_str(), "model" | "instance" | "snapshot" | "id_slot") {
+                continue;
+            }
+            if body_json.get(&key).is_some() {
+                continue;
+            }
+            let value = if key == "id_slot" {
+                value.parse::<i32>().ok().map_or_else(
+                    || serde_json::Value::String(value),
+                    |n| serde_json::json!(n),
+                )
+            } else {
+                serde_json::Value::String(value)
+            };
+            if let serde_json::Value::Object(ref mut obj) = body_json {
+                obj.insert(key, value);
+            }
+        }
+    }
 
     let router_request = match normalize::normalize_request(body_json) {
         Ok(r) => r,
@@ -464,7 +494,7 @@ async fn handle_chat_completion(
             &ladders,
             context_cache.as_ref(),
             session_step.as_ref().map(|s| &s.session),
-            &instance_managers,
+            instance_pool.as_deref(),
         )
         .await?;
         let status = outcome.response.status();
@@ -503,7 +533,7 @@ async fn handle_chat_completion(
             &ladders,
             context_cache.as_ref(),
             session_step.as_ref().map(|s| &s.session),
-            &instance_managers,
+            instance_pool.as_deref(),
         )
         .await?;
         let status = outcome.response.status();
@@ -920,7 +950,72 @@ pub async fn handle_request(
             stats.requests.fetch_add(1, Ordering::Relaxed);
             handle_rigor_request(req, deps).await
         }
+        // -- Shared-weight instance management API (mirrors the llama-server
+        //    contract; aggregated across every managed model) --------------
+        ("GET", "/instances" | "/v1/instances") => {
+            stats.requests.fetch_add(1, Ordering::Relaxed);
+            if let Some(resp) = crate::server::instances_api::check_management_key(&deps, req.headers())
+            {
+                return Ok(resp);
+            }
+            let query = crate::server::instances_api::parse_query(req.uri().query().unwrap_or(""));
+            Ok(crate::server::instances_api::handle_get_instances(&deps, &query).await)
+        }
+        ("POST", "/instances" | "/v1/instances") => {
+            stats.requests.fetch_add(1, Ordering::Relaxed);
+            if let Some(resp) = crate::server::instances_api::check_management_key(&deps, req.headers())
+            {
+                return Ok(resp);
+            }
+            let query = crate::server::instances_api::parse_query(req.uri().query().unwrap_or(""));
+            Ok(crate::server::instances_api::handle_post_instances(req, &deps, &query).await)
+        }
+        ("GET", "/memory") => {
+            stats.requests.fetch_add(1, Ordering::Relaxed);
+            if let Some(resp) = crate::server::instances_api::check_management_key(&deps, req.headers())
+            {
+                return Ok(resp);
+            }
+            Ok(crate::server::instances_api::handle_memory(&deps).await)
+        }
+        ("GET", "/v1/models" | "/models") => {
+            stats.requests.fetch_add(1, Ordering::Relaxed);
+            Ok(crate::server::instances_api::handle_list_models(&deps).await)
+        }
+        ("GET" | "POST", "/props") => {
+            stats.requests.fetch_add(1, Ordering::Relaxed);
+            Ok(crate::server::instances_api::handle_props(&deps).await)
+        }
+        // Model-less llama-server endpoints (proxied to the pool's default
+        // server).
+        ("POST", "/tokenize" | "/detokenize" | "/apply-template" | "/control") => {
+            stats.requests.fetch_add(1, Ordering::Relaxed);
+            let path = path.clone();
+            Ok(crate::server::instances_api::handle_model_less_proxy(req, &deps, &path).await)
+        }
         _ => {
+            // Instance management sub-resources: `/instances/:name[/...]`.
+            if path.starts_with("/instances/") {
+                stats.requests.fetch_add(1, Ordering::Relaxed);
+                if let Some(resp) =
+                    crate::server::instances_api::check_management_key(&deps, req.headers())
+                {
+                    return Ok(resp);
+                }
+                let query =
+                    crate::server::instances_api::parse_query(req.uri().query().unwrap_or(""));
+                return Ok(match route_instance_resource(method.as_str(), &path) {
+                    Some((op, name, snapshot)) => {
+                        crate::server::instances_api::handle_snapshot_op_or_instance_op(
+                            req, &deps, op, &name, snapshot.as_deref(), &query,
+                        )
+                        .await
+                    }
+                    None => crate::server::responses::empty_response(
+                        hyper::StatusCode::NOT_FOUND,
+                    ),
+                });
+            }
             if method == hyper::Method::DELETE && path.starts_with("/admin/cache/") {
                 if !is_local_request(&req) {
                     return Ok(crate::server::responses::forbidden_response());
@@ -957,6 +1052,30 @@ pub async fn handle_request(
     }
 }
 
+/// Route an `/instances/<resource>` path to an operation:
+///
+/// - `DELETE /instances/:name` -> `("delete", name, None)`
+/// - `POST /instances/:name/pin|unpin|resize` -> the matching op
+/// - `POST /instances/:name/snapshot` -> `("save", name, None)`
+/// - `GET /instances/:name/snapshots` -> `("list", name, None)`
+/// - `DELETE /instances/:name/snapshot/:snapshot` -> `("delete_snapshot", name, Some(snapshot))`
+fn route_instance_resource(method: &str, path: &str) -> Option<(&'static str, String, Option<String>)> {
+    let rest = path.strip_prefix("/instances/")?;
+    let parts: Vec<&str> = rest.split('/').collect();
+    match (method, parts.as_slice()) {
+        ("DELETE", [name]) => Some(("delete", name.to_string(), None)),
+        ("POST", [name, "pin"]) => Some(("pin", name.to_string(), None)),
+        ("POST", [name, "unpin"]) => Some(("unpin", name.to_string(), None)),
+        ("POST", [name, "resize"]) => Some(("resize", name.to_string(), None)),
+        ("POST", [name, "snapshot"]) => Some(("save", name.to_string(), None)),
+        ("GET", [name, "snapshots"]) => Some(("list", name.to_string(), None)),
+        ("DELETE", [name, "snapshot", snapshot]) => {
+            Some(("delete_snapshot", name.to_string(), Some(snapshot.to_string())))
+        }
+        _ => None,
+    }
+}
+
 fn is_local_request(req: &hyper::Request<hyper::body::Incoming>) -> bool {
     req.headers()
         .get(hyper::header::HOST)
@@ -979,6 +1098,33 @@ fn resolve_pipeline(
     router_request: &RouterRequest,
 ) -> crate::pipeline::PipelineResult {
     use fluent_wvr::prelude::*;
+
+    // The model id grammar `<model_id>[:<instance|group|latest>]`: a qualified
+    // id resolves directly to the owning model's server, bypassing the route
+    // table. `<id>:latest` means the pool's default instance.
+    if let Some((base_model, qualifier)) = model_name.split_once(':') {
+        if let Some(entry) = models.get(base_model) {
+            let rt = if qualifier == "latest" {
+                RoutingTarget::from_model_entry(base_model, entry)
+            } else {
+                RoutingTarget::from_model_entry_instance(base_model, entry, qualifier)
+            };
+            tracing::info!(
+                target: "router.server",
+                model = %model_name,
+                target = %rt.model,
+                "qualified model id resolved to owning server",
+            );
+            return crate::pipeline::PipelineResult {
+                decisions: vec![],
+                final_response: None,
+                rejected: false,
+                reject_reason: None,
+                routing_target: Some(rt),
+                classifier_response: None,
+            };
+        }
+    }
 
     let route = routes.get(model_name).cloned();
 

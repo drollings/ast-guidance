@@ -3,6 +3,7 @@
 
 pub mod dispatch;
 pub mod handler;
+pub mod instances_api;
 pub mod responses;
 
 use std::collections::HashMap;
@@ -44,8 +45,12 @@ pub struct RouterServer {
     ladders: HashMap<String, Arc<EscalationLadder>>,
     /// Deterministic-fact cache consulted before escalating (M3).
     context_cache: Option<Arc<dyn fluent_types::ContextCache>>,
-    /// Sidecar instance managers (M4), keyed by model endpoint.
-    instance_managers: HashMap<String, Arc<crate::instances::InstanceManager>>,
+    /// Sidecar instance pool (M4): one manager per managed model, aggregating
+    /// the public `/instances` API and consulting the manager on a 503
+    /// group-miss to allocate fresh KV before retrying.
+    instance_pool: Option<Arc<crate::instances::InstancePool>>,
+    /// Env var naming the management API key (enforced on `/instances`).
+    api_key_env_name: Option<String>,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
@@ -74,7 +79,8 @@ impl RouterServer {
             sessions: None,
             ladders: HashMap::new(),
             context_cache: None,
-            instance_managers: HashMap::new(),
+            instance_pool: None,
+            api_key_env_name: None,
             depends: vec![],
             provides: vec![ArcIntern::from("http.endpoint")],
         }
@@ -141,22 +147,27 @@ impl RouterServer {
         self
     }
 
-    /// Attach the sidecar instance managers (M4), keyed by model endpoint.
-    /// `serve` runs each manager's boot reconciliation and residency loop as
-    /// a task; dispatch consults them on a 503 group-miss to allocate KV.
+    /// Attach the sidecar instance pool (M4): one manager per managed model.
+    /// `serve` runs each manager's boot reconciliation and residency loop as a
+    /// task; dispatch consults the owning manager on a 503 group-miss to
+    /// allocate KV, and the public `/instances` API aggregates the pool.
     #[must_use]
-    pub fn with_instance_managers(
-        mut self,
-        instance_managers: HashMap<String, Arc<crate::instances::InstanceManager>>,
-    ) -> Self {
-        if !instance_managers.is_empty() {
+    pub fn with_instance_pool(mut self, pool: crate::instances::InstancePool) -> Self {
+        if !pool.is_empty() {
             tracing::info!(
                 target: "router.server",
-                manager_count = instance_managers.len(),
-                "sidecar instance managers attached",
+                manager_count = pool.managers_iter().count(),
+                "sidecar instance pool attached",
             );
         }
-        self.instance_managers = instance_managers;
+        self.instance_pool = Some(Arc::new(pool));
+        self
+    }
+
+    /// Attach the management API key env var name (enforced on `/instances`).
+    #[must_use]
+    pub fn with_management_api_key(mut self, env_name: Option<String>) -> Self {
+        self.api_key_env_name = env_name;
         self
     }
 
@@ -211,19 +222,22 @@ impl RouterServer {
             ),
             ladders: self.ladders.clone(),
             context_cache: self.context_cache.clone(),
-            instance_managers: self.instance_managers.clone(),
+            instance_pool: self.instance_pool.clone(),
+            api_key_env_name: self.api_key_env_name.clone(),
         };
 
-        // Reconcile configured instances at boot (retrying until the fork's
-        // management API is reachable), then run each manager's residency
-        // loop (poll /memory, evict LRU unpinned on low free VRAM) for the
-        // life of the server.  Best-effort: a failed reconcile/residency
-        // poll logs and continues.
-        for manager in self.instance_managers.values() {
-            let manager = manager.clone();
-            tokio::spawn(async move {
-                manager.bootstrap().await;
-            });
+        // Reconcile configured instances at boot (retrying until the managed
+        // server's management API is reachable), then run each manager's
+        // residency loop (poll /instances, evict LRU unpinned on low free
+        // VRAM) for the life of the server. Best-effort: a failed
+        // reconcile/residency poll logs and continues.
+        if let Some(pool) = &self.instance_pool {
+            for manager in pool.managers_iter() {
+                let manager = manager.clone();
+                tokio::spawn(async move {
+                    manager.bootstrap().await;
+                });
+            }
         }
 
         run_http(&self.bind_addr, deps).await
@@ -260,7 +274,8 @@ impl WorkUnit for RouterServer {
             http_client: Arc::new(reqwest::Client::new()),
             ladders: self.ladders.clone(),
             context_cache: self.context_cache.clone(),
-            instance_managers: self.instance_managers.clone(),
+            instance_pool: self.instance_pool.clone(),
+            api_key_env_name: self.api_key_env_name.clone(),
         };
         let rt = ctx.rt.clone();
 

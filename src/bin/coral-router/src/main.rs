@@ -125,6 +125,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .mock
         .or_else(|| config.mock.as_ref().map(|m| m.transcript_path.clone()));
 
+    // Managed models (weights/hf_repo/instances declared) get their own
+    // spawned `llama-server`: the supervisor assigns each a free localhost
+    // port, spawns the process, and waits for /health BEFORE any backend or
+    // pipeline is built, so classifiers, dispatch, and the sidecar all talk to
+    // a live server. Each managed model's `endpoint` is then rewritten to its
+    // server's address.
+    //
+    // In mock mode the whole point is canned dispatch - no real model is
+    // needed - so the supervisor is skipped (the config endpoints stay as-is).
+    // The `_supervisor` binding is deliberately kept alive for the life of the
+    // process so the spawned servers are not dropped on shutdown.
+    let _supervisor: Option<Arc<fluent_router::supervisor::LlamaServerSupervisor>> =
+        if transcript_path.is_some() {
+            tracing::info!(
+                target: "coral-router",
+                "mock mode - skipping managed llama-server supervision",
+            );
+            None
+        } else {
+            let supervisor =
+                fluent_router::supervisor::LlamaServerSupervisor::build(&config)?;
+            let supervisor = Arc::new(supervisor);
+            if let Err(e) = supervisor.start_all().await {
+                tracing::error!(target: "coral-router", error = %e, "fatal: managed llama-server failed to start");
+                eprintln!("FATAL: {e}");
+                std::process::exit(1);
+            }
+            for key in supervisor.model_keys() {
+                if let Some(server) = supervisor.server_for(key) {
+                    if let Some(entry) = config.models.get_mut(key) {
+                        entry.endpoint = format!("{}/v1/chat/completions", server.base_url());
+                        tracing::info!(
+                            target: "coral-router",
+                            model = %key,
+                            endpoint = %entry.endpoint,
+                            "model endpoint rewritten to managed llama-server",
+                        );
+                    }
+                }
+            }
+            Some(supervisor)
+        };
+
     let mock_except_models: HashSet<String> = args.mock_except.iter().cloned().collect();
 
     if !args.mock_except.is_empty() {
@@ -191,8 +234,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // instance pool. The server owns their reconcile + residency tasks. A
     // malformed instance grammar (duplicate name / group-name collision)
     // fails fast so boot aborts loudly.
-    let instance_managers = match fluent_router::instances::build_instance_managers(&config) {
-        Ok(managers) => managers,
+    let instance_pool = match fluent_router::instances::build_instance_managers(&config) {
+        Ok(pool) => pool,
         Err(e) => {
             tracing::error!(
                 target: "coral-router",
@@ -285,17 +328,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         server = server.with_sessions(sessions);
     }
 
-    if !instance_managers.is_empty() {
-        server = server.with_instance_managers(instance_managers);
+    if !instance_pool.is_empty() {
+        server = server.with_instance_pool(instance_pool);
     }
+    server = server.with_management_api_key(config.sidecar.api_key_env.clone());
 
     if let Some(ctx) = mock_dispatch {
         server = server.with_mock(ctx);
     }
 
-    server.serve().await?;
+    // Serve until a shutdown signal. Coral Router is the process owner of the
+    // spawned llama-servers, so a signal must stop the supervisor (killing its
+    // children) before the process exits - a plain SIGTERM/SIGINT default
+    // would orphan every managed llama-server, leaking ports and VRAM.
+    tokio::select! {
+        result = server.serve() => {
+            result?;
+        }
+        _ = shutdown_signal() => {
+            tracing::info!(
+                target: "coral-router",
+                "shutdown signal received - stopping managed llama-servers",
+            );
+            if let Some(supervisor) = _supervisor.as_ref() {
+                supervisor.shutdown().await;
+            }
+            return Ok(());
+        }
+    }
 
     Ok(())
+}
+
+/// Resolve on SIGINT or SIGTERM (whichever comes first), so restart loops
+/// (`make router-start`) can stop the process tree cleanly.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut terminate = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// Construct the boot-loaded chart store and attach it to the plan route.

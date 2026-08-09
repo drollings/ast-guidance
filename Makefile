@@ -20,10 +20,19 @@ SHELL := /bin/bash
 TARGET_BIN  := guidance
 CORAL_ROUTER_BIN := target/debug/coral-router
 CORAL_ROUTER_CONFIG := env/coral-router.json
-# Extract bind address from the config file (source of truth).
-CORAL_ROUTER_BIND_ADDR := $(shell python3 -c "import json; print(json.load(open('$(CORAL_ROUTER_CONFIG)'))['server']['bind_addr'])" 2>/dev/null)
+# Extract bind address from the config file (source of truth), with a sane
+# fallback when the config is unreadable at parse time.
+CORAL_ROUTER_BIND_ADDR := $(shell python3 -c "import json; print(json.load(open('$(CORAL_ROUTER_CONFIG)'))['server']['bind_addr'])" 2>/dev/null || echo "127.0.0.1:8079")
 CORAL_ROUTER_HEALTH_URL := http://$(CORAL_ROUTER_BIND_ADDR)/health
 CORAL_ROUTER_MOCK_HEALTH_URL := http://127.0.0.1:8078/health
+# How long to poll /health after (re)starting the router. Real mode spawns
+# managed llama-servers at boot, so the default is generous; override with
+# ROUTER_START_TIMEOUT_S=<n>. Mock mode skips supervision and boots fast.
+ROUTER_START_TIMEOUT_S ?= 300
+ROUTER_MOCK_TIMEOUT_S ?= 30
+ROUTER_WAIT_SCRIPT := bin/router-wait-health.sh
+ROUTER_LOG := /tmp/coral-router.out
+ROUTER_MOCK_LOG := /tmp/coral-router-mock.out
 CONFIG      := .guidance/guidance-config.json
 INSTALLDIR  := $(HOME)/.local/bin
 
@@ -125,10 +134,13 @@ RUST_SRC_FILES := $(shell find $(RUST_SRC_DIR) -name '*.rs' 2>/dev/null)
 
 CARGO_BIN := target/debug/$(TARGET_BIN)
 
-$(CARGO_BIN) $(CORAL_ROUTER_BIN): $(RUST_SRC_FILES)
-	$(Q)echo "Building guidance + coral-router"
-	$(Q)cargo build
-	$(Q)echo "Build complete"
+$(CARGO_BIN): $(RUST_SRC_FILES)
+	$(Q)echo "Building guidance"
+	$(Q)cargo build --bin guidance
+
+$(CORAL_ROUTER_BIN): $(RUST_SRC_FILES)
+	$(Q)echo "Building coral-router"
+	$(Q)cargo build --bin coral-router
 
 .PHONY: install
 install: $(CARGO_BIN) $(CORAL_ROUTER_BIN)
@@ -142,51 +154,48 @@ install: $(CARGO_BIN) $(CORAL_ROUTER_BIN)
 .PHONY: router
 router: $(CORAL_ROUTER_BIN) ## Build coral-router
 
+# Kill any running coral-router and wait for it to actually exit before the
+# caller starts a fresh one. The router is the process owner of its spawned
+# llama-servers and handles SIGTERM gracefully (stops the supervisor first),
+# so a plain kill never orphans serving processes.
+define stop-router
+	$(Q)echo "Stopping any running coral-router"
+	$(Q)pkill -x coral-router 2>/dev/null || true
+	$(Q)for i in $$(seq 1 25); do pgrep -x coral-router >/dev/null 2>&1 || break; sleep 0.2; done
+endef
+
 .PHONY: router-test
-router-test: $(CORAL_ROUTER_BIN) ## Run all router unit, golden, and e2e mock tests; validate binary
-	$(Q)pkill coral-router 2>/dev/null || true
-	$(Q)echo "Running fluent-router unit + e2e mock tests"
+router-test: $(CORAL_ROUTER_BIN) ## Run all router unit, golden, and e2e mock tests; validate the built binary
+	$(stop-router)
+	$(Q)echo "Running fluent-router unit + golden + e2e mock tests"
 	$(Q)cargo test -p fluent-router
-	$(Q)echo "Running coral-router dry-run (--help)"
-	$(Q)cargo run --bin coral-router -- --help > /dev/null && echo "All router tests passed." || echo "ERRROR: coral-router did NOT successfully run."
+	$(Q)echo "Validating coral-router --help"
+	$(Q)$(CORAL_ROUTER_BIN) --help > /dev/null && echo "All router tests passed." || echo "ERRROR: coral-router did NOT successfully run."
 
 .PHONY: router-test-all
 router-test-all: $(CORAL_ROUTER_BIN) ## Run all router tests + HNSW benchmarks (large, slow)
-	$(Q)pkill coral-router 2>/dev/null || true
-	$(Q)echo "Running fluent-router unit + e2e mock tests"
+	$(stop-router)
+	$(Q)echo "Running fluent-router unit + golden + e2e mock tests"
 	$(Q)cargo test -p fluent-router
 	$(Q)echo "Running coral-context tests with HNSW benchmarks"
 	$(Q)cargo test -p coral-context --features hnsw-bench -- --ignored --nocapture
-	$(Q)echo "Running coral-router dry-run (--help)"
-	$(Q)cargo run --bin coral-router -- --help > /dev/null && echo "All router tests passed." || echo "ERRROR: coral-router did NOT successfully run."
+	$(Q)echo "Validating coral-router --help"
+	$(Q)$(CORAL_ROUTER_BIN) --help > /dev/null && echo "All router tests passed." || echo "ERRROR: coral-router did NOT successfully run."
 
 ROUTER_MOCK_TEST_SCRIPT := bin/router-mock-tests.sh
 
 .PHONY: router-start
-router-start: $(CORAL_ROUTER_BIN) ## Build (if needed) and start coral-router
-	$(Q)killall coral-router 2>/dev/null || true
-	$(Q)sleep 0.5
-	$(Q)nohup target/debug/coral-router -c $(CORAL_ROUTER_CONFIG) > /tmp/coral-router.out 2>&1 &
-	$(Q)for i in $$(seq 1 10); do \
-		if curl -s -m 1 $(CORAL_ROUTER_HEALTH_URL) > /dev/null 2>&1; then \
-			echo "coral-router started (attempt $$i)"; break; \
-		fi; \
-		echo "Waiting for coral-router..."; sleep 1; \
-	done
+router-start: $(CORAL_ROUTER_BIN) ## Build (if needed) and (re)start coral-router, waiting for /health
+	$(stop-router)
+	$(Q)nohup $(CORAL_ROUTER_BIN) -c $(CORAL_ROUTER_CONFIG) > $(ROUTER_LOG) 2>&1 &
+	$(Q)bash $(ROUTER_WAIT_SCRIPT) $(CORAL_ROUTER_HEALTH_URL) $(ROUTER_START_TIMEOUT_S) $(ROUTER_LOG)
 
 .PHONY: router-mock
-router-mock: $(CORAL_ROUTER_BIN) $(ROUTER_MOCK_TEST_SCRIPT) ## Build, start with mock backend, run curl smoke-tests (leaves server running)
-	$(Q)pkill coral-router 2>/dev/null || true
-	$(Q)sleep 0.5
-	$(Q)nohup target/debug/coral-router -c $(CORAL_ROUTER_CONFIG) --host 127.0.0.1 --port 8078 --mock env/mock-transcripts.json > /tmp/coral-router.out 2>&1 &
-	$(Q)for i in $$(seq 1 5); do \
-		if curl -s -m 1 $(CORAL_ROUTER_MOCK_HEALTH_URL); then \
-			echo "coral-router started (attempt $$i)"; break; \
-		fi; \
-		echo "Waiting for coral-router..."; sleep 1; \
-	done
+router-mock: $(CORAL_ROUTER_BIN) $(ROUTER_MOCK_TEST_SCRIPT) ## Build, start with mock backend, run curl smoke-tests (leaves server running on :8078)
+	$(stop-router)
+	$(Q)nohup $(CORAL_ROUTER_BIN) -c $(CORAL_ROUTER_CONFIG) --host 127.0.0.1 --port 8078 --mock env/mock-transcripts.json > $(ROUTER_MOCK_LOG) 2>&1 &
+	$(Q)bash $(ROUTER_WAIT_SCRIPT) $(CORAL_ROUTER_MOCK_HEALTH_URL) $(ROUTER_MOCK_TIMEOUT_S) $(ROUTER_MOCK_LOG)
 	$(Q)ROUTER_BASE_URL=http://127.0.0.1:8078 bash $(ROUTER_MOCK_TEST_SCRIPT)
-	$(Q)killall coral-router 2>/dev/null || true
 
 # ── Standard Targets ──────────────────────────────────────────────────────────
 

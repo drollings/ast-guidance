@@ -21,21 +21,31 @@ The architecture follows the design principles in `VISION.md`:
 deterministic before probabilistic, cheap before expensive, condensed context
 via a ledger, and frontier as a bounded, audited exception.
 
+Local serving is owned, not proxied. Coral Router spawns and supervises one
+`llama-server` process per model weights file (`supervisor.rs`), serves the
+`/instances` management contract at its own address (`server/instances_api.rs`),
+and is the single routing element between those llama-server tasks and every
+other OpenAI-compatible endpoint. The llama.cpp router mode is never used; a
+local dispatch is a direct HTTP call to the owning server.
+
 ```
 ┌─ Request ──────────────────────────────────────────────────────────────┐
 │  POST /v1/chat/completions  { model, messages, temperature, ... }      │
+│  routing fields (model/instance/snapshot/id_slot) also from query      │
 └─────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
 ┌─ HTTP Server (RouterServer) ────────────────────────────────────────────┐
 │  hyper HTTP/1.1 server on tokio (server.rs + server/handler.rs)         │
-│  normalizes request body → RouterRequest via serde (normalize.rs)       │
+│  merges query routing fields into the body (body wins), normalizes →    │
+│  RouterRequest via serde (normalize.rs)                                 │
 │  records initial request in ContentNodeLedger (LOD0)                    │
 │  calls PipelineOrchestrator::execute() → WorkOutput::typed(PipelineResult) │
 │  on classifier_response: respond directly                               │
 │  on routing_target: server/dispatch.rs (ChatBackend chain)              │
-│  routes: /health /stats /v1/chat/completions /v1/plan /v1/rigor         │
-│          /admin/cache/invalidate, DELETE /admin/cache/{key}             │
+│  management: /instances /v1/models /models /memory /props + model-less  │
+│  proxies; /health /stats /v1/chat/completions /v1/plan /v1/rigor        │
+│  /admin/cache/invalidate, DELETE /admin/cache/{key}                     │
 └─────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
@@ -57,6 +67,13 @@ via a ledger, and frontier as a bounded, audited exception.
              Local dispatch   Escalation ladder   plan / rigor routes
              (ChatBackend      (dispatch/escalation  (routes/plan.rs,
               chain)            → frontier modes)      routes/rigor.rs)
+                    │
+                    ▼
+        ┌─ Serving layer (supervisor.rs) ─────────────────────────────┐
+        │  one llama-server per weights file on a free localhost port │
+        │  direct /instances + generation calls, no llama.cpp router │
+        │  sidecar: evict LRU unpinned on low VRAM; allocate on miss │
+        └─────────────────────────────────────────────────────────────┘
 ```
 
 ## Pipeline: two-stage design
@@ -115,12 +132,12 @@ exactly once and published to the same typed store.
 
 | File | Role |
 |------|------|
-| `types.rs` | `RouterRequest`, `RouterResponse`, `RouterMessage`, `RouterChoice`, `Usage` — serde-serializable OpenAI protocol |
+| `types.rs` | `RouterRequest`, `RouterResponse`, `RouterMessage`, `RouterChoice`, `Usage` — serde-serializable OpenAI protocol. `RouterRequest` also carries the routing fields the owning llama-server reads: `instance`, `snapshot`, `id_slot` |
 | `pipeline_types.rs` | `StageDecision`, `PipelineStage`, `StageVerdict`, `StageDecisionProducer`, `StageMetadata` (typed metadata handoff keys), `PiiVerdict` |
-| `pipeline.rs` | `PipelineOrchestrator`, `PipelineResult`, `RoutingTarget` (url/model/group/params/filter_thinking/retry/stream/timeouts/fallbacks), `STAGE_DECISION_KEY` |
+| `pipeline.rs` | `PipelineOrchestrator`, `PipelineResult`, `RoutingTarget` (url/model/group/params/filter_thinking/retry/stream/timeouts/fallbacks, plus `instance`/`snapshot`/`id_slot` request fields), `STAGE_DECISION_KEY` |
 | `error.rs` | `ServerError` — the single typed server error (Bind / Http / Addr / transparent `DispatchError`) |
-| `config.rs` | `RouterConfig` + sub-config types, split into re-exported submodules: `addr`, `builder` (`PipelineParams`), `classification` (`ClassificationTree`/`ClassificationNode`/`ClassificationChild`), `escalation` (`EscalationLadderConfig`, `FrontierConfig`), `filters` (`RejectPatterns`/`PatternEntry`/`FilterAction`/`FilterScope`/`ConfidenceGate`), `routing` (`RoutingConfig`, `RouteRef`) |
-| `normalize.rs` | Thin adapter over `fluent_llm::openai`: OpenAI JSON ↔ `RouterRequest`/`RouterResponse`, `error_response()`, `messages_to_json()`, `parse_openai_stream_delta` |
+| `config.rs` | `RouterConfig` + sub-config types, split into re-exported submodules: `addr`, `builder` (`PipelineParams`), `classification` (`ClassificationTree`/`ClassificationNode`/`ClassificationChild`), `escalation` (`EscalationLadderConfig`, `FrontierConfig`), `filters` (`RejectPatterns`/`PatternEntry`/`FilterAction`/`FilterScope`/`ConfidenceGate`), `routing` (`RoutingConfig`, `RouteRef`). `ModelEntry` adds the weights source for managed models (`weights`, `hf_repo`, `hf_file`) and `is_managed()` |
+| `normalize.rs` | Thin adapter over `fluent_llm::openai`: OpenAI JSON ↔ `RouterRequest`/`RouterResponse`, `error_response()`, `messages_to_json()`, `parse_openai_stream_delta`. Re-attaches the routing fields the shared normalizer strips |
 
 ### Pipeline & Stages
 
@@ -174,13 +191,15 @@ exactly once and published to the same typed store.
 
 | File | Role |
 |------|------|
-| `server.rs` | `RouterServer` (`WorkUnit`) — hyper HTTP/1.1 accept loop on tokio; assembles `ServerDeps` and fans out to the `server/` submodule; `serve_http` is `pub(crate)` for integration tests |
-| `server/handler.rs` | HTTP routing + request orchestration; `ServerDeps` (the collapsed former 12-Option dependency bundle): pipelines, routes, models, stats, cache, ledger, plan/rigor routes, sessions, ladders, context_cache, mock_dispatch, http_client |
-| `server/dispatch.rs` | `handle_dispatch` / `dispatch_real` — primary + `fallbacks` chain through `ChatBackend` (each wrapped in `RetryChatBackend`), short-circuit on non-retryable errors, response cache read/write, M10 workflow extraction |
+| `server.rs` | `RouterServer` (`WorkUnit`) — hyper HTTP/1.1 accept loop on tokio; assembles `ServerDeps` and fans out to the `server/` submodule; `serve_http` is `pub(crate)` for integration tests; runs each `InstanceManager`'s boot reconcile + residency task from the attached `InstancePool` |
+| `server/handler.rs` | HTTP routing + request orchestration; `ServerDeps` (the collapsed former 12-`Option` dependency bundle): pipelines, routes, models, stats, cache, ledger, plan/rigor routes, sessions, ladders, context_cache, mock_dispatch, http_client, `instance_pool`, `api_key_env_name`. Merges query-string routing fields into the body, resolves the model-id grammar (`<model_id>[:<instance|group|latest>]`) in `resolve_pipeline`, and routes the management/model-less endpoints |
+| `server/instances_api.rs` | The public `/instances` management facade: aggregate envelope across models, `POST /instances`, per-instance ops (delete/pin/unpin/resize/snapshot), `/memory` compat reshape, `/v1/models`, `/props`, model-less proxies (`/tokenize`, `/detokenize`, `/apply-template`, `/control`); management API-key enforcement; query parse/percent-decode helpers |
+| `server/dispatch.rs` | `handle_dispatch` / `dispatch_real` — primary + `fallbacks` chain through `ChatBackend` (each wrapped in `RetryChatBackend`), short-circuit on non-retryable errors, response cache read/write, M10 workflow extraction, allocate-on-503 via the `InstancePool` |
 | `server/responses.rs` | OpenAI-completion response builders, SSE/CORS headers, `ServerStats` counters |
 | `streaming.rs` | `StreamingHandler` — SSE delta formatting for OpenAI-compatible streaming chunks; cross-chunk think-block filtering via `StreamingThinkFilter` |
 | `kv_cache.rs` | Two-tier: `HotKvCache` (RAM LRU over `common_core::cache::LoadCache`, metadata only) + `ColdKvCache` (disk tree `model/adapter/session`); `KvCacheManager` composes both; the router never reads/writes raw KV bytes — it manages filesystem layout + sidecar metadata for llama.cpp slot save/restore |
-| `instances.rs` | Instance-pool grammar generation + validation (`instance_grammar_string`, `validate_instances`) and the M4 sidecar: `InstanceClient` (fork management API over raw `reqwest`, `HttpClass`-classified) + `InstanceManager` (boot reconcile, `/memory` residency loop with LRU eviction, allocate-on-503) |
+| `instances.rs` | Instance-pool grammar generation + validation (`instance_grammar_string`, `validate_instances`, `is_valid_instance_name`) and the sidecar: `InstanceClient` (one server's `/instances` API over raw `reqwest`, `HttpClass`-classified), `InstanceManager` (boot reconcile, `GET /instances` residency loop with LRU eviction + `sleep_idle_seconds` eviction hint, allocate-on-503), and `InstancePool` (the router's aggregate facade: `<model_id>:<name>` ids, 64-bit-summed `total`, `/v1/models`, op proxies) |
+| `supervisor.rs` | `LlamaServerSupervisor` + `ManagedServer` — resolves `llama-server` from `$PATH` (or `LLAMA_SERVER`), spawns one process per managed model on a free localhost port (`--alias`, `-m`/`-hf`, `--instance` grammar, `--slot-save-path`, `--api-key`), waits for `/health`, and supervises each child (logs its output, restarts with capped backoff); `free_port`, `build_server_args`, `shutdown` |
 | `scheduler.rs` | Re-exports `AffinityScheduler` / `ScheduledTask` / `AgingConfig` from `fluent_concurrency::affinity` |
 | `summarization.rs` | `ResultScorer` + `Summarizer` — `WorkUnit` impls that call an LLM (via `Arc<dyn ChatBackend>`) to score/condense responses; feeds the ledger's lazy LOD tiers |
 | `score_matrix.rs` | `ScoreMatrix` — multi-dimensional weighted scoring (coherence/complexity/completeness/risk) with per-route dimension bands |
@@ -338,8 +357,12 @@ coral's Context a reachable read path without the router importing coral.
 ## Pipeline data flow detail
 
 1. **Server**: hyper reads the HTTP request; `server/handler.rs` collects the
-   body (enforcing `max_payload`), deserializes JSON →
-   `normalize::normalize_request` → `RouterRequest`.
+   body (enforcing `max_payload`), merges the query-string routing fields
+   (`model`/`instance`/`snapshot`/`id_slot`) into the body when the body does
+   not define them (body wins), and deserializes JSON →
+   `normalize::normalize_request` → `RouterRequest` (the normalizer re-attaches
+   those routing fields after the shared `fluent_llm` normalizer strips
+   non-OpenAI keys).
 2. **Ledger** (pre-pipeline): `ContentNodeLedger::record_request()` writes the
    full request at LOD0 before any filter runs (through the M1 write-path
    scrub).
@@ -364,15 +387,19 @@ coral's Context a reachable read path without the router importing coral.
    (dispatch instructions), or a rejection verdict.
 6. **Server** (post-pipeline): `server/handler.rs` reads `PipelineResult` — if
    `classifier_response` exists, responds directly; if `routing_target` exists,
-   calls `server/dispatch.rs::handle_dispatch`, which walks the primary target
+   calls    `server/dispatch.rs::handle_dispatch`, which walks the primary target
    plus its `fallbacks` list through `ChatBackend`s (each wrapped in
-   `RetryChatBackend`), short-circuiting on non-retryable errors; if no target,
-   dispatches to the classifier's model as a fallback *target* (the model the
+   `RetryChatBackend`), short-circuiting on non-retryable errors. The client's
+   explicit `instance`/`snapshot`/`id_slot` fields are overlaid onto the target
+   so they reach the outgoing body; a 503 group-miss asks the `InstancePool`
+   to allocate fresh KV before one retry. If no target, the handler dispatches
+   to the classifier's model as a fallback *target* (the model the
    classifier ran on now answers the request), or a canned fallback response.
    Fallback models are target models — never a backup for the classifier. When
    dispatch and escalation fail, the per-group `EscalationLadder`
    (`try_escalate`) runs its configured modes, short-circuiting on a
-   `ContextCache` hit.
+   `ContextCache` hit. Every local dispatch lands as a direct HTTP call on the
+   owning spawned `llama-server` carrying the translated model id.
 7. **Ledger** (post-pipeline): `ContentNodeLedger::record_result()` updates the
    ledger entry with acceptance score and metadata, and — on the routed and
    classifier-fallback dispatch branches — the matched target's answer text is
@@ -463,83 +490,111 @@ handler dispatches to that classifier model as a fallback target
 target's answer is recorded in the session ledger and session step after
 dispatch (§"Pipeline data flow detail", step 7).
 
-## Instance pools and the sidecar
+## Instance pools, the serving layer, and the sidecar
 
-`ModelEntry` supports an `instances` field (the old `sessions` key is a serde
-alias): a map of `InstanceProfile`s declaring the fork's shared-weight
-instances for that model. The fork's `llama-server` (see
-`LLAMA_CPP_SERVER_INSTANCES.md` at the repo root) loads a `(base, variant)`
-weight pool once and serves many named instances — separate KV + compute
-buffers sharing those weights. Requests route to an instance by the model-id
-grammar (`<base>`, `<base>:<group>`, `<base>:<instance>`, ...). The fork no
-longer reads `num_ctx`/`parallel`/`sleep_idle_seconds` from the request body;
-those are declaration-only and coral-router strips them from dispatched bodies.
+**Coral Router owns the serving processes.** A model entry is *managed* when it
+declares a weights source or an instance pool: `ModelEntry.weights`
+(a local GGUF path), `hf_repo`/`hf_file` (on-demand Hugging Face load), or
+`instances`. At boot `main.rs` builds a `LlamaServerSupervisor`
+(`supervisor.rs`), finds `llama-server` on `$PATH` (or `LLAMA_SERVER`), spawns
+**one process per managed model** on a free localhost port, and waits for each
+`/health`. Each managed model's `endpoint` is then rewritten to
+`http://127.0.0.1:<port>/v1/chat/completions`, so every classifier, dispatch
+target, and backend points at the owned server. The supervisor supervises each
+child for the life of the process — logging its output and restarting it with
+capped backoff on an unexpected exit. In `--mock` mode supervision is skipped:
+canned dispatch needs no real model.
 
-A profile declares `count` sibling instances (reinterpreted from the old
-`parallel`), each with its own KV. For `count > 1` the profile expands to
-`<name>0..<name>{count-1}` sharing the profile's `group`. Example: the `swarm`
-model declares three 16384-ctx instances in group `swarm`, plus a pinned
-131072-ctx `ledger` instance (the default dispatch point, targeted by a bare
-`<base>` request) and a 131072-ctx `scratch` instance that auto-sleeps after
-30s idle. The dispatch grammar generator
-(`instances::instance_grammar_string`) emits the exact `--instance` flags the
-operator hands to `llama-server`, matching the fork's
-`common_instances_to_string` byte-for-byte:
+The llama.cpp router mode is never used. Coral Router talks to each spawned
+server directly, and each server loads its model's weights exactly once and
+allocates many named contexts ("instances") from them — separate KV + compute
+buffers sharing those weights. A `count: N` profile expands to N sibling
+instances named `<key>-0` .. `<key>-{N-1}` in the shared `group` (each its own
+full-size window; `parallel` slots share one window and never multiply it).
+Requests route to an instance by the model-id grammar. The minimal-branch
+server no longer reads `num_ctx`/`parallel`/`sleep_idle_seconds` from the
+request body; those are declaration-only, and coral-router strips them from
+dispatched bodies. `sleep_idle_seconds` survives only as a sidecar
+eviction-priority hint.
+
+The dispatch grammar generator (`instances::instance_grammar_string`) emits the
+exact `--instance` flags the supervisor hands to `llama-server` — the minimal
+grammar `name[:group=G][:ctx=N][:parallel=M][:pinned][:default]` (no sleep
+component). For the reference `swarm` pool (`count: 2` at 8192 ctx, a pinned
+65536-ctx `ledger` default, a 131072-ctx `scratch`):
 
 ```
---instance "swarm0:group=swarm:ctx=16384:sleep=0" \
---instance "swarm1:group=swarm:ctx=16384:sleep=0" \
---instance "swarm2:group=swarm:ctx=16384:sleep=0" \
---instance "ledger:ctx=131072:pinned:default" \
---instance "scratch:ctx=131072:sleep=30"
+--instance "swarm-0:group=swarm:ctx=8192:pinned" \
+--instance "swarm-1:group=swarm:ctx=8192:pinned" \
+--instance "ledger:ctx=65536:pinned:default" \
+--instance "scratch:ctx=131072"
 ```
 
-Dispatch is encoded through the model id. There are two distinct qualifier
-intents, resolved by separate methods so they never conflate:
+**Model id translation.** Config keys are the public model ids; llama.cpp model
+names are internal. `ModelEntry::llama_model_name` resolves the server's
+`--alias`, and dispatch always sends the translated id (`<llama-name>[:<instance>]`).
+Two distinct qualifier intents stay separate:
 
-- `ModelEntry::default_dispatch_qualifier()`  - the fork's **default instance**
+- `ModelEntry::default_dispatch_qualifier()` - the pool's **default instance**
   (`:ledger`), used by `RoutingTarget::from_model_entry` for client-facing
-  bare-`<base>` dispatch. Byte-identical to earlier behavior.
-- `ModelEntry::pool_qualifier()`  - the router's **internal work group** (the
+  bare-`<base>` dispatch.
+- `ModelEntry::pool_qualifier()` - the router's **internal work group** (the
   pool, `:swarm`): the largest non-default `count` profile's group, else the
-  default profile's group, else the single shared group, else `None` (bare
-  `<base>`). `local_backend` (the single DIP `LlmClient` factory behind the
-  classifier, chart selector/adjudicator/reranker, target-matching ladder, and
-  rigor roles) routes internal work through this pool so those calls spread
-  across the shared-weight instances instead of pinning to the default.
+  default profile's group, else the single shared group, else `None`.
+  `local_backend` (the single DIP `LlmClient` factory behind the classifier,
+  chart selector/adjudicator/reranker, target-matching ladder, and rigor roles)
+  routes internal work through this pool so those calls spread across the
+  shared-weight instances instead of pinning to the default.
 
 `RoutingTarget::from_model_entry_instance` targets a named point
-(`<base>:ledger`, `<base>:scratch`) for callers like the ledger summarizer and
-any on-demand scratch route; `local_backend_for_instance` merges the named
-instance profile's `params` over the entry `params` (profile wins) and strips
-declaration-only keys, so instance-level sampling knobs (e.g. `scratch`'s
-`temperature: 0.4`) actually reach the body. `snapshot`/`id_slot`/`instance`
-travel as explicit top-level request fields (`build_chat_body` adds them only
-when set).
+(`<base>:ledger`, `<base>:scratch`); `local_backend_for_instance` merges the
+named instance profile's `params` over the entry `params` (profile wins) and
+strips declaration-only keys, so instance-level sampling knobs actually reach
+the body. On the client-facing surface the handler also resolves the model-id
+grammar directly (`resolve_pipeline`): a request for `model: "<id>:<instance>"`
+(or `:<group>`, `:latest`) bypasses the route table and targets the owning
+server. The routing fields `instance`/`snapshot`/`id_slot` are read from the
+JSON body and the query string (body wins), merged in `server/handler.rs`,
+preserved through `normalize`, and overlaid onto the dispatch target in
+`server/dispatch.rs`.
 
-**Sidecar.** coral-router acts as the sidecar the fork's docs describe
-(`config.sidecar`). At boot each model endpoint that declares an instance pool
-gets an `InstanceManager` (`instances.rs`); the combined pool grammar is
-validated (`validate_instances`, fail-fast on duplicate names / group-name
-collisions) and the generated `instance_grammar_string` is logged. Each manager
-reconciles configured instances against `GET /instances`, creating missing ones
-(`POST /instances`), resizing `n_ctx` drift, and tolerating a 409 duplicate. A
-residency loop **always** polls `GET /memory` and logs free/used; eviction is
-gated on `sidecar.vram_total_bytes` (when set, and free VRAM drops below
-`vram_low_watermark_bytes`, evicts up to `evict_batch` least-recently-used
-unpinned instances via `DELETE /instances/:name`; `pinned` instances are never
-evicted). On a 503 `"no free instance in group"` group-miss, dispatch calls
-`InstanceManager::ensure_group` to allocate a fresh `<group>-<uuid>` instance
-before retrying once. `config.sidecar.slot_save_path` feeds the `KvSnapshot`
-`file_path` derivation so the router's snapshot metadata and the server's
-`--slot-save-path` layout agree. The management client reuses the raw-reqwest
+**Public `/instances` API.** `InstancePool` (`instances.rs`) is the router's
+aggregate facade over every managed server. It is served at Coral Router's own
+address (`server/instances_api.rs`) as the single sidecar entry point —
+`GET/POST /instances`, `DELETE /instances/:name`, pin/unpin/resize, and the
+snapshot endpoints — mirroring the llama-server contract under
+`<model_id>:<name>` ids with 64-bit-summed `total` memory. `GET /v1/models` /
+`/models` lists one entry per instance plus aliases; `/props` proxies the
+default server and adds `total_slots` + an `instances` array; `/memory` is a
+compat reshape of the same envelope; the model-less endpoints (`/tokenize`,
+`/detokenize`, `/apply-template`, `/control`) proxy to the pool's default
+server. All management endpoints require the API key when
+`sidecar.api_key_env` names a variable. The managed servers bind to
+`127.0.0.1` only and are never exposed directly.
+
+**Sidecar residency.** Each manager (`InstanceManager`) talks directly to its
+own server's `/instances`. At boot the pool validates every grammar
+(`validate_instances`, fail-fast on duplicate names / group-name collisions)
+and the server runs each manager's reconcile (create missing instances,
+resize `n_ctx` drift, tolerate a 409 duplicate) and residency loop. The
+residency loop **always** polls the aggregate `GET /instances` envelope (the
+`total` is the VRAM signal) and logs free/used; eviction is gated on
+`sidecar.vram_total_bytes` (when set and free VRAM drops below
+`vram_low_watermark_bytes`, evict up to `evict_batch` unpinned instances —
+least-recently-used, with `sleep_idle_seconds` marking good candidates;
+`pinned` instances are never evicted). On a 503 `"no free instance in group"`
+group-miss, dispatch calls `InstanceManager::ensure_group` to allocate a fresh
+`<group>-<uuid>` instance before retrying once. `config.sidecar.slot_save_path`
+is created at boot and feeds the server's `--slot-save-path`; it also drives
+the `KvSnapshot` `file_path` derivation so the router's snapshot metadata and
+the server's layout agree. The management client reuses the raw-reqwest
 pattern of `OpenAiChatBackend` with `HttpClass`-classified errors.
 
-**KV snapshot fork round-trip.** `KvCacheManager` may hold an optional
+**KV snapshot round-trip.** `KvCacheManager` may hold an optional
 `InstanceClient` handle (`with_fork_io`). `save_snapshot` then POSTs the
-snapshot to the fork (`POST /instances/:name/snapshot`) via the shared
+snapshot to the owning server (`POST /instances/:name/snapshot`) via the shared
 `common_core::runtime::block_on` bridge and records the metadata locally;
-`list_snapshots`/`delete_snapshot` delegate to the fork. Rigor's blue-pass
+`list_snapshots`/`delete_snapshot` delegate to that server. Rigor's blue-pass
 completion triggers the save, so the subsequent blue->rewind->red flow sends a
 real `snapshot`/`instance`/`id_slot` on the next dispatch. Without the handle
 these degrade to metadata-only no-ops.

@@ -63,7 +63,8 @@ fn test_deps(
         http_client: Arc::new(reqwest::Client::new()),
         ladders,
         context_cache,
-        instance_managers: HashMap::new(),
+        instance_pool: None,
+        api_key_env_name: None,
     }
 }
 
@@ -188,7 +189,8 @@ fn test_deps_with_ledger(
         http_client: Arc::new(reqwest::Client::new()),
         ladders: HashMap::new(),
         context_cache: None,
-        instance_managers: HashMap::new(),
+        instance_pool: None,
+        api_key_env_name: None,
     }
 }
 
@@ -1460,7 +1462,8 @@ fn rigor_test_deps(
         http_client: Arc::new(reqwest::Client::new()),
         ladders: HashMap::new(),
         context_cache: None,
-        instance_managers: HashMap::new(),
+        instance_pool: None,
+        api_key_env_name: None,
     }
 }
 
@@ -1621,3 +1624,171 @@ async fn rigor_route_unconfigured_returns_explicit_error() {
         "error body must explain, got: {text}"
     );
 }
+
+// -- Shared-weight instance management API ----------------------------------
+
+/// A stub llama-server management backend answering the `/instances` envelope,
+/// create, and delete.
+fn instance_stub_handler(
+) -> Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> {
+    Arc::new(|method, path, _body| match (method, path) {
+        ("GET", "/instances") => (
+            200,
+            json!({
+                "instances": [{
+                    "id": "ledger", "aliases": [], "group": "ledger",
+                    "n_ctx": 65536, "parallel": 1, "pinned": true, "is_default": true,
+                    "state": "loaded", "model_bytes": 2428416000u64, "context_bytes": 100,
+                    "compute_bytes": 100, "total_bytes": 2428416200u64, "vram_bytes": 200,
+                    "last_used": 1,
+                }],
+                "snapshots": [],
+                "total": { "model": 2428416000u64, "context": 100, "compute": 100, "total": 2428416200u64 },
+            })
+            .to_string(),
+        ),
+        ("POST", "/instances") => (
+            201,
+            json!({
+                "id": "work", "group": "swarm", "n_ctx": 32768, "parallel": 1,
+                "pinned": false, "is_default": false, "state": "loaded",
+                "model_bytes": 0, "context_bytes": 0, "compute_bytes": 0,
+                "total_bytes": 0, "vram_bytes": 0, "last_used": -1,
+            })
+            .to_string(),
+        ),
+        ("DELETE", path) if path.starts_with("/instances/") => (200, "{}".into()),
+        ("POST", path) if path.starts_with("/instances/") => (200, "{}".into()),
+        _ => (404, "{}".into()),
+    })
+}
+
+/// Spawn a server wired with a managed instance pool backed by `stub`.
+async fn spawn_instances_server(
+    stub: &crate::instances::stub::StubServer,
+) -> TestServer {
+    use crate::config::SidecarConfig;
+    use crate::instances::{InstanceClient, InstanceManager, InstancePool};
+
+    let mut managers = HashMap::new();
+    managers.insert(
+        "swarm".into(),
+        Arc::new(InstanceManager::new(
+            "swarm",
+            InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
+            Vec::new(),
+            SidecarConfig::default(),
+        )),
+    );
+    let pool = InstancePool::from_managers(managers);
+
+    let config = make_config("http://127.0.0.1:1", false, false, 5000, 2000);
+    let pipelines = Arc::new(config.build_all_pipelines_with_backend(None));
+    let mut deps = test_deps(pipelines, &config, None, None, None, HashMap::new(), None);
+    deps.instance_pool = Some(Arc::new(pool));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let handle = tokio::spawn(async move {
+        if let Err(e) = serve_http(listener, deps).await {
+            tracing::error!(target: "router.test", error = %e, "instances test server failed");
+        }
+    });
+    TestServer { addr, handle }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn instances_api_aggregates_lists_and_proxies() {
+    let stub = crate::instances::stub::StubServer::start(instance_stub_handler());
+    let server = spawn_instances_server(&stub).await;
+
+    // GET /instances aggregates with the public id grammar.
+    let resp = reqwest::get(format!("{}/instances", server.base_url()))
+        .await
+        .expect("GET /instances");
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.expect("instances envelope json");
+    let instances = body["instances"].as_array().expect("instances array");
+    assert_eq!(instances.len(), 1);
+    assert_eq!(instances[0]["id"], "swarm:ledger");
+    assert_eq!(instances[0]["pinned"], true);
+    assert_eq!(body["total"]["model"], 2428416000u64);
+
+    // GET /v1/models lists one entry per instance plus aliases.
+    let resp = reqwest::get(format!("{}/v1/models", server.base_url()))
+        .await
+        .expect("GET /v1/models");
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.expect("models json");
+    let data = body["data"].as_array().expect("models data");
+    assert_eq!(data[0]["id"], "swarm:ledger");
+    let aliases = data[0]["aliases"].as_array().expect("aliases");
+    assert!(aliases.iter().any(|a| a == "swarm"));
+    assert!(aliases.iter().any(|a| a == "swarm:latest"));
+
+    // GET /memory reshapes the same envelope.
+    let resp = reqwest::get(format!("{}/memory", server.base_url()))
+        .await
+        .expect("GET /memory");
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.expect("memory json");
+    assert_eq!(body["object"], "memory");
+    assert_eq!(body["total"]["total"], 2428416200u64);
+
+    // POST /instances creates a fresh context on the owning server.
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/instances", server.base_url()))
+        .json(&json!({"model": "swarm", "name": "work", "group": "swarm", "ctx_size": 32768}))
+        .send()
+        .await
+        .expect("POST /instances");
+    assert_eq!(resp.status(), 201);
+    let body: Value = resp.json().await.expect("create response json");
+    assert_eq!(body["id"], "work");
+
+    // DELETE /instances/<model>:<name> proxies to the owning server.
+    let resp = client
+        .delete(format!("{}/instances/swarm:ledger", server.base_url()))
+        .send()
+        .await
+        .expect("DELETE /instances");
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.expect("delete response json");
+    assert_eq!(body["success"], true);
+
+    // The id grammar also works via ?model= + bare name.
+    let resp = client
+        .delete(format!("{}/instances/ledger?model=swarm", server.base_url()))
+        .send()
+        .await
+        .expect("DELETE ?model= route");
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn instances_api_rejects_unknown_model_and_requires_specify_model() {
+    let stub = crate::instances::stub::StubServer::start(instance_stub_handler());
+    let server = spawn_instances_server(&stub).await;
+    let client = reqwest::Client::new();
+
+    // A management call that names no model (with exactly one managed model)
+    // routes to it; a body carrying an unknown model is rejected.
+    let resp = client
+        .post(format!("{}/instances", server.base_url()))
+        .json(&json!({"name": "work", "group": "swarm", "ctx_size": 16384}))
+        .send()
+        .await
+        .expect("POST without model");
+    assert_eq!(resp.status(), 201, "single managed model is the implicit target");
+
+    let resp = client
+        .post(format!("{}/instances", server.base_url()))
+        .json(&json!({"model": "nope", "name": "work", "group": "swarm"}))
+        .send()
+        .await
+        .expect("POST unknown model");
+    assert_eq!(resp.status(), 400);
+}
+
