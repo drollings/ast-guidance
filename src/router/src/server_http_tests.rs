@@ -65,6 +65,7 @@ fn test_deps(
         context_cache,
         instance_pool: None,
         api_key_env_name: None,
+        supervisor: None,
     }
 }
 
@@ -191,6 +192,7 @@ fn test_deps_with_ledger(
         context_cache: None,
         instance_pool: None,
         api_key_env_name: None,
+        supervisor: None,
     }
 }
 
@@ -1464,6 +1466,7 @@ fn rigor_test_deps(
         context_cache: None,
         instance_pool: None,
         api_key_env_name: None,
+        supervisor: None,
     }
 }
 

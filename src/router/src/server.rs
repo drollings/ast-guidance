@@ -1,6 +1,7 @@
 //! HTTP server exposing the router pipeline as an OpenAI-compatible endpoint.
 //! Uses hyper for HTTP with SSE streaming support via http-body-util::channel.
 
+pub mod admin;
 pub mod dispatch;
 pub mod handler;
 pub mod instances_api;
@@ -49,6 +50,9 @@ pub struct RouterServer {
     /// the public `/instances` API and consulting the manager on a 503
     /// group-miss to allocate fresh KV before retrying.
     instance_pool: Option<Arc<crate::instances::InstancePool>>,
+    /// Managed llama-server supervisor (the process owner). Backs
+    /// `POST /models/unload` and the `/metrics` aggregation.
+    supervisor: Option<Arc<crate::supervisor::LlamaServerSupervisor>>,
     /// Env var naming the management API key (enforced on `/instances`).
     api_key_env_name: Option<String>,
     depends: Vec<ArcIntern<str>>,
@@ -80,6 +84,7 @@ impl RouterServer {
             ladders: HashMap::new(),
             context_cache: None,
             instance_pool: None,
+            supervisor: None,
             api_key_env_name: None,
             depends: vec![],
             provides: vec![ArcIntern::from("http.endpoint")],
@@ -171,6 +176,14 @@ impl RouterServer {
         self
     }
 
+    /// Attach the managed llama-server supervisor (M5). Enables
+    /// `POST /models/unload` and the `/metrics` aggregation.
+    #[must_use]
+    pub fn with_supervisor(mut self, supervisor: Option<Arc<crate::supervisor::LlamaServerSupervisor>>) -> Self {
+        self.supervisor = supervisor;
+        self
+    }
+
     #[must_use]
     pub fn with_mock(mut self, mock_dispatch: MockDispatchContext) -> Self {
         tracing::info!(
@@ -224,6 +237,7 @@ impl RouterServer {
             context_cache: self.context_cache.clone(),
             instance_pool: self.instance_pool.clone(),
             api_key_env_name: self.api_key_env_name.clone(),
+            supervisor: self.supervisor.clone(),
         };
 
         // Reconcile configured pinned instances at boot (retrying until the
@@ -281,6 +295,7 @@ impl WorkUnit for RouterServer {
             context_cache: self.context_cache.clone(),
             instance_pool: self.instance_pool.clone(),
             api_key_env_name: self.api_key_env_name.clone(),
+            supervisor: self.supervisor.clone(),
         };
         let rt = ctx.rt.clone();
 

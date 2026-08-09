@@ -564,7 +564,7 @@ pub async fn handle_model_less_proxy(
 }
 
 /// Read and JSON-parse a request body, enforcing the max payload.
-async fn read_json_body(
+pub(crate) async fn read_json_body(
     req: hyper::Request<hyper::body::Incoming>,
     max_payload: usize,
 ) -> Result<serde_json::Value, HyperResponse> {

@@ -1,11 +1,30 @@
+//! coral-router — LLM Router & Agent Orchestration Server and CLI administration
+//! tool.
+//!
+//! `coral-router start` runs the router server (the process owner of the local
+//! `llama-server` fleet). The remaining subcommands (`list`, `ps`, `pull`,
+//! `scan`, `rm`, `show`, `stop`, `speedtest`) are the CLI administration
+//! surface, ported from `gguf_tool.py`.
+
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::fn_params_excessive_bools,
+    clippy::missing_errors_doc,
+    clippy::too_many_arguments
+)]
+
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use common_core::config::load_json_or_default;
 use fluent_llm::client::ChatBackend;
 use fluent_llm::{create_embedding_provider, EmbeddingProvider};
 use fluent_router::charts::store::ChartStore;
+use fluent_router::cli::{commands, CliContext};
 use fluent_router::config::{validate_no_self_routing, RouterConfig};
 use fluent_router::hnsw::HnswIndexHandle;
 use fluent_router::ledger::ContentNodeLedger;
@@ -20,13 +39,61 @@ use fluent_router::testing::{
 #[derive(Parser)]
 #[command(
     name = "coral-router",
-    about = "LLM Router & Agent Orchestration Server"
+    about = "LLM Router & Agent Orchestration Server + CLI administration tool",
+    version,
+    subcommand_required = true
 )]
-struct Args {
+struct Cli {
     /// Path to the router configuration JSON file.
-    #[arg(short, long, default_value = "coral-router.json")]
+    #[arg(short, long, global = true, default_value = "coral-router.json")]
     config: String,
 
+    /// GGUF directory scanned by the admin subcommands (default:
+    /// /app/ai/models/gguf).
+    #[arg(long, global = true)]
+    gguf_dir: Option<PathBuf>,
+
+    /// Show what would be done without making changes.
+    #[arg(short = 'n', long, global = true)]
+    dry_run: bool,
+
+    /// Enable verbose logging.
+    #[arg(short, long, global = true)]
+    verbose: bool,
+
+    /// Enable debug mode.
+    #[arg(long, global = true)]
+    debug: bool,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Start the router server (spawns and supervises the managed llama-servers).
+    Start(StartArgs),
+    /// List models in the GGUF directory.
+    #[command(alias = "ls")]
+    List,
+    /// List running models via the router's /v1/models and /instances API.
+    Ps(ServerArgs),
+    /// Pull a model from a registry (HuggingFace) or a local GGUF file.
+    Pull(PullArgs),
+    /// Scan the GGUF directory, generate configs and the llama.cpp preset.
+    Scan(ScanArgs),
+    /// Remove a model.
+    Rm(RmArgs),
+    /// Show information for a model.
+    Show(ShowArgs),
+    /// Stop a running model.
+    Stop(StopArgs),
+    /// Measure generation throughput via /metrics.
+    Speedtest(SpeedtestArgs),
+}
+
+#[derive(Args)]
+struct StartArgs {
     /// Override the server bind host (takes priority over config file).
     #[arg(long)]
     host: Option<String>,
@@ -52,11 +119,183 @@ struct Args {
     mock_except: Vec<String>,
 }
 
+/// Shared server-address args for the router-API commands.
+#[derive(Args)]
+struct ServerArgs {
+    /// Router base URL (default: derived from config server.bind_addr).
+    #[arg(short = 'u', long)]
+    api_url: Option<String>,
+}
+
+#[derive(Args)]
+struct PullArgs {
+    /// Model name (e.g. hf.co/author/model:tag).
+    model: String,
+    /// Local GGUF file to use instead of downloading.
+    #[arg(short, long)]
+    input: Option<PathBuf>,
+    /// Overwrite existing destination.
+    #[arg(short, long)]
+    force: bool,
+}
+
+#[derive(Args)]
+struct ScanArgs {
+    /// Write LiteLLM YAML config to path.
+    #[arg(short = 'L', long)]
+    write_litellm: Option<PathBuf>,
+    /// Write aichat config to path.
+    #[arg(short = 'A', long)]
+    write_aichat: Option<PathBuf>,
+    /// Prefix for model paths in the preset (e.g. /app/ai/models/gguf;
+    /// default: absolute host paths).
+    #[arg(long)]
+    path_prefix: Option<String>,
+    /// Output models as JSON.
+    #[arg(short, long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct RmArgs {
+    /// Model name.
+    model: String,
+}
+
+#[derive(Args)]
+struct ShowArgs {
+    /// Model name.
+    model: String,
+    /// Show the Modelfile.
+    #[arg(long)]
+    modelfile: bool,
+    /// Show the license.
+    #[arg(long)]
+    license: bool,
+    /// Show parameters.
+    #[arg(long)]
+    parameters: bool,
+    /// Show the system message.
+    #[arg(long)]
+    system: bool,
+    /// Show the chat template.
+    #[arg(long)]
+    template: bool,
+}
+
+#[derive(Args)]
+struct StopArgs {
+    /// Model name (router model key, or a GGUF-layout name).
+    model: String,
+    /// Force the child process to exit (reserved; the router owns the server).
+    #[arg(short, long)]
+    force: bool,
+    /// Router base URL (default: derived from config server.bind_addr).
+    #[arg(short = 'u', long)]
+    api_url: Option<String>,
+}
+
+#[derive(Args)]
+struct SpeedtestArgs {
+    /// Model to benchmark (default: first configured model key).
+    #[arg(short, long)]
+    model: Option<String>,
+    /// Number of tokens to generate; 0 reports previous performance only.
+    #[arg(short, long, default_value_t = 0)]
+    tokens: u32,
+    /// Prompt to send.
+    #[arg(short, long)]
+    prompt: Option<String>,
+    /// Router base URL (default: derived from config server.bind_addr).
+    #[arg(short = 'u', long)]
+    api_url: Option<String>,
+    /// Sampling temperature.
+    #[arg(short = 'T', long, default_value_t = 0.9)]
+    temperature: f64,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+    let cli = Cli::parse();
+    let ctx = CliContext::new(cli.gguf_dir.clone(), cli.dry_run, cli.verbose, cli.debug);
+    let config_path = resolve_config_path(&cli.config);
 
-    let mut config: RouterConfig = load_json_or_default(args.config.as_ref());
+    match cli.command {
+        Command::Start(args) => run_start(&config_path, args).await?,
+        Command::List => commands::list(&ctx)?,
+        Command::Ps(args) => {
+            commands::ps(
+                &ctx,
+                args.api_url.as_deref(),
+                Some(std::path::Path::new(&config_path)),
+            )
+            .await?
+        }
+        Command::Pull(args) => commands::pull(&ctx, &args.model, args.input, args.force).await?,
+        Command::Scan(args) => commands::scan(
+            &ctx,
+            args.write_litellm.as_ref(),
+            args.write_aichat.as_ref(),
+            args.path_prefix.as_deref(),
+            args.json,
+        )?,
+        Command::Rm(args) => commands::rm(&ctx, &args.model)?,
+        Command::Show(args) => {
+            let flags = fluent_router::cli::commands::ShowFlags {
+                modelfile: args.modelfile,
+                license: args.license,
+                parameters: args.parameters,
+                system: args.system,
+                template: args.template,
+            };
+            commands::show(&ctx, &args.model, &flags)?
+        }
+        Command::Stop(args) => {
+            commands::stop(
+                &ctx,
+                args.api_url.as_deref(),
+                Some(std::path::Path::new(&config_path)),
+                &args.model,
+                args.force,
+            )
+            .await?
+        }
+        Command::Speedtest(args) => {
+            let st = fluent_router::cli::commands::SpeedtestArgs {
+                model: args.model.unwrap_or_default(),
+                tokens: args.tokens,
+                prompt: args.prompt,
+                temperature: args.temperature,
+            };
+            commands::speedtest(
+                &ctx,
+                args.api_url.as_deref(),
+                Some(std::path::Path::new(&config_path)),
+                &st,
+            )
+            .await?
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the config path: the explicit value, or the repository default
+/// (`env/coral-router.json`) when the default path does not exist.
+fn resolve_config_path(explicit: &str) -> String {
+    if std::path::Path::new(explicit).exists() || explicit != "coral-router.json" {
+        return explicit.to_string();
+    }
+    if std::path::Path::new("env/coral-router.json").exists() {
+        "env/coral-router.json".to_string()
+    } else {
+        explicit.to_string()
+    }
+}
+
+/// Start the router server: build config, boot the llama-server supervisor,
+/// attach the pipeline/server, and serve until a shutdown signal.
+async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let mut config: RouterConfig = load_json_or_default(config_path.as_ref());
     config.apply_defaults();
 
     // CLI overrides take priority over config file
@@ -145,8 +384,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             None
         } else {
-            let supervisor =
-                fluent_router::supervisor::LlamaServerSupervisor::build(&config)?;
+            let supervisor = fluent_router::supervisor::LlamaServerSupervisor::build(&config)?;
             let supervisor = Arc::new(supervisor);
             if let Err(e) = supervisor.start_all().await {
                 tracing::error!(target: "coral-router", error = %e, "fatal: managed llama-server failed to start");
@@ -235,21 +473,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // instance pool. The server owns their reconcile + residency tasks. A
     // malformed instance grammar (duplicate name / group-name collision)
     // fails fast so boot aborts loudly.
-    let instance_pool = match fluent_router::instances::build_instance_managers(
-        &config,
-        _supervisor.clone(),
-    ) {
-        Ok(pool) => pool,
-        Err(e) => {
-            tracing::error!(
-                target: "coral-router",
-                error = %e,
-                "fatal: instance pool grammar validation failed",
-            );
-            eprintln!("FATAL: {e}");
-            std::process::exit(1);
-        }
-    };
+    let instance_pool =
+        match fluent_router::instances::build_instance_managers(&config, _supervisor.clone()) {
+            Ok(pool) => pool,
+            Err(e) => {
+                tracing::error!(
+                    target: "coral-router",
+                    error = %e,
+                    "fatal: instance pool grammar validation failed",
+                );
+                eprintln!("FATAL: {e}");
+                std::process::exit(1);
+            }
+        };
 
     // M2 composition: when the operator opts in via the `ledger`/`session`
     // sections, open a `ContentNodeLedger` (with a real `Summarizer` backend
@@ -307,8 +543,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let sessions = if let Some(session_cfg) = &config.session {
         let kv_root = session_cfg.root.as_ref().map(std::path::PathBuf::from);
-        let sessions =
-            Arc::new(fluent_router::dag_session::SessionRegistry::new(kv_root));
+        let sessions = Arc::new(fluent_router::dag_session::SessionRegistry::new(kv_root));
         tracing::info!(
             target: "coral-router",
             session_root = ?session_cfg.root,
@@ -336,6 +571,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         server = server.with_instance_pool(instance_pool);
     }
     server = server.with_management_api_key(config.sidecar.api_key_env.clone());
+    server = server.with_supervisor(_supervisor.clone());
 
     if let Some(ctx) = mock_dispatch {
         server = server.with_mock(ctx);

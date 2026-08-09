@@ -20,6 +20,7 @@
 
 pub mod audit;
 pub mod charts;
+pub mod cli;
 pub mod config;
 pub mod dag_session;
 pub mod dispatch;

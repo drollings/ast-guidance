@@ -55,6 +55,9 @@ pub struct ServerDeps {
     pub instance_pool: Option<Arc<crate::instances::InstancePool>>,
     /// Env var naming the management API key (enforced on `/instances`).
     pub api_key_env_name: Option<String>,
+    /// Managed llama-server supervisor (the process owner). `None` in mock
+    /// mode. Backs `POST /models/unload` and the `/metrics` aggregation.
+    pub supervisor: Option<Arc<crate::supervisor::LlamaServerSupervisor>>,
 }
 
 impl ServerDeps {
@@ -244,6 +247,7 @@ async fn handle_chat_completion(
         context_cache,
         instance_pool,
         api_key_env_name: _,
+        supervisor: _,
     } = deps;
     // M10: the dispatch post-processing hook (workflow extraction), if the
     // operator configured it. Passed through to successful dispatches only.
@@ -982,6 +986,15 @@ pub async fn handle_request(
             stats.requests.fetch_add(1, Ordering::Relaxed);
             Ok(crate::server::instances_api::handle_list_models(&deps).await)
         }
+        ("POST", "/models/unload" | "/v1/models/unload") => {
+            stats.requests.fetch_add(1, Ordering::Relaxed);
+            Ok(crate::server::admin::handle_unload_model(req, &deps).await)
+        }
+        ("GET", "/metrics") => {
+            stats.requests.fetch_add(1, Ordering::Relaxed);
+            let query = crate::server::instances_api::parse_query(req.uri().query().unwrap_or(""));
+            Ok(crate::server::admin::handle_metrics(&deps, &query).await)
+        }
         ("GET" | "POST", "/props") => {
             stats.requests.fetch_add(1, Ordering::Relaxed);
             Ok(crate::server::instances_api::handle_props(&deps).await)
@@ -1076,7 +1089,7 @@ fn route_instance_resource(method: &str, path: &str) -> Option<(&'static str, St
     }
 }
 
-fn is_local_request(req: &hyper::Request<hyper::body::Incoming>) -> bool {
+pub(crate) fn is_local_request(req: &hyper::Request<hyper::body::Incoming>) -> bool {
     req.headers()
         .get(hyper::header::HOST)
         .and_then(|v| v.to_str().ok())

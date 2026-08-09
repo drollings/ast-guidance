@@ -8,7 +8,7 @@
 | Golden tests | `src/router/src/tests/golden.rs` | Labeled corpus — intent, PII, adversarial cases |
 | E2E tests | `src/router/src/tests/e2e_tests.rs` | Full pipeline with `TranscriptProvider` (no LLM) |
 | Server tests | `src/router/src/server_tests.rs` | `RouterServer` construction and config |
-| Mock mode | `coral-router --mock` | Real HTTP server, real pipeline, transcript-driven |
+| Mock mode | `coral-router start --mock` | Real HTTP server, real pipeline, transcript-driven |
 
 ## Quick commands
 
@@ -124,11 +124,11 @@ classifier output, the expected route, and a canned dispatch response:
 
 ```sh
 # Build + start with transcript
-cargo run -p coral-router -- --config env/coral-router.json --mock env/mock-transcripts.json
+cargo run -p coral-router -- start --config env/coral-router.json --mock env/mock-transcripts.json
 
 # Or via config:
 # Add "mock": { "transcript_path": "env/mock-transcripts.json" } to env/coral-router.json
-cargo run -p coral-router -- --config env/coral-router.json
+cargo run -p coral-router -- start --config env/coral-router.json
 ```
 
 ### Sending test requests

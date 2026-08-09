@@ -201,13 +201,13 @@ ROUTER_MOCK_TEST_SCRIPT := bin/router-mock-tests.sh
 router-start: $(CORAL_ROUTER_BIN) ## Build (if needed), (re)start coral-router in real mode on :8079, and wait for /health (stops the old tree first)
 	$(stop-router)
 	$(Q)echo "Starting coral-router"
-	$(Q)nohup $(CORAL_ROUTER_BIN) -c $(CORAL_ROUTER_CONFIG) > $(ROUTER_LOG) 2>&1 &
+	$(Q)nohup $(CORAL_ROUTER_BIN) start -c $(CORAL_ROUTER_CONFIG) > $(ROUTER_LOG) 2>&1 &
 	$(Q)bash $(ROUTER_WAIT_SCRIPT) $(CORAL_ROUTER_HEALTH_URL) $(ROUTER_START_TIMEOUT_S) $(ROUTER_LOG)
 
 .PHONY: router-mock
 router-mock: $(CORAL_ROUTER_BIN) $(ROUTER_MOCK_TEST_SCRIPT) ## Build, start a mock router on :8078, run the 29 curl smoke-tests (leaves that server running)
 	$(stop-router)
-	$(Q)nohup $(CORAL_ROUTER_BIN) -c $(CORAL_ROUTER_CONFIG) --host 127.0.0.1 --port 8078 --mock env/mock-transcripts.json > $(ROUTER_MOCK_LOG) 2>&1 &
+	$(Q)nohup $(CORAL_ROUTER_BIN) start -c $(CORAL_ROUTER_CONFIG) --host 127.0.0.1 --port 8078 --mock env/mock-transcripts.json > $(ROUTER_MOCK_LOG) 2>&1 &
 	$(Q)bash $(ROUTER_WAIT_SCRIPT) $(CORAL_ROUTER_MOCK_HEALTH_URL) $(ROUTER_MOCK_TIMEOUT_S) $(ROUTER_MOCK_LOG)
 	$(Q)ROUTER_BASE_URL=http://127.0.0.1:8078 bash $(ROUTER_MOCK_TEST_SCRIPT)
 
