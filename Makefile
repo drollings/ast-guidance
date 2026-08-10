@@ -158,11 +158,19 @@ router: $(CORAL_ROUTER_BIN) ## Build coral-router (fast, no run; the base for ev
 # caller starts a fresh one. The router is the process owner of its spawned
 # llama-servers and handles SIGTERM gracefully (stops the supervisor first),
 # so a plain kill never orphans serving processes.
+#
+# Match by exact process name (`pkill -x`) AND by the router config file path
+# (`pkill -f 'coral-router[.]json'`): the binary is often invoked through a
+# symlink (e.g. the `gguf_tool` alias) whose comm(2) name is the symlink, so
+# `killall coral-router` would silently miss it and leave a stale router on
+# the port. The `[.]` character class keeps the second pattern from matching
+# its own literal text (or a calling shell that merely mentions the word
+# `coral-router`), so it only ever kills the router process.
 define stop-router
-	$(Q)echo "Stopping any running coral-router"
-	$(Q)#pkill -x coral-router 2>/dev/null || true
-	$(Q)#for i in $$(seq 1 5); do pgrep -x coral-router >/dev/null 2>&1 || break; sleep 0.2; done
-	$(Q)killall coral-router 2>/dev/null || true
+	$(Q)echo "Stopping any running router"
+	$(Q)pkill -x coral-router 2>/dev/null || true
+	$(Q)pkill -f 'coral-router[.]json' 2>/dev/null || true
+	$(Q)for i in $$(seq 1 75); do pgrep -f 'coral-router[.]json' >/dev/null 2>&1 || break; sleep 0.2; done
 endef
 
 .PHONY: router-stop

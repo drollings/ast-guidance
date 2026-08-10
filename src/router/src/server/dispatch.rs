@@ -647,6 +647,7 @@ mod tests {
             no_sleep: true,
             sleep_idle_seconds: None,
             default: false,
+            resume: false,
             params: None,
         };
         let manager = Arc::new(InstanceManager::new(

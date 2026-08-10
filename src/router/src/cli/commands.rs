@@ -83,7 +83,8 @@ fn cli_err(message: impl Into<String>) -> CliError {
 
 fn sync_preset(gguf_dir: &Path) {
     sync_cache(gguf_dir);
-    let _ = write_models_preset(gguf_dir, Some(super::DEFAULT_GGUF_DIR));
+    let prefix = gguf_dir.to_string_lossy().into_owned();
+    let _ = write_models_preset(gguf_dir, Some(&prefix));
 }
 
 // ── list ────────────────────────────────────────────────────────────────────
@@ -414,7 +415,7 @@ fn print_modelfile(
     println!("# FROM {}", entry.display);
     println!();
     let rel = entry.path.strip_prefix(gguf_dir).unwrap_or(&entry.path);
-    println!("FROM /app/ai/models/gguf/{}", rel.display());
+    println!("FROM {}/{}", gguf_dir.display(), rel.display());
     if let Some(t) = template_text {
         println!("TEMPLATE \"\"\"{t}\"\"\"");
     }
@@ -852,8 +853,13 @@ fn print_weight_block(
             let state = inst.get("state").and_then(Value::as_str).unwrap_or("?");
             let sleep = inst_sleep_label(inst);
             let mem = format_size(inst.get("vram_bytes").and_then(Value::as_u64).unwrap_or(0));
+            let resume = if inst.get("resume").and_then(Value::as_bool).unwrap_or(false) {
+                "resume"
+            } else {
+                "-"
+            };
             println!(
-                "    {name:<16}  ctx {n_ctx:>7}  par {par:>3}  sleep {sleep:<9}  state {state:<9}  ctx-mem {mem:>10}"
+                "    {name:<16}  ctx {n_ctx:>7}  par {par:>3}  resume {resume:<6}  sleep {sleep:<9}  state {state:<9}  ctx-mem {mem:>10}"
             );
         }
     }
@@ -912,19 +918,24 @@ fn gguf_weights_size(gguf_dir: &Path, model_key: &str) -> Option<u64> {
 }
 
 /// Resolve a model key's resident weights bytes: the router's reported
-/// `model_bytes` first, then the configured weights file, then the GGUF
-/// layout, then `0`.
+/// `model_bytes` when instance detail exists (a plain model's synthesized
+/// entry reports `0` while the fork has its weights slept out of VRAM, and
+/// the shared weights size once loaded), else the configured weights file,
+/// else the GGUF layout, else `0`.
 fn model_weights_bytes(
     insts: &[Value],
     config: Option<&RouterConfig>,
     gguf_dir: &Path,
     model_key: &str,
 ) -> u64 {
-    insts
-        .iter()
-        .filter_map(|i| i.get("model_bytes").and_then(Value::as_u64).filter(|b| *b > 0))
-        .max()
-        .or_else(|| config_weights_size(config, model_key))
+    if !insts.is_empty() {
+        return insts
+            .iter()
+            .filter_map(|i| i.get("model_bytes").and_then(Value::as_u64))
+            .max()
+            .unwrap_or(0);
+    }
+    config_weights_size(config, model_key)
         .or_else(|| gguf_weights_size(gguf_dir, model_key))
         .unwrap_or(0)
 }
@@ -1060,6 +1071,11 @@ pub async fn speedtest(
     let config = load_config(config_path);
 
     let model_name = resolve_speedtest_model(config.as_ref(), &args.model);
+    if model_name.is_empty() {
+        return Err(cli_err(
+            "no model to benchmark: pass --model, or configure a default_route with a model group",
+        ));
+    }
     let prompt = args
         .prompt
         .as_deref()
@@ -1123,7 +1139,7 @@ pub async fn speedtest(
 }
 
 /// Resolve the speedtest model: the arg if given, else the default route's
-/// first model, else the first configured model key, else `code`.
+/// first model, else the first configured model key.
 fn resolve_speedtest_model(config: Option<&RouterConfig>, arg: &str) -> String {
     if !arg.is_empty() {
         return arg.to_string();
@@ -1142,7 +1158,7 @@ fn resolve_speedtest_model(config: Option<&RouterConfig>, arg: &str) -> String {
             return (*first).clone();
         }
     }
-    "code".to_string()
+    String::new()
 }
 
 fn speedtest_report(usage: &Value, elapsed: Duration) {
@@ -1350,6 +1366,14 @@ mod tests {
         assert_eq!(
             model_weights_bytes(&insts, Some(&config), dir.path(), "swarm"),
             1_000_000_000
+        );
+        // A sleeping plain model reports model_bytes = 0: its weights are NOT
+        // resident, so 0 is returned - never the on-disk weights file size.
+        let sleeping = vec![json!({ "model_bytes": 0u64, "vram_bytes": 0 })];
+        assert_eq!(
+            model_weights_bytes(&sleeping, Some(&config), dir.path(), "swarm"),
+            0,
+            "sleeping weights are not resident"
         );
         // No config, no instance → GGUF layout still resolves the file.
         assert_eq!(

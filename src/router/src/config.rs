@@ -39,7 +39,7 @@ pub struct RouterConfig {
     pub system_prompt: String,
     #[serde(default)]
     pub safety_threshold: f64,
-    #[serde(default = "default_fast_route")]
+    #[serde(default = "default_route")]
     pub default_route: String,
     #[serde(default = "ServerConfig::default")]
     pub server: ServerConfig,
@@ -100,6 +100,11 @@ pub struct RouterConfig {
     /// Applied to every managed model that does not declare the key itself.
     #[serde(default)]
     pub default_params: DefaultModelParams,
+    /// GGUF model directory for the admin CLI commands (`list`, `scan`, `rm`,
+    /// `show`, `pull`, and `ps` weights resolution). Overridable per-invocation
+    /// with `--gguf-dir`; `None` falls back to the built-in default.
+    #[serde(default)]
+    pub gguf_dir: Option<String>,
 }
 
 impl Default for RouterConfig {
@@ -113,7 +118,7 @@ impl Default for RouterConfig {
             routes: HashMap::new(),
             system_prompt: String::new(),
             safety_threshold: 0.5,
-            default_route: "fast".into(),
+            default_route: "local".into(),
             server: ServerConfig::default(),
             logging: LoggingConfig::default(),
             classifier_model: None,
@@ -129,6 +134,7 @@ impl Default for RouterConfig {
             ledger: None,
             session: None,
             default_params: DefaultModelParams::default(),
+            gguf_dir: None,
         }
     }
 }
@@ -273,6 +279,7 @@ impl ModelEntry {
 /// these instances; declaration-only keys (`num_ctx`/`parallel`/
 /// `sleep_idle_seconds`) are stripped before dispatch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct InstanceProfile {
     /// Instance name; default = the map key (expanded `<name><i>` for count > 1).
     #[serde(default)]
@@ -301,6 +308,16 @@ pub struct InstanceProfile {
     /// Target of a bare `<base>` request.
     #[serde(default)]
     pub default: bool,
+    /// Preserve this context across eviction: when the router must free VRAM,
+    /// the context's KV cache is snapshotted (and its session transcript is
+    /// already durable in the ledger) before it is dropped, so a later request
+    /// can resume it with `snapshot=<name>-resume`. `pinned` contexts are never
+    /// evicted, so `resume` is moot on them. Cleared at runtime (explicitly via
+    /// `POST /instances/:name/no-resume`, or automatically after
+    /// `sidecar.resume_ttl_s` of idle) when Coral Router concludes the work is
+    /// done - the snapshot is then deleted.
+    #[serde(default)]
+    pub resume: bool,
     /// Sampling params merged into the request body for dispatches through this
     /// instance.
     #[serde(default)]
@@ -540,8 +557,10 @@ pub struct ClassifierOutput {
 
 use common_core::constants::default_true;
 
-fn default_fast_route() -> String {
-    "fast".into()
+/// The default route when a config omits `default_route`: `local`, matching
+/// the shipped `env/coral-router.json` (no `fast` model exists in-tree).
+fn default_route() -> String {
+    "local".into()
 }
 
 // -- Charts (DAG workflow library) configuration --------------------------
@@ -845,6 +864,13 @@ pub struct SidecarConfig {
     /// (`<slot_save_path>/<model_key>/`). Feeds M3 snapshot-path derivation.
     #[serde(default)]
     pub slot_save_path: Option<String>,
+    /// Resume snapshots older than this many seconds of context idle are
+    /// dropped and their contexts' `resume` flag cleared: the router's signal
+    /// that an evicted workload is done and need not be restorable. `None`
+    /// keeps resume snapshots until explicitly disabled. The flag also feeds
+    /// the `-resume` snapshot naming the router uses on eviction.
+    #[serde(default)]
+    pub resume_ttl_s: Option<u64>,
     /// Env var naming the management API key sent as `Authorization: Bearer`.
     #[serde(default)]
     pub api_key_env: Option<String>,
@@ -859,6 +885,7 @@ impl Default for SidecarConfig {
             vram_total_bytes: None,
             minimum_remaining_vram: None,
             slot_save_path: None,
+            resume_ttl_s: None,
             api_key_env: None,
         }
     }

@@ -1079,6 +1079,8 @@ fn route_instance_resource(method: &str, path: &str) -> Option<(&'static str, St
         ("DELETE", [name]) => Some(("delete", name.to_string(), None)),
         ("POST", [name, "pin"]) => Some(("pin", name.to_string(), None)),
         ("POST", [name, "unpin"]) => Some(("unpin", name.to_string(), None)),
+        ("POST", [name, "resume"]) => Some(("resume", name.to_string(), None)),
+        ("POST", [name, "no-resume"]) => Some(("no_resume", name.to_string(), None)),
         ("POST", [name, "resize"]) => Some(("resize", name.to_string(), None)),
         ("POST", [name, "snapshot"]) => Some(("save", name.to_string(), None)),
         ("GET", [name, "snapshots"]) => Some(("list", name.to_string(), None)),

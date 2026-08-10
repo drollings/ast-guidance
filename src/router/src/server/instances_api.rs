@@ -264,8 +264,12 @@ pub async fn handle_post_instances(
         .get("default")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    let resume = body
+        .get("resume")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     match pool
-        .create(&model, name, group, ctx_size, parallel, pinned, is_default)
+        .create(&model, name, group, ctx_size, parallel, pinned, is_default, resume)
         .await
     {
         Ok(info) => json_response(
@@ -297,6 +301,8 @@ pub async fn handle_instance_op(
         "delete" => pool.destroy(&model, &instance).await,
         "pin" => pool.pin(&model, &instance).await,
         "unpin" => pool.unpin(&model, &instance).await,
+        "resume" => pool.set_resume(&model, &instance, true).await,
+        "no_resume" => pool.set_resume(&model, &instance, false).await,
         "resize" => {
             let body = match read_json_body(req, deps.max_payload).await {
                 Ok(b) => b,

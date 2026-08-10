@@ -217,8 +217,16 @@ struct SpeedtestArgs {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let ctx = CliContext::new(cli.gguf_dir.clone(), cli.dry_run, cli.verbose, cli.debug);
     let config_path = resolve_config_path(&cli.config);
+    // Best-effort config load so CLI defaults (e.g. the GGUF dir) come from
+    // the config file instead of hardcoded paths. An explicit `--gguf-dir`
+    // still wins.
+    let cli_config: RouterConfig = load_json_or_default(std::path::Path::new(&config_path));
+    let gguf_dir = cli
+        .gguf_dir
+        .clone()
+        .or_else(|| cli_config.gguf_dir.as_ref().map(PathBuf::from));
+    let ctx = CliContext::new(gguf_dir, cli.dry_run, cli.verbose, cli.debug);
 
     match cli.command {
         Command::Start(args) => run_start(&config_path, args).await?,
@@ -290,6 +298,31 @@ fn resolve_config_path(explicit: &str) -> String {
     } else {
         explicit.to_string()
     }
+}
+
+/// Resolve the classifier model key for logging/attribution, entirely from
+/// config (never a hardcoded name): the root `classifier_model`, else the
+/// first pipeline's `classifier_model`, else the default route's first model,
+/// else the first configured model key. Empty when nothing resolves.
+fn resolve_classifier_model_name(config: &RouterConfig) -> String {
+    if let Some(m) = &config.classifier_model {
+        return m.clone();
+    }
+    for params in config.pipelines.values() {
+        if let Some(m) = &params.classifier_model {
+            return m.clone();
+        }
+    }
+    if let Some(route) = config.routes.get(&config.default_route) {
+        if let Some(group) = config.model_groups.get(&route.group) {
+            if let Some(first) = group.models().first() {
+                return first.clone();
+            }
+        }
+    }
+    let mut keys: Vec<&String> = config.models.keys().collect();
+    keys.sort_unstable();
+    keys.first().map_or_else(String::new, |k| k.to_string())
 }
 
 /// Start the router server: build config, boot the llama-server supervisor,
@@ -419,8 +452,8 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
         let entries = load_transcript_file(path)?;
         let dispatch_ctx = MockDispatchContext::new(entries, args.mock_except.clone());
 
-        let classifier_model_name = config.classifier_model.as_deref().unwrap_or("fast");
-        let classifier_is_excepted = mock_except_models.contains(classifier_model_name);
+        let classifier_model_name = resolve_classifier_model_name(&config);
+        let classifier_is_excepted = mock_except_models.contains(&classifier_model_name);
         tracing::info!(target: "coral-router", classifier_model = %classifier_model_name, classifier_excepted = classifier_is_excepted, "classifier mock decision");
 
         let pipelines = if classifier_is_excepted {
@@ -446,11 +479,11 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
     // model→pipeline resolution needs no structural change.
     let routes = config.routes_view();
 
-    let classifier_model_name = config.classifier_model.as_deref().unwrap_or("fast");
+    let classifier_model_name = resolve_classifier_model_name(&config);
     let classifier = config
         .models
-        .get(classifier_model_name)
-        .map(|m| (classifier_model_name.to_string(), m.clone()));
+        .get(&classifier_model_name)
+        .map(|m| (classifier_model_name.clone(), m.clone()));
 
     tracing::info!(
         bind_addr = %config.server.bind_addr,

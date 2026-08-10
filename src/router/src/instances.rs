@@ -18,7 +18,8 @@
 //!   sums `total` with 64-bit arithmetic, and proxies per-model operations.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -183,6 +184,13 @@ pub struct InstanceInfo {
     pub pinned: bool,
     #[serde(default)]
     pub is_default: bool,
+    /// Router-side preserve-on-evict flag: when set, the router snapshots this
+    /// context's KV (and keeps its ledger transcript durable) before it drops
+    /// the context to free VRAM, so a later request can resume it with
+    /// `snapshot=<name>-resume`. Not understood by the fork - Coral Router
+    /// tracks it and overlays it on the aggregate envelope.
+    #[serde(default)]
+    pub resume: bool,
     #[serde(default)]
     pub state: String,
     #[serde(default)]
@@ -382,6 +390,7 @@ impl InstanceClient {
             parallel: parallel.unwrap_or(1),
             pinned,
             is_default,
+            resume: false,
             state: "loaded".into(),
             model_bytes: 0,
             context_bytes: 0,
@@ -482,6 +491,15 @@ impl InstanceClient {
         .await
         .map(|_| ())
     }
+
+    /// `GET /props` - the server's property envelope. Best-effort: `None` when
+    /// the endpoint is unreachable or returns a non-2xx. A plain (no-instance
+    /// grammar) server exposes no `/instances`, but `/props` still reports the
+    /// context size and idle-sleep state Coral Router uses to synthesize its
+    /// resident footprint.
+    pub async fn props(&self) -> Option<Value> {
+        self.request(reqwest::Method::GET, "/props", None).await.ok()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -497,6 +515,19 @@ pub struct InstanceManager {
     client: InstanceClient,
     profiles: Vec<InstanceProfile>,
     policy: crate::config::SidecarConfig,
+    /// Resident weights bytes of a plain (no-instance-grammar) model, from the
+    /// configured `weights` file. Instance models report `model_bytes` through
+    /// the fork's `/instances`; plain models need this to surface in the
+    /// aggregate envelope and the residency budget.
+    weights_bytes: u64,
+    /// Router-tracked last-use for plain models (the fork reports no
+    /// `last_used` for them). Updated by [`Self::touch`] on every dispatch; the
+    /// residency loop orders plain-model unloads by it.
+    last_used: AtomicI64,
+    /// Router-side preserve-on-evict map: instance name -> `resume`. Seeded
+    /// from the configured profiles, updated by [`Self::set_resume`]. The fork
+    /// knows nothing of it; the aggregate overlays it on the envelope.
+    resume: Mutex<HashMap<String, bool>>,
 }
 
 impl InstanceManager {
@@ -506,11 +537,157 @@ impl InstanceManager {
         profiles: Vec<InstanceProfile>,
         policy: crate::config::SidecarConfig,
     ) -> Self {
+        let resume = profiles
+            .iter()
+            .filter_map(|p| p.name.as_ref().map(|n| (n.clone(), p.resume)))
+            .collect();
         Self {
             model_key: model_key.into(),
             client,
             profiles,
             policy,
+            weights_bytes: 0,
+            last_used: AtomicI64::new(-1),
+            resume: Mutex::new(resume),
+        }
+    }
+
+    /// Builder-style: set the resident weights size of a plain (no-instance)
+    /// model so the aggregate and residency loops can report it.
+    #[must_use]
+    pub fn with_weights_bytes(mut self, bytes: u64) -> Self {
+        self.weights_bytes = bytes;
+        self
+    }
+
+    /// Whether this manager's model declares an instance pool. Only instance
+    /// models expose `/instances` on their server; a plain (weights-only)
+    /// model's server 404s on it and needs a synthesized footprint instead.
+    pub fn has_pool(&self) -> bool {
+        !self.profiles.is_empty()
+    }
+
+    /// The resident weights size of this model (from the configured weights
+    /// file). For instance models the fork reports `model_bytes` itself; this
+    /// is the size a cold load needs and the plain-model footprint uses.
+    pub fn weights_bytes(&self) -> u64 {
+        self.weights_bytes
+    }
+
+    /// Whether the named instance is marked to be preserved (KV snapshotted +
+    /// ledger transcript) across eviction.
+    pub fn resume_for(&self, name: &str) -> bool {
+        self.resume
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Set (or clear) the preserve-on-evict flag for a named instance.
+    pub fn set_resume(&self, name: &str, enabled: bool) {
+        self.resume
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(name.to_string(), enabled);
+    }
+
+    /// Whether the fork currently has this model's weights slept out of VRAM
+    /// (`is_sleeping` in `/props`). `None` when the server is unreachable.
+    /// Instance models never report sleeping (pinned contexts keep their
+    /// weights resident), so `Some(false)` short-circuits without a call.
+    pub async fn is_sleeping(&self) -> Option<bool> {
+        if self.has_pool() {
+            return Some(false);
+        }
+        self.client
+            .props()
+            .await?
+            .get("is_sleeping")
+            .and_then(Value::as_bool)
+    }
+
+    /// Record a dispatch to this model so residency can order plain models by
+    /// recency (the fork reports no `last_used` for them).
+    pub fn touch(&self) {
+        self.last_used.store(
+            i64::try_from(common_core::now_secs()).unwrap_or(i64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The resident footprint of a plain (no-instance-grammar) managed model.
+    ///
+    /// The fork exposes no `/instances` for these servers, so Coral Router
+    /// synthesizes one envelope entry: `model_bytes` is the configured weights
+    /// file size, or 0 when the server reports `is_sleeping` (the fork's idle
+    /// sleep has moved the weights out of VRAM). `state` mirrors that flag.
+    /// `None` when the server is unreachable (down or never loaded).
+    async fn plain_footprint(&self) -> Option<InstanceInfo> {
+        if self.has_pool() {
+            return None;
+        }
+        let props = self.client.props().await?;
+        let asleep = props
+            .get("is_sleeping")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let n_ctx = props
+            .get("default_generation_settings")
+            .and_then(|g| g.get("n_ctx"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let model_bytes = if asleep { 0 } else { self.weights_bytes };
+        let state = if asleep { "sleeping" } else { "loaded" }.to_string();
+        Some(InstanceInfo {
+            id: format!("{}:default", self.model_key),
+            aliases: vec![],
+            group: "default".into(),
+            n_ctx,
+            parallel: 1,
+            pinned: false,
+            is_default: true,
+            resume: false,
+            state,
+            model_bytes,
+            // No context windows are reported for a plain server; the resident
+            // footprint is the shared weights alone. `vram_bytes` follows the
+            // contract (context + compute, excluding weights) and stays 0.
+            context_bytes: 0,
+            compute_bytes: 0,
+            total_bytes: model_bytes,
+            vram_bytes: 0,
+            last_used: self.last_used.load(Ordering::Relaxed),
+        })
+    }
+
+    /// List this manager's instances, synthesizing a resident footprint when
+    /// the server is a plain (no-instance-grammar) model (its `/instances`
+    /// 404s). Returns `(envelope, plain)`, where `plain` is `true` when the
+    /// envelope is the synthesized footprint rather than the fork's report.
+    /// `None` when the server is unreachable (down or never loaded).
+    async fn list_with_fallback(&self) -> Option<(InstanceList, bool)> {
+        match self.client.list().await {
+            Ok(envelope) => Some((envelope, false)),
+            Err(InstanceError::Rejected { status: 404, .. }) => {
+                let footprint = self.plain_footprint().await?;
+                let total = InstanceTotals {
+                    model: footprint.model_bytes,
+                    context: 0,
+                    compute: 0,
+                    total: footprint.total_bytes,
+                };
+                Some((
+                    InstanceList {
+                        instances: vec![footprint],
+                        snapshots: vec![],
+                        total,
+                    },
+                    true,
+                ))
+            }
+            Err(_) => None,
         }
     }
 
@@ -890,12 +1067,18 @@ pub fn build_instance_managers(
             .and_then(Result::ok)
             .filter(|k| !k.is_empty());
         let client = InstanceClient::new(management_http_client(), base_url, api_key);
-        let manager = Arc::new(InstanceManager::new(
-            key,
-            client,
-            profiles,
-            config.sidecar.clone(),
-        ));
+        // The resident weights size of a plain (no-instance) model: the file
+        // the fork loads. Instance models report `model_bytes` themselves; a
+        // plain model's footprint is synthesized from this.
+        let weights_bytes = entry
+            .weights
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map_or(0, |m| m.len());
+        let manager = Arc::new(
+            InstanceManager::new(key, client, profiles, config.sidecar.clone())
+                .with_weights_bytes(weights_bytes),
+        );
         managers.insert(key.clone(), manager);
     }
     Ok(InstancePool::from_managers(managers, supervisor))
@@ -909,6 +1092,72 @@ fn instance_name_from_server_id(id: &str) -> &str {
         Some((_, name)) => name,
         None => id,
     }
+}
+
+/// The deterministic fork snapshot name a resume-marked context is saved under
+/// before eviction: `<instance>-resume` (snapshot names share the instance
+/// character class `[A-Za-z0-9._-]`), so a later request to the same instance
+/// with `snapshot=<name>-resume` restores it.
+pub fn resume_snapshot_name(instance: &str) -> String {
+    format!("{instance}-resume")
+}
+
+/// One unit the residency/admission control can evict to free VRAM.
+///
+/// A unit is either a single unpinned context (frees its KV + compute; the
+/// model's weights stay) or a whole model with no pinned instances (frees its
+/// weights and every context). Including whole-model units is what makes the
+/// largest resident footprints - e.g. a 10.5 GB weight pool - real eviction
+/// targets instead of only the small per-context buffers.
+enum Evictable<'a> {
+    /// One unpinned context.
+    Context {
+        info: InstanceInfo,
+        manager: &'a Arc<InstanceManager>,
+    },
+    /// A whole model: every unpinned context, then the shared weights.
+    Model {
+        manager: &'a Arc<InstanceManager>,
+        /// The coldest context's last use (model recency).
+        last_used: i64,
+        /// Total VRAM freed: weights + all unpinned contexts.
+        freed_bytes: u64,
+        /// The unpinned contexts to drop first (resume ones are snapshotted).
+        contexts: Vec<InstanceInfo>,
+    },
+}
+
+impl Evictable<'_> {
+    fn last_used(&self) -> i64 {
+        match self {
+            Self::Context { info, .. } => info.last_used,
+            Self::Model { last_used, .. } => *last_used,
+        }
+    }
+
+    fn freed_bytes(&self) -> u64 {
+        match self {
+            Self::Context { info, .. } => info.vram_bytes,
+            Self::Model { freed_bytes, .. } => *freed_bytes,
+        }
+    }
+}
+
+/// Eviction priority score: `freed_bytes * coldness`, where coldness is seconds
+/// since `last_used` (capped as an overflow guard; an entity never used is
+/// maximally cold). This is a "cost of keeping" heuristic: the unit whose
+/// resident footprint times its idle time is largest is the most valuable to
+/// evict. It makes big cold footprints (a model's weights) outrank small hot
+/// ones, so OOM pressure reclaims the largest chunks while a just-used model
+/// scores near zero and stays.
+fn eviction_score(freed_bytes: u64, last_used: i64, now: i64) -> u64 {
+    const COLD_CAP: i64 = 1 << 40; // ~35k years; overflow guard only
+    let coldness = if last_used < 0 {
+        COLD_CAP
+    } else {
+        now.saturating_sub(last_used).clamp(1, COLD_CAP)
+    };
+    freed_bytes.saturating_mul(coldness as u64)
 }
 
 /// The router's aggregate `/instances` facade over every managed model's
@@ -992,13 +1241,30 @@ impl InstancePool {
     /// currently unloaded. Also ensures a specifically-targeted instance
     /// (e.g. `<base>:scratch`) is created on demand. Best-effort: a failure to
     /// load degrades to the caller's normal dispatch error path.
+    ///
+    /// Before the target's weights are (re)loaded, [`Self::make_room_for`]
+    /// evicts LRU unpinned instances and unloads cold plain models so the load
+    /// never pushes the device over its VRAM allocation budget. Residency is
+    /// judged by the *actual* resident state, not the process flag: a plain
+    /// model whose fork has slept its weights out of VRAM (process alive,
+    /// `is_sleeping = true`) needs the same room to wake as a cold load would.
     pub async fn ensure_target_ready(&self, endpoint_url: &str, instance: Option<&str>) {
         let Some(manager) = self.manager_for_url(endpoint_url) else {
             return;
         };
+        // Record dispatch recency so residency can order plain models by last
+        // use (the fork reports no `last_used` for them).
+        manager.touch();
         let model_key = manager.model_key();
         if let Some(sup) = &self.supervisor {
-            if sup.is_running(model_key) != Some(true) {
+            let running = sup.is_running(model_key) == Some(true);
+            // A sleeping plain model is NOT resident: waking it reloads its
+            // weights into VRAM. Treat it like a cold load for admission.
+            let resident = running && manager.is_sleeping().await != Some(true);
+            if !resident {
+                self.make_room_for(model_key, manager.weights_bytes()).await;
+            }
+            if !running {
                 if let Err(e) = sup.ensure_running(model_key).await {
                     tracing::warn!(
                         target: "router.instances",
@@ -1027,12 +1293,15 @@ impl InstancePool {
     /// manager's `/instances` into a device `used` total and compares it to
     /// the allocation budget (`device_total - minimum_remaining_vram`).
     ///
-    /// When the budget is exceeded, evicts up to `evict_batch` least-recently
-    /// used **largest** unpinned instances across all managers (the residency
-    /// goal: free the most VRAM from the coldest context), then unloads any
-    /// model whose server is left with zero contexts (its weights are freed).
+    /// When the budget is exceeded, evicts up to `evict_batch` units - the
+    /// largest resident footprint first (see [`Self::evict_to_fit`]) - and
+    /// then unloads any model whose server is left with zero contexts. Resume
+    /// marked contexts are KV-snapshotted before they drop, and resume work
+    /// idle past `resume_ttl_s` is concluded (flag cleared, snapshot deleted)
+    /// first so the router never keeps saving context it has decided is done.
     /// Pinned instances are never evicted.
     pub async fn residency_cycle(&self) -> Result<(), InstanceError> {
+        self.expire_resume().await;
         let Some(budget) = self.policy.allocation_limit() else {
             tracing::info!(
                 target: "router.instances",
@@ -1040,30 +1309,7 @@ impl InstancePool {
             );
             return Ok(());
         };
-        let mut used: u64 = 0;
-        let mut candidates: Vec<(InstanceInfo, &InstanceManager)> = Vec::new();
-        for manager in self.managers.values() {
-            let envelope = match manager.client().list().await {
-                Ok(e) => e,
-                Err(e) => {
-                    // A down server (lazy model not yet loaded) contributes 0
-                    // VRAM and no candidates; report at debug to avoid noise.
-                    tracing::debug!(
-                        target: "router.instances",
-                        model = %manager.model_key(),
-                        error = %e,
-                        "residency poll skipped - server down",
-                    );
-                    continue;
-                }
-            };
-            used = used.saturating_add(envelope.total.total);
-            for info in envelope.instances {
-                if !info.pinned {
-                    candidates.push((info, manager));
-                }
-            }
-        }
+        let (mut used, evictable) = self.gather_residency(None).await;
         if used <= budget {
             tracing::debug!(
                 target: "router.instances",
@@ -1077,53 +1323,329 @@ impl InstancePool {
             target: "router.instances",
             used_bytes = used,
             budget_bytes = budget,
-            "device VRAM over budget - evicting LRU-largest unpinned instances",
+            "device VRAM over budget - evicting largest coldest footprints",
         );
-        // LRU first (last_used asc), then largest (vram_bytes desc) so each
-        // eviction frees the most VRAM from the coldest context.
-        candidates.sort_by(|(a, _), (b, _)| {
-            a.last_used
-                .cmp(&b.last_used)
-                .then_with(|| b.vram_bytes.cmp(&a.vram_bytes))
+        self.evict_to_fit(&mut used, budget, evictable).await;
+        // Unload any model whose server now has zero contexts: its weights are
+        // freed, restoring VRAM that context-level eviction cannot.
+        self.unload_empty_models().await;
+        Ok(())
+    }
+
+    /// The device's resident VRAM usage and eviction candidates across every
+    /// managed server. `exclude` names a model key whose usage is omitted and
+    /// which is never an eviction candidate (the model about to be loaded).
+    ///
+    /// Every candidate is an [`Evictable`]: either one unpinned context (frees
+    /// its KV + compute) or a whole model with no pinned instances (frees its
+    /// weights *and* all its unpinned contexts - the largest footprint, and the
+    /// only way a 10.5 GB weight pool can actually be reclaimed when OOM
+    /// pressure demands it).
+    async fn gather_residency(
+        &self,
+        exclude: Option<&str>,
+    ) -> (u64, Vec<Evictable<'_>>) {
+        let mut used: u64 = 0;
+        let mut evictable: Vec<Evictable<'_>> = Vec::new();
+        for manager in self.managers.values() {
+            if exclude == Some(manager.model_key()) {
+                continue;
+            }
+            let Some((envelope, plain)) = manager.list_with_fallback().await else {
+                tracing::debug!(
+                    target: "router.instances",
+                    model = %manager.model_key(),
+                    "residency poll skipped - server down",
+                );
+                continue;
+            };
+            used = used.saturating_add(envelope.total.total);
+            if plain {
+                // One synthesized entry per plain model; only a non-sleeping
+                // model's weights are a freeable resident chunk.
+                if let Some(info) = envelope.instances.first() {
+                    if info.model_bytes > 0 {
+                        evictable.push(Evictable::Model {
+                            manager,
+                            last_used: info.last_used,
+                            freed_bytes: info.model_bytes,
+                            contexts: vec![info.clone()],
+                        });
+                    }
+                }
+            } else {
+                let unpinned: Vec<InstanceInfo> = envelope
+                    .instances
+                    .iter()
+                    .filter(|i| !i.pinned)
+                    .cloned()
+                    .collect();
+                for info in &unpinned {
+                    evictable.push(Evictable::Context {
+                        info: info.clone(),
+                        manager,
+                    });
+                }
+                // A model with NO pinned context is fully evictable: dropping
+                // every context unloads its weights too. Pinned contexts keep
+                // a model's weights resident, so only models with zero pinned
+                // instances surface as whole-model candidates.
+                let has_pinned = envelope.instances.iter().any(|i| i.pinned);
+                if !has_pinned && envelope.total.model > 0 {
+                    let weights = envelope.total.model;
+                    let ctx_vram: u64 = unpinned.iter().map(|i| i.vram_bytes).sum();
+                    let last_used = unpinned.iter().map(|i| i.last_used).min().unwrap_or(-1);
+                    evictable.push(Evictable::Model {
+                        manager,
+                        last_used,
+                        freed_bytes: weights.saturating_add(ctx_vram),
+                        contexts: unpinned,
+                    });
+                }
+            }
+        }
+        (used, evictable)
+    }
+
+    /// Load-time admission control: before a cold model spawns (requiring
+    /// `required_bytes` of VRAM for its weights), evict units until the
+    /// projected device usage fits the allocation budget. The target model is
+    /// never an eviction candidate and pinned instances are never evicted.
+    /// Best-effort: if eviction cannot fully make room, the load proceeds and
+    /// the residency loop corrects the overshoot.
+    pub async fn make_room_for(&self, model_key: &str, required_bytes: u64) {
+        let Some(budget) = self.policy.allocation_limit() else {
+            return;
+        };
+        if required_bytes == 0 {
+            return;
+        }
+        let (used, evictable) = self.gather_residency(Some(model_key)).await;
+        let mut projected = used.saturating_add(required_bytes);
+        if projected <= budget {
+            return;
+        }
+        tracing::info!(
+            target: "router.instances",
+            model = %model_key,
+            required_bytes = required_bytes,
+            used_bytes = used,
+            budget_bytes = budget,
+            "making VRAM room for cold model load",
+        );
+        self.evict_to_fit(&mut projected, budget, evictable).await;
+    }
+
+    /// Evict candidates (snapshotting resume-marked contexts first) until
+    /// `used` fits the budget.
+    ///
+    /// Priority is *footprint-weighted coldness*: the candidate that frees the
+    /// most VRAM from the coldest resident entity goes first. A whole model's
+    /// weights (say a 10.5 GB pool) outrank any handful of context buffers, so
+    /// OOM pressure reclaims the big chunks, while a just-used model scores
+    /// near zero and stays - protecting active agentic work from being evicted
+    /// underneath a running task.
+    async fn evict_to_fit(&self, used: &mut u64, budget: u64, mut evictable: Vec<Evictable<'_>>) {
+        let now = i64::try_from(common_core::now_secs()).unwrap_or(i64::MAX);
+        evictable.sort_by(|a, b| {
+            eviction_score(b.freed_bytes(), b.last_used(), now)
+                .cmp(&eviction_score(a.freed_bytes(), a.last_used(), now))
+                .then_with(|| b.last_used().cmp(&a.last_used()))
         });
         let mut evicted = 0usize;
-        for (info, manager) in candidates {
-            if evicted >= self.policy.evict_batch {
+        for unit in evictable {
+            if *used <= budget || evicted >= self.policy.evict_batch {
                 break;
             }
-            let name = instance_name_from_server_id(&info.id);
-            match manager.client().destroy(name, false).await {
-                Ok(()) => {
-                    evicted += 1;
-                    tracing::info!(
-                        target: "router.instances",
-                        model = %manager.model_key(),
-                        instance = %info.id,
-                        last_used = info.last_used,
-                        vram_bytes = info.vram_bytes,
-                        "unpinned instance evicted for over-budget VRAM",
-                    );
-                    crate::audit::emit(
-                        "instances",
-                        serde_json::json!({
-                            "action": "evict",
-                            "instance": info.id,
-                            "reason": "over_budget",
-                        }),
-                    );
+            let freed = match unit {
+                Evictable::Context { info, manager } => {
+                    self.evict_context(manager, &info, "over_budget").await
                 }
-                Err(e) => tracing::warn!(
+                Evictable::Model {
+                    manager,
+                    contexts,
+                    freed_bytes,
+                    ..
+                } => self.evict_model(manager, &contexts, freed_bytes).await,
+            };
+            if let Some(freed) = freed {
+                evicted += 1;
+                *used = used.saturating_sub(freed);
+            }
+        }
+    }
+
+    /// Snapshot (if resume-marked) then destroy one unpinned context. Returns
+    /// the freed bytes, or `None` when the destroy failed.
+    async fn evict_context(
+        &self,
+        manager: &Arc<InstanceManager>,
+        info: &InstanceInfo,
+        reason: &str,
+    ) -> Option<u64> {
+        let name = instance_name_from_server_id(&info.id);
+        self.snapshot_for_resume(manager, name).await;
+        match manager.client().destroy(name, false).await {
+            Ok(()) => {
+                tracing::info!(
+                    target: "router.instances",
+                    model = %manager.model_key(),
+                    instance = %info.id,
+                    vram_bytes = info.vram_bytes,
+                    reason = reason,
+                    "unpinned context evicted",
+                );
+                crate::audit::emit(
+                    "instances",
+                    serde_json::json!({
+                        "action": "evict",
+                        "instance": info.id,
+                        "reason": reason,
+                    }),
+                );
+                Some(info.vram_bytes)
+            }
+            Err(e) => {
+                tracing::warn!(
                     target: "router.instances",
                     instance = %info.id,
                     error = %e,
-                    "instance eviction failed",
-                ),
+                    "context eviction failed",
+                );
+                None
             }
         }
-        // Unload any model whose server now has zero contexts: its weights are
-        // freed, restoring VRAM that instance-level eviction cannot.
-        self.unload_empty_models().await;
-        Ok(())
+    }
+
+    /// Evict a whole model: snapshot (if resume-marked) and destroy every
+    /// unpinned context, then unload the weights. Returns the total freed
+    /// bytes, `None` when the weights could not be unloaded.
+    async fn evict_model(
+        &self,
+        manager: &Arc<InstanceManager>,
+        contexts: &[InstanceInfo],
+        freed_bytes: u64,
+    ) -> Option<u64> {
+        for info in contexts {
+            let name = instance_name_from_server_id(&info.id);
+            self.snapshot_for_resume(manager, name).await;
+            if let Err(e) = manager.client().destroy(name, false).await {
+                tracing::warn!(
+                    target: "router.instances",
+                    instance = %info.id,
+                    error = %e,
+                    "model-eviction context destroy failed",
+                );
+            }
+        }
+        let Some(sup) = &self.supervisor else {
+            return None;
+        };
+        let model_key = manager.model_key();
+        sup.unload(model_key).await;
+        tracing::info!(
+            target: "router.instances",
+            model = %model_key,
+            weights_bytes = freed_bytes,
+            "model unloaded to free VRAM (weights + contexts)",
+        );
+        crate::audit::emit(
+            "instances",
+            serde_json::json!({
+                "action": "unload_model",
+                "model": model_key,
+                "reason": "free_vram",
+            }),
+        );
+        Some(freed_bytes)
+    }
+
+    /// Best-effort KV snapshot of a resume-marked context before it drops. The
+    /// session transcript is already durable in the ledger; this preserves the
+    /// KV so a later `snapshot=<name>-resume` request restores it. A failed
+    /// save (no slot-save path, misconfigured snapshot dir) is logged and the
+    /// eviction still proceeds - the context simply drops unsnapshotted.
+    async fn snapshot_for_resume(&self, manager: &Arc<InstanceManager>, name: &str) {
+        if !manager.resume_for(name) {
+            return;
+        }
+        let snapshot = resume_snapshot_name(name);
+        match manager.client().save_snapshot(name, &snapshot).await {
+            Ok(()) => {
+                tracing::info!(
+                    target: "router.instances",
+                    instance = %name,
+                    snapshot = %snapshot,
+                    "resume context snapshotted before eviction",
+                );
+                crate::audit::emit(
+                    "instances",
+                    serde_json::json!({
+                        "action": "resume_snapshot",
+                        "instance": name,
+                        "snapshot": snapshot,
+                    }),
+                );
+            }
+            Err(e) => tracing::warn!(
+                target: "router.instances",
+                instance = %name,
+                error = %e,
+                "resume snapshot save failed - context drops unsnapshotted",
+            ),
+        }
+    }
+
+    /// "Coral Router concludes its work is done": any resume-marked context
+    /// idle past `resume_ttl_s` has its flag cleared and its `-resume` snapshot
+    /// deleted. Runs each residency pass so eviction stops preserving context
+    /// the router has decided is stale.
+    async fn expire_resume(&self) {
+        let Some(ttl) = self.policy.resume_ttl_s else {
+            return;
+        };
+        let now = i64::try_from(common_core::now_secs()).unwrap_or(i64::MAX);
+        for manager in self.managers.values() {
+            let Some((envelope, _)) = manager.list_with_fallback().await else {
+                continue;
+            };
+            for info in envelope.instances {
+                let name = instance_name_from_server_id(&info.id);
+                if !manager.resume_for(name) {
+                    continue;
+                }
+                let idle = now.saturating_sub(info.last_used);
+                if idle >= ttl as i64 {
+                    manager.set_resume(name, false);
+                    let snapshot = resume_snapshot_name(name);
+                    match manager.client().delete_snapshot(name, &snapshot).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                target: "router.instances",
+                                instance = %name,
+                                idle_secs = idle,
+                                ttl_secs = ttl,
+                                "resume expired - work concluded, snapshot dropped",
+                            );
+                            crate::audit::emit(
+                                "instances",
+                                serde_json::json!({
+                                    "action": "expire_resume",
+                                    "instance": name,
+                                    "reason": "idle_ttl",
+                                }),
+                            );
+                        }
+                        Err(e) => tracing::warn!(
+                            target: "router.instances",
+                            instance = %name,
+                            error = %e,
+                            "resume snapshot delete on expiry failed",
+                        ),
+                    }
+                }
+            }
+        }
     }
 
     /// Unload managed models whose servers report zero contexts (all their
@@ -1233,6 +1755,8 @@ impl InstancePool {
     /// `model: Some(...)` scopes the response to one model. Instance ids are
     /// `<model_id>:<name>`; snapshot entries are tagged with their owning
     /// `model`; `total` sums each server's envelope with 64-bit arithmetic.
+    /// Plain (no-instance-grammar) models contribute a synthesized footprint
+    /// (their shared weights; 0 when the fork reports the model sleeping).
     pub async fn aggregate(&self, model: Option<&str>) -> Result<Value, InstanceError> {
         let mut instances = Vec::new();
         let mut snapshots: Vec<Value> = Vec::new();
@@ -1243,17 +1767,13 @@ impl InstancePool {
                     continue;
                 }
             }
-            let envelope = match manager.client().list().await {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "router.instances",
-                        model = %model_key,
-                        error = %e,
-                        "aggregate /instances poll failed for model",
-                    );
-                    continue;
-                }
+            let Some((envelope, _plain)) = manager.list_with_fallback().await else {
+                tracing::debug!(
+                    target: "router.instances",
+                    model = %model_key,
+                    "aggregate /instances poll skipped - server down",
+                );
+                continue;
             };
             for info in envelope.instances {
                 let instance_name = instance_name_from_server_id(&info.id);
@@ -1266,6 +1786,12 @@ impl InstancePool {
                     obj.insert(
                         "aliases".into(),
                         Value::Array(aliases.into_iter().map(Value::String).collect()),
+                    );
+                    // The fork knows nothing of `resume`; Coral Router tracks it
+                    // and overlays the router-side flag on the envelope.
+                    obj.insert(
+                        "resume".into(),
+                        Value::Bool(manager.resume_for(instance_name)),
                     );
                 }
                 instances.push(entry);
@@ -1290,11 +1816,12 @@ impl InstancePool {
     }
 
     /// `GET /v1/models` - one entry per instance across every managed model,
-    /// plus aliases for the bare model, group, and `latest` forms.
+    /// plus aliases for the bare model, group, and `latest` forms. Plain
+    /// (no-instance-grammar) models contribute one synthesized entry.
     pub async fn list_models(&self) -> Vec<Value> {
         let mut out = Vec::new();
         for (model_key, manager) in &self.managers {
-            let Ok(envelope) = manager.client().list().await else {
+            let Some((envelope, _plain)) = manager.list_with_fallback().await else {
                 continue;
             };
             let created = common_core::now_secs();
@@ -1309,6 +1836,7 @@ impl InstancePool {
                     "n_ctx": info.n_ctx,
                     "parallel": info.parallel,
                     "pinned": info.pinned,
+                    "resume": manager.resume_for(instance_name),
                     "is_default": info.is_default,
                     "state": info.state,
                     "last_used": info.last_used,
@@ -1326,6 +1854,8 @@ impl InstancePool {
     }
 
     /// `POST /instances` - allocate a NEW context on `model_key`'s server.
+    /// `resume` is router-side (the fork knows nothing of it): recorded here so
+    /// the aggregate reports it and eviction snapshots the context first.
     pub async fn create(
         &self,
         model_key: &str,
@@ -1335,6 +1865,7 @@ impl InstancePool {
         parallel: Option<u32>,
         pinned: bool,
         is_default: bool,
+        resume: bool,
     ) -> Result<InstanceInfo, InstanceError> {
         let manager = self
             .managers
@@ -1343,7 +1874,14 @@ impl InstancePool {
                 status: 404,
                 body: format!("unknown model: {model_key}"),
             })?;
-        manager.client().create(name, group, ctx_size, parallel, pinned, is_default).await
+        let info = manager
+            .client()
+            .create(name, group, ctx_size, parallel, pinned, is_default)
+            .await?;
+        manager.set_resume(name, resume);
+        let mut info = info;
+        info.resume = resume;
+        Ok(info)
     }
 
     /// Proxy a per-instance operation to the owning model's server.
@@ -1361,6 +1899,40 @@ impl InstancePool {
     /// Proxy a per-instance operation to the owning model's server.
     pub async fn unpin(&self, model_key: &str, name: &str) -> Result<(), InstanceError> {
         self.manager_checked(model_key)?.unpin(name).await
+    }
+
+    /// Set the preserve-on-evict flag for a context (router-side). Disabling
+    /// also deletes any `-resume` snapshot the context left behind - the router
+    /// concluding the work is done.
+    pub async fn set_resume(
+        &self,
+        model_key: &str,
+        name: &str,
+        enabled: bool,
+    ) -> Result<(), InstanceError> {
+        let manager = self
+            .managers
+            .get(model_key)
+            .ok_or_else(|| InstanceError::Rejected {
+                status: 404,
+                body: format!("unknown model: {model_key}"),
+            })?;
+        if !enabled {
+            let _ = manager
+                .client()
+                .delete_snapshot(name, &resume_snapshot_name(name))
+                .await;
+        }
+        manager.set_resume(name, enabled);
+        crate::audit::emit(
+            "instances",
+            serde_json::json!({
+                "action": "set_resume",
+                "instance": format!("{model_key}:{name}"),
+                "enabled": enabled,
+            }),
+        );
+        Ok(())
     }
 
     /// Proxy a per-instance operation to the owning model's server.
@@ -1568,6 +2140,7 @@ mod tests {
             no_sleep: false,
             sleep_idle_seconds: None,
             default: false,
+            resume: false,
             params: None,
         }
     }
@@ -1624,6 +2197,7 @@ mod tests {
                 no_sleep: self.no_sleep,
                 sleep_idle_seconds: self.sleep,
                 default: self.default,
+                resume: false,
                 params: None,
             }
         }
@@ -1665,6 +2239,7 @@ mod tests {
             no_sleep: true,
             sleep_idle_seconds: None,
             default: false,
+            resume: false,
             params: None,
         };
         // Expand the count as instance_profiles() would.
@@ -1689,6 +2264,7 @@ mod tests {
             num_ctx: 131072,
             pinned: true,
             default: true,
+            resume: false,
             ..profile("x", "x")
         };
         let scratch = InstanceProfile {
@@ -1791,6 +2367,7 @@ mod tests {
             vram_total_bytes: Some(10000),
             minimum_remaining_vram: Some(2000),
             slot_save_path: Some("/srv/slots".into()),
+            resume_ttl_s: None,
             api_key_env: None,
         }
     }
@@ -1804,6 +2381,7 @@ mod tests {
             parallel: 1,
             pinned,
             is_default: false,
+            resume: false,
             state: "loaded".into(),
             model_bytes: 0,
             context_bytes: 262144,
@@ -2016,6 +2594,7 @@ mod tests {
                 no_sleep: false,
                 sleep_idle_seconds: None,
                 default: true,
+            resume: false,
                 params: None,
             },
             InstanceProfile {
@@ -2028,6 +2607,7 @@ mod tests {
                 no_sleep: true,
                 sleep_idle_seconds: None,
                 default: false,
+            resume: false,
                 params: None,
             },
             InstanceProfile {
@@ -2040,6 +2620,7 @@ mod tests {
                 no_sleep: true,
                 sleep_idle_seconds: None,
                 default: false,
+            resume: false,
                 params: None,
             },
         ];
@@ -2095,6 +2676,7 @@ mod tests {
             no_sleep: false,
             sleep_idle_seconds: Some(1),
             default: false,
+            resume: false,
             params: None,
         }];
         let manager = InstanceManager::new("base", client, profiles, sidecar_policy());
@@ -2134,6 +2716,7 @@ mod tests {
             no_sleep: false,
             sleep_idle_seconds: None,
             default: false,
+            resume: false,
             params: None,
         }];
         let manager = InstanceManager::new("base", client, profiles, sidecar_policy());
@@ -2201,6 +2784,7 @@ mod tests {
             no_sleep: true,
             sleep_idle_seconds: None,
             default: false,
+            resume: false,
             params: None,
         }];
         let manager = InstanceManager::new("base", client, profiles, sidecar_policy());
@@ -2210,7 +2794,7 @@ mod tests {
 
     #[tokio::test]
     async fn residency_evicts_lru_unpinned_and_never_pinned() {
-        // Device budget = 10000 - 2000 = 8000; used 9000 -> over budget.
+        // Device budget = 10000 - 2000 = 8000; used 10000 -> over budget.
         let envelope = serde_json::json!({
             "instances": [
                 instance_info("pinned", "g", true, 0),    // exempt
@@ -2219,7 +2803,7 @@ mod tests {
                 instance_info("recent", "g", false, 9000),
             ],
             "snapshots": [],
-            "total": { "model": 5000, "context": 2000, "compute": 2000, "total": 9000 }
+            "total": { "model": 5000, "context": 2500, "compute": 2500, "total": 10000 }
         });
         let stub = residency_stub(envelope);
         let mut managers = HashMap::new();
@@ -2227,8 +2811,9 @@ mod tests {
         let pool = InstancePool::from_managers(managers, None);
         pool.residency_cycle().await.expect("residency");
 
-        // evict_batch = 2: the two oldest unpinned (lru1, lru2) are deleted;
-        // pinned is never touched.
+        // evict_batch = 2 and two 1000-byte evictions are needed to reach the
+        // budget (10000 -> 8000): the two oldest unpinned (lru1, lru2) are
+        // deleted; pinned is never touched.
         let recorded = stub.recorded();
         let deletes: Vec<&str> = recorded
             .iter()
@@ -2244,13 +2829,15 @@ mod tests {
     #[tokio::test]
     async fn residency_eviction_frees_largest_lru_context_first() {
         // Two candidates with the same last_used: the one with more VRAM is
-        // evicted first (freeing the most VRAM from the coldest context).
+        // evicted first (freeing the most VRAM from the coldest context). A
+        // pinned instance keeps the model's weights resident (no whole-model
+        // candidate), isolating the context-level ordering.
         let mut big = instance_info("big", "g", false, 100);
         big.vram_bytes = 5000;
         let mut small = instance_info("small", "g", false, 100);
         small.vram_bytes = 1000;
         let envelope = serde_json::json!({
-            "instances": [ small, big ],
+            "instances": [ small, big, instance_info("keep", "g", true, 0) ],
             "snapshots": [],
             "total": { "model": 5000, "context": 2000, "compute": 2000, "total": 9000 }
         });
@@ -2355,6 +2942,7 @@ mod tests {
             no_sleep: true,
             sleep_idle_seconds: None,
             default: false,
+            resume: false,
             params: None,
         }];
         let manager = InstanceManager::new("base", client, profiles, sidecar_policy());
@@ -2545,7 +3133,7 @@ mod tests {
     #[tokio::test]
     async fn pool_residency_evicts_lru_largest_unpinned_across_managers() {
         // Device budget = 10000 (vram_total) - 2000 (minimum_remaining) = 8000.
-        // Both managers together report used 9000 -> over budget. The coldest
+        // Both managers together report used 10000 -> over budget. The coldest
         // largest unpinned context (old) is evicted first; pinned never is.
         let env_a = serde_json::json!({
             "instances": [
@@ -2554,7 +3142,7 @@ mod tests {
                 instance_info("big", "g", false, 200),    // larger vram 1000
             ],
             "snapshots": [],
-            "total": { "model": 5000, "context": 2000, "compute": 2000, "total": 9000 }
+            "total": { "model": 5000, "context": 2500, "compute": 2500, "total": 10000 }
         });
         let env_b = serde_json::json!({
             "instances": [],
@@ -2721,5 +3309,535 @@ mod tests {
             .unwrap();
         let pool = build_instance_managers(&config, None).expect("no managers");
         assert!(pool.is_empty());
+    }
+
+    // -- plain (no-instance-grammar) model footprint --------------------------
+
+    /// A stub that 404s `/instances` (the fork's behavior for a server started
+    /// without `--instance` grammar) and answers `/props`.
+    fn plain_stub(props: serde_json::Value) -> StubServer {
+        let props = props.to_string();
+        let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
+            move |method, path, _body| {
+                if method == "GET" && path == "/props" {
+                    (200, props.clone())
+                } else {
+                    (404, r#"{"error":{"message":"File Not Found"}}"#.into())
+                }
+            },
+        );
+        StubServer::start(handler)
+    }
+
+    fn plain_manager(stub: &StubServer, weights: u64) -> Arc<InstanceManager> {
+        Arc::new(
+            InstanceManager::new(
+                "qwen",
+                InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
+                Vec::new(),
+                sidecar_policy(),
+            )
+            .with_weights_bytes(weights),
+        )
+    }
+
+    #[tokio::test]
+    async fn plain_model_footprint_reports_weights_when_awake() {
+        let props = serde_json::json!({
+            "is_sleeping": false,
+            "default_generation_settings": { "n_ctx": 16384 }
+        });
+        let stub = plain_stub(props);
+        let manager = plain_manager(&stub, 10_000_000_000);
+        let (envelope, plain) = manager.list_with_fallback().await.expect("fallback");
+        assert!(plain, "a 404 on /instances is synthesized");
+        assert_eq!(envelope.instances.len(), 1);
+        let inst = &envelope.instances[0];
+        assert_eq!(inst.id, "qwen:default");
+        assert_eq!(inst.state, "loaded");
+        assert_eq!(inst.model_bytes, 10_000_000_000);
+        assert_eq!(inst.n_ctx, 16384);
+        assert_eq!(envelope.total.model, 10_000_000_000);
+        assert_eq!(envelope.total.total, 10_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn plain_model_footprint_zeroes_weights_when_sleeping() {
+        let props = serde_json::json!({
+            "is_sleeping": true,
+            "default_generation_settings": { "n_ctx": 16384 }
+        });
+        let stub = plain_stub(props);
+        let manager = plain_manager(&stub, 10_000_000_000);
+        let (envelope, plain) = manager.list_with_fallback().await.expect("fallback");
+        assert!(plain);
+        let inst = &envelope.instances[0];
+        assert_eq!(inst.state, "sleeping");
+        assert_eq!(inst.model_bytes, 0, "sleeping plain model freed its weights");
+        assert_eq!(envelope.total.total, 0);
+    }
+
+    #[tokio::test]
+    async fn plain_model_footprint_none_when_server_down() {
+        // A down (never-loaded) plain server: /props is unreachable -> None.
+        let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> =
+            Arc::new(|_m, _p, _b| (404, "{}".into()));
+        let stub = StubServer::start(handler);
+        let manager = plain_manager(&stub, 1_000);
+        assert!(manager.list_with_fallback().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn aggregate_includes_plain_model_footprint() {
+        let props = serde_json::json!({
+            "is_sleeping": false,
+            "default_generation_settings": { "n_ctx": 8192 }
+        });
+        let stub = plain_stub(props);
+        let mut managers = HashMap::new();
+        managers.insert("qwen".into(), plain_manager(&stub, 5_000_000_000));
+        let pool = InstancePool::from_managers(managers, None);
+
+        let agg = pool.aggregate(None).await.expect("aggregate");
+        let instances = agg["instances"].as_array().unwrap();
+        assert_eq!(instances.len(), 1);
+        let entry = &instances[0];
+        assert_eq!(entry["id"], "qwen:default");
+        assert_eq!(entry["model_bytes"], 5_000_000_000u64);
+        let aliases: Vec<&str> = entry["aliases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a.as_str())
+            .collect();
+        assert!(aliases.contains(&"qwen"), "aliases: {aliases:?}");
+        assert_eq!(agg["total"]["model"], 5_000_000_000u64);
+        assert_eq!(agg["total"]["total"], 5_000_000_000u64);
+
+        let scoped = pool.aggregate(Some("qwen")).await.expect("scoped");
+        assert_eq!(scoped["instances"].as_array().unwrap().len(), 1);
+        let unknown = pool.aggregate(Some("nope")).await.expect("unknown scope");
+        assert_eq!(unknown["instances"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_models_includes_plain_model_entry() {
+        let props = serde_json::json!({
+            "is_sleeping": false,
+            "default_generation_settings": { "n_ctx": 8192 }
+        });
+        let stub = plain_stub(props);
+        let mut managers = HashMap::new();
+        managers.insert("qwen".into(), plain_manager(&stub, 5_000_000_000));
+        let pool = InstancePool::from_managers(managers, None);
+
+        let models = pool.list_models().await;
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["id"], "qwen:default");
+        assert_eq!(models[0]["state"], "loaded");
+    }
+
+    #[tokio::test]
+    async fn touch_advances_plain_model_last_used() {
+        let props = serde_json::json!({
+            "is_sleeping": false,
+            "default_generation_settings": { "n_ctx": 8192 }
+        });
+        let stub = plain_stub(props);
+        let manager = plain_manager(&stub, 1_000);
+        let before = manager.plain_footprint().await.expect("footprint").last_used;
+        manager.touch();
+        let after = manager.plain_footprint().await.expect("footprint").last_used;
+        assert!(after >= before, "touch must advance last_used");
+    }
+
+    #[tokio::test]
+    async fn residency_polls_plain_models_and_survives_without_supervisor() {
+        // A plain model awake at 10_000 bytes, budget 2000: over budget. With
+        // no supervisor the plain-model unload is a no-op break; the pass must
+        // still complete Ok and poll the plain server's /props.
+        let props = serde_json::json!({
+            "is_sleeping": false,
+            "default_generation_settings": { "n_ctx": 8192 }
+        });
+        let stub = plain_stub(props);
+        let mut policy = sidecar_policy();
+        policy.vram_total_bytes = Some(4000);
+        policy.minimum_remaining_vram = Some(2000);
+        let manager = Arc::new(
+            InstanceManager::new(
+                "qwen",
+                InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
+                Vec::new(),
+                policy,
+            )
+            .with_weights_bytes(10_000),
+        );
+        let mut managers = HashMap::new();
+        managers.insert("qwen".into(), manager);
+        let pool = InstancePool::from_managers(managers, None);
+        pool.residency_cycle().await.expect("residency completes without supervisor");
+        assert!(
+            stub.recorded().iter().any(|(m, p, _)| m == "GET" && p == "/props"),
+            "the plain-model branch must poll /props"
+        );
+    }
+
+    // -- load-time admission control (make_room_for) -------------------------
+
+    #[tokio::test]
+    async fn make_room_for_no_eviction_within_budget() {
+        // swarm holds one unpinned instance (used 3000); loading gemma (1000)
+        // projects 4000 <= budget 8000 -> nothing evicted.
+        let swarm_envelope = serde_json::json!({
+            "instances": [ instance_info("scratch", "scratch", false, 5) ],
+            "snapshots": [],
+            "total": { "model": 2000, "context": 500, "compute": 500, "total": 3000 }
+        });
+        let swarm_stub = residency_stub(swarm_envelope);
+        let gemma_stub = plain_stub(serde_json::json!({
+            "is_sleeping": false,
+            "default_generation_settings": { "n_ctx": 8192 }
+        }));
+        let mut managers = HashMap::new();
+        managers.insert("swarm".into(), manager_for_stub(&swarm_stub));
+        managers.insert("gemma".into(), plain_manager(&gemma_stub, 1000));
+        let pool = InstancePool::from_managers(managers, None);
+        pool.make_room_for("gemma", 1000).await;
+        assert!(
+            swarm_stub
+                .recorded()
+                .iter()
+                .all(|(m, _, _)| m != "DELETE"),
+            "no eviction within budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn make_room_for_evicts_unpinned_instance_over_budget() {
+        // Budget 4000 - 2000 = 2000; used 3000 + gemma 1000 = 4000 -> over.
+        // The only freeable chunk is the unpinned `scratch` instance.
+        let envelope = serde_json::json!({
+            "instances": [ instance_info("scratch", "scratch", false, 5) ],
+            "snapshots": [],
+            "total": { "model": 2000, "context": 500, "compute": 500, "total": 3000 }
+        });
+        let stub = residency_stub(envelope);
+        let mut policy = sidecar_policy();
+        policy.vram_total_bytes = Some(4000);
+        let manager = Arc::new(InstanceManager::new(
+            "swarm",
+            InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
+            Vec::new(),
+            policy,
+        ));
+        let mut managers = HashMap::new();
+        managers.insert("swarm".into(), manager);
+        let pool = InstancePool::from_managers(managers, None);
+        pool.make_room_for("gemma", 1000).await;
+        let recorded = stub.recorded();
+        let deletes: Vec<&str> = recorded
+            .iter()
+            .filter(|(m, _, _)| m == "DELETE")
+            .map(|(_, p, _)| p.as_str())
+            .collect();
+        assert!(
+            deletes.contains(&"/instances/scratch"),
+            "unpinned instance evicted to make room: {deletes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn make_room_for_excludes_target_and_survives_without_supervisor() {
+        // qwen (plain, awake, 10_000) resident; gemma (plain, 7_000) is the
+        // cold target. Budget 2000 -> over budget. Without a supervisor the
+        // plain unload is a no-op break; the pass must complete Ok and never
+        // poll the excluded target.
+        let props = serde_json::json!({
+            "is_sleeping": false,
+            "default_generation_settings": { "n_ctx": 8192 }
+        });
+        let qwen_stub = plain_stub(props.clone());
+        let gemma_stub = plain_stub(props);
+        let mut policy = sidecar_policy();
+        policy.vram_total_bytes = Some(4000);
+        let qwen = Arc::new(
+            InstanceManager::new(
+                "qwen",
+                InstanceClient::new(reqwest::Client::new(), qwen_stub.base_url(), None),
+                Vec::new(),
+                policy.clone(),
+            )
+            .with_weights_bytes(10_000),
+        );
+        let gemma = Arc::new(
+            InstanceManager::new(
+                "gemma",
+                InstanceClient::new(reqwest::Client::new(), gemma_stub.base_url(), None),
+                Vec::new(),
+                policy,
+            )
+            .with_weights_bytes(7_000),
+        );
+        let mut managers = HashMap::new();
+        managers.insert("qwen".into(), qwen);
+        managers.insert("gemma".into(), gemma);
+        let pool = InstancePool::from_managers(managers, None);
+        pool.make_room_for("gemma", 7_000).await;
+        assert!(
+            gemma_stub.recorded().is_empty(),
+            "the cold target must be excluded from the gather: {:?}",
+            gemma_stub.recorded()
+        );
+    }
+
+    #[tokio::test]
+    async fn is_sleeping_reflects_fork_state_and_skips_instance_models() {
+        let props = serde_json::json!({
+            "is_sleeping": true,
+            "default_generation_settings": { "n_ctx": 8192 }
+        });
+        let stub = plain_stub(props);
+        let manager = plain_manager(&stub, 1000);
+        assert_eq!(manager.is_sleeping().await, Some(true), "fork reports sleeping");
+
+        let stub2 = plain_stub(serde_json::json!({
+            "is_sleeping": false,
+            "default_generation_settings": { "n_ctx": 8192 }
+        }));
+        let manager2 = plain_manager(&stub2, 1000);
+        assert_eq!(manager2.is_sleeping().await, Some(false), "awake");
+
+        // Instance models never poll /props: their pinned contexts keep the
+        // weights resident, so the answer is always Some(false).
+        let stub3 = plain_stub(serde_json::json!({ "is_sleeping": true }));
+        let instance_manager = InstanceManager::new(
+            "swarm",
+            InstanceClient::new(reqwest::Client::new(), stub3.base_url(), None),
+            vec![profile("ledger", "ledger")],
+            sidecar_policy(),
+        );
+        assert_eq!(instance_manager.is_sleeping().await, Some(false));
+        assert!(
+            stub3.recorded().is_empty(),
+            "instance models must not poll /props: {:?}",
+            stub3.recorded()
+        );
+    }
+
+    // -- resume (preserve-on-evict) ------------------------------------------
+
+    #[test]
+    fn eviction_score_weights_size_and_coldness() {
+        let now = 1_000_000i64;
+        // Equal coldness: the larger footprint scores higher (evicted first) -
+        // a 10 GB weight pool outranks a context buffer of any recency within
+        // reach, which is the OOM-avoidance priority.
+        assert!(eviction_score(10_000_000_000, 100, now) > eviction_score(1_000, 100, now));
+        assert!(eviction_score(10_000_000_000, now - 1, now) > eviction_score(1_000, now - 3600, now));
+        // Equal size: the colder (older last_used) scores higher.
+        assert!(eviction_score(1_000, 50, now) > eviction_score(1_000, 900, now));
+        // Coldness scales within a size class: the same 10 GB pool idle a
+        // minute is far more evictable than when used a second ago, so active
+        // work is relatively protected by recency.
+        assert!(eviction_score(10_000_000_000, now - 60, now) > eviction_score(10_000_000_000, now - 1, now));
+        // Never used = maximally cold.
+        assert!(eviction_score(1_000, -1, now) > eviction_score(1_000, 1, now));
+    }
+
+    #[test]
+    fn resume_flag_round_trips_through_profiles() {
+        // A profile with `resume: true` seeds the manager's map so the
+        // aggregate and eviction see it.
+        let manager = InstanceManager::new(
+            "base",
+            InstanceClient::new(reqwest::Client::new(), "http://x", None),
+            vec![
+                InstanceProfile {
+                    resume: true,
+                    ..profile("agent", "g")
+                },
+                profile("scratch", "g"),
+            ],
+            sidecar_policy(),
+        );
+        assert!(manager.resume_for("agent"));
+        assert!(!manager.resume_for("scratch"));
+        manager.set_resume("scratch", true);
+        assert!(manager.resume_for("scratch"));
+        manager.set_resume("agent", false);
+        assert!(!manager.resume_for("agent"));
+    }
+
+    #[tokio::test]
+    async fn aggregate_reports_resume_overlay() {
+        let envelope = serde_json::json!({
+            "instances": [ instance_info("agent", "g", false, 1) ],
+            "snapshots": [],
+            "total": { "model": 1000, "context": 500, "compute": 500, "total": 2000 }
+        });
+        let stub = residency_stub(envelope);
+        let manager = manager_for_stub(&stub);
+        manager.set_resume("agent", true);
+        let mut managers = HashMap::new();
+        managers.insert("swarm".into(), manager);
+        let pool = InstancePool::from_managers(managers, None);
+        let agg = pool.aggregate(None).await.expect("aggregate");
+        let entry = agg["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["id"] == "swarm:agent")
+            .expect("aggregated entry");
+        assert_eq!(entry["resume"], true, "aggregate overlays the router-side flag");
+    }
+
+    #[tokio::test]
+    async fn eviction_snapshots_resume_context_before_destroy() {
+        // Budget 2000; over budget by a resume-marked unpinned context with a
+        // pinned sibling keeping the weights resident. The resume context is
+        // snapshotted (`POST .../agent/snapshot`) before it is destroyed, and
+        // the pinned sibling is never touched.
+        let mut agent = instance_info("agent", "g", false, 100);
+        agent.vram_bytes = 2000;
+        let envelope = serde_json::json!({
+            "instances": [ instance_info("keep", "g", true, 0), agent ],
+            "snapshots": [],
+            "total": { "model": 5000, "context": 3000, "compute": 3000, "total": 11000 }
+        });
+        let stub = residency_stub(envelope);
+        let mut policy = sidecar_policy();
+        policy.vram_total_bytes = Some(4000); // budget = 4000 - 2000 = 2000
+        let manager = Arc::new(InstanceManager::new(
+            "base",
+            InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
+            Vec::new(),
+            policy,
+        ));
+        manager.set_resume("agent", true);
+        let mut managers = HashMap::new();
+        managers.insert("base".into(), manager);
+        let pool = InstancePool::from_managers(managers, None);
+        pool.residency_cycle().await.expect("residency");
+
+        let recorded = stub.recorded();
+        let snapshot_posts: Vec<&str> = recorded
+            .iter()
+            .filter(|(m, p, _)| m == "POST" && *p == "/instances/agent/snapshot")
+            .map(|(_, p, _)| p.as_str())
+            .collect();
+        assert_eq!(snapshot_posts.len(), 1, "resume context snapshotted: {recorded:?}");
+        let deletes: Vec<&str> = recorded
+            .iter()
+            .filter(|(m, _, _)| m == "DELETE")
+            .map(|(_, p, _)| p.as_str())
+            .collect();
+        assert!(deletes.contains(&"/instances/agent"), "resume context evicted");
+        assert!(
+            !deletes.iter().any(|p| p.contains("keep")),
+            "pinned context never evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn expire_resume_clears_idle_context_and_deletes_snapshot() {
+        // `resume_ttl_s = 60`: an ancient (idle) resume context has its flag
+        // cleared and its `-resume` snapshot deleted - the router concluding
+        // the work is done. Within budget, so no eviction happens.
+        let envelope = serde_json::json!({
+            "instances": [
+                instance_info("agent", "g", false, 100), // idle ~50 years
+                instance_info("keep", "g", true, 0),
+            ],
+            "snapshots": [],
+            "total": { "model": 1000, "context": 500, "compute": 500, "total": 2000 }
+        });
+        let stub = residency_stub(envelope);
+        let mut policy = sidecar_policy();
+        policy.resume_ttl_s = Some(60);
+        let manager = Arc::new(InstanceManager::new(
+            "base",
+            InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
+            Vec::new(),
+            policy,
+        ));
+        manager.set_resume("agent", true);
+        let mut managers = HashMap::new();
+        managers.insert("base".into(), manager);
+        let pool = InstancePool::from_managers(managers, None);
+        pool.residency_cycle().await.expect("residency");
+
+        assert!(
+            !pool.manager("base").unwrap().resume_for("agent"),
+            "idle resume cleared"
+        );
+        let recorded = stub.recorded();
+        let deletes: Vec<&str> = recorded
+            .iter()
+            .filter(|(m, _, _)| m == "DELETE")
+            .map(|(_, p, _)| p.as_str())
+            .collect();
+        assert!(
+            deletes.contains(&"/instances/agent/snapshot/agent-resume"),
+            "resume snapshot deleted on expiry: {deletes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_resume_false_deletes_snapshot() {
+        let envelope = serde_json::json!({
+            "instances": [ instance_info("agent", "g", false, 1) ],
+            "snapshots": [],
+            "total": { "model": 1000, "context": 500, "compute": 500, "total": 2000 }
+        });
+        let stub = residency_stub(envelope);
+        let mut managers = HashMap::new();
+        managers.insert("swarm".into(), manager_for_stub(&stub));
+        let pool = InstancePool::from_managers(managers, None);
+        pool.set_resume("swarm", "agent", true).await.expect("enable");
+        assert!(pool.manager("swarm").unwrap().resume_for("agent"));
+        pool.set_resume("swarm", "agent", false).await.expect("disable");
+        assert!(!pool.manager("swarm").unwrap().resume_for("agent"));
+        let recorded = stub.recorded();
+        let deletes: Vec<&str> = recorded
+            .iter()
+            .filter(|(m, _, _)| m == "DELETE")
+            .map(|(_, p, _)| p.as_str())
+            .collect();
+        assert!(
+            deletes.contains(&"/instances/agent/snapshot/agent-resume"),
+            "disable deletes the resume snapshot: {deletes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn whole_model_is_largest_footprint_candidate() {
+        // A model with NO pinned instances is a whole-model candidate: its
+        // weights + all contexts. Without a supervisor the model eviction
+        // still drops every context before breaking; the point is that the
+        // whole-model unit outranks the individual contexts.
+        let envelope = serde_json::json!({
+            "instances": [
+                instance_info("ctx-a", "g", false, 100),
+                instance_info("ctx-b", "g", false, 200),
+            ],
+            "snapshots": [],
+            "total": { "model": 8000, "context": 2000, "compute": 2000, "total": 12000 }
+        });
+        let stub = residency_stub(envelope);
+        let mut managers = HashMap::new();
+        managers.insert("base".into(), manager_for_stub(&stub));
+        let pool = InstancePool::from_managers(managers, None);
+        pool.residency_cycle().await.expect("residency");
+        let recorded = stub.recorded();
+        let deletes: Vec<&str> = recorded
+            .iter()
+            .filter(|(m, _, _)| m == "DELETE")
+            .map(|(_, p, _)| p.as_str())
+            .collect();
+        assert!(
+            deletes.contains(&"/instances/ctx-a") && deletes.contains(&"/instances/ctx-b"),
+            "whole-model eviction drops every context: {deletes:?}"
+        );
     }
 }
