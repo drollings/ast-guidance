@@ -882,6 +882,7 @@ mod tests {
                         group: "code".into(),
                         pipelines: vec!["default".into()],
                         description: "code".into(),
+            always_route: false,
                     },
                 ),
                 (
@@ -890,6 +891,7 @@ mod tests {
                         group: "translation".into(),
                         pipelines: vec!["default".into()],
                         description: "translation".into(),
+            always_route: false,
                     },
                 ),
                 (
@@ -898,6 +900,7 @@ mod tests {
                         group: "question".into(),
                         pipelines: vec!["default".into()],
                         description: "local".into(),
+            always_route: false,
                     },
                 ),
             ]),
@@ -1156,6 +1159,7 @@ mod tests {
                 group: "fast".into(),
                 pipelines: vec!["default".into()],
                 description: "fresh".into(),
+            always_route: false,
             },
         );
         let tree: ClassificationTree = serde_json::from_value(serde_json::json!({

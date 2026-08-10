@@ -58,6 +58,9 @@ ROUTE_PROMPTS = {
     "extract": "From the following email, extract every date, dollar amount, product name, and person name as structured JSON: 'Hi Sam, the Q3 invoice for the Nebula server upgrade is $12,400. Please wire it by October 15, 2025. Regards, Priya Patel.'",
     "summarize": "Provide a structured two-sentence executive summary of this quarterly report, including the revenue figure and the key risk: 'Q3 revenue reached $4.2M, up 12% YoY, driven by the Europe expansion. The principal risk is component supply chain delays from the Taiwan foundry, which may impact Q4 shipments by up to 15%.'",
     "translation": "Translate the following business contract clause into Japanese, preserving legal precision: 'The party shall be liable for consequential damages arising from gross negligence, subject to a limitation of liability cap of one million dollars.'",
+    "science": "Explain the EPR paradox and how Bell's theorem rules out local hidden variables, being precise about the CHSH inequality and what a Bell-inequality-violating experiment demonstrates.",
+    "legal": "Draft a confidentiality clause for a software licensing agreement that covers the definition of confidential information, permitted disclosures to counsel and subcontractors bound by similar terms, and a three-year survival obligation after termination.",
+    "medical": "Describe the mechanism of action, indications, contraindications, and the most serious adverse effects of metformin, including the circumstances under which lactic acidosis is a clinical concern.",
 }
 
 # Family of "already warm" probes used for the warm TTFT score (models that
@@ -115,6 +118,7 @@ def derive_expectations(cfg: Dict[str, Any]) -> Dict[str, Any]:
             "ladder": ordered,
             "primary": ordered[0] if ordered else None,
             "description": rref.get("description", ""),
+            "always_route": bool(rref.get("always_route", False)),
         }
     return expectations
 
@@ -391,11 +395,13 @@ def main() -> int:
             hard_failures += 1
 
         served_label = f"{served_key} [direct classifier]" if direct else (served_key or f"?? {served}")
+        always_mark = " [always-route]" if exp["always_route"] else ""
         results[route] = {
             "group": exp["group"],
             "ladder": exp["ladder"],
             "primary": exp["primary"],
             "expected_description": exp["description"],
+            "always_route": exp["always_route"],
             "status": status,
             "ttft_s": round_half(ttft),
             "served_model": served,
@@ -407,7 +413,7 @@ def main() -> int:
         log(
             f"[{route:<11}] status={status:<3} ttft={ttft:6.2f}s "
             f"routed={served_label} "
-            f"routing={routing:4.1f} speed={speed:4.1f}"
+            f"routing={routing:4.1f} speed={speed:4.1f}{always_mark}"
         )
 
     # ---- Warm TTFT probe: latency for a now-resident model ----

@@ -416,6 +416,32 @@ impl ClassifierStage {
         }
         prompt.push('\n');
 
+        // Dispatch rules — auto-generated for routes configured `always_route`
+        // (domains where the classifier model is overconfident and must never
+        // answer directly, e.g. creative prose, code, translation, specialized
+        // knowledge). Completely config-driven.
+        let mut always_routes: Vec<&String> = route_names
+            .iter()
+            .copied()
+            .filter(|n| {
+                self.routing_config
+                    .routes
+                    .get(*n)
+                    .is_some_and(|r| r.always_route)
+            })
+            .collect();
+        if !always_routes.is_empty() {
+            always_routes.sort();
+            prompt.push_str("Dispatch rules (never answer these directly):\n");
+            for name in &always_routes {
+                let _ = writeln!(
+                    prompt,
+                    "  - Requests on the \"{name}\" route ALWAYS dispatch to \"{name}\". Set action=route and target=\"{name}\" even if the reasoning complexity seems low: these domains need the stronger model, not you."
+                );
+            }
+            prompt.push('\n');
+        }
+
         // Output schema — derived from ClassifierOutput
         let intent_values: Vec<String> = route_names.iter().map(|n| format!("\"{n}\"")).collect();
         let intent_enum = if intent_values.is_empty() {
@@ -443,8 +469,9 @@ impl ClassifierStage {
             \x20 \"reason\": \"brief explanation\"\n\
             }}\n\n\
             Response rules:\n\
-            - If complexity <= {intel} (your intelligence level), set action=respond and answer directly.\n\
+            - If complexity <= {intel} (your intelligence level), set action=respond and answer directly — UNLESS the request matches a dispatch rule above.\n\
             - If complexity > {intel}, the query needs a more capable model: set action=route with target set to the matching route name. Code requests ALWAYS go to the \"code\" route. Translation requests ALWAYS go to the \"translation\" route.\n\
+            - Dispatch rules above ALWAYS win: set action=route with the named target, never action=respond.\n\
             - If content is incoherent (coherence_score < {coherence}), set action=reject.\n\
             - If content is unsafe (safety_score < {safety}), set action=reject.\n\
             - Safety score 1.0 = completely safe, 0.0 = dangerous.\n\
@@ -478,6 +505,14 @@ impl WorkUnit for ClassifierStage {
 impl ClassifierStage {
     fn decide(&self, ctx: &WorkContext) -> Result<(String, StageDecision), WorkError> {
         let input = extract_user_message(ctx)?;
+        // The route the client requested (the request's `model`). Used to
+        // enforce route-level `always_route`: a route configured to always
+        // dispatch never lets the classifier answer directly.
+        let requested_route: Option<String> = ctx
+            .structured("request")
+            .ok()
+            .map(|r: crate::types::RouterRequest| r.model)
+            .filter(|m| !m.is_empty());
 
         // M4: classification-tree mode — the engine produces the final
         // `StageDecision` directly (routing target, rejection, or the
@@ -588,7 +623,7 @@ impl ClassifierStage {
             "classifier call complete"
         );
 
-        let (output, ok) = parse_classifier_response(&response, &self.routing_config.default_route);
+        let (mut output, ok) = parse_classifier_response(&response, &self.routing_config.default_route);
 
         if !ok {
             tracing::warn!(
@@ -634,6 +669,33 @@ impl ClassifierStage {
                 }),
             };
             return Ok(("rejected".into(), decision));
+        }
+
+        // Route-level `always_route` (config): a route configured to always
+        // dispatch never lets the classifier answer directly. The classifier
+        // model is often a small edge model overconfident in exactly these
+        // domains (creative prose, code, translation, specialized knowledge),
+        // so its `action=respond` is overridden to `action=route` toward the
+        // requested route regardless of its complexity judgment. Simple prompts
+        // on `local`-style routes keep the direct-answer path.
+        if let Some(route) = requested_route.as_deref() {
+            if self
+                .routing_config
+                .routes
+                .get(route)
+                .is_some_and(|r| r.always_route)
+            {
+                tracing::info!(
+                    target: "router.pipeline.stage2",
+                    model = %self.classifier_model,
+                    route = %route,
+                    classifier_action = %output.action,
+                    "always_route override - dispatching instead of direct response",
+                );
+                output.action = "route".into();
+                output.target = Some(route.to_string());
+                output.response = None;
+            }
         }
 
         // M5: matrix-authoritative routing. When opted in, the weighted score

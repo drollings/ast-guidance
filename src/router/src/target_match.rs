@@ -570,6 +570,7 @@ mod tests {
                     group: group.into(),
                     pipelines: vec!["default".into()],
                     description: "local".into(),
+            always_route: false,
                 },
             )]),
             models: keys

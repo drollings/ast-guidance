@@ -8,7 +8,7 @@ mod tests {
         ConfidenceGate, FilterAction, FilterOutcome, FilterScope, PatternEntry, RejectPatterns,
     };
     use crate::pipeline::PipelineOrchestrator;
-    use crate::pipeline_types::{PipelineStage, StageDecision, StageVerdict};
+    use crate::pipeline_types::{PipelineStage, StageDecision, StageMetadata, StageVerdict};
     use crate::stages::deterministic::DeterministicPreFilter;
     use crate::test_support::capture_logs;
 
@@ -1267,5 +1267,107 @@ mod tests {
         let rt = result.routing_target.expect("must dispatch");
         assert_eq!(rt.target_name.as_deref(), Some("code"));
         assert_eq!(rt.model, "qwen3.6-27b");
+    }
+
+    // ── Route-level `always_route`: never let the classifier answer directly ─
+
+    #[test]
+    fn always_route_forces_dispatch_over_classifier_respond() {
+        use crate::config::RoutingConfig;
+        use crate::stages::classifier::ClassifierStage;
+
+        // The classifier model is overconfident and answers a prose prompt
+        // directly; the route is configured `always_route: true`, so the stage
+        // must override action=respond into a dispatch to the route's group.
+        let prompt_log = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let backend: Arc<dyn fluent_llm::client::ChatBackend> = Arc::new(TreeRecordingBackend {
+            prompts: Arc::clone(&prompt_log),
+            response: serde_json::json!({
+                "action": "respond",
+                "coherence_score": 0.9,
+                "safety_score": 0.9,
+                "reason": "i can write prose",
+                "intent": "prose",
+                "response": "once upon a time...",
+            })
+            .to_string(),
+        });
+        let routing_config: RoutingConfig = serde_json::from_value(serde_json::json!({
+            "routes": {
+                "prose": { "group": "prose", "pipelines": ["default"], "description": "creative", "always_route": true },
+                "local": { "group": "default", "pipelines": ["default"], "description": "qa" }
+            },
+            "models": {
+                "gemma": { "endpoint": "http://x/v1/chat/completions", "name": "gemma", "intelligence": 6, "cost_input": 0.0, "cost_output": 0.0, "cost_cached_read": 0.0, "speed": 5 },
+                "swarm": { "endpoint": "http://y/v1/chat/completions", "name": "swarm", "intelligence": 2, "cost_input": 0.0, "cost_output": 0.0, "cost_cached_read": 0.0, "speed": 8 }
+            },
+            "model_groups": {
+                "prose": ["gemma"],
+                "default": ["swarm"]
+            },
+            "system_prompt": "",
+            "safety_threshold": 0.5,
+            "default_route": "local"
+        }))
+        .expect("valid routing config");
+
+        let limiter = Arc::new(fluent_concurrency::pool::Limiter::new(2));
+        let stage = ClassifierStage::new(
+            backend,
+            routing_config.clone(),
+            0.7,
+            None,
+            false,
+            2,
+            "swarm",
+            limiter,
+            None,
+        );
+
+        let mut ctx = WorkContext::default();
+        ctx.set_structured(
+            "request",
+            &serde_json::json!({
+                "model": "prose",
+                "messages": [{"role": "user", "content": "Write a 400-word gothic story..."}],
+            }),
+        );
+        let output = stage.execute(&ctx).expect("execute");
+        let decision: StageDecision = output.data_as().expect("data_as");
+        let metadata = StageMetadata::from(decision.metadata.clone());
+        // The direct response must have been overridden into a routing target.
+        assert!(
+            metadata.response().is_none(),
+            "always_route must not produce a direct response"
+        );
+        let rt = metadata.routing_target().expect("must dispatch");
+        assert_eq!(rt.target_name.as_deref(), Some("prose"));
+        assert_eq!(rt.model, "gemma");
+
+        // The system prompt advertises the dispatch rule so the LLM routes even
+        // without the hard enforcement.
+        let recorded = prompt_log.lock().unwrap().clone();
+        assert!(
+            recorded.iter().any(|p| p.contains("ALWAYS dispatch") && p.contains("prose")),
+            "prompt must teach the always-route rule: {recorded:?}"
+        );
+
+        // A `local`-style route (always_route off) keeps the direct response.
+        let mut ctx_local = WorkContext::default();
+        ctx_local.set_structured(
+            "request",
+            &serde_json::json!({
+                "model": "local",
+                "messages": [{"role": "user", "content": "what is 2+2?"}],
+            }),
+        );
+        let output_local = stage.execute(&ctx_local).expect("execute");
+        let decision_local: StageDecision = output_local.data_as().expect("data_as");
+        let metadata_local = StageMetadata::from(decision_local.metadata.clone());
+        assert_eq!(metadata_local.response().as_deref(), Some("once upon a time..."));
+        assert!(
+            metadata_local.routing_target().is_none(),
+            "non-always-route keeps the direct classifier answer"
+        );
     }
 }

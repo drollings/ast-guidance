@@ -18,6 +18,15 @@ pub struct RouteRef {
     pub pipelines: Vec<String>,
     #[serde(default)]
     pub description: String,
+    /// Never let the classifier answer requests on this route directly: force
+    /// dispatch to the route's group. For domains where the classifier model is
+    /// overconfident (creative prose, code, translation, and specialized
+    /// knowledge such as science/legal/medical), this guarantees the request
+    /// reaches the route's model regardless of the classifier's own complexity
+    /// judgment. `local`-style routes keep `always_route: false` so simple
+    /// prompts are still answered directly.
+    #[serde(default)]
+    pub always_route: bool,
 }
 
 fn default_pipelines() -> Vec<String> {

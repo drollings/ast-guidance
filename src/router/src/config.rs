@@ -180,6 +180,7 @@ impl RouterConfig {
                     group: group.unwrap_or_else(|| route.clone()),
                     pipelines: vec!["default".into()],
                     description,
+                    always_route: false,
                 });
             }
         }
