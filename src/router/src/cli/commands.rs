@@ -798,25 +798,16 @@ fn print_weight_block(
     model_key: &str,
     insts: &[Value],
 ) {
-    let (weights_bytes, gguf_file) = model_weights(config, gguf_dir, model_key);
+    // Weights footprint: the router's reported shared-weights bytes
+    // (`model_bytes`, carried on every instance) is authoritative for a
+    // managed model; fall back to the configured weights file size, then the
+    // GGUF layout, for standalone/remote models with no instance detail.
+    let weights_bytes = model_weights_bytes(insts, config, gguf_dir, model_key);
+    let gguf_file = config_weights_path(config, model_key).or_else(|| gguf_weights_path(gguf_dir, model_key));
     let ctx_mem_sum: u64 = insts
         .iter()
         .map(|i| i.get("vram_bytes").and_then(Value::as_u64).unwrap_or(0))
         .sum();
-    let loaded_ctx: u64 = insts
-        .iter()
-        .filter(|i| {
-            i.get("state")
-                .and_then(Value::as_str)
-                .is_some_and(|s| s != "sleeping")
-        })
-        .map(|i| i.get("vram_bytes").and_then(Value::as_u64).unwrap_or(0))
-        .sum();
-    let weights_vram = weights_bytes.saturating_sub(loaded_ctx.min(weights_bytes));
-    let weights_cpu = weights_bytes.saturating_sub(weights_vram);
-    let total_sys = weights_bytes
-        .saturating_add(ctx_mem_sum)
-        .saturating_sub(weights_vram);
 
     let (short_id, arch) = match &gguf_file {
         Some(path) => (
@@ -832,7 +823,7 @@ fn print_weight_block(
     let tag = gguf_file
         .as_ref()
         .and_then(|p| p.file_stem())
-        .map_or_else(|| "-".to_string(), |s| s.to_string_lossy().to_lowercase());
+        .map_or_else(String::new, |s| s.to_string_lossy().to_lowercase());
     let quant = if tag.is_empty() || tag == "latest" {
         "-".to_string()
     } else {
@@ -841,12 +832,7 @@ fn print_weight_block(
     let display = ollama_display(model_key, &tag);
 
     println!("{display}  (id={short_id}, arch={arch}, quant={quant})");
-    println!(
-        "  weights   {:>12}   VRAM {:>10} / SYS {:>10}",
-        format_size(weights_bytes),
-        format_size(weights_vram),
-        format_size(weights_cpu)
-    );
+    println!("  weights   {:>12}", format_size(weights_bytes));
     if !insts.is_empty() {
         println!("  instances");
         for inst in insts {
@@ -872,35 +858,33 @@ fn print_weight_block(
         }
     }
     println!(
-        "  total     VRAM {:>10} / SYS RAM {:>10}",
-        format_size(weights_vram.saturating_add(ctx_mem_sum)),
-        format_size(total_sys)
+        "  total     {:>12} resident (weights + contexts)",
+        format_size(weights_bytes.saturating_add(ctx_mem_sum))
     );
     println!();
 }
 
-/// Resolve a model key's weights bytes and GGUF path from the config or the
-/// GGUF layout.
-fn model_weights(
-    config: Option<&RouterConfig>,
-    gguf_dir: &Path,
-    model_key: &str,
-) -> (u64, Option<PathBuf>) {
-    if let Some(cfg) = config {
-        if let Some(entry) = cfg.models.get(model_key) {
-            if let Some(weights) = &entry.weights {
-                let path = PathBuf::from(weights);
-                let size = std::fs::metadata(&path).map_or(0, |m| m.len());
-                return (size, Some(path));
-            }
-        }
-    }
-    // Fall back to the GGUF layout: `gguf_dir/<key>/latest.gguf` or the
-    // smallest GGUF under the key's directory.
+/// The configured `weights` path for a model key, if the entry declares one.
+fn config_weights_path(config: Option<&RouterConfig>, model_key: &str) -> Option<PathBuf> {
+    config
+        .and_then(|cfg| cfg.models.get(model_key))
+        .and_then(|entry| entry.weights.as_ref())
+        .map(PathBuf::from)
+}
+
+/// The configured weights file size, if the file exists on this host.
+fn config_weights_size(config: Option<&RouterConfig>, model_key: &str) -> Option<u64> {
+    config_weights_path(config, model_key)
+        .and_then(|p| std::fs::metadata(&p).ok())
+        .map(|m| m.len())
+        .filter(|b| *b > 0)
+}
+
+/// Resolve a model key's GGUF file from the GGUF layout:
+/// `<gguf_dir>/<key>/latest.gguf` or the smallest GGUF under the directory.
+fn gguf_weights_path(gguf_dir: &Path, model_key: &str) -> Option<PathBuf> {
     let dir = gguf_dir.join(model_key);
-    let Ok(read) = std::fs::read_dir(&dir) else {
-        return (0, None);
-    };
+    let read = std::fs::read_dir(&dir).ok()?;
     let mut files: Vec<PathBuf> = Vec::new();
     for entry in read.flatten() {
         let path = entry.path();
@@ -908,21 +892,41 @@ fn model_weights(
             files.push(path);
         }
     }
-    let chosen = files
+    files
         .iter()
         .find(|p| p.file_stem().is_some_and(|s| s == "latest"))
         .or_else(|| {
             files
                 .iter()
                 .min_by_key(|p| std::fs::metadata(p).map_or(u64::MAX, |m| m.len()))
-        });
-    match chosen {
-        Some(path) => {
-            let size = std::fs::metadata(path).map_or(0, |m| m.len());
-            (size, Some(path.clone()))
-        }
-        None => (0, None),
-    }
+        })
+        .cloned()
+}
+
+/// The GGUF-layout weights file size, if a file resolves for the key.
+fn gguf_weights_size(gguf_dir: &Path, model_key: &str) -> Option<u64> {
+    gguf_weights_path(gguf_dir, model_key)
+        .and_then(|p| std::fs::metadata(&p).ok())
+        .map(|m| m.len())
+        .filter(|b| *b > 0)
+}
+
+/// Resolve a model key's resident weights bytes: the router's reported
+/// `model_bytes` first, then the configured weights file, then the GGUF
+/// layout, then `0`.
+fn model_weights_bytes(
+    insts: &[Value],
+    config: Option<&RouterConfig>,
+    gguf_dir: &Path,
+    model_key: &str,
+) -> u64 {
+    insts
+        .iter()
+        .filter_map(|i| i.get("model_bytes").and_then(Value::as_u64).filter(|b| *b > 0))
+        .max()
+        .or_else(|| config_weights_size(config, model_key))
+        .or_else(|| gguf_weights_size(gguf_dir, model_key))
+        .unwrap_or(0)
 }
 
 fn inst_sleep_label(inst: &Value) -> String {
@@ -1313,5 +1317,46 @@ mod tests {
         let ctx = CliContext::new(None, true, false, false);
         let err = pull(&ctx, "nomodel", None, false).await.unwrap_err();
         assert!(err.to_string().contains("namespace/model:tag"));
+    }
+
+    #[test]
+    fn ps_weights_prefer_router_model_bytes_over_config_and_gguf() {
+        let dir = tempfile::tempdir().unwrap();
+        // A config weights file that exists on disk (would be the old answer).
+        let model_dir = dir.path().join("swarm");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("latest.gguf"), vec![0u8; 4096]).unwrap();
+        let config: RouterConfig = serde_json::from_value(json!({
+            "models": {
+                "swarm": {
+                    "endpoint": "http://127.0.0.1:1/v1/chat/completions",
+                    "name": "abiray/test",
+                    "weights": model_dir.join("latest.gguf").to_string_lossy(),
+                    "intelligence": 2,
+                    "cost_input": 1e-6, "cost_output": 6e-6, "cost_cached_read": 4e-7,
+                    "speed": 8
+                }
+            }
+        }))
+        .unwrap();
+
+        // No instance detail: falls back to the config weights file.
+        assert_eq!(
+            model_weights_bytes(&[], Some(&config), dir.path(), "swarm"),
+            4096
+        );
+        // Router-reported model_bytes wins over the config file size.
+        let insts = vec![json!({ "model_bytes": 1_000_000_000u64, "vram_bytes": 100 })];
+        assert_eq!(
+            model_weights_bytes(&insts, Some(&config), dir.path(), "swarm"),
+            1_000_000_000
+        );
+        // No config, no instance → GGUF layout still resolves the file.
+        assert_eq!(
+            model_weights_bytes(&[], None, dir.path(), "swarm"),
+            4096
+        );
+        // Nothing at all → 0 (never crashes).
+        assert_eq!(model_weights_bytes(&[], None, dir.path(), "absent"), 0);
     }
 }
