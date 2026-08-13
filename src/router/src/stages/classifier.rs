@@ -49,7 +49,7 @@ const DEFAULT_COMPLETENESS: f64 = 0.5;
 /// The field-coercion lives in the shared `stages::common` helpers (the
 /// "surviving normalization" both this stage and the M4 tree engine use).
 /// Route-name guessing is gone — the classification tree replaces it.
-fn sanitize_classifier_json(mut v: serde_json::Value) -> serde_json::Value {
+fn sanitize_classifier_json(v: &mut serde_json::Value) {
     if let Some(obj) = v.as_object_mut() {
         coerce_float(obj, "coherence_score", 1.0);
         coerce_float(obj, "safety_score", 1.0);
@@ -59,7 +59,6 @@ fn sanitize_classifier_json(mut v: serde_json::Value) -> serde_json::Value {
         coerce_string(obj, "action", "route");
         coerce_string(obj, "reason", "");
     }
-    v
 }
 
 /// Log the raw classifier response with clear delimiters so multiline content
@@ -75,34 +74,21 @@ fn log_classifier_raw_response(response: &str) {
 }
 
 // LLM boundary: parse the classifier's raw LLM response text (JSON in a
-// string from the model). The tolerant pipeline (fence-strip → parse →
-// extract-first-value) is the shared `fluent_llm::parse_json_response`
-// (M7.4). `true` = pristine parse, `false` = recovered via sanitization.
+// string from the model). Routes through the shared `fluent_llm::parse_typed`
+// codec — direct-deserialize fast path, then fence-strip → parse →
+// extract-first-value, then the shared `sanitize_classifier_json` coercion.
+// `true` = pristine parse, `false` = recovered via sanitization.
 fn parse_classifier_response(response: &str, default_route: &str) -> (ClassifierOutput, bool) {
-    // Fast path: try direct parse first
-    if let Ok(o) = serde_json::from_str::<ClassifierOutput>(response) {
-        return (o, true);
-    }
-
-    // Slow path: sanitize partial JSON via the shared tolerant parser
-    let raw: serde_json::Value = match fluent_llm::parse_json_response(response) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!(
-                target: "router.pipeline.stage2",
-                error = %e,
-                raw_response_len = response.len(),
-                "classifier LLM response was not valid JSON at all — falling back to default route",
-            );
-            log_classifier_raw_response(response);
-            return fallback_parse(default_route, &format!("invalid JSON: {e}"));
-        }
-    };
-
-    let sanitized = sanitize_classifier_json(raw);
-    match serde_json::from_value::<ClassifierOutput>(sanitized) {
+    match fluent_llm::parse_typed::<ClassifierOutput>(
+        response,
+        &serde_json::Value::Null,
+        sanitize_classifier_json,
+    ) {
         Ok(o) => {
-            // If the LLM set action=route but omitted target, use default
+            // `true` iff the raw text directly deserialized (the codec's fast
+            // path); a small re-parse of the already-owned string, once per
+            // classifier call — not on any hot loop.
+            let ok = serde_json::from_str::<ClassifierOutput>(response).is_ok();
             let output = ClassifierOutput {
                 target: o
                     .target
@@ -110,7 +96,16 @@ fn parse_classifier_response(response: &str, default_route: &str) -> (Classifier
                     .or_else(|| o.action.as_str().eq("route").then(|| default_route.into())),
                 ..o
             };
-            (output, false) // false = sanitized, not pristine
+            (output, ok)
+        }
+        Err(fluent_llm::JsonParseError::NoJson) => {
+            tracing::error!(
+                target: "router.pipeline.stage2",
+                raw_response_len = response.len(),
+                "classifier LLM response was not valid JSON at all — falling back to default route",
+            );
+            log_classifier_raw_response(response);
+            fallback_parse(default_route, "invalid JSON in LLM response")
         }
         Err(e) => {
             tracing::error!(

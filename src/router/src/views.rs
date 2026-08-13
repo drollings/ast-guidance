@@ -1,9 +1,9 @@
-//! Reference-only view layer over the shared `NodeStore` (M2).
+//! Reference-only view layer over the shared `ContentNodeStore` (M2).
 //!
 //! Views are the VISION's read surface for the ledger: they hold node-id
 //! lists + per-node fidelity policy + composition, and **never own text**
 //! (D4). Text leaves the store through exactly one exit — [`LedgerView::render`]
-//! → [`NodeStore::lod_text`] — so there is a single place where a consumer can
+//! → [`ContentNodeStore::lod_text`] — so there is a single place where a consumer can
 //! observe/transform what is rendered.
 //!
 //! Two concrete views ship:
@@ -26,7 +26,7 @@ use std::sync::Arc;
 use fluent_types::NodeId;
 
 use crate::ledger_guard;
-use crate::node_store::NodeStore;
+use crate::node_store::ContentNodeStore;
 
 /// Level of detail, 0..=5 (VISION table). Router-local: `ContentNode` keeps
 /// `u8` fields for wire compat (D3).
@@ -47,7 +47,7 @@ impl Lod {
     /// Name / label.
     pub const LOD5: Lod = Lod(5);
 
-    /// The tier as a `u8` (for `NodeStore::lod_text`).
+    /// The tier as a `u8` (for `ContentNodeStore::lod_text`).
     pub fn as_u8(self) -> u8 {
         self.0
     }
@@ -75,7 +75,7 @@ impl std::fmt::Display for Lod {
 /// **only** way text leaves a view.
 pub trait LedgerView: Send + Sync {
     /// The shared store this view reads from.
-    fn store(&self) -> &NodeStore;
+    fn store(&self) -> &ContentNodeStore;
 
     /// The node ids this view covers, in render order (a snapshot).
     fn node_ids(&self) -> Vec<NodeId>;
@@ -120,10 +120,10 @@ pub trait LedgerView: Send + Sync {
 }
 
 /// A parallel view over one store: every `ParallelLedger` shares the same
-/// `Arc<NodeStore>`, so a lazily-derived tier is computed once and visible to
+/// `Arc<ContentNodeStore>`, so a lazily-derived tier is computed once and visible to
 /// all views. `default_lod` is LOD1; per-node `with_override` wins.
 pub struct ParallelLedger {
-    store: Arc<NodeStore>,
+    store: Arc<ContentNodeStore>,
     node_ids: Vec<NodeId>,
     default_lod: Lod,
     /// Per-node fidelity from day one.
@@ -133,7 +133,7 @@ pub struct ParallelLedger {
 impl ParallelLedger {
     /// A view over `store` with no node ids yet. Use `for_session` (or the
     /// builder methods) to populate.
-    pub fn new(store: Arc<NodeStore>) -> Self {
+    pub fn new(store: Arc<ContentNodeStore>) -> Self {
         Self {
             store,
             node_ids: Vec::new(),
@@ -157,7 +157,7 @@ impl ParallelLedger {
     }
 
     /// A view over a whole session, in insertion order.
-    pub fn for_session(store: Arc<NodeStore>, session_id: &str) -> Self {
+    pub fn for_session(store: Arc<ContentNodeStore>, session_id: &str) -> Self {
         let node_ids = store.session_node_ids(session_id);
         Self::new(store).with_node_ids(node_ids)
     }
@@ -169,7 +169,7 @@ impl ParallelLedger {
 }
 
 impl LedgerView for ParallelLedger {
-    fn store(&self) -> &NodeStore {
+    fn store(&self) -> &ContentNodeStore {
         &self.store
     }
 
@@ -210,7 +210,7 @@ impl<V: LedgerView> FilteredLedger<V> {
 }
 
 impl<V: LedgerView> LedgerView for FilteredLedger<V> {
-    fn store(&self) -> &NodeStore {
+    fn store(&self) -> &ContentNodeStore {
         self.inner.store()
     }
 
@@ -247,21 +247,21 @@ pub fn pii_redacted<V: LedgerView, S: std::hash::BuildHasher>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node_store::NodeStore;
+    use crate::node_store::ContentNodeStore;
     use crate::summarization::Summarizer;
     use crate::test_stubs::CountingBackend;
 
-    fn temp_store() -> Arc<NodeStore> {
+    fn temp_store() -> Arc<ContentNodeStore> {
         let dir = std::env::temp_dir().join(format!(
             "coral-router-views-{}",
             common_core::hash::uuid_v4()
         ));
-        let store = Arc::new(NodeStore::open(&dir).unwrap());
+        let store = Arc::new(ContentNodeStore::open(&dir).unwrap());
         let _ = std::fs::remove_file(&dir);
         store
     }
 
-    fn counting_store() -> (Arc<NodeStore>, Arc<CountingBackend>) {
+    fn counting_store() -> (Arc<ContentNodeStore>, Arc<CountingBackend>) {
         let backend = Arc::new(CountingBackend::new("lazy tier text"));
         let summarizer = Summarizer::new(backend.clone(), 20);
         let store = temp_store();

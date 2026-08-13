@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
 
+use common_core::registry::ConcurrentRegistry;
 use common_core::sync::{lock_read, lock_write};
 use fluent_db::error::DbError;
 use fluent_db::hnsw::HnswIndex;
@@ -79,7 +80,7 @@ pub struct ChartStore {
     /// Chart name → validated chart. Read-guarded: the store is shared
     /// (`Arc<ChartStore>`) across the selector and the M10 extraction path,
     /// so runtime upserts go through the lock rather than `&mut self`.
-    charts: RwLock<HashMap<String, Arc<ChartDef>>>,
+    charts: ConcurrentRegistry<String, ChartDef>,
     /// Chart name → runtime health (M10 draft/staleness/demotion state).
     health: RwLock<HashMap<String, ChartHealth>>,
     /// workflow_library HNSW index path handle (M7 retrieval).
@@ -91,7 +92,7 @@ pub struct ChartStore {
 impl ChartStore {
     pub fn new(index: Option<crate::hnsw::HnswIndexHandle>) -> Self {
         Self {
-            charts: RwLock::new(HashMap::new()),
+            charts: ConcurrentRegistry::new(),
             health: RwLock::new(HashMap::new()),
             index,
             built: RwLock::new(None),
@@ -145,22 +146,22 @@ impl ChartStore {
     /// Look up a chart by name. Returns an `Arc` (the store is shared), so a
     /// callers holding the returned handle stays valid across later upserts.
     pub fn get(&self, name: &str) -> Option<Arc<ChartDef>> {
-        lock_read(&self.charts).get(name).cloned()
+        self.charts.get(&name.to_string())
     }
 
     /// All chart names, in insertion order (owned — the store is lock-backed).
     pub fn list(&self) -> Vec<String> {
-        lock_read(&self.charts).keys().cloned().collect()
+        self.charts.keys()
     }
 
     /// Number of loaded charts.
     pub fn len(&self) -> usize {
-        lock_read(&self.charts).len()
+        self.charts.len()
     }
 
     /// `true` if the store holds no charts.
     pub fn is_empty(&self) -> bool {
-        lock_read(&self.charts).is_empty()
+        self.charts.is_empty()
     }
 
     /// Insert or replace a chart. Used by boot loading and by M10
@@ -175,7 +176,7 @@ impl ChartStore {
             reason: format!("chart '{}' failed validation: {e}", chart.name),
         })?;
         self.reset_health(&chart.name);
-        lock_write(&self.charts).insert(chart.name.clone(), Arc::new(chart));
+        self.charts.insert(chart.name.clone(), chart);
         self.invalidate_index();
         Ok(())
     }
@@ -218,11 +219,11 @@ impl ChartStore {
                 reason: format!("subsumed chart '{}' failed validation: {e}", subsumed.name),
             })?;
             self.mark_draft(&subsumed.name);
-            lock_write(&self.charts).insert(existing_name.clone(), Arc::new(subsumed));
+            self.charts.insert(existing_name.clone(), subsumed);
             UpsertOutcome::Subsumed { by: existing_name }
         } else {
             self.mark_draft(&chart.name);
-            lock_write(&self.charts).insert(chart.name.clone(), Arc::new(chart));
+            self.charts.insert(chart.name.clone(), chart);
             UpsertOutcome::Inserted
         };
         self.invalidate_index();
@@ -335,13 +336,12 @@ impl ChartStore {
     /// demoted or still-draft (M10 staleness/draft gate) — demoted and
     /// unvalidated drafts are "no longer selected".
     pub fn charts_sorted(&self) -> Vec<Arc<ChartDef>> {
-        let guard = lock_read(&self.charts);
-        let mut names: Vec<&str> = guard.keys().map(String::as_str).collect();
+        let mut names = self.charts.keys();
         names.sort_unstable();
         names
             .into_iter()
             .filter(|n| !self.is_excluded_from_selection(n))
-            .filter_map(|n| guard.get(n).cloned())
+            .filter_map(|n| self.charts.get(&n))
             .collect()
     }
 

@@ -633,7 +633,7 @@ pub struct RigorConfig {
     #[serde(default)]
     pub judge_model: Option<String>,
     /// Whether the route expects KV-cache checkpoint/rewind to be load-bearing
-    /// (a `DependencySession` with a `KvCacheManager`). Rewind always resets
+    /// (a `DependencySession` with a `SnapshotStore`). Rewind always resets
     /// steps; this flag only gates the KV-restore expectation.
     #[serde(default)]
     pub kv_cache_enabled: bool,
@@ -702,10 +702,53 @@ pub struct LedgerConfig {
     /// Max summary length (tokens) for LOD1-LOD4 derivation.
     #[serde(default = "default_ledger_max_summary_tokens")]
     pub max_summary_tokens: u32,
+    /// Enable continuous background LOD4/LOD5 generation (M2). `false` (the
+    /// default) keeps today's lazy-on-demand behavior.
+    #[serde(default)]
+    pub background_tiering: bool,
+    /// Model key for the tier worker's labeler/summarizer. `None` falls back
+    /// to the ledger model, then the classifier model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_model: Option<String>,
+    /// Max characters for LOD4 (short summary). Default 240 (§0.3).
+    #[serde(default = "default_lod4_max_chars")]
+    pub lod4_max_chars: usize,
+    /// Max characters for LOD5 (description). Default 80 (§0.3).
+    #[serde(default = "default_lod5_max_chars")]
+    pub lod5_max_chars: usize,
+    /// Tier worker batch size (nodes drained per poll).
+    #[serde(default = "default_tier_batch_size")]
+    pub tier_batch_size: usize,
+    /// Tier worker poll interval (ms).
+    #[serde(default = "default_tier_poll_interval_ms")]
+    pub tier_poll_interval_ms: u64,
+    /// Ledger-agent coordinator section (M5). `enabled = true` opts the boot
+    /// path into attaching a `LedgerAgentCoordinator` to the server so a
+    /// request with a session + ledger runs through its synchronization loop
+    /// (`restore-or-assemble → execute → record → snapshot → enqueue`).
+    /// Default-absent so existing deployments are untouched.
+    #[serde(default)]
+    pub orchestrator: OrchestratorSection,
 }
 
 const fn default_ledger_max_summary_tokens() -> u32 {
     DEFAULT_LEDGER_MAX_SUMMARY_TOKENS
+}
+
+const fn default_lod4_max_chars() -> usize {
+    240
+}
+
+const fn default_lod5_max_chars() -> usize {
+    80
+}
+
+const fn default_tier_batch_size() -> usize {
+    8
+}
+
+const fn default_tier_poll_interval_ms() -> u64 {
+    100
 }
 
 impl Default for LedgerConfig {
@@ -714,6 +757,53 @@ impl Default for LedgerConfig {
             path: None,
             model: None,
             max_summary_tokens: DEFAULT_LEDGER_MAX_SUMMARY_TOKENS,
+            background_tiering: false,
+            tier_model: None,
+            lod4_max_chars: default_lod4_max_chars(),
+            lod5_max_chars: default_lod5_max_chars(),
+            tier_batch_size: default_tier_batch_size(),
+            tier_poll_interval_ms: default_tier_poll_interval_ms(),
+            orchestrator: OrchestratorSection::default(),
+        }
+    }
+}
+
+/// The `ledger.orchestrator` section (M5): configures the
+/// `LedgerAgentCoordinator`'s restore-vs-re-prefill policy, its prompt budget,
+/// and the default role recorded for agent output nodes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrchestratorSection {
+    /// Whether to attach the coordinator at boot (opt-in). `false` (the
+    /// default) leaves the server's dispatch path unchanged.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The restore-vs-re-prefill decision rule for per-model KV snapshots.
+    #[serde(default)]
+    pub kv_policy: crate::dag_session::KvSnapshotPolicy,
+    /// The worker's context-window budget (characters) for prompt assembly.
+    /// Default 32768 (8192 tokens × 4 chars/token).
+    #[serde(default = "default_orchestrator_prompt_budget_chars")]
+    pub prompt_budget_chars: usize,
+    /// Default role recorded for agent output nodes.
+    #[serde(default = "default_orchestrator_role")]
+    pub role: String,
+}
+
+const fn default_orchestrator_prompt_budget_chars() -> usize {
+    32768
+}
+
+fn default_orchestrator_role() -> String {
+    "agent".into()
+}
+
+impl Default for OrchestratorSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            kv_policy: crate::dag_session::KvSnapshotPolicy::RestoreIfSameModel,
+            prompt_budget_chars: default_orchestrator_prompt_budget_chars(),
+            role: default_orchestrator_role(),
         }
     }
 }
@@ -1784,5 +1874,104 @@ mod tests {
             back.ledger.unwrap().max_summary_tokens,
             DEFAULT_LEDGER_MAX_SUMMARY_TOKENS
         );
+    }
+
+    #[test]
+    fn ledger_background_tiering_fields_default_absent() {
+        // M2.4: all background-tiering fields are default-absent so existing
+        // `coral-router.json` files deserialize unchanged.
+        let cfg: RouterConfig =
+            serde_json::from_value(serde_json::json!({ "ledger": { "model": "swarm" } })).unwrap();
+        let ledger = cfg.ledger.as_ref().unwrap();
+        assert!(!ledger.background_tiering, "tiering is opt-in");
+        assert!(ledger.tier_model.is_none());
+        assert_eq!(ledger.lod4_max_chars, 240, "default lod4 cap");
+        assert_eq!(ledger.lod5_max_chars, 80, "default lod5 cap");
+        assert_eq!(ledger.tier_batch_size, 8);
+        assert_eq!(ledger.tier_poll_interval_ms, 100);
+    }
+
+    #[test]
+    fn ledger_background_tiering_fields_round_trip() {
+        // A fully-populated ledger section round-trips all M2.4 knobs.
+        let cfg: RouterConfig = serde_json::from_value(serde_json::json!({
+            "ledger": {
+                "model": "swarm",
+                "background_tiering": true,
+                "tier_model": "qwen3.5-4b",
+                "lod4_max_chars": 200,
+                "lod5_max_chars": 60,
+                "tier_batch_size": 16,
+                "tier_poll_interval_ms": 250,
+            }
+        }))
+        .unwrap();
+        let ledger = cfg.ledger.as_ref().unwrap();
+        assert!(ledger.background_tiering);
+        assert_eq!(ledger.tier_model.as_deref(), Some("qwen3.5-4b"));
+        assert_eq!(ledger.lod4_max_chars, 200);
+        assert_eq!(ledger.lod5_max_chars, 60);
+        assert_eq!(ledger.tier_batch_size, 16);
+        assert_eq!(ledger.tier_poll_interval_ms, 250);
+    }
+
+    // -- M5.1: ledger orchestrator section --------------------------------
+
+    #[test]
+    fn orchestrator_section_default_absent() {
+        // Existing ledger configs without an `orchestrator` section keep the
+        // coordinator disabled (opt-in) and today's defaults.
+        let cfg: RouterConfig =
+            serde_json::from_value(serde_json::json!({ "ledger": { "model": "swarm" } })).unwrap();
+        let orch = &cfg.ledger.as_ref().unwrap().orchestrator;
+        assert!(!orch.enabled, "coordinator is opt-in");
+        assert_eq!(
+            orch.kv_policy,
+            crate::dag_session::KvSnapshotPolicy::RestoreIfSameModel
+        );
+        assert_eq!(orch.prompt_budget_chars, 32768);
+        assert_eq!(orch.role, "agent");
+    }
+
+    #[test]
+    fn orchestrator_section_round_trip() {
+        let cfg: RouterConfig = serde_json::from_value(serde_json::json!({
+            "ledger": {
+                "model": "swarm",
+                "orchestrator": {
+                    "enabled": true,
+                    "kv_policy": "never_restore",
+                    "prompt_budget_chars": 16384,
+                    "role": "planner"
+                }
+            }
+        }))
+        .unwrap();
+        let orch = &cfg.ledger.as_ref().unwrap().orchestrator;
+        assert!(orch.enabled);
+        assert_eq!(orch.kv_policy, crate::dag_session::KvSnapshotPolicy::NeverRestore);
+        assert_eq!(orch.prompt_budget_chars, 16384);
+        assert_eq!(orch.role, "planner");
+    }
+
+    #[test]
+    fn orchestrator_kv_policy_parses_all_variants() {
+        use crate::dag_session::KvSnapshotPolicy as P;
+        let a: P = serde_json::from_str(r#""restore_if_same_model""#).unwrap();
+        let b: P = serde_json::from_str(r#""always_restore""#).unwrap();
+        let c: P = serde_json::from_str(r#""never_restore""#).unwrap();
+        assert_eq!(a, P::RestoreIfSameModel);
+        assert_eq!(b, P::AlwaysRestore);
+        assert_eq!(c, P::NeverRestore);
+    }
+
+    #[test]
+    fn kv_snapshot_policy_round_trips_through_serde() {
+        use crate::dag_session::KvSnapshotPolicy as P;
+        for p in [P::RestoreIfSameModel, P::AlwaysRestore, P::NeverRestore] {
+            let json = serde_json::to_string(&p).unwrap();
+            let back: P = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, p, "round-trip {p:?} through {json}");
+        }
     }
 }

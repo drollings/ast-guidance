@@ -165,8 +165,8 @@ exactly once and published to the same typed store.
 
 | File | Role |
 |------|------|
-| `dispatch/backend.rs` | `ChatBackend` trait (`complete` / `stream_complete` — object-safe, per-request params passed as args); `OpenAiChatBackend` (single-attempt HTTP via raw `reqwest`), `RetryChatBackend` (jittered-exponential retry via `common_core::retry`), `FallbackChatBackend` (ordered backend chain) — the single production dispatch path (D4) |
-| `dispatch/escalation.rs` | `EscalationLadder` — the load-bearing ladder runtime: local-chain exhaustion → `filter → question → team → turnover` modes, deterministic-first `ContextCache` short-circuit, `ResultPool`-backed parallel slots, `kind = "escalation"` audit records; `EscalationBackends` / `LocalBackend` / `FrontierBackend` role wiring; `dispatch_frontier` bypass for frontier-owned sessions |
+| `dispatch/backend.rs` | `ChatBackend` trait (`complete` / `stream_complete` — object-safe, per-request params passed as args); `OpenAiChatBackend` (single-attempt HTTP via raw `reqwest`), `RetryBackend` (jittered-exponential retry via `common_core::retry`), `BackendChain` (ordered backend chain) — the single production dispatch path (D4) |
+| `dispatch/escalation.rs` | `Ladder` — the load-bearing ladder runtime: local-chain exhaustion → `filter → question → team → turnover` modes, deterministic-first `ContextCache` short-circuit, `ResultPool`-backed parallel slots, `kind = "escalation"` audit records; `EscalationBackends` / `LocalBackend` / `FrontierBackend` role wiring; `dispatch_frontier` bypass for frontier-owned sessions |
 | `dispatch/frontier.rs` | `DispatchError` + `is_retryable` (the public error type of `ChatBackend`); wire-format build/parse helpers reserved for the ladder — `OpenAiBackend` (`parse_response` reused by `OpenAiChatBackend`), `Anthropic` Messages-API helpers, `StreamEvent` |
 
 ### Session & Orchestration
@@ -174,12 +174,12 @@ exactly once and published to the same typed store.
 | File | Role |
 |------|------|
 | `session.rs` | Thin shim — re-exports `StepStatus` from `fluent-types` (the canonical session node schema is `fluent_types::ContentNode`) |
-| `dag_session.rs` | `DependencySession` — DAG-based session composing `fluent_dag::dep_graph::DependencyGraph<String>` for step tracking, checkpoint/rewind, real KV-cache snapshot restore (model/adapter/session keyed), frontier-ownership flag; `SessionRegistry` — the canonical server-side session home (D6), per-`session_id`, shared `KvCacheManager`, retained for process lifetime |
-| `ledger.rs` | `ContentNodeLedger` — **thin facade** over the shared `NodeStore` (M4); owns the LOD lifecycle (LOD0/LOD5 eager, LOD1–4 lazy from LOD0 via `Summarizer`, at most once); `CompactionStrategy` / `RecencyCompaction` (folded in from the deleted `compaction.rs`); routes all writes through the M1 write-path scrub |
-| `node_store.rs` | `NodeStore` (M4) — the shared store: nodes behind `Arc<RwLock<ContentNode>>`, interned `ArcIntern<str>` session/role index keys, durable `content_json` hydration (seeded `next_id` from `MAX(node_id)`), `ensure_tier` / `lod_text` / `session_node_ids` render primitives, `knn_brute_force` |
+| `dag_session.rs` | `DependencySession` — DAG-based session composing `fluent_dag::dep_graph::DependencyGraph<String>` for step tracking, checkpoint/rewind, real KV-cache snapshot restore (model/adapter/session keyed), frontier-ownership flag; `SessionRegistry` — the canonical server-side session home (D6), per-`session_id`, shared `SnapshotStore`, retained for process lifetime |
+| `ledger.rs` | `ContentNodeLedger` — **thin facade** over the shared `ContentNodeStore` (M4); owns the LOD lifecycle (LOD0/LOD5 eager, LOD1–4 lazy from LOD0 via `Summarizer`, at most once); `CompactionStrategy` / `RecencyCompaction` (folded in from the deleted `compaction.rs`); routes all writes through the M1 write-path scrub |
+| `node_store.rs` | `ContentNodeStore` (M4) — the shared store: nodes behind `Arc<RwLock<ContentNode>>`, interned `ArcIntern<str>` session/role index keys, durable `content_json` hydration (seeded `next_id` from `MAX(node_id)`), `ensure_tier` / `lod_text` / `session_node_ids` render primitives, `knn_brute_force` |
 | `ledger_guard.rs` | `ScrubGuard` (M1) — the irreversible write-path scrubber (`scrub_for_ledger`), decision D1; Redact/Anonymize collapse to `[REDACTED:<pattern>]`, no codeword map retained; uses the builtin filter engine with the `ContentNodeWrite` scope |
-| `views.rs` | `LedgerView` (M2) — the reference-only view layer over `NodeStore`; `Lod` (0..=5), `ParallelLedger` (one store, N views), `FilteredLedger<V>` (exclusion set + render transform); `render()` is the single text-exit; rendering degrades to LOD0 when a lazy tier is un-derivable |
-| `knowledge.rs` | `KnowledgeCapability` impl on `NodeStore` (M4D) behind the `RouterKnowledgeCapability` token — the cross-crate read path for embedded consumers |
+| `views.rs` | `LedgerView` (M2) — the reference-only view layer over `ContentNodeStore`; `Lod` (0..=5), `ParallelLedger` (one store, N views), `FilteredLedger<V>` (exclusion set + render transform); `render()` is the single text-exit; rendering degrades to LOD0 when a lazy tier is un-derivable |
+| `knowledge.rs` | `KnowledgeCapability` impl on `ContentNodeStore` (M4D) behind the `RouterKnowledgeCapability` token — the cross-crate read path for embedded consumers |
 
 ### Routes
 
@@ -196,10 +196,10 @@ exactly once and published to the same typed store.
 | `server.rs` | `RouterServer` (`WorkUnit`) — hyper HTTP/1.1 accept loop on tokio; assembles `ServerDeps` and fans out to the `server/` submodule; `serve_http` is `pub(crate)` for integration tests; runs each `InstanceManager`'s boot reconcile + residency task from the attached `InstancePool` |
 | `server/handler.rs` | HTTP routing + request orchestration; `ServerDeps` (the collapsed former 12-`Option` dependency bundle): pipelines, routes, models, stats, cache, ledger, plan/rigor routes, sessions, ladders, context_cache, mock_dispatch, http_client, `instance_pool`, `api_key_env_name`. Merges query-string routing fields into the body, resolves the model-id grammar (`<model_id>[:<instance|group|latest>]`) in `resolve_pipeline`, and routes the management/model-less endpoints |
 | `server/instances_api.rs` | The public `/instances` management facade: aggregate envelope across models, `POST /instances`, per-instance ops (delete/pin/unpin/resume/no-resume/resize/snapshot), `/memory` compat reshape, `/v1/models`, `/props`, model-less proxies (`/tokenize`, `/detokenize`, `/apply-template`, `/control`); management API-key enforcement; query parse/percent-decode helpers |
-| `server/dispatch.rs` | `handle_dispatch` / `dispatch_real` — primary + `fallbacks` chain through `ChatBackend` (each wrapped in `RetryChatBackend`), short-circuit on non-retryable errors, response cache read/write, M10 workflow extraction, allocate-on-503 via the `InstancePool` |
+| `server/dispatch.rs` | `handle_dispatch` / `dispatch_real` — primary + `fallbacks` chain through `ChatBackend` (each wrapped in `RetryBackend`), short-circuit on non-retryable errors, response cache read/write, M10 workflow extraction, allocate-on-503 via the `InstancePool` |
 | `server/responses.rs` | OpenAI-completion response builders, SSE/CORS headers, `ServerStats` counters |
 | `streaming.rs` | `StreamingHandler` — SSE delta formatting for OpenAI-compatible streaming chunks; cross-chunk think-block filtering via `StreamingThinkFilter` |
-| `kv_cache.rs` | Two-tier: `HotKvCache` (RAM LRU over `common_core::cache::LoadCache`, metadata only) + `ColdKvCache` (disk tree `model/adapter/session`); `KvCacheManager` composes both; the router never reads/writes raw KV bytes — it manages filesystem layout + sidecar metadata for llama.cpp slot save/restore |
+| `kv_cache.rs` | Two-tier: `HotSnapshotIndex` (RAM LRU over `common_core::cache::LoadCache`, metadata only) + `ColdSnapshotIndex` (disk tree `model/adapter/session`); `SnapshotStore` composes both; the router never reads/writes raw KV bytes — it manages filesystem layout + sidecar metadata for llama.cpp slot save/restore |
 | `instances.rs` | Instance-pool grammar generation + validation (`instance_grammar_string`, `validate_instances`, `is_valid_instance_name`) and the sidecar: `InstanceClient` (one server's `/instances` API over raw `reqwest`, `HttpClass`-classified), `InstanceManager` (boot reconcile; per-instance `resume` map; `is_sleeping` residency probe; `list_with_fallback` synthesizing a resident footprint for plain — weights-only, no-instance-grammar — models; `weights_bytes` from the configured weights file), and `InstancePool` (the router's aggregate facade: `<model_id>:<name>` ids, 64-bit-summed `total`, `/v1/models`, op proxies; footprint-weighted eviction `Evictable::{Context, Model}` + `evict_to_fit`; load-time admission control `make_room_for`; `resume` snapshot/expiry and control ops) |
 | `supervisor.rs` | `LlamaServerSupervisor` + `ManagedServer` — resolves `llama-server` from `$PATH` (or `LLAMA_SERVER`), spawns one process per managed model on a free localhost port (`--alias`, `-m`/`-hf`, `--instance` grammar, `--slot-save-path`, `--api-key`), waits for `/health`, and supervises each child (logs its output, restarts with capped backoff); `free_port`, `build_server_args`, `shutdown` |
 | `scheduler.rs` | Re-exports `AffinityScheduler` / `ScheduledTask` / `AgingConfig` from `fluent_concurrency::affinity` |
@@ -245,9 +245,9 @@ pub trait ChatBackend: Send + Sync {
 
 Concrete backends: `OpenAiChatBackend` (single-attempt HTTP through a raw
 `reqwest::Client`; non-2xx status classified via `HttpClass` into
-`DispatchError::RateLimited` vs `DispatchError::Http`), `RetryChatBackend`
+`DispatchError::RateLimited` vs `DispatchError::Http`), `RetryBackend`
 (jittered-exponential retry via `common_core::retry::retry_async` — the single
-backoff helper), and `FallbackChatBackend` (ordered backend chain that
+backoff helper), and `BackendChain` (ordered backend chain that
 short-circuits on terminal 4xx). `server/dispatch.rs::dispatch_real` iterates
 the primary `RoutingTarget` plus its `fallbacks` list, wrapping each target in
 a retry backend. The `fallbacks` are *target* candidates — populated at
@@ -311,11 +311,11 @@ pipeline pre-filter and the M1 write-path scrubber (`ledger_guard.rs`).
 | `Limiter` | `fluent-concurrency::pool` | `ClassifierStage` — concurrent classifier call cap; `charts/compile.rs` + `charts/execute.rs` — chart-DAG execution cap; `PlanRoute` |
 | `WorkContext` | `fluent-wvr` | Carries request, caps, runtime through every stage |
 | `Runtime` trait | `fluent-wvr` | Plugged via `fluent_concurrency::tokio_runtime()` everywhere |
-| `LoadCache<K,V,E>` | `common-core::cache` | `HotKvCache` — bounded get-or-load LRU |
-| `ArcIntern<str>` | `internment` | `NodeStore` session/role index keys; work-unit and graph asset names |
+| `LoadCache<K,V,E>` | `common-core::cache` | `HotSnapshotIndex` — bounded get-or-load LRU |
+| `ArcIntern<str>` | `internment` | `ContentNodeStore` session/role index keys; work-unit and graph asset names |
 | `LatencyHistogram` | `common-core::metrics` | `Instrumented::with_metrics` wiring |
-| `retry_async` | `common-core::retry` | `RetryChatBackend`, `RetryClassifier`, `Zone` retries |
-| `make_hnsw()` / `knn_brute_force` | `common-core::sqlite` / `fluent-db::vector` | `NodeStore` KNN; `hnsw.rs` chart-store fallback |
+| `retry_async` | `common-core::retry` | `RetryBackend`, `RetryClassifier`, `Zone` retries |
+| `make_hnsw()` / `knn_brute_force` | `common-core::sqlite` / `fluent-db::vector` | `ContentNodeStore` KNN; `hnsw.rs` chart-store fallback |
 | `HttpClass` | `guidance-llm` | `dispatch/backend.rs` — status classification in `OpenAiChatBackend` (streaming + buffered) |
 | `DispatchError::is_retryable()` | `fluent-router` (`dispatch/frontier.rs`) | retry/fallback decisions in `dispatch/backend.rs` and `server/dispatch.rs` |
 | `LlmError::is_retryable()` | `fluent-concurrency::llm_queue` | `guidance-llm` client error classification |
@@ -338,7 +338,7 @@ re-exported via `fluent_llm::HttpClass`. It is consumed in two layers:
    and `stream_complete` (streaming) use the identical pattern:
    `HttpClass::from_status(status)` → `is_retryable()` →
    `Err(DispatchError::RateLimited)` (retry) vs `Err(DispatchError::Http)`
-   (permanent). Retries are applied by `RetryChatBackend`, and the
+   (permanent). Retries are applied by `RetryBackend`, and the
    primary-plus-`fallbacks` chain is walked by `server/dispatch.rs::dispatch_real`.
 
 The router's own error taxonomy mirrors this at a higher level:
@@ -397,14 +397,14 @@ coral's Context a reachable read path without the router importing coral.
    `classifier_response` exists, responds directly; if `routing_target` exists,
    calls    `server/dispatch.rs::handle_dispatch`, which walks the primary target
    plus its `fallbacks` list through `ChatBackend`s (each wrapped in
-   `RetryChatBackend`), short-circuiting on non-retryable errors. The client's
+   `RetryBackend`), short-circuiting on non-retryable errors. The client's
    explicit `instance`/`snapshot`/`id_slot` fields are overlaid onto the target
    so they reach the outgoing body; a 503 group-miss asks the `InstancePool`
    to allocate fresh KV before one retry. If no target, the handler dispatches
    to the classifier's model as a fallback *target* (the model the
    classifier ran on now answers the request), or a canned fallback response.
    Fallback models are target models — never a backup for the classifier. When
-   dispatch and escalation fail, the per-group `EscalationLadder`
+   dispatch and escalation fail, the per-group `Ladder`
    (`try_escalate`) runs its configured modes, short-circuiting on a
    `ContextCache` hit. Every local dispatch lands as a direct HTTP call on the
    owning spawned `llama-server` carrying the translated model id.
@@ -499,7 +499,7 @@ cross-group models from `all_dispatch_targets` not already included. These are
 path. `dispatch_real` (`server/dispatch.rs`) walks the primary target plus its
 `fallbacks` in order when a target fails (rate limit, timeout, parse error);
 non-retryable 4xx errors short-circuit the chain. Only after the whole local
-chain is exhausted does the per-group `EscalationLadder` engage
+chain is exhausted does the per-group `Ladder` engage
 (`dispatch/escalation.rs`).
 
 Every model in the chain is a candidate to answer the request — a fallback
@@ -680,7 +680,7 @@ the total `weights + contexts` resident. The GGUF root for file-size fallbacks
 resolves from `--gguf-dir`, else the config's `gguf_dir`, else the built-in
 default, so paths are configurable and never recompiled in.
 
-**KV snapshot round-trip.** `KvCacheManager` may hold an optional
+**KV snapshot round-trip.** `SnapshotStore` may hold an optional
 `InstanceClient` handle (`with_fork_io`). `save_snapshot` then POSTs the
 snapshot to the owning server (`POST /instances/:name/snapshot`) via the shared
 `common_core::runtime::block_on` bridge and records the metadata locally;
@@ -701,12 +701,12 @@ they opt in.
 
 ## Ledger: condensed context architecture
 
-`ContentNodeLedger` is a thin facade over the shared `NodeStore`. Every request
+`ContentNodeLedger` is a thin facade over the shared `ContentNodeStore`. Every request
 is stored at full detail (LOD0) before the pipeline runs, and results are
 recorded afterward. This separates durable storage from live working context:
 
 ```
-User message → ContentNodeLedger → NodeStore (durable, full detail)
+User message → ContentNodeLedger → ContentNodeStore (durable, full detail)
                 ↓                         ↓
          Pipeline stages          ParallelLedger / FilteredLedger
          (read from WorkContext,   (render-only views; single text-exit
@@ -717,11 +717,11 @@ User message → ContentNodeLedger → NodeStore (durable, full detail)
 
 Key load-bearing properties:
 
-- **Write path is checked (M1, D1).** Every write reaches `NodeStore` only
+- **Write path is checked (M1, D1).** Every write reaches `ContentNodeStore` only
   after passing through `ledger_guard::scrub_for_ledger` — the builtin filter
   engine with the `ContentNodeWrite` scope active. PII-matching text is
   irreversibly replaced (`[REDACTED:<pattern>]`), no codeword map retained.
-  Direct `NodeStore` writes are the documented bypass (production writes route
+  Direct `ContentNodeStore` writes are the documented bypass (production writes route
   through the facade).
 - **LOD lifecycle.** LOD0 (full text) + LOD5 (label) are eager; LOD1–LOD4 are
   derived lazily, always from LOD0 only (never chained), via the `Summarizer`
@@ -729,7 +729,7 @@ Key load-bearing properties:
   `RecencyCompaction` demote older nodes to a higher LOD (setting `active_lod`).
 - **Views never own text (M2, D4).** `LedgerView::render` is the single
   text-exit from the store; `ParallelLedger` gives independent default-LOD
-  views over one shared `Arc<NodeStore>`; `FilteredLedger<V>` is a reference
+  views over one shared `Arc<ContentNodeStore>`; `FilteredLedger<V>` is a reference
   overlay (exclusion set + optional render transform) used by both the PII
   frontier view and the rigor red-team view. Rendering degrades to LOD0 when a
   lazy tier is un-derivable rather than erroring.

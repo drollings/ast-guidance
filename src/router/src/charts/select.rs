@@ -514,11 +514,12 @@ fn build_adjudicator_prompt(
 /// Parse an adjudicator response into a `ChartMatch`-shaped verdict.
 ///
 /// Tolerant by design (mirrors `parse_classifier_response`): the shared
-/// `fluent_llm::parse_json_response` strips markdown code fences, fast-paths
+/// `fluent_llm::parse_typed` codec strips markdown code fences, fast-paths
 /// a direct parse, then extracts the first `{...}` object; missing fields are
 /// sanitized to defaults.
 fn parse_adjudicator_output(raw: &str) -> Option<AdjudicatorOutput> {
-    let value = fluent_llm::parse_json_response(raw).ok()?;
+    let value =
+        fluent_llm::parse_typed::<serde_json::Value>(raw, &serde_json::Value::Null, |_| {}).ok()?;
     sanitize_adjudicator_output(&value)
 }
 
@@ -601,12 +602,13 @@ fn build_rerank_prompt(request: &str, candidates: &[(String, f64)], store: &Char
 /// Parse a reranker response into an ordered list of candidate names.
 ///
 /// Tolerant by design (mirrors `parse_adjudicator_output`): the shared
-/// `fluent_llm::parse_json_response` strips fences, accepts a bare array or
+/// `fluent_llm::parse_typed` codec strips fences, accepts a bare array or
 /// a `{"ranking": [...]}` object, and extracts the first balanced JSON value.
 /// Non-string entries are dropped. `None` means "not parseable" — the caller
 /// keeps the HNSW order.
 fn parse_rerank_output(raw: &str) -> Option<Vec<String>> {
-    let value = fluent_llm::parse_json_response(raw).ok()?;
+    let value =
+        fluent_llm::parse_typed::<serde_json::Value>(raw, &serde_json::Value::Null, |_| {}).ok()?;
     let names: Option<Vec<&str>> = match &value {
         serde_json::Value::Array(arr) => Some(arr.iter().filter_map(|v| v.as_str()).collect()),
         serde_json::Value::Object(obj) => obj
@@ -667,12 +669,13 @@ fn build_ambiguity_prompt(amb: &AmbiguousDep) -> String {
 
 /// Parse an ambiguity-adjudicator response into a candidate entity id.
 ///
-/// Tolerant by design: the shared `fluent_llm::parse_json_response` strips
+/// Tolerant by design: the shared `fluent_llm::parse_typed` codec strips
 /// code fences and extracts the first `{...}` object. Returns `None` when the
 /// id is missing or empty — the caller falls back to the deterministic
 /// tie-break.
 fn parse_ambiguity_output(raw: &str) -> Option<String> {
-    let value = fluent_llm::parse_json_response(raw).ok()?;
+    let value =
+        fluent_llm::parse_typed::<serde_json::Value>(raw, &serde_json::Value::Null, |_| {}).ok()?;
     let id = value
         .as_object()?
         .get("entity_id")

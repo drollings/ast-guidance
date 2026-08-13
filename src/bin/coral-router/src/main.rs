@@ -425,8 +425,8 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
                 std::process::exit(1);
             }
             for key in supervisor.model_keys() {
-                if let Some(server) = supervisor.server_for(key) {
-                    if let Some(entry) = config.models.get_mut(key) {
+                if let Some(server) = supervisor.server_for(&key) {
+                    if let Some(entry) = config.models.get_mut(&key) {
                         entry.endpoint = format!("{}/v1/chat/completions", server.base_url());
                         tracing::info!(
                             target: "coral-router",
@@ -491,34 +491,6 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
         classifier_model = %classifier_model_name,
         "starting coral-router server"
     );
-
-    // Chart store boot: load `config.charts.dir` (fail fast on a corrupt
-    // file — a half-loaded library must not serve), attach the shared store
-    // to the plan route. A missing directory is tolerated (empty store).
-    let plan_route = Arc::new(build_plan_route(&config));
-    let rigor_route = Arc::new(build_rigor_route(&config));
-
-    // M3 escalation ladders: one per `model_groups[g].escalation` config.
-    let http_client = reqwest::Client::new();
-    let ladders = config.build_escalation_ladders(&http_client);
-
-    // M4 sidecar: build one instance manager per endpoint that declares an
-    // instance pool. The server owns their reconcile + residency tasks. A
-    // malformed instance grammar (duplicate name / group-name collision)
-    // fails fast so boot aborts loudly.
-    let instance_pool =
-        match fluent_router::instances::build_instance_managers(&config, _supervisor.clone()) {
-            Ok(pool) => pool,
-            Err(e) => {
-                tracing::error!(
-                    target: "coral-router",
-                    error = %e,
-                    "fatal: instance pool grammar validation failed",
-                );
-                eprintln!("FATAL: {e}");
-                std::process::exit(1);
-            }
-        };
 
     // M2 composition: when the operator opts in via the `ledger`/`session`
     // sections, open a `ContentNodeLedger` (with a real `Summarizer` backend
@@ -587,6 +559,122 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
         None
     };
 
+    // M5.3: the shared ledger store (when a ledger is attached) is threaded
+    // into the plan/rigor route builders so their selector/judge models render
+    // the session ledger through the assembler's budget/relevance rules.
+    let ledger_store = ledger.as_ref().map(|l| l.node_store().clone());
+
+    // Chart store boot: load `config.charts.dir` (fail fast on a corrupt
+    // file — a half-loaded library must not serve), attach the shared store
+    // to the plan route. A missing directory is tolerated (empty store).
+    let plan_route = Arc::new(build_plan_route(&config, ledger_store.as_ref()));
+    let rigor_route = Arc::new(build_rigor_route(&config, ledger_store.as_ref()));
+
+    // M3 escalation ladders: one per `model_groups[g].escalation` config.
+    let http_client = reqwest::Client::new();
+    let ladders = config.build_escalation_ladders(&http_client);
+
+    // M4 sidecar: build one instance manager per endpoint that declares an
+    // instance pool. The server owns their reconcile + residency tasks. A
+    // malformed instance grammar (duplicate name / group-name collision)
+    // fails fast so boot aborts loudly.
+    let instance_pool =
+        match fluent_router::instances::build_instance_managers(&config, _supervisor.clone()) {
+            Ok(pool) => pool,
+            Err(e) => {
+                tracing::error!(
+                    target: "coral-router",
+                    error = %e,
+                    "fatal: instance pool grammar validation failed",
+                );
+                eprintln!("FATAL: {e}");
+                std::process::exit(1);
+            }
+        };
+
+    // M2 background tiering: when the operator opts in via
+    // `ledger.background_tiering`, attach a `LedgerTierWorker` to the shared
+    // store so LOD4 (short summary) and LOD5 (LLM description) are derived
+    // continuously in the background. Reuses the single `LlmClient` factory
+    // (`ledger_tier_backend`) — no second HTTP client. Held on the server for
+    // the process lifetime.
+    let mut tier_worker_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut tier_worker: Option<Arc<fluent_router::ledger::tiering::LedgerTierWorker>> = None;
+    if let (Some(ledger_arc), Some(ledger_cfg)) = (&ledger, &config.ledger) {
+        if ledger_cfg.background_tiering {
+            match config.ledger_tier_backend(ledger_cfg.tier_model.as_deref()) {
+                Some(backend) => {
+                    let tier_cfg = config
+                        .ledger_tier_config()
+                        .expect("ledger section present -> tier config");
+                    let store = Arc::clone(ledger_arc.node_store());
+                    let worker = fluent_router::ledger::tiering::LedgerTierWorker::new(
+                        Arc::clone(&store),
+                        backend,
+                        vec![4, 5],
+                        tier_cfg,
+                        fluent_concurrency::tokio_runtime(),
+                    );
+                    store.set_tier_events(worker.sender());
+                    let handle = worker.start();
+                    tracing::info!(
+                        target: "coral-router",
+                        lod4_max_chars = ledger_cfg.lod4_max_chars,
+                        lod5_max_chars = ledger_cfg.lod5_max_chars,
+                        "background ledger tiering enabled",
+                    );
+                    tier_worker_handle = Some(handle);
+                    tier_worker = Some(Arc::clone(&worker));
+                }
+                None => {
+                    tracing::warn!(
+                        target: "coral-router",
+                        tier_model = ?ledger_cfg.tier_model,
+                        "ledger.background_tiering set but no tier backend derivable - tiering skipped",
+                    );
+                }
+            }
+        }
+    }
+
+    // M5.1/M5.4: the `LedgerAgentCoordinator` (the ledger-as-synchronization
+    // point). Opt-in via `ledger.orchestrator.enabled`; requires a ledger, a
+    // session registry, and a tier worker. Reuses the single `LlmClient`
+    // factory (`ledger_tier_backend`) — no second HTTP client.
+    let mut coordinator: Option<Arc<fluent_router::ledger::orchestrator::LedgerAgentCoordinator>> =
+        None;
+    if let (Some(ledger_arc), Some(ledger_cfg), Some(sessions_arc)) =
+        (&ledger, &config.ledger, &sessions)
+    {
+        if ledger_cfg.orchestrator.enabled {
+            let backend = config.ledger_tier_backend(ledger_cfg.tier_model.as_deref());
+            if let (Some(tier_worker), Some(backend)) = (&tier_worker, backend) {
+                let kv = sessions_arc.kv_cache().clone();
+                if let Some(coord) = config.build_ledger_coordinator(
+                    Arc::clone(ledger_arc.node_store()),
+                    Arc::clone(sessions_arc),
+                    kv,
+                    Arc::clone(tier_worker),
+                    backend,
+                ) {
+                    tracing::info!(
+                        target: "coral-router",
+                        kv_policy = ?ledger_cfg.orchestrator.kv_policy,
+                        prompt_budget_chars = ledger_cfg.orchestrator.prompt_budget_chars,
+                        role = %ledger_cfg.orchestrator.role,
+                        "ledger-agent coordinator enabled",
+                    );
+                    coordinator = Some(Arc::new(coord));
+                }
+            } else {
+                tracing::warn!(
+                    target: "coral-router",
+                    "ledger.orchestrator.enabled set but no ledger/tier backend derivable - coordinator skipped",
+                );
+            }
+        }
+    }
+
     let mut server =
         RouterServer::new(pipelines, routes, config.models, &config.server, classifier)
             .with_plan_route(plan_route)
@@ -598,6 +686,12 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
     }
     if let Some(sessions) = sessions {
         server = server.with_sessions(sessions);
+    }
+    if let Some(handle) = tier_worker_handle {
+        server = server.with_tier_worker(handle);
+    }
+    if let Some(coordinator) = coordinator {
+        server = server.with_coordinator(coordinator);
     }
 
     if !instance_pool.is_empty() {
@@ -662,7 +756,10 @@ async fn shutdown_signal() {
 /// disables HNSW retrieval but never aborts boot; deterministic match and LLM
 /// adjudication still work). The adjudicator backend is wired from
 /// `charts.selector_model` when set.
-fn build_plan_route(config: &RouterConfig) -> PlanRoute {
+fn build_plan_route(
+    config: &RouterConfig,
+    ledger_store: Option<&Arc<fluent_router::node_store::ContentNodeStore>>,
+) -> PlanRoute {
     let index_handle = config
         .charts
         .index_path
@@ -759,6 +856,25 @@ fn build_plan_route(config: &RouterConfig) -> PlanRoute {
             "workflow extraction enabled — successful dispatches become draft charts",
         );
     }
+    // M5.3: when a shared ledger store exists, attach the prompt assembler so
+    // the selector/adjudicator render the session ledger through the same
+    // budget/relevance rules (a request that carries a `session_id` folds it in).
+    if let Some(store) = ledger_store {
+        let ctx = fluent_router::routes::plan::PromptAssemblerCtx::new(
+            Arc::clone(store),
+            fluent_router::ledger::prompt::LedgerPromptAssembler,
+            fluent_router::ledger::prompt::PromptBudget::new(
+                config
+                    .ledger
+                    .as_ref()
+                    .map(|l| l.orchestrator.prompt_budget_chars)
+                    .unwrap_or(32768),
+            ),
+            fluent_router::ledger::prompt::LodSpec::full(),
+        );
+        route = route.with_prompt_assembler(ctx);
+        tracing::info!(target: "coral-router", "plan route prompt assembler attached");
+    }
     route
 }
 
@@ -830,7 +946,10 @@ fn default_reranker_backend(config: &RouterConfig) -> Option<Arc<dyn ChatBackend
 /// route is present but unconfigured — requests return an explicit
 /// `Unconfigured` error, never a crash (`env/coral-router.json` ships without
 /// a `rigor` section).
-fn build_rigor_route(config: &RouterConfig) -> RigorRoute {
+fn build_rigor_route(
+    config: &RouterConfig,
+    ledger_store: Option<&Arc<fluent_router::node_store::ContentNodeStore>>,
+) -> RigorRoute {
     let Some(cfg) = &config.rigor else {
         return RigorRoute::new();
     };
@@ -846,6 +965,24 @@ fn build_rigor_route(config: &RouterConfig) -> RigorRoute {
     }
     if let Some(backend) = default_rigor_backend(config, cfg.judge_model.as_deref()) {
         route = route.with_judge_backend(backend);
+    }
+    // M5.3: when a shared ledger store exists, the judge renders its review
+    // prompt over the session ledger through the assembler's budget/relevance
+    // rules (the red team keeps its LOD0 `FilteredLedger` view unchanged). The
+    // store presence is the opt-in gate; the route reads the ledger by session.
+    if ledger_store.is_some() {
+        route = route.with_prompt_assembler(
+            fluent_router::ledger::prompt::LedgerPromptAssembler,
+            fluent_router::ledger::prompt::PromptBudget::new(
+                config
+                    .ledger
+                    .as_ref()
+                    .map(|l| l.orchestrator.prompt_budget_chars)
+                    .unwrap_or(32768),
+            ),
+            fluent_router::ledger::prompt::LodSpec::full(),
+        );
+        tracing::info!(target: "coral-router", "rigor judge prompt assembler attached");
     }
     tracing::info!(
         target: "coral-router",

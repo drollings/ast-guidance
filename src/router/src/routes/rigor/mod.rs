@@ -24,20 +24,35 @@
 //! `Arc<dyn ChatBackend>` built exactly once in `main.rs`. There is **no**
 //! `Interviewable` trait - the targeted interview is a third, distinct shape
 //! from plan's binding-gap closure loop (D5).
+//!
+//! The prompt constants, message builders, and tolerant parse helpers live in
+//! the [`prompts`] submodule.
 
-use std::collections::HashSet;
+pub mod prompts;
+
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
+use common_core::hash::uuid_v4;
 use common_core::sync::lock;
-use fluent_llm::{parse_json_response, ChatMessage};
-use fluent_types::{ContentNode, NodeId, StepStatus};
+use fluent_types::{ContentNode, NodeId};
+use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
 
 use crate::config::RigorConfig;
 use crate::dag_session::{DependencySession, SessionStep, StepResult};
 use crate::dispatch::escalation::LocalBackend;
+use crate::ledger::prompt::{LedgerPromptAssembler, LodSpec, PromptBudget, WorkerContext};
 use crate::ledger::ContentNodeLedger;
+use crate::server::handler::ServerDeps;
+use crate::server::responses::{empty_response, HyperResponse};
 use crate::views::{FilteredLedger, LedgerView, Lod, ParallelLedger};
+
+use prompts::{
+    blue_answer, blue_retry_prompt, chat, dead_end_node_ids, derive_interview, is_reject,
+    judge_prompt, parse_judge, parse_objections, verdict_tag, JUDGE_SYSTEM_PROMPT,
+    RED_SYSTEM_PROMPT,
+};
 
 /// Context passed to the rigor route's execute method. Carries the minimal
 /// information needed for the 3-pass blue/red/judge protocol.
@@ -68,6 +83,13 @@ pub struct RigorRoute {
     /// Route behavior config: `max_passes`, material-rejection threshold,
     /// escalation trigger.
     cfg: RigorConfig,
+    /// Optional `LedgerPromptAssembler` (M5.3): when a ledger is attached, the
+    /// judge renders its review prompt over the session ledger through the
+    /// assembler's budget/relevance rules. The red team keeps its LOD0
+    /// `FilteredLedger` view unchanged (it dereferences LOD0 by design).
+    assembler: Option<LedgerPromptAssembler>,
+    budget: PromptBudget,
+    lod_spec: LodSpec,
 }
 
 #[derive(Debug, Clone)]
@@ -116,12 +138,30 @@ impl RigorRoute {
             red: None,
             judge: None,
             cfg: RigorConfig::default(),
+            assembler: None,
+            budget: PromptBudget::from_tokens_default(8192),
+            lod_spec: LodSpec::full(),
         }
     }
 
     #[must_use]
     pub fn with_kv_cache(mut self) -> Self {
         self.kv_cache_enabled = true;
+        self
+    }
+
+    /// Attach the `LedgerPromptAssembler` so the judge's review prompt renders
+    /// the session ledger at a budget/relevance-matched fidelity (M5.3).
+    #[must_use]
+    pub fn with_prompt_assembler(
+        mut self,
+        assembler: LedgerPromptAssembler,
+        budget: PromptBudget,
+        lod_spec: LodSpec,
+    ) -> Self {
+        self.assembler = Some(assembler);
+        self.budget = budget;
+        self.lod_spec = lod_spec;
         self
     }
 
@@ -184,7 +224,8 @@ impl RigorRoute {
 
         // Red + judge over the (no-dead-end) view.
         let objections = Self::red_pass(ctx, &red, &answer).await?;
-        let (mut verdict, mut confidence) = Self::judge_pass(&judge, &answer, &objections).await?;
+        let (mut verdict, mut confidence) =
+            self.judge_pass(ctx, &judge, &answer, &objections).await?;
 
         let mut rewound = false;
         let mut interview_questions = Vec::new();
@@ -198,7 +239,7 @@ impl RigorRoute {
             answer = blue_answer(&blue, &refocused).await?;
             self.complete_blue_step(ctx, &answer);
             let objections2 = Self::red_pass(ctx, &red, &answer).await?;
-            let (v2, c2) = Self::judge_pass(&judge, &answer, &objections2).await?;
+            let (v2, c2) = self.judge_pass(ctx, &judge, &answer, &objections2).await?;
             verdict = v2;
             confidence = c2;
         }
@@ -291,7 +332,7 @@ impl RigorRoute {
 
     /// Save the blue-pass KV snapshot (D7): record a snapshot named after the
     /// blue step on `ctx.kv_instance` so a later `rewind_to_checkpoint` finds
-    /// real metadata. Requires a session carrying a `KvCacheManager` (with a
+    /// real metadata. Requires a session carrying a `SnapshotStore` (with a
     /// fork handle), a model name for keying, and a `kv_instance`; any missing
     /// piece degrades to a logged no-op - never a crash, never a fabricated
     /// lookup.
@@ -429,15 +470,62 @@ impl RigorRoute {
     }
 
     async fn judge_pass(
+        &self,
+        ctx: &RigorContext,
         judge: &LocalBackend,
         answer: &str,
         objections: &[RedObjection],
     ) -> Result<(JudgeVerdict, f64), RigorError> {
         let prompt = judge_prompt(answer, objections);
+        // M5.3: fold the session ledger (assembled through the budget/relevance
+        // rules) into the judge's review material when a ledger + assembler are
+        // attached. Additive — a route without them keeps today's prompt.
+        let ledger_ctx = self.assembled_judge_context(ctx);
+        let prompt = if ledger_ctx.is_empty() {
+            prompt
+        } else {
+            format!("Session ledger context:\n{ledger_ctx}\n\n{prompt}")
+        };
         let raw = chat(judge, JUDGE_SYSTEM_PROMPT, &prompt)
             .await
             .map_err(|e| RigorError::Judge(e.to_string()))?;
         parse_judge(&raw).map_err(RigorError::Judge)
+    }
+
+    /// Render the session ledger through the `LedgerPromptAssembler` for the
+    /// judge's review prompt (M5.3). Empty when no assembler or ledger is
+    /// attached (the judge degrades to today's prompt). The rendered `body` is
+    /// the assembled context; the per-node fidelity `node_plan` is audited.
+    fn assembled_judge_context(&self, ctx: &RigorContext) -> String {
+        let Some(assembler) = self.assembler else {
+            return String::new();
+        };
+        let Some(ledger) = &ctx.ledger else {
+            return String::new();
+        };
+        let store = ledger.node_store().clone();
+        let view = ParallelLedger::for_session(store, &ctx.session_id);
+        let assembled = assembler.assemble(
+            &view,
+            &WorkerContext::new("judge", "Review the candidate answer against the ledger."),
+            &self.budget,
+            None,
+            &self.lod_spec,
+        );
+        crate::audit::emit(
+            "prompt",
+            serde_json::json!({
+                "session_id": ctx.session_id,
+                "role": "rigor_judge",
+                "budget_used": assembled.budget_used,
+                "node_plan": assembled
+                    .node_plan
+                    .iter()
+                    .map(|(id, lod)| serde_json::json!([id.as_int(), lod.as_u8()]))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+        assembled.body
     }
 
     /// Whether any objection is material (severity >= the configured
@@ -449,262 +537,6 @@ impl RigorRoute {
     }
 }
 
-/// The blue-team system prompt: a direct candidate answer, plain text out.
-const BLUE_SYSTEM_PROMPT: &str = r"You are the blue team. Produce a direct, correct candidate answer to the user's request.
-Be complete and precise. Output only the answer text, no preamble.";
-
-/// The red-team system prompt: a JSON array of objections, each anchored to a
-/// claim's ledger node id where applicable.
-const RED_SYSTEM_PROMPT: &str = r#"You are the red team. Given a blue team's candidate answer and the session material,
-find weaknesses: factual errors, missing requirements, unsafe claims, or unsupported assertions.
-Output a JSON array of objections, each:
-{"category": "a short category", "description": "the objection", "severity": 0.0-1.0, "target_claim": <ledger node id as a number, or null>}
-Output only valid JSON, no other text."#;
-
-/// The judge system prompt: a structured verdict.
-const JUDGE_SYSTEM_PROMPT: &str = r#"You are the judge. Given a blue team's candidate answer and the red team's objections,
-decide whether the answer is acceptable.
-Output JSON only:
-{"verdict": "accept" | "accept_with_caveats" | "reject", "caveats": [...], "reasons": [...], "confidence": 0.0-1.0}
-"confidence" is how confident you are in this verdict. Output only valid JSON, no other text."#;
-
-/// Build the standard system+user message pair.
-fn messages(system: &str, user: &str) -> Vec<ChatMessage> {
-    vec![
-        ChatMessage {
-            role: "system".into(),
-            content: system.into(),
-        },
-        ChatMessage {
-            role: "user".into(),
-            content: user.into(),
-        },
-    ]
-}
-
-/// Run the blue pass: candidate answer as plain text.
-async fn blue_answer(blue: &LocalBackend, user_message: &str) -> Result<String, RigorError> {
-    chat(blue, BLUE_SYSTEM_PROMPT, user_message)
-        .await
-        .map_err(|e| RigorError::BlueTeam(e.to_string()))
-}
-
-/// Run one blocking `ChatBackend::chat_complete` off the executor.
-///
-/// The role backends are synchronous (the codebase's DIP pattern - the same
-/// `Arc<dyn ChatBackend>` used by dispatch). `RigorRoute::execute` is async by
-/// locked decision D5, so the blocking calls are offloaded via
-/// `spawn_blocking` and awaited, honoring the WorkUnit purity contract (never
-/// block a tokio worker).
-async fn chat(
-    backend: &LocalBackend,
-    system: &str,
-    user: &str,
-) -> Result<String, fluent_llm::LlmError> {
-    let backend = backend.clone();
-    let messages = messages(system, user);
-    tokio::task::spawn_blocking(move || backend.chat_complete(&messages))
-        .await
-        .map_err(|e| fluent_llm::LlmError::Api(format!("chat task failed: {e}")))?
-}
-
-/// Fold the red objections into a refocused blue prompt for the second pass.
-fn blue_retry_prompt(
-    user_message: &str,
-    prior_answer: &str,
-    objections: &[RedObjection],
-) -> String {
-    use std::fmt::Write as _;
-
-    let mut prompt = format!(
-        "Original request:\n{user_message}\n\n\
-         Your previous answer was rejected by the red team.\n\
-         Previous answer:\n{prior_answer}\n\n\
-         Address these objections:\n"
-    );
-    for o in objections {
-        let _ = writeln!(
-            prompt,
-            "- [{:.2}] {}: {}",
-            o.severity, o.category, o.description
-        );
-    }
-    prompt
-}
-
-/// Build the judge prompt: the candidate answer plus each objection.
-fn judge_prompt(answer: &str, objections: &[RedObjection]) -> String {
-    use std::fmt::Write as _;
-
-    let mut prompt = format!("Blue team's candidate answer:\n{answer}\n\nRed team objections:\n");
-    if objections.is_empty() {
-        prompt.push_str("(none)\n");
-    }
-    for (i, o) in objections.iter().enumerate() {
-        let claim = o
-            .target_claim
-            .map_or_else(|| "null".to_string(), |id| id.as_int().to_string());
-        let _ = writeln!(
-            prompt,
-            "{i}. [{:.2}] {}: {} (target_claim: {claim})",
-            o.severity, o.category, o.description
-        );
-    }
-    prompt
-}
-
-/// Wire shape of the red output before it is mapped into `RedObjection`.
-#[derive(Debug, Deserialize)]
-struct RedObjectionWire {
-    #[serde(default)]
-    category: String,
-    #[serde(default)]
-    description: String,
-    #[serde(default)]
-    severity: f64,
-    #[serde(default)]
-    target_claim: Option<NodeId>,
-}
-
-/// Tolerant parse of the red-team objections array via
-/// `fluent_llm::parse_json_response` (never hand-rolled fence-stripping).
-fn parse_objections(raw: &str) -> Result<Vec<RedObjection>, String> {
-    let value = parse_json_response(raw).map_err(|e| e.to_string())?;
-    let arr = match value {
-        serde_json::Value::Array(arr) => arr,
-        serde_json::Value::Object(map) => {
-            // Tolerate a wrapped `{"objections": [...]}` shape.
-            map.get("objections")
-                .and_then(serde_json::Value::as_array)
-                .cloned()
-                .ok_or_else(|| "red output is neither an array nor an objections map".to_string())?
-        }
-        other => return Err(format!("red output is not a JSON array: {other}")),
-    };
-    arr.into_iter()
-        .map(|v| {
-            let wire: RedObjectionWire =
-                serde_json::from_value(v).map_err(|e| format!("invalid objection: {e}"))?;
-            Ok(RedObjection {
-                category: wire.category,
-                description: wire.description,
-                severity: wire.severity,
-                target_claim: wire.target_claim,
-            })
-        })
-        .collect()
-}
-
-/// Wire shape of the judge output.
-#[derive(Debug, Deserialize)]
-struct JudgeOutputWire {
-    #[serde(default)]
-    verdict: String,
-    #[serde(default)]
-    caveats: Vec<String>,
-    #[serde(default)]
-    reasons: Vec<String>,
-    #[serde(default = "default_judge_confidence")]
-    confidence: f64,
-}
-
-const fn default_judge_confidence() -> f64 {
-    0.5
-}
-
-/// Tolerant parse of the judge verdict via `fluent_llm::parse_json_response`.
-fn parse_judge(raw: &str) -> Result<(JudgeVerdict, f64), String> {
-    let value = parse_json_response(raw).map_err(|e| e.to_string())?;
-    let wire: JudgeOutputWire =
-        serde_json::from_value(value).map_err(|e| format!("invalid judge output: {e}"))?;
-    let verdict = match wire.verdict.as_str() {
-        "accept" => JudgeVerdict::Accept,
-        "accept_with_caveats" => JudgeVerdict::AcceptWithCaveats {
-            caveats: wire.caveats,
-        },
-        "reject" => JudgeVerdict::Reject {
-            reasons: wire.reasons,
-        },
-        other => return Err(format!("unknown judge verdict: {other}")),
-    };
-    Ok((verdict, wire.confidence))
-}
-
-/// Whether a verdict is a rejection.
-fn is_reject(verdict: &JudgeVerdict) -> bool {
-    matches!(verdict, JudgeVerdict::Reject { .. })
-}
-
-/// Audit-tag form of a verdict.
-fn verdict_tag(verdict: &JudgeVerdict) -> &'static str {
-    match verdict {
-        JudgeVerdict::Accept => "accept",
-        JudgeVerdict::AcceptWithCaveats { .. } => "accept_with_caveats",
-        JudgeVerdict::Reject { .. } => "reject",
-    }
-}
-
-/// The dead-end node ids for the red-team filtered view: ledger nodes in the
-/// session whose `accepted == Some(false)` (the blue dead ends persisted by
-/// `record_blue_dead_end`), plus nodes mapped from session steps whose result
-/// is rejected (the roadmap's step-level mechanism, where available).
-fn dead_end_node_ids(ctx: &RigorContext) -> HashSet<NodeId> {
-    let Some(ledger) = &ctx.ledger else {
-        return HashSet::new();
-    };
-    let store = ledger.node_store();
-    let mut rejected_steps: HashSet<String> = HashSet::new();
-    if let Some(session) = &ctx.session {
-        let s = lock(session);
-        for step_id in s.step_ids() {
-            if let Some(step) = s.get_step(step_id) {
-                let rejected = matches!(step.status, StepStatus::Failed | StepStatus::Cancelled)
-                    || step
-                        .result
-                        .as_ref()
-                        .is_some_and(|r| !r.accepted || r.error.is_some());
-                if rejected {
-                    rejected_steps.insert(step_id.clone());
-                }
-            }
-        }
-    }
-    store
-        .session_node_ids(&ctx.session_id)
-        .into_iter()
-        .filter(|nid| {
-            store.snapshot(*nid).is_some_and(|node| {
-                node.accepted == Some(false)
-                    || node
-                        .step_id
-                        .as_deref()
-                        .is_some_and(|sid| rejected_steps.contains(sid))
-            })
-        })
-        .collect()
-}
-
-/// The targeted-interview fallback: the <= 3 highest-severity objections,
-/// turned into direct clarification questions (VISION: "a targeted interview
-/// with the user - not silent escalation").
-fn derive_interview(objections: &[RedObjection]) -> Vec<String> {
-    let mut ranked: Vec<&RedObjection> = objections.iter().collect();
-    ranked.sort_by(|a, b| {
-        b.severity
-            .partial_cmp(&a.severity)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    ranked
-        .into_iter()
-        .take(3)
-        .map(|o| {
-            format!(
-                "{} - {}. Could you clarify this concern?",
-                o.category, o.description
-            )
-        })
-        .collect()
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum RigorError {
@@ -724,6 +556,8 @@ mod tests {
     use crate::dag_session::DependencySession;
     use crate::test_stubs::StubChatBackend;
     use fluent_llm::client::ChatBackend;
+    use fluent_llm::ChatMessage;
+    use fluent_types::StepStatus;
 
     fn ctx(message: &str) -> RigorContext {
         RigorContext {
@@ -1025,16 +859,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rewind_restores_kv_snapshot_for_real() {
         // Mirrors `dag_session::tests::test_rewind_restores_kv_snapshot_for_real`:
-        // a session carrying the KvCacheManager (D6) has its stored snapshot
+        // a session carrying the SnapshotStore (D6) has its stored snapshot
         // actually restored on rewind.
-        use crate::kv_cache::{ColdKvCache, HotKvCache, KvCacheManager, KvSnapshot};
+        use crate::kv_cache::{ColdSnapshotIndex, HotSnapshotIndex, SnapshotStore, KvSnapshot};
 
         let dir = tempfile::tempdir().unwrap();
         let src_dir = tempfile::tempdir().unwrap();
-        let hot = Arc::new(HotKvCache::new(10, 1024));
-        let kv = KvCacheManager::new(
+        let hot = Arc::new(HotSnapshotIndex::new(10, 1024));
+        let kv = SnapshotStore::new(
             Arc::clone(&hot),
-            Arc::new(ColdKvCache::new(
+            Arc::new(ColdSnapshotIndex::new(
                 dir.path(),
                 1024,
                 86400,
@@ -1086,7 +920,7 @@ mod tests {
         // (`snapshot`/`instance`/`id_slot`) for the next dispatch.
         use crate::instances::stub::StubServer;
         use crate::instances::InstanceClient;
-        use crate::kv_cache::{ColdKvCache, HotKvCache, KvCacheManager};
+        use crate::kv_cache::{ColdSnapshotIndex, HotSnapshotIndex, SnapshotStore};
 
         // Stub fork: answer the snapshot save + any /instances reads.
         let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
@@ -1106,10 +940,10 @@ mod tests {
         ));
 
         let dir = tempfile::tempdir().unwrap();
-        let hot = Arc::new(HotKvCache::new(10, 1024));
-        let kv = KvCacheManager::new(
+        let hot = Arc::new(HotSnapshotIndex::new(10, 1024));
+        let kv = SnapshotStore::new(
             Arc::clone(&hot),
-            Arc::new(ColdKvCache::new(
+            Arc::new(ColdSnapshotIndex::new(
                 dir.path(),
                 1024,
                 86400,
@@ -1156,7 +990,7 @@ mod tests {
         // the blue save is skipped (never a crash) and the stub sees no POST.
         use crate::instances::stub::StubServer;
         use crate::instances::InstanceClient;
-        use crate::kv_cache::{ColdKvCache, HotKvCache, KvCacheManager};
+        use crate::kv_cache::{ColdSnapshotIndex, HotSnapshotIndex, SnapshotStore};
 
         let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
             |method, _path, _body| {
@@ -1174,10 +1008,10 @@ mod tests {
             None,
         ));
         let dir = tempfile::tempdir().unwrap();
-        let hot = Arc::new(HotKvCache::new(10, 1024));
-        let kv = KvCacheManager::new(
+        let hot = Arc::new(HotSnapshotIndex::new(10, 1024));
+        let kv = SnapshotStore::new(
             Arc::clone(&hot),
-            Arc::new(ColdKvCache::new(
+            Arc::new(ColdSnapshotIndex::new(
                 dir.path(),
                 1024,
                 86400,
@@ -1278,4 +1112,208 @@ mod tests {
             "red prompt must exclude the rejected dead end, got: {prompt}"
         );
     }
+
+    // -- M5.3: judge uses the LedgerPromptAssembler -----------------------
+
+    /// A recording judge backend that captures the user message it receives.
+    struct RecordingJudge {
+        captured: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ChatBackend for RecordingJudge {
+        fn chat_complete(&self, messages: &[ChatMessage]) -> Result<String, fluent_llm::LlmError> {
+            let user = messages
+                .iter()
+                .find(|m| m.role == "user")
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+            lock(&self.captured).push(user);
+            Ok(accept_verdict().to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn judge_prompt_renders_ledger_via_assembler() {
+        // M5.3: with a ledger + assembler attached, the judge's review prompt
+        // folds in the session ledger rendered through the assembler's
+        // budget/relevance rules (red team keeps its LOD0 view unchanged).
+        let dir = std::env::temp_dir().join(format!(
+            "coral-router-rigor-judge-{}",
+            common_core::hash::uuid_v4()
+        ));
+        let ledger = Arc::new(ContentNodeLedger::open(&dir).unwrap());
+        let _ = std::fs::remove_file(&dir);
+        ledger
+            .record_request("sess-rigor", "r1", "JUDGE LEDGER CONTEXT at LOD0")
+            .unwrap();
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let judge_backend: LocalBackend = Arc::new(RecordingJudge {
+            captured: Arc::clone(&captured),
+        });
+        let route = RigorRoute::new()
+            .with_blue_backend(Arc::new(StubChatBackend::always("candidate answer")))
+            .with_red_backend(Arc::new(StubChatBackend::always("[]")))
+            .with_judge_backend(judge_backend)
+            .with_config(test_cfg())
+            .with_prompt_assembler(
+                LedgerPromptAssembler,
+                PromptBudget::new(10_000),
+                LodSpec::full(),
+            );
+
+        let mut ctx = ctx("question");
+        ctx.ledger = Some(Arc::clone(&ledger));
+
+        let result = route.execute(&ctx).await.unwrap();
+        assert!(matches!(result.judge_verdict, JudgeVerdict::Accept));
+        let prompt = lock(&captured).last().cloned().unwrap_or_default();
+        assert!(
+            prompt.contains("JUDGE LEDGER CONTEXT at LOD0"),
+            "judge prompt must include the assembled ledger context, got: {prompt}"
+        );
+    }
 }
+
+pub async fn handle_rigor_request(
+    req: hyper::Request<hyper::body::Incoming>,
+    deps: ServerDeps,
+) -> Result<HyperResponse, std::convert::Infallible> {
+    let ServerDeps {
+        stats,
+        max_payload,
+        rigor_route,
+        sessions,
+        ledger,
+        classifier,
+        models,
+        ..
+    } = &deps;
+    let Some(route) = rigor_route else {
+        stats.errors.fetch_add(1, Ordering::Relaxed);
+        return Ok(crate::server::responses::error_response(
+            hyper::StatusCode::SERVICE_UNAVAILABLE,
+            "rigor route not configured",
+        ));
+    };
+
+    let body_bytes = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            stats.errors.fetch_add(1, Ordering::Relaxed);
+            return Ok(crate::server::responses::error_response(
+                hyper::StatusCode::BAD_REQUEST,
+                &format!("body read error: {e}"),
+            ));
+        }
+    };
+    if body_bytes.len() > *max_payload {
+        return Ok(empty_response(hyper::StatusCode::PAYLOAD_TOO_LARGE));
+    }
+    let body: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            stats.errors.fetch_add(1, Ordering::Relaxed);
+            return Ok(crate::server::responses::error_response(
+                hyper::StatusCode::BAD_REQUEST,
+                &format!("invalid JSON: {e}"),
+            ));
+        }
+    };
+
+    let message = body
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if message.is_empty() {
+        return Ok(crate::server::responses::error_response(
+            hyper::StatusCode::BAD_REQUEST,
+            "missing 'message'",
+        ));
+    }
+    let session_id = body
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(uuid_v4, ToOwned::to_owned);
+
+    // The session model key: the classifier model when known, else a stable
+    // placeholder (KV snapshot keying needs *a* model, `dag_session.rs:354`).
+    let model_endpoint = classifier
+        .as_ref()
+        .map_or_else(|| "fast".into(), |(name, _)| name.clone());
+
+    // D5/D6: thread the registry session + shared ledger into the context so
+    // checkpoint/rewind and the red-team LOD0 view are load-bearing.
+    let session = sessions.as_ref().map(|s| s.get_or_create(&session_id));
+    // M3/D7: the session model is set so KV snapshot save/rewind can key by it
+    // (`dag_session.rs` refuses to key without a model). The blue instance is
+    // the model's internal work group (the pool).
+    if let Some(session) = &session {
+        let mut s = lock(session);
+        s.set_model(model_endpoint.clone());
+    }
+    let kv_instance = models
+        .get(&model_endpoint)
+        .and_then(crate::config::ModelEntry::pool_qualifier);
+    let ledger = ledger.clone();
+
+    let ctx = RigorContext {
+        user_message: message.to_string(),
+        session_id,
+        model_endpoint,
+        session,
+        ledger,
+        kv_instance,
+    };
+
+    match route.execute(&ctx).await {
+        Ok(result) => {
+            let response = if matches!(
+                &result.judge_verdict,
+                crate::routes::rigor::JudgeVerdict::Reject { .. }
+            ) {
+                // A final rejection resolves to a targeted interview.
+                serde_json::json!({
+                    "status": "clarify",
+                    "questions": result.interview_questions,
+                    "rewound": result.rewound,
+                })
+            } else {
+                let mut executed = serde_json::json!({
+                    "status": "executed",
+                    "answer": result.blue_answer,
+                    "verdict": verdict_tag(&result.judge_verdict),
+                    "rewound": result.rewound,
+                });
+                if let crate::routes::rigor::JudgeVerdict::AcceptWithCaveats { ref caveats } =
+                    result.judge_verdict
+                {
+                    executed["caveats"] = serde_json::to_value(caveats).unwrap_or_default();
+                }
+                if result.frontier_escalation {
+                    executed["frontier_escalation"] = serde_json::json!(true);
+                }
+                executed
+            };
+            Ok(crate::server::responses::json_response(
+                hyper::StatusCode::OK,
+                &response,
+            ))
+        }
+        Err(RigorError::Unconfigured(name)) => {
+            stats.errors.fetch_add(1, Ordering::Relaxed);
+            Ok(crate::server::responses::error_response(
+                hyper::StatusCode::SERVICE_UNAVAILABLE,
+                &format!("rigor role backend not configured: {name}"),
+            ))
+        }
+        Err(e) => {
+            stats.errors.fetch_add(1, Ordering::Relaxed);
+            Ok(crate::server::responses::error_response(
+                hyper::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ))
+        }
+    }
+}
+

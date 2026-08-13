@@ -7,6 +7,7 @@ use crate::metrics::FailureClass;
 use bytes::Bytes;
 use common_core::drain_sse_lines;
 use common_core::hash::uuid_v4;
+use fluent_concurrency::ladder::first_accept_in_order;
 use fluent_llm::HttpClass;
 use serde_json::Value;
 
@@ -481,16 +482,16 @@ impl ChatBackend for OpenAiChatBackend {
 }
 
 // ---------------------------------------------------------------------------
-// RetryChatBackend - wraps a ChatBackend with exponential-backoff retry
+// RetryBackend - wraps a ChatBackend with exponential-backoff retry
 // ---------------------------------------------------------------------------
 
-pub struct RetryChatBackend {
+pub struct RetryBackend {
     inner: Arc<dyn ChatBackend>,
     retry_count: u32,
     retry_base_interval_s: u64,
 }
 
-impl RetryChatBackend {
+impl RetryBackend {
     pub fn new(inner: Arc<dyn ChatBackend>, retry_count: u32, retry_base_interval_s: u64) -> Self {
         Self {
             inner,
@@ -500,7 +501,7 @@ impl RetryChatBackend {
     }
 }
 
-impl ChatBackend for RetryChatBackend {
+impl ChatBackend for RetryBackend {
     fn complete(
         &self,
         request: RouterRequest,
@@ -585,20 +586,33 @@ impl ChatBackend for RetryChatBackend {
 }
 
 // ---------------------------------------------------------------------------
-// FallbackChatBackend - tries backends in order
+// BackendChain - tries backends in order
 // ---------------------------------------------------------------------------
 
-pub struct FallbackChatBackend {
+pub struct BackendChain {
     backends: Vec<Arc<dyn ChatBackend>>,
 }
 
-impl FallbackChatBackend {
+impl BackendChain {
     pub fn new(backends: Vec<Arc<dyn ChatBackend>>) -> Self {
         Self { backends }
     }
 }
 
-impl ChatBackend for FallbackChatBackend {
+/// A 4xx that is *not* a transient retryable (408/429) — a non-retryable
+/// short-circuit for the fallback chain. Mirrors the original per-backend
+/// predicate exactly.
+fn is_non_retryable_4xx(e: &DispatchError) -> bool {
+    if let DispatchError::Http(ref msg) = e {
+        msg.starts_with("HTTP 4")
+            && !msg.starts_with("HTTP 408")
+            && !msg.starts_with("HTTP 429")
+    } else {
+        false
+    }
+}
+
+impl ChatBackend for BackendChain {
     fn complete(
         &self,
         request: RouterRequest,
@@ -611,34 +625,38 @@ impl ChatBackend for FallbackChatBackend {
         let backends = self.backends.clone();
 
         Box::pin(async move {
-            let mut last_err = DispatchError::AllBackendsFailed;
-            for backend in &backends {
-                match backend
-                    .complete(
-                        request.clone(),
-                        model.clone(),
-                        params.clone(),
-                        idle_timeout_ms,
-                        total_timeout_ms,
-                        filter_thinking,
-                    )
-                    .await
-                {
-                    Ok(resp) => return Ok(resp),
-                    Err(e) => {
-                        if let DispatchError::Http(ref msg) = e {
-                            if msg.starts_with("HTTP 4")
-                                && !msg.starts_with("HTTP 408")
-                                && !msg.starts_with("HTTP 429")
-                            {
-                                return Err(e);
-                            }
-                        }
-                        last_err = e;
+            match first_accept_in_order(
+                backends,
+                |backend| {
+                    // `complete` consumes the request, so each rung gets its
+                    // own owned clone (inherent to the API); the owned rung
+                    // `Arc<dyn ChatBackend>` is moved into the future — no
+                    // per-rung `Arc::clone`.
+                    let request = request.clone();
+                    let model = model.clone();
+                    let params = params.clone();
+                    async move {
+                        backend
+                            .complete(
+                                request,
+                                model,
+                                params,
+                                idle_timeout_ms,
+                                total_timeout_ms,
+                                filter_thinking,
+                            )
+                            .await
+                            .map(Some)
                     }
-                }
+                },
+                is_non_retryable_4xx,
+            )
+            .await
+            {
+                Ok(Some(resp)) => Ok(resp),
+                Err(e) => Err(e),
+                Ok(None) => Err(DispatchError::AllBackendsFailed),
             }
-            Err(last_err)
         })
     }
 
@@ -654,34 +672,34 @@ impl ChatBackend for FallbackChatBackend {
         let backends = self.backends.clone();
 
         Box::pin(async move {
-            let mut last_err = DispatchError::AllBackendsFailed;
-            for backend in &backends {
-                match backend
-                    .stream_complete(
-                        request.clone(),
-                        model.clone(),
-                        params.clone(),
-                        idle_timeout_ms,
-                        total_timeout_ms,
-                        filter_thinking,
-                    )
-                    .await
-                {
-                    Ok(stream) => return Ok(stream),
-                    Err(e) => {
-                        if let DispatchError::Http(ref msg) = e {
-                            if msg.starts_with("HTTP 4")
-                                && !msg.starts_with("HTTP 408")
-                                && !msg.starts_with("HTTP 429")
-                            {
-                                return Err(e);
-                            }
-                        }
-                        last_err = e;
+            match first_accept_in_order(
+                backends,
+                |backend| {
+                    let request = request.clone();
+                    let model = model.clone();
+                    let params = params.clone();
+                    async move {
+                        backend
+                            .stream_complete(
+                                request,
+                                model,
+                                params,
+                                idle_timeout_ms,
+                                total_timeout_ms,
+                                filter_thinking,
+                            )
+                            .await
+                            .map(Some)
                     }
-                }
+                },
+                is_non_retryable_4xx,
+            )
+            .await
+            {
+                Ok(Some(stream)) => Ok(stream),
+                Err(e) => Err(e),
+                Ok(None) => Err(DispatchError::AllBackendsFailed),
             }
-            Err(last_err)
         })
     }
 }
@@ -826,13 +844,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // RetryChatBackend tests
+    // RetryBackend tests
     // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn retry_success_on_first_attempt() {
         let inner = StubBackend::new(vec![Ok(dummy_response())]);
-        let backend = RetryChatBackend::new(inner, 2, 1);
+        let backend = RetryBackend::new(inner, 2, 1);
         let result = backend
             .complete(
                 make_test_request("hi"),
@@ -849,7 +867,7 @@ mod tests {
     #[tokio::test]
     async fn retry_on_transient_then_succeed() {
         let inner = StubBackend::new(vec![Err(DispatchError::RateLimited), Ok(dummy_response())]);
-        let backend = RetryChatBackend::new(inner, 2, 1);
+        let backend = RetryBackend::new(inner, 2, 1);
         let result = backend
             .complete(
                 make_test_request("hi"),
@@ -866,7 +884,7 @@ mod tests {
     #[tokio::test]
     async fn retry_short_circuit_on_non_retryable() {
         let inner = StubBackend::new(vec![Err(DispatchError::ResponseParse("bad json".into()))]);
-        let backend = RetryChatBackend::new(inner, 2, 1);
+        let backend = RetryBackend::new(inner, 2, 1);
         let result = backend
             .complete(
                 make_test_request("hi"),
@@ -890,7 +908,7 @@ mod tests {
             Err(DispatchError::RateLimited),
             Err(DispatchError::RateLimited),
         ]);
-        let backend = RetryChatBackend::new(inner, 1, 1);
+        let backend = RetryBackend::new(inner, 1, 1);
         let result = backend
             .complete(
                 make_test_request("hi"),
@@ -905,14 +923,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FallbackChatBackend tests
+    // BackendChain tests
     // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn fallback_first_backend_succeeds() {
         let b1 = StubBackend::new(vec![Ok(dummy_response())]);
         let b2 = StubBackend::new(vec![Ok(dummy_response())]);
-        let backend = FallbackChatBackend::new(vec![b1, b2]);
+        let backend = BackendChain::new(vec![b1, b2]);
         let result = backend
             .complete(
                 make_test_request("hi"),
@@ -930,7 +948,7 @@ mod tests {
     async fn fallback_falls_through_on_transient_error() {
         let b1 = StubBackend::new(vec![Err(DispatchError::RateLimited)]);
         let b2 = StubBackend::new(vec![Ok(dummy_response())]);
-        let backend = FallbackChatBackend::new(vec![b1, b2]);
+        let backend = BackendChain::new(vec![b1, b2]);
         let result = backend
             .complete(
                 make_test_request("hi"),
@@ -948,7 +966,7 @@ mod tests {
     async fn fallback_short_circuits_on_4xx() {
         let b1 = StubBackend::new(vec![Err(DispatchError::Http("HTTP 400".into()))]);
         let b2 = StubBackend::new(vec![Ok(dummy_response())]);
-        let backend = FallbackChatBackend::new(vec![b1, b2]);
+        let backend = BackendChain::new(vec![b1, b2]);
         let result = backend
             .complete(
                 make_test_request("hi"),
@@ -967,7 +985,7 @@ mod tests {
     async fn fallback_all_backends_fail() {
         let b1 = StubBackend::new(vec![Err(DispatchError::Http("HTTP 503".into()))]);
         let b2 = StubBackend::new(vec![Err(DispatchError::Http("HTTP 502".into()))]);
-        let backend = FallbackChatBackend::new(vec![b1, b2]);
+        let backend = BackendChain::new(vec![b1, b2]);
         let result = backend
             .complete(
                 make_test_request("hi"),
@@ -985,7 +1003,7 @@ mod tests {
     #[tokio::test]
     async fn retry_stream_transient_then_succeed() {
         let inner = StubBackend::new(vec![Err(DispatchError::RateLimited), Ok(dummy_response())]);
-        let backend = RetryChatBackend::new(inner, 2, 1);
+        let backend = RetryBackend::new(inner, 2, 1);
         let result = backend
             .stream_complete(
                 make_test_request("hi"),

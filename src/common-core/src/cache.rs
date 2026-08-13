@@ -285,6 +285,85 @@ impl ResponseCache {
     }
 }
 
+// ─── Weighted-LRU eviction engine ─────────────────────────────────────────
+//
+// The canonical "evict the largest × coldest until under budget" engine. The
+// residency/admission loop (`InstancePool`) composes these three functions.
+// `ColdSnapshotIndex::evict` (the router's TTL metadata sweep) is a *predicate*
+// filter, not a byte-budget eviction, so it intentionally does not use this
+// engine.
+
+/// The maximum coldness used as an overflow guard, and the coldness assigned
+/// to an entity that was never used (`last_used < 0`). ~35k years in seconds.
+const COLD_CAP: i64 = 1 << 40;
+
+/// Eviction priority score: `freed_bytes * coldness`, where coldness is
+/// seconds since `last_used` (capped at `COLD_CAP`; an entity never used is
+/// maximally cold). A "cost of keeping" heuristic: the unit whose resident
+/// footprint times its idle time is largest is the most valuable to evict. It
+/// makes big cold footprints (a model's weights) outrank small hot ones, so
+/// memory pressure reclaims the largest chunks while a just-used entity scores
+/// near zero and stays.
+pub fn eviction_score(freed_bytes: u64, last_used: i64, now: i64) -> u64 {
+    let coldness = if last_used < 0 {
+        COLD_CAP
+    } else {
+        now.saturating_sub(last_used).clamp(1, COLD_CAP)
+    };
+    freed_bytes.saturating_mul(coldness as u64)
+}
+
+/// Order `candidates` best-eviction-first: score descending, then `last_used`
+/// descending (the newer of two equal-scoring units is kept).
+///
+/// Returns the same candidates reordered (an owned `Vec<C>` — the caller
+/// supplies the candidates it gathered and gets back an ordering it can feed
+/// to [`evict_until_fit`]).
+pub fn eviction_order<C>(
+    candidates: Vec<C>,
+    now: i64,
+    freed_of: impl Fn(&C) -> u64,
+    last_used_of: impl Fn(&C) -> i64,
+) -> Vec<C> {
+    let mut ordered = candidates;
+    ordered.sort_by(|a, b| {
+        eviction_score(freed_of(b), last_used_of(b), now)
+            .cmp(&eviction_score(freed_of(a), last_used_of(a), now))
+            .then_with(|| last_used_of(b).cmp(&last_used_of(a)))
+    });
+    ordered
+}
+
+/// Evict candidates (already in [`eviction_order`]) until `used <= budget` or
+/// `batch` candidates have been evicted.
+///
+/// `evict(&candidate)` performs the actual eviction and returns the freed
+/// bytes, or `None` when the eviction failed (not counted toward `batch`).
+/// Returns the updated `used` total and the number of successful evictions.
+pub async fn evict_until_fit<C, F, Fut>(
+    mut used: u64,
+    budget: u64,
+    batch: usize,
+    candidates: Vec<C>,
+    evict: F,
+) -> (u64, usize)
+where
+    F: Fn(&C) -> Fut,
+    Fut: std::future::Future<Output = Option<u64>>,
+{
+    let mut evicted = 0usize;
+    for candidate in candidates {
+        if used <= budget || evicted >= batch {
+            break;
+        }
+        if let Some(freed) = evict(&candidate).await {
+            evicted += 1;
+            used = used.saturating_sub(freed);
+        }
+    }
+    (used, evicted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,5 +671,108 @@ mod tests {
         cache.insert("a".to_string(), "1".to_string());
         assert_eq!(cache.len(), 1);
         assert!(!cache.is_empty());
+    }
+
+    // ─── Weighted-LRU eviction engine tests ─────────────────────────────
+
+    #[test]
+    fn eviction_score_favors_large_and_cold() {
+        // freed * coldness; a 10-byte unit idle 2s scores 20.
+        assert_eq!(eviction_score(10, 100, 102), 20);
+        // A bigger footprint at the same coldness scores higher.
+        assert_eq!(eviction_score(1000, 100, 102), 2000);
+        // A just-used unit (coldness clamped to 1) scores its size.
+        assert_eq!(eviction_score(100, 200, 200), 100);
+    }
+
+    #[test]
+    fn eviction_score_never_used_is_maximally_cold() {
+        // last_used < 0 → COLD_CAP (the overflow guard).
+        let big = eviction_score(1, -1, 123456789);
+        let capped = eviction_score(1, 123456789, 123456789);
+        assert!(big >= capped, "never-used must be at least as cold as any real age");
+        // COLD_CAP = 2^40.
+        assert_eq!(big, 1 << 40);
+    }
+
+    #[test]
+    fn eviction_score_caps_coldness() {
+        // Huge idle time clamps to COLD_CAP.
+        assert_eq!(eviction_score(2, 0, i64::MAX), 2 * (1 << 40));
+    }
+
+    #[test]
+    fn eviction_score_overflow_saturates() {
+        assert_eq!(
+            eviction_score(u64::MAX, 0, 1 << 45),
+            u64::MAX,
+            "saturating_mul must not overflow"
+        );
+    }
+
+    #[test]
+    fn eviction_order_sorts_score_desc_then_last_used_desc() {
+        // Three candidates: (freed, last_used). Highest score first; ties
+        // broken by newer last_used. Scores with now=10: (10,5)->50, (100,5)->500, (10,9)->10.
+        let cands = vec![(10, 5), (100, 5), (10, 9)];
+        let ordered = eviction_order(cands, 10, |c| c.0, |c| c.1);
+        assert_eq!(ordered, vec![(100, 5), (10, 5), (10, 9)]);
+    }
+
+    #[tokio::test]
+    async fn evict_until_fit_evicts_until_budget() {
+        // used=100, budget=50 → evict until <=50. Candidates are best-first.
+        let cands = vec![30u64, 20, 10];
+        let (used, n) = evict_until_fit(100, 50, usize::MAX, cands, |c| {
+            let v = *c;
+            async move { Some(v) }
+        })
+        .await;
+        // 30 then 20 → used=50; 10 is kept.
+        assert_eq!(used, 50);
+        assert_eq!(n, 2);
+    }
+
+    #[tokio::test]
+    async fn evict_until_fit_honors_batch_cap() {
+        let cands = vec![1u64, 1, 1, 1];
+        let (used, n) = evict_until_fit(100, 0, 2, cands, |c| {
+            let v = *c;
+            async move { Some(v) }
+        })
+        .await;
+        assert_eq!(n, 2, "batch caps evictions");
+        assert_eq!(used, 98);
+    }
+
+    #[tokio::test]
+    async fn evict_until_fit_counts_failed_evictions() {
+        // Candidate 1 fails to evict; candidate 2 succeeds; candidate 3 fails.
+        let cands = vec![1u64, 2, 1];
+        let (used, n) = evict_until_fit(100, 0, usize::MAX, cands, |c| {
+            let v = *c;
+            async move {
+                if v == 1 {
+                    None // failed eviction
+                } else {
+                    Some(1)
+                }
+            }
+        })
+        .await;
+        assert_eq!(n, 1, "only successful evictions count toward batch");
+        assert_eq!(used, 99);
+    }
+
+    #[tokio::test]
+    async fn evict_until_fit_stops_when_already_under_budget() {
+        let cands = vec![1u64, 1];
+        let (used, n) = evict_until_fit(40, 50, usize::MAX, cands, |c| {
+            let v = *c;
+            async move { Some(v) }
+        })
+        .await;
+        assert_eq!(used, 40);
+        assert_eq!(n, 0, "no eviction needed once under budget");
     }
 }

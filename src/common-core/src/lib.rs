@@ -71,8 +71,8 @@ pub use jsonrpc::{
     METHOD_NOT_FOUND,
 };
 pub use metrics::LatencyHistogram;
-pub use registry::KeyedRegistry;
-pub use retry::{backoff_ms, retry_async};
+pub use registry::{ConcurrentRegistry, KeyedRegistry};
+pub use retry::{backoff_ms, capped_backoff_ms, retry_async, PollResult, PollWithBackoff};
 pub use runtime::block_on;
 pub use shell::{run_capture, run_command, run_shell_capture, shell_cmd, CommandOutput};
 #[cfg(feature = "sqlite")]

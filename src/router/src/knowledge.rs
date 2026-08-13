@@ -1,7 +1,7 @@
-//! `KnowledgeCapability` implementation for the router's shared `NodeStore`
+//! `KnowledgeCapability` implementation for the router's shared `ContentNodeStore`
 //! (M4D).
 //!
-//! The router server calls `NodeStore` **directly** on the hot path — no
+//! The router server calls `ContentNodeStore` **directly** on the hot path — no
 //! gating, no trait indirection. This trait impl is the boundary for
 //! embedded/cross-crate consumers that reach the store through
 //! `fluent_types::KnowledgeCapability`; each method asserts a router-owned
@@ -12,7 +12,7 @@ use fluent_types::{ContentNode, KnnHit, KnowledgeCapability, KnowledgeError, Nod
 use fluent_wvr::capability::{check_capability, Capability};
 
 use crate::ledger::LedgerError;
-use crate::node_store::NodeStore;
+use crate::node_store::ContentNodeStore;
 
 /// Router-owned capability token gating the `KnowledgeCapability` surface.
 pub struct RouterKnowledgeCapability;
@@ -34,7 +34,7 @@ fn ledger_to_knowledge(e: &LedgerError) -> KnowledgeError {
     }
 }
 
-impl KnowledgeCapability for NodeStore {
+impl KnowledgeCapability for ContentNodeStore {
     fn get_node(&self, node_id: NodeId) -> Option<ContentNode> {
         if check_capability(&RouterKnowledgeCapability).is_err() {
             return None;
@@ -76,12 +76,12 @@ mod tests {
         CapabilitySet::new().with(RouterKnowledgeCapability)
     }
 
-    fn temp_store() -> NodeStore {
+    fn temp_store() -> ContentNodeStore {
         let dir = std::env::temp_dir().join(format!(
             "coral-router-knowledge-{}",
             common_core::hash::uuid_v4()
         ));
-        let store = NodeStore::open(&dir).unwrap();
+        let store = ContentNodeStore::open(&dir).unwrap();
         let _ = std::fs::remove_file(&dir);
         store
     }

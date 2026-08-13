@@ -723,7 +723,7 @@ The wrapper also implements `FieldAccess` (delegating `set_field`/`get_field`/`f
 ### Retry
 
 - **Async transport retry**: `common_core::retry::retry_async(max_attempts,
-  base_ms, jitter_pct, is_retryable, op)` — used by `RetryChatBackend` and the
+  base_ms, jitter_pct, is_retryable, op)` — used by `RetryBackend` and the
   `Zone` supervisor. `Zone` drives per-attempt timeout, `WorkError::Timeout`
   routing, and dependency cancellation on top of it.
 - **Sync free-function retry**: `retry_call(max_attempts, base_ms, f)` —

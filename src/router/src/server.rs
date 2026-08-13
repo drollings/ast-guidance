@@ -17,7 +17,7 @@ use tokio::net::TcpListener;
 
 use crate::config::{ModelEntry, RouteRef, ServerConfig};
 use crate::dag_session::SessionRegistry;
-use crate::dispatch::escalation::EscalationLadder;
+use crate::dispatch::escalation::Ladder;
 use crate::ledger::ContentNodeLedger;
 use crate::pipeline::PipelineOrchestrator;
 use crate::routes::plan::PlanRoute;
@@ -43,7 +43,7 @@ pub struct RouterServer {
     /// Per-`session_id` `DependencySession` registry (D6 canonical session).
     sessions: Option<Arc<SessionRegistry>>,
     /// Per-model-group escalation ladders (M3).
-    ladders: HashMap<String, Arc<EscalationLadder>>,
+    ladders: HashMap<String, Arc<Ladder>>,
     /// Deterministic-fact cache consulted before escalating (M3).
     context_cache: Option<Arc<dyn fluent_types::ContextCache>>,
     /// Sidecar instance pool (M4): one manager per managed model, aggregating
@@ -55,6 +55,12 @@ pub struct RouterServer {
     supervisor: Option<Arc<crate::supervisor::LlamaServerSupervisor>>,
     /// Env var naming the management API key (enforced on `/instances`).
     api_key_env_name: Option<String>,
+    /// Background `LedgerTierWorker` join handle (M2). Held so the worker task
+    /// lives for the process lifetime.
+    tier_worker: Option<tokio::task::JoinHandle<()>>,
+    /// The `LedgerAgentCoordinator` (M4), when the operator opts in. `None`
+    /// keeps dispatch unchanged.
+    coordinator: Option<Arc<crate::ledger::orchestrator::LedgerAgentCoordinator>>,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
@@ -86,6 +92,8 @@ impl RouterServer {
             instance_pool: None,
             supervisor: None,
             api_key_env_name: None,
+            tier_worker: None,
+            coordinator: None,
             depends: vec![],
             provides: vec![ArcIntern::from("http.endpoint")],
         }
@@ -128,7 +136,7 @@ impl RouterServer {
 
     /// Attach the per-model-group escalation ladders (M3).
     #[must_use]
-    pub fn with_ladders(mut self, ladders: HashMap<String, Arc<EscalationLadder>>) -> Self {
+    pub fn with_ladders(mut self, ladders: HashMap<String, Arc<Ladder>>) -> Self {
         tracing::info!(
             target: "router.server",
             ladder_count = ladders.len(),
@@ -161,7 +169,7 @@ impl RouterServer {
         if !pool.is_empty() {
             tracing::info!(
                 target: "router.server",
-                manager_count = pool.managers_iter().count(),
+                manager_count = pool.managers_iter().len(),
                 "sidecar instance pool attached",
             );
         }
@@ -181,6 +189,25 @@ impl RouterServer {
     #[must_use]
     pub fn with_supervisor(mut self, supervisor: Option<Arc<crate::supervisor::LlamaServerSupervisor>>) -> Self {
         self.supervisor = supervisor;
+        self
+    }
+
+    /// Hold the background `LedgerTierWorker` join handle (M2) so the worker
+    /// task lives for the process lifetime.
+    #[must_use]
+    pub fn with_tier_worker(mut self, handle: tokio::task::JoinHandle<()>) -> Self {
+        self.tier_worker = Some(handle);
+        self
+    }
+
+    /// Attach the `LedgerAgentCoordinator` (M4). `None` (the default) leaves
+    /// dispatch unchanged.
+    #[must_use]
+    pub fn with_coordinator(
+        mut self,
+        coordinator: Arc<crate::ledger::orchestrator::LedgerAgentCoordinator>,
+    ) -> Self {
+        self.coordinator = Some(coordinator);
         self
     }
 
@@ -238,6 +265,7 @@ impl RouterServer {
             instance_pool: self.instance_pool.clone(),
             api_key_env_name: self.api_key_env_name.clone(),
             supervisor: self.supervisor.clone(),
+            coordinator: self.coordinator.clone(),
         };
 
         // Reconcile configured pinned instances at boot (retrying until the
@@ -296,6 +324,7 @@ impl WorkUnit for RouterServer {
             instance_pool: self.instance_pool.clone(),
             api_key_env_name: self.api_key_env_name.clone(),
             supervisor: self.supervisor.clone(),
+            coordinator: self.coordinator.clone(),
         };
         let rt = ctx.rt.clone();
 

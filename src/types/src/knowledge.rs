@@ -6,7 +6,7 @@
 //! `fluent-types` types — `ContentNode`, `NodeId`, `KnnHit` — plus
 //! `Option`/`Result`. Capability *mediation* (gating behind a token) is the
 //! implementor's job, not the trait's: each implementor (coral's `Library`,
-//! the router's `NodeStore`) defines its own marker `Capability` token and
+//! the router's `ContentNodeStore`) defines its own marker `Capability` token and
 //! asserts it via `fluent_wvr::capability::check_capability` in its own crate
 //! (the trait never references fluent-wvr).
 
@@ -41,7 +41,7 @@ impl std::error::Error for KnowledgeError {}
 /// The cross-crate boundary for reading and writing a `ContentNode` store.
 ///
 /// Concrete implementations are composed at the binary (coral-context's
-/// `Library`, the router's `NodeStore`); a consumer never imports a concrete
+/// `Library`, the router's `ContentNodeStore`); a consumer never imports a concrete
 /// store crate through this trait.
 pub trait KnowledgeCapability: Send + Sync {
     /// Fetch a node by id (`None` when absent).

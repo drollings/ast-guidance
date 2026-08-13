@@ -96,12 +96,12 @@ pub struct KvSnapshot {
 /// Hot tier: in-process, RAM-resident LRU cache of recently-used snapshot
 /// metadata. Entries represent sessions with KV cache state actively loaded in
 /// a fork slot. Stores metadata only - no raw bytes.
-pub struct HotKvCache {
+pub struct HotSnapshotIndex {
     snapshots: LoadCache<(String, Option<String>, String), Arc<KvSnapshot>, KvCacheError>,
     max_mb: usize,
 }
 
-impl HotKvCache {
+impl HotSnapshotIndex {
     /// Creates a new hot cache with the given capacity (number of entries).
     /// The `max_mb` limit is a soft budget - individual snapshot metadata is
     /// tiny (hundreds of bytes), so `max_mb` is primarily informational for
@@ -142,7 +142,7 @@ impl HotKvCache {
     }
 
     /// Insert an already-`Arc`-wrapped snapshot (used by the two-tier promote
-    /// path in `KvCacheManager::retrieve`).
+    /// path in `SnapshotStore::retrieve`).
     fn insert_arc(&self, key: (String, Option<String>, String), snapshot: Arc<KvSnapshot>) {
         self.snapshots.insert(key, snapshot);
     }
@@ -185,7 +185,7 @@ impl HotKvCache {
 /// `<slot_save_path>/<model_key>/` layout. The fork owns the bytes; this tier
 /// only records which snapshot a session's KV was saved under so a rewind can
 /// switch it back into a slot.
-pub struct ColdKvCache {
+pub struct ColdSnapshotIndex {
     /// The fork's `--slot-save-path`. When `None`, snapshots are recorded as
     /// metadata only (no server-owned store) - never a crash.
     slot_save_path: Option<PathBuf>,
@@ -194,7 +194,7 @@ pub struct ColdKvCache {
     ttl_secs: u64,
 }
 
-impl ColdKvCache {
+impl ColdSnapshotIndex {
     /// Creates a metadata index rooted at `slot_save_path` (the fork's
     /// `--slot-save-path`). `max_mb` is informational; the fork owns the bytes.
     /// `ttl_secs` governs metadata eviction.
@@ -296,17 +296,17 @@ impl ColdKvCache {
 /// Clone is cheap (both tiers are `Arc`-shared), so a single manager can be
 /// attached to many `DependencySession`s.
 #[derive(Clone)]
-pub struct KvCacheManager {
-    hot: Arc<HotKvCache>,
-    cold: Arc<ColdKvCache>,
+pub struct SnapshotStore {
+    hot: Arc<HotSnapshotIndex>,
+    cold: Arc<ColdSnapshotIndex>,
     /// Optional fork management client (M4 sidecar). When present, snapshot
     /// save/list/delete round-trip through the fork's management API; without
     /// one they degrade to metadata-only no-ops (never a crash).
     fork: Option<Arc<crate::instances::InstanceClient>>,
 }
 
-impl KvCacheManager {
-    pub fn new(hot: Arc<HotKvCache>, cold: Arc<ColdKvCache>) -> Self {
+impl SnapshotStore {
+    pub fn new(hot: Arc<HotSnapshotIndex>, cold: Arc<ColdSnapshotIndex>) -> Self {
         Self {
             hot,
             cold,
@@ -352,7 +352,7 @@ impl KvCacheManager {
         let snapshot = self.cold.load(model, adapter, session_id)?;
         let arc = Arc::new(snapshot);
         self.hot.insert_arc(
-            HotKvCache::key(model, adapter, session_id),
+            HotSnapshotIndex::key(model, adapter, session_id),
             Arc::clone(&arc),
         );
         Ok(arc)
@@ -529,7 +529,7 @@ mod tests {
 
     #[test]
     fn test_hot_cache_put_get() {
-        let cache = HotKvCache::new(10, 1024);
+        let cache = HotSnapshotIndex::new(10, 1024);
         let snap = test_snapshot("sess-1");
         cache.put(snap.clone());
 
@@ -540,13 +540,13 @@ mod tests {
 
     #[test]
     fn test_hot_cache_miss() {
-        let cache = HotKvCache::new(10, 1024);
+        let cache = HotSnapshotIndex::new(10, 1024);
         assert!(cache.get("nonexistent", None, "sess-x").is_none());
     }
 
     #[test]
     fn test_hot_cache_remove() {
-        let cache = HotKvCache::new(10, 1024);
+        let cache = HotSnapshotIndex::new(10, 1024);
         cache.put(test_snapshot("sess-1"));
         assert_eq!(cache.len(), 1);
 
@@ -556,7 +556,7 @@ mod tests {
 
     #[test]
     fn test_hot_cache_lru_eviction() {
-        let cache = HotKvCache::new(3, 1024);
+        let cache = HotSnapshotIndex::new(3, 1024);
 
         for i in 0..5 {
             cache.put(KvSnapshot {
@@ -596,7 +596,7 @@ mod tests {
     #[tokio::test]
     async fn test_cold_cache_save_load() {
         let dir = tempfile::tempdir().unwrap();
-        let cold = ColdKvCache::new(dir.path(), 1024, 86400, crate::config::EvictionPolicy::Lru);
+        let cold = ColdSnapshotIndex::new(dir.path(), 1024, 86400, crate::config::EvictionPolicy::Lru);
 
         let mut snap = test_snapshot("sess-cold");
         snap.snapshot_name = "readfiles".into();
@@ -618,7 +618,7 @@ mod tests {
     #[tokio::test]
     async fn test_cold_cache_load_nonexistent() {
         let dir = tempfile::tempdir().unwrap();
-        let cold = ColdKvCache::new(dir.path(), 1024, 86400, crate::config::EvictionPolicy::Lru);
+        let cold = ColdSnapshotIndex::new(dir.path(), 1024, 86400, crate::config::EvictionPolicy::Lru);
 
         let result = cold.load("test-model", None, "no-such-session");
         assert!(result.is_err());
@@ -627,14 +627,14 @@ mod tests {
     #[tokio::test]
     async fn test_kv_cache_manager_two_tier() {
         let dir = tempfile::tempdir().unwrap();
-        let hot = Arc::new(HotKvCache::new(10, 1024));
-        let cold = Arc::new(ColdKvCache::new(
+        let hot = Arc::new(HotSnapshotIndex::new(10, 1024));
+        let cold = Arc::new(ColdSnapshotIndex::new(
             dir.path(),
             1024,
             86400,
             crate::config::EvictionPolicy::Lru,
         ));
-        let mgr = KvCacheManager::new(Arc::clone(&hot), Arc::clone(&cold));
+        let mgr = SnapshotStore::new(Arc::clone(&hot), Arc::clone(&cold));
 
         mgr.store(test_snapshot("sess-tier")).unwrap();
 
@@ -651,7 +651,7 @@ mod tests {
     #[tokio::test]
     async fn test_cold_cache_evict_by_ttl() {
         let dir = tempfile::tempdir().unwrap();
-        let cold = ColdKvCache::new(
+        let cold = ColdSnapshotIndex::new(
             dir.path(),
             1024,
             0, // immediate TTL
@@ -667,7 +667,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_snapshots() {
         let dir = tempfile::tempdir().unwrap();
-        let cold = ColdKvCache::new(dir.path(), 1024, 86400, crate::config::EvictionPolicy::Lru);
+        let cold = ColdSnapshotIndex::new(dir.path(), 1024, 86400, crate::config::EvictionPolicy::Lru);
 
         cold.save(&test_snapshot("sess-list")).unwrap();
 
@@ -678,7 +678,7 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_only_cold_tier_degrades_gracefully() {
-        let cold = ColdKvCache::metadata_only(86400);
+        let cold = ColdSnapshotIndex::metadata_only(86400);
         let mut snap = test_snapshot("sess-meta");
         snap.snapshot_name = "x".into();
         cold.save(&snap).unwrap();
@@ -712,10 +712,10 @@ mod tests {
         ));
 
         let dir = tempfile::tempdir().unwrap();
-        let hot = Arc::new(HotKvCache::new(10, 1024));
-        let kv = KvCacheManager::new(
+        let hot = Arc::new(HotSnapshotIndex::new(10, 1024));
+        let kv = SnapshotStore::new(
             Arc::clone(&hot),
-            Arc::new(ColdKvCache::new(
+            Arc::new(ColdSnapshotIndex::new(
                 dir.path(),
                 1024,
                 86400,
@@ -744,10 +744,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn save_snapshot_without_fork_is_noop() {
         let dir = tempfile::tempdir().unwrap();
-        let hot = Arc::new(HotKvCache::new(10, 1024));
-        let kv = KvCacheManager::new(
+        let hot = Arc::new(HotSnapshotIndex::new(10, 1024));
+        let kv = SnapshotStore::new(
             Arc::clone(&hot),
-            Arc::new(ColdKvCache::new(
+            Arc::new(ColdSnapshotIndex::new(
                 dir.path(),
                 1024,
                 86400,
@@ -791,10 +791,10 @@ mod tests {
             None,
         ));
         let dir = tempfile::tempdir().unwrap();
-        let hot = Arc::new(HotKvCache::new(10, 1024));
-        let kv = KvCacheManager::new(
+        let hot = Arc::new(HotSnapshotIndex::new(10, 1024));
+        let kv = SnapshotStore::new(
             Arc::clone(&hot),
-            Arc::new(ColdKvCache::new(
+            Arc::new(ColdSnapshotIndex::new(
                 dir.path(),
                 1024,
                 86400,

@@ -2,8 +2,8 @@
 //!
 //! The durable ledger can never cache text matching the builtin filter engine:
 //! every write-path payload is scrubbed through
-//! [`scrub_for_ledger`] before it reaches `NodeStore`. The guard lives here
-//! (write policy), NOT in `NodeStore` — the store stays a pure, policy-free
+//! [`scrub_for_ledger`] before it reaches `ContentNodeStore`. The guard lives here
+//! (write policy), NOT in `ContentNodeStore` — the store stays a pure, policy-free
 //! shared store (D1).
 //!
 //! The scrub is **irreversible by design**: `Redact`/`Anonymize` both collapse

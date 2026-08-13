@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use common_core::registry::ConcurrentRegistry;
 use fluent_concurrency::pool::Limiter;
 use fluent_llm::client::ChatBackend;
 use fluent_llm::ChatMessage;
@@ -58,29 +59,22 @@ pub fn build_self_assessment_prompt(user_text: &str) -> String {
 }
 
 /// Tolerant parse of a target's self-assessment response. Mirrors
-/// `parse_tree_verdict` (`stages/tree.rs`): direct deserialize fast path, then
-/// the shared fence-strip → parse → extract pipeline, then the shared field
+/// `parse_tree_verdict` (`stages/tree.rs`) through the shared
+/// `fluent_llm::parse_typed` codec: direct deserialize fast path, then the
+/// shared fence-strip → parse → extract pipeline, then the shared field
 /// coercion so string-valued numbers ("7") survive.
 pub fn parse_self_assessment(response: &str) -> Result<SelfAssessment, WorkError> {
-    if let Ok(v) = serde_json::from_str::<SelfAssessment>(response) {
-        return Ok(v);
-    }
-
-    let raw = fluent_llm::parse_json_response(response).map_err(|e| {
-        WorkError::Execution(format!("self-assessment response was not valid JSON: {e}"))
-    })?;
-    let mut obj = match raw {
-        serde_json::Value::Object(map) => map,
-        other => {
-            return serde_json::from_value(other).map_err(|e| {
-                WorkError::Execution(format!("self-assessment verdict parse error: {e}"))
-            })
-        }
-    };
-    coerce_u8(&mut obj, "complexity", 5);
-    coerce_string(&mut obj, "reason", "");
-    serde_json::from_value(serde_json::Value::Object(obj))
-        .map_err(|e| WorkError::Execution(format!("self-assessment verdict parse error: {e}")))
+    fluent_llm::parse_typed::<SelfAssessment>(
+        response,
+        &serde_json::Value::Null,
+        |v| {
+            if let Some(obj) = v.as_object_mut() {
+                coerce_u8(obj, "complexity", 5);
+                coerce_string(obj, "reason", "");
+            }
+        },
+    )
+    .map_err(|e| WorkError::Execution(format!("self-assessment verdict parse error: {e}")))
 }
 
 /// One ordered member of a `model_group` the matcher climbs over.
@@ -177,7 +171,7 @@ pub fn is_match(candidate: &TargetCandidate, assessed: u8) -> bool {
 /// classification-tree engine's `default_client` fallback.
 #[derive(Clone)]
 pub struct TargetBackends {
-    by_key: HashMap<String, Arc<dyn ChatBackend>>,
+    by_key: ConcurrentRegistry<String, Arc<dyn ChatBackend>>,
     default: Arc<dyn ChatBackend>,
 }
 
@@ -186,7 +180,11 @@ impl TargetBackends {
         by_key: HashMap<String, Arc<dyn ChatBackend>>,
         default: Arc<dyn ChatBackend>,
     ) -> Self {
-        Self { by_key, default }
+        let reg = ConcurrentRegistry::new();
+        for (key, backend) in by_key {
+            reg.insert(key, backend);
+        }
+        Self { by_key: reg, default }
     }
 
     /// The backend for `model_key`, falling back to `default` when the key has
@@ -195,9 +193,8 @@ impl TargetBackends {
     /// exactly this one.
     pub fn get(&self, model_key: &str) -> Arc<dyn ChatBackend> {
         self.by_key
-            .get(model_key)
-            .cloned()
-            .unwrap_or_else(|| Arc::clone(&self.default))
+            .get(&model_key.to_string())
+            .map_or_else(|| Arc::clone(&self.default), |b| b.as_ref().clone())
     }
 
     /// The number of dedicated per-key backends.

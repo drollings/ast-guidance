@@ -3,18 +3,17 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use common_core::hash::uuid_v4;
-use common_core::sync::lock;
 use common_core::ResponseCache;
 use http_body_util::BodyExt;
 
 use crate::config::{ModelEntry, RouteRef};
 use crate::dag_session::{DependencySession, SessionRegistry, SessionStep, StepResult};
-use crate::dispatch::escalation::{EscalationContext, EscalationLadder};
+use crate::dispatch::escalation::{EscalationContext, Ladder};
 use crate::ledger::ContentNodeLedger;
 use crate::normalize;
 use crate::pipeline::{PipelineOrchestrator, RoutingTarget};
 use crate::routes::plan::PlanRoute;
-use crate::routes::rigor::{RigorContext, RigorError, RigorRoute};
+use crate::routes::rigor::RigorRoute;
 use crate::server::dispatch::handle_dispatch;
 use crate::server::responses::completion_to_response;
 use crate::server::responses::empty_response;
@@ -47,7 +46,7 @@ pub struct ServerDeps {
     pub http_client: Arc<reqwest::Client>,
     /// Per-model-group escalation ladders (M3). Keyed by
     /// `RoutingTarget.group`; resolved after the local chain exhausts.
-    pub ladders: HashMap<String, Arc<EscalationLadder>>,
+    pub ladders: HashMap<String, Arc<Ladder>>,
     /// Deterministic-fact cache consulted before escalating (M3).
     pub context_cache: Option<Arc<dyn fluent_types::ContextCache>>,
     /// Sidecar instance pool (M4): aggregates the public `/instances` API and
@@ -58,13 +57,17 @@ pub struct ServerDeps {
     /// Managed llama-server supervisor (the process owner). `None` in mock
     /// mode. Backs `POST /models/unload` and the `/metrics` aggregation.
     pub supervisor: Option<Arc<crate::supervisor::LlamaServerSupervisor>>,
+    /// The `LedgerAgentCoordinator` (M4), when the operator opts in. `None`
+    /// (the default) leaves dispatch unchanged — requests fall through to the
+    /// existing pipeline.
+    pub coordinator: Option<Arc<crate::ledger::orchestrator::LedgerAgentCoordinator>>,
 }
 
 impl ServerDeps {
     /// The escalation ladder for a model's route group, if the group
     /// configured one. Direct-model requests (no route - no group) get `None`
     /// - they never escalate.
-    pub fn ladder_for_model(&self, model_name: &str) -> Option<&Arc<EscalationLadder>> {
+    pub fn ladder_for_model(&self, model_name: &str) -> Option<&Arc<Ladder>> {
         let group = self.routes.get(model_name).map(|r| &r.group)?;
         self.ladders.get(group)
     }
@@ -107,6 +110,58 @@ pub(crate) async fn record_ledger_result(
     })
     .await
     .ok();
+}
+
+/// M4 opt-in: run a request through the `LedgerAgentCoordinator`'s
+/// synchronization loop when one is attached. Returns `Some(response)` when the
+/// coordinator handled the request; `None` when no coordinator is attached (or
+/// it produced no response), so the caller falls through to the existing
+/// pipeline unchanged. Strictly additive — a deployment without a coordinator
+/// is byte-identical to today.
+async fn coordinator_dispatch(
+    coordinator: Option<&Arc<crate::ledger::orchestrator::LedgerAgentCoordinator>>,
+    session_id: &str,
+    model: &str,
+    user_text: &str,
+) -> Option<HyperResponse> {
+    let coord = coordinator.as_ref()?;
+    let worker = crate::ledger::prompt::WorkerContext::new(
+        model,
+        "Answer the user's request using the provided ledger context.",
+    );
+    let outcome = match coord
+        .run_agent(session_id, model, &worker, user_text)
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::error!(
+                target: "router.server",
+                session_id = %session_id,
+                model = %model,
+                error = %e,
+                "coordinator run failed",
+            );
+            return Some(error_response(
+                hyper::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("coordinator error: {e}"),
+            ));
+        }
+    };
+    tracing::info!(
+        target: "router.server",
+        session_id = %session_id,
+        model = %model,
+        kv_restored = outcome.kv_restored,
+        node_id = outcome.node_id.as_int(),
+        "coordinator handled request",
+    );
+    Some(completion_to_response(
+        &make_text_completion(model, &outcome.content),
+        model,
+        false,
+        None,
+    ))
 }
 
 /// Record a dispatch outcome into the session ledger + step (M5).
@@ -248,6 +303,7 @@ async fn handle_chat_completion(
         instance_pool,
         api_key_env_name: _,
         supervisor: _,
+        coordinator,
     } = deps;
     // M10: the dispatch post-processing hook (workflow extraction), if the
     // operator configured it. Passed through to successful dispatches only.
@@ -353,6 +409,16 @@ async fn handle_chat_completion(
         .find(|m| m.role == "user")
         .map(|m| m.content.to_string_lossy())
         .unwrap_or_default();
+
+    // M4 opt-in: when a coordinator is attached, route the request through its
+    // run loop (restore-or-assemble → execute → record → snapshot → enqueue).
+    // `None` falls through to the existing pipeline unchanged.
+    if let Some(resp) =
+        coordinator_dispatch(coordinator.as_ref(), &session_id, &model_name, &request_text).await
+    {
+        return Ok(resp);
+    }
+
     let ledger_node_id = record_ledger_request(
         ledger.as_ref(),
         session_id.clone(),
@@ -483,6 +549,17 @@ async fn handle_chat_completion(
         ));
     }
 
+    let dispatch_deps = crate::server::dispatch::DispatchDeps {
+        http_client: Arc::clone(&http_client),
+        cache: cache.clone(),
+        stats: Arc::clone(&stats),
+        extractor: workflow_extractor.clone(),
+        ladders,
+        context_cache,
+        session: session_step.as_ref().map(|s| s.session.clone()),
+        instance_pool: instance_pool.map(|p| p.as_ref().clone()),
+    };
+
     if let Some(ref rt) = pipeline_result.routing_target {
         let outcome = handle_dispatch(
             rt,
@@ -490,15 +567,8 @@ async fn handle_chat_completion(
             &model_name,
             &user_text,
             mock_dispatch.as_ref(),
-            &http_client,
             is_stream,
-            cache.as_ref(),
-            stats.as_ref(),
-            workflow_extractor.clone(),
-            &ladders,
-            context_cache.as_ref(),
-            session_step.as_ref().map(|s| &s.session),
-            instance_pool.as_deref(),
+            &dispatch_deps,
         )
         .await?;
         let status = outcome.response.status();
@@ -529,15 +599,8 @@ async fn handle_chat_completion(
             &model_name,
             &user_text,
             mock_dispatch.as_ref(),
-            &http_client,
             false,
-            cache.as_ref(),
-            stats.as_ref(),
-            workflow_extractor.clone(),
-            &ladders,
-            context_cache.as_ref(),
-            session_step.as_ref().map(|s| &s.session),
-            instance_pool.as_deref(),
+            &dispatch_deps,
         )
         .await?;
         let status = outcome.response.status();
@@ -578,316 +641,6 @@ async fn handle_chat_completion(
         None,
     ))
 }
-
-/// The `plan` route's HTTP surface (M8): a single targeted interview round.
-///
-/// The request body carries the user message and an optional entity list
-/// (the client's answers to a prior clarification, serialized as entities -
-/// the same shape stored under structured `entities`). The response is
-/// structured JSON, never free-form chat:
-///
-/// - `{"status": "clarify", "questions": [...], "gaps": [...]}` - the chart
-///   needs one round of targeted answers; the client replies with `entities`
-///   plus `retry: true` and the echoed `gaps`.
-/// - `{"status": "executed", "workflow": {...}, "source": ..., "gaps_filled":
-///   [...]}` - the chart is bound and compiled.
-/// - `{"status": "fresh_draft", "source": "fresh_draft"}` - no chart fit;
-///   planning falls through to a blank slate.
-///
-/// A `retry` request that still leaves gaps terminates as `fresh_draft`
-/// (VISION: terminate, don't loop).
-async fn handle_plan_request(
-    req: hyper::Request<hyper::body::Incoming>,
-    plan_route: Option<Arc<PlanRoute>>,
-    max_payload: usize,
-    stats: &ServerStats,
-) -> Result<HyperResponse, std::convert::Infallible> {
-    let Some(route) = plan_route else {
-        stats.errors.fetch_add(1, Ordering::Relaxed);
-        return Ok(crate::server::responses::error_response(
-            hyper::StatusCode::SERVICE_UNAVAILABLE,
-            "plan route not configured",
-        ));
-    };
-
-    let body_bytes = match req.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            stats.errors.fetch_add(1, Ordering::Relaxed);
-            return Ok(crate::server::responses::error_response(
-                hyper::StatusCode::BAD_REQUEST,
-                &format!("body read error: {e}"),
-            ));
-        }
-    };
-    if body_bytes.len() > max_payload {
-        return Ok(empty_response(hyper::StatusCode::PAYLOAD_TOO_LARGE));
-    }
-    let body: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            stats.errors.fetch_add(1, Ordering::Relaxed);
-            return Ok(crate::server::responses::error_response(
-                hyper::StatusCode::BAD_REQUEST,
-                &format!("invalid JSON: {e}"),
-            ));
-        }
-    };
-
-    let message = body
-        .get("message")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    if message.is_empty() {
-        return Ok(crate::server::responses::error_response(
-            hyper::StatusCode::BAD_REQUEST,
-            "missing 'message'",
-        ));
-    }
-
-    let entities: Vec<crate::charts::binding::Entity> = body
-        .get("entities")
-        .and_then(serde_json::Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|e| serde_json::from_value(e.clone()).ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    let retry = body
-        .get("retry")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let prior_gaps: Vec<String> = body
-        .get("gaps")
-        .and_then(serde_json::Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let result = if retry {
-        route
-            .plan_interviewed(message, &entities, &prior_gaps)
-            .await
-    } else {
-        route.plan(message, &entities).await
-    };
-
-    let response = match result.source {
-        crate::routes::plan::PlanSource::FreshDraft => {
-            serde_json::json!({ "status": "fresh_draft", "source": "fresh_draft" })
-        }
-        crate::routes::plan::PlanSource::HnswHit => plan_executed_response("hnsw_hit", &result),
-        crate::routes::plan::PlanSource::TemplateAdapted => {
-            if result.interview_questions.is_empty() {
-                plan_executed_response("template_adapted", &result)
-            } else {
-                serde_json::json!({
-                    "status": "clarify",
-                    "source": "template_adapted",
-                    "questions": result.interview_questions,
-                    "gaps": result.gaps,
-                })
-            }
-        }
-    };
-    Ok(crate::server::responses::json_response(
-        hyper::StatusCode::OK,
-        &response,
-    ))
-}
-
-/// Build the D3 `/v1/plan` "executed" response: execution results, not a
-/// compiled graph. Carries selection provenance (`fit`/`score`) and the
-/// execution summary (`final_output`/`accepted`/`audit`) when the chart ran.
-fn plan_executed_response(
-    source: &str,
-    result: &crate::routes::plan::PlanResult,
-) -> serde_json::Value {
-    let mut executed = serde_json::json!({
-        "status": "executed",
-        "source": source,
-        "gaps_filled": result.gaps_filled,
-    });
-    if let Some(fit) = &result.fit {
-        executed["fit"] = serde_json::Value::String(fit.clone());
-    }
-    if let Some(score) = result.score {
-        executed["score"] = serde_json::json!(score);
-    }
-    if let Some(summary) = &result.summary {
-        executed["accepted"] = serde_json::json!(summary.accepted);
-        if let Some(output) = &summary.final_output {
-            executed["final_output"] = output.clone();
-        }
-        executed["audit"] = serde_json::to_value(&summary.audit).unwrap_or_default();
-        executed["completed"] = serde_json::to_value(&summary.completed).unwrap_or_default();
-    }
-    executed
-}
-
-/// Handle `POST /v1/rigor` - the fixed-pass blue/red/judge protocol (M3).
-///
-/// Body: `{ "message", "session_id"?, "entities"? }`. A configured route with
-/// all three role backends executes and returns `executed` (accepted answer)
-/// or `clarify` (a material rejection resolved to a targeted interview). An
-/// unconfigured route (no `rigor` section / missing backends) returns an
-/// explicit error - never a crash.
-async fn handle_rigor_request(
-    req: hyper::Request<hyper::body::Incoming>,
-    deps: ServerDeps,
-) -> Result<HyperResponse, std::convert::Infallible> {
-    let ServerDeps {
-        stats,
-        max_payload,
-        rigor_route,
-        sessions,
-        ledger,
-        classifier,
-        models,
-        ..
-    } = &deps;
-    let Some(route) = rigor_route else {
-        stats.errors.fetch_add(1, Ordering::Relaxed);
-        return Ok(crate::server::responses::error_response(
-            hyper::StatusCode::SERVICE_UNAVAILABLE,
-            "rigor route not configured",
-        ));
-    };
-
-    let body_bytes = match req.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            stats.errors.fetch_add(1, Ordering::Relaxed);
-            return Ok(crate::server::responses::error_response(
-                hyper::StatusCode::BAD_REQUEST,
-                &format!("body read error: {e}"),
-            ));
-        }
-    };
-    if body_bytes.len() > *max_payload {
-        return Ok(empty_response(hyper::StatusCode::PAYLOAD_TOO_LARGE));
-    }
-    let body: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            stats.errors.fetch_add(1, Ordering::Relaxed);
-            return Ok(crate::server::responses::error_response(
-                hyper::StatusCode::BAD_REQUEST,
-                &format!("invalid JSON: {e}"),
-            ));
-        }
-    };
-
-    let message = body
-        .get("message")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    if message.is_empty() {
-        return Ok(crate::server::responses::error_response(
-            hyper::StatusCode::BAD_REQUEST,
-            "missing 'message'",
-        ));
-    }
-    let session_id = body
-        .get("session_id")
-        .and_then(serde_json::Value::as_str)
-        .map_or_else(uuid_v4, ToOwned::to_owned);
-
-    // The session model key: the classifier model when known, else a stable
-    // placeholder (KV snapshot keying needs *a* model, `dag_session.rs:354`).
-    let model_endpoint = classifier
-        .as_ref()
-        .map_or_else(|| "fast".into(), |(name, _)| name.clone());
-
-    // D5/D6: thread the registry session + shared ledger into the context so
-    // checkpoint/rewind and the red-team LOD0 view are load-bearing.
-    let session = sessions.as_ref().map(|s| s.get_or_create(&session_id));
-    // M3/D7: the session model is set so KV snapshot save/rewind can key by it
-    // (`dag_session.rs` refuses to key without a model). The blue instance is
-    // the model's internal work group (the pool).
-    if let Some(session) = &session {
-        let mut s = lock(session);
-        s.set_model(model_endpoint.clone());
-    }
-    let kv_instance = models
-        .get(&model_endpoint)
-        .and_then(crate::config::ModelEntry::pool_qualifier);
-    let ledger = ledger.clone();
-
-    let ctx = RigorContext {
-        user_message: message.to_string(),
-        session_id,
-        model_endpoint,
-        session,
-        ledger,
-        kv_instance,
-    };
-
-    match route.execute(&ctx).await {
-        Ok(result) => {
-            let response = if matches!(
-                &result.judge_verdict,
-                crate::routes::rigor::JudgeVerdict::Reject { .. }
-            ) {
-                // A final rejection resolves to a targeted interview.
-                serde_json::json!({
-                    "status": "clarify",
-                    "questions": result.interview_questions,
-                    "rewound": result.rewound,
-                })
-            } else {
-                let mut executed = serde_json::json!({
-                    "status": "executed",
-                    "answer": result.blue_answer,
-                    "verdict": verdict_tag(&result.judge_verdict),
-                    "rewound": result.rewound,
-                });
-                if let crate::routes::rigor::JudgeVerdict::AcceptWithCaveats { ref caveats } =
-                    result.judge_verdict
-                {
-                    executed["caveats"] = serde_json::to_value(caveats).unwrap_or_default();
-                }
-                if result.frontier_escalation {
-                    executed["frontier_escalation"] = serde_json::json!(true);
-                }
-                executed
-            };
-            Ok(crate::server::responses::json_response(
-                hyper::StatusCode::OK,
-                &response,
-            ))
-        }
-        Err(RigorError::Unconfigured(name)) => {
-            stats.errors.fetch_add(1, Ordering::Relaxed);
-            Ok(crate::server::responses::error_response(
-                hyper::StatusCode::SERVICE_UNAVAILABLE,
-                &format!("rigor role backend not configured: {name}"),
-            ))
-        }
-        Err(e) => {
-            stats.errors.fetch_add(1, Ordering::Relaxed);
-            Ok(crate::server::responses::error_response(
-                hyper::StatusCode::INTERNAL_SERVER_ERROR,
-                &e.to_string(),
-            ))
-        }
-    }
-}
-
-/// Audit-tag form of a judge verdict for the `executed`/`clarify` response.
-fn verdict_tag(verdict: &crate::routes::rigor::JudgeVerdict) -> &'static str {
-    match verdict {
-        crate::routes::rigor::JudgeVerdict::Accept => "accept",
-        crate::routes::rigor::JudgeVerdict::AcceptWithCaveats { .. } => "accept_with_caveats",
-        crate::routes::rigor::JudgeVerdict::Reject { .. } => "reject",
-    }
-}
-
 #[allow(clippy::implicit_hasher)]
 pub async fn handle_request(
     req: hyper::Request<hyper::body::Incoming>,
@@ -948,11 +701,17 @@ pub async fn handle_request(
         ("POST", "/v1/chat/completions") => handle_chat_completion(req, deps).await,
         ("POST", "/v1/plan") => {
             stats.requests.fetch_add(1, Ordering::Relaxed);
-            handle_plan_request(req, deps.plan_route.clone(), deps.max_payload, stats).await
+            crate::routes::plan::handle_plan_request(
+                req,
+                deps.plan_route.clone(),
+                deps.max_payload,
+                stats,
+            )
+            .await
         }
         ("POST", "/v1/rigor") => {
             stats.requests.fetch_add(1, Ordering::Relaxed);
-            handle_rigor_request(req, deps).await
+            crate::routes::rigor::handle_rigor_request(req, deps).await
         }
         // -- Shared-weight instance management API (mirrors the llama-server
         //    contract; aggregated across every managed model) --------------

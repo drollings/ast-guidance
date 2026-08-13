@@ -1,6 +1,27 @@
 //! Pipeline builder - constructs pipeline stages from `RouterConfig`.
 //! Separated from `config.rs` to keep the configuration types focused
 //! on data definition rather than orchestration.
+//!
+//! # Seams
+//!
+//! This file bundles four builder facades that a future split could separate
+//! into submodules when any grows a second consumer or a dedicated test suite:
+//!
+//! 1. **Pipeline build** (`impl RouterConfig::build_pipeline`,
+//!    `PipelineParams`, `build_classification_engine`) — the two-stage
+//!    deterministic/classifier pipeline construction.
+//! 2. **Escalation build** (`build_escalation_ladders`,
+//!    `escalation_backends`) — the per-group ladder/backend assembly.
+//! 3. **`LlmClient` DIP factory** (`build_llm_client` /
+//!    `frontier_api_client`) — client construction from a shared `reqwest`
+//!    handle and `api_key_env`.
+//! 4. **Ledger/coordinator build** (`build_ledger`, `build_coordinator`) —
+//!    ledger + agent coordinator wiring.
+//!
+//! Today they are kept together because they all live on `impl RouterConfig`
+//! and share `resolve_classifier_model_key` / `classifier_intelligence` /
+//! `build_classifier_client` helpers; the `#[allow(clippy::too_many_arguments)]`
+//! on the pipeline/engine constructors is a builder-shape, not a call-shape.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -484,9 +505,9 @@ impl RouterConfig {
     pub fn build_escalation_ladders(
         &self,
         http_client: &reqwest::Client,
-    ) -> HashMap<String, Arc<crate::dispatch::escalation::EscalationLadder>> {
+    ) -> HashMap<String, Arc<crate::dispatch::escalation::Ladder>> {
         use crate::dispatch::backend::OpenAiChatBackend;
-        use crate::dispatch::escalation::{EscalationBackends, EscalationLadder};
+        use crate::dispatch::escalation::{EscalationBackends, Ladder};
 
         let mut ladders = HashMap::new();
         for (group, group_cfg) in &self.model_groups {
@@ -532,7 +553,7 @@ impl RouterConfig {
             );
             ladders.insert(
                 group.clone(),
-                Arc::new(EscalationLadder::new(ladder_cfg.clone(), backends)),
+                Arc::new(Ladder::new(ladder_cfg.clone(), backends)),
             );
         }
         ladders
@@ -622,6 +643,78 @@ impl RouterConfig {
         Some(crate::summarization::Summarizer::new(
             backend,
             ledger.max_summary_tokens,
+        ))
+    }
+
+    /// Build the `LedgerTierWorker`'s DIP backend (M2) - the tier worker's only
+    /// construction site. Reuses the same `LlmClient` factory and the same
+    /// `<base>:ledger` named-instance target as `summarizer_for_ledger` (no
+    /// second HTTP client). `tier_model` (if given) wins over the ledger
+    /// section's `model`, then the classifier model key. Returns `None` when no
+    /// ledger section is configured, no model key resolves, or the `ledger`
+    /// instance is unknown.
+    pub fn ledger_tier_backend(
+        &self,
+        tier_model: Option<&str>,
+    ) -> Option<Arc<dyn ChatBackend>> {
+        let ledger = self.ledger.as_ref()?;
+        let key = tier_model
+            .or(ledger.model.as_deref())
+            .or(self.classifier_model.as_deref())?;
+        self.local_backend_for_instance(key, "ledger")
+    }
+
+    /// Build the tier worker's `TierConfig` from the `ledger` section (M5.1).
+    /// Queue capacity and max concurrency use the worker defaults; the LOD
+    /// char caps and batch/poll knobs come from config. `None` when no `ledger`
+    /// section is present.
+    pub fn ledger_tier_config(&self) -> Option<crate::ledger::tiering::TierConfig> {
+        let ledger = self.ledger.as_ref()?;
+        Some(crate::ledger::tiering::TierConfig {
+            lod4_max_chars: ledger.lod4_max_chars,
+            lod5_max_chars: ledger.lod5_max_chars,
+            batch_size: ledger.tier_batch_size,
+            poll_interval_ms: ledger.tier_poll_interval_ms,
+            ..Default::default()
+        })
+    }
+
+    /// Build the `LedgerAgentCoordinator` (M5.1) from the `ledger.orchestrator`
+    /// section — the coordinator's only construction site. `None` when the
+    /// coordinator is not enabled (or no ledger section is present), so the
+    /// server's dispatch path is untouched unless a deployment opts in.
+    ///
+    /// Takes the already-composed shared dependencies (`store`, `sessions`,
+    /// `kv`, `tiers`, `backend`) — the composition root (`main.rs`) owns their
+    /// lifetimes. The prompt budget and role flow from config; the KV policy
+    /// is the section's `kv_policy`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_ledger_coordinator(
+        &self,
+        store: Arc<crate::node_store::ContentNodeStore>,
+        sessions: Arc<crate::dag_session::SessionRegistry>,
+        kv: crate::kv_cache::SnapshotStore,
+        tiers: Arc<crate::ledger::tiering::LedgerTierWorker>,
+        backend: Arc<dyn ChatBackend>,
+    ) -> Option<crate::ledger::orchestrator::LedgerAgentCoordinator> {
+        let section = self.ledger.as_ref()?.orchestrator.clone();
+        if !section.enabled {
+            return None;
+        }
+        let config = crate::ledger::orchestrator::OrchestratorConfig {
+            kv_policy: section.kv_policy,
+            budget: crate::ledger::prompt::PromptBudget::new(section.prompt_budget_chars),
+            lod_spec: crate::ledger::prompt::LodSpec::full(),
+            role: section.role,
+        };
+        Some(crate::ledger::orchestrator::LedgerAgentCoordinator::new(
+            store,
+            sessions,
+            kv,
+            tiers,
+            crate::ledger::prompt::LedgerPromptAssembler,
+            backend,
+            config,
         ))
     }
 
@@ -815,6 +908,62 @@ mod tests {
 
         let summarizer = config.summarizer_for_ledger();
         assert!(summarizer.is_some(), "ledger section + ledger instance -> Some");
+    }
+
+    #[test]
+    fn ledger_tier_backend_builds_when_ledger_section_present() {
+        // M2.4: the tier worker's DIP backend targets `<base>:ledger` via the
+        // single LlmClient factory; tier_model wins over ledger.model.
+        let config: RouterConfig = serde_json::from_value(serde_json::json!({
+            "classifier_model": "swarm",
+            "ledger": {
+                "model": "swarm",
+                "tier_model": "qwen3.5-4b",
+                "background_tiering": true
+            },
+            "models": {
+                "swarm": {
+                    "endpoint": "http://x/v1/chat/completions",
+                    "name": "swarm", "intelligence": 2,
+                    "cost_input": 1.0, "cost_output": 6.0, "cost_cached_read": 0.4, "speed": 8,
+                    "instances": {
+                        "ledger": { "num_ctx": 131072, "pinned": true, "default": true },
+                        "swarm": { "count": 3, "group": "swarm", "num_ctx": 16384 }
+                    }
+                },
+                "qwen3.5-4b": {
+                    "endpoint": "http://y/v1/chat/completions",
+                    "name": "qwen3.5-4b", "intelligence": 5,
+                    "cost_input": 2.0, "cost_output": 2.0, "cost_cached_read": 0.8, "speed": 4,
+                    "instances": {
+                        "ledger": { "num_ctx": 131072, "pinned": true, "default": true }
+                    }
+                }
+            }
+        })).expect("valid config");
+
+        // tier_model wins over ledger.model.
+        assert!(config.ledger_tier_backend(Some("qwen3.5-4b")).is_some());
+        // Falls back to ledger.model when tier_model is absent.
+        assert!(config.ledger_tier_backend(None).is_some());
+    }
+
+    #[test]
+    fn ledger_tier_backend_none_without_ledger_section() {
+        let config: RouterConfig = serde_json::from_value(serde_json::json!({
+            "classifier_model": "swarm",
+            "models": {
+                "swarm": {
+                    "endpoint": "http://x/v1/chat/completions",
+                    "name": "swarm", "intelligence": 2,
+                    "cost_input": 1.0, "cost_output": 6.0, "cost_cached_read": 0.4, "speed": 8
+                }
+            }
+        })).expect("valid config");
+        assert!(
+            config.ledger_tier_backend(None).is_none(),
+            "no ledger section -> no tier backend"
+        );
     }
 
     #[test]

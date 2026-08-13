@@ -144,6 +144,7 @@ fn single_model_key(deps: &ServerDeps) -> Option<String> {
     let pool = deps.instance_pool.as_ref()?;
     let mut keys: Vec<String> = pool
         .managers_iter()
+        .into_iter()
         .map(|m| m.model_key().to_string())
         .collect();
     keys.sort();

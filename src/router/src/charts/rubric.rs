@@ -263,10 +263,15 @@ fn judge_output(
     parse_judge_output(&response, rubric.min_score)
 }
 
-/// Parse a judge response (tolerant: shared `parse_json_response` strips
-/// fences and extracts the first `{...}` object).
+/// Parse a judge response (tolerant: the shared `fluent_llm::parse_typed`
+/// codec strips fences and extracts the first `{...}` object).
 fn parse_judge_output(raw: &str, min_score: f64) -> Result<RubricVerdict, ChartError> {
-    let value = fluent_llm::parse_json_response(raw).map_err(|e| ChartError::Selection {
+    let value = fluent_llm::parse_typed::<serde_json::Value>(
+        raw,
+        &serde_json::Value::Null,
+        |_| {},
+    )
+    .map_err(|e| ChartError::Selection {
         reason: format!("rubric judge output unparseable: {e}"),
     })?;
     let obj = value.as_object().ok_or_else(|| ChartError::Selection {

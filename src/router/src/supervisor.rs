@@ -9,13 +9,14 @@
 //! The spawned servers bind to `127.0.0.1` only and are never exposed directly;
 //! every generation and management call goes through Coral Router.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use common_core::registry::ConcurrentRegistry;
+use common_core::retry::{PollResult, PollWithBackoff};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
@@ -353,36 +354,41 @@ impl ManagedServer {
         );
     }
 
-    /// Wait for `/health` to answer 2xx, up to [`HEALTH_TIMEOUT`].
+    /// Wait for `/health` to answer 2xx, up to `HEALTH_TIMEOUT`.
     pub async fn wait_healthy(&self) -> Result<(), String> {
         let client = reqwest::Client::new();
-        let deadline = Instant::now() + HEALTH_TIMEOUT;
-        loop {
-            match client
-                .get(format!("{}/health", self.base_url))
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => {
+        // `cap=1` keeps the poll interval constant at HEALTH_POLL (the poll
+        // deadline is a fixed wall-clock, not a growing backoff), and
+        // `max_failures = HEALTH_TIMEOUT/HEALTH_POLL` bounds the loop to the
+        // deadline, preserving the original hard-stop behavior.
+        let poll = PollWithBackoff::new(HEALTH_POLL, 1)
+            .with_max_failures(HEALTH_TIMEOUT.as_secs() as u32);
+        match poll
+            .run(|| async {
+                let healthy = client
+                    .get(format!("{}/health", self.base_url))
+                    .send()
+                    .await
+                    .is_ok_and(|resp| resp.status().is_success());
+                if healthy {
                     tracing::info!(
                         target: "router.supervisor",
                         model = %self.spec.model_key,
                         base_url = %self.base_url,
                         "llama-server healthy",
                     );
-                    return Ok(());
                 }
-                _ => {}
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "llama-server for model '{}' did not become healthy on {} within {}s",
-                    self.spec.model_key,
-                    self.base_url,
-                    HEALTH_TIMEOUT.as_secs(),
-                ));
-            }
-            tokio::time::sleep(HEALTH_POLL).await;
+                healthy
+            })
+            .await
+        {
+            PollResult::Ready => Ok(()),
+            PollResult::Exhausted { .. } => Err(format!(
+                "llama-server for model '{}' did not become healthy on {} within {}s",
+                self.spec.model_key,
+                self.base_url,
+                HEALTH_TIMEOUT.as_secs(),
+            )),
         }
     }
 
@@ -539,7 +545,7 @@ impl ManagedServer {
 /// The supervisor: one [`ManagedServer`] per managed model.
 pub struct LlamaServerSupervisor {
     bin: PathBuf,
-    servers: HashMap<String, Arc<ManagedServer>>,
+    servers: ConcurrentRegistry<String, ManagedServer>,
 }
 
 impl LlamaServerSupervisor {
@@ -580,7 +586,7 @@ impl LlamaServerSupervisor {
             },
             None => None,
         };
-        let mut servers = HashMap::new();
+        let servers = ConcurrentRegistry::new();
         let mut keys: Vec<&String> = config.models.keys().collect();
         keys.sort();
         for key in keys {
@@ -597,8 +603,7 @@ impl LlamaServerSupervisor {
                 api_key.clone(),
                 config.default_params.clone(),
             );
-            let server = Arc::new(ManagedServer::new(spec));
-            servers.insert(key.clone(), server);
+            servers.insert(key.clone(), ManagedServer::new(spec));
         }
         tracing::info!(
             target: "router.supervisor",
@@ -615,17 +620,17 @@ impl LlamaServerSupervisor {
     }
 
     /// The server for a model id.
-    pub fn server_for(&self, model_key: &str) -> Option<&Arc<ManagedServer>> {
-        self.servers.get(model_key)
+    pub fn server_for(&self, model_key: &str) -> Option<Arc<ManagedServer>> {
+        self.servers.get(&model_key.to_string())
     }
 
     /// The management base URL for a model id.
-    pub fn base_url_for(&self, model_key: &str) -> Option<&str> {
-        self.server_for(model_key).map(|s| s.base_url())
+    pub fn base_url_for(&self, model_key: &str) -> Option<String> {
+        self.server_for(model_key).map(|s| s.base_url().to_string())
     }
 
     /// Every managed model key.
-    pub fn model_keys(&self) -> impl Iterator<Item = &String> {
+    pub fn model_keys(&self) -> Vec<String> {
         self.servers.keys()
     }
 
@@ -639,11 +644,11 @@ impl LlamaServerSupervisor {
     /// skipped).
     pub async fn start_all(self: &Arc<Self>) -> Result<(), String> {
         let bin = self.bin.clone();
-        let mut keys: Vec<String> = self.servers.keys().cloned().collect();
+        let mut keys: Vec<String> = self.servers.keys();
         keys.sort();
         let mut boot_keys = Vec::new();
         for key in &keys {
-            let server = &self.servers[key];
+            let server = self.servers.get(key).expect("managed key from registry");
             if !server.spec.boot {
                 tracing::info!(
                     target: "router.supervisor",
@@ -656,11 +661,12 @@ impl LlamaServerSupervisor {
             server.spawn_child(&bin);
             server.inner.running.store(true, Ordering::Relaxed);
             let handle = {
-                let me = Arc::clone(server);
+                let me = Arc::clone(&server);
                 let bin = bin.clone();
                 tokio::spawn(async move { me.supervise(bin).await; })
             };
-            if let Ok(mut guard) = server.inner.supervisor.lock() {
+            let supervisor_guard = server.inner.supervisor.lock();
+            if let Ok(mut guard) = supervisor_guard {
                 *guard = Some(handle.abort_handle());
             }
         }
@@ -668,7 +674,7 @@ impl LlamaServerSupervisor {
         // aborts (lazy models are not health-checked at boot).
         let mut health = Vec::new();
         for key in &boot_keys {
-            let server = Arc::clone(&self.servers[key]);
+            let server = self.servers.get(key).expect("managed key from registry");
             health.push(async move { (key.clone(), server.wait_healthy().await) });
         }
         for fut in health {
@@ -684,7 +690,7 @@ impl LlamaServerSupervisor {
     /// running) and wait for `/health`. Returns `None` when the model is not
     /// managed. Used by the dispatch path before targeting a lazy model.
     pub async fn ensure_running(&self, model_key: &str) -> Result<(), String> {
-        let server = self.servers.get(model_key).ok_or_else(|| {
+        let server = self.servers.get(&model_key.to_string()).ok_or_else(|| {
             format!("model '{model_key}' is not managed by the supervisor")
         })?;
         server.ensure_running(&self.bin).await
@@ -693,20 +699,20 @@ impl LlamaServerSupervisor {
     /// Whether a managed model's server is currently running. `None` when the
     /// model is not managed.
     pub fn is_running(&self, model_key: &str) -> Option<bool> {
-        self.servers.get(model_key).map(|s| s.is_running())
+        self.servers.get(&model_key.to_string()).map(|s| s.is_running())
     }
 
     /// Unload a model's server on demand (frees its VRAM). The spec stays
     /// registered so [`Self::ensure_running`] can re-load it later.
     pub async fn unload(&self, model_key: &str) {
-        if let Some(server) = self.servers.get(model_key) {
+        if let Some(server) = self.servers.get(&model_key.to_string()) {
             server.unload().await;
         }
     }
 
     /// Stop every managed server (used on shutdown).
     pub async fn shutdown(&self) {
-        let mut keys: Vec<String> = self.servers.keys().cloned().collect();
+        let mut keys: Vec<String> = self.servers.keys();
         keys.sort();
         for key in &keys {
             if let Some(server) = self.servers.get(key) {
@@ -721,16 +727,18 @@ impl Drop for LlamaServerSupervisor {
         // Best-effort process cleanup when the supervisor is dropped outside an
         // async context (each child has kill_on_drop(true), so dropping the
         // supervision task's child handle kills the process).
-        for server in self.servers.values() {
-            server.inner.stopping.store(true, Ordering::Relaxed);
-            if let Some(handle) = server
-                .inner
-                .supervisor
-                .lock()
-                .ok()
-                .and_then(|mut g| g.take())
-            {
-                handle.abort();
+        for key in self.servers.keys() {
+            if let Some(server) = self.servers.get(&key) {
+                server.inner.stopping.store(true, Ordering::Relaxed);
+                if let Some(handle) = server
+                    .inner
+                    .supervisor
+                    .lock()
+                    .ok()
+                    .and_then(|mut g| g.take())
+                {
+                    handle.abort();
+                }
             }
         }
     }

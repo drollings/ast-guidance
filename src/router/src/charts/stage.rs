@@ -285,13 +285,17 @@ fn read_metadata_json(
 
 /// Parse a chart-target LLM response into a structured `output` value.
 ///
-/// Sanitization policy: the shared `fluent_llm::parse_json_response`
+/// Sanitization policy: the shared `fluent_llm::parse_typed`
 /// trims, strips common markdown code fences (```` ```json ```` / ```` ``` ````),
 /// fast-paths a direct parse, then extracts the first JSON value. Unparseable
 /// responses fall back to a string leaf so the raw text still flows to
 /// upstream targets via the structured `stage.{id}.output` channel.
 fn parse_output(response: &str) -> serde_json::Value {
-    match fluent_llm::parse_json_response(response) {
+    match fluent_llm::parse_typed::<serde_json::Value>(
+        response,
+        &serde_json::Value::Null,
+        |_| {},
+    ) {
         Ok(v) => v,
         Err(_) => serde_json::Value::String(response.trim().to_string()),
     }

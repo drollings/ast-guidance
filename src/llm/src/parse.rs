@@ -7,6 +7,7 @@
 //! reranker, rubric judge, chart-stage output) shares one implementation.
 //! It is string-only: no LLM protocol types, so it stays a pure helper on
 //! top of `serde_json`.
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 /// Errors produced by [`parse_json_response`].
@@ -104,6 +105,47 @@ pub fn parse_json_response(text: &str) -> Result<Value, JsonParseError> {
     extract_first_json_value(cleaned).ok_or(JsonParseError::NoJson)
 }
 
+/// Tolerant parse + coerce into a typed value.
+///
+/// Pipeline: (1) try a direct deserialize of `raw` — the fast path, so
+/// pristine LLM JSON skips every recovery step; (2) fall back to the shared
+/// tolerant parse ([`parse_json_response`]: fence-strip → extract-first-value);
+/// (3) merge `defaults` into missing object fields; (4) run `sanitize` field
+/// coercion; (5) deserialize to `T`. Never re-implements fence-stripping.
+///
+/// `defaults` is a JSON object whose fields are inserted into the parsed
+/// object only where the LLM omitted them (existing values are never
+/// overwritten). `sanitize` receives the parsed `Value` — after `defaults` —
+/// and mutates it in place; the canonical `coerce_float`/`coerce_u8`/
+/// `coerce_string` helpers operate on an object map, so a typical closure is
+/// `|v| if let Some(o) = v.as_object_mut() { coerce_float(o, "score", 1.0) }`.
+/// Use a no-op (`|_| {}`) when the target type's `serde` defaults already
+/// cover missing fields.
+///
+/// This is the single codec entry for the "build prompt → call → tolerant
+/// parse → coerce → defaults → deserialize" round-trip shared by every router
+/// LLM feature.
+pub fn parse_typed<T>(
+    raw: &str,
+    defaults: &Value,
+    sanitize: impl FnOnce(&mut Value),
+) -> Result<T, JsonParseError>
+where
+    T: DeserializeOwned,
+{
+    if let Ok(v) = serde_json::from_str::<T>(raw) {
+        return Ok(v);
+    }
+    let mut value = parse_json_response(raw)?;
+    if let (Value::Object(map), Value::Object(defaults)) = (&mut value, defaults) {
+        for (k, dv) in defaults {
+            map.entry(k.clone()).or_insert_with(|| dv.clone());
+        }
+    }
+    sanitize(&mut value);
+    serde_json::from_value(value).map_err(|e| JsonParseError::Serde(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +214,97 @@ mod tests {
     #[test]
     fn fence_strip_handles_missing_closer() {
         assert_eq!(strip_json_fence("```json\n{\"a\": 1}"), r#"{"a": 1}"#);
+    }
+
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    struct Typed {
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        score: f64,
+        #[serde(default)]
+        tags: Vec<String>,
+    }
+
+    fn empty_defaults() -> Value {
+        Value::Null
+    }
+
+    #[test]
+    fn parse_typed_pristine_fast_path() {
+        let t = parse_typed::<Typed>(r#"{"name":"x","score":1.5}"#, &empty_defaults(), |_| {})
+            .unwrap();
+        assert_eq!(t, Typed { name: "x".into(), score: 1.5, tags: vec![] });
+    }
+
+    #[test]
+    fn parse_typed_tolerant_fenced_input() {
+        let t = parse_typed::<Typed>(
+            "```json\n{\"name\":\"x\",\"score\":2.0}\n```",
+            &empty_defaults(),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(t, Typed { name: "x".into(), score: 2.0, tags: vec![] });
+    }
+
+    #[test]
+    fn parse_typed_tolerant_noisy_input() {
+        let t = parse_typed::<Typed>(
+            "Sure! Here is the result:\n{\"name\":\"x\"}",
+            &empty_defaults(),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(t, Typed { name: "x".into(), score: 0.0, tags: vec![] });
+    }
+
+    #[test]
+    fn parse_typed_applies_defaults_for_missing_fields() {
+        // A noisy prefix defeats the fast path so the recovery merge runs; the
+        // LLM omitted `score`/`tags`, which `defaults` fills in.
+        let defaults = serde_json::json!({"score": 9.0, "tags": ["a"]});
+        let t = parse_typed::<Typed>("prefix {\"name\":\"y\"} suffix", &defaults, |_| {}).unwrap();
+        assert_eq!(t, Typed { name: "y".into(), score: 9.0, tags: vec!["a".into()] });
+    }
+
+    #[test]
+    fn parse_typed_defaults_do_not_overwrite_present_values() {
+        // `score` is present so the merge must leave it alone.
+        let defaults = serde_json::json!({"score": 9.0});
+        let t = parse_typed::<Typed>("prefix {\"name\":\"y\",\"score\":3.0} suffix", &defaults, |_| {})
+            .unwrap();
+        assert_eq!(t, Typed { name: "y".into(), score: 3.0, tags: vec![] });
+    }
+
+    #[test]
+    fn parse_typed_runs_sanitize_field_coercion() {
+        // "score" arrives as a string; sanitize coerces it to a number so the
+        // typed deserialize succeeds (mirrors the classifier's coerce_float).
+        let coerce = |v: &mut Value| {
+            if let Some(obj) = v.as_object_mut() {
+                if let Some(s) = obj.get("score").and_then(Value::as_str) {
+                    if let Ok(n) = s.parse::<f64>() {
+                        obj["score"] = Value::from(n);
+                    }
+                }
+            }
+        };
+        let t = parse_typed::<Typed>(r#"{"name":"z","score":"4.5"}"#, &empty_defaults(), coerce)
+            .unwrap();
+        assert_eq!(t, Typed { name: "z".into(), score: 4.5, tags: vec![] });
+    }
+
+    #[test]
+    fn parse_typed_no_json_errors() {
+        let err = parse_typed::<Typed>("not json at all", &empty_defaults(), |_| {}).unwrap_err();
+        assert!(matches!(err, JsonParseError::NoJson));
+    }
+
+    #[test]
+    fn parse_typed_serde_error_when_coercion_fails() {
+        let err = parse_typed::<Typed>(r#"{"name":"x","score":"oops"}"#, &empty_defaults(), |_| {})
+            .unwrap_err();
+        assert!(matches!(err, JsonParseError::Serde(_)));
     }
 }

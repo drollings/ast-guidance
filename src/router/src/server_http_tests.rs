@@ -44,7 +44,7 @@ fn test_deps(
     mock: Option<Arc<MockDispatchContext>>,
     sessions: Option<Arc<crate::dag_session::SessionRegistry>>,
     plan_route: Option<Arc<PlanRoute>>,
-    ladders: std::collections::HashMap<String, Arc<crate::dispatch::escalation::EscalationLadder>>,
+    ladders: std::collections::HashMap<String, Arc<crate::dispatch::escalation::Ladder>>,
     context_cache: Option<Arc<dyn fluent_types::ContextCache>>,
 ) -> ServerDeps {
     ServerDeps {
@@ -66,6 +66,7 @@ fn test_deps(
         instance_pool: None,
         api_key_env_name: None,
         supervisor: None,
+        coordinator: None,
     }
 }
 
@@ -193,6 +194,7 @@ fn test_deps_with_ledger(
         instance_pool: None,
         api_key_env_name: None,
         supervisor: None,
+        coordinator: None,
     }
 }
 
@@ -1467,6 +1469,7 @@ fn rigor_test_deps(
         instance_pool: None,
         api_key_env_name: None,
         supervisor: None,
+        coordinator: None,
     }
 }
 

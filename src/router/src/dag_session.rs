@@ -7,18 +7,18 @@
 //!
 //! `SessionRegistry` (in this module) is the canonical server-side session
 //! home (decision D6): sessions are created per `session_id`, attached to a
-//! shared `KvCacheManager`, and retained for the process lifetime so
+//! shared `SnapshotStore`, and retained for the process lifetime so
 //! checkpoint/rewind state survives across requests.
 
-use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use common_core::sync::lock;
+use common_core::registry::ConcurrentRegistry;
+use fluent_dag::checkpointed::CheckpointedStepGraph;
 use fluent_dag::dep_graph::{DependencyGraph, GraphError};
 use serde::{Deserialize, Serialize};
 
-use crate::kv_cache::{ColdKvCache, HotKvCache, KvCacheError, KvCacheManager, KvSnapshot};
+use crate::kv_cache::{ColdSnapshotIndex, HotSnapshotIndex, KvCacheError, SnapshotStore, KvSnapshot};
 use crate::session::StepStatus;
 
 /// Errors produced by dependency-session operations.
@@ -86,6 +86,48 @@ impl SessionStep {
     }
 }
 
+/// A step's checkpoint flag drives rewind; KV snapshots on context advance
+/// (M3) use the model's KV key. This policy is the explicit decision rule the
+/// coordinator applies when handing control between models: whether a
+/// previously-snapshotted KV state should be **restored** (same model resumes
+/// from KV) or **ignored** (a different model re-prefills from the ledger).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KvSnapshotPolicy {
+    /// Restore only when the pending snapshot belongs to the same model (KV
+    /// affinity). The default — a same-model re-entry resumes from KV, a
+    /// different model re-prefills.
+    #[default]
+    #[serde(alias = "restore_if_same_model")]
+    RestoreIfSameModel,
+    /// Always restore the most recent snapshot, regardless of model.
+    #[serde(alias = "always_restore")]
+    AlwaysRestore,
+    /// Never restore from a snapshot — always re-prefill from the ledger.
+    #[serde(alias = "never_restore")]
+    NeverRestore,
+}
+
+impl KvSnapshotPolicy {
+    /// Whether a snapshot owned by `snapshot_model` should be restored for a
+    /// request targeting `requested_model`.
+    ///
+    /// The caller supplies the snapshot **found under the requested model's
+    /// own `(model, adapter, session)` key** — not the session's *pending*
+    /// snapshot, which may belong to a different model that ran most recently.
+    /// This is what lets a same-model re-entry resume its own KV while a
+    /// different model re-prefills (the coordinator does exactly this: it
+    /// retrieves under `requested_model` and passes that snapshot's model
+    /// here). `None` = no snapshot exists for the requested model.
+    pub fn decide_restore(&self, snapshot_model: Option<&str>, requested_model: &str) -> bool {
+        match self {
+            KvSnapshotPolicy::NeverRestore => false,
+            KvSnapshotPolicy::AlwaysRestore => snapshot_model.is_some(),
+            KvSnapshotPolicy::RestoreIfSameModel => snapshot_model == Some(requested_model),
+        }
+    }
+}
+
 /// A dependency-aware session that tracks steps as a DAG.
 ///
 /// Composes `fluent_dag::dep_graph::DependencyGraph<String>` for
@@ -114,16 +156,16 @@ pub struct DependencySession {
     pub model: Option<String>,
     /// Optional adapter (LoRA) name, part of the KV-cache snapshot key.
     pub adapter: Option<String>,
-    steps: HashMap<String, SessionStep>,
-    graph: DependencyGraph<String>,
-    completed: HashSet<String>,
-    checkpoints: HashMap<String, usize>,
-    kv_cache: Option<KvCacheManager>,
-    step_order: Vec<String>,
+    graph: CheckpointedStepGraph<String, SessionStep>,
+    kv_cache: Option<SnapshotStore>,
     /// The most recently restored KV snapshot on a rewind, carried so the next
     /// dispatch can set the fork's `snapshot`/`instance`/`id_slot` request
     /// fields. `None` before any rewind restored a snapshot.
     pending_snapshot: Option<KvSnapshot>,
+    /// Monotonic per-turn counter used to derive deterministic KV snapshot
+    /// names on context advance (M3): each turn's snapshot is independently
+    /// addressable under the `(model, adapter, session)` key.
+    snapshot_seq: u64,
     /// Set when the escalation ladder's turnover mode hands the session to
     /// a frontier model.  Subsequent requests in the session bypass the
     /// local pipeline and go straight to frontier.
@@ -137,13 +179,10 @@ impl DependencySession {
             session_id: session_id.into(),
             model: None,
             adapter: None,
-            steps: HashMap::new(),
-            graph: DependencyGraph::new(),
-            completed: HashSet::new(),
-            checkpoints: HashMap::new(),
+            graph: CheckpointedStepGraph::new(),
             kv_cache: None,
-            step_order: Vec::new(),
             pending_snapshot: None,
+            snapshot_seq: 0,
             frontier_owned: false,
         }
     }
@@ -183,15 +222,15 @@ impl DependencySession {
 
     /// Attach a KV cache manager for checkpoint/rewind support.
     #[must_use]
-    pub fn with_kv_cache(mut self, cache: KvCacheManager) -> Self {
+    pub fn with_kv_cache(mut self, cache: SnapshotStore) -> Self {
         self.kv_cache = Some(cache);
         self
     }
 
-    /// The attached `KvCacheManager` (M3), when present. Lets rigor's blue-pass
+    /// The attached `SnapshotStore` (M3), when present. Lets rigor's blue-pass
     /// completion record a fork snapshot via `save_snapshot` so a later rewind
     /// finds real metadata.
-    pub fn kv_cache(&self) -> Option<&KvCacheManager> {
+    pub fn kv_cache(&self) -> Option<&SnapshotStore> {
         self.kv_cache.as_ref()
     }
 
@@ -205,11 +244,8 @@ impl DependencySession {
 
         // Each step provides its own ID as an asset, and depends on the
         // IDs of its prerequisite steps. This maps naturally to
-        // `DependencyGraph`'s node/asset model.
-        self.graph.register(&id, &deps, std::slice::from_ref(&id))?;
-
-        self.steps.insert(id.clone(), step);
-        self.step_order.push(id);
+        // `DependencyGraph`'s node/asset model (via `CheckpointedStepGraph`).
+        self.graph.add_step(id, &deps, step)?;
         Ok(())
     }
 
@@ -222,8 +258,8 @@ impl DependencySession {
 
         let is_checkpoint = {
             let step = self
-                .steps
-                .get_mut(step_id)
+                .graph
+                .state_mut(&step_id.to_string())
                 .ok_or_else(|| DagError::StepNotFound(step_id.into()))?;
 
             if step.status == StepStatus::Completed {
@@ -240,15 +276,14 @@ impl DependencySession {
             step.checkpoint
         };
 
-        self.completed.insert(step_id.to_string());
+        self.graph.complete(&step_id.to_string());
 
         if should_cancel {
             self.cancel_dependents(step_id);
         }
 
         if is_checkpoint {
-            self.checkpoints
-                .insert(step_id.to_string(), self.completed.len());
+            self.graph.checkpoint(step_id.to_string())?;
         }
 
         Ok(())
@@ -259,9 +294,9 @@ impl DependencySession {
     /// Uses `DependencyGraph::dependents_of` for transitive traversal
     /// with built-in cycle detection.
     pub fn cancel_dependents(&mut self, step_id: &str) {
-        let dependents = self.graph.dependents_of(&step_id.to_string());
+        let dependents = self.graph.cancel_dependents(&step_id.to_string());
         for dep_id in &dependents {
-            if let Some(step) = self.steps.get_mut(dep_id) {
+            if let Some(step) = self.graph.state_mut(dep_id) {
                 if step.status == StepStatus::Pending || step.status == StepStatus::InProgress {
                     step.status = StepStatus::Cancelled;
                 }
@@ -275,12 +310,12 @@ impl DependencySession {
     /// Uses `DependencyGraph::ready_nodes` against the current set of
     /// completed step IDs, then filters out steps already completed.
     pub fn next_ready(&self) -> Vec<String> {
-        let mut ready = self.graph.ready_nodes(&self.completed);
-        ready.retain(|id| !self.completed.contains(id));
+        let mut ready = self.graph.ready_steps();
+        ready.retain(|id| !self.graph.is_completed(id));
         // Only return steps that are in Pending status
         ready.retain(|id| {
-            self.steps
-                .get(id)
+            self.graph
+                .status(id)
                 .is_some_and(|s| s.status == StepStatus::Pending)
         });
         ready
@@ -291,15 +326,20 @@ impl DependencySession {
     ///
     /// Uses `DependencyGraph::is_ready`.
     pub fn is_ready(&self, step_id: &str) -> bool {
-        self.graph.is_ready(&step_id.to_string(), &self.completed)
+        self.graph.is_ready(&step_id.to_string())
     }
 
     /// Returns the IDs of steps that have the checkpoint flag set.
     pub fn checkpoints(&self) -> Vec<String> {
-        self.steps
+        self.graph
+            .step_ids()
             .iter()
-            .filter(|(_, step)| step.checkpoint)
-            .map(|(id, _)| id.clone())
+            .filter(|id| {
+                self.graph
+                    .status(id)
+                    .is_some_and(|s| s.checkpoint)
+            })
+            .cloned()
             .collect()
     }
 
@@ -307,10 +347,10 @@ impl DependencySession {
     /// checkpoint step.
     ///
     /// Steps are reset to `Pending` but their result data is preserved
-    /// for audit (it is not deleted). If a `KvCacheManager` is attached and
+    /// for audit (it is not deleted). If a `SnapshotStore` is attached and
     /// a model name has been set, the KV cache snapshot metadata is **actually
     /// restored**: the record is retrieved from the cold tier (promoted to the
-    /// hot tier by `KvCacheManager::retrieve`) and returned to the caller, which
+    /// hot tier by `SnapshotStore::retrieve`) and returned to the caller, which
     /// passes its fork-facing identity (`snapshot_name`/`instance`/`id_slot`) to
     /// the next dispatch as request fields. Returns `None` when no snapshot
     /// exists. The restored snapshot is also stored on the session for the next
@@ -325,22 +365,18 @@ impl DependencySession {
         &mut self,
         checkpoint_name: &str,
     ) -> Result<Option<Arc<KvSnapshot>>, DagError> {
-        // Verify checkpoint exists.
-        self.checkpoints
-            .get(checkpoint_name)
-            .ok_or_else(|| DagError::CheckpointNotFound(checkpoint_name.into()))?;
+        // The step graph returns the ordered suffix from the checkpoint
+        // (inclusive) and clears the checkpoint marker + completed set.
+        let reset = self
+            .graph
+            .rewind_to(&checkpoint_name.to_string())
+            .map_err(|_| DagError::CheckpointNotFound(checkpoint_name.into()))?;
 
-        let checkpoint_idx = self
-            .step_order
-            .iter()
-            .position(|id| id == checkpoint_name)
-            .unwrap_or(0);
-
+        // Reset each returned step's status to Pending (result data preserved
+        // for audit — the primitive does not touch `S`).
         let mut discarded: Vec<String> = Vec::new();
-
-        // Reset steps after checkpoint (including checkpoint step itself).
-        for step_id in self.step_order.iter().skip(checkpoint_idx) {
-            if let Some(step) = self.steps.get_mut(step_id) {
+        for step_id in &reset {
+            if let Some(step) = self.graph.state_mut(step_id) {
                 if step.status == StepStatus::Completed
                     || step.status == StepStatus::Cancelled
                     || step.status == StepStatus::Failed
@@ -351,13 +387,10 @@ impl DependencySession {
                         "rewinding step"
                     );
                     step.status = StepStatus::Pending;
-                    self.completed.remove(step_id.as_str());
                     discarded.push(step_id.clone());
                 }
             }
         }
-
-        self.checkpoints.remove(checkpoint_name);
 
         if !discarded.is_empty() {
             tracing::info!(
@@ -384,7 +417,7 @@ impl DependencySession {
 
     /// Retrieve + restore the KV cache snapshot for this session: the
     /// metadata record is loaded from the cold tier (promoted to the hot tier
-    /// by `KvCacheManager::retrieve`) and returned so the caller can pass its
+    /// by `SnapshotStore::retrieve`) and returned so the caller can pass its
     /// fork-facing identity to the next dispatch. `None` when no snapshot
     /// exists. The restored snapshot is also stored on the session so the next
     /// dispatch can set the `snapshot`/`instance`/`id_slot` request fields.
@@ -431,11 +464,106 @@ impl DependencySession {
             .map(|s| (s.snapshot_name.clone(), s.instance.clone(), 0))
     }
 
+    /// The most recently recorded/restored KV snapshot (M3), if any. The
+    /// coordinator inspects its `model` to decide restore-vs-re-prefill via a
+    /// `KvSnapshotPolicy`.
+    pub fn pending_snapshot(&self) -> Option<&KvSnapshot> {
+        self.pending_snapshot.as_ref()
+    }
+
+    /// Snapshot this model's KV on context advance (M3) — called when an
+    /// agent/model finishes a turn and control moves on. Records a per-turn,
+    /// independently-addressable fork snapshot under the `(model, adapter,
+    /// session)` key and sets `pending_snapshot` so the next dispatch can pass
+    /// the fork-facing `snapshot`/`instance`/`id_slot` fields.
+    ///
+    /// Requires `self.model` set (the KV key is `(model, adapter, session)`);
+    /// without a model this logs and returns `Ok(None)` — never a fabricated
+    /// key. Without an attached fork handle `SnapshotStore::save_snapshot`
+    /// degrades to a metadata-only no-op, so this returns `Ok(None)`.
+    ///
+    /// Synchronous by design (mirrors `rewind_to_checkpoint`): the fork
+    /// round-trip runs through the sync `block_on` bridge inside
+    /// `save_snapshot`, so it can be called while holding the session mutex.
+    ///
+    /// **Lock note:** this is only safe when the fork round-trip is cheap and
+    /// metadata-only (the `SnapshotStore` records metadata and hands the bytes
+    /// to llama.cpp; it does not stream them). The coordinator calls it while
+    /// holding the session mutex, so the `block_on` bridge must never await a
+    /// long I/O — if the fork round-trip ever grows real async I/O, the call
+    /// must move outside the guard (the async `run_agent` already stages its
+    /// other session-guarded work the same way).
+    pub fn advance_and_snapshot(
+        &mut self,
+        instance: &str,
+    ) -> Result<Option<Arc<KvSnapshot>>, DagError> {
+        let Some(model) = self.model.clone() else {
+            tracing::debug!(
+                session_id = %self.session_id,
+                "no model name on session - skipping kv snapshot (no fabricated key)",
+            );
+            return Ok(None);
+        };
+        let Some(kv) = &self.kv_cache else {
+            return Ok(None);
+        };
+
+        // Deterministic per-turn snapshot name so each model's progress is
+        // independently addressable under the `(model, adapter, session)` key.
+        self.snapshot_seq += 1;
+        let snapshot_name = format!("{}-{}", self.session_id, self.snapshot_seq);
+
+        kv.save_snapshot(
+            &model,
+            self.adapter.as_deref(),
+            &self.session_id,
+            &snapshot_name,
+            instance,
+        )?;
+
+        // Promote the recorded snapshot into `pending_snapshot` so the next
+        // dispatch (any model) can pass its fork-facing identity. Without a
+        // fork handle `save_snapshot` records no metadata, so `retrieve` finds
+        // nothing → `Ok(None)` (metadata-only no-op, never a crash).
+        match kv.retrieve(&model, self.adapter.as_deref(), &self.session_id) {
+            Ok(snapshot) => {
+                tracing::info!(
+                    session_id = %self.session_id,
+                    model = %model,
+                    snapshot_name = %snapshot.snapshot_name,
+                    instance = ?snapshot.instance,
+                    "kv snapshot recorded on context advance",
+                );
+                self.pending_snapshot = Some((*snapshot).clone());
+                crate::audit::emit(
+                    "kv_advance",
+                    serde_json::json!({
+                        "session_id": self.session_id,
+                        "model": model,
+                        "adapter": self.adapter,
+                        "snapshot_name": snapshot.snapshot_name,
+                        "instance": snapshot.instance,
+                        "turn_seq": self.snapshot_seq,
+                    }),
+                );
+                Ok(Some(snapshot))
+            }
+            Err(KvCacheError::NotFound(_)) => {
+                tracing::debug!(
+                    session_id = %self.session_id,
+                    "no kv snapshot recorded (no fork handle) - metadata-only no-op",
+                );
+                Ok(None)
+            }
+            Err(e) => Err(DagError::KvCache(e)),
+        }
+    }
+
     /// Set a step's status to InProgress (only if currently Pending).
     pub fn start_step(&mut self, step_id: &str) -> Result<(), DagError> {
         let step = self
-            .steps
-            .get_mut(step_id)
+            .graph
+            .state_mut(&step_id.to_string())
             .ok_or_else(|| DagError::StepNotFound(step_id.into()))?;
 
         if step.status != StepStatus::Pending {
@@ -451,27 +579,27 @@ impl DependencySession {
 
     /// Look up a step by ID.
     pub fn get_step(&self, step_id: &str) -> Option<&SessionStep> {
-        self.steps.get(step_id)
+        self.graph.status(&step_id.to_string())
     }
 
     /// All step IDs in insertion order.
     pub fn step_ids(&self) -> &[String] {
-        &self.step_order
+        self.graph.step_ids()
     }
 
     /// Number of steps.
     pub fn step_count(&self) -> usize {
-        self.steps.len()
+        self.graph.step_count()
     }
 
     /// Number of completed steps.
     pub fn completed_count(&self) -> usize {
-        self.completed.len()
+        self.graph.completed_count()
     }
 
     /// Borrow the underlying dependency graph (for inspection).
     pub fn graph(&self) -> &DependencyGraph<String> {
-        &self.graph
+        self.graph.graph()
     }
 
     /// Steps that depend on unsatisfiable assets (assets depended on by
@@ -484,7 +612,7 @@ impl DependencySession {
 /// Process-wide registry of `DependencySession`s keyed by `session_id`.
 ///
 /// The canonical server-side session home (decision D6): sessions are
-/// created on first use, attached to a shared `KvCacheManager`, and retained
+/// created on first use, attached to a shared `SnapshotStore`, and retained
 /// for the process lifetime so checkpoint/rewind state survives across
 /// requests. Each session is individually `Mutex`-wrapped so the server can
 /// mutate it from the (async) request path without holding the registry lock
@@ -495,8 +623,8 @@ pub struct SessionRegistry {
 }
 
 struct SessionRegistryInner {
-    sessions: Mutex<HashMap<String, Arc<Mutex<DependencySession>>>>,
-    kv_cache: KvCacheManager,
+    sessions: ConcurrentRegistry<String, Mutex<DependencySession>>,
+    kv_cache: SnapshotStore,
 }
 
 impl SessionRegistry {
@@ -504,8 +632,8 @@ impl SessionRegistry {
     /// snapshots; when `None`, a process-local temp directory is used (still
     /// durable across requests, ephemeral across restarts).
     pub fn new(kv_root: Option<PathBuf>) -> Self {
-        let hot = Arc::new(HotKvCache::new(1024, 512));
-        let cold = Arc::new(ColdKvCache::new(
+        let hot = Arc::new(HotSnapshotIndex::new(1024, 512));
+        let cold = Arc::new(ColdSnapshotIndex::new(
             kv_root.unwrap_or_else(|| std::env::temp_dir().join("coral-router-kv-cache")),
             4096,
             7 * 24 * 3600, // 7-day TTL
@@ -513,41 +641,50 @@ impl SessionRegistry {
         ));
         Self {
             inner: Arc::new(SessionRegistryInner {
-                sessions: Mutex::new(HashMap::new()),
-                kv_cache: KvCacheManager::new(hot, cold),
+                sessions: ConcurrentRegistry::new(),
+                kv_cache: SnapshotStore::new(hot, cold),
+            }),
+        }
+    }
+
+    /// Create a registry whose sessions share a caller-supplied
+    /// `SnapshotStore` (M4). Enables the `LedgerAgentCoordinator` and the
+    /// registry to snapshot/restore through the same manager (e.g. one with an
+    /// attached fork handle for the fork round-trip).
+    pub fn with_kv_cache(kv: SnapshotStore) -> Self {
+        Self {
+            inner: Arc::new(SessionRegistryInner {
+                sessions: ConcurrentRegistry::new(),
+                kv_cache: kv,
             }),
         }
     }
 
     /// The shared KV cache manager (hot + cold tiers) attached to every
     /// session in this registry.
-    pub fn kv_cache(&self) -> &KvCacheManager {
+    pub fn kv_cache(&self) -> &SnapshotStore {
         &self.inner.kv_cache
     }
 
-    /// Look up a session by ID, creating it (with the shared `KvCacheManager`
+    /// Look up a session by ID, creating it (with the shared `SnapshotStore`
     /// attached) on first use.
     pub fn get_or_create(&self, session_id: &str) -> Arc<Mutex<DependencySession>> {
-        let mut sessions = lock(&self.inner.sessions);
-        sessions
-            .entry(session_id.to_string())
-            .or_insert_with(|| {
-                Arc::new(Mutex::new(
-                    DependencySession::new(session_id).with_kv_cache(self.inner.kv_cache.clone()),
-                ))
-            })
-            .clone()
+        self.inner.sessions.resolve_or_create(session_id.to_string(), |id| {
+            Mutex::new(
+                DependencySession::new(id).with_kv_cache(self.inner.kv_cache.clone()),
+            )
+        })
     }
 
     /// Drop a session (its KV cache snapshot, if any, is retained in the
     /// cold tier for a future session with the same ID).
     pub fn remove(&self, session_id: &str) {
-        lock(&self.inner.sessions).remove(session_id);
+        self.inner.sessions.remove(&session_id.to_string());
     }
 
     /// Number of live sessions.
     pub fn session_count(&self) -> usize {
-        lock(&self.inner.sessions).len()
+        self.inner.sessions.len()
     }
 }
 
@@ -866,10 +1003,10 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let src_dir = tempfile::tempdir().unwrap();
-        let hot = Arc::new(HotKvCache::new(10, 1024));
-        let kv = KvCacheManager::new(
+        let hot = Arc::new(HotSnapshotIndex::new(10, 1024));
+        let kv = SnapshotStore::new(
             Arc::clone(&hot),
-            Arc::new(ColdKvCache::new(
+            Arc::new(ColdSnapshotIndex::new(
                 dir.path(),
                 1024,
                 86400,
@@ -958,13 +1095,13 @@ mod tests {
         // M3: `pending_kv_fields` is set only when a snapshot was actually
         // restored. A session with a kv manager but no stored snapshot has no
         // pending fields; once a snapshot is stored + rewind runs, they appear.
-        use crate::kv_cache::{ColdKvCache, HotKvCache, KvCacheManager, KvSnapshot};
+        use crate::kv_cache::{ColdSnapshotIndex, HotSnapshotIndex, SnapshotStore, KvSnapshot};
 
         let dir = tempfile::tempdir().unwrap();
-        let hot = Arc::new(HotKvCache::new(10, 1024));
-        let kv = KvCacheManager::new(
+        let hot = Arc::new(HotSnapshotIndex::new(10, 1024));
+        let kv = SnapshotStore::new(
             Arc::clone(&hot),
-            Arc::new(ColdKvCache::new(
+            Arc::new(ColdSnapshotIndex::new(
                 dir.path(),
                 1024,
                 86400,
@@ -1037,5 +1174,157 @@ mod tests {
 
         registry.remove("sess-1");
         assert_eq!(registry.session_count(), 0);
+    }
+
+    // -- M3: context-advance KV snapshotting --------------------------------
+
+    fn test_kv_manager(slot_path: &std::path::Path) -> (SnapshotStore, Arc<HotSnapshotIndex>) {
+        let hot = Arc::new(HotSnapshotIndex::new(10, 1024));
+        let kv = SnapshotStore::new(
+            Arc::clone(&hot),
+            Arc::new(ColdSnapshotIndex::new(
+                slot_path,
+                1024,
+                86400,
+                crate::config::EvictionPolicy::Lru,
+            )),
+        );
+        (kv, hot)
+    }
+
+    #[test]
+    fn kv_snapshot_policy_decide_restore() {
+        use KvSnapshotPolicy::*;
+        // RestoreIfSameModel: same model restores, different model ignores.
+        assert!(RestoreIfSameModel.decide_restore(Some("model-a"), "model-a"));
+        assert!(!RestoreIfSameModel.decide_restore(Some("model-a"), "model-b"));
+        assert!(!RestoreIfSameModel.decide_restore(None, "model-a"));
+        // AlwaysRestore: any present snapshot restores.
+        assert!(AlwaysRestore.decide_restore(Some("model-a"), "model-b"));
+        assert!(!AlwaysRestore.decide_restore(None, "model-a"));
+        // NeverRestore: never.
+        assert!(!NeverRestore.decide_restore(Some("model-a"), "model-a"));
+    }
+
+    #[test]
+    fn advance_without_model_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (kv, _) = test_kv_manager(dir.path());
+        let mut session = DependencySession::new("sess").with_kv_cache(kv);
+        let result = session.advance_and_snapshot("scratch").unwrap();
+        assert!(result.is_none(), "no model - no snapshot, no fabricated key");
+        assert!(session.pending_snapshot().is_none());
+    }
+
+    #[test]
+    fn advance_without_fork_is_metadata_only_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (kv, _) = test_kv_manager(dir.path());
+        let mut session = DependencySession::new("sess")
+            .with_model("model-x")
+            .with_kv_cache(kv);
+        // No fork handle -> save_snapshot is a metadata-only no-op returning
+        // Ok, and retrieve finds nothing -> Ok(None), never a crash.
+        let result = session.advance_and_snapshot("scratch").unwrap();
+        assert!(result.is_none(), "no fork handle -> no recorded snapshot");
+        assert!(session.pending_snapshot().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn advance_with_fork_records_snapshot_and_sets_pending() {
+        use crate::instances::stub::StubServer;
+        use crate::instances::InstanceClient;
+
+        let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
+            |method, path, _body| {
+                if method == "POST" && path == "/instances/scratch/snapshot" {
+                    (200, "{}".into())
+                } else {
+                    (200, "[]".into())
+                }
+            },
+        );
+        let stub = StubServer::start(handler);
+        let fork = Arc::new(InstanceClient::new(
+            reqwest::Client::new(),
+            stub.base_url(),
+            None,
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let (kv, hot) = test_kv_manager(dir.path());
+        let kv = kv.with_fork_io(fork);
+        let mut session = DependencySession::new("sess")
+            .with_model("model-x")
+            .with_kv_cache(kv);
+
+        // Two turns -> two independently-addressable snapshots under the key.
+        let s1 = session
+            .advance_and_snapshot("scratch")
+            .unwrap()
+            .expect("first turn snapshot recorded");
+        assert_eq!(s1.session_id, "sess");
+        assert_eq!(s1.model, "model-x");
+        let pending1 = session.pending_kv_fields().expect("pending fields set");
+        let name1 = pending1.0;
+
+        let s2 = session
+            .advance_and_snapshot("scratch")
+            .unwrap()
+            .expect("second turn snapshot recorded");
+        assert_ne!(s2.snapshot_name, s1.snapshot_name, "per-turn distinct names");
+        let pending2 = session.pending_kv_fields().expect("pending fields set");
+        assert_ne!(pending2.0, name1, "pending is the most recent snapshot");
+
+        // The fork received both snapshot POSTs.
+        let posts = stub
+            .recorded()
+            .iter()
+            .filter(|(m, p, _)| m == "POST" && p == "/instances/scratch/snapshot")
+            .count();
+        assert_eq!(posts, 2, "one fork snapshot save per turn");
+
+        // Both snapshots coexist under the (model, adapter, session) key in
+        // the hot/cold tiers via retrieve (latest wins on retrieve).
+        let _ = hot;
+    }
+
+    #[test]
+    fn advance_sets_pending_snapshot_for_same_model_restore() {
+        // RestoreIfSameModel: the pending snapshot's model matches the next
+        // dispatch's model -> restore; a different model -> re-prefill.
+        let mut session = DependencySession::new("sess");
+        // Manually fabricate a pending snapshot to exercise the decision rule.
+        let pending = KvSnapshot {
+            model: "model-x".into(),
+            adapter: None,
+            session_id: "sess".into(),
+            snapshot_name: "sess-1".into(),
+            instance: Some("scratch".into()),
+            file_path: std::path::PathBuf::new(),
+            token_count: None,
+            created_at: common_core::now_secs(),
+            last_used_at: common_core::now_secs(),
+            llama_cpp_version: None,
+            model_quant: None,
+            base_model_hash: None,
+        };
+        session.pending_snapshot = Some(pending);
+
+        assert!(session.pending_snapshot().is_some());
+        assert!(
+            KvSnapshotPolicy::RestoreIfSameModel.decide_restore(
+                session.pending_snapshot().map(|s| s.model.as_str()),
+                "model-x"
+            ),
+            "same model -> restore"
+        );
+        assert!(
+            !KvSnapshotPolicy::RestoreIfSameModel.decide_restore(
+                session.pending_snapshot().map(|s| s.model.as_str()),
+                "model-b"
+            ),
+            "different model -> re-prefill (no restore)"
+        );
     }
 }

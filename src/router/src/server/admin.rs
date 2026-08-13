@@ -83,7 +83,7 @@ pub async fn handle_metrics(deps: &ServerDeps, query: &[(String, String)]) -> Hy
     let Some(supervisor) = deps.supervisor.as_ref() else {
         return text_response("# no managed models\n".into());
     };
-    let mut keys: Vec<String> = supervisor.model_keys().cloned().collect();
+    let mut keys: Vec<String> = supervisor.model_keys();
     keys.sort_unstable();
 
     let mut bodies = Vec::new();

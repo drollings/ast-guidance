@@ -1,7 +1,7 @@
 //! Full-detail content ledger with LOD compaction (decision D6).
 //!
 //! `ContentNodeLedger` is now a **thin facade** over the shared
-//! `NodeStore` (M4): the durable, per-session store of `ContentNode`s (the
+//! `ContentNodeStore` (M4): the durable, per-session store of `ContentNode`s (the
 //! canonical `fluent_types::ContentNode`) lives in `crate::node_store`, where
 //! nodes are shared behind `Arc<RwLock<ContentNode>>` with interned
 //! session/role index keys and a durable `content_json` column. The facade
@@ -12,10 +12,10 @@
 //!
 //! The facade also owns the **write-path guard** (M1, decision D1): every
 //! write delegate scrubs its text through `crate::ledger_guard::scrub_for_ledger`
-//! before reaching `NodeStore`, so the durable ledger can never cache text
+//! before reaching `ContentNodeStore`, so the durable ledger can never cache text
 //! matching the builtin filter engine (on by default, no config flag). The
-//! scrub is irreversible. `NodeStore` itself stays policy-free; the only
-//! documented bypass is the `KnowledgeCapability` impl directly on `NodeStore`
+//! scrub is irreversible. `ContentNodeStore` itself stays policy-free; the only
+//! documented bypass is the `KnowledgeCapability` impl directly on `ContentNodeStore`
 //! (`crate::knowledge`), which is a trait-object boundary that cannot route
 //! through the facade — production server writes all flow through here.
 //!
@@ -37,6 +37,10 @@
 //! column holding the full serialized `ContentNode` (single source of truth
 //! for LOD/role metadata).
 
+pub mod orchestrator;
+pub mod prompt;
+pub mod tiering;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -47,12 +51,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::ledger_guard::scrub_for_ledger;
-use crate::node_store::NodeStore;
+use crate::node_store::ContentNodeStore;
 use crate::summarization::Summarizer;
 use crate::views::LedgerView;
 use crate::views::{Lod, ParallelLedger};
 
-/// Node-construction helper moved to `NodeStore` (M4). Re-exported here so the
+/// Node-construction helper moved to `ContentNodeStore` (M4). Re-exported here so the
 /// facade's tests keep compiling unchanged.
 #[cfg(test)]
 pub(crate) use crate::node_store::new_node;
@@ -101,23 +105,23 @@ pub struct LedgerEntry {
 }
 
 /// The durable, per-session store of `ContentNode`s — a thin facade over the
-/// shared `Arc<NodeStore>` (M4). Every method delegates; the exact public
+/// shared `Arc<ContentNodeStore>` (M4). Every method delegates; the exact public
 /// surface is preserved so the server (`ServerDeps.ledger`) is untouched.
 pub struct ContentNodeLedger {
-    store: Arc<NodeStore>,
+    store: Arc<ContentNodeStore>,
 }
 
 impl ContentNodeLedger {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, LedgerError> {
         Ok(Self {
-            store: Arc::new(NodeStore::open(path)?),
+            store: Arc::new(ContentNodeStore::open(path)?),
         })
     }
 
     /// Open an in-memory ledger (tests / ephemeral stores).
     pub fn open_in_memory() -> Result<Self, LedgerError> {
         Ok(Self {
-            store: Arc::new(NodeStore::open_in_memory()?),
+            store: Arc::new(ContentNodeStore::open_in_memory()?),
         })
     }
 
@@ -130,7 +134,7 @@ impl ContentNodeLedger {
     }
 
     /// The shared store — the new shared/refcounted/interned read path.
-    pub fn node_store(&self) -> &Arc<NodeStore> {
+    pub fn node_store(&self) -> &Arc<ContentNodeStore> {
         &self.store
     }
 
@@ -287,7 +291,7 @@ fn emit_write_audit(pattern: Option<&str>) {
 /// databases lack. Each column migration is a no-op when the column already
 /// exists, so a fresh database and an upgraded one converge.
 ///
-/// Shared with `NodeStore` (4B), which owns the durable backing now — the
+/// Shared with `ContentNodeStore` (4B), which owns the durable backing now — the
 /// schema stays here as the single source of truth.
 pub(crate) fn ledger_migrations() -> [&'static dyn Migration; 4] {
     [

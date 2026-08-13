@@ -1,7 +1,9 @@
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use fluent_concurrency::pool::Limiter;
 use fluent_llm::client::ChatBackend;
+use http_body_util::BodyExt;
 
 use crate::charts::binding::Entity;
 use crate::charts::binding::ENTITIES_META_KEY;
@@ -10,6 +12,9 @@ use crate::charts::extract::WorkflowExtractor;
 use crate::charts::select::{ChartFit, ChartSelector};
 use crate::charts::store::ChartStore;
 use crate::config::ChartsConfig;
+use crate::ledger::prompt::{LedgerPromptAssembler, LodSpec, PromptBudget, WorkerContext};
+use crate::server::responses::{empty_response, HyperResponse, ServerStats};
+use crate::views::ParallelLedger;
 
 pub struct PlanRoute {
     /// The chart store — the single owner of the workflow_library index
@@ -33,6 +38,66 @@ pub struct PlanRoute {
     /// M10 dispatch post-processing hook: distills successful dispatches into
     /// draft charts. `None` when extraction is not configured (opt-in).
     extractor: Option<Arc<WorkflowExtractor>>,
+    /// Optional session-context renderer (M5.3): when a ledger store + prompt
+    /// assembler are attached, the selector/adjudicator models receive the
+    /// session ledger rendered through the assembler's budget/relevance rules.
+    /// `None` keeps today's blank-slate plan prompts (byte-identical).
+    prompt_ctx: Option<PromptAssemblerCtx>,
+}
+
+/// The session-context renderer for the plan route (M5.3): a shared `ContentNodeStore`
+/// plus a `LedgerPromptAssembler` and its budget/fidelity band. Pure — it only
+/// renders, it never triggers LOD derivation.
+#[derive(Clone)]
+pub struct PromptAssemblerCtx {
+    store: Arc<crate::node_store::ContentNodeStore>,
+    assembler: LedgerPromptAssembler,
+    budget: PromptBudget,
+    lod_spec: LodSpec,
+}
+
+impl PromptAssemblerCtx {
+    pub fn new(
+        store: Arc<crate::node_store::ContentNodeStore>,
+        assembler: LedgerPromptAssembler,
+        budget: PromptBudget,
+        lod_spec: LodSpec,
+    ) -> Self {
+        Self {
+            store,
+            assembler,
+            budget,
+            lod_spec,
+        }
+    }
+
+    /// Render a session's ledger through the assembler into a context block
+    /// (`""` for an empty session — the caller keeps the blank-slate prompt).
+    /// Audits the fidelity plan (`kind = "prompt"`, role = `"plan_selector"`).
+    fn render(&self, session_id: &str) -> String {
+        let view = ParallelLedger::for_session(Arc::clone(&self.store), session_id);
+        let assembled = self.assembler.assemble(
+            &view,
+            &WorkerContext::new("chart selector", "Select a chart against the session context."),
+            &self.budget,
+            None,
+            &self.lod_spec,
+        );
+        crate::audit::emit(
+            "prompt",
+            serde_json::json!({
+                "session_id": session_id,
+                "role": "plan_selector",
+                "budget_used": assembled.budget_used,
+                "node_plan": assembled
+                    .node_plan
+                    .iter()
+                    .map(|(id, lod)| serde_json::json!([id.as_int(), lod.as_u8()]))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+        assembled.body
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -75,7 +140,19 @@ impl PlanRoute {
             limiter: Arc::new(Limiter::new(4)),
             cfg: ChartsConfig::default(),
             extractor: None,
+            prompt_ctx: None,
         }
+    }
+
+    /// Attach the session-context renderer (M5.3). When set, the plan route's
+    /// `plan_for_session`/`plan_interviewed_for_session` fold the session
+    /// ledger (rendered via the `LedgerPromptAssembler`) into the
+    /// selector/adjudicator prompts. Opt-in — a route without it is
+    /// byte-identical to today.
+    #[must_use]
+    pub fn with_prompt_assembler(mut self, ctx: PromptAssemblerCtx) -> Self {
+        self.prompt_ctx = Some(ctx);
+        self
     }
 
     /// Attach the boot-loaded chart store. The store is shared (`Arc`) so the
@@ -157,6 +234,53 @@ impl PlanRoute {
     /// `gaps_filled` is reserved for the M8 interview loop.
     pub async fn plan(&self, user_message: &str, entities: &[Entity]) -> PlanResult {
         self.plan_inner(user_message, entities, false).await
+    }
+
+    /// Plan against a session ledger (M5.3): when the route has a prompt
+    /// assembler attached and a `session_id` is given, the session context is
+    /// rendered through the assembler and folded into the selector/adjudicator
+    /// prompt so chart selection follows the same budget/relevance rules.
+    /// Without a session id (or assembler) it is identical to [`Self::plan`].
+    pub async fn plan_for_session(
+        &self,
+        session_id: Option<&str>,
+        user_message: &str,
+        entities: &[Entity],
+    ) -> PlanResult {
+        let enriched = self.enrich_with_context(session_id, user_message);
+        self.plan_inner(&enriched, entities, false).await
+    }
+
+    /// Render the session context (M5.3) and prepend it to the selector's user
+    /// message. Returns the message unchanged when no session id or assembler
+    /// is attached (byte-identical to today).
+    fn enrich_with_context(&self, session_id: Option<&str>, user_message: &str) -> String {
+        let (Some(session_id), Some(ctx)) = (session_id, &self.prompt_ctx) else {
+            return user_message.to_string();
+        };
+        let rendered = ctx.render(session_id);
+        if rendered.is_empty() {
+            return user_message.to_string();
+        }
+        format!("Session ledger context:\n{rendered}\n\nRequest:\n{user_message}")
+    }
+
+    /// Session-aware variant of [`Self::plan_interviewed`] (M5.3). See
+    /// [`Self::plan_for_session`].
+    pub async fn plan_interviewed_for_session(
+        &self,
+        session_id: Option<&str>,
+        user_message: &str,
+        entities: &[Entity],
+        prior_gaps: &[String],
+    ) -> PlanResult {
+        let enriched = self.enrich_with_context(session_id, user_message);
+        let mut result = self.plan_inner(&enriched, entities, true).await;
+        if result.source == PlanSource::HnswHit {
+            result.source = PlanSource::TemplateAdapted;
+            result.gaps_filled = prior_gaps.to_vec();
+        }
+        result
     }
 
     /// Round-2 entry for the one-round interview loop (M8).
@@ -344,6 +468,156 @@ fn plan_ctx(user_message: &str, entities: &[Entity]) -> fluent_wvr::WorkContext 
     }
     ctx
 }
+
+
+
+pub async fn handle_plan_request(
+    req: hyper::Request<hyper::body::Incoming>,
+    plan_route: Option<Arc<PlanRoute>>,
+    max_payload: usize,
+    stats: &ServerStats,
+) -> Result<HyperResponse, std::convert::Infallible> {
+    let Some(route) = plan_route else {
+        stats.errors.fetch_add(1, Ordering::Relaxed);
+        return Ok(crate::server::responses::error_response(
+            hyper::StatusCode::SERVICE_UNAVAILABLE,
+            "plan route not configured",
+        ));
+    };
+
+    let body_bytes = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            stats.errors.fetch_add(1, Ordering::Relaxed);
+            return Ok(crate::server::responses::error_response(
+                hyper::StatusCode::BAD_REQUEST,
+                &format!("body read error: {e}"),
+            ));
+        }
+    };
+    if body_bytes.len() > max_payload {
+        return Ok(empty_response(hyper::StatusCode::PAYLOAD_TOO_LARGE));
+    }
+    let body: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            stats.errors.fetch_add(1, Ordering::Relaxed);
+            return Ok(crate::server::responses::error_response(
+                hyper::StatusCode::BAD_REQUEST,
+                &format!("invalid JSON: {e}"),
+            ));
+        }
+    };
+
+    let message = body
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if message.is_empty() {
+        return Ok(crate::server::responses::error_response(
+            hyper::StatusCode::BAD_REQUEST,
+            "missing 'message'",
+        ));
+    }
+
+    let entities: Vec<crate::charts::binding::Entity> = body
+        .get("entities")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| serde_json::from_value(e.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let retry = body
+        .get("retry")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let prior_gaps: Vec<String> = body
+        .get("gaps")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    // M5.3: when the plan body carries a session_id and the route has a prompt
+    // assembler attached, the selector/adjudicator reads the session ledger
+    // through the assembler's budget/relevance rules.
+    let session_id = body.get("session_id").and_then(serde_json::Value::as_str);
+
+    let result = if retry {
+        route
+            .plan_interviewed_for_session(session_id, message, &entities, &prior_gaps)
+            .await
+    } else {
+        route
+            .plan_for_session(session_id, message, &entities)
+            .await
+    };
+
+    let response = match result.source {
+        PlanSource::FreshDraft => {
+            serde_json::json!({ "status": "fresh_draft", "source": "fresh_draft" })
+        }
+        PlanSource::HnswHit => plan_executed_response("hnsw_hit", &result),
+        PlanSource::TemplateAdapted => {
+            if result.interview_questions.is_empty() {
+                plan_executed_response("template_adapted", &result)
+            } else {
+                serde_json::json!({
+                    "status": "clarify",
+                    "source": "template_adapted",
+                    "questions": result.interview_questions,
+                    "gaps": result.gaps,
+                })
+            }
+        }
+    };
+    Ok(crate::server::responses::json_response(
+        hyper::StatusCode::OK,
+        &response,
+    ))
+}
+
+/// Build the D3 `/v1/plan` "executed" response: execution results, not a
+/// compiled graph. Carries selection provenance (`fit`/`score`) and the
+/// execution summary (`final_output`/`accepted`/`audit`) when the chart ran.
+pub fn plan_executed_response(
+    source: &str,
+    result: &PlanResult,
+) -> serde_json::Value {
+    let mut executed = serde_json::json!({
+        "status": "executed",
+        "source": source,
+        "gaps_filled": result.gaps_filled,
+    });
+    if let Some(fit) = &result.fit {
+        executed["fit"] = serde_json::Value::String(fit.clone());
+    }
+    if let Some(score) = result.score {
+        executed["score"] = serde_json::json!(score);
+    }
+    if let Some(summary) = &result.summary {
+        executed["accepted"] = serde_json::json!(summary.accepted);
+        if let Some(output) = &summary.final_output {
+            executed["final_output"] = output.clone();
+        }
+        executed["audit"] = serde_json::to_value(&summary.audit).unwrap_or_default();
+        executed["completed"] = serde_json::to_value(&summary.completed).unwrap_or_default();
+    }
+    executed
+}
+
+/// Handle `POST /v1/rigor` - the fixed-pass blue/red/judge protocol (M3).
+///
+/// Body: `{ "message", "session_id"?, "entities"? }`. A configured route with
+/// all three role backends executes and returns `executed` (accepted answer)
+/// or `clarify` (a material rejection resolved to a targeted interview). An
+/// unconfigured route (no `rigor` section / missing backends) returns an
+/// explicit error - never a crash.
 
 #[cfg(test)]
 mod tests {
@@ -635,5 +909,118 @@ mod tests {
             "a second failure terminates the interview, never a second round of questions"
         );
         assert!(round2.interview_questions.is_empty());
+    }
+
+    // -- M5.3: session context via the LedgerPromptAssembler --------------
+
+    /// A selector backend that captures the user message it receives.
+    struct RecordingSelector {
+        captured: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ChatBackend for RecordingSelector {
+        fn chat_complete(
+            &self,
+            messages: &[fluent_llm::ChatMessage],
+        ) -> Result<String, fluent_llm::LlmError> {
+            let user = messages
+                .iter()
+                .find(|m| m.role == "user")
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+            self.captured.lock().unwrap().push(user);
+            Ok(r#"{"chart": null, "fit": "mismatch"}"#.to_string())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plan_for_session_folds_ledger_context_into_selector_prompt() {
+        // M5.3: with a ledger store + assembler attached, `plan_for_session`
+        // renders the session ledger and prepends it to the selector prompt.
+        use crate::node_store::ContentNodeStore;
+        let dir = std::env::temp_dir().join(format!(
+            "coral-router-plan-ctx-{}",
+            common_core::hash::uuid_v4()
+        ));
+        let store = Arc::new(ContentNodeStore::open(&dir).unwrap());
+        let _ = std::fs::remove_file(&dir);
+        store
+            .record_request("sess-plan", "r1", "PLAN LEDGER CONTEXT at LOD0")
+            .unwrap();
+        let (chart_store, _tmp) = indexed_store();
+
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let route = PlanRoute::new()
+            .with_chart_store(chart_store)
+            .with_selector_backend(Arc::new(RecordingSelector {
+                captured: Arc::clone(&captured),
+            }))
+            .with_charts_config(ChartsConfig {
+                min_score: 0.0,
+                ..Default::default()
+            })
+            .with_prompt_assembler(PromptAssemblerCtx::new(
+                store,
+                LedgerPromptAssembler,
+                PromptBudget::new(10_000),
+                LodSpec::full(),
+            ));
+
+        let result = route
+            .plan_for_session(Some("sess-plan"), "the request", &[])
+            .await;
+        assert_eq!(result.source, PlanSource::FreshDraft);
+
+        let prompt = captured.lock().unwrap().last().cloned().unwrap_or_default();
+        assert!(
+            prompt.contains("PLAN LEDGER CONTEXT at LOD0"),
+            "selector prompt must include the assembled ledger context, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("the request"),
+            "selector prompt must still carry the request"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plan_without_session_keeps_blank_slate_prompt() {
+        // M5.3 degradation: no session_id → identical to today's prompt (no
+        // ledger context prepended), even with an assembler attached.
+        use crate::node_store::ContentNodeStore;
+        let dir = std::env::temp_dir().join(format!(
+            "coral-router-plan-nosess-{}",
+            common_core::hash::uuid_v4()
+        ));
+        let store = Arc::new(ContentNodeStore::open(&dir).unwrap());
+        let _ = std::fs::remove_file(&dir);
+        store
+            .record_request("sess-plan", "r1", "CONTEXT SHOULD NOT APPEAR")
+            .unwrap();
+        let (chart_store, _tmp) = indexed_store();
+
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let route = PlanRoute::new()
+            .with_chart_store(chart_store)
+            .with_selector_backend(Arc::new(RecordingSelector {
+                captured: Arc::clone(&captured),
+            }))
+            .with_charts_config(ChartsConfig {
+                min_score: 0.0,
+                ..Default::default()
+            })
+            .with_prompt_assembler(PromptAssemblerCtx::new(
+                store,
+                LedgerPromptAssembler,
+                PromptBudget::new(10_000),
+                LodSpec::full(),
+            ));
+
+        let _ = route.plan("the request", &[]).await;
+        let prompt = captured.lock().unwrap().last().cloned().unwrap_or_default();
+        assert!(
+            !prompt.contains("CONTEXT SHOULD NOT APPEAR"),
+            "no session_id -> no ledger context prepended, got: {prompt}"
+        );
+        assert!(prompt.contains("the request"));
     }
 }

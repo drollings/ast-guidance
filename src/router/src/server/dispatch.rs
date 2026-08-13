@@ -3,13 +3,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use common_core::ResponseCache;
+use fluent_concurrency::ladder::first_accept_in_order;
 use http_body_util::BodyExt;
 
 use crate::dag_session::DependencySession;
 use crate::dispatch::backend::ChatBackend;
 use crate::dispatch::backend::OpenAiChatBackend;
-use crate::dispatch::backend::RetryChatBackend;
-use crate::dispatch::escalation::{EscalationContext, EscalationLadder};
+use crate::dispatch::backend::RetryBackend;
+use crate::dispatch::escalation::{EscalationContext, Ladder};
 use crate::dispatch::frontier::DispatchError;
 use crate::pipeline::RoutingTarget;
 use crate::server::responses::answer_text;
@@ -37,6 +38,25 @@ pub struct DispatchOutcome {
     pub stream_answer: Option<StreamAnswer>,
 }
 
+/// The shared, request-invariant dependencies threaded through
+/// `handle_dispatch` → `dispatch_real` → `dispatch_to_single_target`.
+///
+/// Pure struct bundling: collapses the former 14/12/9-argument dispatch
+/// signatures into one `&DispatchDeps` (the fields `ServerDeps` already
+/// bundles for the HTTP handler). Zero runtime cost — no vtable, no behavior
+/// change. Build once per request in the handler and borrow it.
+#[derive(Clone)]
+pub struct DispatchDeps {
+    pub http_client: Arc<reqwest::Client>,
+    pub cache: Option<Arc<ResponseCache>>,
+    pub stats: Arc<ServerStats>,
+    pub extractor: Option<Arc<WorkflowExtractor>>,
+    pub ladders: HashMap<String, Arc<Ladder>>,
+    pub context_cache: Option<Arc<dyn fluent_types::ContextCache>>,
+    pub session: Option<Arc<Mutex<DependencySession>>>,
+    pub instance_pool: Option<crate::instances::InstancePool>,
+}
+
 #[allow(clippy::implicit_hasher)]
 pub async fn handle_dispatch(
     rt: &RoutingTarget,
@@ -44,20 +64,16 @@ pub async fn handle_dispatch(
     model_name: &str,
     user_text: &str,
     mock_dispatch: Option<&Arc<MockDispatchContext>>,
-    http_client: &reqwest::Client,
     is_stream: bool,
-    cache: Option<&Arc<ResponseCache>>,
-    stats: &ServerStats,
-    extractor: Option<Arc<WorkflowExtractor>>,
-    ladders: &HashMap<String, Arc<EscalationLadder>>,
-    context_cache: Option<&Arc<dyn fluent_types::ContextCache>>,
-    session: Option<&Arc<Mutex<DependencySession>>>,
-    instance_pool: Option<&crate::instances::InstancePool>,
+    deps: &DispatchDeps,
 ) -> Result<DispatchOutcome, std::convert::Infallible> {
     // A rewind may have restored a KV snapshot; carry its fork-facing identity
     // (snapshot/instance/id_slot) into the outgoing body via the target's
     // request fields so the next dispatch switches that snapshot into its slot.
-    let pending = session.and_then(|s| common_core::sync::lock(s).pending_kv_fields());
+    let pending = deps
+        .session
+        .as_ref()
+        .and_then(|s| common_core::sync::lock(s).pending_kv_fields());
     // The client's explicit routing fields (`instance`/`snapshot`/`id_slot`)
     // override any the target derived from config; pending rewind fields take
     // precedence over the request's.
@@ -85,33 +101,27 @@ pub async fn handle_dispatch(
     let target_streams = is_stream && rt.stream;
 
     if !target_streams {
-        if let Some(cache_backend) = cache {
+        if let Some(cache_backend) = deps.cache.as_ref() {
             // Boundary: the cache key is the serialized request body.
             let request_json = serde_json::to_string(router_request).unwrap_or_default();
             if let Some(cached) = cache_backend.get(&rt.model, &request_json) {
-                stats
+                deps.stats
                     .cache_hits
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::debug!(target: "router.dispatch", model = %rt.model, "cache hit");
                 let Ok(mut response) =
                     serde_json::from_value::<RouterResponse>(cached.response_json)
                 else {
-                    stats
+                    deps.stats
                         .cache_misses
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return dispatch_real(
                         rt,
                         router_request,
                         model_name,
-                        http_client,
+                        deps,
                         target_streams,
-                        cache,
                         user_text,
-                        extractor,
-                        ladders,
-                        context_cache,
-                        session,
-                        instance_pool,
                     )
                     .await;
                 };
@@ -133,7 +143,7 @@ pub async fn handle_dispatch(
                     stream_answer: None,
                 });
             }
-            stats
+            deps.stats
                 .cache_misses
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -148,15 +158,9 @@ pub async fn handle_dispatch(
                     rt,
                     router_request,
                     model_name,
-                    http_client,
+                    deps,
                     target_streams,
-                    cache,
                     user_text,
-                    extractor,
-                    ladders,
-                    context_cache,
-                    session,
-                    instance_pool,
                 )
                 .await;
             }
@@ -188,26 +192,20 @@ pub async fn handle_dispatch(
         rt,
         router_request,
         model_name,
-        http_client,
+        deps,
         target_streams,
-        cache,
         user_text,
-        extractor,
-        ladders,
-        context_cache,
-        session,
-        instance_pool,
     )
     .await
 }
 
-/// Build a `ChatBackend` (optionally wrapped in `RetryChatBackend`) for a single
+/// Build a `ChatBackend` (optionally wrapped in `RetryBackend`) for a single
 /// routing target.
 fn make_backend(http_client: &reqwest::Client, target: &RoutingTarget) -> Arc<dyn ChatBackend> {
     let base: Arc<dyn ChatBackend> =
         Arc::new(OpenAiChatBackend::new(http_client.clone(), &target.url));
     if target.retry_count > 0 {
-        Arc::new(RetryChatBackend::new(
+        Arc::new(RetryBackend::new(
             base,
             target.retry_count,
             target.retry_base_interval_s,
@@ -263,15 +261,13 @@ pub(crate) fn render_prompt(router_request: &RouterRequest) -> String {
 async fn dispatch_to_single_target(
     target: &RoutingTarget,
     router_request: &RouterRequest,
-    http_client: &reqwest::Client,
     stream: bool,
-    cache: Option<&Arc<ResponseCache>>,
     is_primary: bool,
     is_fallback: bool,
     user_text: &str,
-    extractor: Option<Arc<WorkflowExtractor>>,
+    deps: &DispatchDeps,
 ) -> Result<DispatchOutcome, DispatchError> {
-    let backend = make_backend(http_client, target);
+    let backend = make_backend(&deps.http_client, target);
 
     let params = crate::dispatch::backend::params_with_routing_fields(
         target.params.clone(),
@@ -327,7 +323,7 @@ async fn dispatch_to_single_target(
 
     // Cache only the primary (first) target's response
     if is_primary {
-        if let Some(cache_backend) = cache {
+        if let Some(cache_backend) = deps.cache.as_ref() {
             // Boundary: the cache key is the serialized request body.
             let request_json = serde_json::to_string(router_request).unwrap_or_default();
             if let Ok(response_json) = serde_json::to_value(&completion) {
@@ -341,7 +337,7 @@ async fn dispatch_to_single_target(
     // M10a: record the *real* rendered prompt; M10b: the extractor gates on
     // `is_fallback` + its configured mode (frontier-assisted by default).
     let answer = answer_text(&completion).unwrap_or_default();
-    if let Some(extractor) = extractor {
+    if let Some(extractor) = deps.extractor.as_ref() {
         let prompt = render_prompt(router_request);
         extractor.record_success(user_text, &prompt, &target.model, &answer, is_fallback);
     }
@@ -363,148 +359,160 @@ pub async fn dispatch_real(
     rt: &RoutingTarget,
     router_request: &RouterRequest,
     model_name: &str,
-    http_client: &reqwest::Client,
+    deps: &DispatchDeps,
     stream: bool,
-    cache: Option<&Arc<ResponseCache>>,
     user_text: &str,
-    extractor: Option<Arc<WorkflowExtractor>>,
-    ladders: &HashMap<String, Arc<EscalationLadder>>,
-    context_cache: Option<&Arc<dyn fluent_types::ContextCache>>,
-    session: Option<&Arc<Mutex<DependencySession>>>,
-    instance_pool: Option<&crate::instances::InstancePool>,
 ) -> Result<DispatchOutcome, std::convert::Infallible> {
     let all_targets = std::iter::once(rt)
         .chain(rt.fallbacks.iter())
         .collect::<Vec<_>>();
 
-    let mut last_error: Option<DispatchError> = None;
+    let mut attempt = 0usize;
+    let total = all_targets.len();
 
-    for (i, target) in all_targets.iter().enumerate() {
-        tracing::info!(
-            target: "router.server",
-            attempt = i + 1,
-            total = all_targets.len(),
-            model = %target.model,
-            url = %target.url,
-            stream = stream,
-            retry_count = target.retry_count,
-            idle_timeout_ms = target.idle_timeout_ms,
-            total_timeout_ms = target.total_timeout_ms,
-            "dispatch attempt"
-        );
-
-        // On-demand residency: ensure the target's managed model is loaded
-        // (spawn its llama-server if it is lazy and currently unloaded) and
-        // that a specifically-targeted instance exists. Best-effort — a load
-        // failure surfaces as the target's own dispatch error below.
-        if let Some(pool) = instance_pool {
-            pool.ensure_target_ready(&target.url, target.instance.as_deref())
-                .await;
-        }
-
-        let attempt_start = Instant::now();
-        match dispatch_to_single_target(
-            target,
-            router_request,
-            http_client,
-            stream,
-            cache,
-            i == 0,
-            i > 0,
-            user_text,
-            extractor.clone(),
-        )
-        .await
-        {
-            Ok(outcome) => {
-                crate::audit::emit(
-                    "route",
-                    serde_json::json!({
-                        "stage": "dispatch",
-                        "verdict": "dispatched",
-                        "model": target.model,
-                        "url": target.url,
-                        "attempt": i + 1,
-                        "total": all_targets.len(),
-                        "outcome": "success",
-                    }),
-                );
-                return Ok(outcome);
-            }
-            Err(e) => {
-                // M4 allocate-on-503: a group-miss means the pool had no free
-                // member. Ask the sidecar to allocate fresh KV for the group
-                // (weights already loaded), then retry this target once.
-                if let DispatchError::InstanceGroupMiss { group } = &e {
-                    if let Some(mgr) =
-                        instance_pool.and_then(|pool| pool.manager_for_url(&target.url))
-                    {
-                        if mgr.ensure_group(group).await.is_ok() {
-                            crate::audit::emit(
-                                "instances",
-                                serde_json::json!({
-                                    "action": "allocate_on_miss",
-                                    "group": group,
-                                }),
-                            );
-                            if let Ok(outcome) = dispatch_to_single_target(
-                                target,
-                                router_request,
-                                http_client,
-                                stream,
-                                cache,
-                                i == 0,
-                                i > 0,
-                                user_text,
-                                extractor.clone(),
-                            )
-                            .await
-                            {
-                                return Ok(outcome);
-                            }
-                        }
-                    }
-                }
-                let attempt_latency_ms = attempt_start.elapsed().as_millis() as u64;
-                let is_retryable = e.is_retryable();
-                crate::audit::emit(
-                    "route",
-                    serde_json::json!({
-                        "stage": "dispatch",
-                        "verdict": "dispatch_failed",
-                        "model": target.model,
-                        "url": target.url,
-                        "attempt": i + 1,
-                        "total": all_targets.len(),
-                        "outcome": "failed",
-                        "error": e.to_string(),
-                        "retryable": is_retryable,
-                    }),
-                );
-                tracing::warn!(
+    // First-accept-wins over the target chain (primary + fallbacks). Each
+    // rung owns the per-target residency/audit/warn side effects and the
+    // allocate-on-503 retry; `stop` short-circuits on a non-retryable error
+    // (e.g. 400 Bad Request). The combinator returns the terminal error (the
+    // stop trigger or the last rung failure) for the post-chain
+    // escalation/fallback handling.
+    let result = first_accept_in_order(
+        all_targets,
+        |target| {
+            let i = attempt;
+            attempt += 1;
+            async move {
+                tracing::info!(
                     target: "router.server",
                     attempt = i + 1,
-                    total = all_targets.len(),
+                    total = total,
                     model = %target.model,
-                    error = %e,
-                    retryable = is_retryable,
-                    attempt_latency_ms = attempt_latency_ms,
-                    remaining = all_targets.len() - i - 1,
-                    "dispatch attempt failed"
+                    url = %target.url,
+                    stream = stream,
+                    retry_count = target.retry_count,
+                    idle_timeout_ms = target.idle_timeout_ms,
+                    total_timeout_ms = target.total_timeout_ms,
+                    "dispatch attempt"
                 );
-                last_error = Some(e);
-                // Non-retryable errors (e.g. 400 Bad Request) short-circuit
-                if !is_retryable {
-                    break;
+
+                // On-demand residency: ensure the target's managed model is
+                // loaded (spawn its llama-server if it is lazy and currently
+                // unloaded) and that a specifically-targeted instance exists.
+                // Best-effort — a load failure surfaces as the target's own
+                // dispatch error below.
+                if let Some(pool) = deps.instance_pool.as_ref() {
+                    pool.ensure_target_ready(&target.url, target.instance.as_deref())
+                        .await;
+                }
+
+                let attempt_start = Instant::now();
+                match dispatch_to_single_target(
+                    target,
+                    router_request,
+                    stream,
+                    i == 0,
+                    i > 0,
+                    user_text,
+                    deps,
+                )
+                .await
+                {
+                    Ok(outcome) => {
+                        crate::audit::emit(
+                            "route",
+                            serde_json::json!({
+                                "stage": "dispatch",
+                                "verdict": "dispatched",
+                                "model": target.model,
+                                "url": target.url,
+                                "attempt": i + 1,
+                                "total": total,
+                                "outcome": "success",
+                            }),
+                        );
+                        Ok(Some(outcome))
+                    }
+                    Err(e) => {
+                        // M4 allocate-on-503: a group-miss means the pool had
+                        // no free member. Ask the sidecar to allocate fresh KV
+                        // for the group (weights already loaded), then retry
+                        // this target once.
+                        if let DispatchError::InstanceGroupMiss { group } = &e {
+                            if let Some(mgr) = deps
+                                .instance_pool
+                                .as_ref()
+                                .and_then(|pool| pool.manager_for_url(&target.url))
+                            {
+                                if mgr.ensure_group(group).await.is_ok() {
+                                    crate::audit::emit(
+                                        "instances",
+                                        serde_json::json!({
+                                            "action": "allocate_on_miss",
+                                            "group": group,
+                                        }),
+                                    );
+                                    if let Ok(outcome) = dispatch_to_single_target(
+                                        target,
+                                        router_request,
+                                        stream,
+                                        i == 0,
+                                        i > 0,
+                                        user_text,
+                                        deps,
+                                    )
+                                    .await
+                                    {
+                                        return Ok(Some(outcome));
+                                    }
+                                }
+                            }
+                        }
+                        let attempt_latency_ms = attempt_start.elapsed().as_millis() as u64;
+                        let is_retryable = e.is_retryable();
+                        crate::audit::emit(
+                            "route",
+                            serde_json::json!({
+                                "stage": "dispatch",
+                                "verdict": "dispatch_failed",
+                                "model": target.model,
+                                "url": target.url,
+                                "attempt": i + 1,
+                                "total": total,
+                                "outcome": "failed",
+                                "error": e.to_string(),
+                                "retryable": is_retryable,
+                            }),
+                        );
+                        tracing::warn!(
+                            target: "router.server",
+                            attempt = i + 1,
+                            total = total,
+                            model = %target.model,
+                            error = %e,
+                            retryable = is_retryable,
+                            attempt_latency_ms = attempt_latency_ms,
+                            remaining = total.saturating_sub(i + 1),
+                            "dispatch attempt failed"
+                        );
+                        Err(e)
+                    }
                 }
             }
-        }
-    }
+        },
+        |e: &DispatchError| !e.is_retryable(),
+    )
+    .await;
+
+    let last_error = match result {
+        Ok(Some(outcome)) => return Ok(outcome),
+        Err(e) => Some(e),
+        Ok(None) => None,
+    };
 
     // M3 escalation: only after the local chain is exhausted do we engage the
     // frontier ladder. The ladder is resolved from the resolved route's group
     // (`RoutingTarget.group`); direct-model targets (no group) get `None`.
-        if let Some(ladder) = rt.group.as_deref().and_then(|g| ladders.get(g)) {
+        if let Some(ladder) = rt.group.as_deref().and_then(|g| deps.ladders.get(g)) {
         tracing::info!(
             target: "router.server",
             group = ?rt.group,
@@ -516,8 +524,8 @@ pub async fn dispatch_real(
             request: router_request,
             user_text,
             model_name,
-            context_cache,
-            session,
+            context_cache: deps.context_cache.as_ref(),
+            session: deps.session.as_ref(),
         };
         if let Some(resp) = ladder.try_escalate(&esc_ctx).await {
             return Ok(DispatchOutcome {
@@ -681,22 +689,19 @@ mod tests {
             id_slot: None,
             metadata: Default::default(),
         };
-        let outcome = dispatch_real(
-            &target,
-            &request,
-            "base",
-            &reqwest::Client::new(),
-            false,
-            None,
-            "hello",
-            None,
-            &std::collections::HashMap::new(),
-            None,
-            None,
-            Some(&pool),
-        )
-        .await
-        .expect("dispatch_real is infallible");
+        let deps = DispatchDeps {
+            http_client: Arc::new(reqwest::Client::new()),
+            cache: None,
+            stats: Arc::new(ServerStats::default()),
+            extractor: None,
+            ladders: std::collections::HashMap::new(),
+            context_cache: None,
+            session: None,
+            instance_pool: Some(pool),
+        };
+        let outcome = dispatch_real(&target, &request, "base", &deps, false, "hello")
+            .await
+            .expect("dispatch_real is infallible");
         assert!(outcome.response.status().is_success(), "retry succeeded");
 
         let recorded = stub.recorded();

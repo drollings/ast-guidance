@@ -8,8 +8,8 @@
 //! - `pipeline` — `PipelineOrchestrator`, `PipelineResult`
 //! - `stages` — pipeline stage implementations (deterministic, classifier, router)
 //! - `transforms` — `TransformStrategy`, transforms (NoTransform, PiiAnonymize, etc.)
-//! - `dispatch` — `ChatBackend` + `OpenAiChatBackend`/`RetryChatBackend`/`FallbackChatBackend`
-//! - `kv_cache` — `HotKvCache`, `ColdKvCache`, `KvCacheManager`
+//! - `dispatch` — `ChatBackend` + `OpenAiChatBackend`/`RetryBackend`/`BackendChain`
+//! - `kv_cache` — `HotSnapshotIndex`, `ColdSnapshotIndex`, `SnapshotStore`
 //! - `summarization` — `ResultScorer`, `ScoredResult`, `Summarizer`
 //! - `scheduler` — `AffinityScheduler`, `ScheduledTask`, `AgingConfig`
 //! - `dag_session` — `DependencySession`, `SessionStep`, `StepResult`, `DagError`,

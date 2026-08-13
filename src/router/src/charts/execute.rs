@@ -24,6 +24,7 @@ use std::sync::Arc;
 use common_core::metrics::LatencyHistogram;
 use fluent_concurrency::pool::Limiter;
 use fluent_concurrency::zone::{Zone, ZoneConfig, ZoneEvent};
+use fluent_dag::dep_graph::DependencyGraph;
 use fluent_llm::client::ChatBackend;
 use fluent_wvr::prelude::*;
 use fluent_wvr::Runtime;
@@ -222,14 +223,36 @@ impl ChartExecutionPlan {
         let mut completed: HashMap<String, StageDecision> = HashMap::new();
         let mut failed: HashSet<String> = HashSet::new();
 
+        // The dependency graph is the single source of readiness and ordering —
+        // it mirrors the topo graph built at compile time (`compile::topo_order`,
+        // F9): each target registers its name, its upstream ids as deps, and
+        // provides its own name (the DependencySession convention). The executor
+        // never re-implements a ready scan by hand.
+        let mut graph: DependencyGraph<String> = DependencyGraph::new();
+        for t in &self.targets {
+            graph
+                .register(&t.name, &t.upstream_ids, std::slice::from_ref(&t.name))
+                .map_err(|e| ChartError::Compile {
+                    reason: format!("stage graph invalid: {e}"),
+                })?;
+        }
+        // name → target lookup for resolving ready node names back to stages.
+        let by_name: HashMap<&str, &CompiledTarget> =
+            self.targets.iter().map(|t| (t.name.as_str(), t)).collect();
+
         // The topo order guarantees every upstream id precedes its dependents,
         // so wave iteration terminates: each wave completes ≥1 target.
         loop {
-            let ready: Vec<&CompiledTarget> = self
-                .targets
-                .iter()
-                .filter(|t| !completed.contains_key(&t.name) && !failed.contains(&t.name))
-                .filter(|t| t.upstream_ids.iter().all(|u| completed.contains_key(u)))
+            // Ready = registered nodes whose deps are all satisfied (the
+            // canonical `ready_nodes` — one inverted-index scan per wave, the
+            // same cost as the per-target `.all()` filter it replaces),
+            // excluding targets already completed or failed.
+            let satisfied: HashSet<String> = completed.keys().cloned().collect();
+            let ready: Vec<&CompiledTarget> = graph
+                .ready_nodes(&satisfied)
+                .into_iter()
+                .filter(|name| !completed.contains_key(name) && !failed.contains(name))
+                .filter_map(|name| by_name.get(name.as_str()).copied())
                 .collect();
             if ready.is_empty() {
                 break;
@@ -290,8 +313,15 @@ impl ChartExecutionPlan {
             }
         }
 
-        // Targets neither completed nor failed were cancelled because a
-        // dependency failed (their upstreams never all completed).
+        // Targets neither completed nor failed were cancelled: their
+        // dependency chain never completed (a dependency failed), or an
+        // essential-failure abort left them ready-but-unexecuted. A single
+        // "not completed and not failed" pass classifies every target — the
+        // plain sweep (M8.2). Note: this is intentionally NOT
+        // `graph.dependents_of(failed)` alone — an abort can strand a ready
+        // target in an *independent* branch (its deps all completed, so it is
+        // not a transitive dependent of the failed target) that the sweep
+        // still cancels; `dependents_of` is a proper subset.
         let mut cancelled: Vec<String> = Vec::new();
         for t in &self.targets {
             if completed.contains_key(&t.name) {
@@ -746,6 +776,66 @@ mod tests {
             .expect("runs");
         assert!(summary.failed.contains(&"a".to_string()));
         assert!(summary.cancelled.contains(&"b".to_string()));
+        assert!(!summary.accepted);
+    }
+
+    /// An essential failure aborts the chart even when an *independent* branch
+    /// has a ready-but-unexecuted target: that target is still cancelled (its
+    /// deps all completed but the chart stopped), so the cancelled set is a
+    /// "not completed and not failed" sweep — not merely the transitive
+    /// `dependents_of` the failed essential target. Locks M8.2's classifier.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn essential_failure_cancels_independent_ready_branch() {
+        let chart_json = r#"{
+            "name": "split",
+            "description": "two independent branches",
+            "schema_version": 1,
+            "author_model": "human",
+            "targets": [
+                { "name": "a1", "provides": ["a1_out"], "depends": [],
+                  "template": "a1 {{ request }}", "essential": true },
+                { "name": "a2", "provides": ["a2_out"], "depends": [
+                    { "kind": "capability", "name": "a1_out" }
+                  ], "template": "a2 {{ upstream.a1.output }}", "essential": true },
+                { "name": "b1", "provides": ["b1_out"], "depends": [],
+                  "template": "b1 {{ request }}", "essential": false },
+                { "name": "b2", "provides": ["b2_out"], "depends": [
+                    { "kind": "capability", "name": "b1_out" }
+                  ], "template": "b2 {{ upstream.b1.output }}", "essential": false }
+            ]
+        }"#;
+        // Wave 1 schedules {a1, b1}; a1 fails (essential), b1 completes. The
+        // abort leaves a2 (dependent of a1) *and* b2 (ready via b1, independent
+        // of a1) both cancelled.
+        let backend: Arc<dyn ChatBackend> = Arc::new(KeyedBackend::new(vec![
+            ("a1 ".to_string(), "__error__".to_string()),
+            ("b1 ".to_string(), r#"{"out": "b1"}"#.to_string()),
+        ]));
+        let plan = build_plan(chart_json, &backend, &[]);
+        let summary = plan
+            .execute(&make_ctx("run"), &default_opts())
+            .await
+            .expect("runs");
+
+        let completed: Vec<&str> = summary
+            .completed
+            .iter()
+            .map(|d| d.metadata["chart_target"].as_str().unwrap_or("?"))
+            .collect();
+        assert!(completed.contains(&"b1"), "b1 completed, got {completed:?}");
+        assert!(summary.failed.contains(&"a1".to_string()), "a1 failed");
+        // Both the dependent-of-the-failure (a2) and the ready-but-independent
+        // (b2) land in cancelled — `dependents_of(a1)` alone would miss b2.
+        assert!(
+            summary.cancelled.contains(&"a2".to_string()),
+            "a2 cancelled: {:?}",
+            summary.cancelled
+        );
+        assert!(
+            summary.cancelled.contains(&"b2".to_string()),
+            "b2 cancelled: {:?}",
+            summary.cancelled
+        );
         assert!(!summary.accepted);
     }
 

@@ -9,6 +9,7 @@ pub mod capability;
 pub mod flow;
 #[cfg(feature = "db")]
 pub mod io;
+pub mod ladder;
 pub mod llm_queue;
 pub mod pool;
 pub mod queue;

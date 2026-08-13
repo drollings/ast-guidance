@@ -394,8 +394,8 @@ rest of device memory the moment a request earns it — never before.
 ## The Ledger: Content Nodes and levels of detail
 
 Every paragraph, prompt, tool result, or intermediate artifact is stored as a
-**Content Node** — the game-engine concept of level-of-detail and scene graph
-applied to semantic text. A `ContentNode` is the canonical type (defined in
+**Content Node** — the game-engine concept of level-of-detail applied to
+semantic text. A `ContentNode` is the canonical type (defined in
 `fluent_types`) that unifies durable storage fields with session-scoped
 metadata — no separate `ContextNode` / `SessionNode` split. The 6-tier LOD
 scheme is defined here (as routing policy); storage and rendering of
@@ -427,36 +427,53 @@ snapshot references where applicable. This is what lets a node be rendered
 either as bare text or as an anchor into richer context (a file on disk, a
 prior session's KV state, a knowledge-graph entity).
 
-## Ledger HNSW: conceptual-distance scene graphs
+## Efficient ledger representations: fidelity by level of detail
 
-Each LOD tier maintains its own lazily-computed HNSW index over that tier's
-node embeddings — a "scene," in the game-engine sense, recomputed only for
-the dirty subset when the nodes it covers change. This is the mechanism that
-lets the ledger behave like a stable, bounded context window instead of a
-monotonically growing one: conceptual distance from the current focus
-determines how a node renders. Near neighbors render toward full detail
-(down toward LOD0); distant nodes collapse toward LOD4/LOD5. A specialized
-agent can request a scene rendered with a different subjective focus, and get
-a different fidelity distribution over the same underlying nodes without any
-of them being duplicated or recomputed.
+The ledger's purpose in agent orchestration is to **synchronize agents to a
+shared task** without ever handing any of them the raw, ever-growing
+transcript. It does this by rendering an **efficient representation** of the
+shared ledger — a bounded slice of Content Nodes at a fidelity matched to a
+worker's context window and its role in the task. The mechanism is exactly the
+level-of-detail stack defined above, not a separate index: each node already
+carries a ladder of progressively-coarser representations (LOD0 full text →
+LOD5 label), every one derived from LOD0.
 
-This is deliberately a **separate concern** from the three library-scale
-HNSW indices — the prior-workflow library, the rubric/validated-answer
-cache, and the blacklist-similarity index. Those operate cross-session,
-over durable artifacts, and are kept as separate indices from each other
-because a false positive means something different, and costs something
-different, in each case (a workflow-library miss just falls back to planning
-from scratch; a blacklist-similarity false positive is a false accusation).
-The ledger's per-level scene graphs are session-scoped, operate at a
-different granularity, and are not merged into the library-scale indices —
-five index concerns, kept apart, each with its own acceptable error rate and
-its own dirty/rebuild cadence.
+Different agents working the same session share the same underlying nodes but
+receive a different fidelity distribution over them: an orchestrator wants
+breadth (LOD1), a narrow specialist focus (LOD3/4), a judge or red-team full
+fidelity (LOD0). Because LOD1–LOD4 are cached on the shared node itself, this
+costs reference-count bumps rather than recomputation, and agents converge on
+the same shared ledger state while each sees only what its role needs — the
+ledger is the point of synchronization, and levels of detail are how a shared
+body of work is made legible to many agents with different context budgets.
 
-All five HNSW index instances (one per LOD tier, three library-scale) are
-built using the same shared HNSW factory (`fluent-db::hnsw` /
-`common_core::sqlite::make_hnsw`) and stored in the router's SQLite store.
-Coral Router owns the index scoping and the decision of which index to query
-for a given routing or cache operation.
+To *choose* which nodes to surface and at what fidelity, the assembler needs a
+relevance signal against the current focus, so a stable, boundedly-sized
+representation replaces the accumulating window: nodes near the focus render
+toward full detail (down toward LOD0), distant nodes collapse toward LOD4/LOD5.
+The design does **not** prescribe a single index for this. The requirement is
+that the choice be deterministic, cheap, incremental, and budget-bounded; the
+concrete mechanism is an implementation detail to be evaluated on cost and
+boundedness, and a few candidate approaches are named here only (not
+specified):
+
+- **Cosine similarity** over node embeddings — the current brute-force path
+  (`ContentNodeStore::knn_search`).
+- **Sparse lexical ranking** (BM25-style) over a node's LOD0 / summary text.
+- An **approximate nearest-neighbor index** (e.g. HNSW) for very large
+  per-session ledgers where exact search would be a bottleneck.
+
+These are interchangeable behind the same fidelity-selection interface; none
+of them is a load-bearing commitment. Whatever mechanism is chosen is a
+**separate concern** from the three cross-session, library-scale indices — the
+prior-workflow library, the rubric/validated-answer cache, and the
+blacklist-similarity index. Those operate over durable artifacts where a false
+positive means something different, and costs something different, in each case
+(a workflow-library miss just falls back to planning from scratch; a
+blacklist-similarity false positive is a false accusation). The ledger's
+per-session relevance selection operates at a different granularity and is not
+merged into the library-scale indices — the concerns stay apart, each with its
+own acceptable error rate and its own update cadence.
 
 ## Shared Content Nodes and parallel ledgers
 
@@ -587,9 +604,9 @@ request falls to the next, more intelligent model in the group; the target
 that matches the complexity answers, and its answer is recorded to the
 session's ledger.
 
-**The Ledger** — nested Content Nodes, HNSW-scened per level, shared and
-reference-counted across parallel and filtered views — replaces a large
-accumulated context window. Conceptual distance between nodes determines
+**The Ledger** — nested Content Nodes rendered at per-node levels of detail,
+shared and reference-counted across parallel and filtered views — replaces a
+large accumulated context window. Conceptual distance between nodes determines
 whether they render in full detail or collapse toward a summary or label,
 giving any session a stable, boundedly-sized context regardless of its raw
 length, renderable at whatever fidelity and whatever subjective focus a

@@ -1,4 +1,4 @@
-//! NodeStore — the shared, reference-counted, interned, durable ContentNode
+//! ContentNodeStore — the shared, reference-counted, interned, durable ContentNode
 //! store (M4).
 //!
 //! This is the surgical successor to `ContentNodeLedger`'s per-process
@@ -40,7 +40,7 @@ use fluent_db::error::DbError;
 
 /// The shared ContentNode store: refcounted nodes + interned indices + durable
 /// backing.
-pub struct NodeStore {
+pub struct ContentNodeStore {
     /// Node id → shared node. The `Arc<RwLock<ContentNode>>` is the sharing
     /// primitive: LOD derivation mutates the shared node, so every holder
     /// observes it.
@@ -59,9 +59,15 @@ pub struct NodeStore {
     /// can be attached after the store is `Arc`-shared
     /// (`ContentNodeLedger::with_summarizer`).
     summarizer: Mutex<Option<Summarizer>>,
+    /// Optional tier-event feed (M2): a sender the background
+    /// `LedgerTierWorker` drains to fill LOD4/LOD5. `None` (the default) leaves
+    /// today's behavior — a store with no attached worker is byte-identical to
+    /// before. `Mutex` for interior mutability so it can be attached after the
+    /// store is `Arc`-shared.
+    tier_events: Mutex<Option<tokio::sync::mpsc::UnboundedSender<NodeId>>>,
 }
 
-impl NodeStore {
+impl ContentNodeStore {
     /// Open (or create) the durable store at `path`, run the ledger schema
     /// migrations, and hydrate the in-memory maps from every row.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, LedgerError> {
@@ -87,6 +93,7 @@ impl NodeStore {
             next_id: AtomicI64::new(1),
             durable: None,
             summarizer: Mutex::new(None),
+            tier_events: Mutex::new(None),
         }
     }
 
@@ -104,6 +111,7 @@ impl NodeStore {
             next_id: AtomicI64::new(1),
             durable,
             summarizer: Mutex::new(None),
+            tier_events: Mutex::new(None),
         };
         store_obj.hydrate()?;
         Ok(store_obj)
@@ -122,6 +130,60 @@ impl NodeStore {
     /// `with_summarizer` uses this through the `Arc`).
     pub fn set_summarizer(&self, summarizer: Summarizer) {
         *lock(&self.summarizer) = Some(summarizer);
+    }
+
+    /// Attach a tier-event sender (M2). When set, the canonical write paths
+    /// (`insert_node`, `record_result`) enqueue any node whose LOD4/LOD5 is
+    /// empty so the background `LedgerTierWorker` can fill them. A store with
+    /// no sender keeps today's behavior (opt-in).
+    pub fn set_tier_events(&self, sender: tokio::sync::mpsc::UnboundedSender<NodeId>) {
+        *lock(&self.tier_events) = Some(sender);
+    }
+
+    /// Enqueue `node_id` on the tier-event feed if its LOD4 or LOD5 is empty
+    /// and a sender is attached. No-op when no sender is attached.
+    fn enqueue_if_needs_tier(&self, node_id: NodeId) {
+        let sender = lock(&self.tier_events).clone();
+        if let Some(sender) = sender {
+            if self.needs_tier(node_id) {
+                let _ = sender.send(node_id);
+            }
+        }
+    }
+
+    /// Whether a node still needs background LOD4/LOD5 derivation (its LOD4 or
+    /// LOD5 tier is empty).
+    pub fn needs_tier(&self, node_id: NodeId) -> bool {
+        self.get_node(node_id).is_some_and(|arc| {
+            let guard = lock_read(&arc);
+            let lod4_empty = guard.lod.get(4).is_none_or(String::is_empty);
+            let lod5_empty = guard.lod.get(5).is_none_or(String::is_empty);
+            lod4_empty || lod5_empty
+        })
+    }
+
+    /// All node ids whose given tiers are empty (M2 boot backfill / worker).
+    /// Iterates the interned session index for the id list (no full node-scan
+    /// Arc clones), then checks each node's tiers under a short read guard.
+    pub fn node_ids_needing_tier(&self, levels: &[u8]) -> Vec<NodeId> {
+        let ids: Vec<NodeId> = lock_read(&self.by_session)
+            .values()
+            .flatten()
+            .copied()
+            .collect();
+        let mut out: Vec<NodeId> = Vec::new();
+        for id in ids {
+            let needs = self.get_node(id).is_some_and(|arc| {
+                let guard = lock_read(&arc);
+                levels
+                    .iter()
+                    .any(|l| guard.lod.get(*l as usize).is_none_or(String::is_empty))
+            });
+            if needs {
+                out.push(id);
+            }
+        }
+        out
     }
 
     /// Access the durable backing (for the facade's flat view and the poison
@@ -215,6 +277,7 @@ impl NodeStore {
                 node.active_lod = Some(LOD0_FULL_TEXT);
             }
         })?;
+        self.enqueue_if_needs_tier(node_id);
         Ok(())
     }
 
@@ -251,6 +314,7 @@ impl NodeStore {
         lock_write(&self.nodes).insert(node_id, Arc::clone(&arc));
         self.index_node(node_id);
         self.persist_insert(&arc)?;
+        self.enqueue_if_needs_tier(node_id);
         Ok(node_id)
     }
 
@@ -385,8 +449,9 @@ impl NodeStore {
 
     /// Apply a mutation to the shared node and persist both the shared node and
     /// the `content_json` column. The single place that keeps the views in
-    /// sync.
-    fn with_node_mut<F>(&self, node_id: NodeId, f: F) -> Result<ContentNode, LedgerError>
+    /// sync. `pub(crate)` so the background `LedgerTierWorker` (M2) writes
+    /// derived tiers through the same canonical path.
+    pub(crate) fn with_node_mut<F>(&self, node_id: NodeId, f: F) -> Result<ContentNode, LedgerError>
     where
         F: FnOnce(&mut ContentNode),
     {
@@ -733,7 +798,9 @@ pub(crate) fn new_node(
 
 /// Deterministic, LLM-free LOD5 label (short descriptor), derived eagerly at
 /// node creation. Falls back to the role when no content survives truncation.
-fn derive_label(role: &str, content: &str) -> String {
+/// `pub(crate)` so the background `LedgerTierWorker` (M2) can use it as the
+/// no-model fallback for LOD5.
+pub(crate) fn derive_label(role: &str, content: &str) -> String {
     let sentence = common_core::string::first_sentence(content);
     let snippet = if sentence.is_empty() {
         common_core::string::truncate_utf8(content, 64)
@@ -771,12 +838,12 @@ mod tests {
     use super::*;
     use crate::test_stubs::{CountingBackend, StubChatBackend};
 
-    fn temp_store() -> NodeStore {
+    fn temp_store() -> ContentNodeStore {
         let dir = std::env::temp_dir().join(format!(
             "coral-router-nodestore-{}",
             common_core::hash::uuid_v4()
         ));
-        let store = NodeStore::open(&dir).unwrap();
+        let store = ContentNodeStore::open(&dir).unwrap();
         let _ = std::fs::remove_file(&dir);
         store
     }
@@ -838,12 +905,12 @@ mod tests {
         ));
         let path = dir.clone();
         {
-            let store = NodeStore::open(&path).unwrap();
+            let store = ContentNodeStore::open(&path).unwrap();
             store.record_request("s", "r1", "first").unwrap();
             store.record_request("s", "r2", "second").unwrap();
         } // drop
         {
-            let store = NodeStore::open(&path).unwrap();
+            let store = ContentNodeStore::open(&path).unwrap();
             let nodes = store.get_session_nodes("s", 10).unwrap();
             assert_eq!(nodes.len(), 2, "data must survive reopen");
             assert_eq!(nodes[0].request_id.as_deref(), Some("r2"));
@@ -883,7 +950,7 @@ mod tests {
 
     #[test]
     fn ephemeral_store_needs_no_durable() {
-        let store = NodeStore::ephemeral();
+        let store = ContentNodeStore::ephemeral();
         let id = store.record_request("s", "r1", "x").unwrap();
         assert!(store.get_node(id).is_some());
         assert!(store.get_session_entries("s", 10).unwrap().is_empty());
