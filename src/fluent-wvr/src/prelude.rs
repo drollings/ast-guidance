@@ -10,7 +10,8 @@ pub use crate::wrapper::{
 };
 pub use crate::{impl_component, impl_fieldless};
 pub use crate::{
-    Capability, CapabilitySet, Component, Describable, FieldAccess, FieldError, MetadataValue,
-    OutputStore, WorkContext, WorkError, WorkOutput, WorkUnit,
+    Capability, CapabilitySet, Component, Describable, DynamicComponent, DynamicExecutor,
+    FieldAccess, FieldError, MetadataValue, OutputStore, WorkContext, WorkError, WorkOutput,
+    WorkUnit,
 };
 pub use internment::ArcIntern;

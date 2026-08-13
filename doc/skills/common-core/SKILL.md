@@ -24,7 +24,9 @@ crate in the workspace. It must NOT import any `guidance-*`, `coral-*`,
 | Shell / subprocess helpers | `shell` | `src/common-core/src/shell.rs` |
 | JSON config load-or-default | `config` | `src/common-core/src/config.rs` |
 | ReadThroughCache<K, V>, LoadCache<K, V, E> (bounded get-or-load LRU) | `cache` | `src/common-core/src/cache.rs` |
-| Generic keyed registry (insert/get/keys/remove/len) | `registry` | `src/common-core/src/registry.rs` |
+| Weighted-LRU eviction engine (eviction_score, eviction_order, evict_until_fit) — "evict largest × coldest until under budget"; composes the InstancePool residency loop | `cache` | `src/common-core/src/cache.rs` |
+| Generic keyed registry (insert/get/keys/remove/len) — `KeyedRegistry` (sync) and `ConcurrentRegistry` (thread-safe, `resolve_or_create` single-construction, Arc-shared) | `registry` | `src/common-core/src/registry.rs` |
+| Retry with jittered exponential backoff (`retry_async`, `backoff_ms`, `capped_backoff_ms`) + poll-with-backoff (`PollWithBackoff`, `PollResult`, `wait_healthy`) | `retry` | `src/common-core/src/retry.rs` |
 
 ## Import pattern
 

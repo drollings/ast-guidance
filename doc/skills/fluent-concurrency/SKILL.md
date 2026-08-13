@@ -6,7 +6,7 @@ This document specifies `fluent-concurrency`, a thin, safe, composable extension
 
 **Core philosophy:**
 - **Tokio is the workhorse.** We do not rebuild `async_executor`, `epoll/kqueue/IOCP`, or work-stealing. We *compose* Tokio's primitives.
-- **Fluent WVR is the control plane.** Every unit of work presents the same `Component` / `WorkUnit` interface regardless of origin (native struct, WASM plugin, DB config). The orchestrator never branches on implementation type.
+- **Fluent WVR is the control plane.** Every unit of work presents the same `Component` / `WorkUnit` interface regardless of origin (native struct, WASM plugin, DB config). The orchestrator iterates over uniform handles. (The one sanctioned exception — the router's `PipelineOrchestrator` downcasting to `StageDecisionProducer` for a typed per-request handoff — is documented in the fluent-wvr SKILL §0.)
 - **Safety and locality.** 100% safe Rust (`#![forbid(unsafe_code)]`). No procedural macros hiding task boundaries. `dyn Trait` is restricted to the Control Plane; the Data Plane uses concrete types and flat enums.
 - **Explicit ownership.** No ambient authority. Every effect requires a capability token. Every spawned task belongs to a `Scope` whose close must be awaited.
 
@@ -23,10 +23,10 @@ This document specifies `fluent-concurrency`, a thin, safe, composable extension
 The crate exports the following modules from `src/lib.rs:3-15`:
 
 ```text
-affinity  capability  flow  io  llm_queue  pool  queue  reserve  router  runtime  scope  thread_resource  zone
+affinity  capability  flow  io  ladder  llm_queue  pool  queue  reserve  router  runtime  scope  thread_resource  zone
 ```
 
-Each is described below. The spec primitives are in §3.1–§3.9; the bonus primitives (`AffinityScheduler`, `ResultPool`, `PriorityResultPool`, `LlmRequestQueue`, `Reserve`, `thread_local_resource!`) are in §3.10.
+Each is described below. The spec primitives are in §3.1–§3.9; the bonus primitives (`AffinityScheduler`, `ResultPool`, `PriorityResultPool`, `LlmRequestQueue`, `Reserve`, `thread_local_resource!`) are in §3.10; the canonical first-Ok fallback combinator (`first_accept_in_order`) is in §3.11.
 
 ### 3.1 `Capability` — Bounded Resource Access
 
@@ -305,11 +305,45 @@ pub enum LlmError { Api(String), Http(String), NoResponse, RateLimited }
 
 `LlmConfig.extra_body_params` is arbitrary JSON merged into every request body (e.g. `num_ctx`, `temperature`, `stop`); `"model"`, `"messages"`, and `"stream"` keys are ignored because those are set explicitly by the chat-completion logic. `LlmConfig::new()` is a `bon` builder (`start_fn = new`).
 
-**`Reserve`** (`reserve.rs:7-94`) — RAII permit on a shared `Arc<AtomicUsize>`. `try_acquire(counter) -> Option<Self>` atomically decrements and returns the permit, or `None` if already at zero. `commit(self)` consumes the permit permanently; otherwise `Drop` returns it to the counter. This is a lower-level primitive than `Limiter`: it does not own the counter (the caller supplies it), and it does not run a closure. Use `Limiter` for "run this with a permit" and `Reserve` for "acquire now, release later" patterns. The crate's own tests are the only in-tree consumer today.
+**`Reserve`** (`reserve.rs:7-94`) — RAII permit on a shared `Arc<AtomicUsize>`. `try_acquire(counter) -> Option<Self>` atomically decrements and returns the permit, or `None` if already at zero. `commit(self)` consumes the permit permanently; otherwise `Drop` returns it to the counter. This is a lower-level primitive than `Limiter`: it does not own the counter (the caller supplies it), and it does not run a closure. Use `Limiter` for "run this with a permit" and `Reserve` for "acquire now, release later" patterns. **Status: compatibility surface (scaffold)** — the crate's own tests are the only in-tree consumer today; keep it as the low-level permit seam unless the throwaway rule (fluent-wvr SKILL §20) is invoked to prune it.
 
-**`AffinityScheduler<T, R, E>`** (`affinity.rs:59-191`) — wraps `PriorityResultPool` with session-aware priority boosting and starvation aging. Tracks which session is currently "affine" and gives its tasks a priority bonus (`AgingConfig::affinity_bonus`, default +10). Starved tasks (different session) periodically increase in base priority at `AgingConfig::aging_rate` (default +2 per 5s tick) up to `AgingConfig::max_priority` (default 100). `set_affinity(Option<String>)` switches the active session. `submit(task: ScheduledTask<T>, base_priority)` computes the effective priority and delegates to the pool. Designed for multi-session agent dispatch where context-switching between sessions should be minimized.
+**`AffinityScheduler<T, R, E>`** (`affinity.rs:59-191`) — wraps `PriorityResultPool` with session-aware priority boosting and starvation aging. Tracks which session is currently "affine" and gives its tasks a priority bonus (`AgingConfig::affinity_bonus`, default +10). Starved tasks (different session) periodically increase in base priority at `AgingConfig::aging_rate` (default +2 per 5s tick) up to `AgingConfig::max_priority` (default 100). `set_affinity(Option<String>)` switches the active session. `submit(task: ScheduledTask<T>, base_priority)` computes the effective priority and delegates to the pool. Designed for multi-session agent dispatch where context-switching between sessions should be minimized. **Status: compatibility surface (scaffold).** No production boot path wires `with_affinity` today — the only in-tree caller is a test in `ledger/orchestrator.rs`. Keep it as the forward-compat seam for session-affine dispatch.
 
 **`thread_local_resource!`** (`thread_resource.rs:37-45`) — macro that declares a thread-local `RefCell<Option<T>>` backed by `Default`. The `with_tlr(&STATIC, |res| ...)` accessor takes-or-defaults, calls the closure, and stores the value back after the closure returns. This is the canonical mechanism for per-thread pooled resources (e.g., AST parsers, string builders) that benefit from reuse across calls without allocating each time.
+
+### 3.11 `first_accept_in_order` — the First-Ok Ladder (canonical fallback combinator)
+
+**Status: production.** The single first-Ok fallback combinator, lifted out of the router in M4 and now consumed by the router's dispatch chain, backend retry/fallback, and the escalation ladder. Any "try A, then B, then C, take the first success" logic MUST compose this instead of hand-rolling a loop.
+
+**API** (`ladder.rs:38`):
+
+```rust
+pub async fn first_accept_in_order<R, E, F, Fut>(
+    rungs: impl IntoIterator<Item = F>,
+    run: impl Fn(F) -> Fut + Send + Sync,
+    stop: impl Fn(&E) -> bool + Send + Sync,
+) -> Result<Option<R>, E>
+where
+    F: Send + Sync + 'static,
+    Fut: Future<Output = Result<R, E>> + Send,
+    E: Send + 'static,
+    R: Send + 'static,
+```
+
+- `rungs` — the ordered fallback candidates (owned; no clones or `&mut` counters needed by the caller).
+- `run` — one attempt per rung; returned `Ok(r)` short-circuits to `Ok(Some(r))`.
+- `stop` — when `true` for an `Err(e)`, the walk **aborts immediately** with `Err(e)` (the terminal error is first-class — no silent swallow). When `false`, the rung is skipped and the next is tried.
+- Returns `Ok(None)` when every rung failed non-terminally (clean exhaustion) — the caller decides the fallback (`AllBackendsFailed` etc.).
+
+**Why this shape:** it is monomorphized (no vtable per rung), takes owned rungs (callers like `BackendChain` no longer clone the backend list), and makes the terminal error a first-class `Err` instead of a `last_error` variable captured across the loop. Consumers:
+
+| Consumer | Pattern | Location |
+|----------|---------|----------|
+| `BackendChain` | `complete`/`stream_complete` fallback across backends | `router/src/dispatch/backend.rs` |
+| `dispatch_real` | model fallback walk with attempt counter | `router/src/server/dispatch.rs` |
+| `Ladder::try_escalate` | escalation-mode walk (`stop = |_| false`, `.ok().flatten()`) | `router/src/dispatch/escalation/mod.rs` |
+
+**Rule:** any ordered first-success walk must use `first_accept_in_order`. The router's `match_target` is the one documented exception (start-index skip + last-always-wins + per-rung audit — a different shape; see `target_match.rs`).
 
 ## 4. Control Plane / Data Plane Integration (Fluent WVR)
 

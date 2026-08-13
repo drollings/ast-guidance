@@ -64,6 +64,54 @@ indefinitely. `topo_sort` returns `Err(GraphError::Cycle)` on cycles.
 |----------|---------------|------|
 | `Zone` (fluent-concurrency) | Task supervision cancellation tree | `src/fluent-concurrency/src/zone.rs` |
 | `DependencySession` (fluent-router) | Session step DAG with checkpoint/rewind | `src/router/src/dag_session.rs` |
+| `ChartExecutionPlan` (fluent-router) | Compiled chart stage order + ready-set | `src/router/src/charts/execute.rs` |
+| `compile_chart_stages` (fluent-router) | Chart target dependency validation/topo order | `src/router/src/charts/compile.rs` |
+
+## `CheckpointedStepGraph<K, S>` — checkpointed step tracking (M6)
+
+**Path**: `src/dag/src/checkpointed.rs`
+**Export**: `fluent_dag::checkpointed::CheckpointedStepGraph`
+
+**Status: production.** The canonical step-DAG primitive with checkpoint/rewind
+bookkeeping, carved out of the router's `DependencySession` in M6. Any session
+step graph that needs to record checkpoints and rewind to them MUST compose
+this rather than re-implementing `steps`/`completed`/`checkpoints`/`step_order`
+bookkeeping by hand.
+
+`CheckpointedStepGraph` composes `DependencyGraph<K>` (it delegates `is_ready`,
+`ready_nodes`, `dependents_of`, `topo_sort`) and adds the checkpoint state that
+`DependencyGraph` deliberately does not track: the insertion-order step list,
+each step's owned `S` state, a single rewind marker, and which steps have
+completed.
+
+### API surface
+
+```rust
+impl<K: Eq + Hash + Clone + Display, S: Send + Sync + 'static> CheckpointedStepGraph<K, S> {
+    pub fn new() -> Self;
+    pub fn add_step(&mut self, key: K, deps: &[K], state: S) -> Result<(), GraphError>;  // GraphError::DuplicateStep
+    pub fn checkpoint(&mut self, name: K) -> Result<(), GraphError>;   // names a rewind point
+    pub fn complete(&mut self, key: &K);                               // marks a step finished
+    pub fn is_ready(&self, key: &K) -> bool;
+    pub fn ready_steps(&self) -> Vec<K>;                               // canonical ready_nodes
+    pub fn cancel_dependents(&self, key: &K) -> Vec<K>;                // dependents_of
+    pub fn rewind_to(&mut self, name: &K) -> Result<Vec<K>, GraphError>; // suffix to re-run
+    pub fn status(&self, key: &K) -> Option<&S>;                       // owned per-step state
+    pub fn state_mut(&mut self, key: &K) -> Option<&mut S>;
+    pub fn is_completed(&self, key: &K) -> bool;
+    pub fn is_checkpoint(&self, key: &K) -> bool;
+    pub fn step_ids(&self) -> &[K];                                    // insertion order
+    pub fn step_count(&self) -> usize;
+    pub fn completed_count(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+    pub fn graph(&self) -> &DependencyGraph<K>;                        // delegate for topo_sort etc.
+}
+```
+
+`rewind_to(name)` returns the steps after the named checkpoint (the suffix to
+re-run) and un-completes them; the consumer owns any status resets (e.g.
+resetting per-step result state). The router's `DependencySession` composes it
+— see `dag_session.rs` — keeping the public session API unchanged.
 
 ## When to use
 

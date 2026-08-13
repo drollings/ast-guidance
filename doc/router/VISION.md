@@ -5,6 +5,17 @@ ideal finished design. It deliberately does not track what is landed today —
 that lives in [`ARCHITECTURE.md`](./ARCHITECTURE.md), which describes the
 current implementation and which pieces are load-bearing.*
 
+> **Section status legend.** Each section below carries a `Status:` line so
+> the vision stays honest without being rewritten as it lands:
+>
+> - **Implemented** — the described shape exists today (details in ARCHITECTURE.md).
+> - **Partial** — a working core exists; the section describes extensions or
+>   refinements not yet built.
+> - **Design-only** — aspirational; nothing (or only scaffolding) exists yet.
+>
+> Marking a section does not make it current — it tells the reader how much of
+> the vision to expect. When a section's status changes, update the line here.
+
 ## Mission
 
 Coral Router is a local-first control plane for LLM traffic: a single
@@ -105,6 +116,12 @@ routed onward after the local ladder has failed.
   much as to anything already shipped.
 
 ## The Classification Tree: a self-updating routing config
+
+> **Status: Partial.** The tree engine (`stages/tree/{engine,verdict,decisions}.rs`),
+> the four node types, and the JSON verdict grammar exist and are tested. The
+> fully self-updating loop (auto-reconstruction of prompt descriptions from
+> child nodes, tree editing at runtime) is Design-only — the config is loaded
+> once at boot and statically assembled.
 
 The central configuration structure for Coral Router is a **nested
 classification tree** — not a flat list of routes, a separate score matrix,
@@ -213,6 +230,11 @@ The classification tree replaces four previously-separate config sections:
 
 ## The Escalation Ladder: progressive frontier engagement
 
+> **Status: Implemented.** The four modes (filter / question / team /
+> turnover) live in `dispatch/escalation/{modes,assemble,audit}.rs`, driven by
+> the canonical `first_accept_in_order` combinator; the audit/assembly records
+> (the "workflow extraction" below) are produced. See ARCHITECTURE.md §Escalation.
+
 When a terminal node dispatches to a `model_group` and every local model in
 that group's chain fails or times out, the system does not fail outright.
 Instead it escalates through a configurable **escalation ladder** — a fixed
@@ -308,6 +330,10 @@ one-time cost that amortizes across similar queries.
 
 ## The Serving Layer: owned llama-server processes
 
+> **Status: Implemented.** One `llama-server` per weights file, free localhost
+> ports, on-demand residency with LRU+size eviction, and graceful shutdown are
+> all live — see ARCHITECTURE.md §Instance pools.
+
 Local models are not reached through a third-party gateway: Coral Router owns
 the serving processes. It spawns and supervises one `llama-server` process per
 model weights file, assigns each a free localhost port, and keeps it under
@@ -393,6 +419,12 @@ rest of device memory the moment a request earns it — never before.
 
 ## The Ledger: Content Nodes and levels of detail
 
+> **Status: Implemented (core) + Partial (agent layer).** The store, LOD
+> lifecycle, views, and scrub path are live. The background tier worker and
+> agent coordinator (`ledger/{tiering,prompt,orchestrator}.rs`) exist but are
+> opt-in via config; the workflow-learning replay from recorded `node_plan`
+> metadata is Design-only. See ARCHITECTURE.md §Ledger.
+
 Every paragraph, prompt, tool result, or intermediate artifact is stored as a
 **Content Node** — the game-engine concept of level-of-detail applied to
 semantic text. A `ContentNode` is the canonical type (defined in
@@ -428,6 +460,11 @@ either as bare text or as an anchor into richer context (a file on disk, a
 prior session's KV state, a knowledge-graph entity).
 
 ## Efficient ledger representations: fidelity by level of detail
+
+> **Status: Partial.** The LOD stack, views, and budget-fit prompt assembly
+> (`LedgerPromptAssembler`) exist; the multi-agent fidelity-per-role
+> orchestration described here is only partially realized through the opt-in
+> coordinator and plan route.
 
 The ledger's purpose in agent orchestration is to **synchronize agents to a
 shared task** without ever handing any of them the raw, ever-growing
@@ -477,6 +514,10 @@ own acceptable error rate and its own update cadence.
 
 ## Shared Content Nodes and parallel ledgers
 
+> **Status: Implemented.** `ParallelLedger` / `FilteredLedger` over one shared
+> `Arc<ContentNodeStore>`, per-view default LOD, and the reference-overlay
+> model are live (see ARCHITECTURE.md §Ledger).
+
 A **ledger** is a nested-list view — directory/file-tree-like — of pointers
 into a shared, reference-counted Content Node store. Ledgers do not own
 nodes; they reference them. This makes parallel ledgers cheap: an
@@ -502,6 +543,10 @@ redundantly per node.
 
 ## Filtered ledgers
 
+> **Status: Implemented.** `FilteredLedger<V>` (exclusion set + optional
+> render transform) is live and used by the PII frontier view and the rigor
+> red-team view.
+
 A **filtered ledger** is a lightweight overlay over an existing ledger: the
 same reference-counted pointers, minus an exclusion set, rather than a copy
 of any content. Building one is cheap — construct a filtered reference list
@@ -525,6 +570,9 @@ of constructing a filter is proportional to the size of the exclusion set,
 not to the size of the underlying node population.
 
 ## Lessons from parallel-stream architectures, applied without retraining
+
+> **Status: Design-only.** None of this section is implemented; it is the
+> research direction for the ledger's LOD semantics.
 
 A separate line of work on multi-stream language models — instruction-tuning
 a model to read from and write to several causally-dependent token streams
@@ -568,6 +616,11 @@ model:
   not something the near-term ledger and routing work waits on.
 
 ## The fully realized system
+
+> **Status: Partial.** The serving layer, ladder, and ledger store in this
+> walk-through are live; the agent-coordination walk (a request driving an
+> orchestrated multi-agent session over shared ledgers) is the opt-in
+> coordinator and remains the forward target.
 
 A request arrives and passes through a strict escalation ladder, spending as
 little as possible at each rung before the next is even considered.

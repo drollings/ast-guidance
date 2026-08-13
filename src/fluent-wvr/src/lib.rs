@@ -18,6 +18,7 @@
 extern crate self as fluent_wvr;
 
 pub mod capability;
+pub mod dynamic;
 pub mod macros;
 pub mod metadata;
 pub mod runtime;
@@ -29,6 +30,7 @@ pub mod prelude;
 pub mod wrapper;
 
 pub use capability::{check_capability, Capability, CapabilityError, CapabilitySet, CURRENT_CAPS};
+pub use dynamic::{DynamicComponent, DynamicExecutor};
 pub use fluent_wvr_macros::{Describable, FieldAccess};
 pub use internment::ArcIntern;
 pub use metadata::MetadataValue;

@@ -185,11 +185,18 @@ CORAL_ROUTER_TEST_SCRIPT := bin/coral-router-test.py
 router-benchmark: router-start ## Score the live router (routing accuracy, TTFT, VRAM) via bin/coral-router-test.py; reads env/coral-router.json for routes + expectations
 	$(Q)python3 $(CORAL_ROUTER_TEST_SCRIPT) --config $(CORAL_ROUTER_CONFIG)
 
+.PHONY: doc-check
+doc-check: ## Doc consistency lint — types named in skill/router docs must exist in source; documented workspace test count must not drift
+	$(Q)bin/doc-check.sh --types
+	$(Q)bin/doc-check.sh --tests
+
 .PHONY: router-test
-router-test: $(CORAL_ROUTER_BIN) ## Run fluent-router unit/golden/e2e tests + a --help dry-run of the built binary (stops a running router first)
+router-test: $(CORAL_ROUTER_BIN) ## Run fluent-router unit/golden/e2e tests + doc-check + a --help dry-run of the built binary (stops a running router first)
 	$(stop-router)
 	$(Q)echo "Running fluent-router unit + golden + e2e mock tests"
 	$(Q)cargo test -p fluent-router
+	$(Q)echo "Running doc-check (doc/type + test-count consistency)"
+	$(Q)bin/doc-check.sh --types
 	$(Q)echo "Validating coral-router --help"
 	$(Q)$(CORAL_ROUTER_BIN) --help > /dev/null && echo "All router tests passed." || echo "ERRROR: coral-router did NOT successfully run."
 

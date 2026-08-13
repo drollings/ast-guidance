@@ -8,13 +8,43 @@
 
 **For humans coming from Python or C++**: Rust's trait system replaces inheritance, its ownership model replaces garbage collection, and its derive macros replace runtime reflection. This document shows how twelve composable patterns together give you Python's runtime ergonomics and C++'s polymorphic flexibility, with absolute memory safety and zero hidden cost.
 
-**For AI agents**: This document is the authoritative reference for how code in `rust-src/` is structured. When writing new code, check the pattern table in §1, find the applicable pattern, and follow the rules and anti-pattern sections. All patterns are in production use in the codebase.
+**For AI agents**: This document is the authoritative reference for how code in `rust-src/` is structured. When writing new code, check the pattern table in §1, find the applicable pattern, and follow the rules and anti-pattern sections.
+
+> **Pattern status.** Every pattern is marked in one of three ways, because
+> "in production use" is not uniform across the crate:
+>
+> - **Production** — composed by a live call path in this workspace (the
+>   pipeline `Component` stages, `DependencyGraph`, `Zone`, `Instrumented`,
+>   `ResultPool`, the roadmap shared primitives).
+> - **Compatibility surface (scaffold)** — the trait/type is derived and
+>   contract-complete, but has no current production caller. It exists to keep
+>   the `Component` interface uniform and forward-compatible for future
+>   runtime assembly. These are **intentional**; do not prune them as dead
+>   code. Examples: `FieldAccess`/`Describable` on router stages,
+>   `PersistableComponent` (trait only, no implementor), `SchemaProvider`
+>   (derive-only, never invoked in production), `DynamicComponent`.
+> - **Planned** — described as the intended end-state but not yet built.
+>
+> Where this document says a pattern is "in production use," read it as
+> *the pattern's composition path is production-real*; per-type reflection
+> methods may still be scaffold.
 
 ---
 
 ## The Core Thesis
 
-Every unit of work in this system — a DAG target, a WASM plugin, a query strategy, an embedding provider — presents the **same interface** to the orchestrator regardless of whether it was assembled at compile time or at runtime. The orchestrator never branches on implementation type. It iterates over uniform handles and calls trait methods. The compiler enforces the interface at every implementation site.
+Every unit of work in this system — a DAG target, a WASM plugin, a query strategy, an embedding provider — presents the **same interface** to the orchestrator regardless of whether it was assembled at compile time or at runtime. The orchestrator iterates over uniform handles and calls trait methods. The compiler enforces the interface at every implementation site.
+
+> **The one sanctioned exception.** `PipelineOrchestrator` (the router's
+> hot path) downcasts `Arc<dyn Component>` to the two known stage types via
+> `as_producer` (`pipeline.rs`) and calls `StageDecisionProducer::evaluate`
+> directly — a typed handoff that avoids serializing each `StageDecision`
+> through `WorkOutput.data` once per request. This is a measured exception to
+> "never branch on type": it exists because a serialize→deserialize round-trip
+> on the request path costs more than one downcast, and it falls back to the
+> uniform `execute` path for unknown components. New code should **not** copy
+> this pattern; it is reserved for the one place where the per-request
+> serialization cost was measured and the downcast won.
 
 The `Component` supertrait is the concrete expression of this principle:
 
@@ -131,6 +161,11 @@ pub enum FieldError {
 /// by `SchemaProvider::schema`. The derive macro on `FieldAccess` does
 /// **not** auto-generate `SchemaProvider`; implement it explicitly when
 /// MCP tool validation or TUI editors need typed schema metadata.
+///
+/// **Status: compatibility surface (scaffold).** `SchemaProvider` is
+/// implemented only via the derive macro; no in-tree consumer calls
+/// `schema()` in production today. Keep it — it is the forward-compat seam
+/// for typed MCP/TUI schema consumption.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldSchema {
     pub name: String,
@@ -147,6 +182,14 @@ pub struct FieldSchema {
 pub trait SchemaProvider {
     fn schema(&self) -> Vec<FieldSchema>;
 }
+
+/// Optional trait for components that can be persisted to storage.
+///
+/// **Status: compatibility surface (scaffold).** No in-tree component
+/// implements `PersistableComponent` yet (see `traits.rs`). A second
+/// consumer that needs to serialize component state (e.g. to a database
+/// or over the wire) should implement it on the specific types that need
+/// persistence — do not add a blanket `Serialize` bound to `Component`.
 
 /// Uniform orchestration interface. Every task the orchestrator executes implements this.
 pub trait WorkUnit: Send + Sync {
@@ -299,17 +342,21 @@ pub struct WorkContext {
 }
 ```
 
-**Channel decision rule). ** Three channels coexist on `WorkContext`
+**Channel decision rule). ** Four channels coexist on `WorkContext`
 (and `WorkOutput`); pick the narrowest one that fits:
 
 | Channel | Purpose | Example |
 |---|---|---|
 | `outputs` (`OutputStore`, typed `HashMap<String, Arc<dyn Any + Send + Sync>>`) | **Primary** in-process handoff between units and stages. `set::<T>(key, value)` / `get::<T>(key) -> Option<&T>`; clone shares arcs. No serialize/deserialize. | `StageDecision`, retry-attempt counter (`i64`) |
+| `structured: HashMap<String, serde_json::Value>` | Structured handoff of **arbitrary JSON payloads whose type is not known at compile time**. `set_structured(key, &T)` serializes, `structured::<T>(key)` deserializes — the *only* place that does `to_value`/`from_value` for the channel. Crosses crate boundaries as `Value` only (never a domain type). | `RouterRequest` under `"request"`, bound chart entities (`"entities"`), per-stage outputs (`"stage.{id}"`) |
 | `WorkOutput.data: serde_json::Value` | **Only** for serialization boundaries (process/RPC/JSON handoff) and the final unit return value. `typed::<T>()` / `data_take::<T>()` | PipelineResult returned to the HTTP handler |
 | `metadata: HashMap<String, MetadataValue>` | Only for genuinely stringly-typed / dynamic annotations that must survive serialization. | `classifier_system_prompt` (external config key), tags |
 
-Use `outputs` for concrete, typed handoffs; fall back to `data`/`metadata`
-only where the boundary truly requires serialization.
+Use `outputs` for concrete, typed handoffs; use `structured` when the payload
+is JSON whose concrete type is unknown at the write site (or crosses crate
+boundaries); fall back to `data`/`metadata` only where the boundary truly
+requires serialization. The router's stages use `structured["request"]` for
+the live request and `outputs` for typed decisions; see `pipeline.rs`.
 
 ```rust
 impl Default for WorkContext { /* dry_run=false, max_retries=0, timeout_ms=30_000, outputs: OutputStore::default(), NoopRuntime */ }
@@ -1577,20 +1624,39 @@ let schema = handle.describe();
 ### Runtime assembly (database-driven config)
 
 ```rust
+use fluent_wvr::DynamicComponent;
+
 // 1. Load config from database
 let rows = db.query("SELECT key, value FROM tool_config WHERE tool_id = ?", &[tool_id])?;
-let config: HashMap<ArcIntern<str>, String> = rows.into_iter()
-    .map(|r| (r.get::<_, String>("key").into(), r.get::<_, String>("value")))
+let config: HashMap<String, String> = rows.into_iter()
+    .map(|r| (r.get::<_, String>("key"), r.get::<_, String>("value")))
     .collect();
 
-// 2. Create dynamic component
-let mut dyn_comp = DynamicComponent::new(config);
+// 2. Inject the executable body (the "tool") as a closure
+let executor: DynamicExecutor = Arc::new(|_ctx, config| {
+    let retries = config.get("retries").cloned().unwrap_or_default();
+    Ok(WorkOutput::ok_with_data(
+        format!("configured retries={retries}"),
+        serde_json::json!({ "retries": retries }),
+    ))
+});
+
+// 3. Assemble + configure by name
+let mut dyn_comp = DynamicComponent::new("db.tool", executor)
+    .with_field_keys(&["retries", "timeout_ms"])
+    .with_config(config);
 dyn_comp.set_field("retries", "3")?;
 
-// 3. Erase to Arc<dyn Component>: same uniform handle
+// 4. Erase to Arc<dyn Component>: same uniform handle
 let handle: Arc<dyn Component> = Arc::new(dyn_comp);
 let output = handle.execute(&ctx)?;
 ```
+
+> **Status: compatibility surface (scaffold).** `DynamicComponent` is the
+> forward-compat seam for runtime-assembled configuration. It has no
+> production consumer in-tree today; its purpose is to keep the `Component`
+> interface uniformly available to DB-config units without branching on
+> origin. Keep it as designed — do not prune it as dead code.
 
 ### Key guarantee
 
@@ -2146,11 +2212,13 @@ When writing new code in `rust-src/`:
 
 25. **Never add a new public API surface (function, type, error variant, or builder helper) without at least one in-tree production consumer.** The codebase has a documented rule against throwaway additions — three APIs shipped in a prior roadmap cycle (`Reserve`, `FieldError::ReadOnly`, `WorkContext::for_unit_in_zone`) had no production consumer on landing. The cost shows up in unused code paths, surprise behaviour, and dead documentation. If a feature must ship ahead of its consumer, file a tracking issue and link it from the API's doc comment.
 
+26. **Compatibility surface is a deliberate, marked exception.** A trait/type kept for forward compatibility (the `FieldAccess`/`Describable` reflection surface, `SchemaProvider`, `PersistableComponent`, `DynamicComponent`, `AffinityScheduler`) is not "throwaway" *when it is explicitly marked as such in its doc comment and in the §0 status taxonomy*. Marking is what distinguishes scaffold (keep, maintain contract) from dead code (prune). Any API that is neither production-composed nor marked scaffold is a throwaway-rule candidate and should be pruned.
+
 ### Verification
 
 28. **Run `cargo clippy --workspace -- -D warnings` before finishing.** The project enforces `#![deny(warnings)]`. (Pre-existing `uninlined_format_args` warnings at `fluent-wvr/src/work.rs:278,284` are grandfathered — do not introduce more.)
 
-29. **Run `cargo test --workspace` before finishing.** All ~1600 workspace tests must pass.
+29. **Run `cargo test --workspace` before finishing.** All workspace tests must pass (2301 as of 2026-08-13; see `make doc-check` for the lint that catches drift).
 
 30. **Check for `unsafe` blocks.** The workspace has 3 `unsafe` blocks, all in `wasm_ipc/src/lib.rs` for `read_unaligned` of packed struct fields. Every new `unsafe` block must be justified and documented; the `forbid(unsafe_code)` lint is set at the crate level for both `fluent-wvr` and `fluent-concurrency`.
 

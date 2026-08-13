@@ -177,7 +177,7 @@ exactly once and published to the same typed store.
 | `dag_session.rs` | `DependencySession` — DAG-based session composing `fluent_dag::dep_graph::DependencyGraph<String>` for step tracking, checkpoint/rewind, real KV-cache snapshot restore (model/adapter/session keyed), frontier-ownership flag; `SessionRegistry` — the canonical server-side session home (D6), per-`session_id`, shared `SnapshotStore`, retained for process lifetime |
 | `ledger.rs` | `ContentNodeLedger` — **thin facade** over the shared `ContentNodeStore` (M4); owns the LOD lifecycle (LOD0/LOD5 eager, LOD1–4 lazy from LOD0 via `Summarizer`, at most once); `CompactionStrategy` / `RecencyCompaction` (folded in from the deleted `compaction.rs`); routes all writes through the M1 write-path scrub |
 | `node_store.rs` | `ContentNodeStore` (M4) — the shared store: nodes behind `Arc<RwLock<ContentNode>>`, interned `ArcIntern<str>` session/role index keys, durable `content_json` hydration (seeded `next_id` from `MAX(node_id)`), `ensure_tier` / `lod_text` / `session_node_ids` render primitives, `knn_brute_force` |
-| `ledger_guard.rs` | `ScrubGuard` (M1) — the irreversible write-path scrubber (`scrub_for_ledger`), decision D1; Redact/Anonymize collapse to `[REDACTED:<pattern>]`, no codeword map retained; uses the builtin filter engine with the `ContentNodeWrite` scope |
+| `ledger_guard.rs` | `scrub_for_ledger` (M1) — the irreversible write-path scrubber, decision D1; Redact/Anonymize collapse to `[REDACTED:<pattern>]`, no codeword map retained; uses the builtin filter engine with the `ContentNodeWrite` scope |
 | `views.rs` | `LedgerView` (M2) — the reference-only view layer over `ContentNodeStore`; `Lod` (0..=5), `ParallelLedger` (one store, N views), `FilteredLedger<V>` (exclusion set + render transform); `render()` is the single text-exit; rendering degrades to LOD0 when a lazy tier is un-derivable |
 | `knowledge.rs` | `KnowledgeCapability` impl on `ContentNodeStore` (M4D) behind the `RouterKnowledgeCapability` token — the cross-crate read path for embedded consumers |
 
@@ -708,7 +708,7 @@ recorded afterward. This separates durable storage from live working context:
 ```
 User message → ContentNodeLedger → ContentNodeStore (durable, full detail)
                 ↓                         ↓
-         Pipeline stages          ParallelLedger / FilteredLedger
+         Pipeline stages         ParallelLedger / FilteredLedger
          (read from WorkContext,   (render-only views; single text-exit
           not from ledger)          LedgerView::render → lod_text)
                 ↓
@@ -737,6 +737,44 @@ Key load-bearing properties:
   with interned `ArcIntern<str>` session/role index keys and durable
   `content_json` hydration (seeded `next_id` from `MAX(node_id)` so restarts
   never re-issue colliding ids).
+
+### Background tier derivation (`ledger/tiering.rs`) — opt-in
+
+`LedgerTierWorker` derives LOD1–LOD4 (and upgrades LOD5 labels) in the
+background instead of on the read path. Boot backfills underivable nodes,
+then drains newly-recorded nodes from the `ContentNodeStore` tier-event feed.
+Concurrency is bounded by a shared `Limiter`; writes are at-most-once
+(re-checked under the node write lock); summarizer failures degrade the node
+to a higher LOD rather than erroring; a successful higher-tier derivation
+downgrades it back (never repeats work it already did). Enabled only when
+`ledger.background_tiering = true` — otherwise the lazy on-read derivation
+described above is unchanged.
+
+### Prompt assembly (`ledger/prompt.rs`) — pure function object
+
+`LedgerPromptAssembler` builds a fidelity-budget-fit prompt from a session's
+cached LOD tiers: the first and last LOD0 anchors are guaranteed, intermediate
+nodes are relevance-ranked (lexical score, recency) and demoted to the highest
+LOD that fits the token budget; only *cached* tiers are rendered — it never
+triggers a summarization cost. Pure (no I/O), unit-tested in isolation, and
+shared by the coordinator (`orchestrator.rs`) and the plan route.
+
+### Agent coordinator (`ledger/orchestrator.rs`) — opt-in
+
+`LedgerAgentCoordinator` runs the agent loop over a session's shared ledger:
+restore a KV snapshot (`KvSnapshotPolicy`: never / always / restore-if-same-model)
+or assemble the prompt → execute the LLM call (on a blocking task, session
+guard dropped — never held across the call) → record the exchange → snapshot
+the KV state (`advance_and_snapshot` → `SnapshotStore`) → enqueue a tier
+derivation → complete the step. `last_resident_model` is session-scoped (walks
+the session's own checkpoint-node index, not all sessions' nodes). Enabled
+only when `ledger.orchestrator.enabled = true`; config supplies the backend,
+adapter, prompt-budget, and snapshot policy. `node_plan` metadata on recorded
+nodes feeds a future workflow-learning replay.
+
+Both opt-in layers reuse the shared primitives (`ContentNodeStore`,
+`SnapshotStore`, `DependencySession`/`CheckpointedStepGraph`, `Limiter`,
+`AffinityScheduler`) rather than adding a parallel store.
 
 ## Logging: two-stream architecture
 
