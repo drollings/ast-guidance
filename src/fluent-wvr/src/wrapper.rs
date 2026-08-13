@@ -538,7 +538,7 @@ impl<'a, T: 'a, E> Default for Pipeline<'a, T, E> {
     }
 }
 
-/// Wraps a `Component` with a name suffix (useful for scatter-gather Zone
+/// Wraps a `Component` with a name suffix (useful for scatter-gather SupervisedBatch
 /// dispatch where the same component type is registered multiple times).
 ///
 /// `execute` merges the zone-supplied runtime (`ctx.rt`) with per-task

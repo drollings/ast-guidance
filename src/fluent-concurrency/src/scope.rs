@@ -25,7 +25,7 @@ use std::future::Future;
 use tokio::task::{AbortHandle, JoinSet};
 
 // The capability-gating task-local lives in `fluent-wvr` (the canonical home
-// of the capability model). Re-exported here so `Scope`/`Zone` propagation and
+// of the capability model). Re-exported here so `Scope`/`SupervisedBatch` propagation and
 // the existing `crate::scope::CURRENT_CAPS` path keep working, and so both
 // `fluent-concurrency` and `fluent-db` read the same variable.
 pub use fluent_wvr::capability::CURRENT_CAPS;

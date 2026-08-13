@@ -1,4 +1,4 @@
-//! Pure dependency-graph algorithms shared by `Zone`, `DependencySession`,
+//! Pure dependency-graph algorithms shared by `SupervisedBatch`, `DependencySession`,
 //! and `DependencyResolver`. No side effects, no execution, no state
 //! machine — callers apply the effect (abort a task, mark a step
 //! cancelled, schedule a build target).
@@ -204,8 +204,8 @@ impl<K: Eq + Hash + Clone> DependencyGraph<K> {
     /// **No side effect.** The caller decides what to do with the
     /// returned nodes (abort a task, mark a step cancelled, etc.).
     ///
-    /// Algorithm ported verbatim from the original `Zone::cancel_dependents_of`
-    /// (now retired) at `src/fluent-concurrency/src/zone.rs`.
+    /// Algorithm ported verbatim from the original `SupervisedBatch::cancel_dependents_of`
+    /// (now retired) at `src/fluent-concurrency/src/batch.rs`.
     pub fn dependents_of(&self, node: &K) -> Vec<K>
     where
         K: std::fmt::Debug,

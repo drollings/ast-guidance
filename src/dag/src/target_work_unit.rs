@@ -2,7 +2,7 @@
 //!
 //! A [`Target`] (from the target registry / resolver world, with bitset
 //! capabilities) adapted to the fluent-wvr [`Component`] world so the
-//! resolver's `ExecutionPlan` can run under `Zone` / `WorkUnit` semantics.
+//! resolver's `ExecutionPlan` can run under `SupervisedBatch` / `WorkUnit` semantics.
 //!
 //! This module replaces the pruned `DagExecutor` Its `execute` mirrors
 //! `CommandUnit`'s semantics exactly via the shared `run_shell_command`
@@ -132,7 +132,7 @@ mod tests {
     use crate::target::{Target, TargetRegistry};
     use bitvec::vec::BitVec;
     use fluent_concurrency::tokio_runtime;
-    use fluent_concurrency::zone::{Zone, ZoneSummary};
+    use fluent_concurrency::batch::{SupervisedBatch, SupervisedBatchSummary};
     use fluent_types::{ExecutorKind, TargetType};
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -239,7 +239,7 @@ mod tests {
     }
 
     /// Parallel-wave variant: independent targets run concurrently in one
-    /// `Zone`. Each writes an `arrived` marker then waits for all three to
+    /// `SupervisedBatch`. Each writes an `arrived` marker then waits for all three to
     /// arrive (a rendezvous barrier) before writing `done` — so every `done`
     /// marker existing proves the three ran concurrently, not serially.
     #[tokio::test]
@@ -247,7 +247,7 @@ mod tests {
         let caps = CapabilityRegistry::new();
         let dir = tempdir().unwrap();
         let dir_str = dir.path().to_string_lossy().into_owned();
-        let mut zone = Zone::new(tokio_runtime(), fluent_wvr::CapabilitySet::new());
+        let mut batch = SupervisedBatch::new(tokio_runtime(), fluent_wvr::CapabilitySet::new());
 
         for i in 0..3 {
             let target = Target::new()
@@ -267,10 +267,10 @@ mod tests {
                 ))
                 .build();
             let unit = TargetWorkUnit::from_target(&target, &caps);
-            zone.register(Arc::new(unit)).unwrap();
+            batch.register(Arc::new(unit)).unwrap();
         }
 
-        let summary: ZoneSummary = (&mut zone).await;
+        let summary: SupervisedBatchSummary = (&mut batch).await;
         assert_eq!(summary.completed.len(), 3, "all workers complete");
         assert_eq!(summary.failed.len(), 0);
         assert_eq!(summary.panicked.len(), 0);

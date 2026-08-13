@@ -1,10 +1,10 @@
 //! Database `Component`/`WorkUnit` adapters (D9).
 //!
 //! `DbWorkUnit` wraps a synchronous store operation so it can run under a
-//! `Zone` supervisor (or any `WorkUnit` orchestrator) without violating the
+//! `SupervisedBatch` supervisor (or any `WorkUnit` orchestrator) without violating the
 //! WorkUnit purity contract (`fluent-wvr` SKILL §10): `execute` is
 //! synchronous and returns promptly. On a multi-threaded runtime worker (the
-//! canonical `Zone`/`ResultPool` context) the blocking rusqlite work is
+//! canonical `SupervisedBatch`/`ResultPool` context) the blocking rusqlite work is
 //! offloaded via `tokio::task::block_in_place`; on a current-thread runtime
 //! (or with no runtime active) it runs on a dedicated scoped OS thread via
 //! `std::thread::scope`, so a slow op still cannot block the caller's single
@@ -79,7 +79,7 @@ impl DbStore for Arc<SqlitePool> {
 /// The op receives the `WorkContext` and returns a `WorkOutput`. `execute`
 /// offloads it via `tokio::task::block_in_place` when on a multi-threaded
 /// runtime worker, so the async executor is never starved — this is what makes
-/// DB work safe to run under `Zone` supervision (timeout/retry/cancellation)
+/// DB work safe to run under `SupervisedBatch` supervision (timeout/retry/cancellation)
 /// and inside `ResultPool` handlers without violating the WorkUnit purity
 /// contract.
 ///
@@ -125,7 +125,7 @@ where
 
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
         // Offload to a blocking thread when on a multi-threaded runtime worker
-        // (the canonical Zone/ResultPool context) so the executor isn't
+        // (the canonical SupervisedBatch/ResultPool context) so the executor isn't
         // starved. On a current-thread runtime (or with no runtime active), run
         // the op on a dedicated scoped OS thread instead of inline, so a
         // genuinely slow op still cannot block the caller's single thread.
@@ -312,9 +312,9 @@ mod tests {
         // (`block_in_place`), so the async executor keeps making progress while
         // the DB work is in flight.
         //
-        // Note: a Zone's `tokio::time::timeout` cannot *preempt* a single
+        // Note: a SupervisedBatch's `tokio::time::timeout` cannot *preempt* a single
         // blocking `execute` (block_in_place parks the worker until the op
-        // returns); the Zone applies its wall-clock budget across the retry
+        // returns); the SupervisedBatch applies its wall-clock budget across the retry
         // loop instead (see `fluent-concurrency` tests/m2.rs
         // `test_zone_real_timeout`). The guarantee `DbWorkUnit` provides is
         // that other tasks are never starved by the DB op.
@@ -349,7 +349,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fast_op_executes_cleanly_under_zone_style_timeout() {
-        // A fast DbWorkUnit runs fine under a simulated `Zone` supervisor
+        // A fast DbWorkUnit runs fine under a simulated `SupervisedBatch` supervisor
         // wrapper (`tokio::time::timeout`), surfacing its result before the
         // budget elapses rather than timing out spuriously.
         let unit = store_unit(store(), "db.fast", |conn| {

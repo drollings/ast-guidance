@@ -1,12 +1,12 @@
-//! Zone-supervised execution of a compiled chart.
+//! SupervisedBatch-supervised execution of a compiled chart.
 //!
-//! The M9 supervisor runs a compiled chart's targets through a `Zone` in
+//! The M9 supervisor runs a compiled chart's targets through a `SupervisedBatch` in
 //! topo-order waves:
 //!
 //! - **Ordering authority**: `compile_chart_stages` + `topo_order` (the
 //!   canonical `DependencyGraph::topo_sort`). The executor never re-implements
 //!   graph algorithms — it only walks the already-computed order in waves.
-//! - **Supervision**: each target runs under the Zone's timeout/retry
+//! - **Supervision**: each target runs under the SupervisedBatch's timeout/retry
 //!   contract (`WorkContext::max_retries` / `timeout_ms`). A failed or
 //!   rubric-rejected target cancels its transitive dependents — independent
 //!   branches keep running (VISION: contain, don't restart; local-first).
@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use common_core::metrics::LatencyHistogram;
 use fluent_concurrency::pool::Limiter;
-use fluent_concurrency::zone::{Zone, ZoneConfig, ZoneEvent};
+use fluent_concurrency::batch::{SupervisedBatch, SupervisedBatchConfig, SupervisedBatchEvent};
 use fluent_dag::dep_graph::DependencyGraph;
 use fluent_llm::client::ChatBackend;
 use fluent_wvr::prelude::*;
@@ -76,7 +76,7 @@ impl ChartAuditEntry {
     }
 }
 
-/// Zone retry predicate for chart zones (M5.1).
+/// SupervisedBatch retry predicate for chart zones (M5.1).
 ///
 /// Chart targets wrap their LLM-call failures in `WorkError::Execution`
 /// (`"chart target '…' LLM call failed: …"`, `charts/stage.rs`). Those are
@@ -95,7 +95,7 @@ fn chart_retry_predicate(err: &WorkError) -> bool {
 /// Options for a supervised chart execution.
 #[derive(Clone)]
 pub struct ChartExecOptions {
-    /// Async runtime driving the Zone (production: `fluent_concurrency::tokio_runtime()`).
+    /// Async runtime driving the SupervisedBatch (production: `fluent_concurrency::tokio_runtime()`).
     pub runtime: Arc<dyn Runtime>,
     /// LLM judge backend for rubrics that declare `judge_model`. `None`
     /// degrades a judge-declaring rubric to the deterministic gate.
@@ -105,7 +105,7 @@ pub struct ChartExecOptions {
     /// Optional latency histogram recorded per target via
     /// `Instrumented::with_metrics` (the canonical latency surface).
     pub metrics: Option<Arc<LatencyHistogram>>,
-    /// Per-attempt retries (0 = none) — the Zone's `WorkContext.max_retries`.
+    /// Per-attempt retries (0 = none) — the SupervisedBatch's `WorkContext.max_retries`.
     pub max_retries: u32,
     /// Per-attempt wall-clock budget in ms (0 = none) — `WorkContext.timeout_ms`.
     pub timeout_ms: u64,
@@ -164,7 +164,7 @@ impl ChartExecutionSummary {
     }
 }
 
-/// A compiled, runnable chart under Zone supervision.
+/// A compiled, runnable chart under SupervisedBatch supervision.
 pub struct ChartExecutionPlan {
     chart_name: String,
     chart_rubric: Option<ChartRubric>,
@@ -204,11 +204,11 @@ impl ChartExecutionPlan {
         &self.order
     }
 
-    /// Run the chart under Zone supervision, in topo-order waves.
+    /// Run the chart under SupervisedBatch supervision, in topo-order waves.
     ///
     /// Each wave registers every ready (deps satisfied) target into a fresh
-    /// `Zone` with its context carrying the accumulated `stage.{id}.*`
-    /// metadata; the Zone enforces timeout/retry per target. Completed
+    /// `SupervisedBatch` with its context carrying the accumulated `stage.{id}.*`
+    /// metadata; the SupervisedBatch enforces timeout/retry per target. Completed
     /// outputs are rubric-gated before promotion; a failed/rubric-rejected
     /// target's dependents never become ready (they land in `cancelled`).
     ///
@@ -258,12 +258,12 @@ impl ChartExecutionPlan {
                 break;
             }
 
-            let mut zone = Zone::new_with_config(
+            let mut batch = SupervisedBatch::new_with_config(
                 opts.runtime.clone(),
                 CapabilitySet::default(),
-                ZoneConfig {
+                SupervisedBatchConfig {
                     is_retryable: chart_retry_predicate,
-                    ..ZoneConfig::default()
+                    ..SupervisedBatchConfig::default()
                 },
             );
             for target in &ready {
@@ -284,21 +284,21 @@ impl ChartExecutionPlan {
                         format!("chart.{}.{}", self.chart_name, target.name),
                     )),
                 };
-                zone.register_with_context(wrapped, ctx)
+                batch.register_with_context(wrapped, ctx)
                     .map_err(|e| ChartError::Compile {
                         reason: format!("register chart target '{}': {e}", target.name),
                     })?;
             }
 
-            let zone_summary = zone.await;
+            let batch_summary = batch.await;
 
-            // Each zone event: promote or fail, gated by the target's rubric.
-            for event in zone_summary
+            // Each batch event: promote or fail, gated by the target's rubric.
+            for event in batch_summary
                 .completed
                 .into_iter()
-                .chain(zone_summary.panicked)
-                .chain(zone_summary.failed)
-                .chain(zone_summary.cancelled)
+                .chain(batch_summary.panicked)
+                .chain(batch_summary.failed)
+                .chain(batch_summary.cancelled)
             {
                 self.process_event(event, opts, &mut completed, &mut failed, &mut summary)?;
             }
@@ -408,14 +408,14 @@ impl ChartExecutionPlan {
     /// Fold a single `ZoneEvent` into the execution state.
     fn process_event(
         &self,
-        event: ZoneEvent,
+        event: SupervisedBatchEvent,
         opts: &ChartExecOptions,
         completed: &mut HashMap<String, StageDecision>,
         failed: &mut HashSet<String>,
         summary: &mut ChartExecutionSummary,
     ) -> Result<(), ChartError> {
         match event {
-            ZoneEvent::Completed { name, output } => {
+            SupervisedBatchEvent::Completed { name, output } => {
                 let decision: StageDecision =
                     output.data_as().map_err(|e| ChartError::Compile {
                         reason: format!("chart target '{name}' output unreadable: {e}"),
@@ -479,7 +479,7 @@ impl ChartExecutionPlan {
                 completed.insert(name.to_string(), decision);
                 Ok(())
             }
-            ZoneEvent::Failed { name, error } => {
+            SupervisedBatchEvent::Failed { name, error } => {
                 failed.insert(name.to_string());
                 let entry = ChartAuditEntry {
                     chart: self.chart_name.clone(),
@@ -493,7 +493,7 @@ impl ChartExecutionPlan {
                 summary.audit.push(entry);
                 Ok(())
             }
-            ZoneEvent::Panicked { name, info } => {
+            SupervisedBatchEvent::Panicked { name, info } => {
                 failed.insert(name.to_string());
                 let entry = ChartAuditEntry {
                     chart: self.chart_name.clone(),
@@ -507,7 +507,7 @@ impl ChartExecutionPlan {
                 summary.audit.push(entry);
                 Ok(())
             }
-            ZoneEvent::Cancelled { name, .. } => {
+            SupervisedBatchEvent::Cancelled { name, .. } => {
                 // Cancelled within a wave (e.g. timeout) → treated as failed
                 // so dependents never become ready.
                 failed.insert(name.to_string());
@@ -593,7 +593,7 @@ mod tests {
     }
 
     /// Fails exactly the first `chat_complete` call, then succeeds forever.
-    /// Exercises the Zone's retry-with-backoff over a transient target failure.
+    /// Exercises the SupervisedBatch's retry-with-backoff over a transient target failure.
     struct RetryOnceBackend {
         failures_left: Mutex<usize>,
         response: String,
@@ -842,7 +842,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn zone_retry_recovers_a_transient_target_failure() {
         // `a`'s LLM call errors on the first attempt, then succeeds. With
-        // max_retries = 1 the Zone retries and the whole chain completes.
+        // max_retries = 1 the SupervisedBatch retries and the whole chain completes.
         let backend: Arc<dyn ChatBackend> =
             Arc::new(RetryOnceBackend::new(r#"{"out": "a-retried"}"#.to_string()));
         let plan = build_plan(&linear_chart_json(), &backend, &[]);
@@ -852,7 +852,7 @@ mod tests {
         assert_eq!(
             summary.completed.len(),
             2,
-            "a recovers via Zone retry, then b runs"
+            "a recovers via SupervisedBatch retry, then b runs"
         );
         assert!(summary.failed.is_empty());
         assert!(summary.cancelled.is_empty());
@@ -1021,12 +1021,12 @@ mod tests {
         );
     }
 
-    // ── Golden e2e: real seed chart + rubric through the Zone ─────────────
+    // ── Golden e2e: real seed chart + rubric through the SupervisedBatch ─────────────
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn golden_rubric_gated_seed_chart_runs_through_zone() {
         // Load the real Appendix A seed chart, add a target rubric, and run it
-        // through the Zone supervisor with a mock backend. The audit trail
+        // through the SupervisedBatch supervisor with a mock backend. The audit trail
         // must record chart/fit/score/targets.
         let seed_dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../env/workflows/charts");
@@ -1082,7 +1082,7 @@ mod tests {
         let summary = plan
             .execute(&ctx, &opts)
             .await
-            .expect("seed chart executes under Zone supervision");
+            .expect("seed chart executes under SupervisedBatch supervision");
 
         if summary.completed.len() != 3 {
             eprintln!("FAILED summary: {summary:#?}");

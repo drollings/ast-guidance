@@ -1,6 +1,6 @@
 use super::*;
 use crate::scope::Scope;
-use crate::zone::{CancelReason, Zone, ZoneConfig, ZoneError, ZoneEvent, ZoneSummary};
+use crate::batch::{CancelReason, SupervisedBatch, SupervisedBatchConfig, SupervisedBatchError, SupervisedBatchEvent, SupervisedBatchSummary};
 #[tokio::test(start_paused = true)]
 async fn test_scope_close_drains_tasks() {
     tokio::time::resume();
@@ -114,13 +114,13 @@ async fn test_scope_defer_aborts_tasks() {
     );
 }
 
-/// Zone panic propagation: a panic in a work unit should propagate as
+/// SupervisedBatch panic propagation: a panic in a work unit should propagate as
 /// JoinError::Panic and trigger dependency-aware cancellation.
 #[tokio::test(start_paused = true)]
 async fn test_zone_panic_propagates_as_join_error() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let mut zone = Zone::new(runtime, caps);
+    let mut batch = SupervisedBatch::new(runtime, caps);
 
     struct PanicOnExecute;
     impl WorkUnit for PanicOnExecute {
@@ -139,15 +139,15 @@ async fn test_zone_panic_propagates_as_join_error() {
     }
     impl_component_for_test!(PanicOnExecute);
 
-    zone.register(Arc::new(PanicOnExecute)).unwrap();
-    let summary: ZoneSummary = (&mut zone).await;
+    batch.register(Arc::new(PanicOnExecute)).unwrap();
+    let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(
         summary.panicked.len(),
         1,
         "panic must be recorded via JoinError::Panic"
     );
     match &summary.panicked[0] {
-        ZoneEvent::Panicked { info, .. } => {
+        SupervisedBatchEvent::Panicked { info, .. } => {
             assert!(
                 info.contains("panicked"),
                 "info must contain 'panicked', got: {info}"
@@ -157,12 +157,12 @@ async fn test_zone_panic_propagates_as_join_error() {
     }
 }
 
-/// Zone: a panic in a provider task must cancel all transitively dependent tasks.
+/// SupervisedBatch: a panic in a provider task must cancel all transitively dependent tasks.
 #[tokio::test(start_paused = true)]
 async fn test_zone_panic_cancels_transitive_dependents() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let mut zone = Zone::new(runtime, caps);
+    let mut batch = SupervisedBatch::new(runtime, caps);
 
     struct PanicProvider {
         provides: Vec<ArcIntern<str>>,
@@ -210,11 +210,11 @@ async fn test_zone_panic_cancels_transitive_dependents() {
     impl_component_for_test!(WaitingDep);
 
     let asset = ArcIntern::<str>::from("asset");
-    zone.register(Arc::new(PanicProvider {
+    batch.register(Arc::new(PanicProvider {
         provides: vec![asset.clone()],
     }))
     .unwrap();
-    zone.register_with_context(
+    batch.register_with_context(
         Arc::new(WaitingDep {
             name: "dep1".into(),
             deps: vec![asset.clone()],
@@ -225,7 +225,7 @@ async fn test_zone_panic_cancels_transitive_dependents() {
         },
     )
     .unwrap();
-    zone.register_with_context(
+    batch.register_with_context(
         Arc::new(WaitingDep {
             name: "dep2".into(),
             deps: vec![asset],
@@ -237,7 +237,7 @@ async fn test_zone_panic_cancels_transitive_dependents() {
     )
     .unwrap();
 
-    let summary: ZoneSummary = (&mut zone).await;
+    let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(summary.panicked.len(), 1, "provider must panic");
     assert_eq!(
         summary.cancelled.len(),
@@ -248,7 +248,7 @@ async fn test_zone_panic_cancels_transitive_dependents() {
         .cancelled
         .iter()
         .map(|e| match e {
-            ZoneEvent::Cancelled { name, .. } => name.to_string(),
+            SupervisedBatchEvent::Cancelled { name, .. } => name.to_string(),
             _ => String::new(),
         })
         .collect();
@@ -260,10 +260,10 @@ async fn test_zone_panic_cancels_transitive_dependents() {
 async fn test_zone_normal_completion() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let mut zone = Zone::new(runtime, caps);
-    zone.register(Arc::new(StubComponent::ok("task1"))).unwrap();
-    zone.register(Arc::new(StubComponent::ok("task2"))).unwrap();
-    let summary: ZoneSummary = (&mut zone).await;
+    let mut batch = SupervisedBatch::new(runtime, caps);
+    batch.register(Arc::new(StubComponent::ok("task1"))).unwrap();
+    batch.register(Arc::new(StubComponent::ok("task2"))).unwrap();
+    let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(summary.completed.len(), 2);
     assert_eq!(summary.panicked.len(), 0);
     assert_eq!(summary.cancelled.len(), 0);
@@ -273,10 +273,10 @@ async fn test_zone_normal_completion() {
 async fn test_zone_panic_containment() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let mut zone = Zone::new(runtime, caps);
-    zone.register(Arc::new(StubComponent::ok("good"))).unwrap();
-    zone.register(Arc::new(StubComponent::fail("bad"))).unwrap();
-    let summary: ZoneSummary = (&mut zone).await;
+    let mut batch = SupervisedBatch::new(runtime, caps);
+    batch.register(Arc::new(StubComponent::ok("good"))).unwrap();
+    batch.register(Arc::new(StubComponent::fail("bad"))).unwrap();
+    let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(summary.completed.len(), 1);
     assert_eq!(summary.failed.len(), 1);
     assert_eq!(summary.cancelled.len(), 0);
@@ -287,7 +287,7 @@ async fn test_zone_real_timeout() {
     tokio::time::resume();
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let mut zone = Zone::new(runtime, caps);
+    let mut batch = SupervisedBatch::new(runtime, caps);
     // The unit fails with a transient error, so the retry backoff keeps it
     // alive past the 50ms wall-clock budget — the outer timeout fires and
     // records a `Timeout` cancellation. (A permanent Execution failure would
@@ -298,13 +298,13 @@ async fn test_zone_real_timeout() {
         max_retries: 5,
         ..WorkContext::default()
     };
-    zone.register_with_context(unit, ctx).unwrap();
-    let summary: ZoneSummary = (&mut zone).await;
+    batch.register_with_context(unit, ctx).unwrap();
+    let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(summary.completed.len(), 0);
     assert_eq!(summary.panicked.len(), 0);
     assert_eq!(summary.cancelled.len(), 1);
     match &summary.cancelled[0] {
-        crate::zone::ZoneEvent::Cancelled {
+        crate::batch::SupervisedBatchEvent::Cancelled {
             name,
             reason: CancelReason::Timeout,
         } => {
@@ -319,7 +319,7 @@ async fn test_zone_retry_with_max_retries() {
     tokio::time::resume();
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let mut zone = Zone::new(Arc::clone(&runtime), caps.clone());
+    let mut batch = SupervisedBatch::new(Arc::clone(&runtime), caps.clone());
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_clone = Arc::clone(&counter);
 
@@ -339,7 +339,7 @@ async fn test_zone_retry_with_max_retries() {
         }
         fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
             self.counter.fetch_add(1, Ordering::SeqCst);
-            // `Dependency` is transient/retryable, so the zone retries up to
+            // `Dependency` is transient/retryable, so the SupervisedBatch retries up to
             // `max_retries` times. A permanent `Execution` failure would
             // short-circuit on the first attempt.
             Err(WorkError::Dependency("retry fail".into()))
@@ -355,8 +355,8 @@ async fn test_zone_retry_with_max_retries() {
         max_retries: 2,
         ..WorkContext::default()
     };
-    zone.register_with_context(unit, ctx).unwrap();
-    let summary: ZoneSummary = (&mut zone).await;
+    batch.register_with_context(unit, ctx).unwrap();
+    let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(summary.completed.len(), 0);
     assert_eq!(summary.failed.len(), 1);
     assert_eq!(counter.load(Ordering::SeqCst), 3);
@@ -372,7 +372,7 @@ async fn test_zone_permanent_error_does_not_retry() {
     tokio::time::resume();
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let mut zone = Zone::new(Arc::clone(&runtime), caps.clone());
+    let mut batch = SupervisedBatch::new(Arc::clone(&runtime), caps.clone());
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_clone = Arc::clone(&counter);
 
@@ -405,8 +405,8 @@ async fn test_zone_permanent_error_does_not_retry() {
         max_retries: 5,
         ..WorkContext::default()
     };
-    zone.register_with_context(unit, ctx).unwrap();
-    let summary: ZoneSummary = (&mut zone).await;
+    batch.register_with_context(unit, ctx).unwrap();
+    let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(summary.completed.len(), 0);
     assert_eq!(summary.failed.len(), 1);
     assert_eq!(
@@ -420,17 +420,17 @@ async fn test_zone_permanent_error_does_not_retry() {
 async fn test_zone_real_panic() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let mut zone = Zone::new(runtime, caps);
+    let mut batch = SupervisedBatch::new(runtime, caps);
 
-    zone.register(Arc::new(StubComponent::ok("good"))).unwrap();
-    zone.register(Arc::new(StubComponent::panic("panic")))
+    batch.register(Arc::new(StubComponent::ok("good"))).unwrap();
+    batch.register(Arc::new(StubComponent::panic("panic")))
         .unwrap();
-    let summary: ZoneSummary = (&mut zone).await;
+    let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(summary.completed.len(), 1);
     assert_eq!(summary.panicked.len(), 1);
     assert_eq!(summary.cancelled.len(), 0);
     match &summary.panicked[0] {
-        crate::zone::ZoneEvent::Panicked { info, .. } => assert!(info.contains("panicked")),
+        crate::batch::SupervisedBatchEvent::Panicked { info, .. } => assert!(info.contains("panicked")),
         _ => panic!("expected Panicked event"),
     }
 }
@@ -439,14 +439,14 @@ async fn test_zone_real_panic() {
 async fn test_zone_dependency_cancellation() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let mut zone = Zone::new(runtime, caps);
+    let mut batch = SupervisedBatch::new(runtime, caps);
 
-    zone.register(Arc::new(
+    batch.register(Arc::new(
         StubComponent::fail("parent").with_provides("shared"),
     ))
     .unwrap();
     let child = Arc::new(StubComponent::dep_fail("child").with_dep("shared"));
-    zone.register_with_context(
+    batch.register_with_context(
         child,
         WorkContext {
             max_retries: 10,
@@ -454,11 +454,11 @@ async fn test_zone_dependency_cancellation() {
         },
     )
     .unwrap();
-    let summary: ZoneSummary = (&mut zone).await;
+    let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(summary.completed.len(), 0);
     assert_eq!(summary.failed.len(), 1);
     assert_eq!(summary.cancelled.len(), 1);
-    if let ZoneEvent::Cancelled {
+    if let SupervisedBatchEvent::Cancelled {
         ref name,
         ref reason,
     } = summary.cancelled[0]
@@ -475,28 +475,28 @@ async fn test_zone_drop_cancels_tasks() {
     tokio::time::resume();
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let mut zone = Zone::new(runtime, caps);
+    let mut batch = SupervisedBatch::new(runtime, caps);
     let unit = Arc::new(StubComponent::fail("slow"));
     let ctx = WorkContext {
         max_retries: 100,
         ..WorkContext::default()
     };
-    zone.register_with_context(unit, ctx).unwrap();
+    batch.register_with_context(unit, ctx).unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
-    drop(zone);
-    // If we got here without hanging, the zone dropped correctly
+    drop(batch);
+    // If we got here without hanging, the SupervisedBatch dropped correctly
 }
 
 #[tokio::test(start_paused = true)]
 async fn test_zone_builder_chaining() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let mut zone = Zone::new(runtime, caps);
-    zone.register(Arc::new(StubComponent::ok("a")))
+    let mut batch = SupervisedBatch::new(runtime, caps);
+    batch.register(Arc::new(StubComponent::ok("a")))
         .unwrap()
         .register(Arc::new(StubComponent::ok("b")))
         .unwrap();
-    let summary: ZoneSummary = (&mut zone).await;
+    let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(summary.completed.len(), 2);
 }
 
@@ -505,11 +505,11 @@ async fn test_zone_transitive_cancellation() {
     tokio::time::resume();
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let mut zone = Zone::new(runtime, caps);
+    let mut batch = SupervisedBatch::new(runtime, caps);
 
-    zone.register(Arc::new(StubComponent::fail("A").with_provides("a_out")))
+    batch.register(Arc::new(StubComponent::fail("A").with_provides("a_out")))
         .unwrap();
-    zone.register_with_context(
+    batch.register_with_context(
         Arc::new(
             StubComponent::dep_fail("B")
                 .with_dep("a_out")
@@ -521,7 +521,7 @@ async fn test_zone_transitive_cancellation() {
         },
     )
     .unwrap();
-    zone.register_with_context(
+    batch.register_with_context(
         Arc::new(StubComponent::dep_fail("C").with_dep("b_out")),
         WorkContext {
             max_retries: 10,
@@ -530,7 +530,7 @@ async fn test_zone_transitive_cancellation() {
     )
     .unwrap();
 
-    let summary: ZoneSummary = (&mut zone).await;
+    let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(summary.completed.len(), 0);
     assert_eq!(summary.failed.len(), 1);
     // B and C should both be cancelled (transitive from A failure)
@@ -539,7 +539,7 @@ async fn test_zone_transitive_cancellation() {
         .cancelled
         .iter()
         .map(|e| match e {
-            ZoneEvent::Cancelled { name, .. } => name.to_string(),
+            SupervisedBatchEvent::Cancelled { name, .. } => name.to_string(),
             _ => String::new(),
         })
         .collect();
@@ -551,13 +551,13 @@ async fn test_zone_transitive_cancellation() {
 async fn test_zone_panic_cancels_dependents() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let mut zone = Zone::new(runtime, caps);
+    let mut batch = SupervisedBatch::new(runtime, caps);
 
-    zone.register(Arc::new(
+    batch.register(Arc::new(
         StubComponent::panic("parent").with_provides("shared"),
     ))
     .unwrap();
-    zone.register_with_context(
+    batch.register_with_context(
         Arc::new(StubComponent::dep_fail("child").with_dep("shared")),
         WorkContext {
             max_retries: 10,
@@ -566,11 +566,11 @@ async fn test_zone_panic_cancels_dependents() {
     )
     .unwrap();
 
-    let summary: ZoneSummary = (&mut zone).await;
+    let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(summary.completed.len(), 0);
     assert_eq!(summary.panicked.len(), 1);
     assert_eq!(summary.cancelled.len(), 1);
-    if let ZoneEvent::Cancelled {
+    if let SupervisedBatchEvent::Cancelled {
         ref name,
         ref reason,
     } = summary.cancelled[0]
@@ -586,14 +586,14 @@ async fn test_zone_panic_cancels_dependents() {
 async fn test_zone_budget_exhaustion() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let mut zone = Zone::new(runtime, caps);
+    let mut batch = SupervisedBatch::new(runtime, caps);
 
     for i in 0..250 {
-        zone.register(Arc::new(StubComponent::ok(&format!("fast_{i}"))))
+        batch.register(Arc::new(StubComponent::ok(&format!("fast_{i}"))))
             .unwrap();
     }
 
-    let summary: ZoneSummary = (&mut zone).await;
+    let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(summary.completed.len(), 250);
     assert_eq!(summary.panicked.len(), 0);
     assert_eq!(summary.cancelled.len(), 0);
@@ -604,7 +604,7 @@ async fn test_zone_drop_aborts_all_tasks() {
     tokio::time::resume();
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let mut zone = Zone::new(runtime, caps);
+    let mut batch = SupervisedBatch::new(runtime, caps);
 
     struct SlowUnit;
     impl WorkUnit for SlowUnit {
@@ -623,21 +623,21 @@ async fn test_zone_drop_aborts_all_tasks() {
     }
     impl_component_for_test!(SlowUnit);
 
-    zone.register(Arc::new(SlowUnit)).unwrap();
-    drop(zone);
+    batch.register(Arc::new(SlowUnit)).unwrap();
+    drop(batch);
 }
 
 #[tokio::test(start_paused = true)]
 async fn test_zone_config_custom_budget() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let config = ZoneConfig {
+    let config = SupervisedBatchConfig {
         poll_budget: 32,
-        ..ZoneConfig::default()
+        ..SupervisedBatchConfig::default()
     };
-    let mut zone = Zone::new_with_config(runtime, caps, config);
-    zone.register(Arc::new(StubComponent::ok("task"))).unwrap();
-    let summary: ZoneSummary = (&mut zone).await;
+    let mut batch = SupervisedBatch::new_with_config(runtime, caps, config);
+    batch.register(Arc::new(StubComponent::ok("task"))).unwrap();
+    let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(summary.completed.len(), 1);
 }
 
@@ -647,14 +647,14 @@ async fn test_zone_config_custom_budget() {
 async fn test_zone_failed_vs_panic_distinct() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let mut zone = Zone::new(runtime, caps);
+    let mut batch = SupervisedBatch::new(runtime, caps);
 
-    zone.register(Arc::new(StubComponent::fail("fail_task")))
+    batch.register(Arc::new(StubComponent::fail("fail_task")))
         .unwrap();
-    zone.register(Arc::new(StubComponent::panic("panic_task")))
+    batch.register(Arc::new(StubComponent::panic("panic_task")))
         .unwrap();
 
-    let summary: ZoneSummary = (&mut zone).await;
+    let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(summary.completed.len(), 0);
     assert_eq!(summary.failed.len(), 1, "fail_task records as Failed");
     assert_eq!(summary.panicked.len(), 1, "panic_task records as Panicked");
@@ -662,32 +662,32 @@ async fn test_zone_failed_vs_panic_distinct() {
     assert!(summary
         .failed
         .iter()
-        .any(|e| matches!(e, ZoneEvent::Failed { name, .. } if &**name == "fail_task")));
+        .any(|e| matches!(e, SupervisedBatchEvent::Failed { name, .. } if &**name == "fail_task")));
     assert!(summary
         .panicked
         .iter()
-        .any(|e| matches!(e, ZoneEvent::Panicked { name, .. } if &**name == "panic_task")));
+        .any(|e| matches!(e, SupervisedBatchEvent::Panicked { name, .. } if &**name == "panic_task")));
 }
 
-/// Drop after natural completion: the Zone's done=true guard in Drop
+/// Drop after natural completion: the SupervisedBatch's done=true guard in Drop
 /// prevents abort_all() from being called on an empty JoinSet.
 #[tokio::test(start_paused = true)]
 async fn test_zone_drop_completed_zone_is_safe() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let mut zone = Zone::new(runtime, caps);
-    zone.register(Arc::new(StubComponent::ok("task"))).unwrap();
-    let summary: ZoneSummary = (&mut zone).await;
+    let mut batch = SupervisedBatch::new(runtime, caps);
+    batch.register(Arc::new(StubComponent::ok("task"))).unwrap();
+    let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(summary.completed.len(), 1);
-    drop(zone);
+    drop(batch);
 }
 
 /// ZoneConfig satisfies Debug, Clone, Copy, PartialEq, Eq.
 #[test]
 fn test_zone_config_traits() {
-    let a = ZoneConfig {
+    let a = SupervisedBatchConfig {
         poll_budget: 64,
-        ..ZoneConfig::default()
+        ..SupervisedBatchConfig::default()
     };
     let b = a;
     assert_eq!(a, b);
@@ -700,7 +700,7 @@ fn test_zone_config_traits() {
 /// permanent `Execution` failures short-circuit, transient ones retry.
 #[test]
 fn test_zone_config_default_retry_predicate() {
-    let config = ZoneConfig::default();
+    let config = SupervisedBatchConfig::default();
     assert!(!(config.is_retryable)(&WorkError::Execution(
         "permanent".into()
     )));
@@ -713,7 +713,7 @@ fn test_zone_config_default_retry_predicate() {
     }));
 }
 
-/// A custom `is_retryable` predicate overrides the default per-zone.
+/// A custom `is_retryable` predicate overrides the default per-SupervisedBatch.
 #[tokio::test(start_paused = true)]
 async fn test_zone_custom_retry_predicate_retries_execution() {
     tokio::time::resume();
@@ -721,11 +721,11 @@ async fn test_zone_custom_retry_predicate_retries_execution() {
     let caps = CapabilitySet::new();
     // Opt-in predicate: retry even `Execution` failures (legacy unconditional
     // behavior), as chart zones do for their LLM-call failures.
-    let config = ZoneConfig {
+    let config = SupervisedBatchConfig {
         is_retryable: |_: &WorkError| true,
-        ..ZoneConfig::default()
+        ..SupervisedBatchConfig::default()
     };
-    let mut zone = Zone::new_with_config(runtime, caps, config);
+    let mut batch = SupervisedBatch::new_with_config(runtime, caps, config);
     let counter = Arc::new(AtomicUsize::new(0));
     let cnt = Arc::clone(&counter);
     let unit = StubComponent::new("retry_exec").with_handler(move |_| {
@@ -736,8 +736,8 @@ async fn test_zone_custom_retry_predicate_retries_execution() {
         max_retries: 2,
         ..WorkContext::default()
     };
-    zone.register_with_context(Arc::new(unit), ctx).unwrap();
-    let summary: ZoneSummary = (&mut zone).await;
+    batch.register_with_context(Arc::new(unit), ctx).unwrap();
+    let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(summary.failed.len(), 1);
     assert_eq!(
         counter.load(Ordering::SeqCst),
@@ -751,13 +751,13 @@ async fn test_zone_custom_retry_predicate_retries_execution() {
 async fn test_zone_config_budget_one() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let config = ZoneConfig {
+    let config = SupervisedBatchConfig {
         poll_budget: 1,
-        ..ZoneConfig::default()
+        ..SupervisedBatchConfig::default()
     };
-    let mut zone = Zone::new_with_config(runtime, caps, config);
-    zone.register(Arc::new(StubComponent::ok("task"))).unwrap();
-    let summary: ZoneSummary = (&mut zone).await;
+    let mut batch = SupervisedBatch::new_with_config(runtime, caps, config);
+    batch.register(Arc::new(StubComponent::ok("task"))).unwrap();
+    let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(summary.completed.len(), 1);
 }
 
@@ -766,10 +766,10 @@ async fn test_zone_config_budget_one() {
 async fn test_zone_register_duplicate_returns_error() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let mut zone = Zone::new(runtime, caps);
-    zone.register(Arc::new(StubComponent::ok("dup"))).unwrap();
-    match zone.register(Arc::new(StubComponent::fail("dup"))) {
-        Err(ZoneError::DuplicateName(n)) => assert_eq!(n, ArcIntern::from("dup")),
+    let mut batch = SupervisedBatch::new(runtime, caps);
+    batch.register(Arc::new(StubComponent::ok("dup"))).unwrap();
+    match batch.register(Arc::new(StubComponent::fail("dup"))) {
+        Err(SupervisedBatchError::DuplicateName(n)) => assert_eq!(n, ArcIntern::from("dup")),
         _ => panic!("expected DuplicateName error"),
     }
 }
@@ -782,7 +782,7 @@ async fn test_zone_drop_multiple_pending_tasks() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
     let counter = Arc::new(AtomicUsize::new(0));
-    let mut zone = Zone::new(runtime, caps);
+    let mut batch = SupervisedBatch::new(runtime, caps);
     for i in 0..10 {
         let cnt = Arc::clone(&counter);
         let unit = StubComponent::new(&format!("task_{i}")).with_handler(move |_| {
@@ -793,9 +793,9 @@ async fn test_zone_drop_multiple_pending_tasks() {
             max_retries: 100,
             ..WorkContext::default()
         };
-        zone.register_with_context(Arc::new(unit), ctx).unwrap();
+        batch.register_with_context(Arc::new(unit), ctx).unwrap();
     }
-    drop(zone);
+    drop(batch);
     // The tasks would each try to execute many times.
     // After abort_all(), they are stopped. If any completed normally,
     // they would have incremented the counter. The counter at 0 proves
@@ -811,10 +811,10 @@ async fn test_zone_drop_dependency_graph() {
     tokio::time::resume();
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let mut zone = Zone::new(runtime, caps);
+    let mut batch = SupervisedBatch::new(runtime, caps);
     // Provider task that fails and retries
     let provider = StubComponent::dep_fail("provider").with_provides("shared_asset");
-    zone.register_with_context(
+    batch.register_with_context(
         Arc::new(provider),
         WorkContext {
             max_retries: 100,
@@ -824,7 +824,7 @@ async fn test_zone_drop_dependency_graph() {
     .unwrap();
     // Dependent task that depends on the provider's asset
     let dependent = StubComponent::dep_fail("dependent").with_dep("shared_asset");
-    zone.register_with_context(
+    batch.register_with_context(
         Arc::new(dependent),
         WorkContext {
             max_retries: 100,
@@ -832,5 +832,5 @@ async fn test_zone_drop_dependency_graph() {
         },
     )
     .unwrap();
-    drop(zone);
+    drop(batch);
 }

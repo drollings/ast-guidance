@@ -1,7 +1,7 @@
 //! Retry and backoff primitives — the single source of truth for the
 //! jittered-exponential backoff schedule used across the workspace.
 //!
-//! Consumers: `RetryBackend` (fluent-router), `Zone`
+//! Consumers: `RetryBackend` (fluent-router), `SupervisedBatch`
 //! (fluent-concurrency), and `fluent_wvr::retry_call` (the synchronous
 //! counterpart for non-async callers). The `async` loop below is the
 //! transport-retry helper; corrective re-prompting (e.g. `RetryClassifier`)

@@ -120,7 +120,7 @@ impl StubComponent {
 
     /// A unit that returns `Err(WorkError::Dependency(...))` — the transient,
     /// retryable failure. Use this (not `fail`) for units that must stay
-    /// pending under a retrying `Zone` until a dependency resolves.
+    /// pending under a retrying `SupervisedBatch` until a dependency resolves.
     pub fn dep_fail(name: &str) -> Self {
         let label = format!("stub dependency fail: {name}");
         Self::new(name).with_handler(move |_| Err(WorkError::Dependency(label.clone())))

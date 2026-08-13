@@ -6,7 +6,7 @@ use std::sync::Arc;
 //
 // This is the canonical home of the capability-gating task-local. It lives
 // here (rather than in a consumer crate) so that both `fluent-concurrency`
-// (which propagates capabilities through `Scope`/`Zone` spawn boundaries)
+// (which propagates capabilities through `Scope`/`SupervisedBatch` spawn boundaries)
 // and `fluent-db` (whose `DbCapability` must gate its operations) can read
 // the *same* variable without a cyclic dependency between the two crates.
 //

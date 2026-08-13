@@ -18,14 +18,14 @@ The result is three pluggable memory backends — `holographic`, `hindsight`, `h
 | Hermes Pattern | Rust Primitive | Rationale |
 |---|---|---|
 | `MemoryProvider` ABC | `MemoryPlugin: Component + MemoryOps` | Extends the existing `Component` supertrait with memory-specific lifecycle |
-| `threading.Lock` / daemon threads | `tokio::sync::Mutex` + `Zone` + `Scope` | Structured concurrency replaces ad-hoc threading |
+| `threading.Lock` / daemon threads | `tokio::sync::Mutex` + `SupervisedBatch` + `Scope` | Structured concurrency replaces ad-hoc threading |
 | Plugin discovery (filesystem scan) | Compile-time registration + `PluginDiscovery` trait | Deterministic; no runtime heuristic scanning |
 | Single-provider constraint | `MemoryPluginRegistry` with `active` slot | Configurable default, multiple plugins coexist |
 | `prefetch` / `sync_turn` hooks | `MemoryOps` trait methods | Direct 1:1 mapping |
 | SQLite + FTS5 (holographic) | `rusqlite` (already a workspace dep) | Same embedded engine, Rust-native |
 | HRR algebra (numpy) | Pure Rust `HrrAlgebra` | No numpy dependency; `f64` SIMD-free scalar math |
 | Knowledge graph (hindsight) | `HindsightGraph` with typed entities | Rust enum dispatch, not stringly-typed |
-| Cross-session reasoning (honcho) | `HonchoAnalyzer` with `Zone`-managed sessions | Async-native, credit-backpressured ingestion |
+| Cross-session reasoning (honcho) | `HonchoAnalyzer` with `SupervisedBatch`-managed sessions | Async-native, credit-backpressured ingestion |
 
 ---
 
@@ -451,7 +451,7 @@ src/memory/                    # New workspace member: guidance-memory
 │   ├── types.rs               # MemoryInitContext, MemoryResult, MemoryError, etc.
 │   ├── registry.rs            # MemoryPluginRegistry, MemoryCapability
 │   ├── capability.rs          # MemoryCapability token
-│   ├── zone.rs                # MemoryZone: ingestion Zone wrapper
+│   ├── zone.rs                # MemoryZone: ingestion SupervisedBatch wrapper
 │   ├── plugins/
 │   │   ├── mod.rs             # Plugin module declarations
 │   │   ├── holographic/
@@ -533,13 +533,13 @@ The ingestion pipeline uses `CreditFlow` from `fluent-concurrency` to prevent un
 ```rust
 // src/memory/src/zone.rs
 
-use fluent_concurrency::{Zone, ZoneConfig, Scope, CreditFlow};
+use fluent_concurrency::{SupervisedBatch, SupervisedBatchConfig, Scope, CreditFlow};
 use crate::traits::*;
 
 /// Memory-specific ingestion zone.
-/// Wraps a fluent-concurrency Zone with memory pipeline semantics.
+/// Wraps the memory pipeline semantics (over `Scope`) with pipeline semantics.
 pub struct MemoryZone {
-    zone: Zone,
+    zone: SupervisedBatch,
     credit: CreditFlow,
 }
 
@@ -554,13 +554,13 @@ impl MemoryZone {
         max_concurrent: usize,
         credit_limit: usize,
     ) -> Self {
-        let config = ZoneConfig {
+        let config = SupervisedBatchConfig {
             max_concurrent_tasks: max_concurrent,
             ..Default::default()
         };
         let (credit, _receiver) = CreditFlow::new(credit_limit);
         Self {
-            zone: Zone::new(rt, caps, config),
+            zone: SupervisedBatch::new(rt, caps, config),
             credit,
         }
     }
@@ -603,7 +603,7 @@ impl fluent_wvr::WorkUnit for IngestUnit {
     fn depends(&self) -> &[ArcIntern<fluent_wvr::ArcIntern<str>>] { &[] }
     fn provides(&self) -> &[ArcIntern<fluent_wvr::ArcIntern<str>>] { &[] }
     fn execute(&self, _ctx: &fluent_wvr::WorkContext) -> Result<fluent_wvr::WorkOutput, fluent_wvr::WorkError> {
-        // Ingestion is async — this unit is a bridge that the Zone polls
+        // Ingestion is async — this unit is a bridge that the SupervisedBatch polls
         Ok(fluent_wvr::WorkOutput::ok("ingestion dispatched"))
     }
 }
@@ -611,8 +611,8 @@ impl fluent_wvr::WorkUnit for IngestUnit {
 
 ### 5.4 Fault Containment
 
-When an ingestion task panics inside the `Zone`:
-1. The `Zone` catches the `JoinError` (panic is caught, not propagated)
+When an ingestion task panics inside the `SupervisedBatch`:
+1. The `SupervisedBatch` catches the `JoinError` (panic is caught, not propagated)
 2. A `ZoneEvent::TaskFailed { name, error }` is emitted
 3. Dependent tasks (if any) are cancelled via structural cancellation tokens
 4. Independent tasks continue unaffected
@@ -896,7 +896,7 @@ pub struct KnowledgeGraph {
 |---|---|
 | Honcho cloud API (`honcho` SDK) | `HonchoAnalyzer` — local-only, no cloud dependency |
 | Session management (Python `session.py`) | `SessionStore` with `tokio::sync::Mutex<Vec<SessionSummary>>` |
-| Background flush threads | `Zone`-managed flush task with `CreditFlow` backpressure |
+| Background flush threads | `SupervisedBatch`-managed flush task with `CreditFlow` backpressure |
 | Peer card deduplication | `ConclusionDeduplicator` — hash-based dedup of reasoning conclusions |
 | Cron guard | `tokio::time::interval` with `Interval`-based gating |
 
@@ -979,7 +979,7 @@ Complete mapping of every `MemoryProvider` ABC method to the Rust `MemoryOps` tr
 
 | Anti-Pattern | Enforcement |
 |---|---|
-| No ambient `tokio::spawn` | Every background task is spawned inside a `Zone` or `Scope` |
+| No ambient `tokio::spawn` | Every background task is spawned inside a `SupervisedBatch` or `Scope` |
 | No raw pointer vtables | All type erasure via `Arc<dyn MemoryPlugin>` (standard safe Rust) |
 | No `dyn Trait` in per-item loops | HRR algebra uses concrete `Vec<f64>`; graph traversal uses `BTreeMap` keys |
 | No `#[async_trait]` proc macros | `MemoryOps` uses `impl Future<Output = ...> + Send` (RPITIT) |
@@ -1020,7 +1020,7 @@ pub struct GuidanceWorkContext {
 | 2 | `HolographicMemory`: store.rs, hrr.rs, retrieval.rs, full `MemoryOps` impl | 3 days |
 | 3 | `HindsightMemory`: graph.rs, entity.rs, retrieval.rs | 3 days |
 | 4 | `HonchoMemory`: session.rs, analyzer.rs, retrieval.rs | 2 days |
-| 5 | `MemoryZone` integration with `fluent-concurrency` Zone | 1 day |
+| 5 | `MemoryZone` integration with `fluent-concurrency` SupervisedBatch | 1 day |
 | 6 | Guidance integration: prefetch injection, tool dispatch | 1 day |
 | 7 | Tests: unit (HRR algebra, entity resolution), integration (full pipeline), property-based (dedup) | 2 days |
 

@@ -114,18 +114,18 @@ pub static DB_POOL: LazyLock<Arc<ResultPool<DbSyncPayload, usize, String>>> = La
     ))
 });
 
-/// Create a `Zone` with the standard guidance configuration (structured
+/// Create a `SupervisedBatch` with the standard guidance configuration (structured
 /// concurrency, failure containment, and dependency tracking for batches of
 /// AST generation tasks).
 ///
-/// Unlike manual oneshot channel management, a Zone:
+/// Unlike manual oneshot channel management, a SupervisedBatch:
 /// - Automatically cancels dependent tasks when a prerequisite fails
 /// - Enforces a poll budget to prevent executor starvation
 /// - Provides a typed event summary (completed/panicked/cancelled)
 ///
 /// # Example
 /// ```ignore
-/// let mut zone = Zone::new_with_config(
+/// let mut batch = SupervisedBatch::new_with_config(
 ///     Arc::new(TokioRuntime),
 ///     CapabilitySet::default(),
 ///     ZoneConfig {
@@ -133,15 +133,15 @@ pub static DB_POOL: LazyLock<Arc<ResultPool<DbSyncPayload, usize, String>>> = La
 ///         ..ZoneConfig::default()
 ///     },
 /// );
-/// zone.register(build_task_a);  // provides "parsed"
-/// zone.register(build_task_b);  // depends on "parsed"
-/// let summary = zone.await;
+/// batch.register(build_task_a);  // provides "parsed"
+/// batch.register(build_task_b);  // depends on "parsed"
+/// let summary = batch.await;
 /// // If task_a panics, task_b is automatically cancelled
 /// ```
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluent_concurrency::zone::Zone;
+    use fluent_concurrency::batch::SupervisedBatch;
 
     #[tokio::test]
     async fn test_ast_pool_static_init() {
@@ -152,6 +152,6 @@ mod tests {
     #[test]
     fn test_sync_zone_is_send() {
         fn assert_send<T: Send>() {}
-        assert_send::<Zone>();
+        assert_send::<SupervisedBatch>();
     }
 }

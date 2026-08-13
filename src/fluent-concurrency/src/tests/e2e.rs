@@ -1,11 +1,11 @@
 use crate::pool::WorkerPool;
-use crate::zone::{Zone, ZoneEvent, ZoneSummary};
+use crate::batch::{SupervisedBatch, SupervisedBatchEvent, SupervisedBatchSummary};
 use fluent_wvr::prelude::*;
 use fluent_wvr_testutil::{impl_component_for_test, StubComponent};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// End-to-end: Zone orchestrates WorkerPool-backed tasks
+/// End-to-end: SupervisedBatch orchestrates WorkerPool-backed tasks
 #[tokio::test(start_paused = true)]
 async fn test_e2e_zone_with_worker_pool() {
     tokio::time::resume();
@@ -45,8 +45,8 @@ async fn test_e2e_zone_with_worker_pool() {
     }
     impl_component_for_test!(PoolWorkUnit);
 
-    let mut zone = Zone::new(runtime, caps);
-    zone.register(Arc::new(PoolWorkUnit {
+    let mut batch = SupervisedBatch::new(runtime, caps);
+    batch.register(Arc::new(PoolWorkUnit {
         name: "task1".into(),
         _pool: Arc::clone(&pool),
         input: 5,
@@ -59,13 +59,13 @@ async fn test_e2e_zone_with_worker_pool() {
     }))
     .unwrap();
 
-    let summary: ZoneSummary = (&mut zone).await;
+    let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(summary.completed.len(), 2);
     assert_eq!(summary.panicked.len(), 0);
     assert_eq!(summary.cancelled.len(), 0);
 }
 
-/// End-to-end: Zone handles mixed success/failure/cancellation
+/// End-to-end: SupervisedBatch handles mixed success/failure/cancellation
 #[tokio::test(start_paused = true)]
 async fn test_e2e_zone_mixed_outcomes() {
     let runtime = crate::tokio_runtime();
@@ -94,7 +94,7 @@ async fn test_e2e_zone_mixed_outcomes() {
                 // first attempt.
                 "fail" => Err(WorkError::Execution("failed".into())),
                 // Transient failure — retryable; keeps the unit pending under
-                // a retrying zone until a dependent provider's failure reaches it.
+                // a retrying SupervisedBatch until a dependent provider's failure reaches it.
                 "dep_fail" => Err(WorkError::Dependency("awaiting shared".into())),
                 "panic" => panic!("intentional panic"),
                 _ => unreachable!(),
@@ -104,8 +104,8 @@ async fn test_e2e_zone_mixed_outcomes() {
     impl_component_for_test!(OutcomeUnit);
 
     let shared = ArcIntern::<str>::from("shared");
-    let mut zone = Zone::new(runtime, caps);
-    zone.register(Arc::new(OutcomeUnit {
+    let mut batch = SupervisedBatch::new(runtime, caps);
+    batch.register(Arc::new(OutcomeUnit {
         name: "root".into(),
         outcome: "fail",
         deps: vec![],
@@ -133,7 +133,7 @@ async fn test_e2e_zone_mixed_outcomes() {
     }))
     .unwrap();
 
-    let summary: ZoneSummary = (&mut zone).await;
+    let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(summary.completed.len(), 0);
     assert_eq!(summary.failed.len(), 1, "root fails with execution error");
     assert_eq!(summary.panicked.len(), 1, "independent panics");
@@ -146,13 +146,13 @@ async fn test_e2e_zone_mixed_outcomes() {
 async fn test_e2e_panic_cascade_with_independent_neighbors() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let mut zone = Zone::new(runtime, caps);
+    let mut batch = SupervisedBatch::new(runtime, caps);
 
-    zone.register(Arc::new(
+    batch.register(Arc::new(
         StubComponent::panic("parent").with_provides("shared"),
     ))
     .unwrap();
-    zone.register_with_context(
+    batch.register_with_context(
         Arc::new(StubComponent::dep_fail("child").with_dep("shared")),
         WorkContext {
             max_retries: 10,
@@ -160,11 +160,11 @@ async fn test_e2e_panic_cascade_with_independent_neighbors() {
         },
     )
     .unwrap();
-    zone.register(Arc::new(
+    batch.register(Arc::new(
         StubComponent::ok("neighbor").with_provides("independent"),
     ))
     .unwrap();
-    zone.register_with_context(
+    batch.register_with_context(
         Arc::new(StubComponent::ok("grandchild").with_dep("independent")),
         WorkContext {
             max_retries: 10,
@@ -173,7 +173,7 @@ async fn test_e2e_panic_cascade_with_independent_neighbors() {
     )
     .unwrap();
 
-    let summary: ZoneSummary = (&mut zone).await;
+    let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(
         summary.completed.len(),
         2,
@@ -184,20 +184,20 @@ async fn test_e2e_panic_cascade_with_independent_neighbors() {
     assert!(summary
         .panicked
         .iter()
-        .any(|e| matches!(e, ZoneEvent::Panicked { name, .. } if &**name == "parent")));
+        .any(|e| matches!(e, SupervisedBatchEvent::Panicked { name, .. } if &**name == "parent")));
     assert!(summary
         .cancelled
         .iter()
-        .any(|e| matches!(e, ZoneEvent::Cancelled { name, .. } if &**name == "child")));
+        .any(|e| matches!(e, SupervisedBatchEvent::Cancelled { name, .. } if &**name == "child")));
 }
 
 /// E2E Cycle Resiliency: verify that a circular dependency does not hang
-/// the zone and that the cascade breaks the loop safely.
+/// the SupervisedBatch and that the cascade breaks the loop safely.
 #[tokio::test(start_paused = true)]
 async fn test_e2e_cycle_resiliency() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
-    let mut zone = Zone::new(runtime, caps);
+    let mut batch = SupervisedBatch::new(runtime, caps);
 
     struct CycleUnit {
         name: String,
@@ -231,14 +231,14 @@ async fn test_e2e_cycle_resiliency() {
     let a_provides = ArcIntern::<str>::from("a_provides");
     let b_provides = ArcIntern::<str>::from("b_provides");
 
-    zone.register(Arc::new(CycleUnit {
+    batch.register(Arc::new(CycleUnit {
         name: "A".into(),
         deps: vec![b_provides.clone()],
         provides: vec![a_provides.clone()],
         retryable: false,
     }))
     .unwrap();
-    zone.register_with_context(
+    batch.register_with_context(
         Arc::new(CycleUnit {
             name: "B".into(),
             deps: vec![a_provides.clone()],
@@ -252,7 +252,7 @@ async fn test_e2e_cycle_resiliency() {
     )
     .unwrap();
 
-    let summary: ZoneSummary = (&mut zone).await;
+    let summary: SupervisedBatchSummary = (&mut batch).await;
     // A fails immediately with Execution error, B is a dependent in a cycle.
     // The cycle should be detected and B should be cancelled.
     assert_eq!(
@@ -268,9 +268,9 @@ async fn test_e2e_cycle_resiliency() {
     assert!(summary
         .failed
         .iter()
-        .any(|e| matches!(e, ZoneEvent::Failed { name, .. } if &**name == "A")));
+        .any(|e| matches!(e, SupervisedBatchEvent::Failed { name, .. } if &**name == "A")));
     assert!(summary
         .cancelled
         .iter()
-        .any(|e| matches!(e, ZoneEvent::Cancelled { name, .. } if &**name == "B")));
+        .any(|e| matches!(e, SupervisedBatchEvent::Cancelled { name, .. } if &**name == "B")));
 }

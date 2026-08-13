@@ -5,7 +5,7 @@
 //! It mirrors `ClassifierStage` (same shape: `name`, `Arc<dyn ChatBackend>`,
 //! `Arc<Limiter>`, `depends`/`provides` as `ArcIntern<str>`,
 //! `impl_component!`) but keeps `execute` synchronous and non-blocking —
-//! timeout/retry/cancellation belong to the Zone supervisor (M9).
+//! timeout/retry/cancellation belong to the SupervisedBatch supervisor (M9).
 
 use std::collections::HashMap;
 use std::sync::Arc;

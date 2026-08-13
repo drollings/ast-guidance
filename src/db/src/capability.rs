@@ -9,7 +9,7 @@
 //! Capability gating is **not** reimplemented here: the canonical primitive is
 //! `fluent_wvr::capability::check_capability`, which consults the
 //! `CURRENT_CAPS` task-local installed by `fluent-concurrency`'s
-//! `Scope`/`Zone`. This crate's `DbCapability` is the *token*; the gating
+//! `Scope`/`SupervisedBatch`. This crate's `DbCapability` is the *token*; the gating
 //! seam stays in `fluent-wvr`.
 //!
 //! The lossy all-values-as-strings `query` / `execute` methods are **deprecated**

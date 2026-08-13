@@ -14,7 +14,7 @@
 > "in production use" is not uniform across the crate:
 >
 > - **Production** — composed by a live call path in this workspace (the
->   pipeline `Component` stages, `DependencyGraph`, `Zone`, `Instrumented`,
+>   pipeline `Component` stages, `DependencyGraph`, `SupervisedBatch`, `Instrumented`,
 >   `ResultPool`, the roadmap shared primitives).
 > - **Compatibility surface (scaffold)** — the trait/type is derived and
 >   contract-complete, but has no current production caller. It exists to keep
@@ -200,7 +200,7 @@ pub trait WorkUnit: Send + Sync {
 
     /// Default per-unit timeout. Override to specialise.
     /// `WorkContext::for_unit(unit, caps)` seeds `timeout_ms` from this value
-    /// for standalone execution. Inside a `Zone`, `register_with_context`
+    /// for standalone execution. Inside a `SupervisedBatch`, `register_with_context`
     /// sets `ctx.timeout_ms` explicitly and the supervisor enforces it
     /// through `execute_with_timeout_and_retry`.
     fn default_timeout_ms(&self) -> u64 { 30_000 }
@@ -271,7 +271,7 @@ impl ComponentArcExt for Arc<dyn Component> {
 ```rust
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum WorkError {
-    /// Synchronous failure inside `execute`. The `Zone` supervisor
+    /// Synchronous failure inside `execute`. The `SupervisedBatch` supervisor
     /// routes this to `summary.failed` — NOT to `summary.panicked`.
     #[error("execution failed: {0}")]
     Execution(String),
@@ -281,8 +281,8 @@ pub enum WorkError {
     #[error("dependency not satisfied: {0}")]
     Dependency(String),
 
-    /// Returned by `Zone::execute_with_timeout_and_retry` when the
-    /// wall-clock budget is exhausted. `Zone` routes this to
+    /// Returned by `SupervisedBatch::execute_with_timeout_and_retry` when the
+    /// wall-clock budget is exhausted. `SupervisedBatch` routes this to
     /// `summary.cancelled`, NOT to `summary.failed`.
     #[error("timeout after {duration_ms}ms ({unit})")]
     Timeout { duration_ms: u64, unit: String },
@@ -327,13 +327,13 @@ impl std::fmt::Display for WorkOutput {
 
 `WorkContext` carries the per-call configuration plus a `Runtime` and
 a `CapabilitySet`. The default uses `NoopRuntime` and an empty
-capability set; `Zone` overrides both at registration time.
+capability set; `SupervisedBatch` overrides both at registration time.
 
 ```rust
 #[derive(Clone)]
 pub struct WorkContext {
     pub dry_run: bool,                   // short-circuit mutating handlers
-    pub max_retries: u32,                // 0 = no retry; >0 = Zone retries this many times
+    pub max_retries: u32,                // 0 = no retry; >0 = SupervisedBatch retries this many times
     pub timeout_ms: u64,                 // per-attempt wall-clock budget
     pub metadata: HashMap<String, MetadataValue>,
     pub outputs: OutputStore,            // typed inter-unit channel
@@ -365,9 +365,9 @@ impl WorkContext {
     /// Build a context for a single unit, using its `default_timeout_ms()`.
     pub fn for_unit(unit: &dyn WorkUnit, caps: CapabilitySet) -> Self;
 
-    /// Build a context that inherits the zone's `rt` and `caps`, with
+    /// Build a context that inherits the SupervisedBatch.s `rt` and `caps`, with
     /// optional per-unit overrides via a closure. The intended
-    /// registration-site helper — `Zone::register` uses it internally.
+    /// registration-site helper — `SupervisedBatch::register` uses it internally.
     pub fn for_unit_in_zone(
         zone_rt: &Arc<dyn Runtime>,
         zone_caps: &CapabilitySet,
@@ -771,7 +771,7 @@ The wrapper also implements `FieldAccess` (delegating `set_field`/`get_field`/`f
 
 - **Async transport retry**: `common_core::retry::retry_async(max_attempts,
   base_ms, jitter_pct, is_retryable, op)` — used by `RetryBackend` and the
-  `Zone` supervisor. `Zone` drives per-attempt timeout, `WorkError::Timeout`
+  `SupervisedBatch` supervisor. `SupervisedBatch` drives per-attempt timeout, `WorkError::Timeout`
   routing, and dependency cancellation on top of it.
 - **Sync free-function retry**: `retry_call(max_attempts, base_ms, f)` —
   the documented, explicitly-blocking counterpart for non-async contexts
@@ -789,9 +789,9 @@ let resp = common_core::retry::retry_async(3, 1000, 0, DispatchError::is_retryab
 let retried = retry_call(3, 50, || parse_file(path))?;
 ```
 
-For async retry with supervision, use the `Zone` supervisor (Pattern in
+For async retry with supervision, use the `SupervisedBatch` supervisor (Pattern in
 `fluent-concurrency`), which routes the underlying error to
-`ZoneSummary::failed` and runs `execute` on a fresh task budget per attempt.
+`SupervisedBatchSummary::failed` and runs `execute` on a fresh task budget per attempt.
 
 ### Application at the registration site
 
@@ -1273,13 +1273,13 @@ let unit: Arc<dyn Component> = Arc::new(Instrumented::new(
 `DbWorkUnit::builder()` (bon-style: `.name()`, `.op(...)`, `.depends()`,
 `.provides()`, `.default_timeout_ms()`) is the fully general form for ops that
 need to read `&WorkContext` or return arbitrary `WorkOutput`. Because the op
-runs on a blocking thread, the unit can be registered under a `Zone` for
+runs on a blocking thread, the unit can be registered under a `SupervisedBatch` for
 timeout/retry/dependency-cancellation without violating the purity contract —
-the `Zone`'s per-attempt budget applies to the offloaded task, and the
+the `SupervisedBatch`'s per-attempt budget applies to the offloaded task, and the
 executor is never starved. `execute` scopes `ctx.caps` into the `CURRENT_CAPS`
 task-local on **both** offload paths (`block_in_place` and the scoped-thread
 path), so a pool-backed op that calls `SqlitePool::acquire`/`with_conn` (both
-capability-gated) works under a `Zone`-style context on multi-thread and
+capability-gated) works under a `SupervisedBatch`-style context on multi-thread and
 current-thread runtimes alike.
 
 ### Orchestration — uniform loop
@@ -1311,7 +1311,7 @@ for unit in &registry {
 - **Store as `Arc<dyn WorkUnit>` or `Arc<dyn Component>`** in registries.
 - **Do NOT add methods to `WorkUnit` speculatively.** Start with `name`, `depends`, `provides`, `execute`. Add `default_timeout_ms`/`type_name` overrides only when the second implementation requires it (both have sensible defaults).
 - **For full runtime configurability**, implement all three sub-traits and call `impl_component!` to satisfy the `Component` supertrait.
-- **`execute` MUST be synchronous and non-blocking.** See the purity contract in the `WorkUnit` doc comment — violations defeat the `Zone` timeout/retry invariants.
+- **`execute` MUST be synchronous and non-blocking.** See the purity contract in the `WorkUnit` doc comment — violations defeat the `SupervisedBatch` timeout/retry invariants.
 
 ---
 
@@ -1573,7 +1573,7 @@ component.set_field("port", "9000")?;
 component.set_field("verbose", "true")?;
 
 // 3. Wrap: add cross-cutting concerns before type erasure (inlineable)
-// (retry composes `common_core::retry` or the `Zone` supervisor instead —
+// (retry composes `common_core::retry` or the `SupervisedBatch` supervisor instead —
 // see the Retry section in Pattern 3)
 let wrapped = Instrumented::new(component, "my_tool");
 
@@ -2037,7 +2037,7 @@ Do you need to adapt component behavior at runtime?
 | `Middleware` | `Send + Sync` required; stateless middleware is zero-contention |
 | `ComponentAdapter` | `Send + Sync` required; closures must be `Send + Sync` |
 | `Scope` (`fluent-concurrency`) | Holds a `JoinSet` internally; not `Sync`. Use `Scope::defer()` to guarantee cleanup on drop. Dropping without `close().await` panics (a structured-concurrency violation). |
-| `Zone` (`fluent-concurrency`) | Holds a `JoinSet` and a per-zone `Runtime` reference. `Zone::register` returns `Result<&mut Self, ZoneError>` — duplicate names are rejected with `Err(ZoneError::DuplicateName(_))`. |
+| `SupervisedBatch` (`fluent-concurrency`) | Holds a `JoinSet` and a per-zone `Runtime` reference. `SupervisedBatch::register` returns `Result<&mut Self, SupervisedBatchError>` — duplicate names are rejected with `Err(SupervisedBatchError::DuplicateName(_))`. |
 | `Reserve` (`fluent-concurrency`) | RAII permit from a shared `AtomicUsize` counter. `Send + Sync` because the counter is `Arc`-shared. Drop without `commit()` returns the permit; `commit()` consumes it permanently. |
 | `LogContext` | Thread-local — no synchronization needed |
 
@@ -2162,7 +2162,7 @@ When writing new code in `rust-src/`:
 
 4. **New runtime-configurable component** → Implement `FieldAccess` (instance method `field_names(&self)`), `Describable` (instance method `describe(&self)`), and `WorkUnit`. Then add `impl_component!(MyType);` after the three impls. There is **no blanket impl** — `impl_component!` is the canonical way to satisfy the supertrait. Both `field_names` and `describe` **must be instance methods** for trait-object dispatch to work.
 
-5. **New cross-cutting logic** → Newtype wrapper **before type erasure** (Pattern 3). If the type is already erased, use Middleware (Pattern 9). Never wrap after type erasure. The canonical wrapper is `Instrumented::new(inner, label)` (timing/observability). Retry composes `common_core::retry` (async `retry_async` / sync `retry_call`) or the `Zone` supervisor — never a blocking sleep inside `execute`.
+5. **New cross-cutting logic** → Newtype wrapper **before type erasure** (Pattern 3). If the type is already erased, use Middleware (Pattern 9). Never wrap after type erasure. The canonical wrapper is `Instrumented::new(inner, label)` (timing/observability). Retry composes `common_core::retry` (async `retry_async` / sync `retry_call`) or the `SupervisedBatch` supervisor — never a blocking sleep inside `execute`.
 
 6. **New subsystem with multiple implementations** → Define a trait with `Send + Sync`. Store as `Arc<dyn Trait>`. Never use `dyn Trait` with only one implementation.
 
@@ -2170,7 +2170,7 @@ When writing new code in `rust-src/`:
 
 8. **New batch-processing loop** → Scoped function with local `Vec`s. RAII drops everything at scope exit. For long-lived async groups, use `Scope::defer()` instead of manually calling `close().await`; dropping a `Scope` without closing panics.
 
-9. **New orchestratable task** → Implement `WorkUnit`. For runtime configurability, add `FieldAccess` + `Describable` and call `impl_component!` to become a `Component`. Store as `Arc<dyn Component>`. Use `Zone::register` (returns `Result<&mut Self, ZoneError>`) to participate in a `Zone` — the supervisor handles timeout, retry, and panic/fail distinct tracking.
+9. **New orchestratable task** → Implement `WorkUnit`. For runtime configurability, add `FieldAccess` + `Describable` and call `impl_component!` to become a `Component`. Store as `Arc<dyn Component>`. Use `SupervisedBatch::register` (returns `Result<&mut Self, SupervisedBatchError>`) to participate in a `SupervisedBatch` — the supervisor handles timeout, retry, and panic/fail distinct tracking.
 
 10. **New request-scoped observability** → Wrap the unit in `Instrumented::with_metrics(inner, label, histogram)`. The histogram is `Arc<common_core::metrics::LatencyHistogram>`; p50/p99/count/sum are queryable after `execute`.
 
@@ -2206,7 +2206,7 @@ When writing new code in `rust-src/`:
 
 23. **Never drop a `Scope` without closing.** Use `Scope::defer()` or `scope.close().await` — drop without close panics.
 
-24. **Never treat `WorkError::Execution` as a panic.** Handler errors land in `ZoneSummary::failed`; only `JoinError::is_panic()` lands in `panicked`.
+24. **Never treat `WorkError::Execution` as a panic.** Handler errors land in `SupervisedBatchSummary::failed`; only `JoinError::is_panic()` lands in `panicked`.
 
 ### The throwaway rule
 
@@ -2218,7 +2218,7 @@ When writing new code in `rust-src/`:
 
 28. **Run `cargo clippy --workspace -- -D warnings` before finishing.** The project enforces `#![deny(warnings)]`. (Pre-existing `uninlined_format_args` warnings at `fluent-wvr/src/work.rs:278,284` are grandfathered — do not introduce more.)
 
-29. **Run `cargo test --workspace` before finishing.** All workspace tests must pass (2301 as of 2026-08-13; see `make doc-check` for the lint that catches drift).
+29. **Run `cargo test --workspace` before finishing.** All workspace tests must pass. (The count is not documented — it changes too quickly to be a stable reference.)
 
 30. **Check for `unsafe` blocks.** The workspace has 3 `unsafe` blocks, all in `wasm_ipc/src/lib.rs` for `read_unaligned` of packed struct fields. Every new `unsafe` block must be justified and documented; the `forbid(unsafe_code)` lint is set at the crate level for both `fluent-wvr` and `fluent-concurrency`.
 
@@ -2237,7 +2237,7 @@ runtime in `fluent-concurrency`. The full surface is documented in
 | `Runtime` (trait) | `fluent-concurrency/src/runtime/` | Pluggable backend: `TokioRuntime` (production), `TestRuntime` (deterministic, paused-time), `NoopRuntime` (in `fluent-wvr/src/runtime.rs`, init-only) |
 | `Capability` + `CapabilitySet` | `fluent-wvr/src/capability.rs` | Type-map of capability tokens; `with`/`get`/`remove`/`remove_as`/`contains`/`iter`/`len`/`is_empty` |
 | `Scope` | `fluent-concurrency/src/scope.rs` | Structured concurrency; `spawn` + `close().await` or `defer()`; drop-without-close panics |
-| `Zone` | `fluent-concurrency/src/zone.rs` | `Scope` + dependency graph + panic/fail/cancel distinct tracking; `ZoneSummary { completed, panicked, failed, cancelled }`; `Zone::register` returns `Result<_, ZoneError>`; `ZoneError::DuplicateName` |
+| `SupervisedBatch` | `fluent-concurrency/src/zone.rs` | `Scope` + dependency graph + panic/fail/cancel distinct tracking; `SupervisedBatchSummary { completed, panicked, failed, cancelled }`; `SupervisedBatch::register` returns `Result<_, SupervisedBatchError>`; `SupervisedBatchError::DuplicateName` |
 | `WorkerPool<T>` | `fluent-concurrency/src/pool.rs` | Bounded FIFO worker pool; capacity + backpressure |
 | `ResultPool<T, R, E>` | `fluent-concurrency/src/pool.rs` | Worker pool that returns a typed `Result<R, ResultPoolError<E>>`; `ResultPoolError` is `Inner(E) \| Canceled \| Pool(PoolError)` |
 | `PriorityResultPool<T, R, E>` | `fluent-concurrency/src/pool.rs` | Priority-ordered variant; workers drain fully before blocking on `Notify`; `submit` uses `notify_waiters` to avoid wakeup collapse |
@@ -2248,10 +2248,10 @@ runtime in `fluent-concurrency`. The full surface is documented in
 | `CreditFlow` | `fluent-concurrency/src/flow.rs` | Sender/receiver backpressure with `CreditSpec { initial, more_after }` |
 | `Reserve` | `fluent-concurrency/src/reserve.rs` | RAII permit from a shared `AtomicUsize`; `try_acquire`/`commit`; **currently has no in-tree production consumer** (throwaway rule candidate) |
 
-A `Zone` is a `Scope` plus the `WorkUnit` integration: tasks implement
-`Component` and are registered with `zone.register(arc).unwrap()`.
-The `Zone` runs each unit through `execute_with_timeout_and_retry`
-using the per-unit `default_timeout_ms()` and the zone-wide
+A `SupervisedBatch` is a `Scope` plus the `WorkUnit` integration: tasks implement
+`Component` and are registered with `batch.register(arc).unwrap()`.
+The `SupervisedBatch` runs each unit through `execute_with_timeout_and_retry`
+using the per-unit `default_timeout_ms()` and the SupervisedBatch-wide
 `max_retries`/`timeout_ms` set on the `WorkContext`. The four-way
 summary discriminates: `Ok(_)` → `completed`, `Err(WorkError::*)` →
 `failed`, `JoinError::is_panic()` → `panicked`, `JoinError::is_cancelled()`

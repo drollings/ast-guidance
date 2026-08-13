@@ -29,7 +29,7 @@ impl WorkError {
     /// exhausted, e.g. by transient overload) are retryable.
     ///
     /// This is the canonical predicate for retry loops that drive
-    /// `WorkUnit::execute` (the `Zone` supervisor and any future caller);
+    /// `WorkUnit::execute` (the `SupervisedBatch` supervisor and any future caller);
     /// `common_core::retry::retry_async` short-circuits on `false`.
     pub fn is_retryable(&self) -> bool {
         matches!(self, WorkError::Dependency(_) | WorkError::Timeout { .. })

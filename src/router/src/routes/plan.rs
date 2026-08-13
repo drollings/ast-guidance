@@ -223,7 +223,7 @@ impl PlanRoute {
     ///
     /// Selection outcome drives the returned plan:
     ///
-    /// - `Exact`: compile + execute the chart under Zone supervision, `source
+    /// - `Exact`: compile + execute the chart under SupervisedBatch supervision, `source
     ///   = HnswHit`, with the execution summary populated.
     /// - `Partial { gaps }`: `source = TemplateAdapted` with the gaps turned
     ///   into `interview_questions` (≤ `CHART_MAX_INTERVIEW_QUESTIONS`),
@@ -369,7 +369,7 @@ impl PlanRoute {
         }
     }
 
-    /// Compile + execute an exact-selected chart under Zone supervision.
+    /// Compile + execute an exact-selected chart under SupervisedBatch supervision.
     ///
     /// A missing `execution_backend` or a compile error degrades to a fresh
     /// draft (never a crash): the chart library is advisory, not mandatory.

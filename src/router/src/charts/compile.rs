@@ -1,5 +1,5 @@
 //! Chart compiler — turns a validated, fully-bound `ChartDef` into a list of
-//! executable stage components (`CompiledTarget`s) ready for the Zone-supervised
+//! executable stage components (`CompiledTarget`s) ready for the SupervisedBatch-supervised
 //! `ChartExecutionPlan` (the single chart executor).
 //!
 //! Compilation is deterministic and fail-fast: a chart whose deps are not
@@ -25,7 +25,7 @@ use super::{ChartDef, ChartError, ChartRubric, ChartTarget, DepSpec};
 /// supervisor needs — the `essential` flag, the acceptance `rubric` (M9),
 /// and the upstream stage ids it reads from.
 ///
-/// Produced by [`compile_chart_stages`]; consumed by the Zone supervisor
+/// Produced by [`compile_chart_stages`]; consumed by the SupervisedBatch supervisor
 /// (`ChartExecutionPlan`, the single chart executor).
 #[derive(Clone)]
 pub struct CompiledTarget {
@@ -128,7 +128,7 @@ fn resolve_target_deps(
 /// target, carrying the supervisor metadata (essential, rubric, edges).
 ///
 /// The dependency-resolution rules live here once, and are consumed by the
-/// Zone-supervised `ChartExecutionPlan::compile` — DRY.
+/// SupervisedBatch-supervised `ChartExecutionPlan::compile` — DRY.
 ///
 /// The second return value is the topological execution order (canonical
 /// `DependencyGraph` via [`topo_order`]), computed and validated here so
@@ -448,7 +448,7 @@ mod tests {
     }
 
     /// End-to-end (M4 — single chart path): `compile_chart_stages` output
-    /// feeds `ChartExecutionPlan`, which executes under Zone supervision and
+    /// feeds `ChartExecutionPlan`, which executes under SupervisedBatch supervision and
     /// yields the compiled order + a completed summary.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn compiled_stages_feed_chart_execution_plan() {

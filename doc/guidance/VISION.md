@@ -446,7 +446,7 @@ src/
   dag/                 guidance-dag: executor, resolver, work_unit, adapter, middleware
   fluent-wvr/          Fluent WVR: Component, WorkUnit, FieldAccess, Describable traits
   fluent-wvr-macros/   Proc macros for FieldAccess derive
-  fluent-concurrency/  WorkerPool, Scope, Zone, Limiter, PriorityQueue, CreditFlow
+  fluent-concurrency/  WorkerPool, Scope, SupervisedBatch, Limiter, PriorityQueue, CreditFlow
   llm/                 LLM HTTP client + embeddings (Ollama, OpenAI)
   types/               Shared domain types (GuidanceDoc, Member, FileType, etc.)
   common-core/         General utilities (hashing, formatting, shell, string ops)

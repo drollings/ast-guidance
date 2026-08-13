@@ -14,8 +14,8 @@ This document specifies `fluent-concurrency`, a thin, safe, composable extension
 
 | Question | Resolution | Rationale |
 |----------|------------|-----------|
-| **Q1 — Supervision restart** | **Containment-only.** A `Zone` catches task panics, emits a typed `ZoneEvent`, and cancels dependent tasks. It does **not** automatically restart. | Restarting async tasks from arbitrary state is a checkpoint-semantics problem. RabbitMQ's `supervisor2` gets away with it because Erlang processes are stateless on restart. Rust async tasks carry arbitrary stack state; automatic restart is a trap. We add restart only when profiling proves it necessary. |
-| **Q2 — Capability granularity** | **Per-scope establishment with task-local inheritance.** Entering a `Scope` (which the `Zone` builds on top of) installs a `CapabilitySet` into `tokio::task_local! CURRENT_CAPS`. All `Scope::spawn` calls capture the current set and reinstall it in the child task via `CURRENT_CAPS.scope(caps, future)`. | Per-call `&Capability` at every `spawn` site adds ceremony without meaningful security gain when scope boundaries are already enforced. Effect *entry points* (e.g., `fs::read`, `db::query`) still require an explicit `&Capability` parameter in their signature, and the gating check (`check_capability`) reads `CURRENT_CAPS.try_with` to enforce presence. |
+| **Q1 — Supervision restart** | **Containment-only.** A `SupervisedBatch` catches task panics, emits a typed `SupervisedBatchEvent`, and cancels dependent tasks. It does **not** automatically restart. | Restarting async tasks from arbitrary state is a checkpoint-semantics problem. RabbitMQ's `supervisor2` gets away with it because Erlang processes are stateless on restart. Rust async tasks carry arbitrary stack state; automatic restart is a trap. We add restart only when profiling proves it necessary. |
+| **Q2 — Capability granularity** | **Per-scope establishment with task-local inheritance.** Entering a `Scope` (which the `SupervisedBatch` builds on top of) installs a `CapabilitySet` into `tokio::task_local! CURRENT_CAPS`. All `Scope::spawn` calls capture the current set and reinstall it in the child task via `CURRENT_CAPS.scope(caps, future)`. | Per-call `&Capability` at every `spawn` site adds ceremony without meaningful security gain when scope boundaries are already enforced. Effect *entry points* (e.g., `fs::read`, `db::query`) still require an explicit `&Capability` parameter in their signature, and the gating check (`check_capability`) reads `CURRENT_CAPS.try_with` to enforce presence. |
 | **Q3 — Deterministic testing** | **Both, phased.** The `Runtime` trait supports a `TestRuntime` that uses Tokio's `start_paused` virtual time + a seeded `fastrand::Rng` for **record-replay**. For **combinatorial exploration**, the trait is designed to swap in a future `LoomRuntime` backend. The initial stack ships record-replay; loom integration is a future primitive. | A full loom-compatible async executor is a research project. Shipping it now would violate the "no academic abstraction inflation" red flag. The trait boundary is wide enough to add it later without breaking user code. |
 
 ## 3. Core Primitives
@@ -23,7 +23,7 @@ This document specifies `fluent-concurrency`, a thin, safe, composable extension
 The crate exports the following modules from `src/lib.rs:3-15`:
 
 ```text
-affinity  capability  flow  io  ladder  llm_queue  pool  queue  reserve  router  runtime  scope  thread_resource  zone
+affinity  capability  flow  io  ladder  llm_queue  pool  queue  reserve  router  runtime  scope  thread_resource  batch
 ```
 
 Each is described below. The spec primitives are in §3.1–§3.9; the bonus primitives (`AffinityScheduler`, `ResultPool`, `PriorityResultPool`, `LlmRequestQueue`, `Reserve`, `thread_local_resource!`) are in §3.10; the canonical first-Ok fallback combinator (`first_accept_in_order`) is in §3.11.
@@ -67,43 +67,43 @@ A `Scope` is the fundamental owner of tasks. It is **`#[must_use]`** and require
 
 **Why not `async Drop`?** Rust does not have async drop. The RabbitMQ Erlang model achieves this because `supervisor2` runs in its own process and can block on `receive`. In Rust, the only way to *guarantee* a child is awaited before the parent frame exits is to make the parent frame itself a `Future` that ends with `scope.close().await`. The `#[must_use]` + `Drop`-panics pattern enforces this at the API level without unsafe or proc macros.
 
-### 3.3 `Zone` — Failure Containment & Supervision
+### 3.3 `SupervisedBatch` — Failure Containment & Supervision
 
-A `Zone` is a `Scope` plus a dependency graph, a typed event sink, retry-with-backoff, and per-task timeouts. It is **also** a `Future<Output = ZoneSummary>` (`zone.rs:207-310`), so the canonical use is `let summary: ZoneSummary = zone.await`.
+A `SupervisedBatch` is a `Scope` plus a dependency graph, a typed event sink, retry-with-backoff, and per-task timeouts. It is **also** a `Future<Output = SupervisedBatchSummary>` (`batch.rs:207-310`), so the canonical use is `let summary: SupervisedBatchSummary = batch.await`.
 
-**Construction** (`zone.rs:115-140`):
+**Construction** (`batch.rs:115-140`):
 
-- `Zone::new(runtime: Arc<dyn Runtime>, caps: CapabilitySet) -> Self` — defaults to `ZoneConfig::default()`.
-- `Zone::new_with_config(runtime, caps, config: ZoneConfig) -> Self`.
+- `SupervisedBatch::new(runtime: Arc<dyn Runtime>, caps: CapabilitySet) -> Self` — defaults to `SupervisedBatchConfig::default()`.
+- `SupervisedBatch::new_with_config(runtime, caps, config: SupervisedBatchConfig) -> Self`.
 
-**Configuration** (`zone.rs:49-60`): `ZoneConfig { poll_budget: usize }` — maximum tasks polled per `Zone::poll` invocation. Default `64`. When the budget is exhausted, the zone wakes itself with `cx.waker().wake_by_ref()` to prevent executor starvation.
+**Configuration** (`batch.rs:49-60`): `SupervisedBatchConfig { poll_budget: usize }` — maximum tasks polled per `SupervisedBatch::poll` invocation. Default `64`. When the budget is exhausted, the zone wakes itself with `cx.waker().wake_by_ref()` to prevent executor starvation.
 
-**Registration** (`zone.rs:148-172`):
+**Registration** (`batch.rs:148-172`):
 
-- `register(unit: Arc<dyn Component>) -> Result<&mut Self, ZoneError>` — builds a `WorkContext` via `WorkContext::for_unit_in_zone(&self.runtime, &self.caps, |_| {})` and forwards.
-- `register_with_context(unit, ctx: WorkContext) -> Result<&mut Self, ZoneError>` — explicit context.
-- `ZoneError::DuplicateName(ArcIntern<str>)` — duplicate `name()` rejection. The signature is `Result`, not panicking, so callers can decide.
+- `register(unit: Arc<dyn Component>) -> Result<&mut Self, SupervisedBatchError>` — builds a `WorkContext` via `WorkContext::for_unit_in_zone(&self.runtime, &self.caps, |_| {})` and forwards.
+- `register_with_context(unit, ctx: WorkContext) -> Result<&mut Self, SupervisedBatchError>` — explicit context.
+- `SupervisedBatchError::DuplicateName(ArcIntern<str>)` — duplicate `name()` rejection. The signature is `Result`, not panicking, so callers can decide.
 
-**Dependency tracking** (`zone.rs:98-113, 189-204, 207-310`): each registered unit contributes to a `DependencyGraph<ArcIntern<str>>` composed from `fluent_dag::dep_graph` (`zone.rs:105`), plus two maps for the abort side effects: `task_names: HashMap<task::Id, ArcIntern<str>>` and `abort_handles: HashMap<ArcIntern<str>, AbortHandle>`.
+**Dependency tracking** (`batch.rs:98-113, 189-204, 207-310`): each registered unit contributes to a `DependencyGraph<ArcIntern<str>>` composed from `fluent_dag::dep_graph` (`batch.rs:105`), plus two maps for the abort side effects: `task_names: HashMap<task::Id, ArcIntern<str>>` and `abort_handles: HashMap<ArcIntern<str>, AbortHandle>`.
 
-When a unit fails/panics/times out, `cancel_dependents_of(name)` (`zone.rs:189-204`) calls `DependencyGraph::dependents_of(name)` — a cycle-resilient DFS — and aborts each transitive dependent's handle. A back-edge into the DFS active path emits a `tracing::warn!` rather than panicking — the cycle is left in place but the offending dependents are not double-cancelled.
+When a unit fails/panics/times out, `cancel_dependents_of(name)` (`batch.rs:189-204`) calls `DependencyGraph::dependents_of(name)` — a cycle-resilient DFS — and aborts each transitive dependent's handle. A back-edge into the DFS active path emits a `tracing::warn!` rather than panicking — the cycle is left in place but the offending dependents are not double-cancelled.
 
-**Retry and timeout** (`zone.rs:320-362`): each registered unit is wrapped in `execute_with_timeout_and_retry` which:
+**Retry and timeout** (`batch.rs:320-362`): each registered unit is wrapped in `execute_with_timeout_and_retry` which:
 
 - Yields once before the first attempt so pending abort signals are processed.
 - Calls `unit.execute(&ctx)`.
 - On `Err(WorkError)`, sleeps the shared jittered-exponential backoff
 - Wraps the whole thing in `tokio::time::timeout(timeout_ms, …)`; on timeout returns `Err(WorkError::Timeout { duration_ms, unit })`.
 
-**Panic propagation**: panics are *not* caught via `catch_unwind`. They propagate through `JoinSet` as `JoinError::Panic`, which `Zone::poll` intercepts (`zone.rs:256-285`) and records as `ZoneEvent::Panicked`. This is deliberate: a `catch_unwind` would lose the panic site and prevent the dependency-aware cancellation graph from firing.
+**Panic propagation**: panics are *not* caught via `catch_unwind`. They propagate through `JoinSet` as `JoinError::Panic`, which `SupervisedBatch::poll` intercepts (`batch.rs:256-285`) and records as `SupervisedBatchEvent::Panicked`. This is deliberate: a `catch_unwind` would lose the panic site and prevent the dependency-aware cancellation graph from firing.
 
-**Event taxonomy** (`zone.rs:20-75`):
+**Event taxonomy** (`batch.rs:20-75`):
 
 ```text
-ZoneEvent::Completed   { name, output }
-ZoneEvent::Panicked    { name, info }
-ZoneEvent::Failed      { name, error: WorkError }
-ZoneEvent::Cancelled   { name, reason: CancelReason }
+SupervisedBatchEvent::Completed   { name, output }
+SupervisedBatchEvent::Panicked    { name, info }
+SupervisedBatchEvent::Failed      { name, error: WorkError }
+SupervisedBatchEvent::Cancelled   { name, reason: CancelReason }
 
 CancelReason::Timeout
 CancelReason::DependencyFailed
@@ -112,12 +112,12 @@ CancelReason::Aborted
 
 `WorkError` and `WorkOutput` are defined in `fluent-wvr::work` with three error variants: `Execution(String)`, `Dependency(String)`, and `Timeout { duration_ms: u64, unit: String }`. `WorkOutput` carries a `serde_json::Value data` field with `typed`/`typed_infallible`/`data_as`/`data_take` accessors for structured-data round-tripping.
 
-**Summary** (`zone.rs:69-75`): `ZoneSummary { completed, panicked, failed, cancelled: Vec<ZoneEvent> }`. The zone `await`s to completion (when all `JoinSet` entries are drained and `active_count == 0`) and yields the summary.
+**Summary** (`batch.rs:69-75`): `SupervisedBatchSummary { completed, panicked, failed, cancelled: Vec<SupervisedBatchEvent> }`. The zone `await`s to completion (when all `JoinSet` entries are drained and `active_count == 0`) and yields the summary.
 
 **Key properties:**
-- A panic in task A does **not** propagate to the parent runtime thread. It is caught as a `JoinError` by the zone's `poll` loop.
-- The zone cancels only the dependents of the failed task; independent tasks continue.
-- Neighboring zones are fully isolated because each zone owns its own `JoinSet`.
+- A panic in task A does **not** propagate to the parent runtime thread. It is caught as a `JoinError` by the SupervisedBatch.s `poll` loop.
+- The SupervisedBatch cancels only the dependents of the failed task; independent tasks continue.
+- Neighboring SupervisedBatches are fully isolated because each owns its own `JoinSet`.
 - `WorkError::Execution` failures go to `summary.failed`; real panics go to `summary.panicked`.
 
 ### 3.4 `WorkerPool` — Bounded Worker Pool
@@ -353,7 +353,7 @@ The `fluent-wvr` crate defines `Component`, `WorkUnit`, `FieldAccess`, `Describa
 
 - `WorkContext::default()` — uses `NoopRuntime`; safe for dry-run / init paths but panics on `spawn` if not inside a tokio runtime.
 - `WorkContext::for_unit(unit, caps)` — uses the unit's `default_timeout_ms()` and a default runtime; the right entry point for a single unit.
-- `WorkContext::for_unit_in_zone(zone_rt, zone_caps, |ctx| { ... })` — clones the zone's runtime and caps, then lets the caller mutate; the canonical entry point inside a `Zone`.
+- `WorkContext::for_unit_in_zone(zone_rt, zone_caps, |ctx| { ... })` — clones the zone's runtime and caps, then lets the caller mutate; the canonical entry point inside a `SupervisedBatch`.
 
 **Wrappers from `fluent-wvr`**:
 
@@ -361,21 +361,21 @@ The `fluent-wvr` crate defines `Component`, `WorkUnit`, `FieldAccess`, `Describa
 - `ComponentAdapter` — runtime override of `name`, `execute`, and any field on a `Component`. `set_field` forwards via `Arc::get_mut` when possible and otherwise stores an override on the adapter. This is the only wrapper that handles the shared-Arc case correctly. `Instrumented` is a *transparent* wrapper: its `FieldAccess` impls delegate `set_field`/`get_field`/`field_names` straight to the inner type (requiring exclusive access to the inner or interior mutability), matching the delegation semantics of its `WorkUnit` impls.
 - `retry_call(max_attempts, base_ms, f)` — the synchronous free-function retry (explicitly blocking, never for `execute` bodies) with jittered-exponential backoff. Returns `Result<RetryResult<T>, E>` where `RetryResult` carries the attempt count. The async canonical path is `common_core::retry::retry_async`.
 
-**Retry**: there is no `WithRetry` wrapper. The single jittered-exponential backoff helper lives in `common_core::retry` (`backoff_ms` / `retry_async`); `Zone` drives per-attempt timeout, `WorkError::Timeout` routing, and dependency cancellation on top of it.
+**Retry**: there is no `WithRetry` wrapper. The single jittered-exponential backoff helper lives in `common_core::retry` (`backoff_ms` / `retry_async`); `SupervisedBatch` drives per-attempt timeout, `WorkError::Timeout` routing, and dependency cancellation on top of it.
 
 **Macros from `fluent-wvr`**:
 
 - `impl_component!(MyType)` and `impl_component!(generic (U: Component + 'static) for Wrapper<U>)` — eliminates the 7-line `as_any`/`as_any_mut` boilerplate that every `Component` implementor would otherwise write.
 - `#[derive(FieldAccess, Describable)]` (in `fluent-wvr-macros`) — `#[field(...)]` attributes support `skip`, `desc`, `min`/`max` (numeric), `format`, `max_len`, `sanitize` (trim/lowercase/strip_html/slugify), `pattern` (substring, not regex), `required` (default true), and `empty_is_none` (default true for `Option<String>`).
 
-**Arc blanket impls** (`fluent-wvr/src/lib.rs:50-129`): the type `Arc<dyn Component>` is the universal wire type. Blanket impls provide `WorkUnit`/`FieldAccess`/`Describable`/`Component` for `Arc<dyn Component>` and `WorkUnit` for `Arc<dyn WorkUnit>`. The latter exists for cases where the implementor doesn't need the full `Component` surface. This is the boundary that lets `Zone`, `ComponentAdapter`, and any orchestrator dispatch through a uniform `Arc<dyn Component>` without knowing the concrete type.
+**Arc blanket impls** (`fluent-wvr/src/lib.rs:50-129`): the type `Arc<dyn Component>` is the universal wire type. Blanket impls provide `WorkUnit`/`FieldAccess`/`Describable`/`Component` for `Arc<dyn Component>` and `WorkUnit` for `Arc<dyn WorkUnit>`. The latter exists for cases where the implementor doesn't need the full `Component` surface. This is the boundary that lets `SupervisedBatch`, `ComponentAdapter`, and any orchestrator dispatch through a uniform `Arc<dyn Component>` without knowing the concrete type.
 
 **Cross-cutting concerns** (timing, rate limiting) are applied via the
 `Instrumented` wrapper *before* type erasure, preserving zero-cost inlining.
 Retry composes `common_core::retry` (the single jittered-exponential backoff
-helper); `Zone` has its own per-task retry loop (driven by
+helper); `SupervisedBatch` has its own per-task retry loop (driven by
 `WorkContext::max_retries` / `WorkContext::timeout_ms`, sleeping via the
-shared helper) that exists because the zone manages a long-lived set of units
+shared helper) that exists because the SupervisedBatch manages a long-lived set of units
 with dependency cancellation, whereas the helper is per-call.
 
 ## 5. Performance & Locality Guarantees
@@ -386,8 +386,8 @@ with dependency cancellation, whereas the helper is per-call.
 | Worker pool job dispatch | `VecDeque` in `Mutex` | One lock per pop; workers sleep on `Notify`. No `dyn` dispatch per job. |
 | Result pool per-submit | `oneshot::channel` per submit | One allocation per job; the worker sends the result through the channel. |
 | Priority queue (all same priority) | `VecDeque` fast path | Zero overhead for the common case. |
-| Zone dependency lookup | Inverted index `provides_to_dependents: HashMap<asset, Vec<task>>` | O(1) dependent lookup at cancellation time; avoids scanning the full DAG. |
-| Zone poll budget | `cx.waker().wake_by_ref()` after N polls | Prevents one zone from starving the executor when many tasks complete in the same wake. |
+| SupervisedBatch dependency lookup | Inverted index `provides_to_dependents: HashMap<asset, Vec<task>>` | O(1) dependent lookup at cancellation time; avoids scanning the full DAG. |
+| SupervisedBatch poll budget | `cx.waker().wake_by_ref()` after N polls | Prevents one zone from starving the executor when many tasks complete in the same wake. |
 | Capability gating | `HashMap<TypeId, Arc<dyn Any>>` lookup on `CURRENT_CAPS` | `TypeId` is pointer-sized; no string comparison. `name()` is informational only. |
 | Data transformation | Concrete enums + pattern matching | `WorkUnit::execute` is one vtable call per task; inside it, all work is monomorphized. |
 | `Reserve` permit | `AtomicUsize` `fetch_sub`/`fetch_add` | Lock-free, no heap allocation. |
@@ -402,10 +402,10 @@ The crate is no longer "proposed" — it ships. The current `Cargo.toml`:
 - `fluent-wvr` (path = `"../fluent-wvr"`) — for `WorkUnit`, `Component`, `CapabilitySet`, `Runtime`, `ArcIntern`
 - `serde`, `serde_json` — for `WorkOutput::data` and `Describable`
 - `bon` — derive builder for `LlmConfig` and `ChatMessage`
-- `thiserror` — error enums (`PoolError`, `ResultPoolError`, `ZoneError`, `LlmError`, `CapabilityError`)
-- `tracing` — `info!`, `warn!`, `error!` from `Instrumented`, `Zone`'s cycle detection, and `Scope`'s panic-during-unwind path
+- `thiserror` — error enums (`PoolError`, `ResultPoolError`, `SupervisedBatchError`, `LlmError`, `CapabilityError`)
+- `tracing` — `info!`, `warn!`, `error!` from `Instrumented`, `SupervisedBatch`'s cycle detection, and `Scope`'s panic-during-unwind path
 - `reqwest` — backing HTTP client for `NetCapability`
-- `common-core` — `LatencyHistogram` (used by `Instrumented::with_metrics` in `fluent-wvr` consumers), `retry` (Zone backoff), and `error::IoError`
+- `common-core` — `LatencyHistogram` (used by `Instrumented::with_metrics` in `fluent-wvr` consumers), `retry` (SupervisedBatch backoff), and `error::IoError`
 - `fluent-db` (**optional**, `db` feature, default-on) — `SqlitePool` / `DbCapability` for the database surface. `rusqlite` and `common-core`'s `sqlite` feature are no longer direct deps; they come in transitively only when the `db` feature is on (D11).
 - `fastrand` — seeded PRNG for `TestRuntime` and jitter in `common_core::retry` / `retry_call`
 - `internment` (with `arc` and `serde` features) — `ArcIntern<str>` for work unit names, dependency asset names, and configuration keys
@@ -420,28 +420,28 @@ No `async-trait`, no `bumpalo`, no `crossbeam`. Tokio's channels, `Notify`, and 
 
 ## 7. Anti-Patterns Explicitly Rejected
 
-1. **No `#[async_trait]` or macro-heavy execution.** The framework uses manual `Future` impls and `async fn` where the compiler can see the boundaries. The `Zone` is a hand-written `impl Future` (`zone.rs:207-310`); `Scope` uses `tokio::task::JoinSet` directly.
-2. **No `tokio::spawn` without a scope.** The `tokio::spawn` calls in the crate are limited to: `Scope::close` (drain) and `Scope::close_graceful` (drain); `Zone`'s `JoinSet`; `WorkerPool`/`ResultPool`/`PriorityResultPool` worker loops; and `DbCapability::query`/`execute` in `fluent-db` (which `spawn_blocking` for sync `rusqlite` work). Every async effect outside these sites flows through `Scope::spawn` (which tracks the handle) or through a pool (which tracks workers).
+1. **No `#[async_trait]` or macro-heavy execution.** The framework uses manual `Future` impls and `async fn` where the compiler can see the boundaries. The `SupervisedBatch` is a hand-written `impl Future` (`batch.rs:207-310`); `Scope` uses `tokio::task::JoinSet` directly.
+2. **No `tokio::spawn` without a scope.** The `tokio::spawn` calls in the crate are limited to: `Scope::close` (drain) and `Scope::close_graceful` (drain); `SupervisedBatch`'s `JoinSet`; `WorkerPool`/`ResultPool`/`PriorityResultPool` worker loops; and `DbCapability::query`/`execute` in `fluent-db` (which `spawn_blocking` for sync `rusqlite` work). Every async effect outside these sites flows through `Scope::spawn` (which tracks the handle) or through a pool (which tracks workers).
 3. **No `dyn Trait` in a per-item loop.** The `PartitionedRouter` hashes once per submit; `PriorityQueue` dispatches via `BTreeMap` keys, not vtables; `CapabilitySet::get` uses `TypeId` (pointer-sized) rather than string comparison; `PartitionedRouter` does no per-job vtable dispatch.
-4. **No ambient `tokio::fs::read` or `tokio::time::sleep`.** All I/O is called through a capability method (`FsCapability::read`, `NetCapability::http_get`, `DbCapability::query`, etc.) which calls `check_capability(self)` first. `tokio::time::sleep` is allowed in the framework's own internals (Zone retry, Zone timeout) and in the `Runtime::sleep` backend, but consumer code is expected to use `Limiter::run`, `common_core::retry`, or `Zone` rather than calling it directly.
-5. **No automatic restart.** Zones contain; they do not restart. Restart is a deliberate operator action.
+4. **No ambient `tokio::fs::read` or `tokio::time::sleep`.** All I/O is called through a capability method (`FsCapability::read`, `NetCapability::http_get`, `DbCapability::query`, etc.) which calls `check_capability(self)` first. `tokio::time::sleep` is allowed in the framework's own internals (SupervisedBatch retry, SupervisedBatch timeout) and in the `Runtime::sleep` backend, but consumer code is expected to use `Limiter::run`, `common_core::retry`, or `SupervisedBatch` rather than calling it directly.
+5. **No automatic restart.** SupervisedBatch instances contain; they do not restart. Restart is a deliberate operator action.
 
 ## 8. Dependency Resolution with DependencyGraph
 
-`Zone` (`src/fluent-concurrency/src/zone.rs`) composes `fluent_dag::dep_graph::DependencyGraph<K>` for dependency tracking and cancellation. This replaced three hand-rolled `HashMap`s with a single canonical primitive.
+`SupervisedBatch` (`src/fluent-concurrency/src/batch.rs`) composes `fluent_dag::dep_graph::DependencyGraph<K>` for dependency tracking and cancellation. This replaced three hand-rolled `HashMap`s with a single canonical primitive.
 
 ### How it works
 
-Each `Zone::register(unit)` call registers the unit's `name()` and its return value of `provides()` in the `DependencyGraph<ArcIntern<str>>`. When a unit fails or panics, `Zone::cancel_dependents_of(name)` calls `DependencyGraph::dependents_of(name)` (cycle-resilient DFS) to find all transitive dependents and cancels them.
+Each `SupervisedBatch::register(unit)` call registers the unit's `name()` and its return value of `provides()` in the `DependencyGraph<ArcIntern<str>>`. When a unit fails or panics, `SupervisedBatch::cancel_dependents_of(name)` calls `DependencyGraph::dependents_of(name)` (cycle-resilient DFS) to find all transitive dependents and cancels them.
 
 ### When to compose DependencyGraph directly
 
-If you need dependency tracking outside a `Zone` (e.g., pipeline step DAGs, build-target graphs, session step ordering), compose `DependencyGraph<K>` directly. Examples:
+If you need dependency tracking outside a `SupervisedBatch` (e.g., pipeline step DAGs, build-target graphs, session step ordering), compose `DependencyGraph<K>` directly. Examples:
 
 | Consumer | Pattern | Location |
 |----------|---------|----------|
 | `DependencySession` | Session steps with checkpoint/rewind | `src/router/src/dag_session.rs` |
-| `Zone` | Task supervision cancellation tree | `src/fluent-concurrency/src/zone.rs` |
+| `SupervisedBatch` | Task supervision cancellation tree | `src/fluent-concurrency/src/batch.rs` |
 
 **Rule**: Any new dependency-tracking workflow MUST compose `DependencyGraph<K>` rather than re-implementing graph algorithms. See `dag/SKILL.md` for the full API.
 

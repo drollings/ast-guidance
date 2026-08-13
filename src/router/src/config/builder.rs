@@ -1304,7 +1304,7 @@ mod tests {
         let summary = plan
             .execute(&ctx, &opts)
             .await
-            .expect("chart executes under Zone supervision");
+            .expect("chart executes under SupervisedBatch supervision");
 
         // Topo order: reproduce - root_cause - fix_plan (3 completed targets).
         assert_eq!(summary.completed.len(), 3);

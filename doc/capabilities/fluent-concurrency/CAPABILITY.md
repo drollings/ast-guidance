@@ -6,7 +6,7 @@ anchors:
   - Queue
   - Limiter
   - Scope
-  - Zone
+  - SupervisedBatch
   - Runtime
   - TokioRuntime
   - CapabilitySet
@@ -22,7 +22,7 @@ Bounded async worker pools, structured concurrency primitives, capability-gated 
 ## Key files
 
 - `src/fluent-concurrency/src/pool.rs` — `WorkerPool`, `Queue`, `Limiter`
-- `src/fluent-concurrency/src/zone.rs` — `Zone`, `ZoneConfig`, `ZoneSummary`
+- `src/fluent-concurrency/src/batch.rs` — `SupervisedBatch`, `SupervisedBatchConfig`, `SupervisedBatchSummary`
 - `src/fluent-concurrency/src/scope.rs` — `Scope` (structured concurrency)
 - `src/fluent-concurrency/src/router.rs` — `PartitionedRouter` (sharded pools)
 - `src/fluent-concurrency/src/queue.rs` — `PriorityQueue`
@@ -93,9 +93,9 @@ pub async fn spawn<F>(&mut self, future: F) -> AbortHandle;
 pub async fn close(&mut self);
 ```
 
-### Zone
+### SupervisedBatch
 
-Supervision zone with async retry, dependency cancellation, and timeout. Implements `Future<Output = ZoneSummary>`.
+Supervision zone with async retry, dependency cancellation, and timeout. Implements `Future<Output = SupervisedBatchSummary>`.
 
 ```rust
 pub fn new(runtime: Arc<dyn Runtime>, caps: CapabilitySet) -> Self;
@@ -103,8 +103,8 @@ pub fn register(&mut self, unit: Arc<dyn WorkUnit>) -> &mut Self;
 ```
 
 - Dependencies form a DAG; if unit A depends on B and B fails, A is cancelled
-- `ZoneConfig { poll_budget }` limits per-poll work (default: 64)
-- `ZoneSummary` reports completed, panicked, and cancelled tasks
+- `SupervisedBatchConfig { poll_budget }` limits per-poll work (default: 64)
+- `SupervisedBatchSummary` reports completed, panicked, and cancelled tasks
 
 ## Runtime Abstraction
 
@@ -189,6 +189,6 @@ router.submit(&key, job).await?;
 - **No `spawn_blocking` abstraction** — use `tokio::task::spawn_blocking` directly for sync work inside pool handlers
 - **`Queue` is single-consumer** — multiple consumers race for `pop()`
 - **`Scope` panics on drop** if `close()` wasn't called — use `defer` patterns or ensure scope lives long enough
-- **`Zone` is a `Future`** — must be `.await`ed or aborted; dropping a running zone cancels all tasks
+- **`SupervisedBatch` is a `Future`** — must be `.await`ed or aborted; dropping a running zone cancels all tasks
 - **`WorkerPool::new` spawns immediately** — workers start during construction; ensure runtime context exists
 - **Credit flow** is for producer-consumer rate limiting, not general concurrency control

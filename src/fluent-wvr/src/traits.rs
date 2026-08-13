@@ -51,7 +51,7 @@ pub trait SchemaProvider {
 }
 
 /// The core execution unit in the component system. Every `Component` implements
-/// this trait. The `Zone` supervisor and `MiddlewareChain` operate on `WorkUnit`s.
+/// this trait. The `SupervisedBatch` supervisor and `MiddlewareChain` operate on `WorkUnit`s.
 ///
 /// ## Purity contract
 ///
@@ -60,12 +60,12 @@ pub trait SchemaProvider {
 /// - Do NOT call `tokio::spawn`, `tokio::time::sleep`, or
 ///   `Handle::block_on` inside `execute`.
 /// - Do NOT perform I/O; instead emit a `WorkError` and let the
-///   supervisor (`Zone`) handle retry/backoff/timeout.
+///   supervisor (`SupervisedBatch`) handle retry/backoff/timeout.
 /// - Do NOT mutate any shared state external to `self` without
 ///   synchronization; `execute` MUST be a pure function of `(&self,
 ///   &WorkContext)`.
 ///
-/// `Zone::execute_with_timeout_and_retry` runs `execute` in an async
+/// `SupervisedBatch::execute_with_timeout_and_retry` runs `execute` in an async
 /// context but expects `execute` itself to return promptly. Violations
 /// defeat the supervisor's timeout and retry invariants.
 ///

@@ -185,9 +185,9 @@ exactly once and published to the same typed store.
 
 | File | Role |
 |------|------|
-| `routes/plan.rs` | `PlanRoute` (M7/M8) — boot-loaded `ChartStore` + `ChartSelector`; Exact → server-side chart compile+execute under `Zone` supervision; Partial → one-round targeted interview (≤ `CHART_MAX_INTERVIEW_QUESTIONS`); Mismatch → fresh draft; `workflow_extractor` hook for the dispatch learning loop |
+| `routes/plan.rs` | `PlanRoute` (M7/M8) — boot-loaded `ChartStore` + `ChartSelector`; Exact → server-side chart compile+execute under `SupervisedBatch` supervision; Partial → one-round targeted interview (≤ `CHART_MAX_INTERVIEW_QUESTIONS`); Mismatch → fresh draft; `workflow_extractor` hook for the dispatch learning loop |
 | `routes/rigor.rs` | `RigorRoute` (M3) — fixed-pass blue/red/judge protocol; real `DependencySession` checkpoint (`rigor.blue`) + `rewind_to_checkpoint` on a material rejection; red team reads through `FilteredLedger` at `Lod::LOD0` (dead ends excluded); final rejection resolves to a targeted interview (≤ 3 questions), frontier escalation only on low judge confidence; `/v1/rigor` is present-but-unconfigured when no backends are attached (explicit error, never a crash) |
-| `charts/` | Chart (DAG workflow) library — `store` (`ChartStore`), `binding` (`Entity`, `ENTITIES_META_KEY`), `compile`, `execute` (under `Limiter` + Zone), `render`, `rubric`, `select` (`ChartSelector`, `ChartFit`), `extract` (`WorkflowExtractor`) — the M6–M10 workflow engine consumed by `PlanRoute` and the dispatch learning loop |
+| `charts/` | Chart (DAG workflow) library — `store` (`ChartStore`), `binding` (`Entity`, `ENTITIES_META_KEY`), `compile`, `execute` (under `Limiter` + SupervisedBatch), `render`, `rubric`, `select` (`ChartSelector`, `ChartFit`), `extract` (`WorkflowExtractor`) — the M6–M10 workflow engine consumed by `PlanRoute` and the dispatch learning loop |
 
 ### Infrastructure
 
@@ -314,7 +314,7 @@ pipeline pre-filter and the M1 write-path scrubber (`ledger_guard.rs`).
 | `LoadCache<K,V,E>` | `common-core::cache` | `HotSnapshotIndex` — bounded get-or-load LRU |
 | `ArcIntern<str>` | `internment` | `ContentNodeStore` session/role index keys; work-unit and graph asset names |
 | `LatencyHistogram` | `common-core::metrics` | `Instrumented::with_metrics` wiring |
-| `retry_async` | `common-core::retry` | `RetryBackend`, `RetryClassifier`, `Zone` retries |
+| `retry_async` | `common-core::retry` | `RetryBackend`, `RetryClassifier`, `SupervisedBatch` retries |
 | `make_hnsw()` / `knn_brute_force` | `common-core::sqlite` / `fluent-db::vector` | `ContentNodeStore` KNN; `hnsw.rs` chart-store fallback |
 | `HttpClass` | `guidance-llm` | `dispatch/backend.rs` — status classification in `OpenAiChatBackend` (streaming + buffered) |
 | `DispatchError::is_retryable()` | `fluent-router` (`dispatch/frontier.rs`) | retry/fallback decisions in `dispatch/backend.rs` and `server/dispatch.rs` |
