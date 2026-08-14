@@ -1,155 +1,155 @@
-# Fluent Monorepo - a high-speed agentic backbone
+# Fluent Monorepo — deterministic-first agentic backbone
 
-This is a Rust monorepo, built as an integrated incubator of unified projects sharing a
-common infrastructure and enforced design patterns that build a dynamic, efficient runtime 
-and extreme agentic efficiency.  
+This is a Rust monorepo: an incubator of integrated projects sharing one
+infrastructure, one set of enforced design patterns, and one runtime. Every
+crate in `src/` is built on the same foundation — Fluent WVR design patterns,
+Fluent Concurrency, capability-gated I/O, and a DAG/session fabric — so that
+new work composes with existing work instead of re-inventing it.
 
-Coral Context and Coral Router are meant to make a deterministic-first backbone of agentic
-"mixture of agents" orchestration, continuous context management, a plugin-driven system
-for agentic memory, and an managed WASM sandbox for a large index of tools.
+The flagship project is **Coral Router**: a deterministic-first LLM request
+router and process owner of a local inference fleet. Coral Context, Guidance,
+and the supporting libraries extend the same backbone toward continuous
+context management, agentic memory, plugin-driven tooling, and a managed WASM
+sandbox.
 
-Its concurrent operations are based on Fluent Concurrency, a lightweight layer of
-guardrails over tokio, hyper, and reqwest meant to make async I/O and inference for
-agentic LLM applications blazing fast and battle-tested.
+Its concurrent operations are built on **Fluent Concurrency**, a lightweight
+layer of guardrails over Tokio, hyper, and reqwest that keeps async I/O and
+inference for agentic LLM applications fast and battle-tested. Its foundation
+is the **Fluent WVR** set of design patterns — `Fluent, Wrapped, Verified,
+Reflected` — which maximize code reuse, composable primitives,
+deterministic-first design, and a uniform source of metadata and validated
+input constraints.
 
-Its foundation is the Fluent WVR (WASM, vtables, reflection) set of design patterns,
-meant to maximize code reuse, composable primitives, deterministic-first design, and
-a uniform source of metadata and sanitized input constraints.  Every crate in `src/`
-builds on the same foundation of proven design patterns, capability-gated concurrency,
-and type-safe runtime composition.
-
-Note:  This project's support for parallel inference is built around a branch of 
-llama.cpp that allows parallel context windows and window sizes upon requests via 
-HTTP parameters.  You can find that at:
+Note: parallel inference support builds on a branch of llama.cpp that allows
+parallel context windows, sized per request via HTTP parameters:
 
 https://github.com/drollings/llama.cpp/tree/_gguf_tool_ctx
+
+## What this codebase is for
+
+The system routes natural-language requests through a ladder of increasing
+cost and capability — from deterministic filters and fast local classifiers,
+through local orchestrator and agent models, to frontier APIs — and owns the
+serving processes in between. Sessions reason over *condensed context*, not
+raw history; results are cached as reusable nodes rather than recomputed; and
+everything that can be decided by a rule is, so that a model call is never
+wasted on the decidable.
+
+## Coral Router — the flagship
+
+Coral Router exposes an OpenAI-compatible HTTP API on `:8079` and runs every
+request through a **two-stage pipeline** — a deterministic pre-filter, then a
+classifier (see `src/router/src/pipeline_types.rs`) — that resolves to a direct
+response, a routing target, or a rejection.
+
+It is also the **process owner of the local inference fleet**: it spawns and
+supervises one `llama-server` per model weights file, serves the `/instances`
+management contract, and is the single routing element between those local
+tasks and every other OpenAI-compatible endpoint. A dispatch to a local model
+is a direct call to the owning server; a frontier or remote call is the same
+request routed onward after the local ladder has genuinely failed to resolve
+it — never by default.
+
+- **Deterministic before probabilistic.** Anything decidable by a regex or a
+  fixed rule never reaches a model call — a cost floor and a fully
+  unit-testable layer with no model in the loop.
+- **Cheap before expensive.** Routing is an economic decision: the ladder runs
+  deterministic filter → fast classifier → local model → frontier, and a
+  request only reaches a rung after the previous one failed.
+- **Condensed context, not accumulated context.** The ledger compacts sessions
+  rather than growing them; the orchestrator never reasons over noise, dead
+  ends, or superseded exploration.
+
+→ `doc/router/VISION.md` · source in `src/router/`
+
+## Fluent WVR — the design patterns
+
+Fluent WVR (`Fluent, Wrapped, Verified, Reflected`) is the control plane of
+this codebase: a collection of interlocking design patterns for consistent
+metadata on composable units of work, polymorphism where needed, schemas for
+datatypes internally and over IPC, and other single sources of truth.
+
+Every orchestratable task presents the same `Arc<dyn Component>` interface —
+whether it is a native Rust struct, a WASM plugin, or a database-driven
+config — so the orchestrator iterates uniform handles and never branches on
+origin. Twelve composable patterns are documented in
+`doc/skills/fluent-wvr/SKILL.md` (Fluent Builder, Trait-Based Reflection,
+Trait Composition, Trait Objects, Binary IPC, Scoped Ownership, Newtype
+Handles, Unit of Work, Middleware Chain, Component Adapter, Structured
+Logging Context, Runtime Composition). These patterns are for the control
+plane, not for hot-path inner loops: the data plane uses concrete types and
+flat enums, and `dyn` lives at the request boundary, not in the tight loop.
+
+## Fluent Concurrency — the execution fabric
+
+`fluent-concurrency` is a thin, 100% safe extension layer over Tokio: bounded
+worker pools, structured `Scope`s, the `SupervisedBatch` (supervision +
+dependency cancellation + panic/fail/cancel tracking), `Limiter`,
+`PriorityQueue`, credit-flow backpressure, and the `first_accept_in_order`
+ladder. Tokio is the workhorse — the crate composes its primitives rather than
+rebuilding the scheduler.
+
+Every spawned task belongs to a `Scope` whose close must be awaited, and
+every effect requires an explicit capability token — no ambient authority.
+→ `doc/skills/fluent-concurrency/SKILL.md`
+
+## DAG — the dependency fabric
+
+`fluent-dag` provides the `DependencyGraph` and `CheckpointedStepGraph`
+primitives that drive the chart executor, session orchestration, and workflow
+execution: dependency validation, ready-node selection, dependency-aware
+cancellation, and checkpoint/rewind — shared by every graph consumer in the
+workspace rather than re-implemented per crate. → `doc/skills/dag/SKILL.md`
+
+## Safe Rust
+
+The workspace is near-total safe Rust: `fluent-wvr`, `fluent-concurrency`,
+`fluent-dag`, and `common-core` are `#![forbid(unsafe_code)]`, and the entire
+monorepo contains just three `unsafe` blocks, all of them `read_unaligned` for
+packed WASM IPC structs in `wasm_ipc`.
 
 ## Quick start
 
 ```bash
-# Build everything
 cargo build --workspace
-
-# Run all tests
 cargo test --workspace
-
-# Lint
 cargo clippy --workspace -- -D warnings
 ```
 
+Coral Router's own loop: `make router` (build), `make router-start` (build and
+restart on `:8079`), `make router-test` (tests), `make router-mock` (mock
+server + smoke checks).
+
 ## Projects
 
-- **Coral Context** — Deterministic-first context graph library with a 6-tier
-  cache cascade (L1 memory → L5 frontier LLM), SQLite graph database, MCP server,
-  and WASM plugin runtime.  Separates deterministic lookups from probabilistic
-  inference.  → `doc/coral/VISION.md`
-
-- **Fluent Concurrency** — Structured concurrency primitives: `WorkerPool`,
-  `Scope`, `Zone` (supervision + dependency cancellation), `Limiter`, `PriorityQueue`,
-  `CreditFlow` backpressure, and `PartitionedRouter`.  Forms the execution fabric for
-  all pipeline and session orchestration in the workspace.
-  → `doc/skills/fluent-concurrency/SKILL.md`
-
-- **Coral Router** — LLM request router with a 5-stage pipeline (deterministic
-  pre-filter → quality gate → planning refinement → guardrail check → router).
-  Decomposes and dispatches complex queries through an escalation ladder, exposing
-  an OpenAI-compatible HTTP API.  → `doc/router/VISION.md`
-
-- **Guidance** — AST-guided code navigation subagent producing
-  `.guidance/src/**/*.json` metadata mirrors and `.guidance.db` SQLite vector
-  search databases.  Sub-100ms deterministic queries for AI-assisted development.
-  → `doc/guidance/VISION.md`
-
-- **Fluent WVR** — The unifying component model (12 composable patterns):
-  `WorkUnit`, `FieldAccess`, `Describable`, `Component` — every orchestratable
-  task presents `Arc<dyn Component>`, whether native, WASM, or DB-driven.
-  → `doc/skills/fluent-wvr/SKILL.md`
-
-## Library infrastructure
-
-### Workspace crates
-
-```
-src/
-  bin/
-    guidance/            guidance CLI binary (14+ subcommands)
-    coral/               coral binary (MCP server + ingest CLI)
-    coral-router/        coral-router binary (HTTP API server)
-    yamake-coral/        yamake-coral binary
-  guidance/              guidance-core: AST parser, sync engine, query engine
-  coral/                 coral-context: graph DB, cache cascade, MCP server, WASM runtime
-  router/                fluent-router: pipeline orchestration, dispatch, agent runtime
-  dag/                   DAG executor: resolver, work_unit, adapter, middleware
-  fluent-wvr/            Component, WorkUnit, FieldAccess, Describable traits
-  fluent-wvr-macros/     proc macros for FieldAccess derive
-  fluent-concurrency/    WorkerPool, Scope, Zone, Limiter, PriorityQueue, CreditFlow
-  llm/                   LLM HTTP client + embeddings (Ollama, OpenAI)
-  types/                 Shared domain types (ContentNode, NodeId, etc.)
-  common-core/           General utilities (hashing, formatting, shell, string ops)
-  search-vector/         SQLite hybrid search (vector + keyword + RRF fusion)
-  knowledge/             WordIndex, TrigramIndex, CsrGraph, QueryCache
-  content-node/          LOD slicing and file content annotation
-  ontology/              Entity extraction, YAGO taxonomy, capability inference
-  rdf/                   Turtle/N-Quads parser and normalization
-  wasm_ipc/              WASM IPC binary types (#[repr(C, packed)])
-  memory-plugin/         Pluggable persistent memory backends
-```
-
-Cross-crate conventions are enforced through `common-core` (the zero-domain crate)
-and Fluent WVR patterns that supplement Traits with run-time polymorphism and reflection, 
-single sources of truth, and support for run-time IPC with WASM sandboxes.  Where you have
-configurable components and control panes, this allows object-oriented and Entity Component 
-System behaviors.
-
-### Key capabilities
-
-| Capability | Crate | Description |
-|-----------|-------|-------------|
-| AST indexing | `guidance` | Tree-sitter parsing for Zig, Python, Rust with incremental `match_hash` sync |
-| Vector search | `search-vector` | Cosine similarity + keyword + RRF hybrid over SQLite, quantized embeddings |
-| Concurrency | `fluent-concurrency` | Bounded pools, structured scopes, capability-gated I/O, credit flow backpressure |
-| DAG execution | `dag` | Dependency-driven workflow with adapters, middleware, type inference |
-| LLM client | `llm` | Ollama/OpenAI chat + embeddings with context packing and request queueing |
-| Context packing | `coral` | Token-budget-aware LOD selection with BFS distance weighting |
-| WASM runtime | `coral` + `wasm_ipc` | Extism plugin execution with binary IPC across the sandbox boundary |
-| MCP server | `coral` | JSON-RPC 2.0 over STDIO for IDE integration |
-| Graph database | `coral` | SQLite graph store with KNN search, recursive CTE traversal, duck typing |
-| Ontology | `ontology` | YAGO taxonomy with transitive `is_a` inference for duck-typed capabilities |
-| RDF ingestion | `rdf` | Turtle/N-Quads parsing with transactional batch flush |
-| Content nodes | `content-node` | 6-level LOD pyramid (full text → keywords) for context window packing |
-| Project knowledge | `knowledge` | Word/trigram inverted indexes, CSR graph, frequency tables |
+- **Coral Router** — LLM request router; two-stage deterministic-first
+  pipeline, escalation ladder, OpenAI-compatible API, owns and supervises the
+  local llama-server fleet. → `doc/router/VISION.md`
+- **Coral Context** — deterministic-first context graph library: 6-tier LOD
+  pyramid, SQLite graph database, MCP server, WASM plugin runtime. Separates
+  deterministic lookups from probabilistic inference. → `doc/coral/VISION.md`
+- **Guidance** — AST-guided code navigation subagent producing metadata
+  mirrors and SQLite vector search databases; sub-100ms deterministic queries
+  for AI-assisted development. → `doc/guidance/VISION.md`
+- **Fluent WVR** — the unifying component model. → `doc/skills/fluent-wvr/SKILL.md`
+- **Fluent Concurrency** — structured concurrency primitives. → `doc/skills/fluent-concurrency/SKILL.md`
+- **Fluent DAG** — dependency graph and checkpointed step graph. → `doc/skills/dag/SKILL.md`
 
 ## Design philosophy
 
-1. **Deterministic-first**: Prefer local computation over probabilistic inference;
-   LLM enhancement is additive, never authoritative
-2. **Cache over compute**: Every novel solution becomes a permanent cached node
-3. **Edge-deployable**: Single-process SQLite, no external services, targets
+1. **Deterministic-first**: prefer local computation over probabilistic
+   inference; LLM enhancement is additive, never authoritative
+2. **Cache over compute**: every novel solution becomes a permanent cached node
+3. **Edge-deployable**: single-process SQLite, no external services, targets
    Raspberry Pi class hardware
-4. **Capability-gated I/O**: All file/network/DB access requires explicit
+4. **Capability-gated I/O**: all file/network/DB access requires explicit
    capability tokens — no ambient authority
-5. **Structured concurrency**: Every spawned task belongs to a Scope whose close
-   must be awaited; panics are contained within Zones
-6. **Uniform interface**: Native Rust, WASM plugins, and DB-driven configs all
+5. **Structured concurrency**: every spawned task belongs to a `Scope` whose
+   close must be awaited; panics are contained within `SupervisedBatch`
+6. **Uniform interface**: native Rust, WASM plugins, and DB-driven configs all
    present `Arc<dyn Component>` — the orchestrator never branches on origin
-
-## Design patterns
-
-The codebase implements twelve composable patterns documented in
-`doc/skills/fluent-wvr/SKILL.md` — Fluent Builder, Trait-Based Reflection,
-Trait Composition (newtype wrappers), Trait Objects, Binary IPC, Scoped
-Ownership, Newtype Handles, Unit of Work, Middleware Chain, Component Adapter,
-Structured Logging Context, and Runtime Composition.
-
-## Source layout
-
-```
-doc/
-  skills/               Fluent WVR and Fluent Concurrency skill docs
-  guidance/VISION.md    Guidance vision document
-  coral/VISION.md       Coral Context vision document
-  router/VISION.md      Coral Router vision document
-```
+7. **Safe by default**: `forbid(unsafe_code)` at the crate level; the only
+   `unsafe` in the workspace is boundary IPC `read_unaligned`
 
 ## Authorship
 

@@ -122,8 +122,7 @@ src/
 
 * Any git write operations (checkout, commit, stash, etc.)
 
-* Any implementation without review of relevant documents including, but not
-  limited to:
+* Any implementation without review of relevant documents including, but not limited to:
 
   - ./doc/skills/common-core/SKILL.md
   - ./doc/skills/fluent-wvr/SKILL.md
