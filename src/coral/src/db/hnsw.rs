@@ -42,7 +42,7 @@ impl super::Library {
             return Some(Vec::new());
         }
 
-        // M8.2: resolve every neighbour's name in a single parameterized
+        // Resolve every neighbour's name in a single parameterized
         // `WHERE id IN (...)` query instead of one query per neighbour.
         let name_by_id: HashMap<i64, String> = {
             let placeholders = common_core::sqlite::in_clause(node_ids.len());

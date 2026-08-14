@@ -38,7 +38,7 @@
 //! ## Zero-cost and optional
 //!
 //! The rusqlite surface is feature-gated on `sqlite` (default-on). A consumer
-//! that only wants pools/scope/zone pays nothing for the database layer.
+//! that only wants pools/scope/batch pays nothing for the database layer.
 
 #[cfg(feature = "sqlite")]
 pub mod error;

@@ -81,7 +81,7 @@ pub struct PipelineParams {
     /// top-scoring route **decides** the dispatch target (weighted selection
     /// over the four score axes) instead of the LLM's `action`/`target` being
     /// metadata-only. Coherence/safety thresholds and the `reject` action stay
-    /// as hard gates that run first (M5). Default `false` so existing behavior
+    /// as hard gates that run first. Default `false` so existing behavior
     /// and goldens are untouched until a deployment opts in.
     #[serde(default)]
     pub score_matrix_authoritative: bool,
@@ -89,7 +89,7 @@ pub struct PipelineParams {
     /// JSON parsing (`0` = disabled, the default - existing behavior is
     /// unchanged). When `> 0`, the classifier stage is wrapped in a
     /// `RetryClassifier` that re-executes it with escalating corrective
-    /// prompts on `metadata.fallback = true` (M6).
+    /// prompts on `metadata.fallback = true`.
     #[serde(default)]
     pub classifier_retry_max: u32,
     /// Escalating corrective system prompts used on each retry attempt (the
@@ -159,7 +159,7 @@ impl RouterConfig {
     }
 
     pub fn routing_config(&self) -> super::RoutingConfig {
-        // M4.4: when a classification tree is configured and no explicit
+        // When a classification tree is configured and no explicit
         // `system_prompt` is set, derive one from the root classifier node's
         // children so flat consumers still observe the auto-generated prompt.
         let system_prompt = if self.system_prompt.is_empty() {
@@ -228,7 +228,7 @@ impl RouterConfig {
             let limiter = Arc::new(fluent_concurrency::pool::Limiter::new(max_concurrency));
             tracing::debug!(target: "router.config", pipeline = %name, classifier_max_concurrency = max_concurrency, "classifier concurrency limiter constructed");
 
-            // M3 target-matching ladder: built only when the pipeline opts in
+            // Target-matching ladder: built only when the pipeline opts in
             // (`target_match: "self_assess"`). The injected mock/transcript
             // backend is the matcher's `default` covering every key absent from
             // the per-key map (test mode: the map is empty, so every candidate
@@ -264,7 +264,7 @@ impl RouterConfig {
             };
 
             let stage = if let Some(tree) = &self.classification {
-                // M4: classification tree drives the classifier stage. The
+                // Classification tree drives the classifier stage. The
                 // injected backend (mock/transcript) is always the default
                 // client; per-node model backends are only built in real mode.
                 // The target-matching ladder is shared with the flat path -
@@ -296,6 +296,7 @@ impl RouterConfig {
                     limiter,
                     Arc::new(engine),
                     target_matcher,
+                    self.classifier_failure_policy,
                 )
             } else {
                 crate::stages::classifier::ClassifierStage::new(
@@ -308,9 +309,10 @@ impl RouterConfig {
                     classifier_model,
                     limiter,
                     target_matcher,
+                    self.classifier_failure_policy,
                 )
             };
-            // M6: when configured, wrap the classifier in the retry decorator
+            // When configured, wrap the classifier in the retry decorator
             // so parse/LLM failures re-run with escalating corrective prompts.
             // `RetryClassifier` is a `Component`, so it pushes as
             // `Arc<dyn Component>`; it is deliberately NOT a
@@ -402,8 +404,8 @@ impl RouterConfig {
 /// Resolve the classifier model key from config, following the priority:
 /// 1. Pipeline-level `classifier_model`
 /// 2. Root-level `classifier_model`
-/// 3. Root `classification` classifier node's `model` (M4.1 - tree configs
-///    boot without a flat classifier key)
+/// 3. Root `classification` classifier node's `model` (tree configs boot
+///    without a flat classifier key)
 /// 4. First model in the `fast` model group
 fn resolve_classifier_model_key<'a>(
     config: &'a RouterConfig,
@@ -452,7 +454,7 @@ fn build_classifier_client(
     config.local_backend(model_key)
 }
 
-/// Build the M4 classification-tree engine for a pipeline.
+/// Build the classification-tree engine for a pipeline.
 ///
 /// `default_client` (the injected mock/transcript backend or the real
 /// classifier client) serves every classifier node whose `model` key has no
@@ -575,7 +577,7 @@ impl RouterConfig {
             Some(qualifier) => format!("{base}:{qualifier}"),
             None => base.to_string(),
         };
-        // D4: the pool is an instance/group of the model, so its sampling
+        // The pool is an instance/group of the model, so its sampling
         // params (e.g. the swarm work pool's temperature) reach the body.
         let params = qualifier
             .as_deref()
@@ -627,7 +629,7 @@ impl RouterConfig {
         Some(Arc::new(LlmClient::with_config(llm_config)))
     }
 
-    /// Build the ledger `Summarizer`'s DIP backend (M2) - the ledger
+    /// Build the ledger `Summarizer`'s DIP backend - the ledger
     /// Summarizer's only construction site. Resolves the ledger model key
     /// (the `ledger` section's `model`, else the classifier model key), then
     /// targets the named `ledger` instance via `local_backend_for_instance`.
@@ -646,7 +648,7 @@ impl RouterConfig {
         ))
     }
 
-    /// Build the `LedgerTierWorker`'s DIP backend (M2) - the tier worker's only
+    /// Build the `LedgerTierWorker`'s DIP backend - the tier worker's only
     /// construction site. Reuses the same `LlmClient` factory and the same
     /// `<base>:ledger` named-instance target as `summarizer_for_ledger` (no
     /// second HTTP client). `tier_model` (if given) wins over the ledger
@@ -664,7 +666,7 @@ impl RouterConfig {
         self.local_backend_for_instance(key, "ledger")
     }
 
-    /// Build the tier worker's `TierConfig` from the `ledger` section (M5.1).
+    /// Build the tier worker's `TierConfig` from the `ledger` section.
     /// Queue capacity and max concurrency use the worker defaults; the LOD
     /// char caps and batch/poll knobs come from config. `None` when no `ledger`
     /// section is present.
@@ -679,7 +681,7 @@ impl RouterConfig {
         })
     }
 
-    /// Build the `LedgerAgentCoordinator` (M5.1) from the `ledger.orchestrator`
+    /// Build the `LedgerAgentCoordinator` from the `ledger.orchestrator`
     /// section — the coordinator's only construction site. `None` when the
     /// coordinator is not enabled (or no ledger section is present), so the
     /// server's dispatch path is untouched unless a deployment opts in.
@@ -847,7 +849,7 @@ mod tests {
 
     #[test]
     fn local_backend_uses_pool_qualifier_while_from_model_entry_keeps_default() {
-        // M1: router-internal work (local_backend) targets the pool group
+        // router-internal work (local_backend) targets the pool group
         // (swarm), while the client-facing canonical target builder
         // (from_model_entry) still resolves the fork's default instance
         // (ledger). Two intents, two answers on the same entry.
@@ -885,7 +887,7 @@ mod tests {
 
     #[test]
     fn summarizer_for_ledger_builds_when_ledger_section_present() {
-        // M2: the ledger Summarizer's DIP construction site. With a `ledger`
+        // The ledger Summarizer's DIP construction site. With a `ledger`
         // section and a swarm entry declaring a `ledger` instance, the backend
         // builds; without a ledger section it is `None`.
         let config: RouterConfig = serde_json::from_value(serde_json::json!({
@@ -912,7 +914,7 @@ mod tests {
 
     #[test]
     fn ledger_tier_backend_builds_when_ledger_section_present() {
-        // M2.4: the tier worker's DIP backend targets `<base>:ledger` via the
+        // The tier worker's DIP backend targets `<base>:ledger` via the
         // single LlmClient factory; tier_model wins over ledger.model.
         let config: RouterConfig = serde_json::from_value(serde_json::json!({
             "classifier_model": "swarm",
@@ -988,7 +990,7 @@ mod tests {
 
     #[test]
     fn local_backend_for_instance_builds_ledger_and_scratch_backends() {
-        // M5: the ledger summarizer and on-demand scratch route must dispatch
+        // The ledger summarizer and on-demand scratch route must dispatch
         // to their named instances. `local_backend_for_instance` builds an
         // `LlmClient` for the `models` key qualified to `<base>:<instance>`,
         // and `RoutingTarget::from_model_entry_instance` mirrors the model id.
@@ -1033,7 +1035,7 @@ mod tests {
 
     #[test]
     fn local_backend_for_instance_merges_profile_params_over_entry_params() {
-        // D4: scratch's profile `params` (temperature 0.4) overlay the entry
+        // Scratch's profile `params` (temperature 0.4) overlay the entry
         // `params` (repeat_penalty 1.05); declaration-only keys are stripped so
         // the merged body carries both sampling params and nothing else.
         let config: RouterConfig = serde_json::from_value(serde_json::json!({
@@ -1152,7 +1154,7 @@ mod tests {
     #[test]
     fn builder_threads_target_match_timeout_ms_into_matcher() {
         // `target_match_timeout_ms` must flow from PipelineParams into the
-        // TargetMatcher's per-assessment budget (M6). The builder logs the
+        // TargetMatcher's per-assessment budget. The builder logs the
         // value it passes on the self-assess path; assert it is the configured
         // knob, not the hardcoded constant.
         let config: RouterConfig = serde_json::from_str(

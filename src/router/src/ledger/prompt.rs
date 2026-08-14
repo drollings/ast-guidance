@@ -1,6 +1,6 @@
-//! `LedgerPromptAssembler` — the pure, deterministic prompt assembler (M1).
+//! `LedgerPromptAssembler` — the pure, deterministic prompt assembler.
 //!
-//! This module is the **foundation** of the coordinator (M4): it turns a
+//! This module is the **foundation** of the coordinator: it turns a
 //! worker's `speciality`/`instructions` plus a `LedgerView` into an optimized
 //! context prompt, selecting a fidelity `Lod` per node from the ledger.
 //!
@@ -10,7 +10,7 @@
 //! triggers LOD derivation beyond what already exists on a node (assembling a
 //! prompt must not pay a summarization cost).
 //!
-//! # Algorithm (M1.2)
+//! # Algorithm
 //!
 //! 1. **Always include first and last node at LOD0** (their `lod_text(0)`),
 //!    even if that overruns the reserved head/tail budget — they are the
@@ -225,7 +225,7 @@ fn estimate(store: &ContentNodeStore, id: NodeId, lod: Lod) -> usize {
     render_node(store, id, lod).chars().count()
 }
 
-/// The deterministic prompt assembler — a pure function object (M1).
+/// The deterministic prompt assembler — a pure function object.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LedgerPromptAssembler;
 

@@ -1,6 +1,49 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
+
+/// Capability-gated **synchronous** filesystem I/O for serving-path code.
+///
+/// Every function first checks that the caller holds the `FsCapability` token
+/// in the current `CURRENT_CAPS` task-local, then performs the standard-library
+/// operation. This is the shared gate the router's boot/serving fs calls use so
+/// each site does not re-implement `check_capability(...)?`. The async
+/// (tokio-based) counterpart lives on [`FsCapability`] itself.
+pub mod capability_aware_fs {
+    use std::io;
+    use std::path::Path;
+
+    use super::{check_capability, FsCapability};
+
+    fn granted() -> io::Result<()> {
+        check_capability(&FsCapability::new())
+    }
+
+    /// `create_dir_all` gated on the `FsCapability` token.
+    pub fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
+        granted()?;
+        std::fs::create_dir_all(path)
+    }
+
+    /// `metadata` gated on the `FsCapability` token.
+    pub fn metadata(path: impl AsRef<Path>) -> io::Result<std::fs::Metadata> {
+        granted()?;
+        std::fs::metadata(path)
+    }
+
+    /// `read_dir` gated on the `FsCapability` token.
+    pub fn read_dir(path: impl AsRef<Path>) -> io::Result<std::fs::ReadDir> {
+        granted()?;
+        std::fs::read_dir(path)
+    }
+
+    /// `read_to_string` gated on the `FsCapability` token.
+    pub fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
+        granted()?;
+        std::fs::read_to_string(path)
+    }
+}
 
 // The `CapabilitySet` installed for the current async task.
 //
@@ -163,6 +206,58 @@ impl CapabilitySet {
     }
 }
 
+/// Capability-gated filesystem operations.
+///
+/// This is the canonical `FsCapability` token (the capability model lives in
+/// `fluent-wvr`). It is re-exported unchanged from
+/// `fluent-concurrency::io::fs`, which is where the async tokio-backed
+/// operations were originally introduced.
+///
+/// Cannot be constructed directly outside this crate; use `FsCapability::new()`.
+pub struct FsCapability {
+    _priv: (),
+}
+
+impl FsCapability {
+    pub fn new() -> Self {
+        Self { _priv: () }
+    }
+
+    pub async fn read(&self, path: impl AsRef<Path>) -> Result<Vec<u8>, common_core::error::IoError> {
+        check_capability(self)?;
+        Ok(tokio::fs::read(path).await?)
+    }
+
+    pub async fn write(
+        &self,
+        path: impl AsRef<Path>,
+        contents: impl AsRef<[u8]>,
+    ) -> Result<(), common_core::error::IoError> {
+        check_capability(self)?;
+        Ok(tokio::fs::write(path, contents).await?)
+    }
+
+    pub async fn metadata(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<std::fs::Metadata, common_core::error::IoError> {
+        check_capability(self)?;
+        Ok(tokio::fs::metadata(path).await?)
+    }
+}
+
+impl Default for FsCapability {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Capability for FsCapability {
+    fn name(&self) -> &'static str {
+        "fs"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,13 +266,6 @@ mod tests {
     impl Capability for NetCapability {
         fn name(&self) -> &'static str {
             "net"
-        }
-    }
-
-    struct FsCapability;
-    impl Capability for FsCapability {
-        fn name(&self) -> &'static str {
-            "fs"
         }
     }
 
@@ -216,12 +304,11 @@ mod tests {
     fn capability_set_contains() {
         let caps = CapabilitySet::new().with(NetCapability);
         assert!(caps.contains::<NetCapability>());
-        assert!(!caps.contains::<FsCapability>());
-    }
+        assert!(!caps.contains::<FsCapability>());    }
 
     #[test]
     fn capability_set_iter_yields_correct_count() {
-        let caps = CapabilitySet::new().with(NetCapability).with(FsCapability);
+        let caps = CapabilitySet::new().with(NetCapability).with(FsCapability::new());
         assert_eq!(caps.iter().count(), 2);
     }
 
@@ -263,5 +350,39 @@ mod tests {
             .unwrap_err();
         assert_eq!(result.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(result.to_string().contains("missing"));
+    }
+
+    #[test]
+    fn capability_aware_fs_denied_without_token() {
+        use super::capability_aware_fs;
+        let dir = std::env::temp_dir().join(format!(
+            "fluent-wvr-fs-gate-{}",
+            common_core::hash::uuid_v4()
+        ));
+        // No FsCapability in the current scope: the gate refuses.
+        assert!(capability_aware_fs::create_dir_all(&dir).is_err());
+        assert_eq!(
+            capability_aware_fs::create_dir_all(&dir).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn capability_aware_fs_allowed_with_token() {
+        use super::capability_aware_fs;
+        let dir = std::env::temp_dir().join(format!(
+            "fluent-wvr-fs-gate-{}",
+            common_core::hash::uuid_v4()
+        ));
+        let result = CURRENT_CAPS.sync_scope(
+            CapabilitySet::new().with(FsCapability::new()),
+            || {
+                let r = capability_aware_fs::create_dir_all(&dir);
+                assert!(r.is_ok(), "gated create_dir_all must succeed with the token");
+                r
+            },
+        );
+        assert!(result.is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

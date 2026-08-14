@@ -341,7 +341,7 @@ impl<'a> DependencyResolver<'a> {
             }
         }
 
-        // Step 5: Final expansion with satisfied + rejected guards (M2.4 fix)
+        // Step 5: Final expansion with satisfied + rejected guards
         let full_provides = compute_full_provides(self.registry, &resolved_set);
         let final_expansion = closure::transitive_closure(
             &ctx,

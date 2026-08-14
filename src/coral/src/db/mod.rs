@@ -33,7 +33,7 @@ pub enum LibraryError {
 impl From<DbError> for LibraryError {
     fn from(e: DbError) -> Self {
         // A UNIQUE-constraint violation surfaces as the typed `DuplicateNode`
-        // variant instead of leaking the raw `DbError::DuplicateEntry` (D3).
+        // variant instead of leaking the raw `DbError::DuplicateEntry`.
         match e {
             DbError::DuplicateEntry(msg) => LibraryError::DuplicateNode(msg),
             other => LibraryError::Db(other),
@@ -551,7 +551,7 @@ mod tests {
 
         let query: Vec<f32> = (0..dims).map(|j| j as f32 / 8.0).collect();
 
-        // "before" (pre-M8.1): full-table scan — SELECT every embedding from
+        // "before": full-table scan — SELECT every embedding from
         // SQLite, deserialize each blob, brute-force over all candidates.
         let start = Instant::now();
         {
@@ -577,7 +577,7 @@ mod tests {
         }
         let legacy_elapsed = start.elapsed();
 
-        // "after" (M8.1): knn_search routes through HNSW above the cap.
+        // "after": knn_search routes through HNSW above the cap.
         let start = Instant::now();
         let hnsw = lib.knn_search(&query, 10, None).expect("knn");
         let hnsw_elapsed = start.elapsed();

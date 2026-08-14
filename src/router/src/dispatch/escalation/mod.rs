@@ -76,7 +76,7 @@ impl Ladder {
     }
 
     /// Direct frontier dispatch of the full request — the bypass path for a
-    /// session the turnover mode already marked frontier-owned (M3.7).
+    /// session the turnover mode already marked frontier-owned.
     /// Buffered (multi-step escalation is not streamable); `None` on failure.
     pub async fn dispatch_frontier(&self, ctx: &EscalationContext<'_>) -> Option<HyperResponse> {
         self.turnover_mode(ctx).await.ok().flatten()

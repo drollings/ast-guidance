@@ -1,4 +1,4 @@
-//! The canonical single-connection SQLite store (D4).
+//! The canonical single-connection SQLite store.
 //!
 //! `SqliteStore` owns the connection lifecycle (open / WAL / schema init) and
 //! exposes typed statement helpers (`query_row`/`query_rows`/`execute`/

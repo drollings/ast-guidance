@@ -675,7 +675,7 @@ fn describable_option_field_not_required() {
     assert!(!required.iter().any(|v| v == "nickname"));
 }
 
-// --- M3: Runtime type identification and typed data tests ---
+// --- Runtime type identification and typed data tests ---
 
 #[test]
 fn as_any_returns_correct_concrete_type() {

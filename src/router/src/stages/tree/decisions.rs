@@ -91,7 +91,7 @@ pub fn fallback_child(
 /// Build the `tree_path` decision for a resolved terminal. Additive over the
 /// existing `route`/`group`/`model`/`complexity` fields: when the
 /// target-matching ladder ran, the walk's self-assessment records and a
-/// `matched_via` marker are appended (M4 — auditability by construction).
+/// `matched_via` marker are appended (auditability by construction).
 pub fn terminal_decision(
     description: &str,
     rt: &RoutingTarget,

@@ -53,7 +53,7 @@ pub struct SupervisedBatchConfig {
     pub poll_budget: usize,
     /// Whether a `WorkError` returned by a registered unit is worth a retry.
     /// Defaults to `WorkError::is_retryable` — permanent `Execution` failures
-    /// short-circuit without burning backoff budget (M5.1). Override when a
+    /// short-circuit without burning backoff budget. Override when a
     /// SupervisedBatch units wrap genuinely transient failures in
     /// `WorkError::Execution` (e.g. chart targets whose LLM call failed).
     pub is_retryable: fn(&WorkError) -> bool,
@@ -161,18 +161,18 @@ impl SupervisedBatch {
 
     /// Registers a `Component` in the SupervisedBatch. Returns `&mut Self` for builder chaining.
     ///
-    /// Returns `Err(ZoneError::DuplicateName)` if a unit with the same `name()`
+    /// Returns `Err(BatchError::DuplicateName)` if a unit with the same `name()`
     /// has already been registered. If you intentionally want to replace an
     /// existing task, use `register_or_replace` (not yet implemented — file
     /// a feature request if you need it).
     pub fn register(&mut self, unit: Arc<dyn Component>) -> Result<&mut Self, SupervisedBatchError> {
-        let ctx = WorkContext::for_unit_in_zone(&self.runtime, &self.caps, |_| {});
+        let ctx = WorkContext::for_unit_in_batch(&self.runtime, &self.caps, |_| {});
         self.register_with_context(unit, ctx)
     }
 
     /// Registers a `Component` with a custom `WorkContext`.
     ///
-    /// Returns `Err(ZoneError::DuplicateName)` if a unit with the same `name()`
+    /// Returns `Err(BatchError::DuplicateName)` if a unit with the same `name()`
     /// has already been registered.
     pub fn register_with_context(
         &mut self,

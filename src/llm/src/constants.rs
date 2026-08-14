@@ -1,5 +1,5 @@
-//! Cross-crate limit moved to `common-core::constants` (consolidation roadmap
-//! M2.3). Re-exported here for backward compatibility — any consumer may
+//! Cross-crate limit moved to `common-core::constants`
+//! Re-exported here for backward compatibility — any consumer may
 //! switch to `common_core::MAX_EMBEDDING_DIMENSIONS` directly.
 pub use common_core::MAX_EMBEDDING_DIMENSIONS;
 

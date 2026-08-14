@@ -256,7 +256,7 @@ Then you you must read
     │       ├── error.rs  # //! The single database error taxonomy f
     │       ├── hnsw.rs  # //! The canonical HNSW-backed vector ind
     │       ├── lib.rs  # //! # fluent-db — the canonical dat...
-    │       ├── migrate.rs  # //! Idempotent schema migrations (M3.2).
+    │       ├── migrate.rs  # //! Idempotent schema migrations.
     │       ├── pool.rs  # //! The canonical pooled SQLite store (D
     │       ├── query.rs  # //! Typed statement helpers shared by `S
     │       ├── store.rs  # //! The canonical single-connection SQLi

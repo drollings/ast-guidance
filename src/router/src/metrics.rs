@@ -1,7 +1,7 @@
 //! Failure classification for the router pipeline.
 //!
 //! `FailureClass` (the enum + stable labels) is the canonical shared
-//! taxonomy in `fluent_llm::http_class`; this module re-exports it (D2).
+//! taxonomy in `fluent_llm::http_class`; this module re-exports it.
 //! Typed-first: `FailureClass` is derived from the typed error
 //! (`DispatchError`/`WorkError`/`ServerError` via `From`), with the string
 //! regex classifier retained only as a fallback for opaque payloads (shell
@@ -234,7 +234,7 @@ mod tests {
         assert_eq!(classify_error(""), FailureClass::Unknown);
     }
 
-    // ── Typed-first mapping (D10) ──────────────────────────────────────
+    // ── Typed-first mapping ──────────────────────────────────────
 
     #[test]
     fn dispatch_rate_limited_maps_to_rate_limit() {

@@ -210,7 +210,7 @@ impl BatchIngestor {
         self.flush()?;
 
         // Resolve hash-based IDs to SQLite NodeIds via one batch query instead
-        // of a per-edge name lookup (M9.6: kills the N+1).
+        // of a per-edge name lookup.
         let names: Vec<&str> = id_to_name.values().map(String::as_str).collect();
         let name_to_sql_id = self.library.find_node_ids_by_names(&names)?;
 

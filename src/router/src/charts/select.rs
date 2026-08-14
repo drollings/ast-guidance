@@ -36,7 +36,7 @@ pub enum ChartFit {
     /// The chart is fully bound by the provided entities — executable now.
     Exact,
     /// The chart is the best fit but some required inputs are missing. The
-    /// gap names drive the M8 interview loop.
+    /// gap names drive the interview loop.
     Partial { gaps: Vec<String> },
     /// No chart fits the request — fall through to fresh planning.
     Mismatch,
@@ -330,12 +330,12 @@ impl ChartSelector {
     }
 
     /// Build a `ChartMatch` for a chosen chart, resolving any ambiguous
-    /// deps first (M8: LLM pick with a deterministic tie-break fallback).
+    /// deps first (LLM pick with a deterministic tie-break fallback).
     ///
     /// The fit is the union of the deterministic binding's gaps (unmatched
     /// required deps) and the adjudicator's flagged gaps. The binding is the
     /// authority on executability; the LLM's gaps capture semantic
-    /// incompleteness the binding cannot see (M8 interview material).
+    /// incompleteness the binding cannot see (interview material).
     fn build_match(
         &self,
         chart: &ChartDef,
@@ -624,7 +624,7 @@ fn parse_rerank_output(raw: &str) -> Option<Vec<String>> {
     Some(names.into_iter().map(str::to_string).collect())
 }
 
-// ── Ambiguity adjudicator (M8): LLM pick + deterministic tie-break ───────
+// ── Ambiguity adjudicator: LLM pick + deterministic tie-break ───────
 
 /// Build the ambiguity-adjudicator system prompt for a single dep.
 ///
@@ -929,8 +929,8 @@ mod tests {
 
     #[test]
     fn entity_only_capability_dep_classifies_partial_not_exact() {
-        // D1: a chart whose capability dep has no in-graph provider and no
-        // matching entity classifies `Partial { gaps }` (drives the M8
+        // A chart whose capability dep has no in-graph provider and no
+        // matching entity classifies `Partial { gaps }` (drives the
         // interview) instead of `Exact`-then-`ChartError::Compile`.
         let tmp = TempDir::new().unwrap();
         let index_path = tmp.path().join("workflow_library.sqlite");
@@ -1036,7 +1036,7 @@ mod tests {
         assert_eq!(out.fit, AdjudicatorFit::Mismatch);
     }
 
-    // ── M7 step 2.5: reranker ────────────────────────────────────────────
+    // ── Step 2.5: reranker ────────────────────────────────────────────
 
     #[test]
     fn parse_rerank_output_accepts_array_and_ranking_object() {
@@ -1125,7 +1125,7 @@ mod tests {
         assert_eq!(sel.rerank("anything", candidates.clone()), candidates);
     }
 
-    // ── M8: ambiguity adjudication ───────────────────────────────────────
+    // ── Ambiguity adjudication ───────────────────────────────────────
 
     /// Two `report` entities both matching the bug_triage `report` predicate
     /// → the dep binds ambiguously; adjudication must resolve it.

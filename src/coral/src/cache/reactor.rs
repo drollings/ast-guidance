@@ -148,7 +148,7 @@ impl QueueReactor {
         if let Some(ref frontier) = args.frontier_config {
             let hist = Arc::new(LatencyHistogram::new());
             let unit = match args.frontier_workers {
-                // M9: route frontier calls through a shared worker pool
+                // Route frontier calls through a shared worker pool
                 // (`LlmRequestQueue` with the `default_handler` transport)
                 // sized from the reactor config — opt-in, non-regressing.
                 Some(workers) => {
@@ -263,7 +263,7 @@ impl QueueReactor {
     ) -> Result<NodeId, CacheError> {
         let hash_bytes = content_hash_with_model(query, "solution");
         let hash_id = i64::from_le_bytes(hash_bytes[..8].try_into().unwrap());
-        // M9.2c: an embedder failure is now observable via `CacheError::Embedding`
+        // An embedder failure is now observable via `CacheError::Embedding`
         // instead of being silently swallowed; a missing embedder (feature not
         // configured) still persists the node without an embedding.
         let embedding = match self.embedder.as_ref() {
@@ -311,7 +311,7 @@ impl QueueReactor {
             total_count += h.count();
             total_sum_ms += h.sum_ms();
         }
-        // M9.5: p50/p99 are aggregated across ALL tier histograms (weighted
+        // p50/p99 are aggregated across ALL tier histograms (weighted
         // by count) instead of reflecting only the first tier.
         let refs: Vec<&LatencyHistogram> = self.histograms.iter().map(Arc::as_ref).collect();
         let p50 = LatencyHistogram::aggregate(&refs, 50.0);

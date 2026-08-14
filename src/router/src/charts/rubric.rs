@@ -54,7 +54,7 @@ impl RubricVerdict {
     }
 }
 
-/// In-memory memo cache of validated rubric/answer pairs (M9).
+/// In-memory memo cache of validated rubric/answer pairs.
 ///
 /// A pair `(rubric, output)` that passed the gate is recorded; a later
 /// identical check short-circuits without re-running the deterministic rules

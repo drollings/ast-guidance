@@ -1,6 +1,6 @@
 //! SupervisedBatch-supervised execution of a compiled chart.
 //!
-//! The M9 supervisor runs a compiled chart's targets through a `SupervisedBatch` in
+//! The supervisor runs a compiled chart's targets through a `SupervisedBatch` in
 //! topo-order waves:
 //!
 //! - **Ordering authority**: `compile_chart_stages` + `topo_order` (the
@@ -49,7 +49,7 @@ pub enum ChartTargetVerdict {
     Cancelled,
 }
 
-/// One audit-trail entry for a chart target run (M9 observability).
+/// One audit-trail entry for a chart target run (observability).
 #[derive(Debug, Clone, Serialize)]
 pub struct ChartAuditEntry {
     pub chart: String,
@@ -76,8 +76,6 @@ impl ChartAuditEntry {
     }
 }
 
-/// SupervisedBatch retry predicate for chart zones (M5.1).
-///
 /// Chart targets wrap their LLM-call failures in `WorkError::Execution`
 /// (`"chart target '…' LLM call failed: …"`, `charts/stage.rs`). Those are
 /// genuinely transient (rate limits, upstream hiccups) and recoverable when
@@ -113,9 +111,9 @@ pub struct ChartExecOptions {
     pub fit: Option<String>,
     /// Selection confidence for the audit trail.
     pub score: Option<f64>,
-    /// M10 staleness: when set, the rubric-gate result is recorded against
-    /// the store — consecutive failures demote the chart, a pass promotes a
-    /// draft. `None` disables the recording (executor stays decoupled).
+    /// When set, the rubric-gate result is recorded against the store —
+    /// consecutive failures demote the chart, a pass promotes a draft. 
+    /// `None` disables the recording (executor stays decoupled).
     pub health: Option<Arc<ChartStore>>,
 }
 
@@ -155,7 +153,7 @@ pub struct ChartExecutionSummary {
 
 impl ChartExecutionSummary {
     /// Whether this run was rejected by a rubric gate (target- or chart-level).
-    /// The M10 staleness policy counts only rubric rejections as "stale
+    /// The staleness policy counts only rubric rejections as "stale
     /// failures" — an execution error is a different failure class.
     pub fn rubric_rejected(&self) -> bool {
         self.audit
@@ -224,8 +222,8 @@ impl ChartExecutionPlan {
         let mut failed: HashSet<String> = HashSet::new();
 
         // The dependency graph is the single source of readiness and ordering —
-        // it mirrors the topo graph built at compile time (`compile::topo_order`,
-        // F9): each target registers its name, its upstream ids as deps, and
+        // it mirrors the topo graph built at compile time (`compile::topo_order`:
+        // each target registers its name, its upstream ids as deps, and
         // provides its own name (the DependencySession convention). The executor
         // never re-implements a ready scan by hand.
         let mut graph: DependencyGraph<String> = DependencyGraph::new();
@@ -317,7 +315,7 @@ impl ChartExecutionPlan {
         // dependency chain never completed (a dependency failed), or an
         // essential-failure abort left them ready-but-unexecuted. A single
         // "not completed and not failed" pass classifies every target — the
-        // plain sweep (M8.2). Note: this is intentionally NOT
+        // plain sweep. Note: this is intentionally NOT
         // `graph.dependents_of(failed)` alone — an abort can strand a ready
         // target in an *independent* branch (its deps all completed, so it is
         // not a transitive dependent of the failed target) that the sweep
@@ -381,7 +379,7 @@ impl ChartExecutionPlan {
         }
         summary.accepted = accepted;
 
-        // M10 staleness: feed the rubric-gate result to the store so
+        // Staleness: feed the rubric-gate result to the store so
         // consecutive failures demote the chart and a pass promotes a draft.
         if let Some(store) = &opts.health {
             if store.get(&self.chart_name).is_some() {
@@ -405,7 +403,7 @@ impl ChartExecutionPlan {
         Ok(summary)
     }
 
-    /// Fold a single `ZoneEvent` into the execution state.
+    /// Fold a single `BatchEvent` into the execution state.
     fn process_event(
         &self,
         event: SupervisedBatchEvent,
@@ -783,7 +781,7 @@ mod tests {
     /// has a ready-but-unexecuted target: that target is still cancelled (its
     /// deps all completed but the chart stopped), so the cancelled set is a
     /// "not completed and not failed" sweep — not merely the transitive
-    /// `dependents_of` the failed essential target. Locks M8.2's classifier.
+    /// `dependents_of` the failed essential target. Locks classifier.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn essential_failure_cancels_independent_ready_branch() {
         let chart_json = r#"{
@@ -840,7 +838,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn zone_retry_recovers_a_transient_target_failure() {
+    async fn batch_retry_recovers_a_transient_target_failure() {
         // `a`'s LLM call errors on the first attempt, then succeeds. With
         // max_retries = 1 the SupervisedBatch retries and the whole chain completes.
         let backend: Arc<dyn ChatBackend> =
@@ -1024,7 +1022,7 @@ mod tests {
     // ── Golden e2e: real seed chart + rubric through the SupervisedBatch ─────────────
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn golden_rubric_gated_seed_chart_runs_through_zone() {
+    async fn golden_rubric_gated_seed_chart_runs_through_batch() {
         // Load the real Appendix A seed chart, add a target rubric, and run it
         // through the SupervisedBatch supervisor with a mock backend. The audit trail
         // must record chart/fit/score/targets.
@@ -1102,7 +1100,7 @@ mod tests {
         assert_eq!(target_names, vec!["reproduce", "root_cause", "fix_plan"]);
     }
 
-    // ── M10: staleness / demotion fed by rubric-gate results ─────────────
+    // ── Staleness / demotion fed by rubric-gate results ─────────────
 
     /// A 1-target chart whose target rubric requires an `out` field.
     fn rubric_failing_chart_json() -> String {

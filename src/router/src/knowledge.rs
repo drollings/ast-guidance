@@ -1,5 +1,4 @@
-//! `KnowledgeCapability` implementation for the router's shared `ContentNodeStore`
-//! (M4D).
+//! `KnowledgeCapability` implementation for the router's shared `ContentNodeStore`.
 //!
 //! The router server calls `ContentNodeStore` **directly** on the hot path — no
 //! gating, no trait indirection. This trait impl is the boundary for

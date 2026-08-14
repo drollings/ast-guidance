@@ -488,7 +488,7 @@ guidance explain "query"
 
 ### Wired (documented, not separately listed)
 
-1. **Fluent WVR Pattern Adoption**: All 6 cache tiers are `WorkUnit` implementations dispatched uniformly through `TierRegistry` (completed by M3 of `ROADMAP_REFINE.md`)
+1. **Fluent WVR Pattern Adoption**: All 6 cache tiers are `WorkUnit` implementations dispatched uniformly through `TierRegistry`
 
 ### Planned
 

@@ -117,7 +117,7 @@ async fn test_scope_defer_aborts_tasks() {
 /// SupervisedBatch panic propagation: a panic in a work unit should propagate as
 /// JoinError::Panic and trigger dependency-aware cancellation.
 #[tokio::test(start_paused = true)]
-async fn test_zone_panic_propagates_as_join_error() {
+async fn test_batch_panic_propagates_as_join_error() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
     let mut batch = SupervisedBatch::new(runtime, caps);
@@ -159,7 +159,7 @@ async fn test_zone_panic_propagates_as_join_error() {
 
 /// SupervisedBatch: a panic in a provider task must cancel all transitively dependent tasks.
 #[tokio::test(start_paused = true)]
-async fn test_zone_panic_cancels_transitive_dependents() {
+async fn test_batch_panic_cancels_transitive_dependents() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
     let mut batch = SupervisedBatch::new(runtime, caps);
@@ -257,7 +257,7 @@ async fn test_zone_panic_cancels_transitive_dependents() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn test_zone_normal_completion() {
+async fn test_batch_normal_completion() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
     let mut batch = SupervisedBatch::new(runtime, caps);
@@ -270,7 +270,7 @@ async fn test_zone_normal_completion() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn test_zone_panic_containment() {
+async fn test_batch_panic_containment() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
     let mut batch = SupervisedBatch::new(runtime, caps);
@@ -283,7 +283,7 @@ async fn test_zone_panic_containment() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn test_zone_real_timeout() {
+async fn test_batch_real_timeout() {
     tokio::time::resume();
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
@@ -315,7 +315,7 @@ async fn test_zone_real_timeout() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn test_zone_retry_with_max_retries() {
+async fn test_batch_retry_with_max_retries() {
     tokio::time::resume();
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
@@ -365,10 +365,10 @@ async fn test_zone_retry_with_max_retries() {
 /// Regression: with the default `is_retryable` predicate
 /// (`WorkError::is_retryable`), a *permanent* `Execution` failure must fail
 /// fast — exactly one attempt, no retry loop — even when `max_retries` is
-/// non-zero. This guards the M5.1 taxonomy: `Execution` is permanent,
+/// non-zero. This guards taxonomy: `Execution` is permanent,
 /// `Dependency`/`Timeout` are transient.
 #[tokio::test(start_paused = true)]
-async fn test_zone_permanent_error_does_not_retry() {
+async fn test_batch_permanent_error_does_not_retry() {
     tokio::time::resume();
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
@@ -417,7 +417,7 @@ async fn test_zone_permanent_error_does_not_retry() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn test_zone_real_panic() {
+async fn test_batch_real_panic() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
     let mut batch = SupervisedBatch::new(runtime, caps);
@@ -436,7 +436,7 @@ async fn test_zone_real_panic() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn test_zone_dependency_cancellation() {
+async fn test_batch_dependency_cancellation() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
     let mut batch = SupervisedBatch::new(runtime, caps);
@@ -471,7 +471,7 @@ async fn test_zone_dependency_cancellation() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn test_zone_drop_cancels_tasks() {
+async fn test_batch_drop_cancels_tasks() {
     tokio::time::resume();
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
@@ -488,7 +488,7 @@ async fn test_zone_drop_cancels_tasks() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn test_zone_builder_chaining() {
+async fn test_batch_builder_chaining() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
     let mut batch = SupervisedBatch::new(runtime, caps);
@@ -501,7 +501,7 @@ async fn test_zone_builder_chaining() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn test_zone_transitive_cancellation() {
+async fn test_batch_transitive_cancellation() {
     tokio::time::resume();
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
@@ -548,7 +548,7 @@ async fn test_zone_transitive_cancellation() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn test_zone_panic_cancels_dependents() {
+async fn test_batch_panic_cancels_dependents() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
     let mut batch = SupervisedBatch::new(runtime, caps);
@@ -583,7 +583,7 @@ async fn test_zone_panic_cancels_dependents() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn test_zone_budget_exhaustion() {
+async fn test_batch_budget_exhaustion() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
     let mut batch = SupervisedBatch::new(runtime, caps);
@@ -600,7 +600,7 @@ async fn test_zone_budget_exhaustion() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn test_zone_drop_aborts_all_tasks() {
+async fn test_batch_drop_aborts_all_tasks() {
     tokio::time::resume();
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
@@ -628,7 +628,7 @@ async fn test_zone_drop_aborts_all_tasks() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn test_zone_config_custom_budget() {
+async fn test_batch_config_custom_budget() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
     let config = SupervisedBatchConfig {
@@ -644,7 +644,7 @@ async fn test_zone_config_custom_budget() {
 /// Verify that Execution failures go to `summary.failed` and real panics
 /// go to `summary.panicked` — they are distinct paths.
 #[tokio::test(start_paused = true)]
-async fn test_zone_failed_vs_panic_distinct() {
+async fn test_batch_failed_vs_panic_distinct() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
     let mut batch = SupervisedBatch::new(runtime, caps);
@@ -672,7 +672,7 @@ async fn test_zone_failed_vs_panic_distinct() {
 /// Drop after natural completion: the SupervisedBatch's done=true guard in Drop
 /// prevents abort_all() from being called on an empty JoinSet.
 #[tokio::test(start_paused = true)]
-async fn test_zone_drop_completed_zone_is_safe() {
+async fn test_batch_drop_completed_batch_is_safe() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
     let mut batch = SupervisedBatch::new(runtime, caps);
@@ -682,9 +682,9 @@ async fn test_zone_drop_completed_zone_is_safe() {
     drop(batch);
 }
 
-/// ZoneConfig satisfies Debug, Clone, Copy, PartialEq, Eq.
+/// BatchConfig satisfies Debug, Clone, Copy, PartialEq, Eq.
 #[test]
-fn test_zone_config_traits() {
+fn test_batch_config_traits() {
     let a = SupervisedBatchConfig {
         poll_budget: 64,
         ..SupervisedBatchConfig::default()
@@ -696,10 +696,10 @@ fn test_zone_config_traits() {
     let _ = format!("{a:?}");
 }
 
-/// The default `ZoneConfig::is_retryable` predicate is `WorkError::is_retryable`:
+/// The default `BatchConfig::is_retryable` predicate is `WorkError::is_retryable`:
 /// permanent `Execution` failures short-circuit, transient ones retry.
 #[test]
-fn test_zone_config_default_retry_predicate() {
+fn test_batch_config_default_retry_predicate() {
     let config = SupervisedBatchConfig::default();
     assert!(!(config.is_retryable)(&WorkError::Execution(
         "permanent".into()
@@ -715,12 +715,12 @@ fn test_zone_config_default_retry_predicate() {
 
 /// A custom `is_retryable` predicate overrides the default per-SupervisedBatch.
 #[tokio::test(start_paused = true)]
-async fn test_zone_custom_retry_predicate_retries_execution() {
+async fn test_batch_custom_retry_predicate_retries_execution() {
     tokio::time::resume();
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
     // Opt-in predicate: retry even `Execution` failures (legacy unconditional
-    // behavior), as chart zones do for their LLM-call failures.
+    // behavior), as chart batches do for their LLM-call failures.
     let config = SupervisedBatchConfig {
         is_retryable: |_: &WorkError| true,
         ..SupervisedBatchConfig::default()
@@ -746,9 +746,9 @@ async fn test_zone_custom_retry_predicate_retries_execution() {
     );
 }
 
-/// ZoneConfig with poll_budget=1: the minimum valid budget works.
+/// BatchConfig with poll_budget=1: the minimum valid budget works.
 #[tokio::test(start_paused = true)]
-async fn test_zone_config_budget_one() {
+async fn test_batch_config_budget_one() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
     let config = SupervisedBatchConfig {
@@ -761,9 +761,9 @@ async fn test_zone_config_budget_one() {
     assert_eq!(summary.completed.len(), 1);
 }
 
-/// Verify that registering a duplicate name returns `Err(ZoneError::DuplicateName)`.
+/// Verify that registering a duplicate name returns `Err(BatchError::DuplicateName)`.
 #[tokio::test(start_paused = true)]
-async fn test_zone_register_duplicate_returns_error() {
+async fn test_batch_register_duplicate_returns_error() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
     let mut batch = SupervisedBatch::new(runtime, caps);
@@ -777,7 +777,7 @@ async fn test_zone_register_duplicate_returns_error() {
 /// Drop with multiple pending tasks that would retry indefinitely:
 /// abort_all() prevents any from leaking or completing as orphans.
 #[tokio::test(start_paused = true)]
-async fn test_zone_drop_multiple_pending_tasks() {
+async fn test_batch_drop_multiple_pending_tasks() {
     tokio::time::resume();
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
@@ -807,7 +807,7 @@ async fn test_zone_drop_multiple_pending_tasks() {
 /// Drop with a dependency graph: all tasks in the graph are aborted,
 /// no matter their dependency level.
 #[tokio::test(start_paused = true)]
-async fn test_zone_drop_dependency_graph() {
+async fn test_batch_drop_dependency_graph() {
     tokio::time::resume();
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();

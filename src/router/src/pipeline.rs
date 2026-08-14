@@ -78,7 +78,7 @@ impl RoutingTarget {
             Some(q) => format!("{base}:{q}"),
             None => base,
         };
-        // D4: when dispatch is qualified to an instance/group, overlay that
+        // When dispatch is qualified to an instance/group, overlay that
         // profile's sampling params (profile wins); otherwise use entry params.
         let params = qualifier
             .as_deref()
@@ -327,7 +327,7 @@ impl PipelineOrchestrator {
     }
 }
 
-/// Router-internal downcast to the typed decision producers (M5.4). The
+/// Router-internal downcast to the typed decision producers. The
 /// pipelines built by `config::RouterConfigBuilder` contain exactly
 /// `DeterministicPreFilter` and `ClassifierStage`; the `None` fallback keeps
 /// the orchestrator usable with arbitrary components (test stubs, pipeline
@@ -395,7 +395,7 @@ impl WorkUnit for PipelineOrchestrator {
             let stage_name_human = stage.name().to_string();
             tracing::debug!(target: "router.pipeline", stage = %stage_name_human, "stage entering");
 
-            // M5.4 typed handoff. The known stages implement
+            // Typed handoff. The known stages implement
             // `StageDecisionProducer`, so their `StageDecision` is produced by
             // a direct method call with the running decision accumulator
             // passed by reference — no per-stage serialize→deserialize through

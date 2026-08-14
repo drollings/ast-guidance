@@ -38,14 +38,14 @@ pub const CHART_SCHEMA_VERSION: u32 = 1;
 /// Maximum length of a single target template (chars).
 pub const CHART_TEMPLATE_MAX_CHARS: usize = 16_384;
 /// Maximum number of targeted interview questions rendered for a `Partial`
-/// fit (M8). Fixed and small — the interview is one round, never open-ended.
+/// fit. Fixed and small — the interview is one round, never open-ended.
 pub const CHART_MAX_INTERVIEW_QUESTIONS: usize = 3;
 /// Default LLM-judge acceptance threshold for a chart rubric gate.
 pub const DEFAULT_RUBRIC_MIN_SCORE: f64 = 0.7;
 /// Consecutive rubric-gate failures after which a chart is demoted (no longer
-/// selected) and flagged in the audit log (M10 staleness policy).
+/// selected) and flagged in the audit log (staleness policy).
 pub const CHART_STALE_FAILS: usize = 3;
-/// Maximum length of an auto-extracted chart name (M10, derived from a query).
+/// Maximum length of an auto-extracted chart name (derived from a query).
 pub const CHART_EXTRACTED_NAME_MAX_CHARS: usize = 64;
 
 // ── Errors ───────────────────────────────────────────────────────────────
@@ -109,12 +109,12 @@ pub struct ChartDef {
     pub description: String,
     /// Gate: charts with unsupported versions are rejected at load.
     pub schema_version: u32,
-    /// "human" or a model key (staleness tracking, M10).
+    /// "human" or a model key (staleness tracking).
     pub author_model: String,
     /// DAG nodes.
     pub targets: Vec<ChartTarget>,
     /// Chart-level acceptance rubric. Gates the final chart output (the last
-    /// completed target's output) before a run is reported successful (M9).
+    /// completed target's output) before a run is reported successful.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rubric: Option<ChartRubric>,
 }
@@ -300,18 +300,17 @@ pub struct ChartTarget {
     #[serde(default)]
     pub essential: bool,
     /// Acceptance rubric gating this target's output before it is promoted to
-    /// `provides` (M9). Absent → output accepted on successful execution.
+    /// `provides`. Absent → output accepted on successful execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rubric: Option<ChartRubric>,
 }
 
 /// An acceptance rubric for a chart target's (or chart's) output.
 ///
-/// Before a target's output is promoted to `provides`, the rubric gate runs:
-/// a cheap deterministic field-presence rule first, and an optional LLM judge
-/// only when `judge_model` is set (M9, VISION: "deterministic field-presence
-/// rule first; optional LLM judge only when the rubric says so"). An absent
-/// rubric accepts any successfully-executed output.
+/// Before a target's output is promoted to `provides`, the rubric gate
+/// runs: a cheap deterministic field-presence rule first, and an optional
+/// LLM judge only when `judge_model` is set.  An absent rubric accepts any
+/// successfully-executed output.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct ChartRubric {
     /// Dotted field paths that must be present and non-null in the output.

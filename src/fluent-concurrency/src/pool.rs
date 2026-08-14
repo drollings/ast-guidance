@@ -216,8 +216,7 @@ pub enum ResultPoolError<E> {
 }
 
 /// Internal wrapper pairing a job with a oneshot sender for its result.
-/// Shared by `ResultPool` and `PriorityResultPool` (M5.3 consolidation — the
-/// two pools previously declared separate but identical wrapper structs).
+/// Shared by `ResultPool` and `PriorityResultPool`.
 struct WrappedJob<T, R, E> {
     job: T,
     result_tx: tokio::sync::oneshot::Sender<Result<R, E>>,
@@ -227,7 +226,7 @@ struct WrappedJob<T, R, E> {
 type PriorityJobQueue<T, R, E> =
     tokio::sync::Mutex<crate::queue::PriorityQueue<WrappedJob<T, R, E>>>;
 
-/// Spawn `cap` worker tasks running one shared worker core (M5.3).
+/// Spawn `cap` worker tasks running one shared worker core.
 ///
 /// Each worker loops: `next_job().await` resolves to `Some(job)` when work is
 /// available or `None` when the pool is shutting down, and `handle(job).await`
@@ -267,7 +266,7 @@ where
     workers
 }
 
-/// Spawn `cap` workers for a `Queue`-backed pool (M5.3). Each worker
+/// Spawn `cap` workers for a `Queue`-backed pool. Each worker
 /// `select!`s between a shutdown notification and `pop`, so shutdown can
 /// preempt a pending pop; `handle` runs each job. Shared by `WorkerPool`
 /// and `ResultPool`.
@@ -304,7 +303,7 @@ where
     )
 }
 
-/// Spawn `cap` workers for `PriorityResultPool` (M5.3). Each worker pops one
+/// Spawn `cap` workers for `PriorityResultPool`. Each worker pops one
 /// job under the queue mutex and, when empty, waits for a submit notification
 /// or shutdown (drain-then-wait).
 ///
@@ -312,7 +311,7 @@ where
 /// because `Notify::notify_waiters` does **not** store a permit: a worker that
 /// re-registers its shutdown future *after* `notify_waiters` would miss the
 /// wake and park forever. `watch::Receiver::changed()` is sticky — a receiver
-/// that registers after the send sees it immediately (M2).
+/// that registers after the send sees it immediately.
 fn spawn_priority_workers<T, R, E, H, HFut>(
     runtime: Arc<dyn Runtime>,
     cap: usize,
@@ -343,7 +342,7 @@ where
                     loop {
                         // Register interest in the submit-notify BEFORE taking
                         // the queue mutex, mirroring `Queue::pop`'s
-                        // anti-missed-wakeup discipline (M2): a submitter that
+                        // anti-missed-wakeup discipline: a submitter that
                         // pushes between the empty pop and this `select!` would
                         // otherwise notify a worker that isn't listening yet,
                         // and the worker would sleep until the next submit.
@@ -708,7 +707,7 @@ mod priority_pool_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_priority_pool_single_submit_wakes_sleeper() {
-        // M2 regression: a job submitted while every worker is parked (queue
+        // A job submitted while every worker is parked (queue
         // observed empty) must always wake one worker. The pre-fix worker
         // registered its `notified()` future only *after* releasing the queue
         // mutex, so a submit landing in that window notified nobody and the

@@ -2,13 +2,13 @@
 
 ## 1. Executive Summary
 
-This document specifies `fluent-concurrency`, a thin, safe, composable extension layer over **Tokio**. It is designed for systems that need the operational resilience of RabbitMQ (bounded worker pools, credit-based backpressure, priority queues, supervision zones) and the minimalism of `smol`, without reimplementing Tokio's scheduler, I/O driver, or timer wheel.
+This document specifies `fluent-concurrency`, a thin, safe, composable extension layer over **Tokio**. It is designed for systems that need the operational resilience of RabbitMQ (bounded worker pools, credit-based backpressure, priority queues, supervision batches) and the minimalism of `smol`, without reimplementing Tokio's scheduler, I/O driver, or timer wheel.
 
 **Core philosophy:**
 - **Tokio is the workhorse.** We do not rebuild `async_executor`, `epoll/kqueue/IOCP`, or work-stealing. We *compose* Tokio's primitives.
 - **Fluent WVR is the control plane.** Every unit of work presents the same `Component` / `WorkUnit` interface regardless of origin (native struct, WASM plugin, DB config). The orchestrator iterates over uniform handles. (The one sanctioned exception — the router's `PipelineOrchestrator` downcasting to `StageDecisionProducer` for a typed per-request handoff — is documented in the fluent-wvr SKILL §0.)
 - **Safety and locality.** 100% safe Rust (`#![forbid(unsafe_code)]`). No procedural macros hiding task boundaries. `dyn Trait` is restricted to the Control Plane; the Data Plane uses concrete types and flat enums.
-- **Explicit ownership.** No ambient authority. Every effect requires a capability token. Every spawned task belongs to a `Scope` whose close must be awaited.
+- **Explicit ownership.** Every task is owned: `Scope`-spawned tasks are awaited when the scope closes, and server-owned background/connection tasks are awaited when the server drains them at graceful shutdown. Effects are capability-gated: DB and knowledge access require tokens, and file/process/network effects are gated wherever a capability set is installed (the serving path) — operator CLI tooling is capability-exempt by design.
 
 ## 2. Design Decisions (Resolving Manifest Open Questions)
 
@@ -36,7 +36,7 @@ Every high-overhead effect (file system, database, AI inference endpoint, blocki
 
 - `FsCapability` — gates `tokio::fs::{read, write, metadata}`. Constructed via `FsCapability::new()`.
 - `NetCapability` — wraps a `reqwest::Client` configured via `NetConfig { max_idle_per_host, idle_timeout, connect_timeout, request_timeout, user_agent }`. Constructed via `NetCapability::new()` or `with_config(&NetConfig)`. Exposes `http_get`, `http_post`, `http_post_json_stream` (returns a streaming `Stream<Item = Result<Bytes, IoError>>` of response chunks, used by SSE forwarding), `tcp_connect`, and the raw `client()`.
-- `DbCapability` — **home is now `fluent-db`** (`fluent_db::capability`, re-exported from `fluent_concurrency::io::db::DbCapability` to keep the module path). Opens a `fluent-db::SqlitePool` (default 5 connections, WAL mode enabled) via `DbCapability::open(path)`. The legacy lossy `query(sql) -> Vec<HashMap<String, String>>` and `execute(sql) -> usize` (all-values-as-strings) are **deprecated** (§0.5 M3): new code uses the typed `SqlitePool::query_row` / `query_rows` / `execute` helpers. Both still check out a `PooledConnection` (RAII; the connection returns to the pool on `Drop`) and offload the synchronous `rusqlite` work via `spawn_blocking`. Note that `SqlitePool::acquire()` is **gated** like every other effect entry point — it requires a `DbCapability` token in the current task-local and returns `DbError::PermissionDenied` otherwise (no caller behavior change; the token still gates via `fluent-wvr`).
+- `DbCapability` — **home is now `fluent-db`** (`fluent_db::capability`, re-exported from `fluent_concurrency::io::db::DbCapability` to keep the module path). Opens a `fluent-db::SqlitePool` (default 5 connections, WAL mode enabled) via `DbCapability::open(path)`. The legacy lossy `query(sql) -> Vec<HashMap<String, String>>` and `execute(sql) -> usize` (all-values-as-strings) are **deprecated*: new code uses the typed `SqlitePool::query_row` / `query_rows` / `execute` helpers. Both still check out a `PooledConnection` (RAII; the connection returns to the pool on `Drop`) and offload the synchronous `rusqlite` work via `spawn_blocking`. Note that `SqlitePool::acquire()` is **gated** like every other effect entry point — it requires a `DbCapability` token in the current task-local and returns `DbError::PermissionDenied` otherwise (no caller behavior change; the token still gates via `fluent-wvr`).
 
 **Helpers** (`capability.rs`):
 
@@ -76,11 +76,11 @@ A `SupervisedBatch` is a `Scope` plus a dependency graph, a typed event sink, re
 - `SupervisedBatch::new(runtime: Arc<dyn Runtime>, caps: CapabilitySet) -> Self` — defaults to `SupervisedBatchConfig::default()`.
 - `SupervisedBatch::new_with_config(runtime, caps, config: SupervisedBatchConfig) -> Self`.
 
-**Configuration** (`batch.rs:49-60`): `SupervisedBatchConfig { poll_budget: usize }` — maximum tasks polled per `SupervisedBatch::poll` invocation. Default `64`. When the budget is exhausted, the zone wakes itself with `cx.waker().wake_by_ref()` to prevent executor starvation.
+**Configuration** (`batch.rs:49-60`): `SupervisedBatchConfig { poll_budget: usize }` — maximum tasks polled per `SupervisedBatch::poll` invocation. Default `64`. When the budget is exhausted, the batch wakes itself with `cx.waker().wake_by_ref()` to prevent executor starvation.
 
 **Registration** (`batch.rs:148-172`):
 
-- `register(unit: Arc<dyn Component>) -> Result<&mut Self, SupervisedBatchError>` — builds a `WorkContext` via `WorkContext::for_unit_in_zone(&self.runtime, &self.caps, |_| {})` and forwards.
+- `register(unit: Arc<dyn Component>) -> Result<&mut Self, SupervisedBatchError>` — builds a `WorkContext` via `WorkContext::for_unit_in_batch(&self.runtime, &self.caps, |_| {})` and forwards.
 - `register_with_context(unit, ctx: WorkContext) -> Result<&mut Self, SupervisedBatchError>` — explicit context.
 - `SupervisedBatchError::DuplicateName(ArcIntern<str>)` — duplicate `name()` rejection. The signature is `Result`, not panicking, so callers can decide.
 
@@ -112,7 +112,7 @@ CancelReason::Aborted
 
 `WorkError` and `WorkOutput` are defined in `fluent-wvr::work` with three error variants: `Execution(String)`, `Dependency(String)`, and `Timeout { duration_ms: u64, unit: String }`. `WorkOutput` carries a `serde_json::Value data` field with `typed`/`typed_infallible`/`data_as`/`data_take` accessors for structured-data round-tripping.
 
-**Summary** (`batch.rs:69-75`): `SupervisedBatchSummary { completed, panicked, failed, cancelled: Vec<SupervisedBatchEvent> }`. The zone `await`s to completion (when all `JoinSet` entries are drained and `active_count == 0`) and yields the summary.
+**Summary** (`batch.rs:69-75`): `SupervisedBatchSummary { completed, panicked, failed, cancelled: Vec<SupervisedBatchEvent> }`. The batch `await`s to completion (when all `JoinSet` entries are drained and `active_count == 0`) and yields the summary.
 
 **Key properties:**
 - A panic in task A does **not** propagate to the parent runtime thread. It is caught as a `JoinError` by the SupervisedBatch.s `poll` loop.
@@ -199,6 +199,20 @@ This is O(log P) for `push` and `pop`, where P is the number of distinct non-zer
 ### 3.7 `CreditFlow` — Chain Backpressure
 
 RabbitMQ's `credit_flow` module throttles publishers end-to-end. Our `CreditFlow` uses explicit message passing between sender and receiver, preserving the exact semantics (`flow.rs:13-98`).
+
+> **Status: compatibility surface (scaffold).** No production caller materializes
+> today. The LLM fan-out paths — coral's `LlmRequestQueue` and the router's
+> escalation team-mode parallel votes — are already bounded by `ResultPool`
+> (a `cap`-and-`queue_capacity`-limited worker pool whose `submit` provides the
+> backpressure), and team-mode's decomposer "subtasks" are counted for audit but
+> not dispatched to a pool, so there is no separate credit-token producer to
+> throttle. The only in-tree `CreditFlow` consumers are `flow.rs`'s own tests in
+> `fluent-concurrency/src/tests/m4.rs` and the unused `MemoryBatch` wrapper in
+> `memory-plugin` (which itself has no caller and whose receiver never calls
+> `recv()`, so it would exhaust and block past `initial` jobs). Keep it as the
+> credit-based backpressure seam for a genuine producer/consumer pipeline unless
+> the throwaway rule (fluent-wvr SKILL §20) is invoked to prune it. Do not
+> present it as load-bearing.
 
 **API**:
 
@@ -313,7 +327,7 @@ pub enum LlmError { Api(String), Http(String), NoResponse, RateLimited }
 
 ### 3.11 `first_accept_in_order` — the First-Ok Ladder (canonical fallback combinator)
 
-**Status: production.** The single first-Ok fallback combinator, lifted out of the router in M4 and now consumed by the router's dispatch chain, backend retry/fallback, and the escalation ladder. Any "try A, then B, then C, take the first success" logic MUST compose this instead of hand-rolling a loop.
+**Status: production.** The single first-Ok fallback combinator, consumed by the router's dispatch chain, backend retry/fallback, and the escalation ladder. Any "try A, then B, then C, take the first success" logic MUST compose this instead of hand-rolling a loop.
 
 **API** (`ladder.rs:38`):
 
@@ -353,7 +367,7 @@ The `fluent-wvr` crate defines `Component`, `WorkUnit`, `FieldAccess`, `Describa
 
 - `WorkContext::default()` — uses `NoopRuntime`; safe for dry-run / init paths but panics on `spawn` if not inside a tokio runtime.
 - `WorkContext::for_unit(unit, caps)` — uses the unit's `default_timeout_ms()` and a default runtime; the right entry point for a single unit.
-- `WorkContext::for_unit_in_zone(zone_rt, zone_caps, |ctx| { ... })` — clones the zone's runtime and caps, then lets the caller mutate; the canonical entry point inside a `SupervisedBatch`.
+- `WorkContext::for_unit_in_batch(batch_rt, batch_caps, |ctx| { ... })` — clones the batch's runtime and caps, then lets the caller mutate; the canonical entry point inside a `SupervisedBatch`.
 
 **Wrappers from `fluent-wvr`**:
 
@@ -387,7 +401,7 @@ with dependency cancellation, whereas the helper is per-call.
 | Result pool per-submit | `oneshot::channel` per submit | One allocation per job; the worker sends the result through the channel. |
 | Priority queue (all same priority) | `VecDeque` fast path | Zero overhead for the common case. |
 | SupervisedBatch dependency lookup | Inverted index `provides_to_dependents: HashMap<asset, Vec<task>>` | O(1) dependent lookup at cancellation time; avoids scanning the full DAG. |
-| SupervisedBatch poll budget | `cx.waker().wake_by_ref()` after N polls | Prevents one zone from starving the executor when many tasks complete in the same wake. |
+| SupervisedBatch poll budget | `cx.waker().wake_by_ref()` after N polls | Prevents one batch from starving the executor when many tasks complete in the same wake. |
 | Capability gating | `HashMap<TypeId, Arc<dyn Any>>` lookup on `CURRENT_CAPS` | `TypeId` is pointer-sized; no string comparison. `name()` is informational only. |
 | Data transformation | Concrete enums + pattern matching | `WorkUnit::execute` is one vtable call per task; inside it, all work is monomorphized. |
 | `Reserve` permit | `AtomicUsize` `fetch_sub`/`fetch_add` | Lock-free, no heap allocation. |

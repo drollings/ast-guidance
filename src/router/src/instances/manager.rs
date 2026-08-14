@@ -581,7 +581,7 @@ pub fn build_instance_managers(
         let weights_bytes = entry
             .weights
             .as_ref()
-            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|p| fluent_wvr::capability::capability_aware_fs::metadata(p).ok())
             .map_or(0, |m| m.len());
         let manager = Arc::new(
             InstanceManager::new(key, client, profiles, config.sidecar.clone())

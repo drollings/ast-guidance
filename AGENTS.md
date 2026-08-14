@@ -102,7 +102,7 @@ src/
     supervisor.rs             LlamaServerSupervisor — spawn/supervise llama-server per model
     dispatch/backend.rs       ChatBackend trait + OpenAi/Retry/Fallback backends
     dispatch/escalation.rs    Ladder (filter → question → team → turnover)
-    ledger.rs, node_store.rs  ContentNode ledger, shared ContentNodeStore, views, M1 scrub
+    ledger.rs, node_store.rs  ContentNode ledger, shared ContentNodeStore, views, scrub
     views.rs, ledger_guard.rs
     dag_session.rs            DependencySession + SessionRegistry (checkpoint/rewind)
     kv_cache.rs               Hot/Cold KV snapshot metadata + fork round-trip

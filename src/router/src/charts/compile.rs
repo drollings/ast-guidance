@@ -22,7 +22,7 @@ use super::binding::{bind_entities, Bindings, Entity};
 use super::{ChartDef, ChartError, ChartRubric, ChartTarget, DepSpec};
 
 /// A compiled chart target: the executable stage plus the metadata the
-/// supervisor needs — the `essential` flag, the acceptance `rubric` (M9),
+/// supervisor needs — the `essential` flag, the acceptance `rubric`,
 /// and the upstream stage ids it reads from.
 ///
 /// Produced by [`compile_chart_stages`]; consumed by the SupervisedBatch supervisor
@@ -35,7 +35,7 @@ pub struct CompiledTarget {
     pub name: String,
     /// `essential` flag — a failed essential target fails the whole chart.
     pub essential: bool,
-    /// Acceptance rubric gating this target's output (M9). `None` = no gate.
+    /// Acceptance rubric gating this target's output. `None` = no gate.
     pub rubric: Option<ChartRubric>,
     /// Upstream chart-target stage ids this target's output depends on.
     pub upstream_ids: Vec<String>,
@@ -161,7 +161,7 @@ pub fn compile_chart_stages(
         }
 
         // Capability asset names this target consumes that the chart's own
-        // targets provide in-graph (D1): the runtime re-bind in the stage
+        // targets provide in-graph: the runtime re-bind in the stage
         // must not fail-closed on these — their input is the upstream
         // target's `stage.{id}.output`, not a context entity.
         let graph_satisfied: Vec<String> = target
@@ -447,7 +447,7 @@ mod tests {
         assert_eq!(order, vec!["t".to_string()]);
     }
 
-    /// End-to-end (M4 — single chart path): `compile_chart_stages` output
+    /// End-to-end (single chart path): `compile_chart_stages` output
     /// feeds `ChartExecutionPlan`, which executes under SupervisedBatch supervision and
     /// yields the compiled order + a completed summary.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

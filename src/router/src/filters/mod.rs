@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{FilterAction, FilterScope};
 
-/// A single regex match with positional info for codeword substitution (M4.2).
+/// A single regex match with positional info for codeword substitution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegexMatch {
     pub pattern_name: String,
@@ -74,7 +74,7 @@ impl FilterContext {
     }
 
     /// The ledger write path: adds the `ContentNodeWrite` scope so the builtin
-    /// PII engine always scrubs durable content (D1).
+    /// PII engine always scrubs durable content.
     pub fn ledger_write(user_message: String) -> Self {
         Self {
             user_message,

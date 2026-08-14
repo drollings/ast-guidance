@@ -1,4 +1,4 @@
-//! Irreversible write-path scrubber for the Content-Node ledger (M1).
+//! Irreversible write-path scrubber for the Content-Node ledger.
 //!
 //! The durable ledger can never cache text matching the builtin filter engine:
 //! every write-path payload is scrubbed through
@@ -8,7 +8,7 @@
 //!
 //! The scrub is **irreversible by design**: `Redact`/`Anonymize` both collapse
 //! to `[REDACTED:<pattern>]` and no codeword map is retained. This is the
-//! `transform` hook's implementation from `crate::views` (M2) — one
+//! `transform` hook's implementation from `crate::views` — one
 //! implementation, two callers.
 //!
 //! The engine is the same `DeterministicFilterEngine` built by

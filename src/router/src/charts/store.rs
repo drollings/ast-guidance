@@ -2,8 +2,7 @@
 //! `yamake_loader` tradition.
 //!
 //! The store is the single owner of the workflow_library index path; the
-//! `index` handle is reserved for M7 retrieval. Minimal store — selection/
-//! retrieval comes in M7.
+//! `index` handle is reserved for retrieval.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -20,23 +19,23 @@ use search_vector::math::{knn_brute_force, try_bytes_to_vec, vec_to_bytes};
 
 use super::{ChartDef, ChartError};
 
-/// Cosine-similarity threshold for the M10 idempotent-upsert near-neighbor
+/// Cosine-similarity threshold for the idempotent-upsert near-neighbor
 /// check: a chart whose embedding is at or above this similarity to an
 /// existing chart *subsumes* it (VISION: update/subsumes, never duplicate).
 /// Router-only constant — promote to `common-core::constants` when a second
 /// consumer appears (Consolidation Contract).
 pub(crate) const CHART_SUBSUME_THRESHOLD: f32 = 0.9;
 
-/// Per-chart runtime health — the M10 staleness/demotion policy.
+/// Per-chart runtime health — the staleness/demotion policy.
 ///
 /// Kept *out* of the persisted `ChartDef` content model: a chart's health is
 /// a runtime property of the store, not a declarative fact about the DAG.
 #[derive(Debug, Clone, Default)]
 pub struct ChartHealth {
-    /// Auto-extracted (M10) and not yet rubric-validated: excluded from
+    /// Auto-extracted and not yet rubric-validated: excluded from
     /// selection until a rubric-validated run clears the flag.
     pub draft: bool,
-    /// Consecutive rubric-gate failures (M9 gate). Reset on any pass.
+    /// Consecutive rubric-gate failures. Reset on any pass.
     pub stale_failures: usize,
     /// Demoted after `CHART_STALE_FAILS` consecutive rubric failures:
     /// excluded from selection, flagged in the audit log. Sticky until the
@@ -44,7 +43,7 @@ pub struct ChartHealth {
     pub demoted: bool,
 }
 
-/// Outcome of an idempotent chart upsert (M10).
+/// Outcome of an idempotent chart upsert.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum UpsertOutcome {
     /// No near neighbor — the chart was stored under its own name (as a
@@ -78,12 +77,12 @@ struct ChartIndex {
 /// In-memory registry of validated charts, backed by JSON files on disk.
 pub struct ChartStore {
     /// Chart name → validated chart. Read-guarded: the store is shared
-    /// (`Arc<ChartStore>`) across the selector and the M10 extraction path,
+    /// (`Arc<ChartStore>`) across the selector and the extraction path,
     /// so runtime upserts go through the lock rather than `&mut self`.
     charts: ConcurrentRegistry<String, ChartDef>,
-    /// Chart name → runtime health (M10 draft/staleness/demotion state).
+    /// Chart name → runtime health (draft/staleness/demotion state).
     health: RwLock<HashMap<String, ChartHealth>>,
-    /// workflow_library HNSW index path handle (M7 retrieval).
+    /// workflow_library HNSW index path handle.
     index: Option<crate::hnsw::HnswIndexHandle>,
     /// Built index (HNSW graph + embedder), if `build_index` succeeded.
     built: RwLock<Option<Arc<ChartIndex>>>,
@@ -104,7 +103,7 @@ impl ChartStore {
     /// - A missing directory yields an empty store (with a `warn!`) — a
     ///   directory is allowed to be absent at boot.
     /// - A present-but-invalid file is a **hard error** — a corrupted
-    ///   library must not half-load (fail fast, decision D3).
+    ///   library must not half-load (fail fast).
     pub fn load_dir(&self, dir: &Path) -> Result<(), ChartError> {
         if !dir.is_dir() {
             tracing::warn!(
@@ -164,11 +163,11 @@ impl ChartStore {
         self.charts.is_empty()
     }
 
-    /// Insert or replace a chart. Used by boot loading and by M10
+    /// Insert or replace a chart. Used by boot loading and by
     /// auto-extraction upsert. Rejects invalid charts (fail fast).
     ///
     /// A plain upsert resets the chart's health: a fresh chart is
-    /// selectable by default (`draft = false`, cleared demotion). The M10
+    /// selectable by default (`draft = false`, cleared demotion). The
     /// extraction path uses [`Self::upsert_idempotent`], which writes a
     /// draft and deduplicates against near neighbors.
     pub fn upsert(&self, chart: ChartDef) -> Result<(), ChartError> {
@@ -181,7 +180,7 @@ impl ChartStore {
         Ok(())
     }
 
-    /// Idempotent upsert for the M10 learning loop.
+    /// Idempotent upsert for the learning loop.
     ///
     /// Before writing, the `workflow_library` index is checked for a
     /// near-neighbor chart (VISION: "update/subsumes it rather than
@@ -235,7 +234,7 @@ impl ChartStore {
         Ok(outcome)
     }
 
-    /// Record one rubric-gate result (M9 gate) for `chart` (M10 staleness).
+    /// Record one rubric-gate result for `chart` (staleness).
     ///
     /// - A **pass** resets the consecutive-failure streak and promotes a
     ///   draft to selectable (the chart "became validated by a rubric run").
@@ -314,7 +313,7 @@ impl ChartStore {
     }
 
     /// Whether `name` is excluded from selection: demoted, or a draft that
-    /// has not yet been rubric-validated (M10).
+    /// has not yet been rubric-validated.
     fn is_excluded_from_selection(&self, name: &str) -> bool {
         lock_read(&self.health)
             .get(name)
@@ -326,14 +325,14 @@ impl ChartStore {
         self.index.as_ref()
     }
 
-    /// `true` if the retrieval index has been built (M7 step 2 can run).
+    /// `true` if the retrieval index has been built.
     pub fn is_index_built(&self) -> bool {
         self.built.read().is_ok_and(|g| g.is_some())
     }
 
     /// All *selectable* charts in a stable (name-sorted) order. Selection
     /// code must not depend on `HashMap` iteration order. Excludes charts
-    /// demoted or still-draft (M10 staleness/draft gate) — demoted and
+    /// demoted or still-draft (staleness/draft gate) — demoted and
     /// unvalidated drafts are "no longer selected".
     pub fn charts_sorted(&self) -> Vec<Arc<ChartDef>> {
         let mut names = self.charts.keys();
@@ -345,7 +344,7 @@ impl ChartStore {
             .collect()
     }
 
-    /// Build the workflow_library retrieval index (M7 step 2).
+    /// Build the workflow_library retrieval index.
     ///
     /// Lazy: with no `index_path` configured this is a no-op. When configured,
     /// one vector per chart is computed over the chart's *document text*
@@ -353,7 +352,7 @@ impl ChartStore {
     /// is rebuilt, and embeddings are upserted into the router-side SQLite
     /// file so repeated boots reuse them (idempotent per chart). Fail-fast:
     /// any embedding error aborts the whole build — a half-built index must
-    /// not serve (decision D3).
+    /// not serve.
     pub fn build_index(&self, embedder: Arc<dyn EmbeddingProvider>) -> Result<(), ChartError> {
         let Some(handle) = self.index.as_ref() else {
             tracing::warn!(
@@ -463,8 +462,8 @@ impl ChartStore {
     }
 
     /// Retrieve the top `k` charts by cosine similarity to the embedded raw
-    /// request (M7 step 2). Returns `(chart name, similarity in [0,1])`
-    /// sorted most-similar first. An unbuilt index yields no candidates.
+    /// request.  Returns `(chart name, similarity in [0,1])` sorted
+    /// most-similar first.  An unbuilt index yields no candidates.
     pub fn search(&self, request: &str, k: usize) -> Result<Vec<(String, f32)>, ChartError> {
         let guard = lock_read(&self.built);
         let Some(index) = guard.as_ref() else {
@@ -507,7 +506,7 @@ impl ChartStore {
         }
         hits.sort_by(|a, b| b.1.total_cmp(&a.1));
         hits.truncate(k);
-        // Never surface demoted or unvalidated-draft charts (M10).
+        // Never surface demoted or unvalidated-draft charts.
         hits.retain(|(name, _)| !self.is_excluded_from_selection(name));
         Ok(hits)
     }
@@ -538,7 +537,7 @@ fn load_cached_embedding(
 }
 
 /// Build the indexed document text for a chart: description + every target's
-/// provides assets + name n-grams. One vector per chart (M7 spec).
+/// provides assets + name n-grams. One vector per chart.
 fn chart_doc_text(chart: &ChartDef) -> String {
     let mut parts: Vec<String> = Vec::new();
     parts.push(chart.description.clone());
@@ -562,7 +561,7 @@ fn name_ngrams(name: &str) -> Vec<String> {
         .collect()
 }
 
-/// Deserialize a chart directly from JSON (used by tests and the M10
+/// Deserialize a chart directly from JSON (used by tests and the
 /// extraction path without going through the filesystem).
 pub fn chart_from_str(json: &str) -> Result<ChartDef, ChartError> {
     let chart: ChartDef = serde_json::from_str(json).map_err(|e| ChartError::Parse {
@@ -707,7 +706,7 @@ mod tests {
         assert_eq!(names, vec!["bug_triage", "draft_doc"]);
     }
 
-    // ── M10: idempotent upsert + draft gate ─────────────────────────────
+    // ── Idempotent upsert + draft gate ─────────────────────────────
 
     fn indexed_store() -> (ChartStore, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -775,7 +774,7 @@ mod tests {
         assert!(store.charts_sorted().iter().any(|c| c.name == "alpha"));
     }
 
-    // ── M10: staleness / demotion policy ────────────────────────────────
+    // ── Staleness / demotion policy ────────────────────────────────
 
     #[test]
     fn record_rubric_result_demotes_after_stale_fails() {

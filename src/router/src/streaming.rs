@@ -8,7 +8,7 @@ use common_core::sync::lock;
 
 use crate::types::RouterChoice;
 
-/// Best-effort stream finalization sink (M5). The streaming backend's task
+/// Best-effort stream finalization sink. The streaming backend's task
 /// writes the assembled answer here once the stream ends; the HTTP handler
 /// waits on it (bounded) and records the content into the ledger + session
 /// step. `finalize` is idempotent in effect — the last writer wins.

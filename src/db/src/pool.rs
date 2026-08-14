@@ -56,7 +56,7 @@ impl PoolConfig {
 }
 
 /// Where the pool's connections point, so a replacement opened after a
-/// health-check failure targets the *same* database (M1).
+/// health-check failure targets the *same* database.
 enum Backing {
     /// A file-backed database (WAL mode).
     File(PathBuf),
@@ -90,7 +90,7 @@ impl SqlitePool {
     /// A literal `:memory:` path is SQLite's *per-connection* private in-memory
     /// database — `config.size` independent empty DBs, so writes vanish across
     /// checkouts. It is routed to the shared-name path so an in-memory pool is
-    /// coherent (M1).
+    /// coherent.
     pub fn open(path: &Path, config: &PoolConfig) -> Result<Self, DbError> {
         if path == Path::new(":memory:") {
             return Self::open_in_memory(config);
@@ -359,7 +359,7 @@ impl SqlitePool {
             .map_err(|e| DbError::Other(format!("blocking database task failed: {e}")))?
     }
 
-    // ── Borrowed-connection helpers (M5.2) ───────────────────────────────
+    // ── Borrowed-connection helpers ───────────────────────────────
     //
     // The async helpers above box each parameter as
     // `Box<dyn ToSql + Send + Sync>` so an owned `IntoIterator` can cross the
@@ -513,7 +513,7 @@ mod tests {
 
     #[tokio::test]
     async fn poisoned_idle_connections_mutex_still_serves_acquire() {
-        // M2.1: the pool's idle-connections lock must recover from poison via
+        // The pool's idle-connections lock must recover from poison via
         // `common_core::sync::lock`, mirroring `store.rs::poison_recovery_via_lock`.
         // A panic while holding a guard obtained via `.lock().unwrap()` poisons
         // the mutex; a subsequent `acquire` must still serve a usable connection.
@@ -552,7 +552,7 @@ mod tests {
 
     #[tokio::test]
     async fn acquire_requires_db_capability() {
-        // M3.1: the raw-acquire path is gated like every other effect entry
+        // The raw-acquire path is gated like every other effect entry
         // point — a pool held without a `DbCapability` token must be denied.
         let pool = pool();
         let err = match pool.acquire().await {
@@ -807,7 +807,7 @@ mod tests {
             .await;
     }
 
-    // ── Borrowed-connection helpers (M5.2) ───────────────────────────────
+    // ── Borrowed-connection helpers ───────────────────────────────
 
     #[tokio::test]
     async fn borrowed_helpers_match_async_helpers_without_boxing() {
@@ -914,7 +914,7 @@ mod tests {
         assert_eq!(val, None);
     }
 
-    // ── M1: in-memory pool isolation ─────────────────────────────────────
+    // ── In-memory pool isolation ─────────────────────────────────────
 
     #[tokio::test]
     async fn in_memory_pool_concurrent_visibility() {

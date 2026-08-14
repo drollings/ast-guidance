@@ -207,7 +207,7 @@ impl super::Library {
         if query_vec.is_empty() {
             return Ok(Vec::new());
         }
-        // M8.1: the row scan is hard-capped at MAX_KNN_CANDIDATES so a large
+        // The row scan is hard-capped at MAX_KNN_CANDIDATES so a large
         // table can never be fully scanned. When the embedded-node count
         // exceeds the cap, the approximate HNSW index is the primary query
         // path; only fall back to the capped brute-force scan when no HNSW
@@ -281,7 +281,7 @@ impl super::Library {
         let keyword_results = self.keyword_search(query)?;
 
         let vector_results = if let Some(vec) = query_vec {
-            // M8.3: merge (do not discard) partial HNSW hits with the
+            // Merge (do not discard) partial HNSW hits with the
             // brute-force hits, dedup by node id keeping the best score,
             // then fill to `k`. The HNSW hits are never thrown away when the
             // index recall is below `k`.
@@ -312,7 +312,7 @@ impl super::Library {
             Vec::new()
         };
 
-        // Generic ranked fusion over `(id, item)` pairs (M7) — replaces the
+        // Generic ranked fusion over `(id, item)` pairs — replaces the
         // inline RRF; dedup + truncation semantics unchanged.
         let fused: Vec<(f64, KnnHit)> = fluent_db::vector::rrf_merge(
             keyword_results

@@ -36,7 +36,7 @@ pub struct ClassificationEngine {
     limiter: Arc<Limiter>,
     /// Coherence threshold for classifier nodes that don't set their own.
     default_coherence_threshold: f64,
-    /// The M3 target-matching ladder, shared with the flat classifier path
+    /// The target-matching ladder, shared with the flat classifier path
     /// (DRY — one climbing implementation). `Some` (pipeline `target_match:
     /// "self_assess"`) resolves terminals with 2+ member groups through
     /// per-candidate self-assessment; `None` keeps the static

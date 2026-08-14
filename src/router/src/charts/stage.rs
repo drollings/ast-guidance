@@ -5,7 +5,7 @@
 //! It mirrors `ClassifierStage` (same shape: `name`, `Arc<dyn ChatBackend>`,
 //! `Arc<Limiter>`, `depends`/`provides` as `ArcIntern<str>`,
 //! `impl_component!`) but keeps `execute` synchronous and non-blocking —
-//! timeout/retry/cancellation belong to the SupervisedBatch supervisor (M9).
+//! timeout/retry/cancellation belong to the SupervisedBatch supervisor.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -58,7 +58,7 @@ pub struct ChartPromptStage {
     /// self-provided target name, deduplicated).
     provides: Vec<ArcIntern<str>>,
     /// Capability dep names this target consumes that the chart's own
-    /// targets provide in-graph (D1). The runtime re-bind must not
+    /// targets provide in-graph. The runtime re-bind must not
     /// fail-closed on these — their input is an upstream target's
     /// `stage.{id}.output`, not a context entity.
     graph_satisfied: Vec<String>,
@@ -128,10 +128,10 @@ impl WorkUnit for ChartPromptStage {
         let entities = parse_entities_from_ctx(ctx);
         let bindings = bind_entities(&self.depends_specs, &entities);
 
-        // Compile (M5) already guarantees a fully-bound chart, but execution
+        // Compile already guarantees a fully-bound chart, but execution
         // re-binds in case the ctx entities differ from compile time. Failing
         // closed here beats rendering a prompt with missing inputs. A
-        // capability satisfied by an in-graph upstream is *not* a gap (D1) —
+        // capability satisfied by an in-graph upstream is *not* a gap —
         // its input arrives via `stage.{id}.output`, so only deps that still
         // need runtime context after excluding graph-satisfied capabilities
         // trigger the fail-closed path.
@@ -461,7 +461,7 @@ mod tests {
     #[test]
     fn unmatched_capability_dep_fails_closed() {
         // A capability dep with no in-graph provider and no matching entity
-        // at runtime fails closed (D1) — the stage must not render without
+        // at runtime fails closed — the stage must not render without
         // the capability's input.
         let backend = StubChatBackend::always(r#"{"x": 1}"#);
         let stage = ChartPromptStage::new(
@@ -490,7 +490,7 @@ mod tests {
     fn graph_satisfied_capability_does_not_fail_closed() {
         // A capability dep satisfied by an in-graph upstream is bound by the
         // graph, not by context entities — the runtime re-bind must not
-        // fail-closed on it even when no entity provides it (D1).
+        // fail-closed on it even when no entity provides it.
         let backend = StubChatBackend::always(r#"{"plan": "minimal repro"}"#);
         let stage = ChartPromptStage::new(
             Arc::new(backend),

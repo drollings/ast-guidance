@@ -1,7 +1,7 @@
 //! Frontier escalation ladder — VISION §"The escalation ladder".
 //!
 //!  `EscalationMode` is the canonical taxonomy of frontier-engagement
-//! stages (decision D8 — replaces the old `FrontierMode` "four involvement
+//! stages (replaces the old `FrontierMode` "four involvement
 //! modes" enum, which never matched the VISION ladder).  Stages are tried
 //! in order (filter → question → team → turnover) after every local model
 //! in a `model_group` fails.  The ladder *runtime* lives in

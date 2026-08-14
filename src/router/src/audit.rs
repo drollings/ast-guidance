@@ -2,7 +2,7 @@
 //!
 //! The audit layer (`logging::audit_layer`) subscribes to a single `tracing`
 //! target, [`AUDIT_TARGET`], and every audit producer — chart target runs,
-//! filter verdicts, route decisions, dispatch attempts, and (M3)
+//! filter verdicts, route decisions, dispatch attempts, and
 //! escalation-ladder interactions — emits through [`emit`] into it. Audit
 //! *kinds* are distinguished by the `kind` structured field, never by a second
 //! dot-namespace (the `router.charts.audit` target predates this module and is

@@ -1,5 +1,5 @@
 //! ContentNodeStore — the shared, reference-counted, interned, durable ContentNode
-//! store (M4).
+//! store.
 //!
 //! This is the surgical successor to `ContentNodeLedger`'s per-process
 //! `SqliteStore`+`Mutex<i64>` storage: nodes live once, behind
@@ -59,7 +59,7 @@ pub struct ContentNodeStore {
     /// can be attached after the store is `Arc`-shared
     /// (`ContentNodeLedger::with_summarizer`).
     summarizer: Mutex<Option<Summarizer>>,
-    /// Optional tier-event feed (M2): a sender the background
+    /// Optional tier-event feed: a sender the background
     /// `LedgerTierWorker` drains to fill LOD4/LOD5. `None` (the default) leaves
     /// today's behavior — a store with no attached worker is byte-identical to
     /// before. `Mutex` for interior mutability so it can be attached after the
@@ -132,7 +132,7 @@ impl ContentNodeStore {
         *lock(&self.summarizer) = Some(summarizer);
     }
 
-    /// Attach a tier-event sender (M2). When set, the canonical write paths
+    /// Attach a tier-event sender. When set, the canonical write paths
     /// (`insert_node`, `record_result`) enqueue any node whose LOD4/LOD5 is
     /// empty so the background `LedgerTierWorker` can fill them. A store with
     /// no sender keeps today's behavior (opt-in).
@@ -162,7 +162,7 @@ impl ContentNodeStore {
         })
     }
 
-    /// All node ids whose given tiers are empty (M2 boot backfill / worker).
+    /// All node ids whose given tiers are empty (boot backfill / worker).
     /// Iterates the interned session index for the id list (no full node-scan
     /// Arc clones), then checks each node's tiers under a short read guard.
     pub fn node_ids_needing_tier(&self, levels: &[u8]) -> Vec<NodeId> {
@@ -194,7 +194,7 @@ impl ContentNodeStore {
     }
 
     /// Load every persisted row into the maps, seeding `next_id` from
-    /// `MAX(node_id) + 1` (pre-existing restart-collision bug fix, M4).
+    /// `MAX(node_id) + 1` (pre-existing restart-collision bug fix).
     fn hydrate(&self) -> Result<(), LedgerError> {
         let Some(ref store) = self.durable else {
             return Ok(());
@@ -449,7 +449,7 @@ impl ContentNodeStore {
 
     /// Apply a mutation to the shared node and persist both the shared node and
     /// the `content_json` column. The single place that keeps the views in
-    /// sync. `pub(crate)` so the background `LedgerTierWorker` (M2) writes
+    /// sync. `pub(crate)` so the background `LedgerTierWorker` writes
     /// derived tiers through the same canonical path.
     pub(crate) fn with_node_mut<F>(&self, node_id: NodeId, f: F) -> Result<ContentNode, LedgerError>
     where
@@ -545,7 +545,7 @@ impl ContentNodeStore {
     }
 
     /// Read a single LOD tier's text — the **only** method through which a
-    /// view's text leaves the store (M2, D4). Eager tiers (LOD0/LOD5) are
+    /// view's text leaves the store. Eager tiers (LOD0/LOD5) are
     /// returned directly; lazy tiers (LOD1–LOD4) are derived on demand via
     /// `ensure_tier` and then re-read. A read guard is held only long enough
     /// to copy the string out.
@@ -798,7 +798,7 @@ pub(crate) fn new_node(
 
 /// Deterministic, LLM-free LOD5 label (short descriptor), derived eagerly at
 /// node creation. Falls back to the role when no content survives truncation.
-/// `pub(crate)` so the background `LedgerTierWorker` (M2) can use it as the
+/// `pub(crate)` so the background `LedgerTierWorker` can use it as the
 /// no-model fallback for LOD5.
 pub(crate) fn derive_label(role: &str, content: &str) -> String {
     let sentence = common_core::string::first_sentence(content);

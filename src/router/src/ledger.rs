@@ -1,7 +1,7 @@
-//! Full-detail content ledger with LOD compaction (decision D6).
+//! Full-detail content ledger with LOD compaction.
 //!
 //! `ContentNodeLedger` is now a **thin facade** over the shared
-//! `ContentNodeStore` (M4): the durable, per-session store of `ContentNode`s (the
+//! `ContentNodeStore`: the durable, per-session store of `ContentNode`s (the
 //! canonical `fluent_types::ContentNode`) lives in `crate::node_store`, where
 //! nodes are shared behind `Arc<RwLock<ContentNode>>` with interned
 //! session/role index keys and a durable `content_json` column. The facade
@@ -10,14 +10,15 @@
 //! `ensure_lod`, `compact_session`, `collapse_node`) signature-identical and
 //! delegates to the store.
 //!
-//! The facade also owns the **write-path guard** (M1, decision D1): every
-//! write delegate scrubs its text through `crate::ledger_guard::scrub_for_ledger`
-//! before reaching `ContentNodeStore`, so the durable ledger can never cache text
-//! matching the builtin filter engine (on by default, no config flag). The
-//! scrub is irreversible. `ContentNodeStore` itself stays policy-free; the only
-//! documented bypass is the `KnowledgeCapability` impl directly on `ContentNodeStore`
-//! (`crate::knowledge`), which is a trait-object boundary that cannot route
-//! through the facade — production server writes all flow through here.
+//!  The facade also owns the **write-path guard**: every write delegate
+//! scrubs its text through `crate::ledger_guard::scrub_for_ledger` before
+//! reaching `ContentNodeStore`, so the durable ledger can never cache text
+//! matching the builtin filter engine (on by default, no config flag).  The
+//! scrub is irreversible.  `ContentNodeStore` itself stays policy-free; the
+//! only documented bypass is the `KnowledgeCapability` impl directly on
+//! `ContentNodeStore` (`crate::knowledge`), which is a trait-object
+//! boundary that cannot route through the facade — production server writes
+//! all flow through here.
 //!
 //! The LOD lifecycle is owned by the store:
 //!
@@ -56,7 +57,7 @@ use crate::summarization::Summarizer;
 use crate::views::LedgerView;
 use crate::views::{Lod, ParallelLedger};
 
-/// Node-construction helper moved to `ContentNodeStore` (M4). Re-exported here so the
+/// Node-construction helper moved to `ContentNodeStore`. Re-exported here so the
 /// facade's tests keep compiling unchanged.
 #[cfg(test)]
 pub(crate) use crate::node_store::new_node;
@@ -105,7 +106,7 @@ pub struct LedgerEntry {
 }
 
 /// The durable, per-session store of `ContentNode`s — a thin facade over the
-/// shared `Arc<ContentNodeStore>` (M4). Every method delegates; the exact public
+/// shared `Arc<ContentNodeStore>`. Every method delegates; the exact public
 /// surface is preserved so the server (`ServerDeps.ledger`) is untouched.
 pub struct ContentNodeLedger {
     store: Arc<ContentNodeStore>,
@@ -141,7 +142,7 @@ impl ContentNodeLedger {
     /// Record a user request as a new node. LOD0 (full text) and LOD5 (label)
     /// are written eagerly; LOD1–LOD4 stay empty until derived lazily.
     ///
-    /// The write-path guard (M1) scrubs `content` against the builtin filter
+    /// The write-path guard scrubs `content` against the builtin filter
     /// engine before persisting; flagged writes emit an audit record.
     pub fn record_request(
         &self,
@@ -160,7 +161,7 @@ impl ContentNodeLedger {
     /// score, and final content. Keeps the flat projection and the
     /// `content_json` node in sync (LOD0/LOD5 are recomputed eagerly).
     ///
-    /// The write-path guard (M1) scrubs `content` before persisting.
+    /// The write-path guard scrubs `content` before persisting.
     pub fn record_result(
         &self,
         node_id: NodeId,
@@ -178,7 +179,7 @@ impl ContentNodeLedger {
     /// Persist an arbitrary origin-typed `ContentNode`. LOD0/LOD5 are
     /// guaranteed present (derived from the node's text when missing).
     ///
-    /// The write-path guard (M1) scrubs the node's LOD0 text and clears LOD5
+    /// The write-path guard scrubs the node's LOD0 text and clears LOD5
     /// so the store re-derives the label from the scrubbed text.
     pub fn record_content_node(&self, node: &ContentNode) -> Result<NodeId, LedgerError> {
         let mut node = node.clone();
@@ -231,7 +232,7 @@ impl ContentNodeLedger {
     /// the shared store).
     ///
     /// Returns `None` if the node is absent. The pre-LOD flat-column hydration
-    /// fallback was retired (M5.7): the canonical read path is single-format.
+    /// fallback was retired: the canonical read path is single-format.
     pub fn get_node(&self, node_id: NodeId) -> Option<ContentNode> {
         self.store.snapshot(node_id)
     }
@@ -253,7 +254,7 @@ impl ContentNodeLedger {
         self.store.get_session_entries(session_id, limit)
     }
 
-    /// Render a session through a `ParallelLedger` at `default_lod` (M2). The
+    /// Render a session through a `ParallelLedger` at `default_lod`. The
     /// view's single `render()` exit. A compacted (collapsed) node renders its
     /// collapsed LOD0 — compaction mutates LOD0, so the view's fidelity policy
     /// never "defeats" compaction.
@@ -271,7 +272,7 @@ impl ContentNodeLedger {
     }
 }
 
-/// Emit the M1 write-path audit record: a builtin-filter match flagged on a
+/// Emit the write-path audit record: a builtin-filter match flagged on a
 /// durable ledger write.
 fn emit_write_audit(pattern: Option<&str>) {
     crate::audit::emit(
@@ -284,7 +285,7 @@ fn emit_write_audit(pattern: Option<&str>) {
     );
 }
 
-/// Versioned ledger schema lifecycle (fluent_db::migrate, M6.2).
+/// Versioned ledger schema lifecycle (fluent_db::migrate).
 ///
 /// One migration per schema step: the base table + session index, then the
 /// three LOD-era columns (`label`, `lod`, `content_json`) that pre-LOD
@@ -387,7 +388,7 @@ impl Migration for LedgerContentJsonColumn {
 
 // ── LOD compaction policy ─────────────────────────────────────────────────
 //
-// Moved here from the deleted standalone `compaction.rs` (D6): compaction is
+// Moved here from the deleted standalone `compaction.rs`: compaction is
 // ledger responsibility — it demotes older session nodes to lower detail
 // levels to stay within context budget. The interface is a trait so smarter
 // policies can be plugged in later.
@@ -473,7 +474,7 @@ mod tests {
         // Simulate a migrated pre-LOD row: the flat projection is populated
         // but `content_json` is still the '{}' placeholder. The canonical
         // read (`get_node`) must return `None` — the dual-format hydration
-        // fallback is retired (M5.7); only `get_session_entries` (the flat
+        // fallback is retired; only `get_session_entries` (the flat
         // audit view) reads columns directly. The row is inserted after
         // hydration, so the in-memory maps never see it.
         let store = ledger.node_store().durable().unwrap();
@@ -696,7 +697,7 @@ mod tests {
             .collect()
     }
 
-    // ── M1 write-path guard (facade scrub) ────────────────────────────────
+    // ── Write-path guard (facade scrub) ────────────────────────────────
 
     #[test]
     fn record_request_scrubs_email_and_emits_audit() {

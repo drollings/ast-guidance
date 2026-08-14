@@ -1,5 +1,6 @@
 //! fluent-dag: DAG executor with resolver, middleware, adapter, and work unit
 //! abstractions. Orchestrates dependency-driven workflow execution.
+#![forbid(unsafe_code)]
 
 pub mod adapter;
 pub(crate) mod closure;

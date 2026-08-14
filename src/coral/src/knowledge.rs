@@ -1,4 +1,4 @@
-//! `KnowledgeCapability` implementation for coral-context's `Library` (M4E).
+//! `KnowledgeCapability` implementation for coral-context's `Library`.
 //!
 //! This is the agreed cross-crate boundary: the router can read coral's Context
 //! through `fluent_types::KnowledgeCapability` without importing coral (and

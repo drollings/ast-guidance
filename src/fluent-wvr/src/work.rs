@@ -276,14 +276,14 @@ impl WorkContext {
     ///
     /// For batched registration of identical contexts, construct one `WorkContext`
     /// and reuse it with `register_with_context` directly.
-    pub fn for_unit_in_zone(
-        zone_rt: &Arc<dyn Runtime>,
-        zone_caps: &CapabilitySet,
+    pub fn for_unit_in_batch(
+        batch_rt: &Arc<dyn Runtime>,
+        batch_caps: &CapabilitySet,
         mutate: impl FnOnce(&mut WorkContext),
     ) -> Self {
         let mut ctx = WorkContext {
-            rt: Arc::clone(zone_rt),
-            caps: zone_caps.clone(),
+            rt: Arc::clone(batch_rt),
+            caps: batch_caps.clone(),
             ..WorkContext::default()
         };
         mutate(&mut ctx);

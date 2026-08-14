@@ -16,7 +16,7 @@ pub(crate) struct ClosureCtx<'a> {
 ///
 /// For each required capability:
 ///   - skip if `satisfied` contains it (NarrowOne durability guard);
-///   - skip providers in `rejected` (narrowing losers — the M2.4 bug fix);
+///   - skip providers in `rejected` (narrowing losers;
 ///   - 0 providers → implicit name fallback (NarrowOne only: a target whose
 ///     name matches the capability name), else strict-error or skip;
 ///   - N providers → push all non-rejected, non-visited providers.

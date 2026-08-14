@@ -479,7 +479,7 @@ impl TierRegistry {
         }
 
         let output = self.cascade.execute_first_ok(&ctx)?;
-        // M8.4: exactly one deserialize hop — the tier serialized once via
+        // Exactly one deserialize hop — the tier serialized once via
         // `WorkOutput::typed`, this consumes it back.
         output
             .data_take::<RoutingResult>()
@@ -513,7 +513,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_l5_frontier_unit_with_queue_routes_through_pool() {
-        // M9: when a shared `LlmRequestQueue` is attached, frontier calls flow
+        // When a shared `LlmRequestQueue` is attached, frontier calls flow
         // through the worker pool (`default_handler` HTTP transport) instead of
         // unbounded direct HTTP. An unreachable endpoint surfaces an error from
         // the queue, proving the wiring exists end-to-end.

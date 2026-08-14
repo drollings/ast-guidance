@@ -174,7 +174,7 @@ std.log.info("explain cache: {d} hits, {d} misses", .{stats.hits, stats.misses})
 
 ## Iteration Profiling
 
-M10 adds per-iteration profiling with `IterationProfile`:
+Adds per-iteration profiling with `IterationProfile`:
 
 ```zig
 pub const IterationProfile = struct {

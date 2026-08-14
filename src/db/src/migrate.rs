@@ -1,4 +1,4 @@
-//! Idempotent schema migrations (M3.2).
+//! Idempotent schema migrations.
 //!
 //! Generalizes the ad-hoc `ensure_column` sequences that consumers hand-roll
 //! (e.g. `router/src/ledger.rs:636-641` and the holographic store's inline

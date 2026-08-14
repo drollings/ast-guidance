@@ -93,7 +93,7 @@ decision before propagating).
 
 The classifier stage has two modes. Flat mode performs a single LLM call that
 returns structured JSON — a direct response, a rejection, or a `RoutingTarget`.
-Tree mode wraps the M4 `ClassificationEngine` (`stages/tree.rs`): when a
+Tree mode wraps the `ClassificationEngine` (`stages/tree.rs`): when a
 classification tree is configured (`config/classification.rs`), the engine
 evaluates the nested tree recursively — filter nodes (hard_reject /
 soft_redirect / output_filter), classifier nodes (auto-built prompt, three-axis
@@ -117,7 +117,7 @@ impl Describable for DeterministicPreFilter { … }
 impl_component!(DeterministicPreFilter);
 ```
 
-**Typed handoff (M5.4).** The two known stages implement
+**Typed handoff.** The two known stages implement
 `StageDecisionProducer` (`pipeline_types.rs`); the orchestrator downcasts via
 `component_downcast_ref` and calls `evaluate(ctx, prior)` directly — a typed
 call that removes the per-stage `StageDecision` serialize→deserialize through
@@ -146,7 +146,7 @@ exactly once and published to the same typed store.
 | File | Role |
 |------|------|
 | `stages/deterministic.rs` | `DeterministicPreFilter` — delegates to `DeterministicFilterEngine`; slash-command dispatch (`/help`, `/stats`, `/checkpoint`) |
-| `stages/classifier.rs` | `ClassifierStage` — single LLM call (flat) or the M4 `ClassificationEngine` (tree); emits direct response / routing target / rejection; builds the `RoutingTarget`; enforces route-level `always_route` (override `action=respond` → `route`) and auto-generates the "Dispatch rules" section of the system prompt from routes marked `always_route` |
+| `stages/classifier.rs` | `ClassifierStage` — single LLM call (flat) or the `ClassificationEngine` (tree); emits direct response / routing target / rejection; builds the `RoutingTarget`; enforces route-level `always_route` (override `action=respond` → `route`) and auto-generates the "Dispatch rules" section of the system prompt from routes marked `always_route` |
 | `stages/tree.rs` | `ClassificationEngine` — recursive nested-tree evaluation; filter / classifier / terminal / fallback nodes; `tree_path` audit trail; `kind = "tree_node"` records |
 | `stages/common.rs` | Shared stage helpers — `extract_user_message()`, `get_metadata_string()`, JSON-field ensure helpers |
 | `stages/retry_classifier.rs` | `RetryClassifier` — retry-with-backoff decorator over the classifier stage (opt-in behind `classifier_retry_max`) |
@@ -175,19 +175,19 @@ exactly once and published to the same typed store.
 |------|------|
 | `session.rs` | Thin shim — re-exports `StepStatus` from `fluent-types` (the canonical session node schema is `fluent_types::ContentNode`) |
 | `dag_session.rs` | `DependencySession` — DAG-based session composing `fluent_dag::dep_graph::DependencyGraph<String>` for step tracking, checkpoint/rewind, real KV-cache snapshot restore (model/adapter/session keyed), frontier-ownership flag; `SessionRegistry` — the canonical server-side session home (D6), per-`session_id`, shared `SnapshotStore`, retained for process lifetime |
-| `ledger.rs` | `ContentNodeLedger` — **thin facade** over the shared `ContentNodeStore` (M4); owns the LOD lifecycle (LOD0/LOD5 eager, LOD1–4 lazy from LOD0 via `Summarizer`, at most once); `CompactionStrategy` / `RecencyCompaction` (folded in from the deleted `compaction.rs`); routes all writes through the M1 write-path scrub |
-| `node_store.rs` | `ContentNodeStore` (M4) — the shared store: nodes behind `Arc<RwLock<ContentNode>>`, interned `ArcIntern<str>` session/role index keys, durable `content_json` hydration (seeded `next_id` from `MAX(node_id)`), `ensure_tier` / `lod_text` / `session_node_ids` render primitives, `knn_brute_force` |
-| `ledger_guard.rs` | `scrub_for_ledger` (M1) — the irreversible write-path scrubber, decision D1; Redact/Anonymize collapse to `[REDACTED:<pattern>]`, no codeword map retained; uses the builtin filter engine with the `ContentNodeWrite` scope |
-| `views.rs` | `LedgerView` (M2) — the reference-only view layer over `ContentNodeStore`; `Lod` (0..=5), `ParallelLedger` (one store, N views), `FilteredLedger<V>` (exclusion set + render transform); `render()` is the single text-exit; rendering degrades to LOD0 when a lazy tier is un-derivable |
-| `knowledge.rs` | `KnowledgeCapability` impl on `ContentNodeStore` (M4D) behind the `RouterKnowledgeCapability` token — the cross-crate read path for embedded consumers |
+| `ledger.rs` | `ContentNodeLedger` — **thin facade** over the shared `ContentNodeStore`; owns the LOD lifecycle (LOD0/LOD5 eager, LOD1–4 lazy from LOD0 via `Summarizer`, at most once); `CompactionStrategy` / `RecencyCompaction` (folded in from the deleted `compaction.rs`); routes all writes through the write-path scrub |
+| `node_store.rs` | `ContentNodeStore` — the shared store: nodes behind `Arc<RwLock<ContentNode>>`, interned `ArcIntern<str>` session/role index keys, durable `content_json` hydration (seeded `next_id` from `MAX(node_id)`), `ensure_tier` / `lod_text` / `session_node_ids` render primitives, `knn_brute_force` |
+| `ledger_guard.rs` | `scrub_for_ledger` — the irreversible write-path scrubber, decision D1; Redact/Anonymize collapse to `[REDACTED:<pattern>]`, no codeword map retained; uses the builtin filter engine with the `ContentNodeWrite` scope |
+| `views.rs` | `LedgerView` — the reference-only view layer over `ContentNodeStore`; `Lod` (0..=5), `ParallelLedger` (one store, N views), `FilteredLedger<V>` (exclusion set + render transform); `render()` is the single text-exit; rendering degrades to LOD0 when a lazy tier is un-derivable |
+| `knowledge.rs` | `KnowledgeCapability` impl on `ContentNodeStore` behind the `RouterKnowledgeCapability` token — the cross-crate read path for embedded consumers |
 
 ### Routes
 
 | File | Role |
 |------|------|
-| `routes/plan.rs` | `PlanRoute` (M7/M8) — boot-loaded `ChartStore` + `ChartSelector`; Exact → server-side chart compile+execute under `SupervisedBatch` supervision; Partial → one-round targeted interview (≤ `CHART_MAX_INTERVIEW_QUESTIONS`); Mismatch → fresh draft; `workflow_extractor` hook for the dispatch learning loop |
-| `routes/rigor.rs` | `RigorRoute` (M3) — fixed-pass blue/red/judge protocol; real `DependencySession` checkpoint (`rigor.blue`) + `rewind_to_checkpoint` on a material rejection; red team reads through `FilteredLedger` at `Lod::LOD0` (dead ends excluded); final rejection resolves to a targeted interview (≤ 3 questions), frontier escalation only on low judge confidence; `/v1/rigor` is present-but-unconfigured when no backends are attached (explicit error, never a crash) |
-| `charts/` | Chart (DAG workflow) library — `store` (`ChartStore`), `binding` (`Entity`, `ENTITIES_META_KEY`), `compile`, `execute` (under `Limiter` + SupervisedBatch), `render`, `rubric`, `select` (`ChartSelector`, `ChartFit`), `extract` (`WorkflowExtractor`) — the M6–M10 workflow engine consumed by `PlanRoute` and the dispatch learning loop |
+| `routes/plan.rs` | `PlanRoute` — boot-loaded `ChartStore` + `ChartSelector`; Exact → server-side chart compile+execute under `SupervisedBatch` supervision; Partial → one-round targeted interview (≤ `CHART_MAX_INTERVIEW_QUESTIONS`); Mismatch → fresh draft; `workflow_extractor` hook for the dispatch learning loop |
+| `routes/rigor.rs` | `RigorRoute` — fixed-pass blue/red/judge protocol; real `DependencySession` checkpoint (`rigor.blue`) + `rewind_to_checkpoint` on a material rejection; red team reads through `FilteredLedger` at `Lod::LOD0` (dead ends excluded); final rejection resolves to a targeted interview (≤ 3 questions), frontier escalation only on low judge confidence; `/v1/rigor` is present-but-unconfigured when no backends are attached (explicit error, never a crash) |
+| `charts/` | Chart (DAG workflow) library — `store` (`ChartStore`), `binding` (`Entity`, `ENTITIES_META_KEY`), `compile`, `execute` (under `Limiter` + SupervisedBatch), `render`, `rubric`, `select` (`ChartSelector`, `ChartFit`), `extract` (`WorkflowExtractor`) — the workflow engine consumed by `PlanRoute` and the dispatch learning loop |
 
 ### Infrastructure
 
@@ -196,7 +196,7 @@ exactly once and published to the same typed store.
 | `server.rs` | `RouterServer` (`WorkUnit`) — hyper HTTP/1.1 accept loop on tokio; assembles `ServerDeps` and fans out to the `server/` submodule; `serve_http` is `pub(crate)` for integration tests; runs each `InstanceManager`'s boot reconcile + residency task from the attached `InstancePool` |
 | `server/handler.rs` | HTTP routing + request orchestration; `ServerDeps` (the collapsed former 12-`Option` dependency bundle): pipelines, routes, models, stats, cache, ledger, plan/rigor routes, sessions, ladders, context_cache, mock_dispatch, http_client, `instance_pool`, `api_key_env_name`. Merges query-string routing fields into the body, resolves the model-id grammar (`<model_id>[:<instance|group|latest>]`) in `resolve_pipeline`, and routes the management/model-less endpoints |
 | `server/instances_api.rs` | The public `/instances` management facade: aggregate envelope across models, `POST /instances`, per-instance ops (delete/pin/unpin/resume/no-resume/resize/snapshot), `/memory` compat reshape, `/v1/models`, `/props`, model-less proxies (`/tokenize`, `/detokenize`, `/apply-template`, `/control`); management API-key enforcement; query parse/percent-decode helpers |
-| `server/dispatch.rs` | `handle_dispatch` / `dispatch_real` — primary + `fallbacks` chain through `ChatBackend` (each wrapped in `RetryBackend`), short-circuit on non-retryable errors, response cache read/write, M10 workflow extraction, allocate-on-503 via the `InstancePool` |
+| `server/dispatch.rs` | `handle_dispatch` / `dispatch_real` — primary + `fallbacks` chain through `ChatBackend` (each wrapped in `RetryBackend`), short-circuit on non-retryable errors, response cache read/write, workflow extraction, allocate-on-503 via the `InstancePool` |
 | `server/responses.rs` | OpenAI-completion response builders, SSE/CORS headers, `ServerStats` counters |
 | `streaming.rs` | `StreamingHandler` — SSE delta formatting for OpenAI-compatible streaming chunks; cross-chunk think-block filtering via `StreamingThinkFilter` |
 | `kv_cache.rs` | Two-tier: `HotSnapshotIndex` (RAM LRU over `common_core::cache::LoadCache`, metadata only) + `ColdSnapshotIndex` (disk tree `model/adapter/session`); `SnapshotStore` composes both; the router never reads/writes raw KV bytes — it manages filesystem layout + sidecar metadata for llama.cpp slot save/restore |
@@ -210,7 +210,7 @@ exactly once and published to the same typed store.
 | `logging.rs` | Two-stream `tracing` subscriber: operational JSON/console rolling file + the durable audit stream (separate retention, always JSON, gated on `router.audit=info`) |
 | `frontier/modes.rs` | `EscalationMode` ladder taxonomy — `Filter`, `Question`, `Team`, `Turnover` (D8; the old `FrontierMode` enum is gone), serde snake_case; `FrontierResult` and `AuditEntry`. Taxonomy and audit types only — the runtime lives in `dispatch/escalation.rs` |
 | `hnsw.rs` | `HnswIndexHandle` — the single HNSW index handle type for the chart store's brute-force / `knn_brute_force` fallback |
-| `transforms/` | `TransformStrategy` trait + `rewrite_text_messages` shared helper (M7.5/D9): `NoTransform`, `PiiAnonymize`, `DecomposeToAnonymizedHypothetical`, `DecomposeToSubtasks`, `CodewordAnonymizer`, `Sanitize`, `SecretMask` |
+| `transforms/` | `TransformStrategy` trait + `rewrite_text_messages` shared helper: `NoTransform`, `PiiAnonymize`, `DecomposeToAnonymizedHypothetical`, `DecomposeToSubtasks`, `CodewordAnonymizer`, `Sanitize`, `SecretMask` |
 | `testing/` | `TranscriptProvider`, `MockTranscriptEntry`, `MockDispatchContext` — transcript-driven integration-test harness for E2E and golden tests |
 | `test_stubs.rs` | `StubChatBackend`, `HashEmbedder` — test-only backends (cfg(test)) |
 
@@ -274,7 +274,7 @@ ladder: `DispatchError` + `is_retryable`, `OpenAiBackend` (whose
 `parse_response` is reused by `OpenAiChatBackend`), the `Anthropic`
 Messages-API helpers, and `StreamEvent`. The old `DispatchBackend` trait,
 `LlmDispatcher`, `ProviderConfig`, and `OpenAiCompatBackend` were deleted by
-the M3 dispatch collapse (D4).
+the dispatch collapse (D4).
 
 ### Filter engine architecture (`filters/`)
 
@@ -298,7 +298,7 @@ in order, returning the first non-`None` decision. Built-in filters:
 apply on the ledger write path, decision D1). `FilterDecision::OutputFilter`
 carries `RegexMatch` structs with position data so the `CodewordAnonymizer`
 can do consistent, position-aware substitution. The same engine backs both the
-pipeline pre-filter and the M1 write-path scrubber (`ledger_guard.rs`).
+pipeline pre-filter and the write-path scrubber (`ledger_guard.rs`).
 
 ## Key Compositions & Reusable Primitives
 
@@ -366,7 +366,7 @@ coral's Context a reachable read path without the router importing coral.
    those routing fields after the shared `fluent_llm` normalizer strips
    non-OpenAI keys).
 2. **Ledger** (pre-pipeline): `ContentNodeLedger::record_request()` writes the
-   full request at LOD0 before any filter runs (through the M1 write-path
+   full request at LOD0 before any filter runs (through the write-path
    scrub).
 3. **Pipeline**: `WorkContext.structured["request"]` = serialized
    `RouterRequest`; the orchestrator calls each stage via `StageDecisionProducer`
@@ -717,7 +717,7 @@ User message → ContentNodeLedger → ContentNodeStore (durable, full detail)
 
 Key load-bearing properties:
 
-- **Write path is checked (M1, D1).** Every write reaches `ContentNodeStore` only
+- **Write path is checked.** Every write reaches `ContentNodeStore` only
   after passing through `ledger_guard::scrub_for_ledger` — the builtin filter
   engine with the `ContentNodeWrite` scope active. PII-matching text is
   irreversibly replaced (`[REDACTED:<pattern>]`), no codeword map retained.
@@ -727,13 +727,13 @@ Key load-bearing properties:
   derived lazily, always from LOD0 only (never chained), via the `Summarizer`
   WorkUnit, and cached on the node at most once. `CompactionStrategy`/
   `RecencyCompaction` demote older nodes to a higher LOD (setting `active_lod`).
-- **Views never own text (M2, D4).** `LedgerView::render` is the single
+- **Views never own text.** `LedgerView::render` is the single
   text-exit from the store; `ParallelLedger` gives independent default-LOD
   views over one shared `Arc<ContentNodeStore>`; `FilteredLedger<V>` is a reference
   overlay (exclusion set + optional render transform) used by both the PII
   frontier view and the rigor red-team view. Rendering degrades to LOD0 when a
   lazy tier is un-derivable rather than erroring.
-- **Shared store (M4).** Nodes live once behind `Arc<RwLock<ContentNode>>`
+- **Shared store.** Nodes live once behind `Arc<RwLock<ContentNode>>`
   with interned `ArcIntern<str>` session/role index keys and durable
   `content_json` hydration (seeded `next_id` from `MAX(node_id)` so restarts
   never re-issue colliding ids).

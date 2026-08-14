@@ -42,14 +42,14 @@ feature (never the reverse).
 | `capability` | `DbCapability` — a `fluent_wvr::Capability` token over an `Arc<SqlitePool>`; the deprecated lossy `query`/`execute` (all-values-as-strings) stay for legacy callers | `src/db/src/capability.rs` |
 | `wvr` | `DbWorkUnit<F>` + `store_unit` — database `Component`/`WorkUnit` adapters whose `execute` offloads the blocking op via `tokio::task::block_in_place`/`spawn_blocking` (WorkUnit purity contract). `execute` scopes `ctx.caps` into `CURRENT_CAPS` on **both** offload paths (`block_in_place` and scoped-thread), so pool-backed units are capability-correct on multi-thread and current-thread runtimes alike. The pool-backed `DbStore` bridges sync→async via `common_core::runtime::block_on` | `src/db/src/wvr.rs` |
 
-## Zero-cost guarantee (D11)
+## Zero-cost guarantee
 
 The rusqlite surface is feature-gated on `sqlite` (default-on). A consumer that
-only wants pools/scope/zone pays nothing for the database layer:
+only wants pools/scope/batch pays nothing for the database layer:
 `cargo build -p fluent-db --no-default-features` pulls no `rusqlite`, and
 `fluent-concurrency --no-default-features` has no `io`/`capability` modules.
 
-## Consumers (M4–M8 adoption)
+## Consumers
 
 `search-vector` (`GuidanceDb`), `coral-context` (`Library`), `fluent-router`
 (ledger + charts store), `fluent-knowledge` (`QueryCache` → `TtlCache`),

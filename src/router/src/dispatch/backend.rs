@@ -24,7 +24,7 @@ use crate::types::{RouterRequest, RouterResponse};
 pub struct StreamResult {
     pub model: String,
     pub body: http_body_util::channel::Channel<Bytes, std::convert::Infallible>,
-    /// M5: best-effort finalization sink for the assembled answer text.
+    /// Best-effort finalization sink for the assembled answer text.
     /// The streaming task writes `filtered_content()` here when the stream
     /// ends; `None` for backends/stubs that don't accumulate content.
     pub answer: Option<crate::streaming::StreamAnswer>,
@@ -116,7 +116,7 @@ fn dispatch_url(endpoint_url: &str) -> String {
 /// (`unavailable_error` "no free instance in group '<group>'"). `None` when the
 /// body is not a group-miss (a generic 503).
 ///
-/// D10: the fork's real payload is JSON
+/// The fork's real payload is JSON
 /// (`{"error":{"message":"no free instance in group 'X'"}}`), so parse that
 /// shape first; fall back to the raw substring scan so a non-JSON body (or an
 /// older wire format) never regresses.
@@ -376,7 +376,7 @@ impl ChatBackend for OpenAiChatBackend {
 
             let (mut tx, rx) = http_body_util::channel::Channel::new(32);
 
-            // M5: assemble the streamed answer and finalize it when the stream
+            // Assemble the streamed answer and finalize it when the stream
             // ends so the handler can record it into the ledger + session step.
             let answer = crate::streaming::StreamAnswer::new();
             let answer_for_task = answer.clone();
@@ -1072,7 +1072,7 @@ mod tests {
 
     #[test]
     fn parse_group_miss_fork_json_shape() {
-        // D10: the fork's real 503 payload is JSON with `error.message`.
+        // The fork's real 503 payload is JSON with `error.message`.
         let body = r#"{"error":{"code":503,"message":"no free instance in group 'swarm'","type":"unavailable_error"}}"#;
         assert_eq!(parse_group_miss(body).as_deref(), Some("swarm"));
     }

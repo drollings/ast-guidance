@@ -18,34 +18,34 @@ use crate::views::ParallelLedger;
 
 pub struct PlanRoute {
     /// The chart store — the single owner of the workflow_library index
-    /// path. Shared via `Arc` so the M7 `ChartSelector` and the route read
+    /// path. Shared via `Arc` so the `ChartSelector` and the route read
     /// from the same boot-loaded store.
     charts: Arc<ChartStore>,
-    /// Adjudicator backend for chart selection (M7 step 3). `None` degrades
+    /// Adjudicator backend for chart selection. `None` degrades
     /// selection to deterministic + HNSW only. Also doubles as the rubric
-    /// judge backend for chart execution (M4.1).
+    /// judge backend for chart execution.
     selector_backend: Option<Arc<dyn ChatBackend>>,
-    /// Reranker backend for chart selection (M7 step 2.5). `None` skips
+    /// Reranker backend for chart selection. `None` skips
     /// candidate re-ranking (Step 2 → Step 3 directly).
     reranker_backend: Option<Arc<dyn ChatBackend>>,
-    /// Backend that executes a selected chart's targets (M4.1 server-side
-    /// execution). `None` degrades an exact fit to a fresh draft.
+    /// Backend that executes a selected chart's targets.
+    /// `None` degrades an exact fit to a fresh draft.
     execution_backend: Option<Arc<dyn ChatBackend>>,
     /// Bounds concurrent chart-target LLM calls during execution.
     limiter: Arc<Limiter>,
     /// Chart-selection configuration (thresholds, max candidates).
     cfg: ChartsConfig,
-    /// M10 dispatch post-processing hook: distills successful dispatches into
+    /// Dispatch post-processing hook: distills successful dispatches into
     /// draft charts. `None` when extraction is not configured (opt-in).
     extractor: Option<Arc<WorkflowExtractor>>,
-    /// Optional session-context renderer (M5.3): when a ledger store + prompt
+    /// Optional session-context renderer: when a ledger store + prompt
     /// assembler are attached, the selector/adjudicator models receive the
     /// session ledger rendered through the assembler's budget/relevance rules.
     /// `None` keeps today's blank-slate plan prompts (byte-identical).
     prompt_ctx: Option<PromptAssemblerCtx>,
 }
 
-/// The session-context renderer for the plan route (M5.3): a shared `ContentNodeStore`
+/// The session-context renderer for the plan route: a shared `ContentNodeStore`
 /// plus a `LedgerPromptAssembler` and its budget/fidelity band. Pure — it only
 /// renders, it never triggers LOD derivation.
 #[derive(Clone)]
@@ -104,8 +104,8 @@ impl PromptAssemblerCtx {
 pub struct PlanResult {
     pub source: PlanSource,
     pub interview_questions: Vec<String>,
-    /// Raw gap dep names behind the rendered questions (M8 round-trip: the
-    /// handler echoes these back so the interview stays exactly one round).
+    /// Raw gap dep names behind the rendered questions (the handler echoes
+    /// these back so the interview stays exactly one round).
     pub gaps: Vec<String>,
     pub gaps_filled: Vec<String>,
     /// Execution summary when a chart was compiled + executed server-side
@@ -144,7 +144,7 @@ impl PlanRoute {
         }
     }
 
-    /// Attach the session-context renderer (M5.3). When set, the plan route's
+    /// Attach the session-context renderer. When set, the plan route's
     /// `plan_for_session`/`plan_interviewed_for_session` fold the session
     /// ledger (rendered via the `LedgerPromptAssembler`) into the
     /// selector/adjudicator prompts. Opt-in — a route without it is
@@ -156,14 +156,14 @@ impl PlanRoute {
     }
 
     /// Attach the boot-loaded chart store. The store is shared (`Arc`) so the
-    /// M7 `ChartSelector` can be built over the same instance.
+    /// `ChartSelector` can be built over the same instance.
     #[must_use]
     pub fn with_chart_store(mut self, store: Arc<ChartStore>) -> Self {
         self.charts = store;
         self
     }
 
-    /// Attach the adjudicator backend used by chart selection (M7 step 3).
+    /// Attach the adjudicator backend used by chart selection.
     /// Mock-injectable.
     #[must_use]
     pub fn with_selector_backend(mut self, backend: Arc<dyn ChatBackend>) -> Self {
@@ -171,7 +171,7 @@ impl PlanRoute {
         self
     }
 
-    /// Attach the reranker backend used by chart selection (M7 step 2.5).
+    /// Attach the reranker backend used by chart selection.
     /// Mock-injectable.
     #[must_use]
     pub fn with_reranker_backend(mut self, backend: Arc<dyn ChatBackend>) -> Self {
@@ -179,7 +179,7 @@ impl PlanRoute {
         self
     }
 
-    /// Attach the backend that executes a selected chart's targets (M4.1).
+    /// Attach the backend that executes a selected chart's targets.
     /// Mock-injectable.
     #[must_use]
     pub fn with_execution_backend(mut self, backend: Arc<dyn ChatBackend>) -> Self {
@@ -201,7 +201,7 @@ impl PlanRoute {
         self
     }
 
-    /// Attach the M10 dispatch post-processing hook. `None` disables the
+    /// Attach the Dispatch post-processing hook. `None` disables the
     /// learning loop for this route.
     #[must_use]
     pub fn with_workflow_extractor(mut self, extractor: Arc<WorkflowExtractor>) -> Self {
@@ -219,7 +219,7 @@ impl PlanRoute {
         self.charts.as_ref()
     }
 
-    /// Plan a request against the chart library (M7), executing server-side.
+    /// Plan a request against the chart library, executing server-side.
     ///
     /// Selection outcome drives the returned plan:
     ///
@@ -231,12 +231,12 @@ impl PlanRoute {
     /// - `Mismatch`: `source = FreshDraft`, `summary = None` (fall through to
     ///   blank-slate planning).
     ///
-    /// `gaps_filled` is reserved for the M8 interview loop.
+    /// `gaps_filled` is reserved for the interview loop.
     pub async fn plan(&self, user_message: &str, entities: &[Entity]) -> PlanResult {
         self.plan_inner(user_message, entities, false).await
     }
 
-    /// Plan against a session ledger (M5.3): when the route has a prompt
+    /// Plan against a session ledger: when the route has a prompt
     /// assembler attached and a `session_id` is given, the session context is
     /// rendered through the assembler and folded into the selector/adjudicator
     /// prompt so chart selection follows the same budget/relevance rules.
@@ -251,7 +251,7 @@ impl PlanRoute {
         self.plan_inner(&enriched, entities, false).await
     }
 
-    /// Render the session context (M5.3) and prepend it to the selector's user
+    /// Render the session context and prepend it to the selector's user
     /// message. Returns the message unchanged when no session id or assembler
     /// is attached (byte-identical to today).
     fn enrich_with_context(&self, session_id: Option<&str>, user_message: &str) -> String {
@@ -265,7 +265,7 @@ impl PlanRoute {
         format!("Session ledger context:\n{rendered}\n\nRequest:\n{user_message}")
     }
 
-    /// Session-aware variant of [`Self::plan_interviewed`] (M5.3). See
+    /// Session-aware variant of [`Self::plan_interviewed`]. See
     /// [`Self::plan_for_session`].
     pub async fn plan_interviewed_for_session(
         &self,
@@ -283,7 +283,7 @@ impl PlanRoute {
         result
     }
 
-    /// Round-2 entry for the one-round interview loop (M8).
+    /// Round-2 entry for the one-round interview loop.
     ///
     /// The client's answers have been turned into `entities` (kind = the gap
     /// dep name). Re-binds and:
@@ -543,7 +543,7 @@ pub async fn handle_plan_request(
                 .collect()
         })
         .unwrap_or_default();
-    // M5.3: when the plan body carries a session_id and the route has a prompt
+    // When the plan body carries a session_id and the route has a prompt
     // assembler attached, the selector/adjudicator reads the session ledger
     // through the assembler's budget/relevance rules.
     let session_id = body.get("session_id").and_then(serde_json::Value::as_str);
@@ -582,7 +582,7 @@ pub async fn handle_plan_request(
     ))
 }
 
-/// Build the D3 `/v1/plan` "executed" response: execution results, not a
+/// Build the `/v1/plan` "executed" response: execution results, not a
 /// compiled graph. Carries selection provenance (`fit`/`score`) and the
 /// execution summary (`final_output`/`accepted`/`audit`) when the chart ran.
 pub fn plan_executed_response(
@@ -611,7 +611,7 @@ pub fn plan_executed_response(
     executed
 }
 
-/// Handle `POST /v1/rigor` - the fixed-pass blue/red/judge protocol (M3).
+/// Handle `POST /v1/rigor` - the fixed-pass blue/red/judge protocol.
 ///
 /// Body: `{ "message", "session_id"?, "entities"? }`. A configured route with
 /// all three role backends executes and returns `executed` (accepted answer)
@@ -792,7 +792,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn plan_with_reranker_backend_still_selects() {
-        // The reranker backend (M7 step 2.5) is threaded into the selector.
+        // The reranker backend is threaded into the selector.
         // A stub that returns the correct ranking, plus an adjudicator that
         // picks the chart, must yield an HnswHit exactly as without a
         // reranker — the rerank stage is additive.
@@ -816,7 +816,7 @@ mod tests {
         assert!(result.summary.is_some());
     }
 
-    // ── M8: one-round interview loop ─────────────────────────────────────
+    // ── One-round interview loop ─────────────────────────────────────
 
     /// A route whose selector always returns Partial with a `report` gap.
     fn partial_route() -> PlanRoute {
@@ -911,7 +911,7 @@ mod tests {
         assert!(round2.interview_questions.is_empty());
     }
 
-    // -- M5.3: session context via the LedgerPromptAssembler --------------
+    // -- Session context via the LedgerPromptAssembler --------------
 
     /// A selector backend that captures the user message it receives.
     struct RecordingSelector {
@@ -935,7 +935,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn plan_for_session_folds_ledger_context_into_selector_prompt() {
-        // M5.3: with a ledger store + assembler attached, `plan_for_session`
+        // With a ledger store + assembler attached, `plan_for_session`
         // renders the session ledger and prepends it to the selector prompt.
         use crate::node_store::ContentNodeStore;
         let dir = std::env::temp_dir().join(format!(
@@ -984,7 +984,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn plan_without_session_keeps_blank_slate_prompt() {
-        // M5.3 degradation: no session_id → identical to today's prompt (no
+        // Degradation: no session_id → identical to today's prompt (no
         // ledger context prepended), even with an assembler attached.
         use crate::node_store::ContentNodeStore;
         let dir = std::env::temp_dir().join(format!(

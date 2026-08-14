@@ -254,7 +254,7 @@ impl<T: EmbeddingProvider + Send + Sync + 'static> EmbeddingProvider
     }
 
     fn embed_batch(&self, texts: &[&str]) -> Result<BatchEmbedding, EmbeddingError> {
-        // M8.5: the sync variant is a thin runtime shim over the single async
+        // The sync variant is a thin runtime shim over the single async
         // core — the cache loop lives in exactly one place. Uses the canonical
         // `block_in_place` / fallback-runtime pattern from `do_http_post`
         // (which mirrors `client.rs::chat_complete`).
@@ -322,7 +322,7 @@ impl<T: EmbeddingProvider + Send + Sync + 'static> EmbeddingProvider
                     })?
                     .to_vec();
                 let key = self.cache_key(uncached_texts[j]);
-                // M8.8: move the fresh vector into the result slot; the cache
+                // Move the fresh vector into the result slot; the cache
                 // receives a clone (the result slot must keep its value).
                 if let Ok(mut map) = self.cache.lock() {
                     map.put(key, vec.clone());

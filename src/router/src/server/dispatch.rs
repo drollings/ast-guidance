@@ -30,7 +30,7 @@ use crate::charts::extract::WorkflowExtractor;
 /// path the answer is assembled asynchronously and surfaced via
 /// [`DispatchOutcome::stream_answer`].
 ///
-/// M5: the handler records `answer_text` (or the finalized stream content)
+/// The handler records `answer_text` (or the finalized stream content)
 /// into the session ledger + session step.
 pub struct DispatchOutcome {
     pub response: HyperResponse,
@@ -235,7 +235,7 @@ fn apply_pending_snapshot(
 }
 
 /// Reconstruct the prompt actually sent to the model from the normalized
-/// request messages (M10a LOD0 fidelity).
+/// request messages.
 ///
 /// The dispatch backend serializes exactly `request.messages` via
 /// `normalize::messages_to_json`, so this assembly — the role-prefixed text
@@ -255,8 +255,8 @@ pub(crate) fn render_prompt(router_request: &RouterRequest) -> String {
 }
 
 /// Try dispatching to a single target.  `is_primary` controls cache write;
-/// `is_fallback` (an index > 0 in the dispatch chain) controls M10b
-/// extraction scope.
+/// `is_fallback` (an index > 0 in the dispatch chain) controls extraction
+/// scope.
 /// Returns `Ok(DispatchOutcome)` on success or `Err(DispatchError)` on failure.
 async fn dispatch_to_single_target(
     target: &RoutingTarget,
@@ -332,9 +332,9 @@ async fn dispatch_to_single_target(
         }
     }
 
-    // M10 learning loop: a successful buffered dispatch is a solved solution —
+    // Learning loop: a successful buffered dispatch is a solved solution —
     // distill it into a draft chart (best-effort, never fails the request).
-    // M10a: record the *real* rendered prompt; M10b: the extractor gates on
+    // Record the *real* rendered prompt; the extractor gates on
     // `is_fallback` + its configured mode (frontier-assisted by default).
     let answer = answer_text(&completion).unwrap_or_default();
     if let Some(extractor) = deps.extractor.as_ref() {
@@ -433,7 +433,7 @@ pub async fn dispatch_real(
                         Ok(Some(outcome))
                     }
                     Err(e) => {
-                        // M4 allocate-on-503: a group-miss means the pool had
+                        // Allocate-on-503: a group-miss means the pool had
                         // no free member. Ask the sidecar to allocate fresh KV
                         // for the group (weights already loaded), then retry
                         // this target once.
@@ -509,7 +509,7 @@ pub async fn dispatch_real(
         Ok(None) => None,
     };
 
-    // M3 escalation: only after the local chain is exhausted do we engage the
+    // Escalation: only after the local chain is exhausted do we engage the
     // frontier ladder. The ladder is resolved from the resolved route's group
     // (`RoutingTarget.group`); direct-model targets (no group) get `None`.
         if let Some(ladder) = rt.group.as_deref().and_then(|g| deps.ladders.get(g)) {

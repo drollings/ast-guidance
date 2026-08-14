@@ -128,7 +128,7 @@ async fn spawn_test_server(config: RouterConfig, mock: Option<MockDispatchContex
     spawn_test_server_with_sessions(config, mock, None).await
 }
 
-/// `spawn_test_server` with an optional `SessionRegistry` (D6 session-step
+/// `spawn_test_server` with an optional `SessionRegistry` (session-step
 /// tracking on the dispatch path).
 async fn spawn_test_server_with_sessions(
     config: RouterConfig,
@@ -139,7 +139,7 @@ async fn spawn_test_server_with_sessions(
 }
 
 /// `spawn_test_server` with an optional `SessionRegistry` and/or ledger
-/// (M5 answer-recording tests wire both). A `Some` ledger makes the matched
+/// (Answer-recording tests wire both). A `Some` ledger makes the matched
 /// target's answer read-back via `ContentNodeLedger::get_node` load-bearing.
 async fn spawn_test_server_with_ledger(
     config: RouterConfig,
@@ -159,7 +159,7 @@ async fn spawn_test_server_with_ledger(
 
     let deps = test_deps_with_ledger(pipelines, &config, mock, sessions, ledger);
     let handle = tokio::spawn(async move {
-        if let Err(e) = serve_http(listener, deps).await {
+        if let Err(e) = serve_http(listener, deps, None).await {
             tracing::error!(target: "router.test", error = %e, "test server failed");
         }
     });
@@ -167,7 +167,7 @@ async fn spawn_test_server_with_ledger(
     TestServer { addr, handle }
 }
 
-/// `test_deps` with a session registry and/or ledger wired (M5).
+/// `test_deps` with a session registry and/or ledger wired.
 fn test_deps_with_ledger(
     pipelines: Arc<std::collections::HashMap<String, Arc<crate::pipeline::PipelineOrchestrator>>>,
     config: &RouterConfig,
@@ -198,11 +198,11 @@ fn test_deps_with_ledger(
     }
 }
 
-/// Spawn a server with a plan route (M8 interview round-trip tests). The
+/// Spawn a server with a plan route (interview round-trip tests). The
 /// chart store is seeded with `bug_triage`; no selector backend is attached,
 /// so the deterministic/HNSW binding is the sole authority on executability.
 /// An execution backend feeds the two chart targets (reproduce - root_cause)
-/// so an exact hit executes server-side (M4/D3).
+/// so an exact hit executes server-side.
 async fn spawn_plan_server() -> TestServer {
     use crate::charts::store::{chart_from_str, ChartStore};
     use crate::hnsw::HnswIndexHandle;
@@ -280,7 +280,7 @@ async fn spawn_plan_server() -> TestServer {
         None,
     );
     let handle = tokio::spawn(async move {
-        if let Err(e) = serve_http(listener, deps).await {
+        if let Err(e) = serve_http(listener, deps, None).await {
             tracing::error!(target: "router.test", error = %e, "plan test server failed");
         }
     });
@@ -386,7 +386,7 @@ async fn buffered_happy_path_returns_200_with_choices() {
     assert_eq!(value["choices"][0]["finish_reason"], "stop");
 }
 
-// -- D6: session-step recording on the dispatch path ----------------------
+// -- Session-step recording on the dispatch path ----------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_step_recorded_and_completed_on_dispatch_path() {
@@ -430,7 +430,7 @@ async fn session_step_recorded_and_completed_on_dispatch_path() {
     assert!(step.result.as_ref().unwrap().accepted);
 }
 
-// -- M5: matched target's answer recorded in ledger + session --------------
+// -- Matched target's answer recorded in ledger + session --------------
 
 /// An upstream that answers every buffered dispatch with `content`.
 async fn upstream_answering(content: &'static str) -> String {
@@ -504,7 +504,7 @@ async fn ledger_with_summarizer_attached_derives_lod() {
     use crate::ledger::{ContentNodeLedger, LedgerError};
     use crate::summarization::Summarizer;
 
-    // M2: a ledger wired with a `Summarizer` must derive lazy LOD levels at
+    // A ledger wired with a `Summarizer` must derive lazy LOD levels at
     // runtime - `ensure_lod` returns `Ok` (with the summary) instead of
     // `LedgerError::NoSummarizer`. The routed answer is recorded at LOD0 and
     // the lazy tier is derived from LOD0 only.
@@ -772,7 +772,7 @@ async fn oversized_payload_returns_413() {
     assert_eq!(response.status(), 413);
 }
 
-// -- Scenario 5: M1.1 regression - multi-byte UTF-8 at the 120-byte boundary
+// -- Scenario 5: multi-byte UTF-8 at the 120-byte boundary
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multibyte_utf8_message_at_120_byte_boundary_returns_200() {
@@ -806,7 +806,7 @@ async fn multibyte_utf8_message_at_120_byte_boundary_returns_200() {
     assert_eq!(value["choices"][0]["message"]["content"], "ok");
 }
 
-// -- Scenario 6: M2 regression - never-responding upstream times out ------
+// -- Scenario 6: regression - never-responding upstream times out ------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn never_responding_upstream_times_out() {
@@ -1008,7 +1008,7 @@ async fn filter_thinking_never_leaks_partial_tag_in_stream() {
     );
 }
 
-// -- M8: plan route interview round-trip ----------------------------------
+// -- Plan route interview round-trip ----------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plan_route_responds_with_targeted_clarification_then_executes() {
@@ -1131,9 +1131,9 @@ async fn plan_route_unconfigured_returns_service_unavailable() {
     assert_eq!(resp.status(), 503);
 }
 
-// -- M10: dispatch post-processing - workflow extraction -------------------
+// -- Dispatch post-processing - workflow extraction -------------------
 
-/// Spawn the real server with a plan route (M10 extraction hook over a
+/// Spawn the real server with a plan route (extraction hook over a
 /// boot-loaded chart store).
 async fn spawn_server_with_plan_route(
     config: RouterConfig,
@@ -1158,7 +1158,7 @@ async fn spawn_server_with_plan_route(
         None,
     );
     let handle = tokio::spawn(async move {
-        if let Err(e) = serve_http(listener, deps).await {
+        if let Err(e) = serve_http(listener, deps, None).await {
             tracing::error!(target: "router.test", error = %e, "test server failed");
         }
     });
@@ -1195,7 +1195,7 @@ async fn successful_dispatch_distills_a_draft_chart() {
 
     let config = make_config(&upstream, false, false, 5000, 2000);
 
-    // A shared store with the M10 extraction hook enabled (operator opt-in).
+    // A shared store with the extraction hook enabled (operator opt-in).
     // Mode `"all"` keeps the blanket extraction the e2e asserts (the default
     // `"frontier"` scope would skip this single-target primary dispatch).
     let store = Arc::new(ChartStore::new(None));
@@ -1234,7 +1234,7 @@ async fn successful_dispatch_distills_a_draft_chart() {
         store.is_draft(name),
         "the auto-extracted chart is a draft until rubric-validated"
     );
-    // M10a LOD0 fidelity: the draft's template captures the real prompt shape
+    // LOD0 fidelity: the draft's template captures the real prompt shape
     // (the role-prefixed message) - not the synthesized "Solve the following
     // request-" wrapper.
     let chart = store.get(name).expect("chart exists");
@@ -1251,7 +1251,7 @@ async fn successful_dispatch_distills_a_draft_chart() {
     assert!(!store.charts_sorted().iter().any(|c| c.name == name));
 }
 
-// -- M3: escalation ladder - integration -----------------------------------
+// -- Escalation ladder - integration -----------------------------------
 
 /// Install (once) the process-wide global subscriber and return its capture
 /// buffer. The escalation tests assert on the `router.audit` lines it
@@ -1302,7 +1302,7 @@ async fn spawn_test_server_with_deps(deps: ServerDeps) -> TestServer {
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
     let handle = tokio::spawn(async move {
-        if let Err(e) = serve_http(listener, deps).await {
+        if let Err(e) = serve_http(listener, deps, None).await {
             tracing::error!(target: "router.test", error = %e, "test server failed");
         }
     });
@@ -1439,7 +1439,7 @@ async fn context_cache_short_circuits_before_frontier_integration() {
     );
 }
 
-// -- M3.6: /v1/rigor server round-trip ------------------------------------
+// -- /v1/rigor server round-trip ------------------------------------
 
 /// Assemble `ServerDeps` with a rigor route + session registry + ledger wired
 /// (checkpoint/rewind + red-team view are load-bearing in the server path).
@@ -1507,7 +1507,7 @@ async fn spawn_rigor_server(blue: Vec<&str>, red: Vec<&str>, judge: Vec<&str>) -
         Some(ledger),
     );
     let handle = tokio::spawn(async move {
-        if let Err(e) = serve_http(listener, deps).await {
+        if let Err(e) = serve_http(listener, deps, None).await {
             tracing::error!(target: "router.test", error = %e, "rigor test server failed");
         }
     });
@@ -1610,7 +1610,7 @@ async fn rigor_route_unconfigured_returns_explicit_error() {
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
     let handle = tokio::spawn(async move {
-        if let Err(e) = serve_http(listener, deps).await {
+        if let Err(e) = serve_http(listener, deps, None).await {
             tracing::error!(target: "router.test", error = %e, "rigor test server failed");
         }
     });
@@ -1697,7 +1697,7 @@ async fn spawn_instances_server(
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
     let handle = tokio::spawn(async move {
-        if let Err(e) = serve_http(listener, deps).await {
+        if let Err(e) = serve_http(listener, deps, None).await {
             tracing::error!(target: "router.test", error = %e, "instances test server failed");
         }
     });
@@ -1796,5 +1796,149 @@ async fn instances_api_rejects_unknown_model_and_requires_specify_model() {
         .await
         .expect("POST unknown model");
     assert_eq!(resp.status(), 400);
+}
+
+// ---------------------------------------------------------------------------
+// Capability gating is real on the serving path.
+// ---------------------------------------------------------------------------
+
+/// A classifier backend that records whether the router's knowledge capability
+/// is granted in the current task-local when the classifier runs, then returns
+/// a routing decision so the pipeline proceeds normally. This observes the
+/// `handle_request` grant from inside the request path without touching
+/// dispatch.
+struct KnowledgeProbeBackend {
+    gate: Arc<Mutex<Option<bool>>>,
+}
+
+impl ChatBackend for KnowledgeProbeBackend {
+    fn chat_complete(
+        &self,
+        _messages: &[fluent_llm::ChatMessage],
+    ) -> Result<String, fluent_llm::LlmError> {
+        let granted =
+            fluent_wvr::capability::check_capability(&crate::knowledge::RouterKnowledgeCapability)
+                .is_ok();
+        *lock(&self.gate) = Some(granted);
+        let out = serde_json::to_string(&crate::config::ClassifierOutput {
+            action: "route".into(),
+            response: None,
+            target: Some("fast".into()),
+            coherence_score: 0.95,
+            safety_score: 0.9,
+            complexity: None,
+            intent: Some("question".into()),
+            reason: "probe".into(),
+            completeness: None,
+            risk: None,
+        })
+        .unwrap_or_default();
+        Ok(out)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn knowledge_gate_is_open_inside_http_request_and_closed_outside() {
+    use fluent_wvr::capability::check_capability;
+
+    // Outside any scope: the gate must be closed.
+    assert!(
+        check_capability(&crate::knowledge::RouterKnowledgeCapability).is_err(),
+        "the knowledge capability must not be granted outside a request scope"
+    );
+
+    let gate = Arc::new(Mutex::new(None::<bool>));
+    let probe = KnowledgeProbeBackend { gate: Arc::clone(&gate) };
+    let backend: Arc<dyn ChatBackend> = Arc::new(probe);
+    let config = make_config("http://127.0.0.1:1", false, false, 2000, 1000);
+    let pipelines = Arc::new(config.build_all_pipelines_with_backend(Some(&backend)));
+
+    let mock = Arc::new(MockDispatchContext::new(
+        vec![MockTranscriptEntry {
+            user_message: "What is 2+2?".into(),
+            classifier_response: String::new(),
+            expected_route: Some("fast".into()),
+            dispatch_response: Some("four".into()),
+            rejected: false,
+            reject_reason_contains: None,
+        }],
+        vec![],
+    ));
+
+    let deps = test_deps(pipelines, &config, Some(mock), None, None, HashMap::new(), None);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let handle = tokio::spawn(async move {
+        let _ = serve_http(listener, deps, None).await;
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&json!({
+            "model": "fast",
+            "messages": [{"role": "user", "content": "What is 2+2?"}]
+        }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 200, "canned dispatch should succeed");
+    handle.abort();
+
+    assert_eq!(
+        *lock(&gate),
+        Some(true),
+        "the router knowledge capability must be granted inside the HTTP handler"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Server-owned tasks are drained on graceful shutdown.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graceful_shutdown_drains_tracked_connections_within_timeout() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+
+    let config = make_config("http://127.0.0.1:1", false, false, 2000, 1000);
+    let provider = TranscriptProvider::new(HashMap::new());
+    let backend: Arc<dyn ChatBackend> = Arc::new(provider);
+    let pipelines = Arc::new(config.build_all_pipelines_with_backend(Some(&backend)));
+    let deps = test_deps(pipelines, &config, None, None, None, HashMap::new(), None);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let serve = tokio::spawn(async move {
+        serve_http(listener, deps, Some(shutdown_rx)).await
+    });
+
+    // A completed request is served normally before shutdown.
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://{addr}/health"))
+        .send()
+        .await
+        .expect("health");
+    assert_eq!(resp.status(), 200);
+
+    // Leave a connection half-open so an in-flight per-connection task exists
+    // when shutdown fires; graceful stop must abort+await it within a timeout.
+    let mut lingering = TcpStream::connect(addr).await.expect("connect");
+    let _ = lingering
+        .write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n")
+        .await; // no terminating CRLF: connection stays open
+
+    let _ = shutdown_tx.send(true);
+    let drained = tokio::time::timeout(Duration::from_secs(3), async {
+        serve.await.expect("serve task joined").expect("serve_http ok")
+    })
+    .await;
+
+    assert!(
+        drained.is_ok(),
+        "graceful shutdown must stop accepting and drain tracked connection tasks within timeout"
+    );
 }
 

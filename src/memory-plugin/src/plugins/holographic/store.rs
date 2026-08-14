@@ -209,7 +209,7 @@ impl HolographicStore {
                     Ok(_) => conn.last_insert_rowid(),
                     Err(e) => {
                         // Unique-violation classification is centralized in
-                        // `DbError::DuplicateEntry` (D3).
+                        // `DbError::DuplicateEntry`.
                         let db_err = DbError::from(e);
                         match db_err {
                             DbError::DuplicateEntry(_) => conn

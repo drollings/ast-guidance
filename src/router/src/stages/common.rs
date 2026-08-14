@@ -9,7 +9,7 @@ use crate::types::{RouterMessageContent, RouterRequest};
 /// Ensure a floating-point field exists on a classifier/tree JSON object,
 /// coercing a string-valued number back to numeric. The shared "surviving
 /// normalization" used by both the flat `ClassifierStage` sanitizer and the
-/// M4 classification-tree parser.
+/// classification-tree parser.
 pub(crate) fn coerce_float(obj: &mut Map<String, Value>, key: &str, default: f64) {
     match obj.get(key) {
         None => {

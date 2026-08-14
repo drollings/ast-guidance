@@ -381,9 +381,9 @@ impl WorkContext {
     /// Build a context that inherits the SupervisedBatch.s `rt` and `caps`, with
     /// optional per-unit overrides via a closure. The intended
     /// registration-site helper — `SupervisedBatch::register` uses it internally.
-    pub fn for_unit_in_zone(
-        zone_rt: &Arc<dyn Runtime>,
-        zone_caps: &CapabilitySet,
+    pub fn for_unit_in_batch(
+        batch_rt: &Arc<dyn Runtime>,
+        batch_caps: &CapabilitySet,
         mutate: impl FnOnce(&mut WorkContext),
     ) -> Self;
 
@@ -410,7 +410,7 @@ use fluent_wvr::prelude::*;
 > `ComponentArcExt`, `FieldSchema`, `SchemaProvider`, and
 > `PersistableComponent` are **not** in the prelude — they are niche
 > types that should be imported from `fluent_wvr::traits` or
-> `fluent_wvr::capability` when actually needed. The M2 milestone
+> `fluent_wvr::capability` when actually needed. The milestone
 > removed them from the prelude because no consumer in the in-tree
 > call graph imported them through the prelude.
 
@@ -1666,7 +1666,7 @@ config and name overrides stay coral-side state that *feeds* the cascade.
 > (re-exported as `common_core::impl_from_io_error!`) writes the
 > `impl From<std::io::Error> for T { fn from(e) -> Self { Self::Io(IoError(e)) } }`
 > hop for enums that already carry an `Io(#[from] IoError)` variant. Use it
-> instead of hand-copying the wrapper (9 consumer copies replaced in M6).
+> instead of hand-copying the wrapper.
 
 ---
 
@@ -2378,7 +2378,7 @@ When writing new code in `rust-src/`:
 
 ### The throwaway rule
 
-25. **Never add a new public API surface (function, type, error variant, or builder helper) without at least one in-tree production consumer.** The codebase has a documented rule against throwaway additions — three APIs shipped in a prior roadmap cycle (`Reserve`, `FieldError::ReadOnly`, `WorkContext::for_unit_in_zone`) had no production consumer on landing. The cost shows up in unused code paths, surprise behaviour, and dead documentation. If a feature must ship ahead of its consumer, file a tracking issue and link it from the API's doc comment.
+25. **Never add a new public API surface (function, type, error variant, or builder helper) without at least one in-tree production consumer.** The codebase has a documented rule against throwaway additions — three APIs shipped in a prior roadmap cycle (`Reserve`, `FieldError::ReadOnly`, `WorkContext::for_unit_in_batch`) had no production consumer on landing. The cost shows up in unused code paths, surprise behaviour, and dead documentation. If a feature must ship ahead of its consumer, file a tracking issue and link it from the API's doc comment.
 
 26. **Compatibility surface is a deliberate, marked exception.** A trait/type kept for forward compatibility (the `FieldAccess`/`Describable` reflection surface, `SchemaProvider`, `PersistableComponent`, `DynamicComponent`, `AffinityScheduler`) is not "throwaway" *when it is explicitly marked as such in its doc comment and in the §0 status taxonomy*. Marking is what distinguishes scaffold (keep, maintain contract) from dead code (prune). Any API that is neither production-composed nor marked scaffold is a throwaway-rule candidate and should be pruned.
 
@@ -2423,7 +2423,7 @@ runtime in `fluent-concurrency`. The full surface is documented in
 | `PriorityQueue<T>` | `fluent-concurrency/src/queue.rs` | O(log P) for distinct priorities, O(1) for all-zero fast path |
 | `PartitionedRouter<K, J>` | `fluent-concurrency/src/router.rs` | Hash-based sharding; preserves causal ordering per key |
 | `first_accept_in_order` | `fluent-concurrency/src/ladder.rs` | Monomorphized first-Ok-wins fallback combinator ("try rungs in order, take the first success"); the canonical ladder primitive composed by `BackendChain`, `dispatch_real`, and the router's escalation ladder |
-| `CreditFlow` | `fluent-concurrency/src/flow.rs` | Sender/receiver backpressure with `CreditSpec { initial, more_after }` |
+| `CreditFlow` | `fluent-concurrency/src/flow.rs` | Sender/receiver backpressure with `CreditSpec { initial, more_after }`; **compatibility surface (scaffold)** — no production caller today (see `fluent-concurrency` SKILL §3.7) |
 | `Reserve` | `fluent-concurrency/src/reserve.rs` | RAII permit from a shared `AtomicUsize`; `try_acquire`/`commit`; **currently has no in-tree production consumer** (throwaway rule candidate) |
 
 A `SupervisedBatch` is a `Scope` plus the `WorkUnit` integration: tasks implement

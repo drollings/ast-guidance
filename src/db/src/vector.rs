@@ -1,8 +1,8 @@
-//! Embedding vector math (D8).
+//! Embedding vector math.
 //!
 //! The canonical home for cosine similarity, brute-force KNN, vector↔byte
 //! encoding, and int8 quantization. This module was moved verbatim from
-//! `search-vector::math` (M4) so that the dependency direction stays acyclic:
+//! `search-vector::math` so that the dependency direction stays acyclic:
 //! `search-vector` and `coral` depend on `fluent-db`, never the reverse, and
 //! `search-vector::math` is now a re-export of this module.
 
@@ -140,7 +140,7 @@ pub fn cosine_similarity_q8(a: &QuantizedEmbedding, b: &QuantizedEmbedding) -> f
 /// The inputs are `(id, item)` pairs in rank order (index 0 = best rank), so
 /// this is generic over the candidate item type — `search-vector`'s
 /// `SearchResult` and coral's `KnnHit` both fuse through this single
-/// implementation (M7).
+/// implementation.
 pub fn rrf_merge<T>(
     keyword_results: Vec<(i64, T)>,
     vector_results: Vec<(i64, T)>,

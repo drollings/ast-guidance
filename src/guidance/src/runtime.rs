@@ -56,7 +56,7 @@ pub static AST_POOL: LazyLock<Arc<ResultPool<AstGenPayload, GuidanceDoc, SyncEng
         ))
     });
 
-/// Shared `GuidanceDb` cache for the DB sync pool (M8.2).
+/// Shared `GuidanceDb` cache for the DB sync pool.
 ///
 /// The first `DbSyncPayload` to reach `DB_POOL` opens the database once; later
 /// jobs at the same path reuse it, so the connection/schema lifecycle lives in
@@ -77,7 +77,7 @@ fn shared_guidance_db(path: &Path) -> Result<Arc<GuidanceDb>, String> {
     Ok(db)
 }
 
-/// Build the `DbWorkUnit` that performs a guidance DB sync (M8.2).
+/// Build the `DbWorkUnit` that performs a guidance DB sync.
 ///
 /// The op runs on a dedicated blocking thread via `DbWorkUnit::execute`'s
 /// offload, so the `ResultPool` worker never blocks on the rusqlite work.
@@ -128,9 +128,9 @@ pub static DB_POOL: LazyLock<Arc<ResultPool<DbSyncPayload, usize, String>>> = La
 /// let mut batch = SupervisedBatch::new_with_config(
 ///     Arc::new(TokioRuntime),
 ///     CapabilitySet::default(),
-///     ZoneConfig {
+///     BatchConfig {
 ///         poll_budget: 64,
-///         ..ZoneConfig::default()
+///         ..BatchConfig::default()
 ///     },
 /// );
 /// batch.register(build_task_a);  // provides "parsed"
@@ -150,7 +150,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_zone_is_send() {
+    fn test_sync_batch_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<SupervisedBatch>();
     }

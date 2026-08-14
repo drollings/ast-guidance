@@ -66,7 +66,7 @@ impl RoutingConfig {
     /// `intelligence` meets `min_complexity`, falling back to the cheapest in
     /// the group) and attaches the resolved group, the `target_name`, and the
     /// ordered `fallbacks`. This is the canonical target builder shared by the
-    /// flat classifier stage and the M4 classification-tree engine — a
+    /// flat classifier stage and the classification-tree engine — a
     /// terminal node dispatches through it unchanged
     pub fn routing_target(&self, route: &str, min_complexity: Option<u8>) -> Option<RoutingTarget> {
         let (entry, model_name) = self.resolve_route(route, min_complexity)?;

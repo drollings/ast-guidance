@@ -31,7 +31,7 @@ pub struct RenderContext {
     pub request: String,
     /// dep name → bound entities.
     pub deps: HashMap<String, Vec<BoundEntity>>,
-    /// Prior target outputs, keyed by stage id (M5).
+    /// Prior target outputs, keyed by stage id.
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub upstream: HashMap<String, serde_json::Value>,
     /// Chart name (provenance).

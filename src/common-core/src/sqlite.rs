@@ -39,7 +39,7 @@ pub fn open_in_memory() -> Result<Connection> {
 /// Every connection opened with the same `name` participates in one shared
 /// in-memory database, so a pool of connections to `memdb{N}` sees the same
 /// tables and data. This is the fix for the pool-isolation bug where each
-/// checkout silently saw a different private empty DB (M1): `open_in_memory()`
+/// checkout silently saw a different private empty DB: `open_in_memory()`
 /// (and SQLite's bare `:memory:`) create a *per-connection* database, which is
 /// incoherent under concurrent pooling.
 ///
@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn open_shared_in_memory_is_shared_across_connections() {
         // Two connections to the same named shared-cache memory DB must see the
-        // same database (M1): a write through one is visible through the other.
+        // same database: a write through one is visible through the other.
         let a = open_shared_in_memory("memdb_shared_test_a").unwrap();
         let b = open_shared_in_memory("memdb_shared_test_a").unwrap();
         a.execute_batch("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (7)")

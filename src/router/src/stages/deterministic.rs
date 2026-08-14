@@ -227,7 +227,7 @@ fn build_command_registry(handlers: &HashMap<String, String>) -> HashMap<String,
 }
 
 impl DeterministicPreFilter {
-    /// Produce the stage decision and its `WorkOutput` message (M5.4). The
+    /// Produce the stage decision and its `WorkOutput` message. The
     /// typed `StageDecision` is built here once and consumed directly by the
     /// orchestrator's typed handoff; `WorkUnit::execute` wraps the same result
     /// into `WorkOutput` for the composition path.

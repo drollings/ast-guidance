@@ -95,7 +95,7 @@ pub async fn close(&mut self);
 
 ### SupervisedBatch
 
-Supervision zone with async retry, dependency cancellation, and timeout. Implements `Future<Output = SupervisedBatchSummary>`.
+Supervision batch with async retry, dependency cancellation, and timeout. Implements `Future<Output = SupervisedBatchSummary>`.
 
 ```rust
 pub fn new(runtime: Arc<dyn Runtime>, caps: CapabilitySet) -> Self;
@@ -189,6 +189,6 @@ router.submit(&key, job).await?;
 - **No `spawn_blocking` abstraction** — use `tokio::task::spawn_blocking` directly for sync work inside pool handlers
 - **`Queue` is single-consumer** — multiple consumers race for `pop()`
 - **`Scope` panics on drop** if `close()` wasn't called — use `defer` patterns or ensure scope lives long enough
-- **`SupervisedBatch` is a `Future`** — must be `.await`ed or aborted; dropping a running zone cancels all tasks
+- **`SupervisedBatch` is a `Future`** — must be `.await`ed or aborted; dropping a running batch cancels all tasks
 - **`WorkerPool::new` spawns immediately** — workers start during construction; ensure runtime context exists
 - **Credit flow** is for producer-consumer rate limiting, not general concurrency control

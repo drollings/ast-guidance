@@ -4,7 +4,7 @@
 //! Configurable via `RoutingConfig` from the top-level coral-router config.
 //!
 //! When `RouterConfig.classification` is `Some`, the stage becomes a thin
-//! wrapper over the M4 classification-tree engine (`stages::tree`): the engine
+//! wrapper over the classification-tree engine (`stages::tree`): the engine
 //! evaluates the nested tree recursively, auto-builds prompts from child keys
 //! and descriptions, enforces per-node coherence/safety thresholds, and emits a
 //! `StageDecision` per visited node plus a durable audit record. The flat path
@@ -27,7 +27,7 @@ use fluent_wvr::prelude::*;
 
 use crate::metrics::classify_error;
 
-use crate::config::{ClassifierOutput, RoutingConfig};
+use crate::config::{ClassifierFailurePolicy, ClassifierOutput, RoutingConfig};
 use crate::pipeline::RoutingTarget;
 use crate::pipeline_types::{
     PipelineStage, StageDecision, StageDecisionProducer, StageMetadata, StageVerdict,
@@ -47,7 +47,7 @@ const DEFAULT_COMPLETENESS: f64 = 0.5;
 /// survive parsing instead of falling back to the default route.
 ///
 /// The field-coercion lives in the shared `stages::common` helpers (the
-/// "surviving normalization" both this stage and the M4 tree engine use).
+/// "surviving normalization" both this stage and the tree engine use).
 /// Route-name guessing is gone — the classification tree replaces it.
 fn sanitize_classifier_json(v: &mut serde_json::Value) {
     if let Some(obj) = v.as_object_mut() {
@@ -77,8 +77,13 @@ fn log_classifier_raw_response(response: &str) {
 // string from the model). Routes through the shared `fluent_llm::parse_typed`
 // codec — direct-deserialize fast path, then fence-strip → parse →
 // extract-first-value, then the shared `sanitize_classifier_json` coercion.
-// `true` = pristine parse, `false` = recovered via sanitization.
-fn parse_classifier_response(response: &str, default_route: &str) -> (ClassifierOutput, bool) {
+// `Ok((output, true))` = pristine parse; `Ok((output, false))` = recovered via
+// sanitization; `Err(reason)` = total parse failure (the caller applies the
+// `ClassifierFailurePolicy`).
+fn parse_classifier_response(
+    response: &str,
+    default_route: &str,
+) -> Result<(ClassifierOutput, bool), String> {
     match fluent_llm::parse_typed::<ClassifierOutput>(
         response,
         &serde_json::Value::Null,
@@ -96,46 +101,28 @@ fn parse_classifier_response(response: &str, default_route: &str) -> (Classifier
                     .or_else(|| o.action.as_str().eq("route").then(|| default_route.into())),
                 ..o
             };
-            (output, ok)
+            Ok((output, ok))
         }
         Err(fluent_llm::JsonParseError::NoJson) => {
             tracing::error!(
                 target: "router.pipeline.stage2",
                 raw_response_len = response.len(),
-                "classifier LLM response was not valid JSON at all — falling back to default route",
+                "classifier LLM response was not valid JSON at all",
             );
             log_classifier_raw_response(response);
-            fallback_parse(default_route, "invalid JSON in LLM response")
+            Err("invalid JSON in LLM response".into())
         }
         Err(e) => {
             tracing::error!(
                 target: "router.pipeline.stage2",
                 error = %e,
                 raw_response_len = response.len(),
-                "classifier response survived sanitization but still failed to parse — falling back to default route",
+                "classifier response survived sanitization but still failed to parse",
             );
             log_classifier_raw_response(response);
-            fallback_parse(default_route, &format!("post-sanitize parse error: {e}"))
+            Err(format!("post-sanitize parse error: {e}"))
         }
     }
-}
-
-fn fallback_parse(default_route: &str, reason: &str) -> (ClassifierOutput, bool) {
-    (
-        ClassifierOutput {
-            action: "route".into(),
-            response: None,
-            target: Some(default_route.into()),
-            coherence_score: 1.0,
-            safety_score: 1.0,
-            complexity: None,
-            intent: None,
-            reason: reason.into(),
-            completeness: None,
-            risk: None,
-        },
-        false,
-    )
 }
 
 fn check_thresholds(
@@ -233,11 +220,11 @@ fn resolve_via_matcher(
 /// - `route` → the explicit `target` or `default_route`,
 /// - anything else → a warning and the `default_route` fallback.
 ///
-/// The M4.5 cleanup deleted `normalize_classifier_action`'s route-name
+/// The cleanup deleted `normalize_classifier_action`'s route-name
 /// guessing from `action`/`intent` strings — route selection is the
 /// classification tree's job now. Complexity-based model selection still flows
 /// through the shared target resolver (`resolve_via_matcher`), which runs the
-/// M3 self-assessment ladder when the pipeline opts in.
+/// self-assessment ladder when the pipeline opts in.
 fn resolve_routing_target(
     action: &str,
     output: &ClassifierOutput,
@@ -286,7 +273,7 @@ pub struct ClassifierStage {
     coherence_threshold: f64,
     score_matrix: Option<ScoreMatrix>,
     /// When `true` and `score_matrix` is `Some`, the matrix's top route
-    /// decides the dispatch target (M5) instead of the LLM's `action`/`target`
+    /// decides the dispatch target instead of the LLM's `action`/`target`
     /// being metadata-only. Thresholds/`reject` still gate first.
     score_matrix_authoritative: bool,
     classifier_intelligence: u8,
@@ -302,14 +289,18 @@ pub struct ClassifierStage {
     /// parallel classifier fan-out; this limiter only bounds the current sync
     /// path so a burst cannot starve every tokio worker via `block_in_place`.
     limiter: Arc<Limiter>,
-    /// The M4 classification-tree engine. `Some` short-circuits `execute` into
-    /// tree evaluation; the flat path below is then unused (M4.5).
+    /// The classification-tree engine. `Some` short-circuits `execute` into
+    /// tree evaluation; the flat path below is then unused.
     tree_engine: Option<Arc<ClassificationEngine>>,
-    /// The M3 target-matching ladder. `Some` (pipeline `target_match:
+    /// The target-matching ladder. `Some` (pipeline `target_match:
     /// "self_assess"`) resolves routes through per-candidate self-assessment;
     /// `None` (`target_match: "static"`) keeps today's cheapest-qualifying
-    /// pick. The tree engine (M4) shares the same matcher via this field.
+    /// pick. The tree engine shares the same matcher via this field.
     target_matcher: Option<TargetMatcher>,
+    /// What to do when the classifier LLM call fails or its response cannot be
+    /// parsed. Injected from `RouterConfig`; the stage never
+    /// branches on config fields directly (DIP).
+    failure_policy: ClassifierFailurePolicy,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
@@ -326,6 +317,7 @@ impl ClassifierStage {
         classifier_model: impl Into<String>,
         limiter: Arc<Limiter>,
         target_matcher: Option<TargetMatcher>,
+        failure_policy: ClassifierFailurePolicy,
     ) -> Self {
         Self {
             name: ArcIntern::from("pipeline.stage2.classifier"),
@@ -339,6 +331,7 @@ impl ClassifierStage {
             limiter,
             tree_engine: None,
             target_matcher,
+            failure_policy,
             depends: vec![ArcIntern::from("pipeline.stage1.output")],
             provides: vec![ArcIntern::from("pipeline.stage2.output")],
         }
@@ -360,6 +353,7 @@ impl ClassifierStage {
         limiter: Arc<Limiter>,
         tree_engine: Arc<ClassificationEngine>,
         target_matcher: Option<TargetMatcher>,
+        failure_policy: ClassifierFailurePolicy,
     ) -> Self {
         Self {
             name: ArcIntern::from("pipeline.stage2.classifier.tree"),
@@ -373,6 +367,7 @@ impl ClassifierStage {
             limiter,
             tree_engine: Some(tree_engine),
             target_matcher,
+            failure_policy,
             depends: vec![ArcIntern::from("pipeline.stage1.output")],
             provides: vec![ArcIntern::from("pipeline.stage2.output")],
         }
@@ -509,7 +504,7 @@ impl ClassifierStage {
             .map(|r: crate::types::RouterRequest| r.model)
             .filter(|m| !m.is_empty());
 
-        // M4: classification-tree mode — the engine produces the final
+        // Classification-tree mode — the engine produces the final
         // `StageDecision` directly (routing target, rejection, or the
         // `tree_path` of visited nodes in metadata).
         if let Some(engine) = &self.tree_engine {
@@ -579,33 +574,9 @@ impl ClassifierStage {
                     retryable = e.is_retryable(),
                     llm_latency_ms = llm_latency_ms,
                     total_latency_ms = total_latency_ms,
-                    "classifier LLM call failed — falling back to default route"
+                    "classifier LLM call failed"
                 );
-                let output = ClassifierOutput {
-                    action: "route".into(),
-                    response: None,
-                    target: Some(self.routing_config.default_route.clone()),
-                    coherence_score: 1.0,
-                    safety_score: 1.0,
-                    complexity: None,
-                    intent: None,
-                    reason: format!("LLM error: {e}"),
-                    completeness: None,
-                    risk: None,
-                };
-                let fallback_rt = resolve_routing_target(
-                    &output.action,
-                    &output,
-                    &self.routing_config,
-                    self.target_matcher.as_ref(),
-                    &input,
-                );
-                return Ok(Self::build_decision(
-                    &output,
-                    fallback_rt.as_ref(),
-                    false,
-                    self.score_matrix.as_ref(),
-                ));
+                return Ok(self.failure_decision(&format!("LLM error: {e}")));
             }
         };
 
@@ -618,7 +589,13 @@ impl ClassifierStage {
             "classifier call complete"
         );
 
-        let (mut output, ok) = parse_classifier_response(&response, &self.routing_config.default_route);
+        let (mut output, ok) = match parse_classifier_response(
+            &response,
+            &self.routing_config.default_route,
+        ) {
+            Ok(parsed) => parsed,
+            Err(reason) => return Ok(self.failure_decision(&reason)),
+        };
 
         if !ok {
             tracing::warn!(
@@ -693,7 +670,7 @@ impl ClassifierStage {
             }
         }
 
-        // M5: matrix-authoritative routing. When opted in, the weighted score
+        // Matrix-authoritative routing. When opted in, the weighted score
         // matrix DECIDES the route — the top-scoring route's name is resolved
         // through the one shared dispatch path (`routing_config.routing_target`)
         // — instead of the LLM's `action`/`target` being metadata-only. The
@@ -749,6 +726,94 @@ impl ClassifierStage {
             self.score_matrix.as_ref(),
         ))
     }
+
+    /// Apply the `ClassifierFailurePolicy` to a classifier outage (LLM error or
+    /// total parse failure). The single DRY decision point — both fail-open
+    /// paths funnel here.
+    fn failure_decision(&self, reason: &str) -> (String, StageDecision) {
+        match self.failure_policy {
+            ClassifierFailurePolicy::Reject => {
+                tracing::warn!(
+                    target: "router.pipeline.stage2.classifier",
+                    model = %self.classifier_model,
+                    reason,
+                    "classifier failure policy=reject — rejecting request"
+                );
+                let decision = StageDecision {
+                    stage: PipelineStage::Classifier,
+                    verdict: StageVerdict::Rejected,
+                    score: None,
+                    reason: format!("classifier failure: {reason}"),
+                    latency_ms: 0,
+                    metadata: serde_json::json!({
+                        "failure": reason,
+                        "failure_policy": "reject",
+                        // `fallback: true` lets `RetryClassifier` detect this
+                        // as a retryable outage and re-run with corrective
+                        // prompts BEFORE the policy is applied. After retries
+                        // exhaust, this Rejected verdict is returned as-is, so
+                        // the safe default fails closed.
+                        "fallback": true,
+                    }),
+                };
+                ("rejected".into(), decision)
+            }
+            ClassifierFailurePolicy::RouteToDefaultTruthful => {
+                let output = ClassifierOutput {
+                    action: "route".into(),
+                    response: None,
+                    target: Some(self.routing_config.default_route.clone()),
+                    coherence_score: 0.0,
+                    safety_score: 0.0,
+                    complexity: None,
+                    intent: None,
+                    reason: reason.into(),
+                    completeness: None,
+                    risk: None,
+                };
+                let fallback_rt = resolve_routing_target(
+                    &output.action,
+                    &output,
+                    &self.routing_config,
+                    self.target_matcher.as_ref(),
+                    "",
+                );
+                Self::build_decision(
+                    &output,
+                    fallback_rt.as_ref(),
+                    false,
+                    self.score_matrix.as_ref(),
+                )
+            }
+            ClassifierFailurePolicy::LegacyFailOpen => {
+                let output = ClassifierOutput {
+                    action: "route".into(),
+                    response: None,
+                    target: Some(self.routing_config.default_route.clone()),
+                    coherence_score: 1.0,
+                    safety_score: 1.0,
+                    complexity: None,
+                    intent: None,
+                    reason: reason.into(),
+                    completeness: None,
+                    risk: None,
+                };
+                let fallback_rt = resolve_routing_target(
+                    &output.action,
+                    &output,
+                    &self.routing_config,
+                    self.target_matcher.as_ref(),
+                    "",
+                );
+                Self::build_decision(
+                    &output,
+                    fallback_rt.as_ref(),
+                    false,
+                    self.score_matrix.as_ref(),
+                )
+            }
+        }
+    }
 }
 
 impl StageDecisionProducer for ClassifierStage {
@@ -768,7 +833,7 @@ impl StageDecisionProducer for ClassifierStage {
 impl ClassifierStage {
     /// The four-axis score vector the matrix ranks over: coherence, normalized
     /// complexity (0–1), completeness, and risk. The single source of the
-    /// vector — shared by the matrix-authoritative `decide()` path (M5) and the
+    /// vector — shared by the matrix-authoritative `decide()` path and the
     /// `build_decision` audit metadata.
     fn score_vector(output: &ClassifierOutput) -> HashMap<String, f64> {
         std::collections::HashMap::from([

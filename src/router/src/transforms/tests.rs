@@ -15,7 +15,7 @@ mod tests {
         test_request(text)
     }
 
-    // ── M3.9: NoTransform ────────────────────────────────────────────────
+    // ── NoTransform ────────────────────────────────────────────────
 
     #[test]
     fn test_no_transform_passes_through_unchanged() {
@@ -49,7 +49,7 @@ mod tests {
         assert_eq!(transform.name(), "none");
     }
 
-    // ── M3.9: PiiAnonymize ──────────────────────────────────────────────
+    // ── PiiAnonymize ──────────────────────────────────────────────
 
     #[test]
     fn test_pii_anonymize_redacts_ssn() {
@@ -125,7 +125,7 @@ mod tests {
         assert_eq!(transform.name(), "pii_anonymize");
     }
 
-    // ── M3.9: DecomposeToAnonymizedHypothetical ─────────────────────────
+    // ── DecomposeToAnonymizedHypothetical ─────────────────────────
 
     #[test]
     fn test_decompose_hypothetical_no_pii_in_output() {
@@ -188,7 +188,7 @@ mod tests {
         assert_eq!(transform.name(), "decompose_to_anonymized_hypothetical");
     }
 
-    // ── M3.9: DecomposeToSubtasks ───────────────────────────────────────
+    // ── DecomposeToSubtasks ───────────────────────────────────────
 
     #[test]
     fn test_decompose_subtasks_with_stub_decomposer() {
@@ -264,6 +264,6 @@ mod tests {
         assert_eq!(transform.name(), "decompose_to_subtasks");
     }
 
-    // ── M3.9: No LLM calls in any test ──────────────────────────────────
+    // ── No LLM calls in any test ──────────────────────────────────
     // All tests above use only fixture data — no live models or network.
 }

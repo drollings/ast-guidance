@@ -125,8 +125,7 @@ pub fn init_router_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::er
     // The `NonBlocking` writer is `Clone` (an `Arc` to the inner channel), so
     // hand a clone to the subscriber and leak the `AuditResources` struct —
     // dropping it here would drop the `WorkerGuard` and shut down the audit
-    // writer thread before any event is ever flushed (the pre-M1 bug that left
-    // the durable audit file empty).
+    // writer thread before any event is ever flushed.
     let audit_writer: Option<tracing_appender::non_blocking::NonBlocking> =
         audit_resources.as_ref().map(|r| r.appender.clone());
     std::mem::forget(audit_resources);
@@ -223,10 +222,11 @@ where
 
 /// Build an audit log layer (always JSON-formatted).
 ///
-/// The filter subscribes to the canonical `router.audit` target (M1.2). It
-/// also keeps `router.charts.audit=info` (M1.1) so pre-M1.3 chart audits
-/// still land in the file; once every producer emits through
-/// `crate::audit::AUDIT_TARGET` the second directive can be reverted.
+
+/// The filter subscribes to the canonical `router.audit` target.  It also
+/// keeps `router.charts.audit=info` so chart audits still land in the file;
+/// once every producer emits through `crate::audit::AUDIT_TARGET` the
+/// second directive can be reverted.
 fn audit_layer<S>(
     writer: tracing_appender::non_blocking::NonBlocking,
 ) -> Box<dyn Layer<S> + Send + Sync>

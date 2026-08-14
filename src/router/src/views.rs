@@ -1,8 +1,8 @@
-//! Reference-only view layer over the shared `ContentNodeStore` (M2).
+//! Reference-only view layer over the shared `ContentNodeStore`.
 //!
 //! Views are the VISION's read surface for the ledger: they hold node-id
-//! lists + per-node fidelity policy + composition, and **never own text**
-//! (D4). Text leaves the store through exactly one exit — [`LedgerView::render`]
+//! lists + per-node fidelity policy + composition, and **never own text**.
+//! Text leaves the store through exactly one exit — [`LedgerView::render`]
 //! → [`ContentNodeStore::lod_text`] — so there is a single place where a consumer can
 //! observe/transform what is rendered.
 //!
@@ -13,9 +13,9 @@
 //!   is computed **at most once** on the shared node and visible to every view.
 //! - [`FilteredLedger<V>`] — composes any inner view with an exclusion set and
 //!   an optional render transform. It is the single mechanism for both the PII
-//!   frontier view (`views::pii_redacted`, transform = M1's `scrub_for_ledger`)
+//!   frontier view (`views::pii_redacted`, transform = `scrub_for_ledger`)
 //!   and rigor's red-team view (exclusion of dead ends, no transform) — one
-//!   composition, two consumers (D4).
+//!   composition, two consumers.
 //!
 //! Rendering degrades to LOD0 when a lazy tier is missing or un-derivable (no
 //! summarizer) rather than erroring the whole render.
@@ -29,7 +29,7 @@ use crate::ledger_guard;
 use crate::node_store::ContentNodeStore;
 
 /// Level of detail, 0..=5 (VISION table). Router-local: `ContentNode` keeps
-/// `u8` fields for wire compat (D3).
+/// `u8` fields for wire compat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Lod(u8);
 
@@ -71,7 +71,7 @@ impl std::fmt::Display for Lod {
 }
 
 /// A reference-only view over the shared store. Views hold node-id lists and
-/// configuration, never owned text (D4). `render()` is provided and is the
+/// configuration, never owned text. `render()` is provided and is the
 /// **only** way text leaves a view.
 pub trait LedgerView: Send + Sync {
     /// The shared store this view reads from.
@@ -233,9 +233,9 @@ impl<V: LedgerView> LedgerView for FilteredLedger<V> {
     }
 }
 
-/// The PII frontier view (the VISION-named consumer of M1): a `FilteredLedger`
-/// whose transform scrubs every rendered line through the write-path guard.
-/// One implementation (`scrub_for_ledger`), two callers (D4/DRY).
+/// The PII frontier view: a `FilteredLedger` whose transform scrubs every
+/// rendered line through the write-path guard.  One implementation
+/// (`scrub_for_ledger`), two callers (DRY).
 pub fn pii_redacted<V: LedgerView, S: std::hash::BuildHasher>(
     inner: V,
     excluded: HashSet<NodeId, S>,

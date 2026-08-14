@@ -29,7 +29,9 @@ pub mod work;
 pub mod prelude;
 pub mod wrapper;
 
-pub use capability::{check_capability, Capability, CapabilityError, CapabilitySet, CURRENT_CAPS};
+pub use capability::{
+    check_capability, Capability, CapabilityError, CapabilitySet, FsCapability, CURRENT_CAPS,
+};
 pub use dynamic::{DynamicComponent, DynamicExecutor};
 pub use fluent_wvr_macros::{Describable, FieldAccess};
 pub use internment::ArcIntern;

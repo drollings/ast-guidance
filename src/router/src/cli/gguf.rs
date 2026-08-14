@@ -627,17 +627,28 @@ pub fn load_gguf_cache(gguf_dir: &Path) -> Option<GgufCache> {
 
 /// Write the cache, capturing `gguf_dir`'s post-write mtime as `parent_mtime`
 /// so `needs_rescan` sees a stable snapshot until the directory changes.
+///
+/// Writing the cache file can bump `gguf_dir`'s own mtime (asynchronously on
+/// some filesystems), so the value captured immediately after the first write
+/// may be stale and trigger a spurious rescan. Rewrite + recapture until the
+/// parent mtime is stable across consecutive reads: once the cache file exists,
+/// rewriting it no longer changes the parent directory's mtime, so the value
+/// settles after at most a few passes.
 pub fn write_gguf_cache(gguf_dir: &Path, cache: &mut GgufCache) {
-    let update = |cache: &mut GgufCache| {
-        cache.parent_mtime = file_mtime(gguf_dir);
+    let mut last = 0.0f64;
+    for _ in 0..8 {
         if let Ok(text) = serde_json::to_string_pretty(cache) {
-            let _ = std::fs::write(cache_path(gguf_dir), text);
+            if std::fs::write(cache_path(gguf_dir), text).is_err() {
+                return;
+            }
         }
-    };
-    // The first write bumps gguf_dir's mtime; re-capture so the next
-    // `needs_rescan` comparison is stable.
-    update(cache);
-    update(cache);
+        let now = file_mtime(gguf_dir);
+        cache.parent_mtime = now;
+        if now <= last {
+            return;
+        }
+        last = now;
+    }
 }
 
 /// Ensure the cache is fresh, rescanning when the directory changed.

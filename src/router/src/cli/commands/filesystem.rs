@@ -1,5 +1,13 @@
 //! Filesystem admin commands (`list`, `scan`, `rm`, `show`, `pull`) operating
 //! on the GGUF model layout.
+//!
+//! These are **operator tooling**: they run in a standalone CLI process
+//! before the server has established a `CURRENT_CAPS` scope, and they
+//! deliberately manipulate the model store (`rm -rf`, downloads, preset
+//! writes). They are **capability-exempt** by design and are NOT gated with the
+//! `FsCapability` token that the serving path enforces — an operator running
+//! `coral-router` against the filesystem is exercising explicit, authorized
+//! authority, not an ambient effect inside the serving request path.
 
 use std::collections::HashMap;
 use std::io::Write as _;

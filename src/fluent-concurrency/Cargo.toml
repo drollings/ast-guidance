@@ -7,7 +7,7 @@ edition.workspace = true
 default = ["db"]
 # The `db` feature pulls in the pooled-database surface. It is default-on so
 # existing consumers keep working; `--no-default-features` builds the pool /
-# zone / scope / queue primitives with zero database weight (D11).
+# batch / scope / queue primitives with zero database weight.
 db = ["dep:fluent-db", "fluent-db/sqlite"]
 
 [dependencies]

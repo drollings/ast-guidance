@@ -243,7 +243,7 @@ mod tests {
     /// arrive (a rendezvous barrier) before writing `done` — so every `done`
     /// marker existing proves the three ran concurrently, not serially.
     #[tokio::test]
-    async fn test_target_work_unit_zone_parallel_wave() {
+    async fn test_target_work_unit_batch_parallel_wave() {
         let caps = CapabilityRegistry::new();
         let dir = tempdir().unwrap();
         let dir_str = dir.path().to_string_lossy().into_owned();

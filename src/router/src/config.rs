@@ -1,4 +1,11 @@
 //! Router configuration types - deserialized from JSON via `common_core::config`.
+//!
+//! TODO(config.rs split, OPTIONAL): this file is large (the biggest
+//! production file in the workspace) but it is *cohesive config data*, not a
+//! logic god-file: ~42 serde structs, no duplicated logic. A future split is
+//! optional, NOT required by this roadmap. If split, group by concern
+//! (e.g. `RouterConfig`/`ModelEntry`/`SidecarConfig`/`PipelineParams`), but do
+//! not undertake it while the structs remain serde-heavy and cohesive.
 
 pub mod addr;
 pub mod builder;
@@ -41,18 +48,23 @@ pub struct RouterConfig {
     pub safety_threshold: f64,
     #[serde(default = "default_route")]
     pub default_route: String,
+    /// What the classifier stage does when its LLM call fails or its response
+    /// cannot be parsed. Safe default: reject rather than route on fabricated
+    /// scores.
+    #[serde(default = "default_classifier_failure_policy")]
+    pub classifier_failure_policy: ClassifierFailurePolicy,
     #[serde(default = "ServerConfig::default")]
     pub server: ServerConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
     #[serde(default)]
     pub classifier_model: Option<String>,
-    /// Chart-embedding model key (M7 HNSW index). Selects an entry from
+    /// Chart-embedding model key (HNSW index). Selects an entry from
     /// `models`. `None` falls back to `charts.selector_model`, then
     /// `classifier_model`.
     #[serde(default)]
     pub embedding_model: Option<String>,
-    /// Chart-candidate reranker model key (M7 step 2.5). Selects an entry
+    /// Chart-candidate reranker model key. Selects an entry
     /// from `models`. `None` skips the rerank stage (Step 2 - Step 3
     /// directly).
     #[serde(default)]
@@ -61,10 +73,10 @@ pub struct RouterConfig {
     pub mock: Option<MockConfig>,
     #[serde(default)]
     pub score_matrix: Option<ScoreMatrix>,
-    /// Chart store configuration (DAG workflow library). See M6-M10.
+    /// Chart store configuration (DAG workflow library).
     #[serde(default)]
     pub charts: ChartsConfig,
-    /// Post-processing configuration (M10 learning loop).
+    /// Post-processing configuration.
     #[serde(default)]
     pub post_process: PostProcessConfig,
     /// Nested classification tree.  `Some` switches the classifier stage
@@ -73,25 +85,25 @@ pub struct RouterConfig {
     /// of the server needs flat views.
     #[serde(default)]
     pub classification: Option<ClassificationTree>,
-    /// Rigor-route configuration (M3). `None` (the default) leaves the route
+    /// Rigor-route configuration. `None` (the default) leaves the route
     /// present but unconfigured - requests return an explicit `Unconfigured`
     /// error, never a crash.
     #[serde(default)]
     pub rigor: Option<RigorConfig>,
-    /// Sidecar instance-management policy (M4). Governs the sidecar task that
+    /// Sidecar instance-management policy. Governs the sidecar task that
     /// reconciles the fork's shared-weight instances against the configured
     /// profiles, polls `/memory`, and evicts/allocates KV + compute only (the
     /// weights stay loaded in `llama-server`).
     #[serde(default)]
     pub sidecar: SidecarConfig,
-    /// Ledger composition section (M2). `Some` opts the boot path into opening
+    /// Ledger composition section. `Some` opts the boot path into opening
     /// a `ContentNodeLedger` (with a real `Summarizer` backend targeting
     /// `<base>:ledger`) so LOD derivation exists at runtime. `None` (the
     /// default) leaves today's behavior - no ledger at boot.
     #[serde(default)]
     pub ledger: Option<LedgerConfig>,
-    /// Session composition section (M2). `Some` opts the boot path into a
-    /// `SessionRegistry` (D6 canonical session home) so rigor rewind and
+    /// Session composition section. `Some` opts the boot path into a
+    /// `SessionRegistry` (canonical session home) so rigor rewind and
     /// checkpoint/rewind state exist at runtime. `None` (the default) leaves
     /// today's behavior - no session registry at boot.
     #[serde(default)]
@@ -119,6 +131,7 @@ impl Default for RouterConfig {
             system_prompt: String::new(),
             safety_threshold: 0.5,
             default_route: "local".into(),
+            classifier_failure_policy: ClassifierFailurePolicy::Reject,
             server: ServerConfig::default(),
             logging: LoggingConfig::default(),
             classifier_model: None,
@@ -558,6 +571,31 @@ pub struct ClassifierOutput {
 
 use common_core::constants::default_true;
 
+/// What the classifier stage does when its LLM call fails or its response
+/// cannot be parsed. The safe default is `Reject`: the router
+/// must never convert a classifier outage into a maximum-confidence dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClassifierFailurePolicy {
+    /// Return `StageVerdict::Rejected` with a truthful reason (no fabricated
+    /// scores).
+    Reject,
+    /// Route to the configured default route, but with scores that reflect the
+    /// failure (coherence/safety = 0.0) and a `reason` stating the error.
+    RouteToDefaultTruthful,
+    /// Fall back to route with fabricated 1.0 scores.
+    /// Deprecated; exists only for backward compatibility in code (never
+    /// deserializable from config).
+    #[serde(skip)]
+    LegacyFailOpen,
+}
+
+/// Safe default for `RouterConfig.classifier_failure_policy`: reject on
+/// classifier failure rather than route on fabricated scores.
+fn default_classifier_failure_policy() -> ClassifierFailurePolicy {
+    ClassifierFailurePolicy::Reject
+}
+
 /// The default route when a config omits `default_route`: `local`, matching
 /// the shipped `env/coral-router.json` (no `fast` model exists in-tree).
 fn default_route() -> String {
@@ -569,8 +607,8 @@ fn default_route() -> String {
 /// Chart store configuration - the `charts` section of `RouterConfig`.
 ///
 /// The store is owned by `fluent-router` (see `coral-router`/`charts/`): a
-/// directory of human-authored chart JSON files (`D3`), a router-side
-/// `workflow_library` HNSW/SQLite path for retrieval (M7), and the model key
+/// directory of human-authored chart JSON files, a router-side
+/// `workflow_library` HNSW/SQLite path for retrieval, and the model key
 /// used by chart-selection LLM adjudication.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChartsConfig {
@@ -579,10 +617,10 @@ pub struct ChartsConfig {
     #[serde(default)]
     pub dir: Option<String>,
     /// `workflow_library` HNSW/SQLite file path. The index is built lazily
-    /// at boot only when this is set (M7).
+    /// at boot only when this is set.
     #[serde(default)]
     pub index_path: Option<String>,
-    /// Chart-selection classifier model key (M7 LLM adjudication step).
+    /// Chart-selection classifier model key (LLM adjudication step).
     #[serde(default)]
     pub selector_model: Option<String>,
     /// Max candidates surfaced to the selector's LLM adjudication.
@@ -613,7 +651,7 @@ const fn default_charts_max_candidates() -> usize {
     5
 }
 
-// -- Rigor (M3) configuration ----------------------------------------------
+// -- Rigor configuration ----------------------------------------------
 
 /// Rigor-route configuration - the `rigor` section of `RouterConfig`.
 ///
@@ -647,7 +685,7 @@ pub struct RigorConfig {
     #[serde(default = "default_rigor_severity_threshold")]
     pub severity_threshold: f64,
     /// Judge confidence below which a final rejection escalates to frontier.
-    /// An explicit config value - never "red scored a point" (M3.5).
+    /// An explicit config value - never "red scored a point".
     /// Default 0.4.
     #[serde(default = "default_rigor_escalation_confidence")]
     pub escalation_confidence: f64,
@@ -683,7 +721,7 @@ const fn default_rigor_escalation_confidence() -> f64 {
 /// named constant - `LedgerConfig.max_summary_tokens` defaults to it.
 pub const DEFAULT_LEDGER_MAX_SUMMARY_TOKENS: u32 = 200;
 
-/// Ledger composition section (M2) - the `ledger` block of `RouterConfig`.
+/// Ledger composition section - the `ledger` block of `RouterConfig`.
 ///
 /// `Some` opts the composition root (`main.rs`) into opening a
 /// `ContentNodeLedger` and attaching a `Summarizer` backend targeting the
@@ -702,7 +740,7 @@ pub struct LedgerConfig {
     /// Max summary length (tokens) for LOD1-LOD4 derivation.
     #[serde(default = "default_ledger_max_summary_tokens")]
     pub max_summary_tokens: u32,
-    /// Enable continuous background LOD4/LOD5 generation (M2). `false` (the
+    /// Enable continuous background LOD4/LOD5 generation. `false` (the
     /// default) keeps today's lazy-on-demand behavior.
     #[serde(default)]
     pub background_tiering: bool,
@@ -722,7 +760,7 @@ pub struct LedgerConfig {
     /// Tier worker poll interval (ms).
     #[serde(default = "default_tier_poll_interval_ms")]
     pub tier_poll_interval_ms: u64,
-    /// Ledger-agent coordinator section (M5). `enabled = true` opts the boot
+    /// Ledger-agent coordinator section. `enabled = true` opts the boot
     /// path into attaching a `LedgerAgentCoordinator` to the server so a
     /// request with a session + ledger runs through its synchronization loop
     /// (`restore-or-assemble → execute → record → snapshot → enqueue`).
@@ -768,7 +806,7 @@ impl Default for LedgerConfig {
     }
 }
 
-/// The `ledger.orchestrator` section (M5): configures the
+/// The `ledger.orchestrator` section: configures the
 /// `LedgerAgentCoordinator`'s restore-vs-re-prefill policy, its prompt budget,
 /// and the default role recorded for agent output nodes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -808,9 +846,9 @@ impl Default for OrchestratorSection {
     }
 }
 
-/// Session composition section (M2) - the `session` block of `RouterConfig`.
+/// Session composition section - the `session` block of `RouterConfig`.
 ///
-/// `Some` opts the composition root into a `SessionRegistry` (D6 canonical
+/// `Some` opts the composition root into a `SessionRegistry` (canonical
 /// session home) so checkpoint/rewind state and rigor rewind exist at runtime.
 /// `None` (absent) keeps today's behavior - no session registry at boot.
 /// Default model run parameters - the top-level `default_params` block.
@@ -907,9 +945,9 @@ const fn default_sleep_idle_seconds() -> i32 {
     15
 }
 
-/// Session composition section (M2) - the `session` block of `RouterConfig`.
+/// Session composition section - the `session` block of `RouterConfig`.
 ///
-/// `Some` opts the composition root into a `SessionRegistry` (D6 canonical
+/// `Some` opts the composition root into a `SessionRegistry` (canonical
 /// session home) so checkpoint/rewind state and rigor rewind exist at runtime.
 /// `None` (absent) keeps today's behavior - no session registry at boot.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -921,7 +959,7 @@ pub struct SessionConfig {
     pub root: Option<String>,
 }
 
-/// Sidecar instance-management policy (M4).
+/// Sidecar instance-management policy.
 ///
 /// The sidecar task is the external VRAM-policy owner the fork's docs
 /// describe: it boot-reconciles configured instance profiles against
@@ -952,7 +990,7 @@ pub struct SidecarConfig {
     #[serde(default)]
     pub minimum_remaining_vram: Option<u64>,
     /// Slot-save directory the fork writes KV snapshots under
-    /// (`<slot_save_path>/<model_key>/`). Feeds M3 snapshot-path derivation.
+    /// (`<slot_save_path>/<model_key>/`). Feeds snapshot-path derivation.
     #[serde(default)]
     pub slot_save_path: Option<String>,
     /// Resume snapshots older than this many seconds of context idle are
@@ -965,6 +1003,16 @@ pub struct SidecarConfig {
     /// Env var naming the management API key sent as `Authorization: Bearer`.
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// Post-boot liveness poll: how often the supervision task probes a running
+    /// server's `/health` (seconds). A server that stays alive but stops
+    /// answering `liveness_failures_before_restart` consecutive probes is
+    /// killed and restarted.
+    #[serde(default = "default_sidecar_liveness_poll_s")]
+    pub liveness_poll_interval_s: u64,
+    /// Consecutive failed `/health` probes before a hung server is killed and
+    /// restarted.
+    #[serde(default = "default_sidecar_liveness_failures")]
+    pub liveness_failures_before_restart: u32,
 }
 
 impl Default for SidecarConfig {
@@ -978,6 +1026,8 @@ impl Default for SidecarConfig {
             slot_save_path: None,
             resume_ttl_s: None,
             api_key_env: None,
+            liveness_poll_interval_s: default_sidecar_liveness_poll_s(),
+            liveness_failures_before_restart: default_sidecar_liveness_failures(),
         }
     }
 }
@@ -994,16 +1044,24 @@ const fn default_sidecar_evict_batch() -> usize {
     1
 }
 
+const fn default_sidecar_liveness_poll_s() -> u64 {
+    30
+}
+
+const fn default_sidecar_liveness_failures() -> u32 {
+    3
+}
+
 /// Detect the device VRAM total (bytes) from the ROCm sysfs interface. Returns
 /// the first non-zero `mem_info_vram_total` found under `/sys/class/drm`. Used
 /// when `sidecar.vram_total_bytes` is unset so a `minimum_remaining_vram`
 /// budget alone can drive the residency loop. `None` when the interface is
 /// absent (non-ROCm hosts).
 pub fn detect_device_vram_total() -> Option<u64> {
-    let entries = std::fs::read_dir("/sys/class/drm").ok()?;
+    let entries = fluent_wvr::capability::capability_aware_fs::read_dir("/sys/class/drm").ok()?;
     for entry in entries.flatten() {
         let path = entry.path().join("device/mem_info_vram_total");
-        let text = std::fs::read_to_string(path).ok()?;
+        let text = fluent_wvr::capability::capability_aware_fs::read_to_string(path).ok()?;
         let total = text.trim().parse::<u64>().ok()?;
         if total > 0 {
             return Some(total);
@@ -1037,13 +1095,13 @@ const fn default_charts_entity_context() -> bool {
     true
 }
 
-// -- Post-processing (M10 learning loop) configuration ---------------------
+// -- Post-processing configuration ---------------------
 
 /// Post-processing configuration - the `post_process` section of
 /// `RouterConfig`.
 ///
 /// Controls the VISION learning loop: whether a *successful* dispatch is
-/// distilled into a reusable draft chart (M10). Per VISION -"Post-processing:
+/// distilled into a reusable draft chart. Per VISION -"Post-processing:
 /// audit + workflow extraction", extraction is opt-in and the produced chart
 /// is a draft that only becomes selectable after a rubric-validated run.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1061,7 +1119,7 @@ pub struct PostProcessConfig {
     pub workflow_extraction_mode: WorkflowExtractionMode,
 }
 
-/// Extraction scope for the M10 learning loop (see `PostProcessConfig`).
+/// Extraction scope for the learning loop (see `PostProcessConfig`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkflowExtractionMode {
     /// Only frontier-assisted dispatches (an index > 0 in the primary +
@@ -1103,7 +1161,7 @@ mod tests {
         assert!(cfg.selector_model.is_none());
     }
 
-    // -- M3 rigor-route configuration -------------------------------------
+    // -- Rigor-route configuration -------------------------------------
 
     #[test]
     fn rigor_config_defaults() {
@@ -1233,7 +1291,7 @@ mod tests {
         assert_eq!(cfg.charts.min_score, 0.6, "unset field keeps its default");
     }
 
-    // -- Post-process (M10 learning loop) --------------------------------
+    // -- Post-process (learning loop) --------------------------------
 
     #[test]
     fn post_process_defaults_to_disabled() {
@@ -1324,7 +1382,7 @@ mod tests {
 
     #[test]
     fn model_entry_serde_defaults_read_canonical_constants() {
-        // The same constants `RoutingTarget` reads (M7.2 divergence guard).
+        // The same constants `RoutingTarget` reads (divergence guard).
         let entry: ModelEntry = serde_json::from_value(serde_json::json!({
             "endpoint": "http://localhost:8080/v1/chat/completions",
             "intelligence": 2,
@@ -1348,7 +1406,7 @@ mod tests {
         );
     }
 
-    // -- M4 classification-tree derived flat views ------------------------
+    // -- Classification-tree derived flat views ------------------------
 
     fn tree_section() -> serde_json::Value {
         serde_json::json!({
@@ -1428,7 +1486,7 @@ mod tests {
         assert_eq!(routing.system_prompt, "custom preamble");
     }
 
-    // -- M6: in-group target-matching knob (PipelineParams) ----------------
+    // -- In-group target-matching knob (PipelineParams) ----------------
 
     #[test]
     fn pipeline_params_target_match_defaults() {
@@ -1503,7 +1561,7 @@ mod tests {
         assert_eq!(back.pipelines["default"].target_match_timeout_ms, 12345);
     }
 
-    // -- M1 instance-pool declaration -------------------------------------
+    // -- Instance-pool declaration -------------------------------------
 
     fn profile_json(name: &str, count: u32, group: &str, num_ctx: u64) -> serde_json::Value {
         serde_json::json!({
@@ -1603,7 +1661,7 @@ mod tests {
         assert!(profiles[0].no_sleep);
     }
 
-    // -- M1 pool vs default qualifier (D1) -------------------------------
+    // -- Pool vs default qualifier -------------------------------
 
     /// The reference swarm entry: a count=3 non-default `swarm` work pool, a
     /// pinned `default: true` ledger, and a non-default scratch profile.
@@ -1686,8 +1744,6 @@ mod tests {
         assert!(entry.pool_qualifier().is_none());
     }
 
-    // -- M4 sidecar policy -----------------------------------------------
-
     #[test]
     fn sidecar_absent_section_defaults_cleanly() {
         let cfg: RouterConfig =
@@ -1739,17 +1795,28 @@ mod tests {
         // No explicit ceiling: the budget is computed from the detected total.
         // The host has a ROCm device (mem_info_vram_total > 0), so the limit is
         // detection - minimum_remaining; a missing floor yields the full total.
+        // Detection reads `/sys/class/drm` through the capability-gated fs
+        // helper, so it runs under the `FsCapability` grant the serving
+        // path establishes at boot.
         let cfg: RouterConfig = serde_json::from_value(serde_json::json!({
             "sidecar": { "minimum_remaining_vram": 2147483648u64 }
         }))
         .unwrap();
-        let detected = super::detect_device_vram_total();
+        let (detected, allocation_limit) = fluent_concurrency::scope::CURRENT_CAPS.sync_scope(
+            fluent_concurrency::capability::default_capability_set(),
+            || {
+                (
+                    super::detect_device_vram_total(),
+                    cfg.sidecar.allocation_limit(),
+                )
+            },
+        );
         assert!(
             detected.is_some(),
             "ROCm sysfs mem_info_vram_total present on this host"
         );
         assert_eq!(
-            cfg.sidecar.allocation_limit(),
+            allocation_limit,
             detected.map(|t| t.saturating_sub(2147483648))
         );
     }
@@ -1812,7 +1879,7 @@ mod tests {
         assert_eq!(cfg.default_params.num_ctx, 32768);
     }
 
-    // -- M2 ledger + session composition sections ------------------------
+    // -- Ledger + session composition sections ------------------------
 
     #[test]
     fn router_config_absent_ledger_and_session_sections_default_to_none() {
@@ -1878,7 +1945,7 @@ mod tests {
 
     #[test]
     fn ledger_background_tiering_fields_default_absent() {
-        // M2.4: all background-tiering fields are default-absent so existing
+        // All background-tiering fields are default-absent so existing
         // `coral-router.json` files deserialize unchanged.
         let cfg: RouterConfig =
             serde_json::from_value(serde_json::json!({ "ledger": { "model": "swarm" } })).unwrap();
@@ -1893,7 +1960,7 @@ mod tests {
 
     #[test]
     fn ledger_background_tiering_fields_round_trip() {
-        // A fully-populated ledger section round-trips all M2.4 knobs.
+        // A fully-populated ledger section round-trips knobs.
         let cfg: RouterConfig = serde_json::from_value(serde_json::json!({
             "ledger": {
                 "model": "swarm",
@@ -1915,7 +1982,7 @@ mod tests {
         assert_eq!(ledger.tier_poll_interval_ms, 250);
     }
 
-    // -- M5.1: ledger orchestrator section --------------------------------
+    // -- Ledger orchestrator section --------------------------------
 
     #[test]
     fn orchestrator_section_default_absent() {

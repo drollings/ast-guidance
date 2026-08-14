@@ -12,8 +12,8 @@
 //! `Scope`/`SupervisedBatch`. This crate's `DbCapability` is the *token*; the gating
 //! seam stays in `fluent-wvr`.
 //!
-//! The lossy all-values-as-strings `query` / `execute` methods are **deprecated**
-//! (M3, §0.5): new code should use the typed `SqlitePool::query_row` /
+//! The lossy all-values-as-strings `query` / `execute` methods are **deprecated**:
+//! new code should use the typed `SqlitePool::query_row` /
 //! `query_rows` / `execute` helpers with typed row mappers. Both surfaces share
 //! the `DbError` error type — the deprecated methods return `DbError`, not
 //! `IoError`, so callers see one error taxonomy across the whole crate.
@@ -58,8 +58,8 @@ impl DbCapability {
     /// Opens a database at the given path (or `:memory:` for an ephemeral
     /// in-memory pool) with the default pool configuration (5 connections).
     ///
-    /// The `:memory:` path routes through the shared-cache in-memory pool path
-    /// (M1): all pool connections share one named in-memory database, so
+    /// The `:memory:` path routes through the shared-cache in-memory pool path:
+    /// all pool connections share one named in-memory database, so
     /// concurrent checkouts are coherent rather than each seeing a private
     /// empty DB.
     pub fn open(path: &str) -> Result<Self, DbError> {
@@ -82,7 +82,7 @@ impl DbCapability {
     ///
     /// **Deprecated**: this lossy string-map shape is superseded by the typed
     /// `SqlitePool::query_row` / `query_rows` helpers. Kept so existing
-    /// callers compile unchanged (§0.5 M3).
+    /// callers compile unchanged.
     #[deprecated = "use SqlitePool::query_rows/query_row with typed row mappers instead"]
     pub async fn query(&self, sql: &str) -> Result<Vec<HashMap<String, String>>, DbError> {
         check_db_capability()?;
@@ -127,7 +127,7 @@ impl DbCapability {
     /// number of rows affected.
     ///
     /// **Deprecated**: superseded by the typed `SqlitePool::execute`. Kept so
-    /// existing callers compile unchanged (§0.5 M3).
+    /// existing callers compile unchanged.
     #[deprecated = "use SqlitePool::execute with typed params instead"]
     pub async fn execute(&self, sql: &str) -> Result<usize, DbError> {
         check_db_capability()?;
@@ -147,7 +147,7 @@ impl DbCapability {
 #[cfg(test)]
 mod tests {
     // The deprecated `query`/`execute` are exercised here as the behavior
-    // oracle for legacy callers (§0.5 M3).
+    // oracle for legacy callers.
     #![allow(deprecated)]
     use super::*;
     use fluent_wvr::capability::CURRENT_CAPS;

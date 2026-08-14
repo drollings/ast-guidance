@@ -1,4 +1,4 @@
-//! `LedgerTierWorker` — continuous background LOD4/LOD5 generation (M2).
+//! `LedgerTierWorker` — continuous background LOD4/LOD5 generation.
 //!
 //! A background task drains a feed of pending node ids (attached to the
 //! `ContentNodeStore` via `set_tier_events`) and derives LOD4 (short summary) and
@@ -11,7 +11,7 @@
 //! bounds concurrent derivations with a `Limiter` and emits a `kind = "tier"`
 //! audit record per derived node.
 //!
-//! Degradation rules (M2.2): when the backend is unavailable, LOD5 falls back
+//! Degradation rules: when the backend is unavailable, LOD5 falls back
 //! to the deterministic `derive_label` and LOD4 is left empty — never a crash.
 //! Transient backend errors are re-enqueued with bounded retry (no infinite
 //! loop).
@@ -74,7 +74,7 @@ pub enum TierError {
 /// A fully derived LOD4 + LOD5 pair for one node.
 type DerivedTiers = (Option<String>, Option<String>);
 
-/// The background LOD4/LOD5 derivation worker (M2).
+/// The background LOD4/LOD5 derivation worker.
 pub struct LedgerTierWorker {
     store: Arc<ContentNodeStore>,
     /// The injected backend — the same transport the `Summarizer` uses; no
@@ -92,7 +92,7 @@ pub struct LedgerTierWorker {
     /// Bounded re-enqueue attempt counts (avoid infinite retry loops).
     retries: Mutex<HashMap<NodeId, u32>>,
     max_retries: u32,
-    /// Latency histogram over the backend derive step (M5.2 observability).
+    /// Latency histogram over the backend derive step (observability).
     metrics: Arc<common_core::metrics::LatencyHistogram>,
 }
 
@@ -126,7 +126,7 @@ impl LedgerTierWorker {
         })
     }
 
-    /// The shared latency histogram over tier derivation (M5.2). Exposed so the
+    /// The shared latency histogram over tier derivation. Exposed so the
     /// server's metrics surface can aggregate it.
     pub fn metrics(&self) -> Arc<common_core::metrics::LatencyHistogram> {
         Arc::clone(&self.metrics)
@@ -268,7 +268,7 @@ impl LedgerTierWorker {
             let lod4_empty = guard.lod.get(4).is_none_or(String::is_empty);
             // LOD5 is eager (deterministic label); it "needs" derivation only
             // when empty or still holding the deterministic placeholder (i.e.
-            // not yet upgraded to an LLM description — M2.3).
+            // not yet upgraded to an LLM description)
             let current_l5 = guard.lod.get(5).cloned().unwrap_or_default();
             let lod5_needs_upgrade = current_l5.is_empty() || current_l5 == derive_label(&role, &lod0);
             (
@@ -682,7 +682,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn derive_records_latency_metric() {
-        // M5.2: each backend derive step records into the shared histogram.
+        // Each backend derive step records into the shared histogram.
         let store = temp_store();
         let backend: Arc<dyn ChatBackend> = repeating(
             "SUMMARY: s\nDESCRIPTION: d",

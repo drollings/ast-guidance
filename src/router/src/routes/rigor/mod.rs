@@ -1,4 +1,4 @@
-//! Rigor route - the fixed-pass blue/red/judge protocol (M3).
+//! Rigor route - the fixed-pass blue/red/judge protocol.
 //!
 //! `RigorRoute` wires the VISION's high-stakes verification loop to live
 //! backends:
@@ -6,7 +6,7 @@
 //! 1. **Blue team** produces a candidate answer (plain text).
 //! 2. A `DependencySession` checkpoint (`rigor.blue`) is recorded so a
 //!    red-team-identified dead end can be **rewound for real**.
-//! 3. **Red team** reads the session through M2's `FilteredLedger` at
+//! 3. **Red team** reads the session through `FilteredLedger` at
 //!    `Lod::LOD0` (exclusion set = blue's rejected dead ends) and emits a JSON
 //!    array of objections.
 //! 4. **Judge** emits a structured verdict (`accept` /
@@ -23,7 +23,7 @@
 //! (VISION: terminate, don't loop). Backends are DIP-injected
 //! `Arc<dyn ChatBackend>` built exactly once in `main.rs`. There is **no**
 //! `Interviewable` trait - the targeted interview is a third, distinct shape
-//! from plan's binding-gap closure loop (D5).
+//! from plan's binding-gap closure loop.
 //!
 //! The prompt constants, message builders, and tolerant parse helpers live in
 //! the [`prompts`] submodule.
@@ -61,14 +61,14 @@ pub struct RigorContext {
     pub user_message: String,
     pub session_id: String,
     pub model_endpoint: String,
-    /// The `DependencySession` for checkpoint/rewind between passes (D5).
+    /// The `DependencySession` for checkpoint/rewind between passes.
     /// `None` degrades to a sessionless run (no checkpoint, no rewind, no
     /// red-team ledger view).
     pub session: Option<Arc<Mutex<DependencySession>>>,
-    /// The shared `ContentNodeLedger` whose store the red team reads at LOD0
-    /// (D6). `None` degrades the red pass to the blue answer only.
+    /// The shared `ContentNodeLedger` whose store the red team reads at LOD0.
+    /// `None` degrades the red pass to the blue answer only.
     pub ledger: Option<Arc<ContentNodeLedger>>,
-    /// The named instance the blue pass served on (M3/D7). `Some` lets the
+    /// The named instance the blue pass served on. `Some` lets the
     /// blue-pass completion record a fork KV snapshot on it; `None` skips the
     /// save (degrade, never a crash).
     pub kv_instance: Option<String>,
@@ -83,7 +83,7 @@ pub struct RigorRoute {
     /// Route behavior config: `max_passes`, material-rejection threshold,
     /// escalation trigger.
     cfg: RigorConfig,
-    /// Optional `LedgerPromptAssembler` (M5.3): when a ledger is attached, the
+    /// Optional `LedgerPromptAssembler`: when a ledger is attached, the
     /// judge renders its review prompt over the session ledger through the
     /// assembler's budget/relevance rules. The red team keeps its LOD0
     /// `FilteredLedger` view unchanged (it dereferences LOD0 by design).
@@ -110,8 +110,8 @@ pub struct RedObjection {
     pub category: String,
     pub description: String,
     pub severity: f64,
-    /// The claim's ledger node id the objection dereferences at LOD0
-    /// (D5). `None` when the objection is not claim-anchored.
+    /// The claim's ledger node id the objection dereferences at LOD0.
+    /// `None` when the objection is not claim-anchored.
     #[serde(default)]
     pub target_claim: Option<NodeId>,
 }
@@ -151,7 +151,7 @@ impl RigorRoute {
     }
 
     /// Attach the `LedgerPromptAssembler` so the judge's review prompt renders
-    /// the session ledger at a budget/relevance-matched fidelity (M5.3).
+    /// the session ledger at a budget/relevance-matched fidelity.
     #[must_use]
     pub fn with_prompt_assembler(
         mut self,
@@ -205,7 +205,7 @@ impl RigorRoute {
         backend.ok_or_else(|| RigorError::Unconfigured(name.to_string()))
     }
 
-    /// Execute the fixed-pass rigor protocol (D5):
+    /// Execute the fixed-pass rigor protocol:
     /// blue -> checkpoint -> red -> judge -> (rewind + second blue + judge) ->
     /// interview/escalation.
     ///
@@ -401,7 +401,7 @@ impl RigorRoute {
     }
 
     /// Persist the first blue answer as a rejected dead-end ledger node so the
-    /// second red pass's filtered view excludes it (D6). Best-effort; a
+    /// second red pass's filtered view excludes it. Best-effort; a
     /// missing ledger degrades silently.
     fn record_blue_dead_end(ctx: &RigorContext, answer: &str) {
         let Some(ledger) = &ctx.ledger else {
@@ -437,8 +437,8 @@ impl RigorRoute {
         let _ = ledger.record_content_node(&node);
     }
 
-    /// Red-pass prompt: the blue answer plus the session rendered through M2's
-    /// `FilteredLedger` at LOD0, excluding blue's rejected dead ends (D6).
+    /// Red-pass prompt: the blue answer plus the session rendered through
+    /// `FilteredLedger` at LOD0, excluding blue's rejected dead ends.
     /// No ledger/session -> the blue answer alone (documented degradation).
     async fn red_pass(
         ctx: &RigorContext,
@@ -457,7 +457,7 @@ impl RigorRoute {
         parse_objections(&raw).map_err(RigorError::RedTeam)
     }
 
-    /// The M2 red-team view: `ParallelLedger::for_session(...).with_default_lod
+    /// A red-team view: `ParallelLedger::for_session(...).with_default_lod
     /// (Lod::LOD0)` wrapped in `FilteredLedger` excluding dead-end node ids.
     fn red_team_view(ctx: &RigorContext) -> String {
         let Some(ledger) = &ctx.ledger else {
@@ -477,7 +477,7 @@ impl RigorRoute {
         objections: &[RedObjection],
     ) -> Result<(JudgeVerdict, f64), RigorError> {
         let prompt = judge_prompt(answer, objections);
-        // M5.3: fold the session ledger (assembled through the budget/relevance
+        // Fold the session ledger (assembled through the budget/relevance
         // rules) into the judge's review material when a ledger + assembler are
         // attached. Additive — a route without them keeps today's prompt.
         let ledger_ctx = self.assembled_judge_context(ctx);
@@ -493,7 +493,7 @@ impl RigorRoute {
     }
 
     /// Render the session ledger through the `LedgerPromptAssembler` for the
-    /// judge's review prompt (M5.3). Empty when no assembler or ledger is
+    /// judge's review prompt. Empty when no assembler or ledger is
     /// attached (the judge degrades to today's prompt). The rendered `body` is
     /// the assembled context; the per-node fidelity `node_plan` is audited.
     fn assembled_judge_context(&self, ctx: &RigorContext) -> String {
@@ -608,7 +608,7 @@ mod tests {
         r#"{"verdict": "reject", "caveats": [], "reasons": ["x"], "confidence": 0.8}"#
     }
 
-    // -- M3.2: prompts + parse --------------------------------------------
+    // -- Prompts + parse --------------------------------------------
 
     #[tokio::test]
     async fn blue_returns_plain_string() {
@@ -690,7 +690,7 @@ mod tests {
         assert!(parse_judge(r#"{"verdict": "maybe", "confidence": 0.5}"#).is_err());
     }
 
-    // -- M3.5: bounded pass loop ------------------------------------------
+    // -- Bounded pass loop ------------------------------------------
 
     #[tokio::test]
     async fn judge_accepts_first_pass_no_rewind_no_interview() {
@@ -804,7 +804,7 @@ mod tests {
         ));
     }
 
-    // -- M3.3: session steps + real rewind --------------------------------
+    // -- Session steps + real rewind --------------------------------
 
     #[tokio::test]
     async fn material_rejection_resets_rigor_steps_to_pending() {
@@ -859,7 +859,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rewind_restores_kv_snapshot_for_real() {
         // Mirrors `dag_session::tests::test_rewind_restores_kv_snapshot_for_real`:
-        // a session carrying the SnapshotStore (D6) has its stored snapshot
+        // a session carrying the SnapshotStore has its stored snapshot
         // actually restored on rewind.
         use crate::kv_cache::{ColdSnapshotIndex, HotSnapshotIndex, SnapshotStore, KvSnapshot};
 
@@ -914,7 +914,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn blue_save_then_rewind_produces_pending_kv_fields() {
-        // M3/D7: the blue-pass completion saves a fork snapshot on the blue
+        // The blue-pass completion saves a fork snapshot on the blue
         // instance (stub fork receives the POST), then the material-rejection
         // rewind finds real metadata and the session carries pending KV fields
         // (`snapshot`/`instance`/`id_slot`) for the next dispatch.
@@ -986,7 +986,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn blue_save_without_kv_instance_is_a_no_op() {
-        // M3/D7 degradation: with a kv manager + fork but no `kv_instance`,
+        // Degradation: with a kv manager + fork but no `kv_instance`,
         // the blue save is skipped (never a crash) and the stub sees no POST.
         use crate::instances::stub::StubServer;
         use crate::instances::InstanceClient;
@@ -1044,7 +1044,7 @@ mod tests {
         );
     }
 
-    // -- M3.4: red-team filtered view at LOD0 -----------------------------
+    // -- Red-team filtered view at LOD0 -----------------------------
 
     /// A recording backend that captures the user message it receives (the red
     /// prompt) so the test can assert on the rendered view material.
@@ -1113,7 +1113,7 @@ mod tests {
         );
     }
 
-    // -- M5.3: judge uses the LedgerPromptAssembler -----------------------
+    // -- Judge uses the LedgerPromptAssembler -----------------------
 
     /// A recording judge backend that captures the user message it receives.
     struct RecordingJudge {
@@ -1134,7 +1134,7 @@ mod tests {
 
     #[tokio::test]
     async fn judge_prompt_renders_ledger_via_assembler() {
-        // M5.3: with a ledger + assembler attached, the judge's review prompt
+        // With a ledger + assembler attached, the judge's review prompt
         // folds in the session ledger rendered through the assembler's
         // budget/relevance rules (red team keeps its LOD0 view unchanged).
         let dir = std::env::temp_dir().join(format!(
@@ -1242,10 +1242,10 @@ pub async fn handle_rigor_request(
         .as_ref()
         .map_or_else(|| "fast".into(), |(name, _)| name.clone());
 
-    // D5/D6: thread the registry session + shared ledger into the context so
+    // Thread the registry session + shared ledger into the context so
     // checkpoint/rewind and the red-team LOD0 view are load-bearing.
     let session = sessions.as_ref().map(|s| s.get_or_create(&session_id));
-    // M3/D7: the session model is set so KV snapshot save/rewind can key by it
+    // The session model is set so KV snapshot save/rewind can key by it
     // (`dag_session.rs` refuses to key without a model). The blue instance is
     // the model's internal work group (the pool).
     if let Some(session) = &session {

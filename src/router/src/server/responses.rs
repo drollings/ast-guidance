@@ -158,7 +158,7 @@ pub fn fallback_completion(model_name: &str) -> RouterResponse {
 /// The assistant's answer text from a completion (first choice), or `None`
 /// when the response carries no choices.
 ///
-/// M5: the single extraction used by the dispatch path (M10 workflow
+/// The single extraction used by the dispatch path (workflow
 /// extractor, `server/dispatch.rs`) and by the handler when it records the
 /// matched target's answer into the ledger + session step.
 pub fn answer_text(completion: &RouterResponse) -> Option<String> {

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 /// End-to-end: SupervisedBatch orchestrates WorkerPool-backed tasks
 #[tokio::test(start_paused = true)]
-async fn test_e2e_zone_with_worker_pool() {
+async fn test_e2e_batch_with_worker_pool() {
     tokio::time::resume();
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
@@ -67,7 +67,7 @@ async fn test_e2e_zone_with_worker_pool() {
 
 /// End-to-end: SupervisedBatch handles mixed success/failure/cancellation
 #[tokio::test(start_paused = true)]
-async fn test_e2e_zone_mixed_outcomes() {
+async fn test_e2e_batch_mixed_outcomes() {
     let runtime = crate::tokio_runtime();
     let caps = CapabilitySet::new();
 

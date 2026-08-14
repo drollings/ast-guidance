@@ -299,7 +299,7 @@ impl ColdSnapshotIndex {
 pub struct SnapshotStore {
     hot: Arc<HotSnapshotIndex>,
     cold: Arc<ColdSnapshotIndex>,
-    /// Optional fork management client (M4 sidecar). When present, snapshot
+    /// Optional fork management client. When present, snapshot
     /// save/list/delete round-trip through the fork's management API; without
     /// one they degrade to metadata-only no-ops (never a crash).
     fork: Option<Arc<crate::instances::InstanceClient>>,
@@ -314,7 +314,7 @@ impl SnapshotStore {
         }
     }
 
-    /// Attach the fork management client (D6) so `save_snapshot`/`list_snapshots`
+    /// Attach the fork management client so `save_snapshot`/`list_snapshots`
     /// /`delete_snapshot` round-trip through the fork's snapshot API. Optional,
     /// post-construction; without it the manager keeps today's metadata-only
     /// behavior. Reuses the single `InstanceClient` (no second HTTP client).
@@ -366,7 +366,7 @@ impl SnapshotStore {
     /// Record (server-side) that a snapshot named `name` was saved on `instance`
     /// for the given `(model, adapter, session)` key.
     ///
-    /// With an attached fork handle (D6) this round-trips the fork's
+    /// With an attached fork handle this round-trips the fork's
     /// `POST /instances/:instance/snapshot` (through the shared
     /// `common_core::runtime::block_on` bridge - never a hand-rolled runtime)
     /// and then records the metadata in both tiers so a rewind finds it. Without
@@ -688,7 +688,7 @@ mod tests {
         assert!(loaded.file_path.as_os_str().is_empty());
     }
 
-    // -- M3: fork round-trip via the optional InstanceClient handle --------
+    // -- Fork round-trip via the optional InstanceClient handle --------
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn save_snapshot_with_fork_records_metadata_and_posts() {

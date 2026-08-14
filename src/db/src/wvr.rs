@@ -1,4 +1,4 @@
-//! Database `Component`/`WorkUnit` adapters (D9).
+//! Database `Component`/`WorkUnit` adapters.
 //!
 //! `DbWorkUnit` wraps a synchronous store operation so it can run under a
 //! `SupervisedBatch` supervisor (or any `WorkUnit` orchestrator) without violating the
@@ -227,7 +227,7 @@ mod tests {
         store
     }
 
-    /// A `CapabilitySet` carrying a `DbCapability` token (M3.1: the pool's
+    /// A `CapabilitySet` carrying a `DbCapability` token (the pool's
     /// `acquire` path is gated, so tests that check out a connection must scope
     /// one).
     fn db_caps() -> CapabilitySet {
@@ -316,7 +316,7 @@ mod tests {
         // blocking `execute` (block_in_place parks the worker until the op
         // returns); the SupervisedBatch applies its wall-clock budget across the retry
         // loop instead (see `fluent-concurrency` tests/m2.rs
-        // `test_zone_real_timeout`). The guarantee `DbWorkUnit` provides is
+        // `test_batch_real_timeout`). The guarantee `DbWorkUnit` provides is
         // that other tasks are never starved by the DB op.
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         store.init_schema("CREATE TABLE t (id INTEGER)").unwrap();
@@ -348,7 +348,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fast_op_executes_cleanly_under_zone_style_timeout() {
+    async fn fast_op_executes_cleanly_under_batch_style_timeout() {
         // A fast DbWorkUnit runs fine under a simulated `SupervisedBatch` supervisor
         // wrapper (`tokio::time::timeout`), surfacing its result before the
         // budget elapses rather than timing out spuriously.
@@ -383,7 +383,7 @@ mod tests {
     #[test]
     fn db_store_impl_for_pool() {
         let pool = in_memory_pool();
-        // M3.1: `acquire` is capability-gated, so the pool-backed `DbStore`
+        // `acquire` is capability-gated, so the pool-backed `DbStore`
         // path must run under a `DbCapability` scope (the sync `sync_scope`
         // propagates into the fallback-runtime `block_on`).
         let n: i64 = CURRENT_CAPS.sync_scope(db_caps(), || {
@@ -397,13 +397,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pool_with_conn_blocking_from_bare_multi_thread_task_succeeds() {
-        // M1 §0.5 deliberate improvement: the pool-backed `DbStore` path routes
-        // through the unified `common_core::runtime::block_on`, which wraps a
-        // multi-thread worker in `block_in_place`. Calling
-        // `with_conn_blocking` from a bare async task on a multi-thread runtime
-        // (NOT wrapped in `block_in_place` by the caller) must now succeed —
-        // the old plain `handle.block_on` copy panicked here with "Cannot
-        // start a runtime from within a runtime".
+        // The pool-backed `DbStore` path routes through the unified
+        // `common_core::runtime::block_on`, which wraps a multi-thread
+        // worker in `block_in_place`.  Calling `with_conn_blocking` from a
+        // bare async task on a multi-thread runtime (NOT wrapped in
+        // `block_in_place` by the caller) must now succeed — the old plain
+        // `handle.block_on` copy panicked here with "Cannot start a runtime
+        // from within a runtime".
         let pool = in_memory_pool();
         let n: i64 = CURRENT_CAPS
             .scope(db_caps(), async {
@@ -448,7 +448,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pool_backed_db_work_unit_scopes_caps_on_multi_thread_path() {
-        // M3.2: a pool-backed `DbWorkUnit` op calls `with_conn_blocking` →
+        // A pool-backed `DbWorkUnit` op calls `with_conn_blocking` →
         // gated `acquire`, which reads the `CURRENT_CAPS` task-local.
         // `execute` must re-scope `ctx.caps` around the `block_in_place`
         // offload (the multi-thread path), so the gate passes when a

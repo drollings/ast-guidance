@@ -44,12 +44,12 @@ pub struct ServerDeps {
     pub rigor_route: Option<Arc<RigorRoute>>,
     pub sessions: Option<Arc<SessionRegistry>>,
     pub http_client: Arc<reqwest::Client>,
-    /// Per-model-group escalation ladders (M3). Keyed by
+    /// Per-model-group escalation ladders. Keyed by
     /// `RoutingTarget.group`; resolved after the local chain exhausts.
     pub ladders: HashMap<String, Arc<Ladder>>,
-    /// Deterministic-fact cache consulted before escalating (M3).
+    /// Deterministic-fact cache consulted before escalating.
     pub context_cache: Option<Arc<dyn fluent_types::ContextCache>>,
-    /// Sidecar instance pool (M4): aggregates the public `/instances` API and
+    /// Sidecar instance pool: aggregates the public `/instances` API and
     /// is consulted on a 503 group-miss to allocate fresh KV before retrying.
     pub instance_pool: Option<Arc<crate::instances::InstancePool>>,
     /// Env var naming the management API key (enforced on `/instances`).
@@ -57,7 +57,7 @@ pub struct ServerDeps {
     /// Managed llama-server supervisor (the process owner). `None` in mock
     /// mode. Backs `POST /models/unload` and the `/metrics` aggregation.
     pub supervisor: Option<Arc<crate::supervisor::LlamaServerSupervisor>>,
-    /// The `LedgerAgentCoordinator` (M4), when the operator opts in. `None`
+    /// The `LedgerAgentCoordinator`, when the operator opts in. `None`
     /// (the default) leaves dispatch unchanged — requests fall through to the
     /// existing pipeline.
     pub coordinator: Option<Arc<crate::ledger::orchestrator::LedgerAgentCoordinator>>,
@@ -112,7 +112,7 @@ pub(crate) async fn record_ledger_result(
     .ok();
 }
 
-/// M4 opt-in: run a request through the `LedgerAgentCoordinator`'s
+/// Opt-in: run a request through the `LedgerAgentCoordinator`'s
 /// synchronization loop when one is attached. Returns `Some(response)` when the
 /// coordinator handled the request; `None` when no coordinator is attached (or
 /// it produced no response), so the caller falls through to the existing
@@ -164,7 +164,7 @@ async fn coordinator_dispatch(
     ))
 }
 
-/// Record a dispatch outcome into the session ledger + step (M5).
+/// Record a dispatch outcome into the session ledger + step.
 ///
 /// Buffered dispatches carry the answer text synchronously and record it here.
 /// Streaming dispatches assemble the answer as the client consumes the body,
@@ -172,7 +172,7 @@ async fn coordinator_dispatch(
 /// [`StreamAnswer`](crate::streaming::StreamAnswer) finalizer (bounded by the
 /// target's total timeout) and then records - never delaying the HTTP response.
 /// `label` is the fallback content when no answer is available (escalation,
-/// empty body), preserving the pre-M5 status-style recording.
+/// empty body).
 async fn record_dispatch_outcome(
     answer_text: Option<String>,
     label: String,
@@ -218,7 +218,7 @@ async fn record_dispatch_outcome(
     });
 }
 
-/// Per-request handle into a `DependencySession` step (D6). Holds the session
+/// Per-request handle into a `DependencySession` step. Holds the session
 /// `Arc` and the request's step id so the outcome can be recorded exactly once
 /// from whichever terminal branch the request takes. Locking is scoped to the
 /// `complete` call - never held across an await.
@@ -305,7 +305,7 @@ async fn handle_chat_completion(
         supervisor: _,
         coordinator,
     } = deps;
-    // M10: the dispatch post-processing hook (workflow extraction), if the
+    // The dispatch post-processing hook (workflow extraction), if the
     // operator configured it. Passed through to successful dispatches only.
     let workflow_extractor = plan_route
         .as_ref()
@@ -410,7 +410,7 @@ async fn handle_chat_completion(
         .map(|m| m.content.to_string_lossy())
         .unwrap_or_default();
 
-    // M4 opt-in: when a coordinator is attached, route the request through its
+    // Opt-in: when a coordinator is attached, route the request through its
     // run loop (restore-or-assemble → execute → record → snapshot → enqueue).
     // `None` falls through to the existing pipeline unchanged.
     if let Some(resp) =
@@ -427,7 +427,7 @@ async fn handle_chat_completion(
     )
     .await;
 
-    // D6 canonical session: register the request as a step and complete it at
+    // Canonical session: register the request as a step and complete it at
     // whichever terminal branch the request takes (outcome recorded exactly
     // once).
     let session_step = begin_session_step(
@@ -439,7 +439,7 @@ async fn handle_chat_completion(
         &request_text,
     );
 
-    // M3.7 bypass: a session the turnover mode marked frontier-owned skips
+    // Bypass: a session the turnover mode marked frontier-owned skips
     // the local pipeline and goes straight to the frontier.
     if let Some(step) = &session_step {
         let frontier_owned = step.session.lock().is_ok_and(|s| s.is_frontier_owned());
@@ -643,6 +643,24 @@ async fn handle_chat_completion(
 }
 #[allow(clippy::implicit_hasher)]
 pub async fn handle_request(
+    req: hyper::Request<hyper::body::Incoming>,
+    deps: ServerDeps,
+) -> Result<HyperResponse, std::convert::Infallible> {
+    // Install the router's knowledge capability for the life of this
+    // request so `ContentNodeStore`'s gated `KnowledgeCapability` impl
+    // (`crate::knowledge.rs`) is *actually reachable* on the serving path —
+    // not only in tests. Every gated knowledge read/write during dispatch
+    // checks this token in the current task-local. Effects the request path
+    // does not need are simply absent from this set.
+    fluent_wvr::CURRENT_CAPS
+        .scope(
+            fluent_wvr::CapabilitySet::new().with(crate::knowledge::RouterKnowledgeCapability),
+            handle_request_inner(req, deps),
+        )
+        .await
+}
+
+async fn handle_request_inner(
     req: hyper::Request<hyper::body::Incoming>,
     deps: ServerDeps,
 ) -> Result<HyperResponse, std::convert::Infallible> {

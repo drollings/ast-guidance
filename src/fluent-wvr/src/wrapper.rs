@@ -541,7 +541,7 @@ impl<'a, T: 'a, E> Default for Pipeline<'a, T, E> {
 /// Wraps a `Component` with a name suffix (useful for scatter-gather SupervisedBatch
 /// dispatch where the same component type is registered multiple times).
 ///
-/// `execute` merges the zone-supplied runtime (`ctx.rt`) with per-task
+/// `execute` merges the batch-supplied runtime (`ctx.rt`) with per-task
 /// configuration from `self.ctx`, so the task gets the live runtime but
 /// retains its own capabilities and metadata.
 pub struct SuffixedComponent {
@@ -567,9 +567,9 @@ impl WorkUnit for SuffixedComponent {
     fn provides(&self) -> &[ArcIntern<str>] {
         self.inner.provides()
     }
-    fn execute(&self, zone_ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+    fn execute(&self, batch_ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
         let merged = WorkContext {
-            rt: Arc::clone(&zone_ctx.rt),
+            rt: Arc::clone(&batch_ctx.rt),
             ..self.ctx.clone()
         };
         self.inner.execute(&merged)
@@ -755,7 +755,7 @@ mod tests {
 
     /// Exercises `Instrumented::with_metrics` end-to-end: confirms the
     /// histogram records one observation after `execute` runs and that the
-    /// recorded sum is non-zero. This is the M12 minimum-bar in-tree usage;
+    /// recorded sum is non-zero. This is the minimum-bar in-tree usage;
     /// see the `with_metrics` doc comment for the candidate production sites
     /// that have not yet been wired.
     #[test]
@@ -788,7 +788,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // --- M1.3: Downcast round-trip tests ---
+    // --- Downcast round-trip tests ---
 
     #[test]
     fn instrumented_downcast_roundtrip() {
@@ -988,7 +988,7 @@ mod tests {
         assert_eq!(&*adapter.provides()[0], "c");
     }
 
-    /// M10.3: Wrap an AdapterHost with non-empty `field_names` and verify the
+    /// Wrap an AdapterHost with non-empty `field_names` and verify the
     /// adapter reports the same set — proves `ComponentAdapter::field_names`
     /// delegates to `self.inner.field_names()` rather than returning `&[]`.
     #[test]

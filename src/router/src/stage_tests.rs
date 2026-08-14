@@ -377,6 +377,7 @@ mod tests {
             "fast",
             limiter,
             None,
+            crate::config::ClassifierFailurePolicy::Reject,
         );
 
         std::thread::scope(|scope| {
@@ -403,7 +404,148 @@ mod tests {
         );
     }
 
-    // ── Stage 2: ClassifierStage in M4 classification-tree mode ─────────────
+    // ── Stage 2: ClassifierStage failure policy ─────────────────────────
+
+    /// A backend that always fails its LLM call.
+    struct AlwaysFailBackend;
+
+    impl fluent_llm::client::ChatBackend for AlwaysFailBackend {
+        fn chat_complete(
+            &self,
+            _messages: &[fluent_llm::ChatMessage],
+        ) -> Result<String, fluent_llm::LlmError> {
+            Err(fluent_llm::LlmError::Api("simulated outage".into()))
+        }
+    }
+
+    /// A backend that always returns the given raw text (to exercise the
+    /// parse-fallback path).
+    struct FixedResponseBackend {
+        response: String,
+    }
+
+    impl fluent_llm::client::ChatBackend for FixedResponseBackend {
+        fn chat_complete(
+            &self,
+            _messages: &[fluent_llm::ChatMessage],
+        ) -> Result<String, fluent_llm::LlmError> {
+            Ok(self.response.clone())
+        }
+    }
+
+    fn classifier_stage_with_policy(
+        backend: Arc<dyn fluent_llm::client::ChatBackend>,
+        policy: crate::config::ClassifierFailurePolicy,
+    ) -> crate::stages::classifier::ClassifierStage {
+        let routing_config = crate::config::RoutingConfig {
+            routes: std::collections::HashMap::new(),
+            models: std::collections::HashMap::new(),
+            model_groups: std::collections::HashMap::new(),
+            system_prompt: String::new(),
+            safety_threshold: 0.5,
+            default_route: "fast".into(),
+            score_matrix: None,
+        };
+        crate::stages::classifier::ClassifierStage::new(
+            backend,
+            routing_config,
+            0.7,
+            None,
+            false,
+            1,
+            "fast",
+            Arc::new(fluent_concurrency::pool::Limiter::new(4)),
+            None,
+            policy,
+        )
+    }
+
+    fn classifier_ctx() -> WorkContext {
+        let mut ctx = WorkContext::default();
+        ctx.set_structured(
+            "request",
+            &serde_json::json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "hello"}],
+            }),
+        );
+        ctx
+    }
+
+    #[test]
+    fn classifier_reject_policy_rejects_on_llm_error() {
+        let stage = classifier_stage_with_policy(
+            Arc::new(AlwaysFailBackend),
+            crate::config::ClassifierFailurePolicy::Reject,
+        );
+        let decision: StageDecision = stage
+            .execute(&classifier_ctx())
+            .expect("execute")
+            .data_as()
+            .expect("data_as");
+        assert_eq!(decision.verdict, StageVerdict::Rejected);
+        assert!(decision.reason.contains("LLM error"));
+        // No fabricated 1.0 scores may appear on the reject path.
+        assert!(
+            !decision.reason.contains("coherence")
+                && !decision.reason.contains("1.00"),
+            "reject path must not fabricate scores: {}",
+            decision.reason
+        );
+    }
+
+    #[test]
+    fn classifier_reject_policy_rejects_on_parse_failure() {
+        let stage = classifier_stage_with_policy(
+            Arc::new(FixedResponseBackend {
+                response: "this is not json".into(),
+            }),
+            crate::config::ClassifierFailurePolicy::Reject,
+        );
+        let decision: StageDecision = stage
+            .execute(&classifier_ctx())
+            .expect("execute")
+            .data_as()
+            .expect("data_as");
+        assert_eq!(decision.verdict, StageVerdict::Rejected);
+        assert!(decision.reason.contains("classifier failure"));
+    }
+
+    #[test]
+    fn classifier_route_to_default_truthful_uses_zero_scores() {
+        let stage = classifier_stage_with_policy(
+            Arc::new(AlwaysFailBackend),
+            crate::config::ClassifierFailurePolicy::RouteToDefaultTruthful,
+        );
+        let decision: StageDecision = stage
+            .execute(&classifier_ctx())
+            .expect("execute")
+            .data_as()
+            .expect("data_as");
+        assert_eq!(decision.verdict, StageVerdict::Passed);
+        let meta = decision.metadata.as_object().expect("metadata object");
+        assert_eq!(meta.get("coherence_score").and_then(|v| v.as_f64()), Some(0.0));
+        assert_eq!(meta.get("safety_score").and_then(|v| v.as_f64()), Some(0.0));
+    }
+
+    #[test]
+    fn classifier_legacy_fail_open_keeps_high_scores() {
+        let stage = classifier_stage_with_policy(
+            Arc::new(AlwaysFailBackend),
+            crate::config::ClassifierFailurePolicy::LegacyFailOpen,
+        );
+        let decision: StageDecision = stage
+            .execute(&classifier_ctx())
+            .expect("execute")
+            .data_as()
+            .expect("data_as");
+        assert_eq!(decision.verdict, StageVerdict::Passed);
+        let meta = decision.metadata.as_object().expect("metadata object");
+        assert_eq!(meta.get("coherence_score").and_then(|v| v.as_f64()), Some(1.0));
+        assert_eq!(meta.get("safety_score").and_then(|v| v.as_f64()), Some(1.0));
+    }
+
+    // ── Stage 2: ClassifierStage in classification-tree mode ─────────────
 
     /// A backend that records every system prompt and always returns the
     /// supplied classifier verdict.
@@ -491,7 +633,7 @@ mod tests {
             .to_string(),
         });
 
-        // The stage is built through the pipeline builder (exercises the M4
+        // The stage is built through the pipeline builder (exercises the
         // tree-engine construction path, not a hand-built engine).
         let pipeline = config
             .build_named_pipeline_with_backend("default", Some(backend))
@@ -572,7 +714,7 @@ mod tests {
         );
     }
 
-    // ── M5: ScoreMatrix as the routing decision engine ─────────────────────
+    // ── ScoreMatrix as the routing decision engine ─────────────────────
 
     const DEFAULT_MATRIX_ROUTES: &str = r#"{
         "plan":  {"bands": {"completeness": [0.0, 0.5]}},
@@ -823,7 +965,7 @@ mod tests {
         assert_eq!(rt.model, "code-model");
     }
 
-    // ── M6: RetryClassifier wired into the production builder ──────────────
+    // ── RetryClassifier wired into the production builder ──────────────
 
     /// A `ChatBackend` that fails JSON parsing the first two calls (garbage
     /// output) then returns the supplied valid classifier response, recording
@@ -960,6 +1102,60 @@ mod tests {
         );
     }
 
+    /// A backend that always returns garbage (never recovers), to exercise the
+    /// retries-exhausted path.
+    struct AlwaysGarbageBackend;
+
+    impl fluent_llm::client::ChatBackend for AlwaysGarbageBackend {
+        fn chat_complete(
+            &self,
+            _messages: &[fluent_llm::ChatMessage],
+        ) -> Result<String, fluent_llm::LlmError> {
+            Ok("not json at all".into())
+        }
+    }
+
+    #[test]
+    fn retry_exhausts_then_default_policy_rejects() {
+        // After max_retries, the default (Reject) classifier failure policy
+        // yields a `Rejected` verdict — never a fabricated 1.0-score dispatch.
+        let config = retry_config(2);
+        let pipeline = config
+            .build_named_pipeline_with_backend(
+                "default",
+                Some(std::sync::Arc::new(AlwaysGarbageBackend)),
+            )
+            .expect("retry pipeline should build");
+        let mut ctx = WorkContext::default();
+        ctx.set_structured(
+            "request",
+            &serde_json::json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "write a sort"}],
+            }),
+        );
+        let output = pipeline.execute(&ctx).expect("pipeline executes");
+        let result: crate::pipeline::PipelineResult = output.data_as().expect("pipeline result");
+
+        assert!(result.rejected, "default policy must fail closed");
+        assert!(result.routing_target.is_none(), "no dispatch on reject");
+
+        let decision = result
+            .decisions
+            .iter()
+            .find(|d| d.stage == crate::pipeline_types::PipelineStage::Classifier)
+            .expect("classifier decision");
+        assert_eq!(
+            decision.verdict,
+            crate::pipeline_types::StageVerdict::Rejected,
+            "after retries exhaust the default policy rejects"
+        );
+        // The reject path must not carry fabricated 1.0 scores.
+        let meta = decision.metadata.as_object().expect("metadata object");
+        assert_eq!(meta.get("coherence_score"), None);
+        assert_eq!(meta.get("safety_score"), None);
+    }
+
     #[test]
     fn retry_disabled_by_default_is_byte_for_byte_unchanged() {
         // Defaults: retry disabled (0) with the two stock prompts.
@@ -1057,7 +1253,7 @@ mod tests {
         assert_eq!(rt.model, "code-model");
     }
 
-    // ── M3: target-matching ladder wired into the flat classifier path ───────
+    // ── Target-matching ladder wired into the flat classifier path ───────
 
     /// A flat config whose `code` route resolves to the 2-member group
     /// `[swarm, qwen3.6-27b]` — the shipped ladder shape. `target_match` is
@@ -1159,7 +1355,7 @@ mod tests {
         // Mechanical-failure fallbacks = the group tail (empty after the last
         // member) plus any `all_dispatch_targets` entries not already included
         // — here the primary group's other member, preserving today's
-        // cross-group resilience list (M2 semantics).
+        // cross-group resilience list.
         let fb: Vec<&str> = rt.fallbacks.iter().map(|f| f.model.as_str()).collect();
         assert_eq!(fb, vec!["swarm"]);
     }
@@ -1322,6 +1518,7 @@ mod tests {
             "swarm",
             limiter,
             None,
+            crate::config::ClassifierFailurePolicy::Reject,
         );
 
         let mut ctx = WorkContext::default();

@@ -1,11 +1,11 @@
-//! Memory ingestion zone. Wraps `fluent_concurrency::Scope` with
+//! Memory ingestion SupervisedBatch. Wraps `fluent_concurrency::Scope` with
 //! credit-based backpressure for memory pipeline ingestion.
 
 use crate::types::*;
 use fluent_concurrency::flow::{self, CreditReceiver, CreditSender, CreditSpec};
 use fluent_concurrency::scope::Scope;
 
-/// Ingestion job dispatched to the memory zone.
+/// Ingestion job dispatched to the memory SupervisedBatch.
 ///
 /// Flat enum dispatch — no `dyn Trait` in the hot path.
 pub enum IngestJob {
@@ -32,20 +32,20 @@ pub enum IngestJob {
     },
 }
 
-/// Memory-specific ingestion zone.
+/// Memory-specific ingestion SupervisedBatch.
 ///
 /// Wraps a `fluent_concurrency::Scope` with credit-based backpressure:
 /// - Credit tokens prevent unbounded heap accumulation during deep repo syncs
 /// - Fault containment: all tasks live inside the scope; close awaits completion
 /// - No ambient `tokio::spawn` — every task is spawned inside this scope
-pub struct MemoryZone {
+pub struct MemoryBatch {
     scope: Scope,
     credit: CreditSender,
     _receiver: CreditReceiver,
 }
 
-impl MemoryZone {
-    /// Create a new memory ingestion zone.
+impl MemoryBatch {
+    /// Create a new memory ingestion SupervisedBatch.
     ///
     /// - `credit_limit`: max queued items before producer blocks
     /// - `more_after`: bump credit after this many completions
@@ -85,7 +85,7 @@ impl MemoryZone {
         Ok(())
     }
 
-    /// Close the zone, waiting for all in-flight ingestion to complete.
+    /// Close the SupervisedBatch, waiting for all in-flight ingestion to complete.
     pub async fn close(&mut self) {
         self.scope.close().await;
     }

@@ -356,7 +356,7 @@ fn test_e2e_custom_fixtures_produce_expected_results() {
     assert!(!good_result.rejected, "good input should not be rejected");
 }
 
-// ── M4: classification-tree config through mock mode ──────────────────────
+// ── Classification-tree config through mock mode ──────────────────────
 
 /// A tree-shaped config: root classifier → terminal nodes, plus a fallback.
 fn make_tree_config() -> RouterConfig {

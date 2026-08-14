@@ -100,7 +100,7 @@ impl McpServer {
     }
 
     fn handle_coral_insert(&self, request: &JsonRpcRequest) -> JsonRpcResponse {
-        // M8.8: deserialize from the borrowed `&Value` (Value implements
+        // Deserialize from the borrowed `&Value` (Value implements
         // `serde::Deserializer`) instead of cloning the params first.
         let node: ContentNode = match request.params.as_ref().map(ContentNode::deserialize) {
             Some(Ok(n)) => n,
@@ -210,7 +210,7 @@ impl McpServer {
 
 impl JsonRpcHandler for McpServer {
     fn handle_request(&self, raw: &str) -> Result<String, JsonRpcError> {
-        // M9.2b: bound the incoming request size so an oversized payload is
+        // Bound the incoming request size so an oversized payload is
         // rejected before JSON parsing.
         if raw.len() > MAX_MCP_REQUEST_SIZE {
             return Err(JsonRpcError {
@@ -220,9 +220,19 @@ impl JsonRpcHandler for McpServer {
                 ),
             });
         }
-        let request: JsonRpcRequest = serde_json::from_str(raw)?;
-        let response = self.dispatch(&request);
-        Ok(serde_json::to_string(&response)?)
+        // Install coral's knowledge capability for the life of this
+        // request so `Library`'s gated `KnowledgeCapability` impl
+        // (`crate::knowledge.rs`) is reachable on the serving path — the same
+        // grant the router installs around its HTTP dispatch. This is a sync
+        // handler, so the task-local grant uses `sync_scope`.
+        fluent_wvr::CURRENT_CAPS.sync_scope(
+            fluent_wvr::CapabilitySet::new().with(crate::knowledge::CoralKnowledgeCapability),
+            || {
+                let request: JsonRpcRequest = serde_json::from_str(raw)?;
+                let response = self.dispatch(&request);
+                Ok(serde_json::to_string(&response)?)
+            },
+        )
     }
 }
 
@@ -356,5 +366,38 @@ mod tests {
         assert_eq!(v["result"]["total_count"], 0);
         // But we should have at least one tier histogram (L3)
         assert!(v["result"]["tier_count"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn coral_knowledge_gate_closed_outside_open_inside_request_scope() {
+        use crate::knowledge::CoralKnowledgeCapability;
+        use fluent_wvr::capability::{check_capability, CURRENT_CAPS};
+        use fluent_wvr::CapabilitySet;
+
+        // Outside any request scope: the coral knowledge gate is closed.
+        assert!(
+            check_capability(&CoralKnowledgeCapability).is_err(),
+            "the coral knowledge capability must not be granted outside a request scope"
+        );
+
+        // `handle_request` establishes exactly this grant for the life of each
+        // MCP request, mirroring the router's HTTP handler. A gated
+        // `KnowledgeCapability` call therefore succeeds inside the scope.
+        let granted = CURRENT_CAPS.sync_scope(
+            CapabilitySet::new().with(CoralKnowledgeCapability),
+            || check_capability(&CoralKnowledgeCapability).is_ok(),
+        );
+        assert!(
+            granted,
+            "the coral knowledge capability must be granted inside the MCP request scope"
+        );
+
+        // A request through the handler runs under the same grant.
+        let server = make_server();
+        let req =
+            r#"{"jsonrpc":"2.0","method":"coral_query","id":1,"params":{"name":"nonexistent"}}"#;
+        let resp = server.handle_request(req).expect("handle");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("parse");
+        assert_eq!(v["result"]["found"], false);
     }
 }

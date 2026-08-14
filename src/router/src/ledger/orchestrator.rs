@@ -1,4 +1,4 @@
-//! `LedgerAgentCoordinator` — the synchronization point (M4).
+//! `LedgerAgentCoordinator` — the synchronization point.
 //!
 //! Ties together the session step graph (`DependencySession`), the shared
 //! `ContentNodeStore` (content), `SnapshotStore` (per-model KV), the
@@ -10,7 +10,7 @@
 //! shared primitives — `DependencyGraph` (via `DependencySession`),
 //! `SnapshotStore::save_snapshot`/`retrieve`, `ContentNodeStore`/`ContentNodeLedger`,
 //! `LedgerTierWorker::enqueue`, `ContentNodeStore::lod_text` (through the assembler),
-//! `Limiter`/`ArcIntern` — and introduces **no** new primitive (M4.2).
+//! `Limiter`/`ArcIntern` — and introduces **no** new primitive.
 //!
 //! `run_agent` is async by design (the server already runs in an async
 //! context); the injected `ChatBackend` transport is synchronous, so no session
@@ -88,15 +88,15 @@ pub struct AgentOutcome {
     pub budget_used: usize,
 }
 
-/// The composable coordinator (M4).
+/// The composable coordinator.
 ///
-/// M6.2: an optional `AffinityScheduler` is composed for KV-affinity-aware
+/// An optional `AffinityScheduler` is composed for KV-affinity-aware
 /// scheduling — it tracks which session is currently resident so the active
 /// session's agent turn gets a priority bonus (minimize context switches) while
 /// starved sessions age up. The actual "prefer the last-resident model/instance"
 /// decision is exposed via [`LedgerAgentCoordinator::preferred_model`], which
 /// reads the durable `checkpoint` ledger nodes (the record of "which model was
-/// at which KV state when", M3.2). Re-prefill is the fallback whenever the
+/// at which KV state when").  Re-prefill is the fallback whenever the
 /// requested model is not the last-resident one (a true capability gap).
 pub struct LedgerAgentCoordinator {
     store: Arc<ContentNodeStore>,
@@ -106,13 +106,13 @@ pub struct LedgerAgentCoordinator {
     assembler: LedgerPromptAssembler,
     backend: Arc<dyn ChatBackend>,
     config: OrchestratorConfig,
-    /// Optional KV-affinity scheduler (M6.2). `None` disables affinity
+    /// Optional KV-affinity scheduler. `None` disables affinity
     /// bookkeeping entirely — existing deployments are untouched.
     affinity: Option<AffinityScheduler<String, String, String>>,
 }
 
 impl LedgerAgentCoordinator {
-    /// Construct the coordinator (DI-injected, M4.1).
+    /// Construct the coordinator (DI-injected).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<ContentNodeStore>,
@@ -135,7 +135,7 @@ impl LedgerAgentCoordinator {
         }
     }
 
-    /// Compose a KV-affinity scheduler (M6.2, forward track). The scheduler's
+    /// Compose a KV-affinity scheduler (forward track). The scheduler's
     /// pool worker is a trivial identity echo — it exists solely to drive the
     /// shared `AffinityScheduler`'s affinity-bonus/aging priority bookkeeping;
     /// the coordinator's transport and KV-affinity decision are unchanged.
@@ -149,7 +149,7 @@ impl LedgerAgentCoordinator {
     }
 
     /// Build a ready-to-compose KV-affinity scheduler over the shared runtime
-    /// (M6.2). `cap` bounds concurrent agent turns tracked by the pool.
+    /// `cap` bounds concurrent agent turns tracked by the pool.
     pub fn build_affinity_scheduler(
         cap: usize,
     ) -> AffinityScheduler<String, String, String> {
@@ -167,7 +167,7 @@ impl LedgerAgentCoordinator {
     }
 
     /// The last-resident (KV-affine) model for a session, from the durable
-    /// `checkpoint` ledger nodes (M3.2) — the record of "which model was at
+    /// `checkpoint` ledger nodes — the record of "which model was at
     /// which KV state when." Returns the model of the most recent checkpoint
     /// node for the session, or `None` when the session has no checkpoint (no
     /// resident instance yet → a caller re-prefills).
@@ -193,7 +193,7 @@ impl LedgerAgentCoordinator {
             })
     }
 
-    /// Prefer the last-resident (KV-affine) model for a session (M6.2):
+    /// Prefer the last-resident (KV-affine) model for a session:
     /// returns the `candidates` entry that is currently resident, so a caller
     /// avoids a context switch by re-entering that model's KV. Returns `None`
     /// when no candidate is resident — the true capability-gap fallback is to
@@ -206,14 +206,14 @@ impl LedgerAgentCoordinator {
             .map(ToString::to_string)
     }
 
-    /// The session currently marked KV-affine by the composed scheduler (M6.2),
+    /// The session currently marked KV-affine by the composed scheduler,
     /// or `None` when no scheduler is attached. `None` from a composed
     /// scheduler means no `run_agent` has run yet.
     pub fn affinity_session(&self) -> Option<String> {
         self.affinity.as_ref().and_then(AffinityScheduler::current_affinity)
     }
 
-    /// Run one agent synchronization step (M4.1).
+    /// Run one agent synchronization step.
     ///
     /// # Steps
     /// 1. Resolve the context source: restore a same-model KV snapshot (per
@@ -232,7 +232,7 @@ impl LedgerAgentCoordinator {
     ) -> Result<AgentOutcome, CoordinatorError> {
         let session = self.sessions.get_or_create(session_id);
 
-        // 0. M6.2 KV-affinity bookkeeping: when a scheduler is composed, mark
+        // 0. KV-affinity bookkeeping: when a scheduler is composed, mark
         // this session as the currently-affine one (its turns get a priority
         // bonus — minimize context switches) and submit its identity through the
         // shared scheduler so starved sessions age up. The pool worker is an
@@ -258,7 +258,7 @@ impl LedgerAgentCoordinator {
         // `(model, adapter, session)` key (not the pending snapshot, which may
         // belong to a different model that ran most recently). This is what
         // lets a same-model re-entry resume its own KV while a different model
-        // re-prefills (M4.4).
+        // re-prefills.
         let (kv_restored, step_id) = {
             let mut guard = session
                 .lock()
@@ -294,7 +294,7 @@ impl LedgerAgentCoordinator {
 
         // 3. Record the output node (embedding the assembled node_plan into
         // its metadata so a future workflow-extraction pass can replay the
-        // same decomposition without re-prefilling — M5.3 learning loop).
+        // same decomposition without re-prefilling — learning loop).
         let node_id = self.record_agent_node(session_id, model, &content, &step_id, &node_plan)?;
 
         // 4-6. Snapshot KV on context advance, record a checkpoint node, and
@@ -319,7 +319,7 @@ impl LedgerAgentCoordinator {
             );
         }
 
-        // 5. Enqueue the new node for background LOD4/LOD5 (M2).
+        // 5. Enqueue the new node for background LOD4/LOD5.
         self.tiers.enqueue(node_id);
 
         // Audit the run (kind = "agent").
@@ -378,7 +378,7 @@ impl LedgerAgentCoordinator {
             None,
             &self.config.lod_spec,
         );
-        // M5.2/M5.3: emit a `prompt` audit carrying the fidelity plan so the
+        // Emit a `prompt` audit carrying the fidelity plan so the
         // audit stream records exactly which ledger nodes were rendered at
         // which `Lod` (the workflow-learning replay signal).
         crate::audit::emit(
@@ -435,13 +435,13 @@ impl LedgerAgentCoordinator {
         node.metadata = Some(serde_json::json!({
             "model": model,
             "origin": "agent_coordinator",
-            // M5.3: the fidelity plan for workflow-learning replay (node→Lod).
+            // The fidelity plan for workflow-learning replay (node→Lod).
             "node_plan": node_plan_json(node_plan),
         }));
         Ok(self.store.record_content_node(&node)?)
     }
 
-    /// Record a checkpoint ledger node (role `"checkpoint"`, M3.2) carrying the
+    /// Record a checkpoint ledger node (role `"checkpoint"`, carrying the
     /// snapshot's fork-facing identity so the ledger is the durable record of
     /// "which model was at which KV state when."
     fn record_checkpoint_node(
@@ -475,7 +475,7 @@ impl LedgerAgentCoordinator {
 use crate::ledger::prompt::AssembledPrompt;
 
 /// Serialize a per-node fidelity plan as a JSON array of `[node_id, lod]`
-/// pairs (M5.3 workflow-learning replay signal).
+/// pairs (Workflow-learning replay signal).
 fn node_plan_json(plan: &[(NodeId, Lod)]) -> serde_json::Value {
     serde_json::json!(plan
         .iter()
@@ -778,7 +778,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn agent_node_records_node_plan_for_learning_replay() {
-        // M5.3: on a re-prefill turn, the recorded agent node's metadata embeds
+        // On a re-prefill turn, the recorded agent node's metadata embeds
         // the assembled node_plan (node→Lod) so a future workflow-extraction
         // pass can replay the same decomposition.
         let store = temp_store();
@@ -821,7 +821,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn affinity_tracks_current_session_through_run_agent() {
-        // M6.2: composing an `AffinityScheduler` must mark the active session
+        // Composing an `AffinityScheduler` must mark the active session
         // as the currently-affine one and submit its turn identity through the
         // shared scheduler (minimize context switches), without changing the
         // restore decision or the transport.
@@ -862,7 +862,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn preferred_model_prefers_last_resident_and_falls_back() {
-        // M6.2: the coordinator derives the last-resident (KV-affine) model
+        // The coordinator derives the last-resident (KV-affine) model
         // from the durable `checkpoint` ledger nodes and prefers it, falling
         // back to re-prefill (None) only on a true capability gap.
         let store = temp_store();

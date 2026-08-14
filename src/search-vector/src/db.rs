@@ -28,9 +28,7 @@ pub struct SearchResult {
 
 /// SQLite hybrid search engine backed by the canonical `fluent-db` components:
 /// a `SqliteStore` for the connection/schema and an `HnswIndex` for the KNN
-/// index (M4). The public method surface is unchanged from the pre-M4 shape so
-/// `bin/guidance`, `guidance::query_engine`, `guidance::sync_engine`, and
-/// `bin/guidance::mcp` call sites keep compiling.
+/// index.
 pub struct GuidanceDb {
     store: SqliteStore,
     hnsw: HnswIndex,
@@ -369,7 +367,7 @@ impl GuidanceDb {
             Vec::new()
         };
 
-        // Generic ranked fusion over `(id, item)` pairs (M7). Reached via the
+        // Generic ranked fusion over `(id, item)` pairs. Reached via the
         // `search_vector::math` re-export of `fluent_db::vector::rrf_merge`.
         let mut fused: Vec<SearchResult> = math::rrf_merge(
             keyword_results.into_iter().map(|r| (r.id, r)).collect(),

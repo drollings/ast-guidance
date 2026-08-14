@@ -6,7 +6,7 @@
 //! no manual topo sort, no manual transitive DFS).
 //!
 //! `SessionRegistry` (in this module) is the canonical server-side session
-//! home (decision D6): sessions are created per `session_id`, attached to a
+//! home: sessions are created per `session_id`, attached to a
 //! shared `SnapshotStore`, and retained for the process lifetime so
 //! checkpoint/rewind state survives across requests.
 
@@ -87,7 +87,7 @@ impl SessionStep {
 }
 
 /// A step's checkpoint flag drives rewind; KV snapshots on context advance
-/// (M3) use the model's KV key. This policy is the explicit decision rule the
+/// use the model's KV key. This policy is the explicit decision rule the
 /// coordinator applies when handing control between models: whether a
 /// previously-snapshotted KV state should be **restored** (same model resumes
 /// from KV) or **ignored** (a different model re-prefills from the ledger).
@@ -163,7 +163,7 @@ pub struct DependencySession {
     /// fields. `None` before any rewind restored a snapshot.
     pending_snapshot: Option<KvSnapshot>,
     /// Monotonic per-turn counter used to derive deterministic KV snapshot
-    /// names on context advance (M3): each turn's snapshot is independently
+    /// names on context advance: each turn's snapshot is independently
     /// addressable under the `(model, adapter, session)` key.
     snapshot_seq: u64,
     /// Set when the escalation ladder's turnover mode hands the session to
@@ -227,7 +227,7 @@ impl DependencySession {
         self
     }
 
-    /// The attached `SnapshotStore` (M3), when present. Lets rigor's blue-pass
+    /// The attached `SnapshotStore`, when present. Lets rigor's blue-pass
     /// completion record a fork snapshot via `save_snapshot` so a later rewind
     /// finds real metadata.
     pub fn kv_cache(&self) -> Option<&SnapshotStore> {
@@ -464,14 +464,14 @@ impl DependencySession {
             .map(|s| (s.snapshot_name.clone(), s.instance.clone(), 0))
     }
 
-    /// The most recently recorded/restored KV snapshot (M3), if any. The
+    /// The most recently recorded/restored KV snapshot, if any. The
     /// coordinator inspects its `model` to decide restore-vs-re-prefill via a
     /// `KvSnapshotPolicy`.
     pub fn pending_snapshot(&self) -> Option<&KvSnapshot> {
         self.pending_snapshot.as_ref()
     }
 
-    /// Snapshot this model's KV on context advance (M3) — called when an
+    /// Snapshot this model's KV on context advance — called when an
     /// agent/model finishes a turn and control moves on. Records a per-turn,
     /// independently-addressable fork snapshot under the `(model, adapter,
     /// session)` key and sets `pending_snapshot` so the next dispatch can pass
@@ -611,7 +611,7 @@ impl DependencySession {
 
 /// Process-wide registry of `DependencySession`s keyed by `session_id`.
 ///
-/// The canonical server-side session home (decision D6): sessions are
+/// The canonical server-side session home: sessions are
 /// created on first use, attached to a shared `SnapshotStore`, and retained
 /// for the process lifetime so checkpoint/rewind state survives across
 /// requests. Each session is individually `Mutex`-wrapped so the server can
@@ -648,7 +648,7 @@ impl SessionRegistry {
     }
 
     /// Create a registry whose sessions share a caller-supplied
-    /// `SnapshotStore` (M4). Enables the `LedgerAgentCoordinator` and the
+    /// `SnapshotStore`. Enables the `LedgerAgentCoordinator` and the
     /// registry to snapshot/restore through the same manager (e.g. one with an
     /// attached fork handle for the fork round-trip).
     pub fn with_kv_cache(kv: SnapshotStore) -> Self {
@@ -1092,7 +1092,7 @@ mod tests {
 
     #[test]
     fn test_pending_kv_fields_only_when_metadata_exists() {
-        // M3: `pending_kv_fields` is set only when a snapshot was actually
+        // `pending_kv_fields` is set only when a snapshot was actually
         // restored. A session with a kv manager but no stored snapshot has no
         // pending fields; once a snapshot is stored + rewind runs, they appear.
         use crate::kv_cache::{ColdSnapshotIndex, HotSnapshotIndex, SnapshotStore, KvSnapshot};
@@ -1176,7 +1176,7 @@ mod tests {
         assert_eq!(registry.session_count(), 0);
     }
 
-    // -- M3: context-advance KV snapshotting --------------------------------
+    // -- context-advance KV snapshotting --------------------------------
 
     fn test_kv_manager(slot_path: &std::path::Path) -> (SnapshotStore, Arc<HotSnapshotIndex>) {
         let hot = Arc::new(HotSnapshotIndex::new(10, 1024));

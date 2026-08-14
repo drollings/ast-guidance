@@ -21,10 +21,10 @@ pub mod plugins;
 pub mod registry;
 pub mod traits;
 pub mod types;
-pub mod zone;
+pub mod batch;
 
 pub use capability::MemoryCapability;
 pub use registry::MemoryPluginRegistry;
 pub use traits::{MemoryOps, MemoryPlugin};
 pub use types::*;
-pub use zone::MemoryZone;
+pub use batch::MemoryBatch;

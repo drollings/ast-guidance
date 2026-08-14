@@ -409,6 +409,11 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
     // needed - so the supervisor is skipped (the config endpoints stay as-is).
     // The `_supervisor` binding is deliberately kept alive for the life of the
     // process so the spawned servers are not dropped on shutdown.
+    //
+    // `build` resolves the slot-save dir with a capability-gated
+    // `create_dir_all`, so it runs with the `FsCapability` grant installed in
+    // the current task-local. This is the serving-path grant: boot is the
+    // boundary that establishes the router's filesystem authority.
     let _supervisor: Option<Arc<fluent_router::supervisor::LlamaServerSupervisor>> =
         if transcript_path.is_some() {
             tracing::info!(
@@ -417,7 +422,10 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
             );
             None
         } else {
-            let supervisor = fluent_router::supervisor::LlamaServerSupervisor::build(&config)?;
+            let supervisor = fluent_concurrency::scope::CURRENT_CAPS.sync_scope(
+                fluent_concurrency::capability::default_capability_set(),
+                || fluent_router::supervisor::LlamaServerSupervisor::build(&config),
+            )?;
             let supervisor = Arc::new(supervisor);
             if let Err(e) = supervisor.start_all().await {
                 tracing::error!(target: "coral-router", error = %e, "fatal: managed llama-server failed to start");
@@ -474,7 +482,7 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
         (pipelines, None)
     };
 
-    // M4.4: with a classification tree the `routes` view is derived from the
+    // With a classification tree the `routes` view is derived from the
     // tree's terminal nodes (plus the explicit flat map) so the server's
     // model→pipeline resolution needs no structural change.
     let routes = config.routes_view();
@@ -492,10 +500,10 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
         "starting coral-router server"
     );
 
-    // M2 composition: when the operator opts in via the `ledger`/`session`
-    // sections, open a `ContentNodeLedger` (with a real `Summarizer` backend
-    // targeting `<base>:ledger`) and/or a `SessionRegistry`, and attach both
-    // to the server so rigor rewind and ledger LOD derivation exist at runtime.
+    // When the operator opts in via the `ledger`/`session` sections, open a
+    // `ContentNodeLedger` (with a real `Summarizer` backend targeting
+    // `<base>:ledger`) and/or a `SessionRegistry`, and attach both to the
+    // server so rigor rewind and ledger LOD derivation exist at runtime. 
     // Both are default-absent, so existing deployments are untouched.
     let ledger = if let Some(ledger_cfg) = &config.ledger {
         let opened = match &ledger_cfg.path {
@@ -559,7 +567,7 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
         None
     };
 
-    // M5.3: the shared ledger store (when a ledger is attached) is threaded
+    // The shared ledger store (when a ledger is attached) is threaded
     // into the plan/rigor route builders so their selector/judge models render
     // the session ledger through the assembler's budget/relevance rules.
     let ledger_store = ledger.as_ref().map(|l| l.node_store().clone());
@@ -570,29 +578,34 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
     let plan_route = Arc::new(build_plan_route(&config, ledger_store.as_ref()));
     let rigor_route = Arc::new(build_rigor_route(&config, ledger_store.as_ref()));
 
-    // M3 escalation ladders: one per `model_groups[g].escalation` config.
+    // Escalation ladders: one per `model_groups[g].escalation` config.
     let http_client = reqwest::Client::new();
     let ladders = config.build_escalation_ladders(&http_client);
 
-    // M4 sidecar: build one instance manager per endpoint that declares an
+    // Sidecar: build one instance manager per endpoint that declares an
     // instance pool. The server owns their reconcile + residency tasks. A
     // malformed instance grammar (duplicate name / group-name collision)
     // fails fast so boot aborts loudly.
-    let instance_pool =
-        match fluent_router::instances::build_instance_managers(&config, _supervisor.clone()) {
-            Ok(pool) => pool,
-            Err(e) => {
-                tracing::error!(
-                    target: "coral-router",
-                    error = %e,
-                    "fatal: instance pool grammar validation failed",
-                );
-                eprintln!("FATAL: {e}");
-                std::process::exit(1);
-            }
-        };
+    //
+    // manager build stats each managed model's weights file with a
+    // capability-gated `metadata`, so it runs with `FsCapability` installed.
+    let instance_pool = match fluent_concurrency::scope::CURRENT_CAPS.sync_scope(
+        fluent_concurrency::capability::default_capability_set(),
+        || fluent_router::instances::build_instance_managers(&config, _supervisor.clone()),
+    ) {
+        Ok(pool) => pool,
+        Err(e) => {
+            tracing::error!(
+                target: "coral-router",
+                error = %e,
+                "fatal: instance pool grammar validation failed",
+            );
+            eprintln!("FATAL: {e}");
+            std::process::exit(1);
+        }
+    };
 
-    // M2 background tiering: when the operator opts in via
+    // Background tiering: when the operator opts in via
     // `ledger.background_tiering`, attach a `LedgerTierWorker` to the shared
     // store so LOD4 (short summary) and LOD5 (LLM description) are derived
     // continuously in the background. Reuses the single `LlmClient` factory
@@ -637,9 +650,9 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
         }
     }
 
-    // M5.1/M5.4: the `LedgerAgentCoordinator` (the ledger-as-synchronization
-    // point). Opt-in via `ledger.orchestrator.enabled`; requires a ledger, a
-    // session registry, and a tier worker. Reuses the single `LlmClient`
+    // The `LedgerAgentCoordinator` (the ledger-as-synchronization point). 
+    // Opt-in via `ledger.orchestrator.enabled`; requires a ledger, a
+    // session registry, and a tier worker.  Reuses the single `LlmClient`
     // factory (`ledger_tier_backend`) — no second HTTP client.
     let mut coordinator: Option<Arc<fluent_router::ledger::orchestrator::LedgerAgentCoordinator>> =
         None;
@@ -708,22 +721,28 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
     // spawned llama-servers, so a signal must stop the supervisor (killing its
     // children) before the process exits - a plain SIGTERM/SIGINT default
     // would orphan every managed llama-server, leaking ports and VRAM.
-    tokio::select! {
-        result = server.serve() => {
-            result?;
-        }
-        _ = shutdown_signal() => {
-            tracing::info!(
-                target: "coral-router",
-                "shutdown signal received - stopping managed llama-servers",
-            );
-            if let Some(supervisor) = _supervisor.as_ref() {
-                supervisor.shutdown().await;
-            }
-            return Ok(());
-        }
+    //
+    // The shutdown watch is the single graceful-stop signal: a background
+    // task fires it on SIGTERM/SIGINT, `serve` drains its owned background and
+    // connection tasks (abort + await, within a timeout) and returns, and the
+    // supervisor is stopped afterwards - so no server task and no llama-server
+    // is left detached on shutdown.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+
+    let serve_result = server.serve(shutdown_rx).await;
+
+    // Always stop the managed llama-servers before exiting, whether serving
+    // ended normally (graceful shutdown) or failed (e.g. bind error) - a
+    // failed serve still leaves the already-spawned llama-servers running.
+    if let Some(supervisor) = _supervisor.as_ref() {
+        supervisor.shutdown().await;
     }
 
+    serve_result?;
     Ok(())
 }
 
@@ -747,14 +766,14 @@ async fn shutdown_signal() {
 
 /// Construct the boot-loaded chart store and attach it to the plan route.
 ///
-/// Semantics (decision D3 — fail fast): a missing chart directory yields an
+/// Semantics (decision — fail fast): a missing chart directory yields an
 /// empty store (`ChartStore::load_dir` logs a `warn!`); a present-but-invalid
 /// chart file aborts boot so a corrupted library never half-loads.
 ///
-/// M7 retrieval: when `charts.index_path` is configured the `workflow_library`
-/// index is built at boot (lazy + failure-tolerant — a down embedding endpoint
-/// disables HNSW retrieval but never aborts boot; deterministic match and LLM
-/// adjudication still work). The adjudicator backend is wired from
+/// When `charts.index_path` is configured the `workflow_library` index is
+/// built at boot (lazy + failure-tolerant — a down embedding endpoint
+/// disables HNSW retrieval but never aborts boot; deterministic match and
+/// LLM adjudication still work).  The adjudicator backend is wired from
 /// `charts.selector_model` when set.
 fn build_plan_route(
     config: &RouterConfig,
@@ -796,7 +815,7 @@ fn build_plan_route(
         "chart store loaded",
     );
 
-    // Build the workflow_library HNSW index at boot (M7 step 2). Lazy: only
+    // Build the workflow_library HNSW index at boot. Lazy: only
     // when index_path is configured. Failure-tolerant: a missing/unreachable
     // embedding endpoint skips the build with a warning, never aborts boot.
     if config.charts.index_path.is_some() {
@@ -830,7 +849,7 @@ fn build_plan_route(
     if let Some(backend) = default_reranker_backend(config) {
         route = route.with_reranker_backend(backend);
     }
-    // M4 server-side execution: the same charts model runs a selected chart's
+    // Server-side execution: the same charts model runs a selected chart's
     // targets (and doubles as the rubric judge). A shared limiter bounds
     // concurrent chart-target LLM calls. When no charts model is configured
     // the exact fit degrades to a fresh draft (see `PlanRoute::execute_chart`).
@@ -840,7 +859,7 @@ fn build_plan_route(
     route = route.with_limiter(Arc::new(fluent_concurrency::pool::Limiter::new(
         CHART_EXECUTION_CONCURRENCY,
     )));
-    // M10 learning loop: attach the dispatch post-processing hook when the
+    // Learning loop: attach the dispatch post-processing hook when the
     // operator opts in (`post_process.workflow_extraction`). Off by default.
     // The two `Arc`s are NOT redundant: `plan_route` is Arc-shared into the
     // HTTP server, while the extractor is separately Arc-wrapped because the
@@ -856,7 +875,7 @@ fn build_plan_route(
             "workflow extraction enabled — successful dispatches become draft charts",
         );
     }
-    // M5.3: when a shared ledger store exists, attach the prompt assembler so
+    // When a shared ledger store exists, attach the prompt assembler so
     // the selector/adjudicator render the session ledger through the same
     // budget/relevance rules (a request that carries a `session_id` folds it in).
     if let Some(store) = ledger_store {
@@ -883,7 +902,7 @@ fn build_plan_route(
 /// client parses the response); this only sets the declared capacity.
 const CHART_EMBEDDING_DIMS: u32 = 768;
 
-/// Max concurrent chart-target LLM calls during M4 server-side execution.
+/// Max concurrent chart-target LLM calls during server-side execution.
 const CHART_EXECUTION_CONCURRENCY: usize = 4;
 
 /// Derive an OpenAI-compatible embeddings base URL from a chat-completions
@@ -929,17 +948,17 @@ fn default_adjudicator_backend(config: &RouterConfig) -> Option<Arc<dyn ChatBack
     config.local_backend(key)
 }
 
-/// Build the chart-candidate reranker backend (M7 step 2.5) from the
-/// root-level `reranker_model`, if configured. Mirrors
-/// `default_adjudicator_backend`: exactly one place constructs a concrete
-/// `LlmClient` for the reranker. The rerank is a cross-encoder-style LLM call
-/// over the HNSW candidates before adjudication (`None` skips the stage).
+/// Build the chart-candidate reranker backend from the root-level
+/// `reranker_model`, if configured.  Mirrors `default_adjudicator_backend`:
+/// exactly one place constructs a concrete `LlmClient` for the reranker. 
+/// The rerank is a cross-encoder-style LLM call over the HNSW candidates
+/// before adjudication (`None` skips the stage).
 fn default_reranker_backend(config: &RouterConfig) -> Option<Arc<dyn ChatBackend>> {
     let key = config.reranker_model.as_deref()?;
     config.local_backend(key)
 }
 
-/// Build the rigor route (M3) from `config.rigor`, mirroring `build_plan_route`.
+/// Build the rigor route from `config.rigor`, mirroring `build_plan_route`.
 ///
 /// Each role backend is DIP-constructed exactly once from its model key via
 /// `default_rigor_backend`. With no `rigor` section (or missing keys), the
@@ -966,7 +985,7 @@ fn build_rigor_route(
     if let Some(backend) = default_rigor_backend(config, cfg.judge_model.as_deref()) {
         route = route.with_judge_backend(backend);
     }
-    // M5.3: when a shared ledger store exists, the judge renders its review
+    // When a shared ledger store exists, the judge renders its review
     // prompt over the session ledger through the assembler's budget/relevance
     // rules (the red team keeps its LOD0 `FilteredLedger` view unchanged). The
     // store presence is the opt-in gate; the route reads the ledger by session.

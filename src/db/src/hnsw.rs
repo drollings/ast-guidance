@@ -1,4 +1,4 @@
-//! The canonical HNSW-backed vector index store (D6).
+//! The canonical HNSW-backed vector index store.
 //!
 //! `HnswIndex` owns the cosine-distance `Hnsw` index plus its external-id
 //! mapping (`id_map`: HNSW `d_id` → caller node id), and exposes
@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn poisoned_hnsw_rwlock_still_serves_insert_and_search() {
-        // M2.2: the hnsw `RwLock` must recover from poison via
+        // The hnsw `RwLock` must recover from poison via
         // `common_core::sync::lock_write` / `lock_read`. A panic while holding
         // a write guard obtained via `.write().unwrap()` poisons the lock; a
         // subsequent `insert`/`search` must still work.

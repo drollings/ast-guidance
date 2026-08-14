@@ -488,8 +488,6 @@ mod tests {
         assert!(validate_instances(&[a, b]).is_ok());
     }
 
-    // -- M4 sidecar ---------------------------------------------------------
-
     fn sidecar_policy() -> crate::config::SidecarConfig {
         crate::config::SidecarConfig {
             poll_interval_s: 5,
@@ -500,6 +498,8 @@ mod tests {
             slot_save_path: Some("/srv/slots".into()),
             resume_ttl_s: None,
             api_key_env: None,
+            liveness_poll_interval_s: 30,
+            liveness_failures_before_restart: 3,
         }
     }
 
@@ -1038,7 +1038,15 @@ mod tests {
         let mut managers = HashMap::new();
         managers.insert("base".into(), manager);
         let pool = InstancePool::from_managers(managers, None);
-        pool.residency_cycle().await.expect("residency");
+        // `residency_cycle` reads the ROCm sysfs VRAM total through the
+        // capability-gated fs helper; grant `FsCapability` as the serving
+        // path does.
+        fluent_concurrency::scope::CURRENT_CAPS
+            .scope(
+                fluent_concurrency::capability::default_capability_set(),
+                async { pool.residency_cycle().await.expect("residency") },
+            )
+            .await;
         let recorded = stub.recorded();
         assert!(
             recorded.iter().any(|(m, p, _)| m == "GET" && p == "/instances"),
@@ -1348,7 +1356,14 @@ mod tests {
         let mut managers = HashMap::new();
         managers.insert("swarm".into(), manager);
         let pool = InstancePool::from_managers(managers, None);
-        pool.residency_cycle().await.expect("residency");
+        // `residency_cycle` reads the ROCm sysfs VRAM total via the gated
+        // fs helper; grant `FsCapability` as the serving path does.
+        fluent_concurrency::scope::CURRENT_CAPS
+            .scope(
+                fluent_concurrency::capability::default_capability_set(),
+                async { pool.residency_cycle().await.expect("residency") },
+            )
+            .await;
         assert!(
             stub.recorded().iter().all(|(m, _, _)| m != "DELETE"),
             "no budget -> no eviction"

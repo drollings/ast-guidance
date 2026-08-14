@@ -14,6 +14,7 @@ use std::time::Duration;
 use common_core::ResponseCache;
 use fluent_wvr::prelude::*;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 
 use crate::config::{ModelEntry, RouteRef, ServerConfig};
 use crate::dag_session::SessionRegistry;
@@ -35,18 +36,18 @@ pub struct RouterServer {
     mock_dispatch: Option<Arc<MockDispatchContext>>,
     ledger: Option<Arc<ContentNodeLedger>>,
     cache: Option<Arc<ResponseCache>>,
-    /// Chart store + selector host (boot-loaded; M7/M8 dispatch to it).
+    /// Chart store + selector host (boot-loaded; dispatch to it).
     plan_route: Option<Arc<PlanRoute>>,
-    /// Rigor route (M3): blue/red/judge protocol. `None` → `/v1/rigor`
+    /// Rigor route: blue/red/judge protocol. `None` → `/v1/rigor`
     /// returns an explicit "not configured" response.
     rigor_route: Option<Arc<RigorRoute>>,
-    /// Per-`session_id` `DependencySession` registry (D6 canonical session).
+    /// Per-`session_id` `DependencySession` registry (canonical session).
     sessions: Option<Arc<SessionRegistry>>,
-    /// Per-model-group escalation ladders (M3).
+    /// Per-model-group escalation ladders.
     ladders: HashMap<String, Arc<Ladder>>,
-    /// Deterministic-fact cache consulted before escalating (M3).
+    /// Deterministic-fact cache consulted before escalating.
     context_cache: Option<Arc<dyn fluent_types::ContextCache>>,
-    /// Sidecar instance pool (M4): one manager per managed model, aggregating
+    /// Sidecar instance pool: one manager per managed model, aggregating
     /// the public `/instances` API and consulting the manager on a 503
     /// group-miss to allocate fresh KV before retrying.
     instance_pool: Option<Arc<crate::instances::InstancePool>>,
@@ -55,10 +56,10 @@ pub struct RouterServer {
     supervisor: Option<Arc<crate::supervisor::LlamaServerSupervisor>>,
     /// Env var naming the management API key (enforced on `/instances`).
     api_key_env_name: Option<String>,
-    /// Background `LedgerTierWorker` join handle (M2). Held so the worker task
+    /// Background `LedgerTierWorker` join handle. Held so the worker task
     /// lives for the process lifetime.
     tier_worker: Option<tokio::task::JoinHandle<()>>,
-    /// The `LedgerAgentCoordinator` (M4), when the operator opts in. `None`
+    /// The `LedgerAgentCoordinator`, when the operator opts in. `None`
     /// keeps dispatch unchanged.
     coordinator: Option<Arc<crate::ledger::orchestrator::LedgerAgentCoordinator>>,
     depends: Vec<ArcIntern<str>>,
@@ -117,7 +118,7 @@ impl RouterServer {
         self
     }
 
-    /// Attach the rigor route (M3). `None` (default) leaves `/v1/rigor`
+    /// Attach the rigor route. `None` (default) leaves `/v1/rigor`
     /// present but unconfigured — requests return an explicit error.
     #[must_use]
     pub fn with_rigor_route(mut self, rigor_route: Arc<RigorRoute>) -> Self {
@@ -125,7 +126,7 @@ impl RouterServer {
         self
     }
 
-    /// Attach the per-session `DependencySession` registry (D6 canonical
+    /// Attach the per-session `DependencySession` registry (canonical
     /// session). Each chat-completion request then tracks a step in the
     /// session keyed by its `session_id`.
     #[must_use]
@@ -134,7 +135,7 @@ impl RouterServer {
         self
     }
 
-    /// Attach the per-model-group escalation ladders (M3).
+    /// Attach the per-model-group escalation ladders.
     #[must_use]
     pub fn with_ladders(mut self, ladders: HashMap<String, Arc<Ladder>>) -> Self {
         tracing::info!(
@@ -146,7 +147,7 @@ impl RouterServer {
         self
     }
 
-    /// Attach the deterministic context cache consulted before escalating (M3).
+    /// Attach the deterministic context cache consulted before escalating.
     #[must_use]
     pub fn with_context_cache(
         mut self,
@@ -160,7 +161,7 @@ impl RouterServer {
         self
     }
 
-    /// Attach the sidecar instance pool (M4): one manager per managed model.
+    /// Attach the sidecar instance pool: one manager per managed model.
     /// `serve` runs each manager's boot reconciliation and residency loop as a
     /// task; dispatch consults the owning manager on a 503 group-miss to
     /// allocate KV, and the public `/instances` API aggregates the pool.
@@ -184,7 +185,7 @@ impl RouterServer {
         self
     }
 
-    /// Attach the managed llama-server supervisor (M5). Enables
+    /// Attach the managed llama-server supervisor. Enables
     /// `POST /models/unload` and the `/metrics` aggregation.
     #[must_use]
     pub fn with_supervisor(mut self, supervisor: Option<Arc<crate::supervisor::LlamaServerSupervisor>>) -> Self {
@@ -192,7 +193,7 @@ impl RouterServer {
         self
     }
 
-    /// Hold the background `LedgerTierWorker` join handle (M2) so the worker
+    /// Hold the background `LedgerTierWorker` join handle so the worker
     /// task lives for the process lifetime.
     #[must_use]
     pub fn with_tier_worker(mut self, handle: tokio::task::JoinHandle<()>) -> Self {
@@ -200,7 +201,7 @@ impl RouterServer {
         self
     }
 
-    /// Attach the `LedgerAgentCoordinator` (M4). `None` (the default) leaves
+    /// Attach the `LedgerAgentCoordinator`. `None` (the default) leaves
     /// dispatch unchanged.
     #[must_use]
     pub fn with_coordinator(
@@ -222,7 +223,16 @@ impl RouterServer {
         self
     }
 
-    pub async fn serve(&self) -> Result<(), crate::error::ServerError> {
+    /// Serve until the `shutdown` watch fires. Coral Router owns the local
+    /// inference fleet and the server's serving tasks, so this method runs the
+    /// HTTP accept loop to completion and then **drains** (aborts + awaits,
+    /// within a timeout) the process-lifetime background tasks it spawned —
+    /// the per-manager pinned-instance reconcile and the device-wide residency
+    /// loop — so nothing is left detached on shutdown.
+    pub async fn serve(
+        &self,
+        shutdown: watch::Receiver<bool>,
+    ) -> Result<(), crate::error::ServerError> {
         let chart_count = self
             .plan_route
             .as_ref()
@@ -274,20 +284,44 @@ impl RouterServer {
         // LRU-largest unpinned when over the VRAM budget, unload empty
         // models). Best-effort: a failed reconcile/residency poll logs and
         // continues.
+        //
+        // These are process-lifetime background tasks owned by the server:
+        // they run in a `JoinSet` that is drained on shutdown, never detached.
+        let mut background = tokio::task::JoinSet::new();
         if let Some(pool) = &self.instance_pool {
             for manager in pool.managers_iter() {
                 let manager = manager.clone();
-                tokio::spawn(async move {
+                background.spawn(async move {
                     manager.bootstrap().await;
                 });
             }
             let pool = pool.clone();
-            tokio::spawn(async move {
-                pool.run_residency().await;
+            background.spawn(async move {
+                // The residency loop reads the ROCm sysfs VRAM total
+                // through a capability-gated `read_dir`; install the
+                // `FsCapability` grant for the life of the task.
+                fluent_wvr::CURRENT_CAPS
+                    .scope(
+                        fluent_wvr::CapabilitySet::new().with(fluent_wvr::FsCapability::new()),
+                        async move {
+                            pool.run_residency().await;
+                        },
+                    )
+                    .await;
             });
         }
 
-        run_http(&self.bind_addr, deps).await
+        let result = run_http(&self.bind_addr, deps, shutdown).await;
+
+        // Graceful shutdown: abort the background tasks and await their
+        // completion so no process-lifetime task is left detached.
+        background.abort_all();
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            while background.join_next().await.is_some() {}
+        })
+        .await;
+
+        result
     }
 }
 
@@ -328,8 +362,12 @@ impl WorkUnit for RouterServer {
         };
         let rt = ctx.rt.clone();
 
+        // The `WorkUnit`/`SupervisedBatch` entry runs the server as a
+        // supervised task; it holds its own (never-fired) shutdown watch so
+        // `run_http`'s accept loop runs for the task's lifetime.
+        let (_, shutdown_rx) = watch::channel(false);
         let _handle = rt.spawn(Box::pin(async move {
-            if let Err(e) = run_http(&bind_addr, deps).await {
+            if let Err(e) = run_http(&bind_addr, deps, shutdown_rx).await {
                 tracing::error!(target: "router.server", error = %e, "HTTP server error");
             }
         }));
@@ -354,6 +392,7 @@ impl_component!(RouterServer);
 async fn run_http(
     bind_addr: &str,
     deps: handler::ServerDeps,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<(), crate::error::ServerError> {
     let listener =
         TcpListener::bind(bind_addr)
@@ -365,20 +404,40 @@ async fn run_http(
 
     tracing::info!(target: "router.server", addr = %bind_addr, "HTTP server listening (hyper)");
 
-    serve_http(listener, deps).await
+    serve_http(listener, deps, Some(shutdown)).await
 }
 
 /// Accept loop over an already-bound listener. Public(crate) so integration
 /// tests can bind an ephemeral listener themselves (`127.0.0.1:0`) and drive
 /// a real server with no rebind race; production entry is `run_http`.
+///
+/// `shutdown` is an optional graceful-stop signal. `None` runs the accept loop
+/// forever (the test-helper default). `Some(receiver)`: when the watch fires
+/// the loop stops accepting, then drains the in-flight per-connection
+/// tasks (abort + await, within a timeout) so no per-request task is left
+/// detached.
 pub(crate) async fn serve_http(
     listener: TcpListener,
     deps: handler::ServerDeps,
+    shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<(), crate::error::ServerError> {
     use hyper_util::rt::TokioIo;
 
+    let mut connections: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+
     loop {
-        let (stream, _peer) = match listener.accept().await {
+        let accepted = match &shutdown {
+            Some(sh) => {
+                let mut sh = sh.clone();
+                tokio::select! {
+                    _ = sh.changed() => break,
+                    accepted = listener.accept() => accepted,
+                }
+            }
+            None => listener.accept().await,
+        };
+
+        let (stream, _peer) = match accepted {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!(target: "router.server", error = %e, "accept error");
@@ -387,8 +446,7 @@ pub(crate) async fn serve_http(
         };
 
         let deps = deps.clone();
-
-        tokio::spawn(async move {
+        connections.spawn(async move {
             let io = TokioIo::new(stream);
             let service = hyper::service::service_fn(move |req| {
                 let deps = deps.clone();
@@ -407,4 +465,14 @@ pub(crate) async fn serve_http(
             }
         });
     }
+
+    // Graceful shutdown: abort in-flight connections and await their
+    // tasks within a timeout, so tracked per-request tasks are never detached.
+    connections.abort_all();
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
+
+    Ok(())
 }

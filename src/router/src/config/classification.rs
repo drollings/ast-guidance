@@ -11,7 +11,7 @@
 //! The flat sections (`pipelines`, `routes`, `system_prompt`, `score_matrix`,
 //! `models`, `model_groups`) are unchanged and still load; when a tree is
 //! present the flat *views* the rest of the server expects (route→pipeline
-//! mapping, system prompt) are derived from it (M4.4).
+//! mapping, system prompt) are derived from it.
 
 use std::fmt::Write;
 
@@ -30,7 +30,7 @@ pub struct ClassificationTree {
 impl ClassificationTree {
     /// The model key of the root node when it is a `classifier` — the natural
     /// default for the classifier stage's backend when no flat
-    /// `classifier_model` is configured (M4.1 boot).
+    /// `classifier_model` is configured.
     pub fn root_classifier_model(&self) -> Option<&str> {
         match &self.root {
             ClassificationNode::Classifier { model, .. } => Some(model),
@@ -50,17 +50,17 @@ impl ClassificationTree {
     }
 
     /// `(route, group, description)` for every `terminal` node in the tree —
-    /// the source for the derived flat `routes` view (M4.4).
+    /// the source for the derived flat `routes` view.
     pub fn terminal_views(&self) -> Vec<(String, Option<String>, String)> {
         let mut out = Vec::new();
         self.root.collect_terminals(&mut out);
         out
     }
 
-    /// Auto-generate the classifier system prompt from the root node's children
-    /// and descriptions — the derived `system_prompt` view for tree configs
-    /// (M4.4). `None` when the root is not a classifier or has no routeable
-    /// children.
+    /// Auto-generate the classifier system prompt from the root node's
+    /// children and descriptions — the derived `system_prompt` view for
+    /// tree configs `None` when the root is not a classifier or has no
+    /// routeable children.
     pub fn derive_system_prompt(&self) -> Option<String> {
         let (coherence, safety) = match &self.root {
             ClassificationNode::Classifier {

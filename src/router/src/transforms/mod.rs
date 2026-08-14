@@ -32,7 +32,7 @@ pub trait TransformStrategy: Send + Sync {
 pub type TransformStrategyRef = Arc<dyn TransformStrategy>;
 
 /// Shared clone-messages/iterate/match boilerplate for transforms that rewrite
-/// each `Text` message in place (M7.5 / D9 — the six-copy clone/iterate/match
+/// each `Text` message in place (the six-copy clone/iterate/match
 /// skeleton is consolidated here). `Parts` messages are left untouched.
 ///
 /// Each transform becomes a thin closure: only the per-message rewrite

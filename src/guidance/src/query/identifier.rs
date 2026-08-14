@@ -8,9 +8,8 @@ pub struct IdentifierPattern {
     pub kind: IdentifierKind,
 }
 
-/// Identifier case-style classification. Re-exported from
-/// `common_core::string` (M3.4/M7.2 promotion) so existing guidance
-/// consumers keep the same path.
+/// Identifier case-style classification.  Re-exported from
+/// `common_core::string` so existing guidance consumers keep the same path.
 pub use common_core::string::IdentifierKind;
 
 pub fn detect_identifier_pattern(query: &str) -> Option<IdentifierPattern> {

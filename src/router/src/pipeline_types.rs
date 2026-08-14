@@ -8,7 +8,7 @@ use crate::config::FilterAction;
 use crate::filters::RegexMatch;
 use crate::pipeline::RoutingTarget;
 
-/// A pipeline stage that emits a typed `StageDecision` (M5.4).
+/// A pipeline stage that emits a typed `StageDecision`.
 ///
 /// The `PipelineOrchestrator` calls `evaluate` directly, passing the running
 /// decision accumulator (`prior`) by reference — a typed handoff that removes
@@ -75,6 +75,11 @@ impl StageDecision {
 pub enum PipelineStage {
     DeterministicPreFilter,
     Classifier,
+    /// Synthetic error marker only — NOT a real pipeline stage. Retained so
+    /// telemetry/rejection paths have a stable value to report when the
+    /// pipeline itself fails to produce a verdict (F9); the pipeline never
+    /// enters a `Router` stage, and no `PipelineStage` of this name is ever
+    /// executed.
     Router,
 }
 

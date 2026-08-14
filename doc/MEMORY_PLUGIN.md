@@ -451,7 +451,7 @@ src/memory/                    # New workspace member: guidance-memory
 │   ├── types.rs               # MemoryInitContext, MemoryResult, MemoryError, etc.
 │   ├── registry.rs            # MemoryPluginRegistry, MemoryCapability
 │   ├── capability.rs          # MemoryCapability token
-│   ├── zone.rs                # MemoryZone: ingestion SupervisedBatch wrapper
+│   ├── batch.rs               # MemoryBatch: ingestion SupervisedBatch wrapper
 │   ├── plugins/
 │   │   ├── mod.rs             # Plugin module declarations
 │   │   ├── holographic/
@@ -531,20 +531,20 @@ const _: () = {
 The ingestion pipeline uses `CreditFlow` from `fluent-concurrency` to prevent unbounded memory accumulation during deep repo syncs:
 
 ```rust
-// src/memory/src/zone.rs
+// src/memory/src/batch.rs
 
 use fluent_concurrency::{SupervisedBatch, SupervisedBatchConfig, Scope, CreditFlow};
 use crate::traits::*;
 
-/// Memory-specific ingestion zone.
+/// Memory-specific ingestion batch.
 /// Wraps the memory pipeline semantics (over `Scope`) with pipeline semantics.
-pub struct MemoryZone {
-    zone: SupervisedBatch,
+pub struct MemoryBatch {
+    batch: SupervisedBatch,
     credit: CreditFlow,
 }
 
-impl MemoryZone {
-    /// Create a new memory ingestion zone with bounded backpressure.
+impl MemoryBatch {
+    /// Create a new memory ingestion batch with bounded backpressure.
     ///
     /// - `max_concurrent`: max simultaneous ingest tasks (prevents SQLite thrashing)
     /// - `credit_limit`: max queued items before producer blocks (prevents heap growth)
@@ -560,7 +560,7 @@ impl MemoryZone {
         };
         let (credit, _receiver) = CreditFlow::new(credit_limit);
         Self {
-            zone: SupervisedBatch::new(rt, caps, config),
+            batch: SupervisedBatch::new(rt, caps, config),
             credit,
         }
     }
@@ -569,15 +569,15 @@ impl MemoryZone {
     /// Blocks (async) if credit is exhausted.
     pub async fn ingest(&self, job: IngestJob) -> Result<(), MemoryError> {
         self.credit.acquire().await
-            .map_err(|_| MemoryError::IngestionFailed("zone shutting down".into()))?;
-        // Spawn within the zone's scope — fault containment applies
-        self.zone.spawn(Box::new(IngestUnit { job }))
+            .map_err(|_| MemoryError::IngestionFailed("batch shutting down".into()))?;
+        // Spawn within the batch's scope — fault containment applies
+        self.batch.spawn(Box::new(IngestUnit { job }))
             .map_err(|e| MemoryError::IngestionFailed(e.to_string()))
     }
 
-    /// Close the zone, waiting for all in-flight ingestion to complete.
+    /// Close the batch, waiting for all in-flight ingestion to complete.
     pub async fn close(self) {
-        self.zone.close().await;
+        self.batch.close().await;
     }
 }
 
@@ -613,7 +613,7 @@ impl fluent_wvr::WorkUnit for IngestUnit {
 
 When an ingestion task panics inside the `SupervisedBatch`:
 1. The `SupervisedBatch` catches the `JoinError` (panic is caught, not propagated)
-2. A `ZoneEvent::TaskFailed { name, error }` is emitted
+2. A `BatchEvent::TaskFailed { name, error }` is emitted
 3. Dependent tasks (if any) are cancelled via structural cancellation tokens
 4. Independent tasks continue unaffected
 5. **No automatic restart** — restart is a deliberate operator action per `fluent-concurrency` philosophy
@@ -1020,7 +1020,7 @@ pub struct GuidanceWorkContext {
 | 2 | `HolographicMemory`: store.rs, hrr.rs, retrieval.rs, full `MemoryOps` impl | 3 days |
 | 3 | `HindsightMemory`: graph.rs, entity.rs, retrieval.rs | 3 days |
 | 4 | `HonchoMemory`: session.rs, analyzer.rs, retrieval.rs | 2 days |
-| 5 | `MemoryZone` integration with `fluent-concurrency` SupervisedBatch | 1 day |
+| 5 | `MemoryBatch` integration with `fluent-concurrency` SupervisedBatch | 1 day |
 | 6 | Guidance integration: prefetch injection, tool dispatch | 1 day |
 | 7 | Tests: unit (HRR algebra, entity resolution), integration (full pipeline), property-based (dedup) | 2 days |
 

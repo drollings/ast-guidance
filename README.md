@@ -14,11 +14,11 @@ sandbox.
 
 Its concurrent operations are built on **Fluent Concurrency**, a lightweight
 layer of guardrails over Tokio, hyper, and reqwest that keeps async I/O and
-inference for agentic LLM applications fast and battle-tested. Its foundation
-is the **Fluent WVR** set of design patterns — `Fluent, Wrapped, Verified,
-Reflected` — which maximize code reuse, composable primitives,
-deterministic-first design, and a uniform source of metadata and validated
-input constraints.
+inference for agentic LLM applications fast, guardrailed, and rooted in the
+battle-tested Rust ecosystem.  Its foundation is the **Fluent WVR** set of
+design patterns — `Fluent, Wrapped, Verified, Reflected` — which maximize
+code reuse, composable primitives, deterministic-first design, and a uniform
+source of metadata and validated input constraints.
 
 Note: parallel inference support builds on a branch of llama.cpp that allows
 parallel context windows, sized per request via HTTP parameters:
@@ -85,12 +85,16 @@ flat enums, and `dyn` lives at the request boundary, not in the tight loop.
 `fluent-concurrency` is a thin, 100% safe extension layer over Tokio: bounded
 worker pools, structured `Scope`s, the `SupervisedBatch` (supervision +
 dependency cancellation + panic/fail/cancel tracking), `Limiter`,
-`PriorityQueue`, credit-flow backpressure, and the `first_accept_in_order`
-ladder. Tokio is the workhorse — the crate composes its primitives rather than
-rebuilding the scheduler.
+`PriorityQueue`, `CreditFlow` (scaffold — see §3.7), and the
+`first_accept_in_order` ladder. Tokio is the workhorse — the crate composes its
+primitives rather than rebuilding the scheduler.
 
-Every spawned task belongs to a `Scope` whose close must be awaited, and
-every effect requires an explicit capability token — no ambient authority.
+Every task is owned: tasks spawned inside a `Scope` are awaited when the scope
+closes, and server-owned background/connection tasks are awaited when the
+server drains them at graceful shutdown. Effects are capability-gated: DB
+and knowledge access require tokens, and file/process/network effects are gated
+wherever a capability set is installed (the serving path) — operator CLI
+tooling is capability-exempt by design.
 → `doc/skills/fluent-concurrency/SKILL.md`
 
 ## DAG — the dependency fabric
@@ -142,10 +146,13 @@ server + smoke checks).
 2. **Cache over compute**: every novel solution becomes a permanent cached node
 3. **Edge-deployable**: single-process SQLite, no external services, targets
    Raspberry Pi class hardware
-4. **Capability-gated I/O**: all file/network/DB access requires explicit
-   capability tokens — no ambient authority
-5. **Structured concurrency**: every spawned task belongs to a `Scope` whose
-   close must be awaited; panics are contained within `SupervisedBatch`
+4. **Capability-gated I/O**: DB and knowledge effects require explicit
+   capability tokens; file/process/network effects are gated where the
+   capability set is installed (the serving path) and are operator-exempt in
+   CLI tooling
+5. **Structured concurrency**: every task is owned — `Scope`-spawned tasks
+   are awaited when the scope closes and server-owned tasks are awaited at
+   graceful shutdown; panics are contained within `SupervisedBatch`
 6. **Uniform interface**: native Rust, WASM plugins, and DB-driven configs all
    present `Arc<dyn Component>` — the orchestrator never branches on origin
 7. **Safe by default**: `forbid(unsafe_code)` at the crate level; the only

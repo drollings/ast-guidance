@@ -2,12 +2,10 @@
 //!
 //! Binds context entities to a chart target's `DepSpec`s using structural
 //! JSON-Schema-style predicates. This is the "first layer" of the dual-layer
-//! resolver: it produces concrete asset keys and the caller (M5 stage) drives
+//! resolver: it produces concrete asset keys and the caller drives
 //! the existing `DependencyGraph` (`topo_sort`, `ready_nodes`, `is_ready`).
 //! Nothing in `dep_graph.rs` or `resolver.rs` is modified — this module is
 //! pure data in, pure data out.
-//!
-//! LLM fallback (for `Unmatched`/`Ambiguous`) is M8.
 
 use std::collections::{HashMap, HashSet};
 
@@ -41,7 +39,7 @@ pub struct Bindings {
     pub ambiguous: Vec<AmbiguousDep>,
 }
 
-/// A dep that matched more than one entity — adjudication engages (M8).
+/// A dep that matched more than one entity — adjudication engages.
 #[derive(Debug, Clone)]
 pub struct AmbiguousDep {
     pub dep: String,
@@ -56,11 +54,11 @@ pub struct AmbiguousDep {
 /// - `EntityMatch` with a `predicate`: 0 matches → unmatched/skipped (per
 ///   `required`); 1 match → bound; >1 matches → ambiguous.
 /// - `EntityMatch` without a `predicate`: cannot be evaluated
-///   deterministically — treated as no match (required → unmatched, M8 LLM
+///   deterministically — treated as no match (required → unmatched, LLM
 ///   fallback engages).
 /// - `Capability { name }`: satisfied when an entity's `kind == name` or its
 ///   `value.provides` array contains `name`; a zero-match capability is
-///   pushed into `unmatched` (D1) so capability-gapped charts classify
+///   pushed into `unmatched` so capability-gapped charts classify
 ///   `Partial` instead of failing only at compile time.
 ///
 /// This per-target form has no chart context, so it cannot know which
@@ -73,7 +71,7 @@ pub fn bind_entities(deps: &[DepSpec], entities: &[Entity]) -> Bindings {
 
 /// Chart-aware binding: capability assets provided by the chart's own
 /// targets are bound by the graph (never a context-entity gap), so they are
-/// excluded from `unmatched` (D1). `EntityMatch` semantics are unchanged.
+/// excluded from `unmatched`. `EntityMatch` semantics are unchanged.
 fn bind_entities_impl(deps: &[DepSpec], entities: &[Entity], in_graph: &HashSet<&str>) -> Bindings {
     let mut bindings = Bindings::default();
 
@@ -112,7 +110,7 @@ fn bind_entities_impl(deps: &[DepSpec], entities: &[Entity], in_graph: &HashSet<
             } => {
                 let Some(pred) = predicate else {
                     // No deterministic rule → cannot bind structurally. The
-                    // LLM fallback (M8) adjudicates; surface as unmatched if
+                    // LLM fallback adjudicates; surface as unmatched if
                     // required.
                     if *required {
                         bindings.unmatched.push(name.clone());
@@ -148,13 +146,13 @@ fn bind_entities_impl(deps: &[DepSpec], entities: &[Entity], in_graph: &HashSet<
 ///
 /// The aggregation is order-independent: satisfied assets and entity maps are
 /// unioned, unmatched deps are deduplicated (in first-seen order), and
-/// ambiguous deps accumulate. Used by chart selection (M7) to decide whether
+/// ambiguous deps accumulate. Used by chart selection to decide whether
 /// a chosen chart is `Exact` or `Partial` (interview gaps).
 ///
-/// Chart-aware (D1): a `Capability` dep that another chart target provides
+/// Chart-aware: a `Capability` dep that another chart target provides
 /// in-graph is bound by the graph, not by context entities — it is excluded
 /// from `unmatched`. Only capabilities with **no in-graph provider and no
-/// matching entity** surface as gaps, driving the M8 interview instead of an
+/// matching entity** surface as gaps; interview instead of an
 /// `Exact`-then-`ChartError::Compile`.
 pub fn bind_chart(chart: &super::ChartDef, entities: &[Entity]) -> Bindings {
     let mut agg = Bindings::default();
@@ -199,8 +197,8 @@ fn bind_one(bindings: &mut Bindings, dep: &str, entity: &Entity) {
 
 /// Apply the shared 0/1/>1 semantics to a match list (used by Capability).
 ///
-/// A zero-match `Capability` dep is pushed into `unmatched` (D1/option a):
-/// the chart then classifies `ChartFit::Partial { gaps }` (drives the M8
+/// A zero-match `Capability` dep is pushed into `unmatched`:
+/// the chart then classifies `ChartFit::Partial { gaps }` (drives the
 /// interview) instead of `Exact`-then-`ChartError::Compile`, and `compile.rs`
 /// still treats an unbound capability as a hard error. `Capability` has no
 /// `required` field, so a zero-match capability is *always* unmatched.
@@ -604,7 +602,7 @@ mod tests {
 
     #[test]
     fn zero_match_capability_is_unmatched() {
-        // D1: a capability dep with no matching entity surfaces as unmatched
+        // A capability dep with no matching entity surfaces as unmatched
         // instead of silently binding to nothing.
         let b = bind_entities(&[capability("spell_check")], &[]);
         assert_eq!(b.unmatched, vec!["spell_check".to_string()]);
@@ -628,7 +626,7 @@ mod tests {
     fn bind_chart_filters_in_graph_capabilities_out_of_unmatched() {
         // Chart-aware binding: a capability dep provided by another chart
         // target in-graph is bound by the graph, not by context entities —
-        // it must not surface as a selection gap (D1).
+        // it must not surface as a selection gap.
         let chart_json = r#"{
             "name": "internal_chain",
             "description": "in-graph capability chain",
@@ -768,7 +766,7 @@ mod tests {
         let entities = vec![entity("r1", "report", serde_json::json!({"title": "T"}))];
         let c_bindings = bind_entities(&deps_c, &entities);
         assert!(c_bindings.satisfied.contains("entity:report:r1"));
-        // D1: the zero-match capability `b_out` is now self-described as
+        // The zero-match capability `b_out` is now self-described as
         // unmatched at the per-target binding layer — the chart-level
         // `bind_chart` filters in-graph-provided capabilities, but plain
         // `bind_entities` has no chart context.

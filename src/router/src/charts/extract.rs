@@ -5,7 +5,7 @@
 //! template capturing the prompt shape and `depends`/`provides` edges from the
 //! actual data flow. Extraction is a best-effort *deterministic*
 //! reconstruction (no LLM): the chart is written as a **draft** that only
-//! becomes selectable after a rubric-validated run (M9 gate).
+//! becomes selectable after a rubric-validated run.
 
 use std::sync::Arc;
 
@@ -42,7 +42,7 @@ pub struct ChartAuditStep {
 pub struct ChartAuditTranscript {
     /// The user's original request.
     pub query: String,
-    /// Model key that authored the solution (staleness tracking, M10).
+    /// Model key that authored the solution (staleness tracking).
     #[serde(default)]
     pub author_model: String,
     /// The discrete steps, in execution order.
@@ -50,7 +50,7 @@ pub struct ChartAuditTranscript {
 }
 
 /// Best-effort deterministic reconstruction of a `ChartDef` from an audit
-/// transcript (M10).
+/// transcript.
 ///
 /// - Chart name is a slug of the query (truncated to
 ///   `CHART_EXTRACTED_NAME_MAX_CHARS`); a degenerate slug is a hard
@@ -63,7 +63,7 @@ pub struct ChartAuditTranscript {
 ///   convention).
 /// - The chart is a *draft*: it self-provides `draft_output` only when no
 ///   step already provides an asset, and `author_model` records the authoring
-///   model for the M10 staleness policy.
+///   model for the staleness policy.
 pub fn extract_chart_from_audit(transcript: &ChartAuditTranscript) -> Result<ChartDef, ChartError> {
     let name = slugify_chart_name(&transcript.query);
     if name.is_empty() {
@@ -173,7 +173,7 @@ pub fn slugify_chart_name(query: &str) -> String {
 /// Build the audit-shaped transcript for a single successful dispatch
 /// (the current dispatch chain is one buffered LLM call, so the faithful
 /// decomposition is one step). The `prompt` is the **actual** prompt sent
-/// to the model (M10a LOD0 fidelity) — it captures the real LOD0 prompt
+/// to the model (LOD0 fidelity) — it captures the real LOD0 prompt
 /// shape so `template_from_prompt` produces a faithful template, instead of
 /// synthesizing a "Solve the following request…" wrapper.
 pub fn transcript_from_dispatch(
@@ -196,7 +196,7 @@ pub fn transcript_from_dispatch(
     }
 }
 
-/// The M10 dispatch post-processing hook: distills successful dispatches into
+/// The dispatch post-processing hook: distills successful dispatches into
 /// draft charts in the shared `ChartStore`.
 ///
 /// Best-effort by design (VISION §"Post-processing: audit + workflow
@@ -207,7 +207,7 @@ pub fn transcript_from_dispatch(
 ///   fails a request.
 /// - Extraction is a *deterministic* reconstruction (no LLM); the written
 ///   chart is a **draft**, excluded from selection until a rubric-validated
-///   run promotes it (M9 gate).
+///   run promotes it.
 /// - Writes are idempotent: a near-neighbor chart in the `workflow_library`
 ///   index subsumes the new draft instead of duplicating it (VISION's rule),
 ///   and the subsumed chart's `author_model` is refreshed — a newer, stronger
@@ -243,7 +243,7 @@ impl WorkflowExtractor {
         self
     }
 
-    /// Set the extraction scope (M10b): `Frontier` (default) distills only
+    /// Set the extraction scope: `Frontier` (default) distills only
     /// frontier-assisted (escalated/fallback) dispatches; `All` restores the
     /// blanket behavior.
     #[must_use]
@@ -426,7 +426,7 @@ mod tests {
         }
     }
 
-    // ── M10: WorkflowExtractor (dispatch post-processing hook) ───────────
+    // ── WorkflowExtractor (dispatch post-processing hook) ───────────
 
     #[test]
     fn transcript_from_dispatch_produces_single_step() {
@@ -440,7 +440,7 @@ mod tests {
         assert_eq!(t.author_model, "claude-4");
         assert_eq!(t.steps.len(), 1);
         assert_eq!(t.steps[0].id, "solve");
-        // M10a LOD0 fidelity: the step prompt is the real prompt that was
+        // LOD0 fidelity: the step prompt is the real prompt that was
         // sent to the model — no synthesized "Solve the following request…"
         // wrapper.
         assert_eq!(
@@ -502,7 +502,7 @@ mod tests {
         assert!(store.is_empty());
     }
 
-    // ── M10b: extraction scope (frontier-assisted only by default) ────────
+    // ── Extraction scope (frontier-assisted only by default) ────────
 
     #[test]
     fn frontier_mode_skips_primary_dispatch() {

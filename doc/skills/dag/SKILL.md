@@ -67,13 +67,13 @@ indefinitely. `topo_sort` returns `Err(GraphError::Cycle)` on cycles.
 | `ChartExecutionPlan` (fluent-router) | Compiled chart stage order + ready-set | `src/router/src/charts/execute.rs` |
 | `compile_chart_stages` (fluent-router) | Chart target dependency validation/topo order | `src/router/src/charts/compile.rs` |
 
-## `CheckpointedStepGraph<K, S>` — checkpointed step tracking (M6)
+## `CheckpointedStepGraph<K, S>` — checkpointed step tracking
 
 **Path**: `src/dag/src/checkpointed.rs`
 **Export**: `fluent_dag::checkpointed::CheckpointedStepGraph`
 
 **Status: production.** The canonical step-DAG primitive with checkpoint/rewind
-bookkeeping, carved out of the router's `DependencySession` in M6. Any session
+bookkeeping, carved out of the router's `DependencySession`. Any session
 step graph that needs to record checkpoints and rewind to them MUST compose
 this rather than re-implementing `steps`/`completed`/`checkpoints`/`step_order`
 bookkeeping by hand.
@@ -141,7 +141,7 @@ for node in graph.topo_sort()? {
 
 | Module | Purpose | Path |
 |--------|---------|------|
-| `executor` | ~~Sequential target executor~~ **pruned (M2)** — run plans under `SupervisedBatch` via the `TargetWorkUnit` bridge instead | (`deleted`; see `target_work_unit`) |
+| `executor` | ~~Sequential target executor~~ **pruned** — run plans under `SupervisedBatch` via the `TargetWorkUnit` bridge instead | (`deleted`; see `target_work_unit`) |
 | `resolver` | Resolves abstract dependencies to concrete targets; `ProviderSelection::{All, NarrowOne}` policy | `src/dag/src/resolver.rs` |
 | `target_work_unit` | `TargetWorkUnit` — `Target` → `WorkUnit` bridge (`from_target`), runnable under `SupervisedBatch` supervision | `src/dag/src/target_work_unit.rs` |
 | `closure` | Shared transitive-closure primitive (DFS over depends edges) — `pub(crate)` | `src/dag/src/closure.rs` |

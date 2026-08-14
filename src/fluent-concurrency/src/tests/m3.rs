@@ -134,7 +134,7 @@ fn limiter_run_sync_caps_concurrency() {
 /// `Limiter::run_sync` called from *inside* a running multi-threaded tokio
 /// runtime must not panic with "Cannot start a runtime from within a runtime".
 /// This is the router HTTP handler's exact shape: the classifier runs through
-/// `run_sync` on a tokio worker thread. Regression for M7 (HTTP harness).
+/// `run_sync` on a tokio worker thread. Regression for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn limiter_run_sync_inside_multithread_runtime_no_panic() {
     let limiter = Limiter::new(1);

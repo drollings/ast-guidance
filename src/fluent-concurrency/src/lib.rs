@@ -3,7 +3,7 @@
 pub mod affinity;
 // The `capability` module provides the concrete Fs/Net/Db capability tokens
 // and the `io` module the gated engines behind them. Both are behind the `db`
-// feature so a non-DB consumer pays nothing for the database layer (D11).
+// feature so a non-DB consumer pays nothing for the database layer.
 #[cfg(feature = "db")]
 pub mod capability;
 pub mod flow;
