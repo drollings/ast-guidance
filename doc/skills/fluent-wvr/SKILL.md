@@ -1,6 +1,81 @@
-# Fluent WVR in Rust — The Synthesis Pipeline
+# Fluent WVR = Fluent, Wrapped, Verified, Reflected.
 
-**A design pattern guide for human coders and AI agents working in the Rust codebase.**
+**A design pattern guide for human coders and AI agents working in this Rust codebase.**
+
+You are reading the document that defines the core concepts and conventions of 
+this codebase's control plane. Its design patterns interlock for clean extensibility 
+and composition.  It's not a silver bullet or a hammer to every nail, but the 
+pervasive thread of forward-compatible design in this codebase.
+
+---
+
+## What is it?
+
+The fluent-wvr document and its code is a collection of interlocking design 
+patterns enabling consistent metadata for composable units of work, polymorphism 
+where needed, schemas for datatypes internally and over IPC, and other single 
+sources of truth.
+
+---
+
+## Why fluent-wvr exists
+
+fluent-wvr is the **control plane** of this codebase: the layer that makes
+components *composable and flexible* instead of hard-wired. It answers one
+design question that every nontrivial system eventually hits — *"how do I let
+the same orchestrator run very different things without a `match` statement
+for every kind?"* — with a single, compiler-checked answer.
+
+**It gives Rust the polymorphism other languages take for granted.** C++ and
+Python express this with class inheritance: a base class with virtual methods,
+or a subclass that overrides behavior. Entity Component Systems express it
+differently: small, independently-composable pieces assembled per entity
+rather than inherited. fluent-wvr does both in Rust terms:
+
+- **Inheritance-like polymorphism** — the `Component`/`WorkUnit` trait is the
+  "base class"; a native struct, a WASM plugin, and a database-driven config
+  are all "subclasses" that can be swapped behind one `Arc<dyn Component>`
+  handle.
+- **ECS-like composition** — instead of deep type hierarchies, units declare
+  what they *depend on* and *provide* (`depends()`/`provides()`), so an
+  orchestrator composes behavior from independent pieces, exactly as an ECS
+  composes entities from components.
+
+The difference from C++/Python: **strong typing and Rust idioms are embraced,
+not fought.** Polymorphism is *nominal and explicit* — an implementation must
+declare the interface it satisfies, and the compiler checks every method
+signature at compile time. There is no silent runtime method-miss (Python) and
+no unchecked downcast (C++).
+
+**It is a single source of truth for the control plane.** The struct
+definition is authoritative: one `#[derive(FieldAccess, Describable)]` on a
+type generates field access, validation, and a JSON Schema from the *same*
+fields — so the accessor, the validator, the schema, and the interface glue
+can never drift apart. You edit one definition; everything else follows.
+
+FieldAccess definitions are intended expressly for configurable composable 
+definitions, schemas, datatypes, and control planes.  Lacking FieldAccess 
+definitions is not a problem for small units of work in hot paths.  Lacking 
+forward compatibility with them in key control, schema, and definition surfaces 
+is an anti-pattern in this codebase.
+
+**What fluent-wvr is NOT for.** These patterns are for **control-plane
+objects** — configuration, orchestration, interfaces, and the "glue" that
+connects major types — not for every object processed in bulk. Do **not** wrap
+the hot-path inner loops in trait objects: a vtable lookup per element is a
+real cost when you process millions of items per second. That is why this
+guide pairs every polymorphic pattern with its monomorphized alternative
+(direct field access, generics, `first_accept_in_order`), and why the hot
+paths in this codebase use concrete types or monomorphized functions while the
+control plane uses `dyn Component`. **Rule of thumb: `dyn` at the request
+boundary, concrete in the tight loop.**
+
+**How the patterns contribute to better code, briefly:** they make unit tests
+trivial (swap a real backend for a stub behind the same handle), make new
+implementations additive (add a type, not a `match` arm), keep configuration
+schema-complete and validated, and let cross-cutting concerns (timing, retry,
+adaptation) attach without touching business logic — all at near-zero runtime
+cost except where a vtable or serialization boundary genuinely exists.
 
 ---
 
@@ -8,7 +83,7 @@
 
 **For humans coming from Python or C++**: Rust's trait system replaces inheritance, its ownership model replaces garbage collection, and its derive macros replace runtime reflection. This document shows how twelve composable patterns together give you Python's runtime ergonomics and C++'s polymorphic flexibility, with absolute memory safety and zero hidden cost.
 
-**For AI agents**: This document is the authoritative reference for how code in `rust-src/` is structured. When writing new code, check the pattern table in §1, find the applicable pattern, and follow the rules and anti-pattern sections.
+**For AI agents**: This document is the authoritative reference for how code in this Rust `fluent-monorepo` is structured. When writing new code, check the pattern table in §1, find the applicable pattern, and follow the rules and anti-pattern sections.
 
 > **Pattern status.** Every pattern is marked in one of three ways, because
 > "in production use" is not uniform across the crate:
@@ -29,9 +104,42 @@
 > *the pattern's composition path is production-real*; per-type reflection
 > methods may still be scaffold.
 
+### Reading this guide from Python, C++, Go, or stock Rust
+
+The patterns here exist because Rust's toolbox differs from the languages
+most programmers come from. Map the foreign concept to the Rust idiom before
+reading a pattern:
+
+| You know this | It maps to | Rust idiom in this crate |
+|---|---|---|
+| Python `getattr`/`setattr` | dynamic field access | `FieldAccess` (Pattern 2) — but *checked* and *validated* |
+| Python `@decorator` | function wrapping | Newtype wrapper (Pattern 3) — compile-time, inlinable |
+| Python duck typing | dynamic dispatch | `dyn Trait` + `Arc` (Pattern 4) — *static* dispatch, no runtime crash |
+| C++ virtual methods / vtables | runtime polymorphism | `dyn Trait` + `Arc` (Pattern 4) — compiler generates the vtable |
+| C++ templates | compile-time polymorphism | Generics / `impl Trait` — monomorphized, zero-cost |
+| C++ constructor overloads | readable multi-arg init | `bon::Builder` (Pattern 1) |
+| Go `interface{}` + type switch | erased heterogeneous values | `Arc<dyn Component>` + downcast (Patterns 4, 10) — *typed* |
+| Go `struct` methods + embedding | method delegation | Trait delegation in wrappers (Patterns 3, 11) |
+| Go `context.Context` | per-call config/flow | `WorkContext` (Pattern 8) — typed channels, no stringly-typed keys |
+| Go goroutines + `sync.WaitGroup` | supervised concurrency | `Scope` / `SupervisedBatch` (fluent-concurrency) — structured, panic-aware |
+| Stock Rust `enum` + `match` | exhaustive variant handling | Keep `enum` — but when N independent impls exist, prefer `dyn Trait` (Pattern 4) |
+
+The guiding rule: **prefer the Rust idiom that a reader from another language
+would have to fake by hand.** If your C++ self would write a vtable, use
+`dyn Trait`; if your Python self would reach for `setattr`, reach for
+`FieldAccess` — the compiler then enforces what the other language only
+documents.
+
 ---
 
 ## The Core Thesis
+
+**The one idea to take away before reading further:** this crate lets you write
+code that *swaps implementations at runtime* — a WASM plugin, a native struct,
+or a database-driven config — behind a single, compiler-checked interface, the
+way Python's duck typing does, but with the safety of C++'s static types and
+none of Go's `interface{}` boxing surprises. Everything below is a variation on
+that single theme.
 
 Every unit of work in this system — a DAG target, a WASM plugin, a query strategy, an embedding provider — presents the **same interface** to the orchestrator regardless of whether it was assembled at compile time or at runtime. The orchestrator iterates over uniform handles and calls trait methods. The compiler enforces the interface at every implementation site.
 
@@ -96,6 +204,12 @@ Runtime:           Orchestrator calls unit.execute() — no branching needed
 
 ## 1. Pattern Table
 
+**What this is.** The index of all twelve patterns at a glance — what problem
+each solves and its cost. Use it to navigate: find the row for your situation,
+then jump to that section. The "cost" column matters: the patterns are nearly
+free (derive macros, wrappers, RAII) except where a vtable or a serialization
+boundary genuinely exists.
+
 Twelve patterns compose into a single coherent architecture.
 
 | Pattern | Problem solved | Cost | Primary source |
@@ -109,7 +223,7 @@ Twelve patterns compose into a single coherent architecture.
 | **Newtype Handles** | ID type confusion across module boundaries | Zero — same representation | `guidance-types/src/lib.rs` |
 | **Unit of Work** | Uniform orchestration of heterogeneous tasks | One trait impl per task | `dag/src/work_unit.rs` |
 | **Middleware Chain** | Composable cross-cutting on trait objects | One allocation per layer | `dag/src/middleware.rs` |
-| **Component Adapter** | Runtime type adaptation without losing uniform interface | One `Arc` per adapter | `dag/src/adapter.rs` |
+| **Component Adapter** | Runtime type adaptation without losing uniform interface | One `Arc` per adapter | `fluent-wvr/src/wrapper.rs` (`ComponentAdapter`; `dag/src/adapter.rs` is a backward-compat re-export) |
 | **Structured Logging Context** | Request-scoped observability without manual context passing | Thread-local storage | `fluent-wvr/src/wrapper.rs` (Instrumented) |
 | **Runtime Composition** | Full lifecycle: build → configure → wrap → execute → inspect | Zero — uses above patterns | Throughout |
 
@@ -117,211 +231,110 @@ Twelve patterns compose into a single coherent architecture.
 
 ## 2. The Component Interface in Detail
 
-Understanding this section is a prerequisite for every pattern below. All patterns either produce a `Component`, consume one, or compose with one.
+**What problem this solves.** If you come from Python, think of `Component` as
+a *duck type that the compiler checks*: any type can be wrapped in
+`Arc<dyn Component>` and driven uniformly, but only if it satisfies four
+sub-interfaces the compiler verifies at compile time. If you come from C++,
+it is an abstract base class with `virtual` methods — except the vtable is
+generated for you and `Send + Sync` bounds prevent data races at compile time.
+If you come from Go, it is an `interface` that *forces* you to implement every
+method (no optional "this one panics if you call it").
 
-### Trait definitions
+Understanding this section is a prerequisite for every pattern below. All patterns either produce a `Component`, consume one, or compose with one. The four sub-interfaces split along two axes:
+
+- **Who drives it:** the *orchestrator* (uniform dispatch) vs. the *configurator* (runtime field access).
+- **What it knows:** a `WorkUnit` knows how to run; `FieldAccess`/`Describable` describe and configure.
+
+### Trait definitions (the essential shapes)
 
 ```rust
-/// Runtime field access by name with validation.
-/// Generated by #[derive(FieldAccess)] for compile-time-known structs.
-/// Implemented manually for WASM plugins and DB-driven schemas.
+// ── Orchestrator-facing: what the scheduler/dispatcher can do with it ──
+pub trait WorkUnit: Send + Sync {
+    fn name(&self) -> &str;
+    fn depends(&self) -> &[ArcIntern<str>];   // assets this unit needs
+    fn provides(&self) -> &[ArcIntern<str>];  // assets this unit produces
+    fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError>;
+    fn default_timeout_ms(&self) -> u64 { 30_000 }   // override per unit
+    fn type_name(&self) -> &'static str { std::any::type_name::<Self>() }
+}
+
+// ── Configurator-facing: runtime access by field name (Python's setattr) ──
 pub trait FieldAccess {
-    /// Set a field by name from a string value. Performs type parsing and validation.
     fn set_field(&mut self, name: &str, value: &str) -> Result<(), FieldError>;
-    /// Get a field by name as a string.
     fn get_field(&self, name: &str) -> Result<String, FieldError>;
-    /// All field names for this type. Used by schema generators and TUI editors.
     fn field_names(&self) -> &'static [&'static str];
 }
 
-/// Schema description for MCP tool parameter validation and TUI editors.
-/// Must be implemented alongside every FieldAccess implementation.
+// Schema description (drives MCP tool validation / TUI editors).
 pub trait Describable {
     fn describe(&self) -> serde_json::Value;
 }
 
-/// Errors produced by `FieldAccess` implementations.
-#[derive(Error, Debug, PartialEq, Eq)]
-pub enum FieldError {
-    #[error("field not found: {0}")]
-    NotFound(String),
-    #[error("field parse error: {0}")]
-    Parse(String),
-    #[error("constraint violation: {0}")]
-    Constraint(String),
-    /// Returned by the `Arc<dyn Component>` blanket `set_field` impl when
-    /// the Arc has multiple owners. Callers who need shared mutation
-    /// should either (a) use `ComponentArcExt::try_as_any_mut` and
-    /// handle `None`, or (b) use a wrapper with interior mutability.
-    #[error("field {0:?} is read-only on a shared Arc: {1}")]
-    ReadOnly(String, String),
-}
-
-/// Optional JSON-Schema-style description of a single field. Returned
-/// by `SchemaProvider::schema`. The derive macro on `FieldAccess` does
-/// **not** auto-generate `SchemaProvider`; implement it explicitly when
-/// MCP tool validation or TUI editors need typed schema metadata.
-///
-/// **Status: compatibility surface (scaffold).** `SchemaProvider` is
-/// implemented only via the derive macro; no in-tree consumer calls
-/// `schema()` in production today. Keep it — it is the forward-compat seam
-/// for typed MCP/TUI schema consumption.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FieldSchema {
-    pub name: String,
-    pub type_name: String,
-    pub description: Option<String>,
-    pub min: Option<f64>,
-    pub max: Option<f64>,
-    pub required: bool,
-    pub format: Option<String>,
-    pub max_len: Option<usize>,
-    pub sanitize: Option<String>,
-    pub pattern: Option<String>,
-}
-pub trait SchemaProvider {
-    fn schema(&self) -> Vec<FieldSchema>;
-}
-
-/// Optional trait for components that can be persisted to storage.
-///
-/// **Status: compatibility surface (scaffold).** No in-tree component
-/// implements `PersistableComponent` yet (see `traits.rs`). A second
-/// consumer that needs to serialize component state (e.g. to a database
-/// or over the wire) should implement it on the specific types that need
-/// persistence — do not add a blanket `Serialize` bound to `Component`.
-
-/// Uniform orchestration interface. Every task the orchestrator executes implements this.
-pub trait WorkUnit: Send + Sync {
-    fn name(&self) -> &str;
-    fn depends(&self) -> &[ArcIntern<str>];
-    fn provides(&self) -> &[ArcIntern<str>];
-    fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError>;
-
-    /// Default per-unit timeout. Override to specialise.
-    /// `WorkContext::for_unit(unit, caps)` seeds `timeout_ms` from this value
-    /// for standalone execution. Inside a `SupervisedBatch`, `register_with_context`
-    /// sets `ctx.timeout_ms` explicitly and the supervisor enforces it
-    /// through `execute_with_timeout_and_retry`.
-    fn default_timeout_ms(&self) -> u64 { 30_000 }
-
-    /// Concrete type name. Default uses `std::any::type_name::<Self>()`
-    /// — useful for logging and metrics aggregation.
-    fn type_name(&self) -> &'static str { std::any::type_name::<Self>() }
-}
-
-/// The unified process boundary. Requires as_any/as_any_mut for runtime
-/// type identification after dyn Component erasure.
+// ── The union: every fully-featured unit is all four + downcast support ──
 pub trait Component: FieldAccess + Describable + WorkUnit + Send + Sync {
-    fn as_any(&self) -> &dyn Any;
+    fn as_any(&self) -> &dyn Any;       // safe downcast after dyn erasure
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
-
-/// Use the `impl_component!` macro instead of hand-writing `as_any`/`as_any_mut`:
-///
-/// ```ignore
-/// impl_component!(MyConfig);                       // concrete type
-/// impl_component!(generic (U: Component + 'static) for Instrumented<U>);  // generic
-/// ```
-///
-/// Two arms: the concrete-type form writes `impl Component for $type`
-/// directly; the `generic (bounds) for Type<…>` form writes
-/// `impl <$($generics)*> Component for $type` so wrapper types like
-/// `Instrumented<U>` can satisfy the supertrait
-/// without copy-pasting the same body.
-
-/// Use `impl_fieldless!(Type)` for components with **no configurable fields**:
-/// it writes the `FieldAccess` no-op trio (`set_field`/`get_field` →
-/// `FieldError::NotFound` with the `"<TypeName> has no configurable fields"`
-/// message, `field_names` → `&[]`). Mirrors `impl_component!`'s concrete +
-/// generic arms. Do NOT use it on types with real fields (`CommandUnit`, WASM
-/// components) — those derive or hand-implement `FieldAccess`.
-///
-/// ```ignore
-/// impl_fieldless!(MyConfig);                                  // concrete
-/// impl_fieldless!(generic (U: Component + 'static) for Wrapper<U>);  // generic
-/// ```
-
-/// Free functions for downcasting (no blanket impl — Rust dyn-compatibility).
-pub fn component_downcast_ref<T: 'static>(comp: &dyn Component) -> Option<&T>;
-pub fn component_downcast_mut<T: 'static>(comp: &mut dyn Component) -> Option<&mut T>;
-
-/// Extension trait for safe mutable downcasting through an `Arc<dyn Component>`.
-pub trait ComponentArcExt {
-    fn try_as_any_mut(&mut self) -> Option<&mut dyn Any>;
-}
-impl ComponentArcExt for Arc<dyn Component> {
-    fn try_as_any_mut(&mut self) -> Option<&mut dyn Any> {
-        Arc::get_mut(self).map(Component::as_any_mut)
-    }
-}
-
-/// `Arc<dyn Component>` and `Arc<dyn WorkUnit>` themselves satisfy the
-/// full supertrait surface. The blanket impls in `lib.rs:50-129` make
-/// every `Arc<dyn Component>` callable as a `Component`/`WorkUnit`/
-/// `FieldAccess`/`Describable`. The `set_field` impl returns
-/// `FieldError::ReadOnly(name, reason)` when the `Arc` is shared
-/// (i.e. `Arc::get_mut` returns `None`).
 ```
+
+`impl_component!(T)` writes the two `as_any` bodies for you — never hand-roll
+them. It has a concrete-type arm (`impl_component!(MyConfig)`) and a generic
+arm for wrapper types
+(`impl_component!(generic (U: Component + 'static) for Instrumented<U>)`).
+For units with **no configurable fields**, `impl_fieldless!(T)` also writes
+the `FieldAccess` no-op trio. There is **no blanket
+`impl<T: ...> Component for T`** — it would collide with
+`impl Component for Arc<dyn Component>`; the macro is the mechanism.
+
+The full annotated definitions (every `FieldError` variant, the
+`SchemaProvider`/`PersistableComponent` scaffold types, the `Arc<dyn
+Component>` blanket-impl details) live in `src/fluent-wvr/src/traits.rs` —
+read them there when you need the complete contract, not here.
+
+> **The one subtle requirement to remember:** `field_names` and `describe` are
+> `&self` **instance** methods, not `static fn`s. A static associated function
+> is not object-safe — you could not call it through `Arc<dyn Component>`.
+> This is why the derive macro emits instance methods.
+
+### The purity contract of `execute`
+
+`WorkUnit::execute` MUST be synchronous, non-blocking, and free of side effects
+beyond its return value:
+
+- NO `tokio::spawn`, `tokio::time::sleep`, or `Handle::block_on` inside it.
+- NO blocking I/O — emit a `WorkError` instead and let the `SupervisedBatch`
+  supervisor handle retry/backoff/timeout.
+- NO mutation of shared state without synchronization.
+
+Violations defeat the supervisor's timeout and retry invariants. This is why
+`DbWorkUnit` (Pattern 8) offloads blocking rusqlite work to a blocking thread
+instead of doing it inline.
 
 ### Error and output types
 
 `WorkError` and `WorkOutput` are the data flow types for `WorkUnit::execute`.
 
 ```rust
-#[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum WorkError {
-    /// Synchronous failure inside `execute`. The `SupervisedBatch` supervisor
-    /// routes this to `summary.failed` — NOT to `summary.panicked`.
-    #[error("execution failed: {0}")]
-    Execution(String),
-
-    /// Dependency prerequisite could not be satisfied. Used by the
-    /// orchestrator when a `depends()` asset is not yet `provides()`'d.
-    #[error("dependency not satisfied: {0}")]
-    Dependency(String),
-
-    /// Returned by `SupervisedBatch::execute_with_timeout_and_retry` when the
-    /// wall-clock budget is exhausted. `SupervisedBatch` routes this to
-    /// `summary.cancelled`, NOT to `summary.failed`.
-    #[error("timeout after {duration_ms}ms ({unit})")]
-    Timeout { duration_ms: u64, unit: String },
+    Execution(String),                      // sync failure → SupervisedBatchSummary::failed
+    Dependency(String),                     // a depends() asset not yet provides()'d
+    Timeout { duration_ms: u64, unit: String },  // wall-clock budget exhausted → cancelled
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkOutput {
     pub success: bool,
     pub message: String,
     pub data: serde_json::Value,
 }
-
-impl WorkOutput {
-    pub fn ok(message: impl Into<String>) -> Self;
-    pub fn ok_with_data(message: impl Into<String>, data: serde_json::Value) -> Self;
-    pub fn fail(message: impl Into<String>) -> Self;
-
-    /// Serialise a typed value into `data` and return `Ok(Self)`.
-    /// Returns `Err(WorkError::Execution)` on serialisation failure —
-    /// use this for untrusted input.
-    pub fn typed<T: Serialize>(message: impl Into<String>, data: &T)
-        -> Result<Self, WorkError>;
-
-    /// Same as `typed` but panics on serialisation failure. For
-    /// trusted input only.
-    pub fn typed_infallible<T: Serialize>(message: impl Into<String>, data: &T) -> Self;
-
-    /// Deserialise `data` to a typed value (borrows `self`).
-    pub fn data_as<T: for<'de> Deserialize<'de>>(&self) -> Result<T, WorkError>;
-
-    /// Deserialise `data`, consuming `self` — avoids the clone that
-    /// `data_as` requires.
-    pub fn data_take<T: for<'de> Deserialize<'de>>(self) -> Result<T, WorkError>;
-}
-
-impl std::fmt::Display for WorkOutput {
-    // "OK: msg" or "FAIL: msg"
-}
 ```
+
+The three-way `WorkError` taxonomy matters: the `SupervisedBatch` supervisor
+discriminates on it — `Execution` lands in `summary.failed`, `Timeout` lands
+in `summary.cancelled`, and only a task *panic* (a `JoinError::is_panic()`)
+lands in `summary.panicked`. Do not overload `Execution` for the other two.
+`WorkOutput::typed::<T>` / `data_take::<T>` serialize typed payloads into
+`data`; `ok`/`ok_with_data`/`fail` are the plain constructors. Full
+constructors and `Display` live in `src/fluent-wvr/src/work.rs`.
 
 ### Execution context
 
@@ -388,9 +401,10 @@ impl WorkContext {
 use fluent_wvr::prelude::*;
 // Brings in: Component, WorkUnit, FieldAccess, Describable, FieldError,
 // WorkContext, WorkError, WorkOutput, OutputStore, Capability, CapabilitySet,
-// impl_component, retry_call, ComponentAdapter, ComponentCascade,
-// ExecuteFn, Instrumented, Middleware, MiddlewareChain, Pipeline,
-// SuffixedComponent, MetadataValue, ArcIntern.
+// DynamicComponent, DynamicExecutor, impl_component, impl_fieldless,
+// retry_call, ComponentAdapter, ComponentCascade, ExecuteFn, Instrumented,
+// Middleware, MiddlewareChain, Pipeline, SuffixedComponent, MetadataValue,
+// ArcIntern.
 ```
 
 > `ComponentArcExt`, `FieldSchema`, `SchemaProvider`, and
@@ -401,20 +415,6 @@ use fluent_wvr::prelude::*;
 > call graph imported them through the prelude.
 
 > **Critical design note on `field_names` and `describe`:** Both are defined as `&self` instance methods, not static associated functions. This is deliberate: it makes them callable through `dyn Component`. A `fn field_names() -> &'static [&'static str]` associated function is not object-safe and cannot be dispatched through a trait object. Always use the instance method form.
-
-### Why `describe` is not `json_schema() -> serde_json::Value` (static)
-
-The original design used a static associated function `fn json_schema() -> serde_json::Value`. That form is **not object-safe** — you cannot call it through `Arc<dyn Component>` or `Arc<dyn Describable>`. The turbofish syntax `<ToolConfig as Describable>::json_schema()` only works when the concrete type is known at the call site.
-
-The corrected `describe(&self)` method is callable through any trait object:
-
-```rust
-// This works with the instance-method form:
-let schema = component.describe();  // works on Arc<dyn Component>
-
-// This does NOT work if describe is a static associated function:
-// let schema = component.describe();  // compile error: not object-safe
-```
 
 ### FieldAccess mutability and interior mutability
 
@@ -446,6 +446,15 @@ The rule: **configure Rust-struct components before wrapping in `Arc`; configure
 ---
 
 ## 3. Pattern 1 — Fluent Builder
+
+**What problem this solves.** If you come from C++, you have experienced the
+unreadable constructor call — seven positional arguments where the fourth one
+is a mystery (`Target t("build", Type::File, ..., true, "zig build")`). Python
+fixes this with keyword args but pushes errors to runtime. Go leaves you
+writing a constructor that takes a config struct or a chain of setter methods
+by hand. This pattern gives you the best of all three: a readable, named,
+compile-time-checked construction path with **zero runtime cost** — the
+builder is generated by a derive macro and the compiler inlines it away.
 
 ### The problem
 
@@ -536,6 +545,15 @@ let target = registry.validate_and_allocate(args)?;
 ---
 
 ## 4. Pattern 2 — Trait-Based Reflection
+
+**What problem this solves.** If you come from Python, you are used to
+`setattr(config, "port", 9000)` — convenient, but with no compile-time
+checking, no validation, and no schema. C++ has no runtime reflection at all.
+Go's `reflect` is verbose and slow. This pattern gives you a **layered
+reflection ladder**: pick the cheapest tier that fits, from plain field access
+(free) up to a validated, schema-typed `FieldAccess` (for runtime field names)
+— with serde at the boundary. The single source of truth is the struct
+definition; derive macros generate access, validation, and schema from it.
 
 ### The Boundary Rule
 
@@ -715,6 +733,15 @@ Is a field name known only at runtime (config editor, WASM config)?
 
 ## 5. Pattern 3 — Trait Composition (Cross-Cutting Concerns)
 
+**What problem this solves.** If you come from Python, you know the decorator
+`@timing @retry(max=3)` — transparent wrapping, but the wrappers are runtime
+closures that are hard to type and impossible to inline. C++ solves this with
+CRTP or template mixins, which are notoriously cryptic. Go has no clean answer
+(you hand-write a wrapper struct per concern). This pattern gives you
+Python's decorator ergonomics with C++'s zero-cost inlining: a *newtype
+wrapper* implements the same trait as the inner type and adds one
+cross-cutting concern. The compiler inlines the wrapper when it can.
+
 ### The problem
 
 ```python
@@ -832,6 +859,14 @@ registry.push(Arc::new(unit));   // one vtable boundary total
 
 ## 6. Pattern 4 — Trait Objects (Runtime Polymorphism)
 
+**What problem this solves.** This is the pattern C++ programmers know as
+virtual methods, Python programmers know as duck typing, and Go programmers
+know as interfaces. The difference is *where* the safety lives. In Python, a
+typo in the method signature crashes at runtime. In Go, `interface{}` erases
+all type information and forces manual type switches. Here, `dyn Trait` +
+`Arc` gives you runtime dispatch with **compile-time verification** that every
+implementation satisfies the full interface and is `Send + Sync`.
+
 ### The problem
 
 ```cpp
@@ -909,6 +944,14 @@ Adding `Serialize` to the `Component` trait would require every implementor to b
 ---
 
 ## 7. Pattern 5 — Binary IPC (`#[repr(C, packed)]`)
+
+**What problem this solves.** When you execute untrusted or dynamically loaded
+code (a WASM plugin), you cross a trust boundary: the guest cannot hand you a
+Rust `&[u8]` or a struct pointer. Every language solves this with a byte
+protocol — Python's `struct.pack`, C++'s `reinterpret_cast` (unsafe), Go's
+`encoding/binary`. Here the answer is an explicitly encoded, versioned,
+zero-copy message format: `#[repr(C, packed)]` removes padding, and you
+encode/decode with `to_le_bytes()`/`from_le_bytes()` — never `transmute`.
 
 ### The problem
 
@@ -1018,6 +1061,14 @@ pub fn get_provides_bitset(
 
 ## 8. Pattern 6 — Scoped Ownership (Replacing Arenas)
 
+**What problem this solves.** If you come from C++, you may reach for an arena
+allocator or a "reusable buffer" to avoid repeated malloc/free in batch
+processing. If you come from Go or Python, you rarely think about this at all
+— and your programs pay for it. Rust's ownership model already gives you the
+arena for free: local `Vec`s and `String`s are dropped at scope exit by RAII.
+Trust the stack; only pre-allocate when profiling proves allocation is the
+bottleneck.
+
 ### The problem
 
 Rust has no built-in arena allocator (and `bumpalo` is forbidden by project policy). Intermediate allocations are scoped to logical units of work via RAII ownership.
@@ -1056,6 +1107,13 @@ async fn handle_request(&self, raw_json: &str) -> Result<String, McpError> {
 ---
 
 ## 9. Pattern 7 — Newtype Handles (Typed Opaque IDs)
+
+**What problem this solves.** In Python, `NodeId` and `SessionId` are both
+`int` — passing one where the other is expected compiles, runs, and crashes
+later. Go has the same weakness with aliased types. C++ typedefs too. A Rust
+*newtype* wraps the integer in a distinct type so the compiler rejects the mix
+at every call site — the same zero-cost representation, with a different,
+non-interchangeable type.
 
 ### The problem
 
@@ -1103,6 +1161,14 @@ process_node(sess);  // Compile error: expected NodeId, found SessionId
 ---
 
 ## 10. Pattern 8 — Unit of Work (Orchestration Interface)
+
+**What problem this solves.** An orchestrator (a DAG executor, an MCP server,
+a WASM host) must run *heterogeneous* tasks uniformly. Without a common
+interface, the orchestrator ends up with a `match` on every task type — the
+branching that C++ hides in vtables and Python does implicitly. This pattern
+is the single interface (`WorkUnit`) every task presents, so the orchestrator
+iterates a `Vec<Arc<dyn Component>>` and calls `.execute()` with no `match`.
+It is the pattern on which the whole crate rests.
 
 ### The problem
 
@@ -1317,11 +1383,25 @@ for unit in &registry {
 
 ## 11. Pattern 9 — Middleware Chain (Post-Erasure Cross-Cutting)
 
+**What problem this solves.** Pattern 3 (newtype wrappers) can only add
+cross-cutting concerns *before* the type is erased to `Arc<dyn Component>` —
+that is the one point where the compiler can inline. Once a unit is in the
+registry, you can no longer wrap it generically. This pattern is the
+post-erasure answer: a `Middleware` takes an `Arc<dyn Component>` and returns a
+wrapped one. If you know Go's middleware-in-a-server idiom (`next(w, r)`), it
+is the same shape; C++ analog is the chain-of-responsibility; Python analog is
+a decorator applied after the fact.
+
 ### The problem
 
 When you already have `Arc<dyn WorkUnit>` and need to add logging, retry, or rate limiting, you cannot use newtype wrappers (Pattern 3) because the type is erased. You need post-erasure composition.
 
-### Definition in `dag/src/middleware.rs`
+### Definition
+
+The `Middleware` trait and `MiddlewareChain` live in
+`fluent-wvr/src/wrapper.rs` (the canonical home); `dag/src/middleware.rs`
+implements `TimingMiddleware` on top of them. The trait is the minimal
+post-erasure seam:
 
 ```rust
 pub trait Middleware: Send + Sync {
@@ -1374,9 +1454,45 @@ let wrapped = chain.apply(unit);
 - **Each middleware layer adds one vtable dispatch.** Minimize layers on hot paths.
 - **Reuse `Instrumented` from fluent-wvr.** Do not define parallel wrapper types inside `dag` — the whole point of fluent-wvr is the single source of truth.
 
+### Sequential step chains: `Pipeline<'a, T, E>`
+
+`Pipeline` (in `fluent-wvr/src/wrapper.rs`, re-exported by the prelude) is the
+composition helper for a **sequential, fallible step chain over one mutable
+value** — the middleware/cascade analog for plain `&mut T` processing rather
+than `Arc<dyn Component>`. Steps run in registration order; optional steps are
+gated by a predicate and skipped when it returns `false`.
+
+```rust
+use fluent_wvr::wrapper::Pipeline;
+
+let mut pipeline = Pipeline::new()
+    .step(|cfg: &mut Config| -> Result<(), ConfigError> { cfg.validate()?; Ok(()) })
+    .maybe(
+        |cfg| cfg.env == "prod",
+        |cfg| -> Result<(), ConfigError> { cfg.enforce_tls()?; Ok(()) },
+    );
+
+let mut cfg = Config::default();
+pipeline.run(&mut cfg)?;   // required step always runs; prod-only step gated
+```
+
+Use `Pipeline` when a config/handshake/request goes through an ordered series
+of fallible transformations with optional stages. Use `MiddlewareChain` for
+post-erasure `Arc<dyn Component>` wrapping, and `ComponentCascade` (Pattern 10)
+for first-Ok-wins dispatch.
+
+
 ---
 
 ## 12. Pattern 10 — Component Adapter (Runtime Type Adaptation)
+
+**What problem this solves.** Sometimes the adaptation decision — renaming a
+component, swapping its behavior, overriding a field — is made at *runtime*,
+not at compile time. A newtype wrapper (Pattern 3) cannot do this: it is fixed
+at compile time. This pattern wraps an existing `Arc<dyn Component>` and lets
+you layer overrides (`name`, `execute`, fields) without modifying the original
+type — the runtime analog of Go's embedded struct that overrides a method, or
+C++'s decorator.
 
 ### The problem
 
@@ -1556,6 +1672,14 @@ config and name overrides stay coral-side state that *feeds* the cascade.
 
 ## 13. Runtime Composition: The Full Lifecycle
 
+**What this section does.** Every pattern so far produces or consumes one
+`Arc<dyn Component>`. This section walks a single component through the *whole
+lifecycle* — build → configure → wrap → execute → inspect — to show that the
+origin (Rust struct, WASM plugin, database config) is irrelevant: the caller
+sees the same six operations through the same handle. If you are new to the
+crate, this is the section to read after §2: it is Patterns 1, 2, 3, 4, and 10
+composed end-to-end.
+
 This section demonstrates how all twelve patterns compose into a single workflow. Each step uses the same `Arc<dyn Component>` handle.
 
 ### Compile-time assembly (Rust struct)
@@ -1666,6 +1790,13 @@ In all three cases — Rust struct, WASM plugin, database config — the orchest
 
 ## 14. Pattern 11 — Structured Logging Context
 
+**What problem this solves.** In a multi-threaded server, log lines from
+different requests interleave; correlating them with a request is hard. Python
+uses thread-local context vars, Go uses `context.Context` threading, C++ uses
+a thread-local or a manually-passed logger. This crate deliberately does **not**
+invent a context-logger; it composes `Instrumented` (per-unit timing logs) with
+a lock-free `LatencyHistogram` — observability without a new global.
+
 ### The problem
 
 In a multi-threaded server, log messages from different requests interleave. Without request context, correlating log lines with a specific request is difficult.
@@ -1741,6 +1872,12 @@ A consumer test that exercises the histogram path end-to-end lives in
 
 ## 15. Pattern Synergies
 
+**What this section does.** The patterns above are individually useful but
+their real power is combination: each produces something another consumes
+(Builder → owned struct → wrapped → erased → orchestrated → adapted). Read
+this as the "how it all fits together" map — if you understand the arrows, you
+understand the crate.
+
 The patterns are not independently beneficial — their value multiplies when composed. Each pattern produces something another consumes.
 
 | Pattern | Produces | Consumed by |
@@ -1783,6 +1920,13 @@ rather than copy the consumer copy.
 ---
 
 ## 16. Anti-Patterns
+
+**What this section does.** Each anti-pattern is a *seductive wrong answer* —
+the thing a programmer new to Rust naturally reaches for (raw pointers for
+vtables, hand-rolled builders, a `match`-based orchestrator, `transmute` for
+IPC) and the correct pattern that replaces it. If you are reviewing code, scan
+this list for the ❌ markers; if you are writing code, the ✅/Right alternatives
+are the canonical shapes.
 
 ### ❌ Manual builder structs
 
@@ -1967,6 +2111,11 @@ let plan = self.tier_registry.execute(query, depth)?;
 
 ## 17. Pattern Selection Guide
 
+**What this is.** A decision tree: for a given task, walk down the questions to
+find the one pattern to reach for. If you remember nothing else, remember the
+first three: *4+ constructor args → Builder; boundary string → serde or
+FieldAccess; 2+ implementations → dyn Trait.*
+
 ```
 Does construction have 4+ parameters?
   YES → #[derive(bon::Builder)]
@@ -2021,6 +2170,13 @@ Do you need to adapt component behavior at runtime?
 
 ## 18. Thread Safety
 
+**What this section covers.** Rust's `Send`/`Sync` are compile-time, but *what
+the pattern implies* is not automatic — a `dyn Trait` stored in an `Arc` is
+only safe if every implementation is `Send + Sync`, and shared mutable state
+still needs explicit protection. This section is the cheat-sheet for "which
+pattern needs what," the shared-mutable-objects catalog, and the create/destroy
+rules of thumb.
+
 ### Thread safety by pattern
 
 | Pattern | Thread safety mechanism |
@@ -2037,9 +2193,9 @@ Do you need to adapt component behavior at runtime?
 | `Middleware` | `Send + Sync` required; stateless middleware is zero-contention |
 | `ComponentAdapter` | `Send + Sync` required; closures must be `Send + Sync` |
 | `Scope` (`fluent-concurrency`) | Holds a `JoinSet` internally; not `Sync`. Use `Scope::defer()` to guarantee cleanup on drop. Dropping without `close().await` panics (a structured-concurrency violation). |
-| `SupervisedBatch` (`fluent-concurrency`) | Holds a `JoinSet` and a per-zone `Runtime` reference. `SupervisedBatch::register` returns `Result<&mut Self, SupervisedBatchError>` — duplicate names are rejected with `Err(SupervisedBatchError::DuplicateName(_))`. |
+| `SupervisedBatch` (`fluent-concurrency`) | Holds a `JoinSet` and a per-batch `Runtime` reference. `SupervisedBatch::register` returns `Result<&mut Self, SupervisedBatchError>` — duplicate names are rejected with `Err(SupervisedBatchError::DuplicateName(_))`. |
 | `Reserve` (`fluent-concurrency`) | RAII permit from a shared `AtomicUsize` counter. `Send + Sync` because the counter is `Arc`-shared. Drop without `commit()` returns the permit; `commit()` consumes it permanently. |
-| `LogContext` | Thread-local — no synchronization needed |
+| Observability (Pattern 11) | There is **no** standalone `LogContext` type. Timing/observability compose `Instrumented` (wraps `WorkUnit`, logs via `tracing`) + `common_core::metrics::LatencyHistogram` (lock-free atomic histogram) — see §14. |
 
 ### Detailed rules
 
@@ -2058,7 +2214,7 @@ Do you need to adapt component behavior at runtime?
 | `CapabilityRegistry` | `RwLock<HashMap<...>>` | Read-heavy concurrent intern calls |
 | `L1Cache` | `DashMap<String, RoutingResult>` | Write-concurrent cache access |
 | `WasmComponent.plugin` | `Mutex<extism::Plugin>` | Plugin state is not thread-safe |
-| `LogContext` | Thread-local | Each thread has its own context |
+| Observability (Pattern 11) | `Instrumented` + `LatencyHistogram` | No global mutable state; histogram is lock-free atomic |
 
 ### Typical usage pattern
 
@@ -2078,6 +2234,12 @@ drop(provider);
 ---
 
 ## 19. Schema Evolution
+
+**What this section covers.** Config and IPC schemas change over time; a
+forward/backward-compatible migration plan is the difference between a safe
+deploy and a data-corruption incident. This section is the versioning playbook
+for `serde` (add-with-default, remove-with-skip, rename-with-alias, migration
+functions) and for the binary IPC format (bump `BINARY_SCHEMA_VERSION`).
 
 ### Versioning with `serde`
 
@@ -2151,6 +2313,12 @@ if version != BINARY_SCHEMA_VERSION {
 ---
 
 ## 20. Quick Reference for AI Agents
+
+**What this is.** The "if I'm writing new code, which rule applies" checklist —
+a numbered decision list (1–12) for what to do, and a numbered "never" list,
+plus the throwaway rule and verification steps. Human coders can skip this
+section; it exists so agents write idiomatic code without re-reading the whole
+guide.
 
 When writing new code in `rust-src/`:
 
@@ -2228,6 +2396,15 @@ When writing new code in `rust-src/`:
 
 ## 21. Companion crate: `fluent-concurrency`
 
+**What this covers.** The `Component`/`WorkUnit` framework is the *control
+plane*: it says what a unit *is* and how it is configured and composed. The
+`fluent-concurrency` crate is the *runtime*: it actually runs units with
+supervision, retry, timeout, and dependency-aware cancellation. If you know
+Go's goroutines + wait groups but want panic-aware structured concurrency, or
+C++'s async futures and want cancellation, this is the crate. The table below
+is the index; the full semantics live in
+`doc/skills/fluent-concurrency/SKILL.md`.
+
 The trait framework in `fluent-wvr` is paired with a structured-concurrency
 runtime in `fluent-concurrency`. The full surface is documented in
 `doc/skills/fluent-concurrency/SKILL.md`. The high-level primitives are:
@@ -2237,7 +2414,7 @@ runtime in `fluent-concurrency`. The full surface is documented in
 | `Runtime` (trait) | `fluent-concurrency/src/runtime/` | Pluggable backend: `TokioRuntime` (production), `TestRuntime` (deterministic, paused-time), `NoopRuntime` (in `fluent-wvr/src/runtime.rs`, init-only) |
 | `Capability` + `CapabilitySet` | `fluent-wvr/src/capability.rs` | Type-map of capability tokens; `with`/`get`/`remove`/`remove_as`/`contains`/`iter`/`len`/`is_empty` |
 | `Scope` | `fluent-concurrency/src/scope.rs` | Structured concurrency; `spawn` + `close().await` or `defer()`; drop-without-close panics |
-| `SupervisedBatch` | `fluent-concurrency/src/zone.rs` | `Scope` + dependency graph + panic/fail/cancel distinct tracking; `SupervisedBatchSummary { completed, panicked, failed, cancelled }`; `SupervisedBatch::register` returns `Result<_, SupervisedBatchError>`; `SupervisedBatchError::DuplicateName` |
+| `SupervisedBatch` | `fluent-concurrency/src/batch.rs` | `Scope` + dependency graph + panic/fail/cancel distinct tracking; `SupervisedBatchSummary { completed, panicked, failed, cancelled }`; `SupervisedBatch::register` returns `Result<_, SupervisedBatchError>`; `SupervisedBatchError::DuplicateName` |
 | `WorkerPool<T>` | `fluent-concurrency/src/pool.rs` | Bounded FIFO worker pool; capacity + backpressure |
 | `ResultPool<T, R, E>` | `fluent-concurrency/src/pool.rs` | Worker pool that returns a typed `Result<R, ResultPoolError<E>>`; `ResultPoolError` is `Inner(E) \| Canceled \| Pool(PoolError)` |
 | `PriorityResultPool<T, R, E>` | `fluent-concurrency/src/pool.rs` | Priority-ordered variant; workers drain fully before blocking on `Notify`; `submit` uses `notify_waiters` to avoid wakeup collapse |
@@ -2245,6 +2422,7 @@ runtime in `fluent-concurrency`. The full surface is documented in
 | `Queue<T>` | `fluent-concurrency/src/pool.rs` | Bounded async FIFO; `PoolError::Full` on overflow |
 | `PriorityQueue<T>` | `fluent-concurrency/src/queue.rs` | O(log P) for distinct priorities, O(1) for all-zero fast path |
 | `PartitionedRouter<K, J>` | `fluent-concurrency/src/router.rs` | Hash-based sharding; preserves causal ordering per key |
+| `first_accept_in_order` | `fluent-concurrency/src/ladder.rs` | Monomorphized first-Ok-wins fallback combinator ("try rungs in order, take the first success"); the canonical ladder primitive composed by `BackendChain`, `dispatch_real`, and the router's escalation ladder |
 | `CreditFlow` | `fluent-concurrency/src/flow.rs` | Sender/receiver backpressure with `CreditSpec { initial, more_after }` |
 | `Reserve` | `fluent-concurrency/src/reserve.rs` | RAII permit from a shared `AtomicUsize`; `try_acquire`/`commit`; **currently has no in-tree production consumer** (throwaway rule candidate) |
 

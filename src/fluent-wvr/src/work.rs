@@ -270,9 +270,9 @@ impl WorkContext {
         }
     }
 
-    /// Returns a new `WorkContext` with `rt` and `caps` cloned from the zone's
-    /// defaults, with `max_retries`/`timeout_ms`/etc overridden by the supplied
-    /// closure.
+    /// Returns a new `WorkContext` with `rt` and `caps` cloned from the
+    /// SupervisedBatch's defaults, with `max_retries`/`timeout_ms`/etc
+    /// overridden by the supplied closure.
     ///
     /// For batched registration of identical contexts, construct one `WorkContext`
     /// and reuse it with `register_with_context` directly.

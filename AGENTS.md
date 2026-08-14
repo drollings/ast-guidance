@@ -80,11 +80,8 @@ is the priority.
 
 ## Import boundaries
 
-`fluent-router` may import from `common-core`, `fluent-wvr`,
-`fluent-concurrency`, `guidance-llm`, `guidance-types`, `dag`,
-`search-vector`, and standard library / `tokio` / `reqwest`.
-It must NOT import from `guidance`, `coral`, `wasm_ipc`, `knowledge`,
-`ontology`, or `rdf`.
+Shared library crates may NOT import from `guidance`, `coral`, or
+`wasm_ipc`, as those are reserved for building compiled tools.
 
 ## Router crate map
 
@@ -121,32 +118,21 @@ src/
   types/                      guidance-types: NodeId, SessionId, TargetId, LOD_COUNT
 ```
 
-## Reuse before you write
+### Prohibited AI Use Cases or Actions
 
-Reimplementing a shared primitive is a defect. The most-referenced canonical
-homes:
+* Any git write operations (checkout, commit, stash, etc.)
 
-| Need | Canonical location |
-|---|---|
-| Text utils (`strip_thinking_blocks`, `truncate_at_sentence`, `contains_ignore_case`, `AnsiStripper`, …) | `common-core::string` (`src/common-core/src/string.rs`) |
-| Jittered-exponential retry (`retry_async`, `backoff_ms`) | `common-core::retry` |
-| Sync→async bridge (`block_on`) | `common-core::runtime` |
-| Timeout/retry defaults (`DEFAULT_TOTAL_TIMEOUT_MS`=300_000, …) | `common-core::constants` |
-| Poison-safe locking (`lock`/`lock_read`/`lock_write`) | `common-core::sync` |
-| Hashing (blake3, sha256, fnv1a64, hex) | `common-core::hash` |
-| Bounded LRU cache (`LoadCache`, `ReadThroughCache`) | `common-core::cache` |
-| Generic keyed registry (`KeyedRegistry`) | `common-core::registry` |
-| OpenAI wire format + normalization (`build_openai_chat_body`, `normalize_request`, …) | `guidance-llm::openai` (`src/llm/src/openai.rs`) |
-| HTTP-status taxonomy (`HttpClass`) | `guidance-llm::http_class` |
-| Tolerant LLM-JSON parse (`parse_json_response`) | `fluent_llm::parse` |
-| WVR 80% import line (`Component`, `WorkUnit`, `FieldAccess`, `prelude::*`) | `fluent-wvr::prelude` |
-| `impl_component!` / `impl_fieldless!` macros | `fluent-wvr::macros` |
-| `WorkOutput::typed` / `data_take` | `fluent-wvr::work` |
-| `ComponentArcExt::try_as_any_mut` | `fluent-wvr::traits` |
-| Dependency tracking (`DependencyGraph<K>`) | `fluent-dag::dep_graph` |
-| Vector math / brute-force KNN (`cosine_similarity`, `knn_brute_force`, `rrf_merge`) | `fluent-db::vector` |
-| Latency histograms (`LatencyHistogram`) | `common-core::metrics` |
-| Shared-string interning (`ArcIntern<str>`) | `internment` |
+* Any implementation without review of relevant documents including, but not
+  limited to:
 
-Cross-crate limits with a single consumer stay in their domain crate but
-**must** move to `common-core::constants` once a second consumer appears.
+  - ./doc/skills/common-core/SKILL.md
+  - ./doc/skills/fluent-wvr/SKILL.md
+  - ./doc/skills/fluent-concurrency/SKILL.md
+
+* Any implementation without reviewing shared primitives in shared libraries, and any removal of code from without human approval from these libraries:
+
+  - ./src/common-core
+  - ./src/fluent-wvr
+  - ./src/fluent-concurrency
+
+* Referencing transient roadmaps or milestones in documentation or comments
