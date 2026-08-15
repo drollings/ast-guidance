@@ -16,6 +16,8 @@ struct FieldMeta {
     max_len: Option<usize>,
     sanitize: Option<String>,
     pattern: Option<String>,
+    coerce: Option<String>,
+    parse: Option<String>,
     empty_is_none: bool,
 }
 
@@ -31,6 +33,8 @@ fn parse_field_attrs(field: &syn::Field) -> FieldMeta {
         max_len: None,
         sanitize: None,
         pattern: None,
+        coerce: None,
+        parse: None,
         empty_is_none: true,
     };
 
@@ -132,12 +136,35 @@ fn parse_field_attrs(field: &syn::Field) -> FieldMeta {
                 }
                 return Ok(());
             }
+            if meta.path.is_ident("coerce") {
+                let value = meta.value()?;
+                let lit: Lit = value.parse()?;
+                if let Lit::Str(s) = lit {
+                    result.coerce = Some(s.value());
+                }
+                return Ok(());
+            }
+            if meta.path.is_ident("parse") {
+                let value = meta.value()?;
+                let lit: Lit = value.parse()?;
+                if let Lit::Str(s) = lit {
+                    match s.value().as_str() {
+                        "number" => result.parse = Some("number".into()),
+                        other => {
+                            return Err(meta.error(format!(
+                                "unknown parse mode, expected `number`, got `{other}`"
+                            )));
+                        }
+                    }
+                }
+                return Ok(());
+            }
             if meta.path.is_ident("clamp") {
                 result.clamp = true;
                 return Ok(());
             }
             Err(meta.error(
-                "unknown field attribute, expected `skip`, `desc`, `min`, `max`, `clamp`, `required`, `format`, `max_len`, `sanitize`, `pattern`, or `empty_is_none`",
+                "unknown field attribute, expected `skip`, `desc`, `min`, `max`, `clamp`, `required`, `format`, `max_len`, `sanitize`, `pattern`, `coerce`, `parse`, or `empty_is_none`",
             ))
         });
     }
@@ -262,6 +289,30 @@ pub fn derive_field_access(input: TokenStream) -> TokenStream {
         } else {
             ty_str.clone()
         };
+        let inner_is_numeric = is_numeric_type(&inner_ty_str);
+        let number_tolerant = meta.parse.as_deref() == Some("number") && inner_is_numeric;
+        let inner_ty_tokens: TokenStream2 = if number_tolerant {
+            syn::parse_str::<TokenStream2>(&inner_ty_str).unwrap_or_else(|_| {
+                syn::parse_str::<TokenStream2>("i64").expect("i64 parses")
+            })
+        } else {
+            TokenStream2::new()
+        };
+        // Numeric initializer honoring `#[field(parse = "number")]`: tolerant
+        // parse_number when requested, strict str::parse otherwise.
+        let wide_init_tokens: TokenStream2 = if number_tolerant {
+            quote! {
+                ::fluent_wvr::coerce::parse_number(&value).ok_or_else(|| fluent_wvr::FieldError::Parse(
+                    format!("invalid {} for '{}': {}", #ty_str, #field_name_str, value)
+                ))?
+            }
+        } else {
+            quote! {
+                value.parse().map_err(|_| fluent_wvr::FieldError::Parse(
+                    format!("invalid {} for '{}': {}", #ty_str, #field_name_str, value)
+                ))?
+            }
+        };
 
         let mut parse_and_set = if is_option {
             let inner_is_string = inner_ty_str == "String"
@@ -279,12 +330,22 @@ pub fn derive_field_access(input: TokenStream) -> TokenStream {
                 quote! {
                     Some(value.to_string())
                 }
+            } else if number_tolerant {
+                quote! {
+                    if value.is_empty() {
+                        None
+                    } else {
+                        Some(::fluent_wvr::coerce::parse_number(&value).ok_or_else(|| fluent_wvr::FieldError::Parse(
+                            format!("invalid Option<{}> for '{}': {}", #inner_ty_str, #field_name_str, value)
+                        ))? as #inner_ty_tokens)
+                    }
+                }
             } else {
                 quote! {
                     if value.is_empty() {
                         None
                     } else {
-                        Some(value.parse::<#ty>().map_err(|_| fluent_wvr::FieldError::Parse(
+                        Some(value.parse::<#inner_ty_tokens>().map_err(|_| fluent_wvr::FieldError::Parse(
                             format!("invalid Option<{}> for '{}': {}", #inner_ty_str, #field_name_str, value)
                         ))?)
                     }
@@ -303,14 +364,18 @@ pub fn derive_field_access(input: TokenStream) -> TokenStream {
             }
         } else if ty_str.starts_with("ArcIntern") || ty_str.contains("ArcIntern") {
             quote! { fluent_wvr::ArcIntern::from(value) }
-        } else if has_constraints && is_numeric_type(&ty_str) {
+        } else if has_constraints && inner_is_numeric {
             quote! {
                 {
-                    let wide_val: f64 = value.parse().map_err(|_| fluent_wvr::FieldError::Parse(
-                        format!("invalid {} for '{}': {}", #ty_str, #field_name_str, value)
-                    ))?;
+                    let wide_val: f64 = #wide_init_tokens;
                     wide_val as #ty
                 }
+            }
+        } else if number_tolerant {
+            quote! {
+                ::fluent_wvr::coerce::parse_number(&value).ok_or_else(|| fluent_wvr::FieldError::Parse(
+                    format!("invalid {} for '{}': {}", #ty_str, #field_name_str, value)
+                ))? as #ty
             }
         } else {
             quote! {
@@ -419,9 +484,7 @@ pub fn derive_field_access(input: TokenStream) -> TokenStream {
                     (Some(min), Some(max)) => {
                         parse_and_set = quote! {
                             {
-                                let wide: f64 = value.parse().map_err(|_| fluent_wvr::FieldError::Parse(
-                                    format!("invalid {} for '{}': {}", #ty_str, #field_name_str, value)
-                                ))?;
+                                let wide: f64 = #wide_init_tokens;
                                 (wide.clamp(#min, #max)) as #ty
                             }
                         };
@@ -458,9 +521,7 @@ pub fn derive_field_access(input: TokenStream) -> TokenStream {
                 if min_check.is_some() || max_check.is_some() {
                     parse_and_set = quote! {
                         {
-                            let wide: f64 = value.parse().map_err(|_| fluent_wvr::FieldError::Parse(
-                                format!("invalid {} for '{}': {}", #ty_str, #field_name_str, value)
-                            ))?;
+                            let wide: f64 = #wide_init_tokens;
                             #min_check
                             #max_check
                             wide as #ty
@@ -470,7 +531,52 @@ pub fn derive_field_access(input: TokenStream) -> TokenStream {
             }
         }
 
+        // Boundary-string coercion pipeline (`#[field(coerce = "...")]`)
+        // applied before parsing/constraints: shapes the untrusted string the
+        // same way `fluent_wvr::boundary` does, so both decode paths share one
+        // vocabulary.
+        let coerce_stmt: TokenStream2 = if let Some(ref modes) = meta.coerce {
+            let mut tokens: Vec<TokenStream2> = Vec::new();
+            let mut bad: Option<String> = None;
+            for m in modes.split(',') {
+                let m = m.trim();
+                if m.is_empty() {
+                    continue;
+                }
+                match m {
+                    "trim" => tokens.push(quote! { ::fluent_wvr::coerce::Coercion::Trim }),
+                    "lowercase" => {
+                        tokens.push(quote! { ::fluent_wvr::coerce::Coercion::Lowercase })
+                    }
+                    "strip_quotes" => {
+                        tokens.push(quote! { ::fluent_wvr::coerce::Coercion::StripQuotes })
+                    }
+                    "json_escape" => {
+                        tokens.push(quote! { ::fluent_wvr::coerce::Coercion::JsonEscape })
+                    }
+                    "normalize_literal" => {
+                        tokens.push(quote! { ::fluent_wvr::coerce::Coercion::NormalizeLiteral })
+                    }
+                    other => {
+                        bad = Some(other.to_string());
+                        break;
+                    }
+                }
+            }
+            if let Some(other) = bad {
+                syn::Error::new_spanned(f, format!("unknown coerce mode: {other}"))
+                    .to_compile_error()
+            } else {
+                quote! {
+                    let value = ::fluent_wvr::coerce::coerce(value, &[#(#tokens),*]);
+                }
+            }
+        } else {
+            quote! {}
+        };
+
         let set_expr = quote! {
+            #coerce_stmt
             self.#field_ident = #parse_and_set;
             Ok(())
         };
@@ -490,7 +596,16 @@ pub fn derive_field_access(input: TokenStream) -> TokenStream {
         }
 
         let to_string_expr = if is_option {
-            quote! { self.#field_ident.as_deref().unwrap_or("").to_string() }
+            let inner_is_string = inner_ty_str == "String"
+                || inner_ty_str == "std::string::String"
+                || inner_ty_str.ends_with("::String");
+            if inner_is_string {
+                quote! { self.#field_ident.as_deref().unwrap_or("").to_string() }
+            } else {
+                // Numeric/other Option inner types have no Deref: render the
+                // contained value (or empty when None).
+                quote! { self.#field_ident.map(|v| v.to_string()).unwrap_or_default() }
+            }
         } else if ty_str == "String"
             || ty_str == "std::string::String"
             || ty_str.ends_with("::String")
@@ -643,6 +758,14 @@ pub fn derive_describable(input: TokenStream) -> TokenStream {
             schema.push(quote! { "pattern": #pattern });
         }
 
+        if let Some(ref coerce) = meta.coerce {
+            schema.push(quote! { "coerce": #coerce });
+        }
+
+        if let Some(ref parse) = meta.parse {
+            schema.push(quote! { "parse": #parse });
+        }
+
         let field_name_lit = field_name_str.clone();
         properties.push(quote! {
             #field_name_lit: {
@@ -686,6 +809,14 @@ pub fn derive_describable(input: TokenStream) -> TokenStream {
             Some(p) => quote! { Some(#p.into()) },
             None => quote! { None },
         };
+        let coerce_expr = match &meta.coerce {
+            Some(c) => quote! { Some(#c.into()) },
+            None => quote! { None },
+        };
+        let parse_expr = match &meta.parse {
+            Some(p) => quote! { Some(#p.into()) },
+            None => quote! { None },
+        };
 
         schema_fields.push(quote! {
             fluent_wvr::FieldSchema {
@@ -699,6 +830,8 @@ pub fn derive_describable(input: TokenStream) -> TokenStream {
                 max_len: #max_len_expr,
                 sanitize: #sanitize_expr,
                 pattern: #pattern_expr,
+                coerce: #coerce_expr,
+                parse: #parse_expr,
             }
         });
 

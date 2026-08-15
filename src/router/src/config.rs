@@ -29,6 +29,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use fluent_wvr::{Describable, FieldAccess};
+
 use crate::logging::LoggingConfig;
 use crate::score_matrix::ScoreMatrix;
 
@@ -549,22 +551,37 @@ impl Default for AuditLogConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The classifier's parsed LLM output. `FieldAccess` + the `#[field(...)]`
+/// coercions make the struct the single source of truth for the boundary
+/// decode path (`fluent_wvr::boundary::decode_boundary`): the `coerce`/`parse`
+/// modes shape the raw model value strings exactly as the repair walker does,
+/// so both decode paths share one vocabulary.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, FieldAccess, Describable)]
 pub struct ClassifierOutput {
+    #[field(desc = "classifier action", coerce = "strip_quotes,trim")]
     pub action: String,
+    #[field(desc = "direct response text", coerce = "strip_quotes,trim")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response: Option<String>,
+    #[field(desc = "routing target", coerce = "strip_quotes,trim")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    #[field(desc = "coherence score", min = 0.0, max = 1.0, coerce = "strip_quotes,trim", parse = "number")]
     pub coherence_score: f64,
+    #[field(desc = "safety score", min = 0.0, max = 1.0, coerce = "strip_quotes,trim", parse = "number")]
     pub safety_score: f64,
+    #[field(desc = "complexity", min = 0.0, max = 10.0, coerce = "strip_quotes,trim", parse = "number")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub complexity: Option<u8>,
+    #[field(desc = "intent", coerce = "strip_quotes,trim,normalize_literal")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intent: Option<String>,
+    #[field(desc = "routing reason", coerce = "strip_quotes,trim")]
     pub reason: String,
+    #[field(desc = "completeness", min = 0.0, max = 1.0, coerce = "strip_quotes,trim", parse = "number")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completeness: Option<f64>,
+    #[field(desc = "risk", min = 0.0, max = 1.0, coerce = "strip_quotes,trim", parse = "number")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk: Option<f64>,
 }

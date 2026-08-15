@@ -10,6 +10,10 @@ pub use crate::wrapper::{
 };
 pub use crate::{impl_component, impl_fieldless};
 pub use crate::{
+    boundary::{
+        decode_boundary, decode_boundary_typed, extract_members, repair_boundary, BoundaryError,
+        BoundaryOptions,
+    },
     Capability, CapabilitySet, Component, Describable, DynamicComponent, DynamicExecutor,
     FieldAccess, FieldError, MetadataValue, OutputStore, WorkContext, WorkError, WorkOutput,
     WorkUnit,

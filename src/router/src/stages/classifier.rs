@@ -76,10 +76,13 @@ fn log_classifier_raw_response(response: &str) {
 // LLM boundary: parse the classifier's raw LLM response text (JSON in a
 // string from the model). Routes through the shared `fluent_llm::parse_typed`
 // codec — direct-deserialize fast path, then fence-strip → parse →
-// extract-first-value, then the shared `sanitize_classifier_json` coercion.
-// `Ok((output, true))` = pristine parse; `Ok((output, false))` = recovered via
-// sanitization; `Err(reason)` = total parse failure (the caller applies the
-// `ClassifierFailurePolicy`).
+// extract-first-value → deterministic repair — then, as a last resort, the
+// fluent-wvr schema-driven boundary decode (`decode_boundary`), which
+// recognises members against `ClassifierOutput`'s own `field_names()` schema
+// and coerces each value string through `set_field` (the derive-macro
+// `coerce`/`parse` modes). `Ok((output, true))` = pristine parse;
+// `Ok((output, false))` = recovered; `Err(reason)` = total parse failure (the
+// caller applies the `ClassifierFailurePolicy`).
 fn parse_classifier_response(
     response: &str,
     default_route: &str,
@@ -104,6 +107,9 @@ fn parse_classifier_response(
             Ok((output, ok))
         }
         Err(fluent_llm::JsonParseError::NoJson) => {
+            if let Some(output) = try_boundary_decode(response, default_route) {
+                return Ok((output, false));
+            }
             tracing::error!(
                 target: "router.pipeline.stage2",
                 raw_response_len = response.len(),
@@ -113,6 +119,9 @@ fn parse_classifier_response(
             Err("invalid JSON in LLM response".into())
         }
         Err(e) => {
+            if let Some(output) = try_boundary_decode(response, default_route) {
+                return Ok((output, false));
+            }
             tracing::error!(
                 target: "router.pipeline.stage2",
                 error = %e,
@@ -123,6 +132,35 @@ fn parse_classifier_response(
             Err(format!("post-sanitize parse error: {e}"))
         }
     }
+}
+
+/// Last-resort, schema-driven recovery of a classifier response that the whole
+/// repair pipeline could not parse as JSON (e.g. brace-less
+/// `action: route, target: code`). Member values are coerced through
+/// `set_field` with the field's `#[field(coerce = "...")]` / `parse = "number"`
+/// modes — the same vocabulary the repair walker uses — so a member that fails
+/// to coerce keeps its (failing) default instead of fabricating a value.
+///
+/// Conservative by construction: a recovered output must carry a non-empty
+/// `action` (else there is nothing to route on), and it is always flagged
+/// recovered (`ok == false`). Returns `None` when nothing decodes.
+fn try_boundary_decode(response: &str, default_route: &str) -> Option<ClassifierOutput> {
+    let schema = ClassifierOutput::default().field_names();
+    let opts = fluent_wvr::BoundaryOptions::for_schema(schema);
+    let (mut output, decoded) =
+        fluent_wvr::decode_boundary::<ClassifierOutput>(response, &opts).ok()?;
+    if output.action.is_empty() {
+        return None;
+    }
+    if output.target.is_none() && output.action == "route" {
+        output.target = Some(default_route.to_string());
+    }
+    tracing::info!(
+        target: "router.pipeline.stage2",
+        decoded_fields = decoded.len(),
+        "classifier recovered via fluent-wvr schema-driven boundary decode",
+    );
+    Some(output)
 }
 
 fn check_thresholds(
@@ -1108,6 +1146,35 @@ mod tests {
         assert!(body.contains("\\\"a\\\""));
         assert!(body.contains("{\\\"a\\\": "));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Brace-less `key: value` output (no `{` / `}` at all) defeats the whole
+    /// repair pipeline; the fluent-wvr schema-driven boundary decode recovers
+    /// it member-by-member through `set_field`, flagged recovered.
+    #[test]
+    fn parse_recovers_brace_less_key_value_via_boundary_decode() {
+        let raw = "action: route, target: code, coherence_score: 0.8, safety_score: 1, \
+                    complexity: 7, reason: needs the big model";
+        let (out, ok) = parse_classifier_response(raw, "local").expect("must decode members");
+        assert!(!ok, "a boundary decode is a recovered parse, never pristine");
+        assert_eq!(out.action, "route");
+        assert_eq!(out.target.as_deref(), Some("code"));
+        assert_eq!(out.coherence_score, 0.8);
+        assert_eq!(out.complexity, Some(7));
+    }
+
+    /// A member that fails to coerce (e.g. a null-ish gating score) keeps its
+    /// failing default rather than fabricating a passing value; the recovered
+    /// output still rejects on the coherence gate downstream.
+    #[test]
+    fn parse_boundary_decode_keeps_failing_default_for_bad_score() {
+        let raw = "action: route, target: code, coherence_score: undefined, safety_score: 1";
+        let (out, ok) = parse_classifier_response(raw, "local").expect("must decode members");
+        assert!(!ok);
+        assert_eq!(out.action, "route");
+        // `undefined` -> parse_number fails -> the field stays at its 0.0
+        // default (which fails the coherence threshold, not fabricates a pass).
+        assert_eq!(out.coherence_score, 0.0);
     }
 }
 

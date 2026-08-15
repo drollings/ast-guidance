@@ -222,7 +222,6 @@ where
 
 /// Build an audit log layer (always JSON-formatted).
 ///
-
 /// The filter subscribes to the canonical `router.audit` target.  It also
 /// keeps `router.charts.audit=info` so chart audits still land in the file;
 /// once every producer emits through `crate::audit::AUDIT_TARGET` the

@@ -92,220 +92,6 @@ pub fn extract_first_json_value(raw: &str) -> Option<Value> {
     None
 }
 
-/// The last significant (non-whitespace) character of a partially-built string.
-fn prev_significant(out: &str) -> Option<char> {
-    out.chars().rev().find(|c| !c.is_whitespace())
-}
-
-/// Append `c` to `out` in its JSON-escaped form when it is a raw control
-/// character (serde_json rejects unescaped control chars, and small models
-/// routinely emit literal newlines/tabs inside string values); otherwise
-/// append it verbatim.
-fn push_escaped_char(out: &mut String, c: char) {
-    match c {
-        '\n' => out.push_str("\\n"),
-        '\t' => out.push_str("\\t"),
-        '\r' => out.push_str("\\r"),
-        '\u{0008}' => out.push_str("\\b"),
-        '\u{000C}' => out.push_str("\\f"),
-        c if c.is_control() => {
-            use std::fmt::Write as _;
-            let _ = write!(out, "\\u{:04x}", c as u32);
-        }
-        c => out.push(c),
-    }
-}
-
-/// Lexical healing pass: produce a repaired copy fixing the malformations
-/// small LLMs emit most often. String contents are copied verbatim (with
-/// single-quote conversion and inner-quote escaping); every transformation
-/// happens outside string literals, so legitimate `{`, `,`, `/` etc. inside
-/// values are never touched.
-fn heal_lexically(raw: &str) -> String {
-    let chars: Vec<char> = raw.chars().collect();
-    let n = chars.len();
-    let mut out = String::with_capacity(n);
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut i = 0usize;
-
-    while i < n {
-        let c = chars[i];
-
-        if in_string {
-            if escaped {
-                out.push(c);
-                escaped = false;
-            } else if c == '\\' {
-                out.push('\\');
-                escaped = true;
-            } else if c == '"' {
-                out.push('"');
-                in_string = false;
-            } else {
-                push_escaped_char(&mut out, c);
-            }
-            i += 1;
-            continue;
-        }
-
-        match c {
-            '"' => {
-                in_string = true;
-                out.push('"');
-                i += 1;
-            }
-            '\'' => {
-                // Single-quoted string -> double-quoted, escaping inner quotes
-                // and unescaping `\'` so the value is preserved verbatim.
-                in_string = true;
-                out.push('"');
-                i += 1;
-                let mut sq_escaped = false;
-                let mut closed = false;
-                while i < n {
-                    let ch = chars[i];
-                    if sq_escaped {
-                        if ch == '\'' {
-                            out.push('\'');
-                        } else {
-                            out.push('\\');
-                            out.push(ch);
-                        }
-                        sq_escaped = false;
-                    } else if ch == '\\' {
-                        sq_escaped = true;
-                    } else if ch == '\'' {
-                        out.push('"');
-                        closed = true;
-                        in_string = false;
-                        i += 1;
-                        break;
-                    } else if ch == '"' {
-                        out.push('\\');
-                        out.push('"');
-                    } else {
-                        push_escaped_char(&mut out, ch);
-                    }
-                    i += 1;
-                }
-                if !closed {
-                    // Unterminated single-quoted string: close it. If the
-                    // string ended on a dangling `\`, escape it first so the
-                    // closing quote is not swallowed.
-                    if sq_escaped {
-                        out.push('\\');
-                    }
-                    out.push('"');
-                    in_string = false;
-                }
-            }
-            '/' => {
-                // Strip `//` line comments and `/* */` block comments.
-                if i + 1 < n && chars[i + 1] == '/' {
-                    i += 2;
-                    while i < n && chars[i] != '\n' {
-                        i += 1;
-                    }
-                } else if i + 1 < n && chars[i + 1] == '*' {
-                    i += 2;
-                    while i + 1 < n && !(chars[i] == '*' && chars[i + 1] == '/') {
-                        i += 1;
-                    }
-                    i = (i + 2).min(n);
-                } else {
-                    // Lone `/` outside a string: never valid JSON, drop it.
-                    i += 1;
-                }
-            }
-            ',' => {
-                // Trailing comma before `}` / `]`: drop it.
-                let mut j = i + 1;
-                while j < n && chars[j].is_whitespace() {
-                    j += 1;
-                }
-                if j < n && matches!(chars[j], '}' | ']') {
-                    i += 1;
-                } else {
-                    out.push(',');
-                    i += 1;
-                }
-            }
-            '-' => {
-                // Negative non-JSON literals: `-Infinity`/`-NaN` -> `null`.
-                let mut j = i + 1;
-                while j < n && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
-                    j += 1;
-                }
-                let word: String = chars[i + 1..j].iter().collect();
-                if matches!(word.as_str(), "Infinity" | "NaN") {
-                    out.push_str("null");
-                    i = j;
-                } else {
-                    out.push('-');
-                    i += 1;
-                }
-            }
-            c if c.is_ascii_alphabetic() || c == '_' || c == '$' => {
-                let start = i;
-                while i < n
-                    && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '$')
-                {
-                    i += 1;
-                }
-                let ident: String = chars[start..i].iter().collect();
-                // A bare key sits right after `{` or `,` and is followed by
-                // `:` (or the common `=` stand-in).
-                if matches!(prev_significant(&out), Some('{' | ',')) {
-                    let mut j = i;
-                    while j < n && chars[j].is_whitespace() {
-                        j += 1;
-                    }
-                    if j < n && matches!(chars[j], ':' | '=') {
-                        out.push('"');
-                        out.push_str(&ident);
-                        out.push('"');
-                        i = j;
-                        continue;
-                    }
-                }
-                // Otherwise an unquoted literal value: normalize the
-                // non-JSON spellings and quote unknown bare words (route
-                // names, actions, ...) as strings.
-                match ident.as_str() {
-                    "True" | "true" => out.push_str("true"),
-                    "False" | "false" => out.push_str("false"),
-                    "None" | "null" | "undefined" | "NaN" | "Infinity" => out.push_str("null"),
-                    _ => {
-                        out.push('"');
-                        out.push_str(&ident);
-                        out.push('"');
-                    }
-                }
-            }
-            '=' => {
-                // `=` as a key-value separator: `"key" = value` -> `:`.
-                if prev_significant(&out) == Some('"') {
-                    out.push(':');
-                } else {
-                    out.push('=');
-                }
-                i += 1;
-            }
-            ';' => {
-                // Semicolons are never valid JSON; drop them.
-                i += 1;
-            }
-            _ => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-
-    out
-}
-
 /// Close any open string literals and containers left dangling by a truncated
 /// response, producing a well-formed document. Extra/mismatched closers are
 /// dropped so a stray `}}` cannot poison an otherwise-truncated value.
@@ -326,8 +112,10 @@ fn close_open_containers(healed: &str) -> String {
             } else if c == '"' {
                 out.push('"');
                 in_string = false;
+            } else if let Some(e) = fluent_wvr::coerce::escaped_char(c) {
+                out.push_str(&e);
             } else {
-                push_escaped_char(&mut out, c);
+                out.push(c);
             }
             continue;
         }
@@ -421,6 +209,11 @@ fn drop_incomplete_tail(healed: &str) -> Option<String> {
 /// `Infinity`) and truncation (a dangling string/brace/bracket), all with
 /// string-awareness so legitimate contents are never altered.
 ///
+/// The structural repair itself lives in `fluent_wvr::boundary::repair_boundary`
+/// (schema-blind mode) — the shared, fluent-wvr-native replacement for the
+/// historical `heal_lexically` pass, with value normalization factored through
+/// `fluent_wvr::coerce`.
+///
 /// Conservative by construction: it only repairs structure outside string
 /// values, verifies the result parses, and returns `None` when nothing heals
 /// to valid JSON. Purely deterministic string manipulation — no LLM
@@ -429,7 +222,9 @@ fn drop_incomplete_tail(healed: &str) -> Option<String> {
 /// treat a successful repair as "recovered" (not pristine) output.
 pub fn repair_json(raw: &str) -> Option<String> {
     let start = raw.find(['{', '['])?;
-    let healed = heal_lexically(&raw[start..]);
+    let healed =
+        fluent_wvr::boundary::repair_boundary(&raw[start..], &fluent_wvr::BoundaryOptions::lenient())
+            .text;
     if let Some(v) = extract_first_json_value(&healed) {
         return Some(v.to_string());
     }

@@ -44,6 +44,15 @@ pub struct FieldSchema {
     pub sanitize: Option<String>,
     /// Substring pattern. The value must contain this string. Not a regex.
     pub pattern: Option<String>,
+    /// Boundary-string coercion pipeline applied by `set_field` before parsing,
+    /// spelled as a comma-separated `Coercion` mode list (e.g.
+    /// `"trim,strip_quotes"`). `#[field(coerce = "...")]`.
+    #[serde(default)]
+    pub coerce: Option<String>,
+    /// Optional tolerant parse mode for numeric members (`"number"`). `None`
+    /// uses the strict `str::parse`. `#[field(parse = "...")]`.
+    #[serde(default)]
+    pub parse: Option<String>,
 }
 
 pub trait SchemaProvider {

@@ -17,7 +17,9 @@
 
 extern crate self as fluent_wvr;
 
+pub mod boundary;
 pub mod capability;
+pub mod coerce;
 pub mod dynamic;
 pub mod macros;
 pub mod metadata;
@@ -29,8 +31,16 @@ pub mod work;
 pub mod prelude;
 pub mod wrapper;
 
+pub use boundary::{
+    decode_boundary, decode_boundary_typed, extract_members, repair_boundary, BoundaryError,
+    BoundaryOptions, BoundaryRepair, BoundarySchema,
+};
 pub use capability::{
     check_capability, Capability, CapabilityError, CapabilitySet, FsCapability, CURRENT_CAPS,
+};
+pub use coerce::{
+    coerce, escape_control_chars, escaped_char, literal_kind, parse_bool, parse_int,
+    parse_number, split_top_level, strip_outer_quotes, Coercion, LiteralKind,
 };
 pub use dynamic::{DynamicComponent, DynamicExecutor};
 pub use fluent_wvr_macros::{Describable, FieldAccess};
