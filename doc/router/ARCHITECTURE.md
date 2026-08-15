@@ -45,7 +45,8 @@ local dispatch is a direct HTTP call to the owning server.
 │  on routing_target: server/dispatch.rs (ChatBackend chain)              │
 │  management: /instances /v1/models /models /memory /props + model-less  │
 │  proxies; /health /stats /v1/chat/completions /v1/plan /v1/rigor        │
-│  /admin/cache/invalidate, DELETE /admin/cache/{key}                     │
+│  /admin/cache/invalidate, DELETE /admin/cache/{key}; admin /models/unload │
+│  + /metrics                                                              │
 └─────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
@@ -65,11 +66,11 @@ local dispatch is a direct HTTP call to the owning server.
                     ┌───────────────┼──────────────────┐
                     ▼               ▼                  ▼
              Local dispatch   Escalation ladder   plan / rigor routes
-             (ChatBackend      (dispatch/escalation  (routes/plan.rs,
-              chain)            → frontier modes)      routes/rigor.rs)
+             (ChatBackend      (dispatch/escalation/  (routes/plan.rs,
+              chain)            → frontier modes)      routes/rigor/)
                     │
                     ▼
-        ┌─ Serving layer (supervisor.rs + instances.rs) ─────────────────┐
+        ┌─ Serving layer (supervisor.rs + instances/) ───────────────────┐
         │  one llama-server per weights file on a free localhost port    │
         │  direct /instances + generation calls, no llama.cpp router     │
         │  sidecar: footprint-weighted eviction (weights included) when  │
@@ -93,7 +94,7 @@ decision before propagating).
 
 The classifier stage has two modes. Flat mode performs a single LLM call that
 returns structured JSON — a direct response, a rejection, or a `RoutingTarget`.
-Tree mode wraps the `ClassificationEngine` (`stages/tree.rs`): when a
+Tree mode wraps the `ClassificationEngine` (`stages/tree/`): when a
 classification tree is configured (`config/classification.rs`), the engine
 evaluates the nested tree recursively — filter nodes (hard_reject /
 soft_redirect / output_filter), classifier nodes (auto-built prompt, three-axis
@@ -140,6 +141,7 @@ exactly once and published to the same typed store.
 | `error.rs` | `ServerError` — the single typed server error (Bind / Http / Addr / transparent `DispatchError`) |
 | `config.rs` | `RouterConfig` + sub-config types, split into re-exported submodules: `addr`, `builder` (`PipelineParams`), `classification` (`ClassificationTree`/`ClassificationNode`/`ClassificationChild`), `escalation` (`EscalationLadderConfig`, `FrontierConfig`), `filters` (`RejectPatterns`/`PatternEntry`/`FilterAction`/`FilterScope`/`ConfidenceGate`), `routing` (`RoutingConfig`, `RouteRef` with `always_route`). `ModelEntry` adds the weights source for managed models (`weights`, `hf_repo`, `hf_file`) and `is_managed()`. Top-level `gguf_dir` is the admin-CLI GGUF root; `sidecar.resume_ttl_s` bounds resume snapshot lifetime |
 | `normalize.rs` | Thin adapter over `fluent_llm::openai`: OpenAI JSON ↔ `RouterRequest`/`RouterResponse`, `error_response()`, `messages_to_json()`, `parse_openai_stream_delta`. Re-attaches the routing fields the shared normalizer strips |
+| `target_match.rs` | `TargetMatcher` — the in-group complexity ladder: `build_self_assessment_prompt`, `parse_self_assessment`, `candidates_for_group`, `start_index`/`is_match` selection core. DRY-shared by the flat classifier path (`stages/classifier.rs`) and the classification-tree engine (`stages/tree/engine.rs`) |
 
 ### Pipeline & Stages
 
@@ -147,8 +149,9 @@ exactly once and published to the same typed store.
 |------|------|
 | `stages/deterministic.rs` | `DeterministicPreFilter` — delegates to `DeterministicFilterEngine`; slash-command dispatch (`/help`, `/stats`, `/checkpoint`) |
 | `stages/classifier.rs` | `ClassifierStage` — single LLM call (flat) or the `ClassificationEngine` (tree); emits direct response / routing target / rejection; builds the `RoutingTarget`; enforces route-level `always_route` (override `action=respond` → `route`) and auto-generates the "Dispatch rules" section of the system prompt from routes marked `always_route` |
-| `stages/tree.rs` | `ClassificationEngine` — recursive nested-tree evaluation; filter / classifier / terminal / fallback nodes; `tree_path` audit trail; `kind = "tree_node"` records |
+| `stages/tree/` | `ClassificationEngine` — recursive nested-tree evaluation; filter / classifier / terminal / fallback nodes; `tree_path` audit trail; `kind = "tree_node"` records. Split into `mod.rs` (re-exports), `engine.rs` (the recursive walk + `cost`), `verdict.rs` (`TreeClassifierVerdict` + `parse_tree_verdict`), `decisions.rs` (`TreeOutcome`/`TreeEvaluation` + the `StageDecision` builders); the classifier-node prompt builders live in `config/classification.rs` (`ClassificationNode::build_prompt`) |
 | `stages/common.rs` | Shared stage helpers — `extract_user_message()`, `get_metadata_string()`, JSON-field ensure helpers |
+| `stages/prompt_parse.rs` | `chat_json` + `PromptParseError` — the router-local LLM-JSON round-trip codec over `fluent_llm::parse::parse_typed` (call + tolerant parse/coerce in one envelope) |
 | `stages/retry_classifier.rs` | `RetryClassifier` — retry-with-backoff decorator over the classifier stage (opt-in behind `classifier_retry_max`) |
 | `stages/pipeline_ref.rs` | `PipelineRefStage` — re-usable pipeline stage from named config |
 
@@ -166,7 +169,7 @@ exactly once and published to the same typed store.
 | File | Role |
 |------|------|
 | `dispatch/backend.rs` | `ChatBackend` trait (`complete` / `stream_complete` — object-safe, per-request params passed as args); `OpenAiChatBackend` (single-attempt HTTP via raw `reqwest`), `RetryBackend` (jittered-exponential retry via `common_core::retry`), `BackendChain` (ordered backend chain) — the single production dispatch path (D4) |
-| `dispatch/escalation.rs` | `Ladder` — the load-bearing ladder runtime: local-chain exhaustion → `filter → question → team → turnover` modes, deterministic-first `ContextCache` short-circuit, `ResultPool`-backed parallel slots, `kind = "escalation"` audit records; `EscalationBackends` / `LocalBackend` / `FrontierBackend` role wiring; `dispatch_frontier` bypass for frontier-owned sessions |
+| `dispatch/escalation/` | `Ladder` — the load-bearing ladder runtime: local-chain exhaustion → `filter → question → team → turnover` modes, deterministic-first `ContextCache` short-circuit, `ResultPool`-backed parallel slots, `kind = "escalation"` audit records; `EscalationBackends` / `LocalBackend` / `FrontierBackend` role wiring; `dispatch_frontier` bypass for frontier-owned sessions. Split into `mod.rs` (`Ladder` + `try_escalate`), `modes.rs` (the four mode implementations + the single shared `frontier_complete` transport), `assemble.rs` (parse/assemble/scorer helpers), `audit.rs` (`emit_audit` record builder) |
 | `dispatch/frontier.rs` | `DispatchError` + `is_retryable` (the public error type of `ChatBackend`); wire-format build/parse helpers reserved for the ladder — `OpenAiBackend` (`parse_response` reused by `OpenAiChatBackend`), `Anthropic` Messages-API helpers, `StreamEvent` |
 
 ### Session & Orchestration
@@ -186,31 +189,34 @@ exactly once and published to the same typed store.
 | File | Role |
 |------|------|
 | `routes/plan.rs` | `PlanRoute` — boot-loaded `ChartStore` + `ChartSelector`; Exact → server-side chart compile+execute under `SupervisedBatch` supervision; Partial → one-round targeted interview (≤ `CHART_MAX_INTERVIEW_QUESTIONS`); Mismatch → fresh draft; `workflow_extractor` hook for the dispatch learning loop |
-| `routes/rigor.rs` | `RigorRoute` — fixed-pass blue/red/judge protocol; real `DependencySession` checkpoint (`rigor.blue`) + `rewind_to_checkpoint` on a material rejection; red team reads through `FilteredLedger` at `Lod::LOD0` (dead ends excluded); final rejection resolves to a targeted interview (≤ 3 questions), frontier escalation only on low judge confidence; `/v1/rigor` is present-but-unconfigured when no backends are attached (explicit error, never a crash) |
-| `charts/` | Chart (DAG workflow) library — `store` (`ChartStore`), `binding` (`Entity`, `ENTITIES_META_KEY`), `compile`, `execute` (under `Limiter` + SupervisedBatch), `render`, `rubric`, `select` (`ChartSelector`, `ChartFit`), `extract` (`WorkflowExtractor`) — the workflow engine consumed by `PlanRoute` and the dispatch learning loop |
+| `routes/rigor/` | `RigorRoute` — fixed-pass blue/red/judge protocol; real `DependencySession` checkpoint (`rigor.blue`) + `rewind_to_checkpoint` on a material rejection; red team reads through `FilteredLedger` at `Lod::LOD0` (dead ends excluded); final rejection resolves to a targeted interview (≤ 3 questions), frontier escalation only on low judge confidence; `/v1/rigor` is present-but-unconfigured when no backends are attached (explicit error, never a crash). Prompt constants / message builders / tolerant parses live in the `prompts` submodule |
+| `charts/` | Chart (DAG workflow) library — `store` (`ChartStore`), `binding` (`Entity`, `ENTITIES_META_KEY`), `compile`, `execute` (under `Limiter` + SupervisedBatch), `render`, `rubric`, `select` (`ChartSelector`, `ChartFit`), `extract` (`WorkflowExtractor`), `stage` (`ChartPromptStage` — a `ClassifierStage`-shaped component that renders one target's template and makes one LLM call) — the workflow engine consumed by `PlanRoute` and the dispatch learning loop |
 
 ### Infrastructure
 
 | File | Role |
 |------|------|
-| `server.rs` | `RouterServer` (`WorkUnit`) — hyper HTTP/1.1 accept loop on tokio; assembles `ServerDeps` and fans out to the `server/` submodule; `serve_http` is `pub(crate)` for integration tests; runs each `InstanceManager`'s boot reconcile + residency task from the attached `InstancePool` |
-| `server/handler.rs` | HTTP routing + request orchestration; `ServerDeps` (the collapsed former 12-`Option` dependency bundle): pipelines, routes, models, stats, cache, ledger, plan/rigor routes, sessions, ladders, context_cache, mock_dispatch, http_client, `instance_pool`, `api_key_env_name`. Merges query-string routing fields into the body, resolves the model-id grammar (`<model_id>[:<instance|group|latest>]`) in `resolve_pipeline`, and routes the management/model-less endpoints |
+| `server.rs` | `RouterServer` (`WorkUnit`) — hyper HTTP/1.1 accept loop on tokio; assembles `ServerDeps` and fans out to the `server/` submodule; `serve_http` is `pub(crate)` for integration tests; runs each `InstanceManager`'s boot reconcile + residency task from the attached `InstancePool` (in a drained `JoinSet`, never detached) |
+| `server/handler.rs` | HTTP routing + request orchestration; `ServerDeps` (the collapsed former 12-`Option` dependency bundle): pipelines, routes, models, stats, cache, ledger, plan/rigor routes, sessions, ladders, context_cache, mock_dispatch, http_client, `instance_pool`, `api_key_env_name`, `supervisor`, `coordinator`. Merges query-string routing fields into the body, resolves the model-id grammar (`<model_id>[:<instance|group|latest>]`) in `resolve_pipeline`, and routes the management/model-less endpoints |
 | `server/instances_api.rs` | The public `/instances` management facade: aggregate envelope across models, `POST /instances`, per-instance ops (delete/pin/unpin/resume/no-resume/resize/snapshot), `/memory` compat reshape, `/v1/models`, `/props`, model-less proxies (`/tokenize`, `/detokenize`, `/apply-template`, `/control`); management API-key enforcement; query parse/percent-decode helpers |
 | `server/dispatch.rs` | `handle_dispatch` / `dispatch_real` — primary + `fallbacks` chain through `ChatBackend` (each wrapped in `RetryBackend`), short-circuit on non-retryable errors, response cache read/write, workflow extraction, allocate-on-503 via the `InstancePool` |
 | `server/responses.rs` | OpenAI-completion response builders, SSE/CORS headers, `ServerStats` counters |
+| `server/admin.rs` | Admin endpoints for the CLI — `POST /models/unload` (stop a managed model's `llama-server`; spec stays registered so dispatch reloads it) and `GET /metrics` (aggregates the managed llama-servers' Prometheus expositions, `?model=`-filterable, `# HELP`/`# TYPE` lines deduplicated) |
 | `streaming.rs` | `StreamingHandler` — SSE delta formatting for OpenAI-compatible streaming chunks; cross-chunk think-block filtering via `StreamingThinkFilter` |
 | `kv_cache.rs` | Two-tier: `HotSnapshotIndex` (RAM LRU over `common_core::cache::LoadCache`, metadata only) + `ColdSnapshotIndex` (disk tree `model/adapter/session`); `SnapshotStore` composes both; the router never reads/writes raw KV bytes — it manages filesystem layout + sidecar metadata for llama.cpp slot save/restore |
-| `instances.rs` | Instance-pool grammar generation + validation (`instance_grammar_string`, `validate_instances`, `is_valid_instance_name`) and the sidecar: `InstanceClient` (one server's `/instances` API over raw `reqwest`, `HttpClass`-classified), `InstanceManager` (boot reconcile; per-instance `resume` map; `is_sleeping` residency probe; `list_with_fallback` synthesizing a resident footprint for plain — weights-only, no-instance-grammar — models; `weights_bytes` from the configured weights file), and `InstancePool` (the router's aggregate facade: `<model_id>:<name>` ids, 64-bit-summed `total`, `/v1/models`, op proxies; footprint-weighted eviction `Evictable::{Context, Model}` + `evict_to_fit`; load-time admission control `make_room_for`; `resume` snapshot/expiry and control ops) |
-| `supervisor.rs` | `LlamaServerSupervisor` + `ManagedServer` — resolves `llama-server` from `$PATH` (or `LLAMA_SERVER`), spawns one process per managed model on a free localhost port (`--alias`, `-m`/`-hf`, `--instance` grammar, `--slot-save-path`, `--api-key`), waits for `/health`, and supervises each child (logs its output, restarts with capped backoff); `free_port`, `build_server_args`, `shutdown` |
+| `instances/` | Instance-pool grammar generation + validation (`instance_grammar_string`, `validate_instances`, `is_valid_instance_name`) and the sidecar. Split into `mod.rs` (grammar/validation helpers + test stub), `client.rs` (`InstanceClient` — one server's `/instances` API over raw `reqwest`, `HttpClass`-classified; `InstanceError`/`InstanceInfo`/`InstanceTotals`/`SnapshotInfo`), `manager.rs` (`InstanceManager` — boot reconcile; per-instance `resume` map; `is_sleeping` residency probe; `list_with_fallback` synthesizing a resident footprint for plain — weights-only, no-instance-grammar — models; `weights_bytes`; `ensure_instance` on-demand creation; `ensure_group` allocate-on-503), and `pool.rs` (`InstancePool` — the router's aggregate facade: `<model_id>:<name>` ids, 64-bit-summed `total`, `/v1/models`, op proxies; footprint-weighted eviction `Evictable::{Context, Model}` + `evict_to_fit`; load-time admission control `make_room_for`; `resume` snapshot/expiry and control ops; the residency engine `run_residency`). The public `/instances` surface lives in `instances/api.rs` |
+| `supervisor.rs` | `LlamaServerSupervisor` + `ManagedServer` — resolves `llama-server` from `$PATH` (or `LLAMA_SERVER`), spawns one process per managed model on a free localhost port (`--alias`, `-m`/`-hf`, `--instance` grammar, `--slot-save-path`, `--api-key`), waits for `/health`, and supervises each child (logs its output, restarts with capped backoff; post-boot **liveness** supervision probes `/health` and kills+restarts a hung server past `liveness_failures_before_restart`). Boots only models with a pinned instance (`start_all`); lazy models load on demand via `ensure_running` (spawn-locked, no double-spawn) and unload via `unload` (spec stays registered). `free_port`, `build_server_args`, `shutdown` |
 | `scheduler.rs` | Re-exports `AffinityScheduler` / `ScheduledTask` / `AgingConfig` from `fluent_concurrency::affinity` |
 | `summarization.rs` | `ResultScorer` + `Summarizer` — `WorkUnit` impls that call an LLM (via `Arc<dyn ChatBackend>`) to score/condense responses; feeds the ledger's lazy LOD tiers |
 | `score_matrix.rs` | `ScoreMatrix` — multi-dimensional weighted scoring (coherence/complexity/completeness/risk) with per-route dimension bands |
 | `metrics.rs` | `FailureClass` + `classify_error` — typed-first error classification with a string-regex fallback for opaque shell/command output (D10) |
 | `audit.rs` | The canonical durable-audit surface — a single `tracing` target `router.audit`; `AuditRecord` + `emit(kind, detail)`; audit kinds are distinguished by the `kind` field (`route`, `filter`, `tree_node`, `escalation`, `rigor`, `chart_target`, …) |
 | `logging.rs` | Two-stream `tracing` subscriber: operational JSON/console rolling file + the durable audit stream (separate retention, always JSON, gated on `router.audit=info`) |
-| `frontier/modes.rs` | `EscalationMode` ladder taxonomy — `Filter`, `Question`, `Team`, `Turnover` (D8; the old `FrontierMode` enum is gone), serde snake_case; `FrontierResult` and `AuditEntry`. Taxonomy and audit types only — the runtime lives in `dispatch/escalation.rs` |
+| `frontier/modes.rs` | `EscalationMode` ladder taxonomy — `Filter`, `Question`, `Team`, `Turnover` (D8; the old `FrontierMode` enum is gone), serde snake_case; `FrontierResult` and `AuditEntry`. Taxonomy and audit types only — the runtime lives in `dispatch/escalation/` (mode implementations in `dispatch/escalation/modes.rs`) |
 | `hnsw.rs` | `HnswIndexHandle` — the single HNSW index handle type for the chart store's brute-force / `knn_brute_force` fallback |
+| `telemetry.rs` | Structured telemetry events with a controlled vocabulary (`ToolName`/`ProviderCategory`/`FeatureName`), the `TelemetryEvent` enum, and `TelemetrySink` (`TracingSink`/`NoopSink`) — no free strings, no PII |
 | `transforms/` | `TransformStrategy` trait + `rewrite_text_messages` shared helper: `NoTransform`, `PiiAnonymize`, `DecomposeToAnonymizedHypothetical`, `DecomposeToSubtasks`, `CodewordAnonymizer`, `Sanitize`, `SecretMask` |
+| `cli/` | Admin CLI support backing the `coral-router` binary's `list`/`ps`/`pull`/`scan`/`rm`/`show`/`stop`/`speedtest` subcommands (ported from `gguf_tool.py`): `gguf.rs` (GGUF-directory scanning + `models.json` cache), `preset.rs` (`models-preset.ini` rendering), `commands/` (`filesystem.rs` for the GGUF commands, `server.rs` for the HTTP-driven `ps`/`stop`/`speedtest`), and `CliContext`/`CliError` in `mod.rs` |
 | `testing/` | `TranscriptProvider`, `MockTranscriptEntry`, `MockDispatchContext` — transcript-driven integration-test harness for E2E and golden tests |
 | `test_stubs.rs` | `StubChatBackend`, `HashEmbedder` — test-only backends (cfg(test)) |
 
@@ -259,10 +265,10 @@ for the classifier. Streaming flows through `StreamingHandler` over an
 `fluent_llm::openai::build_openai_chat_body` (which carries the
 `chat_template_kwargs: {"enable_thinking": false}` default).
 
-`dispatch/escalation.rs` owns the ladder runtime. After every local model in a
+`dispatch/escalation/` owns the ladder runtime. After every local model in a
 `model_group` chain fails, `try_escalate` consults the deterministic
 `ContextCache` first (short-circuit before any frontier call), then runs the
-configured modes in order. Each mode's frontier transport reuses
+configured modes in order (`modes.rs`). Each mode's frontier transport reuses
 `dispatch/backend.rs` (`ChatBackend`) — no third HTTP path — and every
 interaction emits a `kind = "escalation"` audit record (`mode`/`accepted`/
 `payload`/`raw_response`/`trigger`/`timestamp`). Turnover marks the session
@@ -306,7 +312,7 @@ pipeline pre-filter and the write-path scrubber (`ledger_guard.rs`).
 |-----------|--------|-------------------|
 | `Component` / `WorkUnit` | `fluent-wvr` | Every pipeline stage, `PipelineOrchestrator`, `RouterServer`, `ResultScorer`/`Summarizer` |
 | `DependencyGraph<K>` | `fluent-dag::dep_graph` | `DependencySession` for step DAG tracking |
-| `ResultPool` | `fluent-concurrency::pool` | `dispatch/escalation.rs` — parallel classifier slots (team mode) |
+| `ResultPool` | `fluent-concurrency::pool` | `dispatch/escalation/modes.rs` — parallel classifier slots (team mode) and parallel hypotheticals (question mode) |
 | `PriorityResultPool` | `fluent-concurrency::pool` | `AffinityScheduler` — priority dispatch with aging |
 | `Limiter` | `fluent-concurrency::pool` | `ClassifierStage` — concurrent classifier call cap; `charts/compile.rs` + `charts/execute.rs` — chart-DAG execution cap; `PlanRoute` |
 | `WorkContext` | `fluent-wvr` | Carries request, caps, runtime through every stage |
@@ -319,8 +325,8 @@ pipeline pre-filter and the write-path scrubber (`ledger_guard.rs`).
 | `HttpClass` | `guidance-llm` | `dispatch/backend.rs` — status classification in `OpenAiChatBackend` (streaming + buffered) |
 | `DispatchError::is_retryable()` | `fluent-router` (`dispatch/frontier.rs`) | retry/fallback decisions in `dispatch/backend.rs` and `server/dispatch.rs` |
 | `LlmError::is_retryable()` | `fluent-concurrency::llm_queue` | `guidance-llm` client error classification |
-| `parse_json_response` | `fluent_llm::parse` | `routes/rigor.rs` (red/judge parses), `dispatch/escalation.rs` |
-| `Decomposer` | `fluent_llm` | `dispatch/escalation.rs` — question-mode hypothetical decomposition |
+| `parse_json_response` | `fluent_llm::parse` | `routes/rigor/` (red/judge parses), `dispatch/escalation/assemble.rs` |
+| `Decomposer` | `fluent_llm` | `dispatch/escalation/modes.rs` — question-mode hypothetical decomposition |
 
 ## HttpClass: where it lives and why
 
@@ -500,7 +506,7 @@ path. `dispatch_real` (`server/dispatch.rs`) walks the primary target plus its
 `fallbacks` in order when a target fails (rate limit, timeout, parse error);
 non-retryable 4xx errors short-circuit the chain. Only after the whole local
 chain is exhausted does the per-group `Ladder` engage
-(`dispatch/escalation.rs`).
+(`dispatch/escalation/`).
 
 Every model in the chain is a candidate to answer the request — a fallback
 *target*. None of them backs up the classifier: the classifier stage runs on
@@ -529,14 +535,19 @@ classifier prompt's "Dispatch rules" section is generated from the same
 declares a weights source or an instance pool: `ModelEntry.weights`
 (a local GGUF path), `hf_repo`/`hf_file` (on-demand Hugging Face load), or
 `instances`. At boot `main.rs` builds a `LlamaServerSupervisor`
-(`supervisor.rs`), finds `llama-server` on `$PATH` (or `LLAMA_SERVER`), spawns
-**one process per managed model** on a free localhost port, and waits for each
-`/health`. Each managed model's `endpoint` is then rewritten to
+(`supervisor.rs`), finds `llama-server` on `$PATH` (or `LLAMA_SERVER`), and
+**on-demand residency**: only models declaring at least one pinned instance are
+spawned at boot (each on a free localhost port, awaited for `/health`); the rest
+are loaded lazily by the dispatch path (`supervisor.ensure_running` — spawn-locked
+so concurrent dispatches never double-spawn) and unloaded again when the sidecar
+evicts their last context (`supervisor.unload` — the spec stays registered).
+Each spawned model's `endpoint` is rewritten to
 `http://127.0.0.1:<port>/v1/chat/completions`, so every classifier, dispatch
 target, and backend points at the owned server. The supervisor supervises each
 child for the life of the process — logging its output and restarting it with
-capped backoff on an unexpected exit. In `--mock` mode supervision is skipped:
-canned dispatch needs no real model.
+capped backoff on an unexpected exit, and probing `/health` post-boot to
+kill+restart a server that stops answering. In `--mock` mode supervision is
+skipped: canned dispatch needs no real model.
 
 The llama.cpp router mode is never used. Coral Router talks to each spawned
 server directly, and each server loads its model's weights exactly once and
@@ -591,7 +602,7 @@ JSON body and the query string (body wins), merged in `server/handler.rs`,
 preserved through `normalize`, and overlaid onto the dispatch target in
 `server/dispatch.rs`.
 
-**Public `/instances` API.** `InstancePool` (`instances.rs`) is the router's
+**Public `/instances` API.** `InstancePool` (`instances/pool.rs`) is the router's
 aggregate facade over every managed server. It is served at Coral Router's own
 address (`server/instances_api.rs`) as the single sidecar entry point —
 `GET/POST /instances`, `DELETE /instances/:name`, pin/unpin, and the snapshot
