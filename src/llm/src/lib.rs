@@ -35,4 +35,4 @@ pub use embeddings::{
 };
 pub use error::EmbedError;
 pub use http_class::{classify_http_status, FailureClass, HttpClass};
-pub use parse::{parse_json_response, parse_typed, strip_json_fence, JsonParseError};
+pub use parse::{parse_json_response, parse_typed, repair_json, strip_json_fence, JsonParseError};

@@ -939,4 +939,55 @@ impl Describable for ClassifierStage {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Small classifiers (e.g. lfm2.5-350m) intermittently emit malformed
+    /// JSON. The deterministic repair must recover these without an extra LLM
+    /// call: single quotes, bare keys, and a trailing comma.
+    #[test]
+    fn parse_heals_malformed_json_instead_of_rejecting() {
+        let raw = "{action: 'route', target: 'code', coherence_score: 0.9, safety_score: 1, \
+                    complexity: 7, intent: 'code', reason: 'needs the big model',}";
+        let (out, ok) = parse_classifier_response(raw, "local").expect("must self-heal");
+        assert!(!ok, "a repaired parse must be flagged as recovered, not pristine");
+        assert_eq!(out.action, "route");
+        assert_eq!(out.target.as_deref(), Some("code"));
+        assert_eq!(out.coherence_score, 0.9);
+        assert_eq!(out.complexity, Some(7));
+    }
+
+    /// Truncated responses (missing closing brace / string) are the common
+    /// small-model failure; the repair must close the dangling containers.
+    #[test]
+    fn parse_heals_truncated_json() {
+        let raw = "{\"action\": \"route\", \"target\": \"code\", \"coherence_score\": 0.85, \
+                    \"safety_score\": 1";
+        let (out, ok) = parse_classifier_response(raw, "local").expect("must heal truncation");
+        assert!(!ok);
+        assert_eq!(out.action, "route");
+        assert_eq!(out.coherence_score, 0.85);
+    }
+
+    /// Pristine JSON stays on the fast path (ok == true), untouched by repair.
+    #[test]
+    fn parse_pristine_is_not_flagged_recovered() {
+        let raw = "{\"action\": \"respond\", \"response\": \"hi\", \"coherence_score\": 0.99, \
+                    \"safety_score\": 1.0, \"complexity\": 2, \"reason\": \"trivial\"}";
+        let (out, ok) = parse_classifier_response(raw, "local").expect("must parse");
+        assert!(ok, "pristine JSON must not be flagged as recovered");
+        assert_eq!(out.action, "respond");
+        assert_eq!(out.response.as_deref(), Some("hi"));
+    }
+
+    /// Garbage that cannot be repaired still fails closed (the `Reject`
+    /// policy), never producing a fabricated decision.
+    #[test]
+    fn parse_garbage_still_fails() {
+        let err = parse_classifier_response("llama llama llama", "local").unwrap_err();
+        assert!(err.contains("invalid JSON"));
+    }
+}
+
 impl_component!(ClassifierStage);

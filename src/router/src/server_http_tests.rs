@@ -854,6 +854,53 @@ async fn never_responding_upstream_times_out() {
     );
 }
 
+/// A route referencing a pipeline that was never built (the misconfigured
+/// classifier case — boot logs `built=0`) must fail the request with a
+/// legible error, not the canned success fallback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_pipeline_returns_error_not_canned_success() {
+    let config = make_config(
+        "http://upstream.test:8080/v1/chat/completions",
+        false,
+        false,
+        500,
+        500,
+    );
+    // Simulate a boot where the `default` pipeline failed to build: the
+    // route still references it, but the pipelines map is empty.
+    let pipelines = Arc::new(std::collections::HashMap::new());
+    let deps = test_deps_with_ledger(pipelines, &config, None, None, None);
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let handle = tokio::spawn(async move {
+        if let Err(e) = serve_http(listener, deps, None).await {
+            tracing::error!(target: "router.test", error = %e, "test server failed");
+        }
+    });
+    let server = TestServer { addr, handle };
+
+    let body = json!({
+        "model": "fast",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    let response = post_chat(&server.base_url(), body, 5000)
+        .await
+        .expect("request must not hang");
+    assert_eq!(response.status(), 200);
+    let text = response.text().await.expect("read body");
+    assert!(
+        text.contains("ERROR"),
+        "expected a legible error for the unbuilt pipeline, got: {text}"
+    );
+    assert!(
+        !text.contains("pipeline completed successfully"),
+        "must not claim success when no pipeline is built, got: {text}"
+    );
+}
+
 // -- Scenario 7a: filter_thinking - buffered strip ------------------------
 
 /// Spawn an in-process mock upstream that answers every request via `respond`.

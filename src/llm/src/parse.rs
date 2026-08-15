@@ -92,17 +92,293 @@ pub fn extract_first_json_value(raw: &str) -> Option<Value> {
     None
 }
 
+/// The last significant (non-whitespace) character of a partially-built string.
+fn prev_significant(out: &str) -> Option<char> {
+    out.chars().rev().find(|c| !c.is_whitespace())
+}
+
+/// Lexical healing pass: produce a repaired copy fixing the malformations
+/// small LLMs emit most often. String contents are copied verbatim (with
+/// single-quote conversion and inner-quote escaping); every transformation
+/// happens outside string literals, so legitimate `{`, `,`, `/` etc. inside
+/// values are never touched.
+fn heal_lexically(raw: &str) -> String {
+    let chars: Vec<char> = raw.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(n);
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut i = 0usize;
+
+    while i < n {
+        let c = chars[i];
+
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        match c {
+            '"' => {
+                in_string = true;
+                out.push('"');
+                i += 1;
+            }
+            '\'' => {
+                // Single-quoted string -> double-quoted, escaping inner quotes
+                // and unescaping `\'` so the value is preserved verbatim.
+                in_string = true;
+                out.push('"');
+                i += 1;
+                let mut sq_escaped = false;
+                let mut closed = false;
+                while i < n {
+                    let ch = chars[i];
+                    if sq_escaped {
+                        if ch == '\'' {
+                            out.push('\'');
+                        } else {
+                            out.push('\\');
+                            out.push(ch);
+                        }
+                        sq_escaped = false;
+                    } else if ch == '\\' {
+                        sq_escaped = true;
+                    } else if ch == '\'' {
+                        out.push('"');
+                        closed = true;
+                        in_string = false;
+                        i += 1;
+                        break;
+                    } else if ch == '"' {
+                        out.push('\\');
+                        out.push('"');
+                    } else {
+                        out.push(ch);
+                    }
+                    i += 1;
+                }
+                if !closed {
+                    // Unterminated single-quoted string: close it.
+                    out.push('"');
+                    in_string = false;
+                }
+            }
+            '/' => {
+                // Strip `//` line comments and `/* */` block comments.
+                if i + 1 < n && chars[i + 1] == '/' {
+                    i += 2;
+                    while i < n && chars[i] != '\n' {
+                        i += 1;
+                    }
+                } else if i + 1 < n && chars[i + 1] == '*' {
+                    i += 2;
+                    while i + 1 < n && !(chars[i] == '*' && chars[i + 1] == '/') {
+                        i += 1;
+                    }
+                    i = (i + 2).min(n);
+                } else {
+                    // Lone `/` outside a string: never valid JSON, drop it.
+                    i += 1;
+                }
+            }
+            ',' => {
+                // Trailing comma before `}` / `]`: drop it.
+                let mut j = i + 1;
+                while j < n && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                if j < n && matches!(chars[j], '}' | ']') {
+                    i += 1;
+                } else {
+                    out.push(',');
+                    i += 1;
+                }
+            }
+            '-' => {
+                // Negative non-JSON literals: `-Infinity`/`-NaN` -> `null`.
+                let mut j = i + 1;
+                while j < n && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                let word: String = chars[i + 1..j].iter().collect();
+                if matches!(word.as_str(), "Infinity" | "NaN") {
+                    out.push_str("null");
+                    i = j;
+                } else {
+                    out.push('-');
+                    i += 1;
+                }
+            }
+            c if c.is_ascii_alphabetic() || c == '_' || c == '$' => {
+                let start = i;
+                while i < n
+                    && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '$')
+                {
+                    i += 1;
+                }
+                let ident: String = chars[start..i].iter().collect();
+                // A bare key sits right after `{` or `,` and is followed by
+                // `:` (or the common `=` stand-in).
+                if matches!(prev_significant(&out), Some('{' | ',')) {
+                    let mut j = i;
+                    while j < n && chars[j].is_whitespace() {
+                        j += 1;
+                    }
+                    if j < n && matches!(chars[j], ':' | '=') {
+                        out.push('"');
+                        out.push_str(&ident);
+                        out.push('"');
+                        i = j;
+                        continue;
+                    }
+                }
+                // Otherwise an unquoted literal value: normalize the
+                // non-JSON spellings and quote unknown bare words (route
+                // names, actions, ...) as strings.
+                match ident.as_str() {
+                    "True" | "true" => out.push_str("true"),
+                    "False" | "false" => out.push_str("false"),
+                    "None" | "null" | "undefined" | "NaN" | "Infinity" => out.push_str("null"),
+                    _ => {
+                        out.push('"');
+                        out.push_str(&ident);
+                        out.push('"');
+                    }
+                }
+            }
+            '=' => {
+                // `=` as a key-value separator: `"key" = value` -> `:`.
+                if prev_significant(&out) == Some('"') {
+                    out.push(':');
+                } else {
+                    out.push('=');
+                }
+                i += 1;
+            }
+            ';' => {
+                // Semicolons are never valid JSON; drop them.
+                i += 1;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+
+    out
+}
+
+/// Close any open string literals and containers left dangling by a truncated
+/// response, producing a well-formed document. Extra/mismatched closers are
+/// dropped so a stray `}}` cannot poison an otherwise-truncated value.
+fn close_open_containers(healed: &str) -> String {
+    let mut out = String::with_capacity(healed.len() + 4);
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for c in healed.chars() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '{' | '[' => {
+                stack.push(c);
+                out.push(c);
+            }
+            '}' | ']' => {
+                let matching = stack.last().is_some_and(|open| {
+                    (*open == '{' && c == '}') || (*open == '[' && c == ']')
+                });
+                if matching {
+                    stack.pop();
+                    out.push(c);
+                }
+                // Mismatched or extra closer: dropped.
+            }
+            _ => {
+                out.push(c);
+            }
+        }
+    }
+
+    if in_string {
+        out.push('"');
+    }
+    while let Some(open) = stack.pop() {
+        out.push(if open == '[' { ']' } else { '}' });
+    }
+
+    out
+}
+
+/// Deterministically heal common malformed JSON that small LLMs emit — the
+/// self-healing step. Fixes trailing commas, unquoted keys, single-quoted
+/// strings, comments, non-JSON literals (`undefined`, `None`, `NaN`,
+/// `Infinity`) and truncation (a dangling string/brace/bracket), all with
+/// string-awareness so legitimate contents are never altered.
+///
+/// Conservative by construction: it only repairs structure outside string
+/// values, verifies the result parses, and returns `None` when nothing heals
+/// to valid JSON. Purely deterministic string manipulation — no LLM
+/// round-trip — so it never spends context-window budget the way a
+/// corrective-prompt retry would. Callers should try a direct parse first and
+/// treat a successful repair as "recovered" (not pristine) output.
+pub fn repair_json(raw: &str) -> Option<String> {
+    let start = raw.find(['{', '['])?;
+    let healed = heal_lexically(&raw[start..]);
+    if let Some(v) = extract_first_json_value(&healed) {
+        return Some(v.to_string());
+    }
+    let closed = close_open_containers(&healed);
+    serde_json::from_str::<Value>(&closed)
+        .is_ok()
+        .then_some(closed)
+}
+
 /// Tolerant parse of an LLM response into JSON.
 ///
 /// Pipeline: strip a surrounding ` ```json ` fence, try a direct parse of the
-/// cleaned text, then fall back to extracting the first balanced JSON value.
-/// Returns [`JsonParseError::NoJson`] when nothing parses.
+/// cleaned text, then fall back to extracting the first balanced JSON value,
+/// then — last resort — deterministically repair common malformations
+/// ([`repair_json`]) and re-parse. Returns [`JsonParseError::NoJson`] when
+/// nothing parses.
 pub fn parse_json_response(text: &str) -> Result<Value, JsonParseError> {
     let cleaned = strip_json_fence(text);
     if let Ok(v) = serde_json::from_str::<Value>(cleaned) {
         return Ok(v);
     }
-    extract_first_json_value(cleaned).ok_or(JsonParseError::NoJson)
+    if let Some(v) = extract_first_json_value(cleaned) {
+        return Ok(v);
+    }
+    if let Some(repaired) = repair_json(cleaned) {
+        if let Ok(v) = serde_json::from_str::<Value>(&repaired) {
+            return Ok(v);
+        }
+    }
+    Err(JsonParseError::NoJson)
 }
 
 /// Tolerant parse + coerce into a typed value.
@@ -306,5 +582,119 @@ mod tests {
         let err = parse_typed::<Typed>(r#"{"name":"x","score":"oops"}"#, &empty_defaults(), |_| {})
             .unwrap_err();
         assert!(matches!(err, JsonParseError::Serde(_)));
+    }
+
+    // -- Deterministic self-healing (repair_json) ---------------------------
+
+    fn repaired(raw: &str) -> Value {
+        serde_json::from_str(&repair_json(raw).expect("must repair")).expect("repaired output parses")
+    }
+
+    #[test]
+    fn repair_heals_trailing_commas() {
+        assert_eq!(
+            repaired(r#"{"a": 1, "b": [1, 2,],}"#),
+            serde_json::json!({"a": 1, "b": [1, 2]})
+        );
+    }
+
+    #[test]
+    fn repair_quotes_bare_keys_and_values() {
+        assert_eq!(
+            repaired(r#"{action: route, target: code}"#),
+            serde_json::json!({"action": "route", "target": "code"})
+        );
+    }
+
+    #[test]
+    fn repair_converts_single_quotes() {
+        assert_eq!(
+            repaired("{'a': 'it\\'s', 'b': \"ok\"}"),
+            serde_json::json!({"a": "it's", "b": "ok"})
+        );
+    }
+
+    #[test]
+    fn repair_strips_comments() {
+        assert_eq!(
+            repaired("{\"a\": 1, // note\n \"b\": 2 /* inline */}"),
+            serde_json::json!({"a": 1, "b": 2})
+        );
+    }
+
+    #[test]
+    fn repair_normalizes_non_json_literals() {
+        assert_eq!(
+            repaired(
+                r#"{"a": undefined, "b": NaN, "c": Infinity, "d": -Infinity, "e": None, "f": true}"#
+            ),
+            serde_json::json!({
+                "a": null, "b": null, "c": null, "d": null, "e": null, "f": true
+            })
+        );
+    }
+
+    #[test]
+    fn repair_closes_truncated_object() {
+        assert_eq!(
+            repaired(r#"{"a": 1, "b": 2"#),
+            serde_json::json!({"a": 1, "b": 2})
+        );
+    }
+
+    #[test]
+    fn repair_closes_truncated_array_and_string() {
+        assert_eq!(
+            repaired(r#"{"a": "hello"#),
+            serde_json::json!({"a": "hello"})
+        );
+        assert_eq!(
+            repaired(r#"{"a": [1, 2"#),
+            serde_json::json!({"a": [1, 2]})
+        );
+    }
+
+    #[test]
+    fn repair_handles_mismatched_extra_closers() {
+        assert_eq!(
+            repaired(r#"{"a": [1, 2}}"#),
+            serde_json::json!({"a": [1, 2]})
+        );
+    }
+
+    #[test]
+    fn repair_extracts_from_leading_prose() {
+        assert_eq!(repaired("Sure! {a: 1}"), serde_json::json!({"a": 1}));
+    }
+
+    #[test]
+    fn repair_preserves_braces_inside_strings() {
+        assert_eq!(
+            repaired(r#"{"a": "text { with brace", "b": "}"}"#),
+            serde_json::json!({"a": "text { with brace", "b": "}"})
+        );
+    }
+
+    #[test]
+    fn repair_returns_none_for_garbage() {
+        assert_eq!(repair_json("not json"), None);
+        assert_eq!(repair_json(""), None);
+        assert_eq!(repair_json("just words"), None);
+    }
+
+    #[test]
+    fn parse_json_response_self_heals() {
+        let v = parse_json_response(r#"{"a": 1, "b": [2, 3,],}"#).unwrap();
+        assert_eq!(v, serde_json::json!({"a": 1, "b": [2, 3]}));
+    }
+
+    #[test]
+    fn parse_json_response_repaired_is_recovered_not_pristine() {
+        // The pristine fast path must be untouched: valid JSON stays as-is and
+        // is not forced through the repair pipeline.
+        assert_eq!(
+            parse_json_response(r#"{"a": 1}"#).unwrap(),
+            serde_json::json!({"a": 1})
+        );
     }
 }

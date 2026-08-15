@@ -986,14 +986,40 @@ fn resolve_pipeline(
         last_result = Some(result);
     }
 
-    let mut final_result = last_result.unwrap_or(crate::pipeline::PipelineResult {
-        decisions: vec![],
-        final_response: None,
-        rejected: false,
-        reject_reason: None,
-        routing_target: None,
-        classifier_response: None,
-    });
+    let mut final_result = match last_result {
+        Some(result) => result,
+        None => {
+            // No requested pipeline is built (boot logged the drop). In a
+            // healthy boot every route's pipeline exists; an empty build
+            // means a config error — most commonly a `classifier_model` that
+            // does not resolve to a configured model. Surface a legible
+            // error rather than a canned success.
+            if pipeline_names.is_empty() {
+                crate::pipeline::PipelineResult {
+                    decisions: vec![],
+                    final_response: None,
+                    rejected: false,
+                    reject_reason: None,
+                    routing_target: None,
+                    classifier_response: None,
+                }
+            } else {
+                return crate::pipeline::PipelineResult {
+                    decisions: all_decisions,
+                    final_response: None,
+                    rejected: true,
+                    reject_reason: Some(format!(
+                        "none of the requested pipelines are built (missing: {}); \
+                         check the config — a classifier model that does not resolve \
+                         to a configured model prevents pipeline build",
+                        pipeline_names.join(", ")
+                    )),
+                    routing_target: None,
+                    classifier_response: None,
+                };
+            }
+        }
+    };
     final_result.decisions = all_decisions;
     final_result
 }
