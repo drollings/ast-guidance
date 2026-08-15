@@ -555,9 +555,28 @@ pub fn list_gguf_entries(gguf_dir: &Path) -> Vec<GgufEntry> {
     entries
 }
 
+/// Snapshot resolution for the cache's directory-mtime tokens (`parent_mtime`,
+/// `newest_mtime`), in units of the epoch (microseconds).
+///
+/// The mtime is stored as an integer-valued `f64` count of microseconds.
+/// Integer-valued f64s ≤ 2^53 (≈ 285 years in microseconds) round-trip through
+/// `serde_json` losslessly, whereas fractional-second f64s at ~1.7e9 lose up to
+/// one ULP (~238 ns) in serde_json's parser — which made `needs_rescan` see a
+/// spurious change on a freshly written cache. Writer and reader must derive
+/// the token through this same function so they agree on the snapshot value.
+pub const MTIME_SNAPSHOT_RES: f64 = 1e6;
+
+/// Quantize a Unix-second mtime (fractional) to the integer-valued snapshot
+/// token both `write_gguf_cache` and `needs_rescan` compare against.
+fn mtime_snapshot(secs: f64) -> f64 {
+    (secs * MTIME_SNAPSHOT_RES).round()
+}
+
 /// Build the version-2 cache data from a full entry list.
 fn cache_data_from_entries(entries: Vec<GgufEntry>) -> GgufCache {
-    let newest_mtime = entries.iter().fold(0.0f64, |acc, e| acc.max(e.mtime));
+    let newest_mtime = entries
+        .iter()
+        .fold(0.0f64, |acc, e| acc.max(mtime_snapshot(e.mtime)));
     let models: HashMap<String, CacheEntry> = entries
         .into_iter()
         .map(|e| {
@@ -603,7 +622,7 @@ pub fn needs_rescan(gguf_dir: &Path) -> bool {
     if data.get("version").and_then(Value::as_u64) != Some(2) {
         return true;
     }
-    let current = file_mtime(gguf_dir);
+    let current = mtime_snapshot(file_mtime(gguf_dir));
     if let Some(parent) = data.get("parent_mtime").and_then(Value::as_f64) {
         if parent > 0.0 {
             return current > parent;
@@ -642,7 +661,7 @@ pub fn write_gguf_cache(gguf_dir: &Path, cache: &mut GgufCache) {
                 return;
             }
         }
-        let now = file_mtime(gguf_dir);
+        let now = mtime_snapshot(file_mtime(gguf_dir));
         cache.parent_mtime = now;
         if now <= last {
             return;
@@ -869,5 +888,35 @@ mod tests {
             .expect("default entry keyed by name");
         assert!(entry.path.ends_with("latest.gguf"));
         assert!(!needs_rescan(dir.path()), "fresh cache requires no rescan");
+    }
+
+    #[test]
+    fn sync_cache_remains_fresh_across_rewrite_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = dir.path().join("abiray/test");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        write_gguf(&model_dir.join("latest.gguf"), "llama", 15);
+
+        for _ in 0..5 {
+            sync_cache(dir.path());
+            assert!(!needs_rescan(dir.path()), "fresh cache requires no rescan");
+        }
+    }
+
+    #[test]
+    fn mtime_snapshot_round_trips_through_json() {
+        // A fractional-second mtime at ~1.7e9 loses up to one ULP (~238 ns) in
+        // serde_json's f64 parser (1786778176.386162519 round-trips as
+        // ...3861623), so the raw value itself cannot be persisted losslessly.
+        // The integer-valued microsecond snapshot must be exactly representable
+        // and survive the JSON round-trip bit-for-bit, which is what keeps the
+        // `parent_mtime` token stable across a cache rewrite.
+        let raw = 1786778176.386162519f64;
+        let snap = mtime_snapshot(raw);
+        assert_eq!(snap.fract(), 0.0, "snapshot must be an integer-valued f64");
+        assert_eq!(snap, 1786778176386163.0);
+        let text = serde_json::to_string(&snap).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed.as_f64(), Some(snap));
     }
 }
