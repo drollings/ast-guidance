@@ -1013,6 +1013,17 @@ pub struct SidecarConfig {
     /// restarted.
     #[serde(default = "default_sidecar_liveness_failures")]
     pub liveness_failures_before_restart: u32,
+    /// Consecutive crashes (spawn failures or boot-time child exits) after
+    /// which the supervisor stops restarting a model's `llama-server` and
+    /// marks it **failed** (containment, per the fluent-concurrency
+    /// supervision contract — no endless crash loop). `ensure_running` then
+    /// returns a terminal error until the router restarts or the model is
+    /// unloaded, at which point a fresh (bounded) load attempt is allowed.
+    /// The count resets the moment a server answers `/health`, so a crash
+    /// after a healthy period is a fresh failure. `0` disables the limit
+    /// (unbounded restart with rising backoff).
+    #[serde(default = "default_sidecar_max_restarts")]
+    pub max_restarts: u32,
 }
 
 impl Default for SidecarConfig {
@@ -1028,6 +1039,7 @@ impl Default for SidecarConfig {
             api_key_env: None,
             liveness_poll_interval_s: default_sidecar_liveness_poll_s(),
             liveness_failures_before_restart: default_sidecar_liveness_failures(),
+            max_restarts: default_sidecar_max_restarts(),
         }
     }
 }
@@ -1050,6 +1062,10 @@ const fn default_sidecar_liveness_poll_s() -> u64 {
 
 const fn default_sidecar_liveness_failures() -> u32 {
     3
+}
+
+const fn default_sidecar_max_restarts() -> u32 {
+    5
 }
 
 /// Detect the device VRAM total (bytes) from the ROCm sysfs interface. Returns

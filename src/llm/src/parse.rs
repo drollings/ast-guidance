@@ -97,6 +97,25 @@ fn prev_significant(out: &str) -> Option<char> {
     out.chars().rev().find(|c| !c.is_whitespace())
 }
 
+/// Append `c` to `out` in its JSON-escaped form when it is a raw control
+/// character (serde_json rejects unescaped control chars, and small models
+/// routinely emit literal newlines/tabs inside string values); otherwise
+/// append it verbatim.
+fn push_escaped_char(out: &mut String, c: char) {
+    match c {
+        '\n' => out.push_str("\\n"),
+        '\t' => out.push_str("\\t"),
+        '\r' => out.push_str("\\r"),
+        '\u{0008}' => out.push_str("\\b"),
+        '\u{000C}' => out.push_str("\\f"),
+        c if c.is_control() => {
+            use std::fmt::Write as _;
+            let _ = write!(out, "\\u{:04x}", c as u32);
+        }
+        c => out.push(c),
+    }
+}
+
 /// Lexical healing pass: produce a repaired copy fixing the malformations
 /// small LLMs emit most often. String contents are copied verbatim (with
 /// single-quote conversion and inner-quote escaping); every transformation
@@ -114,13 +133,17 @@ fn heal_lexically(raw: &str) -> String {
         let c = chars[i];
 
         if in_string {
-            out.push(c);
             if escaped {
+                out.push(c);
                 escaped = false;
             } else if c == '\\' {
+                out.push('\\');
                 escaped = true;
             } else if c == '"' {
+                out.push('"');
                 in_string = false;
+            } else {
+                push_escaped_char(&mut out, c);
             }
             i += 1;
             continue;
@@ -162,12 +185,17 @@ fn heal_lexically(raw: &str) -> String {
                         out.push('\\');
                         out.push('"');
                     } else {
-                        out.push(ch);
+                        push_escaped_char(&mut out, ch);
                     }
                     i += 1;
                 }
                 if !closed {
-                    // Unterminated single-quoted string: close it.
+                    // Unterminated single-quoted string: close it. If the
+                    // string ended on a dangling `\`, escape it first so the
+                    // closing quote is not swallowed.
+                    if sq_escaped {
+                        out.push('\\');
+                    }
                     out.push('"');
                     in_string = false;
                 }
@@ -289,20 +317,24 @@ fn close_open_containers(healed: &str) -> String {
 
     for c in healed.chars() {
         if in_string {
-            out.push(c);
             if escaped {
+                out.push(c);
                 escaped = false;
             } else if c == '\\' {
+                out.push('\\');
                 escaped = true;
             } else if c == '"' {
+                out.push('"');
                 in_string = false;
+            } else {
+                push_escaped_char(&mut out, c);
             }
             continue;
         }
         match c {
             '"' => {
                 in_string = true;
-                out.push(c);
+                out.push('"');
             }
             '{' | '[' => {
                 stack.push(c);
@@ -325,6 +357,10 @@ fn close_open_containers(healed: &str) -> String {
     }
 
     if in_string {
+        // A dangling `\` would swallow the closing quote; escape it first.
+        if escaped {
+            out.push('\\');
+        }
         out.push('"');
     }
     while let Some(open) = stack.pop() {
@@ -332,6 +368,51 @@ fn close_open_containers(healed: &str) -> String {
     }
 
     out
+}
+
+/// Truncation repair for a response cut off mid-member. Collects the
+/// top-level comma positions, then (rightmost first) drops the dangling tail
+/// after each comma, closes the remaining containers, and returns the first
+/// candidate that parses. Handles `{"a": 1, "b":}`-style truncation that
+/// closing containers alone cannot fix. Returns `None` when no truncation
+/// point heals.
+fn drop_incomplete_tail(healed: &str) -> Option<String> {
+    let chars: Vec<char> = healed.chars().collect();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut commas: Vec<usize> = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => depth = (depth - 1).max(0),
+            ',' if depth == 1 => commas.push(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    for pos in commas.into_iter().rev() {
+        let candidate: String = chars[..pos].iter().collect();
+        let closed = close_open_containers(&candidate);
+        if serde_json::from_str::<Value>(&closed).is_ok() {
+            return Some(closed);
+        }
+    }
+    None
 }
 
 /// Deterministically heal common malformed JSON that small LLMs emit — the
@@ -353,9 +434,11 @@ pub fn repair_json(raw: &str) -> Option<String> {
         return Some(v.to_string());
     }
     let closed = close_open_containers(&healed);
-    serde_json::from_str::<Value>(&closed)
-        .is_ok()
-        .then_some(closed)
+    if serde_json::from_str::<Value>(&closed).is_ok() {
+        return Some(closed);
+    }
+    // Truncated mid-member: drop the dangling tail at a top-level comma.
+    drop_incomplete_tail(&healed)
 }
 
 /// Tolerant parse of an LLM response into JSON.
@@ -659,6 +742,49 @@ mod tests {
         assert_eq!(
             repaired(r#"{"a": [1, 2}}"#),
             serde_json::json!({"a": [1, 2]})
+        );
+    }
+
+    #[test]
+    fn repair_escapes_raw_control_chars_in_strings() {
+        // Literal newline and tab inside a string value (very common from
+        // small models); the raw chars must be escaped to parse.
+        assert_eq!(
+            repaired("{\"response\": \"line one\nline two\"}"),
+            serde_json::json!({"response": "line one\nline two"})
+        );
+        assert_eq!(
+            repaired("{\"response\": \"tab\there\"}"),
+            serde_json::json!({"response": "tab\there"})
+        );
+        // And inside single-quoted strings.
+        assert_eq!(
+            repaired("{'response': 'a\nb'}"),
+            serde_json::json!({"response": "a\nb"})
+        );
+    }
+
+    #[test]
+    fn repair_handles_dangling_backslash() {
+        // A string truncated right after a backslash: the trailing `\` must be
+        // escaped so the closing quote terminates the string.
+        assert_eq!(
+            repaired(r#"{"a": "trailing\"#),
+            serde_json::json!({"a": "trailing\\"})
+        );
+    }
+
+    #[test]
+    fn repair_drops_incomplete_tail_member() {
+        // Truncated mid-member: `"b":` has no value. Dropping the dangling
+        // tail yields a valid (if lossy) object.
+        assert_eq!(
+            repaired(r#"{"a": 1, "b":}"#),
+            serde_json::json!({"a": 1})
+        );
+        assert_eq!(
+            repaired(r#"{"a": 1, "b": 2, "c": "#),
+            serde_json::json!({"a": 1, "b": 2})
         );
     }
 

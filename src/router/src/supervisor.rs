@@ -239,8 +239,21 @@ struct ServerInner {
     spawn_lock: tokio::sync::Mutex<()>,
     /// Abort handle for the supervision task.
     supervisor: Mutex<Option<tokio::task::AbortHandle>>,
-    /// Consecutive spawn failures (drives restart backoff).
+    /// Consecutive failures since the server last answered `/health` (spawn
+    /// failures and boot-time child exits alike). Drives restart backoff and
+    /// the restart limit. Reset to 0 only on a successful `/health` probe or
+    /// `wait_healthy` — never on spawn, so a process that starts but dies
+    /// before becoming healthy keeps escalating.
     spawn_failures: AtomicU32,
+    /// Consecutive-failure cap: past this many crashes the supervision task
+    /// stops restarting and marks the server `failed` (containment). `0`
+    /// disables the limit (unbounded restart with rising backoff).
+    max_restarts: u32,
+    /// Set when `spawn_failures` reaches `max_restarts`: the server is
+    /// contained. `ensure_running`/`start` fail fast with a terminal error and
+    /// the supervision task has stopped. Cleared by `stop`/`unload` (a later
+    /// load attempt starts from a fresh budget) and by `wait_healthy` success.
+    failed: AtomicBool,
     /// How often the supervision task probes a running server's `/health`.
     liveness_poll: Duration,
     /// Consecutive failed `/health` probes before a hung server is killed and
@@ -253,6 +266,7 @@ impl ManagedServer {
         spec: LlamaServerSpec,
         liveness_poll: Duration,
         liveness_failures_before_restart: u32,
+        max_restarts: u32,
     ) -> Self {
         let base_url = format!("http://127.0.0.1:{}", spec.port);
         Self {
@@ -265,6 +279,8 @@ impl ManagedServer {
                 spawn_lock: tokio::sync::Mutex::new(()),
                 supervisor: Mutex::new(None),
                 spawn_failures: AtomicU32::new(0),
+                max_restarts,
+                failed: AtomicBool::new(false),
                 liveness_poll,
                 liveness_failures_before_restart,
             }),
@@ -294,6 +310,9 @@ impl ManagedServer {
     /// Spawn the child and wait for it to answer `/health`. Called at boot for
     /// boot models; the supervision task handles later exits and restarts.
     pub async fn start(self: &Arc<Self>, bin: &Path) -> Result<(), String> {
+        if self.contained() {
+            return Err(self.terminal_failure());
+        }
         self.spawn_child(bin);
         self.wait_healthy().await
     }
@@ -303,6 +322,9 @@ impl ManagedServer {
     /// spawn lock prevents a lazy model from being double-spawned. Called by
     /// the router when a dispatch targets a managed model that is not loaded.
     pub async fn ensure_running(self: &Arc<Self>, bin: &Path) -> Result<(), String> {
+        if self.contained() {
+            return Err(self.terminal_failure());
+        }
         if self.inner.running.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -341,8 +363,13 @@ impl ManagedServer {
     /// Unload the server (on-demand teardown): kill the child and stop the
     /// supervision task so it does not restart. The spec stays registered, so
     /// a later [`Self::ensure_running`] re-spawns the model. Used by the
-    /// sidecar when a model's weights must be freed for VRAM.
+    /// sidecar when a model's weights must be freed for VRAM. Also clears any
+    /// containment state: a later load attempt starts from a fresh (bounded)
+    /// crash budget, so an operator's fix to the weights/config takes effect
+    /// on the next on-demand dispatch.
     pub async fn unload(self: &Arc<Self>) {
+        self.inner.failed.store(false, Ordering::Relaxed);
+        self.inner.spawn_failures.store(0, Ordering::Relaxed);
         self.inner.running.store(false, Ordering::Relaxed);
         if let Some(handle) = self.inner.supervisor.lock().ok().and_then(|mut g| g.take()) {
             handle.abort();
@@ -388,7 +415,16 @@ impl ManagedServer {
             })
             .await
         {
-            PollResult::Ready => Ok(()),
+            PollResult::Ready => {
+                // A server that answered `/health` has earned a fresh restart
+                // budget: reset the consecutive-failure count (which drives
+                // backoff and the restart limit) and clear any containment
+                // flag. The reset lives here — on health, never on spawn — so
+                // a process that dies before becoming healthy keeps counting.
+                self.inner.spawn_failures.store(0, Ordering::Relaxed);
+                self.inner.failed.store(false, Ordering::Relaxed);
+                Ok(())
+            }
             PollResult::Exhausted { .. } => Err(format!(
                 "llama-server for model '{}' did not become healthy on {} within {}s",
                 self.spec.model_key,
@@ -396,6 +432,33 @@ impl ManagedServer {
                 HEALTH_TIMEOUT.as_secs(),
             )),
         }
+    }
+
+    /// Whether the server is contained: `spawn_failures` has reached
+    /// `max_restarts` (or a limit is configured and already met).
+    fn contained(&self) -> bool {
+        let limit = self.inner.max_restarts;
+        limit > 0 && self.inner.spawn_failures.load(Ordering::Relaxed) >= limit
+    }
+
+    /// Mark the server contained: `failed` (load paths fail fast) and no
+    /// longer `running`. Called by the supervision task exactly once when the
+    /// crash budget is exhausted.
+    fn mark_contained(&self) {
+        self.inner.failed.store(true, Ordering::Relaxed);
+        self.inner.running.store(false, Ordering::Relaxed);
+    }
+
+    /// The terminal error a contained server returns from every load path,
+    /// naming the model and what the operator should do. This is the single
+    /// containment message — never duplicated at call sites.
+    fn terminal_failure(&self) -> String {
+        format!(
+            "model '{}' failed to start after {} consecutive crash-restarts (supervisor containment); \
+             fix its weights/endpoint config or restart the router",
+            self.spec.model_key,
+            self.inner.spawn_failures.load(Ordering::Relaxed),
+        )
     }
 
     /// Probe the server's `/health` endpoint once; `true` iff it answers 2xx.
@@ -440,7 +503,12 @@ impl ManagedServer {
                     };
                     *guard = Some(child);
                 }
-                self.inner.spawn_failures.store(0, Ordering::Relaxed);
+                // NOTE: `spawn_failures` is deliberately NOT reset here. An
+                // OS-level spawn that produces a process which dies before
+                // answering `/health` is a failure, not a success; the count
+                // only resets on a successful health check (see
+                // `wait_healthy`/`supervise`). Resetting here caused the
+                // crash-loop bug: every restart looked like the first.
                 // Log the server's output (best-effort, detached).
                 if let Some(out) = stdout {
                     let tag = self.spec.model_key.clone();
@@ -513,11 +581,23 @@ impl ManagedServer {
                 guard.take()
             };
             let Some(mut child) = child else {
-                // No child to watch (spawn failed); retry with backoff.
+                // No child to watch (spawn failed); retry with backoff unless
+                // the crash budget is exhausted.
                 if self.inner.stopping.load(Ordering::Relaxed) {
                     return;
                 }
                 let failures = self.inner.spawn_failures.load(Ordering::Relaxed);
+                if self.contained() {
+                    self.mark_contained();
+                    tracing::error!(
+                        target: "router.supervisor",
+                        model = %self.spec.model_key,
+                        failures = failures,
+                        limit = self.inner.max_restarts,
+                        "llama-server spawn failed too many times - giving up (contained)",
+                    );
+                    return;
+                }
                 tokio::time::sleep(restart_backoff(failures.max(1))).await;
                 self.spawn_child(&bin);
                 continue;
@@ -544,6 +624,11 @@ impl ManagedServer {
                 }
                 if self.probe_health().await {
                     liveness_failures = 0;
+                    // The server answered `/health`: it earned a fresh crash
+                    // budget. The reset must only happen here (and in
+                    // `wait_healthy`) — a process that dies before becoming
+                    // healthy keeps its rising failure count.
+                    self.inner.spawn_failures.store(0, Ordering::Relaxed);
                 } else {
                     liveness_failures += 1;
                     tracing::warn!(
@@ -597,14 +682,30 @@ impl ManagedServer {
                     "llama-server exited unexpectedly - restarting with backoff",
                 );
             }
+            if self.contained() {
+                self.mark_contained();
+                tracing::error!(
+                    target: "router.supervisor",
+                    model = %self.spec.model_key,
+                    base_url = %self.base_url,
+                    failures = failures,
+                    limit = self.inner.max_restarts,
+                    "llama-server failed to start after {failures} consecutive attempts - giving up (contained); fix the model's weights/config or restart the router",
+                );
+                return;
+            }
             tokio::time::sleep(restart_backoff(failures)).await;
             self.spawn_child(&bin);
         }
     }
 
     /// Stop the server: mark stopped, kill the child (the supervision task
-    /// sees `stopping` and exits without restarting).
+    /// sees `stopping` and exits without restarting). Also clears any
+    /// containment state — a router restart (`make router-start`) is the
+    /// documented recovery path for a contained model.
     pub async fn stop(self: &Arc<Self>) {
+        self.inner.failed.store(false, Ordering::Relaxed);
+        self.inner.spawn_failures.store(0, Ordering::Relaxed);
         self.inner.stopping.store(true, Ordering::Relaxed);
         self.inner.running.store(false, Ordering::Relaxed);
         if let Some(handle) = self.inner.supervisor.lock().ok().and_then(|mut g| g.take()) {
@@ -694,7 +795,12 @@ impl LlamaServerSupervisor {
             );
             servers.insert(
                 key.clone(),
-                ManagedServer::with_liveness(spec, liveness_poll, liveness_failures),
+                ManagedServer::with_liveness(
+                    spec,
+                    liveness_poll,
+                    liveness_failures,
+                    config.sidecar.max_restarts,
+                ),
             );
         }
         tracing::info!(
@@ -1043,6 +1149,27 @@ mod tests {
         script
     }
 
+    /// Write a fake `llama-server` script that logs each spawn to `counter` and
+    /// then exits immediately (a crash loop — e.g. a missing weights file).
+    fn write_crashing_llama(counter: &Path) -> PathBuf {
+        let script = counter
+            .parent()
+            .expect("counter parent")
+            .join("fake-llama-crash");
+        let content = format!(
+            "#!/bin/sh\necho spawned >> \"{}\"\nexit 1\n",
+            counter.display()
+        );
+        std::fs::write(&script, content).expect("write crashing fake llama");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake llama");
+        }
+        script
+    }
+
     fn spawn_count(counter: &Path) -> usize {
         std::fs::read_to_string(counter)
             .map(|s| s.lines().count())
@@ -1075,6 +1202,7 @@ mod tests {
             LlamaServerSpec::from_entry("swarm", &managed_entry(), port, None, None, defaults()),
             Duration::from_millis(100),
             3,
+            0,
         ));
         server.spawn_child(&bin);
         let supervise = tokio::spawn(server.clone().supervise(bin));
@@ -1116,6 +1244,7 @@ mod tests {
             LlamaServerSpec::from_entry("swarm", &managed_entry(), port, None, None, defaults()),
             Duration::from_millis(50),
             1,
+            0,
         ));
         server.spawn_child(&bin);
         let supervise = tokio::spawn(server.clone().supervise(bin.clone()));
@@ -1132,5 +1261,47 @@ mod tests {
             "shutdown must never restart the server"
         );
         supervise.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn crash_loop_is_contained_after_max_restarts() {
+        // A llama-server that dies immediately (e.g. a missing weights file)
+        // must NOT restart forever: the failure count rises, the backoff
+        // escalates, and after `max_restarts` crashes the supervision task
+        // gives up and marks the server failed (containment).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let counter = tmp.path().join("spawns");
+        let bin = write_crashing_llama(&counter);
+
+        let server = Arc::new(ManagedServer::with_liveness(
+            LlamaServerSpec::from_entry("swarm", &managed_entry(), 1, None, None, defaults()),
+            Duration::from_millis(50),
+            3,
+            3,
+        ));
+        server.spawn_child(&bin);
+        let supervise = tokio::spawn(server.clone().supervise(bin.clone()));
+
+        // Three spawns (initial + two restarts) exhaust the budget; then the
+        // loop stops. Give the third child time to exit and be contained.
+        wait_for_spawn_count(&counter, 3, Duration::from_secs(30)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            spawn_count(&counter),
+            3,
+            "containment stops the restart loop at max_restarts"
+        );
+        assert!(
+            server.inner.failed.load(Ordering::Relaxed),
+            "server marked failed (contained)"
+        );
+        assert!(!server.is_running(), "contained server is not running");
+        supervise.abort();
+
+        // A load attempt after containment fails fast with the terminal error
+        // instead of spawning again.
+        let err = server.ensure_running(&bin).await.unwrap_err();
+        assert!(err.contains("containment"), "terminal error names containment: {err}");
+        assert_eq!(spawn_count(&counter), 3, "contained server is never re-spawned");
     }
 }

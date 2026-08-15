@@ -301,8 +301,66 @@ pub struct ClassifierStage {
     /// parsed. Injected from `RouterConfig`; the stage never
     /// branches on config fields directly (DIP).
     failure_policy: ClassifierFailurePolicy,
+    /// Where unparseable classifier responses are dumped for review
+    /// (`<dir>/classifier_failures/`). `None` disables the diagnostic dump.
+    /// Threaded from `RouterConfig.logging.log_dir`; failures land in files,
+    /// not in the main log stream or the ledger.
+    failure_dir: Option<std::path::PathBuf>,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
+}
+
+/// Dump a classifier JSON parse failure to `<dir>/classifier_failures/` so
+/// operators (and repair-tuning work) can review exactly what the model
+/// emitted. Each failure is one small JSON file; a write error is logged and
+/// never fails the request. The raw response is kept out of the main log and
+/// the ledger to avoid clutter.
+pub(crate) fn dump_classifier_failure(dir: &std::path::Path, model: &str, error: &str, raw: &str) {
+    let failures_dir = dir.join("classifier_failures");
+    if let Err(e) = std::fs::create_dir_all(&failures_dir) {
+        tracing::warn!(
+            target: "router.pipeline.stage2.classifier",
+            dir = %failures_dir.display(),
+            error = %e,
+            "could not create classifier-failure dump dir",
+        );
+        return;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let model_slug: String = model
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let path = failures_dir.join(format!("{ts}-{nanos:09}-{model_slug}.json"));
+    let body = serde_json::json!({
+        "ts": ts,
+        "model": model,
+        "error": error,
+        "raw_response": raw,
+    });
+    let body = serde_json::to_string_pretty(&body).unwrap_or_default();
+    if let Err(e) = std::fs::write(&path, body) {
+        tracing::warn!(
+            target: "router.pipeline.stage2.classifier",
+            path = %path.display(),
+            error = %e,
+            "could not write classifier-failure dump",
+        );
+        return;
+    }
+    tracing::warn!(
+        target: "router.pipeline.stage2.classifier",
+        model = %model,
+        error = %error,
+        raw_len = raw.len(),
+        path = %path.display(),
+        "classifier JSON parse failure dumped for review",
+    );
 }
 
 impl ClassifierStage {
@@ -318,6 +376,7 @@ impl ClassifierStage {
         limiter: Arc<Limiter>,
         target_matcher: Option<TargetMatcher>,
         failure_policy: ClassifierFailurePolicy,
+        failure_dir: Option<std::path::PathBuf>,
     ) -> Self {
         Self {
             name: ArcIntern::from("pipeline.stage2.classifier"),
@@ -332,6 +391,7 @@ impl ClassifierStage {
             tree_engine: None,
             target_matcher,
             failure_policy,
+            failure_dir,
             depends: vec![ArcIntern::from("pipeline.stage1.output")],
             provides: vec![ArcIntern::from("pipeline.stage2.output")],
         }
@@ -354,6 +414,7 @@ impl ClassifierStage {
         tree_engine: Arc<ClassificationEngine>,
         target_matcher: Option<TargetMatcher>,
         failure_policy: ClassifierFailurePolicy,
+        failure_dir: Option<std::path::PathBuf>,
     ) -> Self {
         Self {
             name: ArcIntern::from("pipeline.stage2.classifier.tree"),
@@ -368,6 +429,7 @@ impl ClassifierStage {
             tree_engine: Some(tree_engine),
             target_matcher,
             failure_policy,
+            failure_dir,
             depends: vec![ArcIntern::from("pipeline.stage1.output")],
             provides: vec![ArcIntern::from("pipeline.stage2.output")],
         }
@@ -594,7 +656,15 @@ impl ClassifierStage {
             &self.routing_config.default_route,
         ) {
             Ok(parsed) => parsed,
-            Err(reason) => return Ok(self.failure_decision(&reason)),
+            Err(reason) => {
+                // Diagnostic corpus: dump exactly what the model emitted so
+                // the repair heuristics can be reviewed and improved. The
+                // dump stays in a file — never the ledger or the response.
+                if let Some(dir) = &self.failure_dir {
+                    dump_classifier_failure(dir, &self.classifier_model, &reason, &response);
+                }
+                return Ok(self.failure_decision(&reason));
+            }
         };
 
         if !ok {
@@ -987,6 +1057,57 @@ mod tests {
     fn parse_garbage_still_fails() {
         let err = parse_classifier_response("llama llama llama", "local").unwrap_err();
         assert!(err.contains("invalid JSON"));
+    }
+
+    /// Raw control characters inside string values (literal newlines/tabs) are
+    /// the other common small-model artifact; they must be escaped, not
+    /// rejected.
+    #[test]
+    fn parse_heals_raw_control_chars() {
+        let raw = "{\"action\": \"respond\", \"response\": \"first line\nsecond line\", \
+                    \"coherence_score\": 0.9, \"safety_score\": 1, \
+                    \"reason\": \"tab\there\"}";
+        let (out, ok) = parse_classifier_response(raw, "local").expect("must escape controls");
+        assert!(!ok);
+        assert_eq!(out.action, "respond");
+        assert_eq!(out.response.as_deref(), Some("first line\nsecond line"));
+    }
+
+    /// Truncation mid-member (`"b":` with no value) must drop the dangling
+    /// tail rather than fail.
+    #[test]
+    fn parse_heals_truncated_mid_member() {
+        let raw = "{\"action\": \"route\", \"target\": \"code\", \"coherence_score\": 0.8, \
+                    \"safety_score\": 1, \"reason\": \"big\", \"completeness\": ";
+        let (out, ok) = parse_classifier_response(raw, "local").expect("must drop tail");
+        assert!(!ok);
+        assert_eq!(out.action, "route");
+        assert_eq!(out.target.as_deref(), Some("code"));
+        assert_eq!(out.reason, "big");
+    }
+
+    /// A parse failure dumps the raw response to `<dir>/classifier_failures/`
+    /// for review; the dump is a file, never the ledger.
+    #[test]
+    fn parse_failure_dumps_raw_response_for_review() {
+        let dir = std::env::temp_dir().join(format!(
+            "coral-classifier-fail-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let failures = dir.join("classifier_failures");
+        dump_classifier_failure(&dir, "lfm2.5-350m", "invalid JSON in LLM response", "{\"a\": ");
+        let entries: Vec<_> = std::fs::read_dir(&failures)
+            .expect("failures dir must exist")
+            .flatten()
+            .collect();
+        assert_eq!(entries.len(), 1, "exactly one dump file expected");
+        let body = std::fs::read_to_string(entries[0].path()).expect("dump must be readable");
+        assert!(body.contains("lfm2.5-350m"));
+        assert!(body.contains("invalid JSON in LLM response"));
+        assert!(body.contains("\\\"a\\\""));
+        assert!(body.contains("{\\\"a\\\": "));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

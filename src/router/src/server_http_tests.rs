@@ -901,6 +901,123 @@ async fn missing_pipeline_returns_error_not_canned_success() {
     );
 }
 
+/// The classifier-fallback dispatch (a `respond` decision that carries no
+/// response text, so the pipeline resolves neither a direct response nor a
+/// routing target) must honor the client's `stream` flag. Regression for the
+/// `Invalid response event-stream. content-type: application/json` client
+/// error: the fallback hardcoded `is_stream = false`, so a streaming client
+/// got a bare JSON completion body instead of SSE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn classifier_fallback_dispatch_honors_stream_flag() {
+    let upstream = spawn_mock_upstream(Arc::new(|_req: &Value| {
+        let (mut tx, rx) =
+            http_body_util::channel::Channel::<Bytes, std::convert::Infallible>::new(4);
+        tokio::spawn(async move {
+            let events = [
+                r#"data: {"choices":[{"delta":{"content":"streamed "}}]}"#,
+                r#"data: {"choices":[{"delta":{"content":"story"}}]}"#,
+                "data: [DONE]",
+            ];
+            for event in events {
+                if tx
+                    .send_data(Bytes::from(format!("{event}\n\n")))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        hyper::Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .body(rx.boxed_unsync())
+            .expect("build response")
+    }))
+    .await;
+
+    let config = make_config(&upstream, true, false, 5000, 2000);
+    let classifier_entry = config.models.get("fast").expect("fast model").clone();
+
+    // Classifier answers `respond` with no response text: neither a routing
+    // target nor a direct response, so the handler falls back to dispatching
+    // the request to the classifier model itself.
+    let provider = TranscriptProvider::new(HashMap::new()).with_default(
+        serde_json::to_string(&crate::config::ClassifierOutput {
+            action: "respond".into(),
+            response: None,
+            target: None,
+            coherence_score: 0.9,
+            safety_score: 1.0,
+            complexity: None,
+            intent: None,
+            reason: "no direct answer".into(),
+            completeness: None,
+            risk: None,
+        })
+        .expect("classifier output serializes"),
+    );
+    let backend: Arc<dyn ChatBackend> = Arc::new(provider);
+    let pipelines = Arc::new(config.build_all_pipelines_with_backend(Some(&backend)));
+
+    let mock = Arc::new(mock_for("fallback me", "Once upon a time"));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let deps = ServerDeps {
+        pipelines,
+        routes: Arc::new(config.routes.clone()),
+        models: Arc::new(config.models.clone()),
+        stats: Arc::new(ServerStats::new()),
+        max_payload: config.server.max_payload,
+        classifier: Some(("fast".to_string(), classifier_entry)),
+        mock_dispatch: Some(mock),
+        ledger: None,
+        cache: None,
+        plan_route: None,
+        rigor_route: None,
+        sessions: None,
+        http_client: Arc::new(reqwest::Client::new()),
+        ladders: HashMap::new(),
+        context_cache: None,
+        instance_pool: None,
+        api_key_env_name: None,
+        supervisor: None,
+        coordinator: None,
+    };
+    let handle = tokio::spawn(async move {
+        if let Err(e) = serve_http(listener, deps, None).await {
+            tracing::error!(target: "router.test", error = %e, "test server failed");
+        }
+    });
+    let server = TestServer { addr, handle };
+
+    let body = json!({
+        "model": "fast",
+        "messages": [{"role": "user", "content": "fallback me"}],
+        "stream": true
+    });
+    let response = post_chat(&server.base_url(), body, 5000)
+        .await
+        .expect("request must complete");
+    assert_eq!(response.status(), 200);
+    assert!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.contains("text/event-stream")),
+        "classifier-fallback dispatch must stream when the client requests it"
+    );
+    let text = response.text().await.expect("read SSE body");
+    assert!(
+        text.contains("Once upon a time"),
+        "fallback must carry the dispatched content, got: {text}"
+    );
+}
+
 // -- Scenario 7a: filter_thinking - buffered strip ------------------------
 
 /// Spawn an in-process mock upstream that answers every request via `respond`.

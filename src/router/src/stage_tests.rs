@@ -378,6 +378,7 @@ mod tests {
             limiter,
             None,
             crate::config::ClassifierFailurePolicy::Reject,
+            None,
         );
 
         std::thread::scope(|scope| {
@@ -457,6 +458,7 @@ mod tests {
             Arc::new(fluent_concurrency::pool::Limiter::new(4)),
             None,
             policy,
+            None,
         )
     }
 
@@ -1519,6 +1521,7 @@ mod tests {
             limiter,
             None,
             crate::config::ClassifierFailurePolicy::Reject,
+            None,
         );
 
         let mut ctx = WorkContext::default();

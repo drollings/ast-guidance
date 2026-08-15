@@ -505,6 +505,38 @@ impl InstanceManager {
         }
         result
     }
+
+    /// Ensure the group has at least one resident member, creating on demand
+    /// when it is entirely absent. Idempotent: no-op when any instance already
+    /// belongs to the group. For a **pinned** group the boot reconciliation
+    /// creates the canonical members (e.g. `swarm-0`/`swarm-1`); for an
+    /// unpinned group a fresh member is allocated. Used by the classifier path,
+    /// whose sync client cannot trigger the dispatch path's allocate-on-miss.
+    pub async fn ensure_group_ready(&self, group: &str) -> Result<(), InstanceError> {
+        if self.profiles.is_empty() {
+            return Ok(());
+        }
+        let existing = match self.client.list().await {
+            Ok(envelope) => envelope,
+            Err(e) => return Err(e),
+        };
+        if existing
+            .instances
+            .iter()
+            .any(|i| i.group == group)
+        {
+            return Ok(());
+        }
+        let group_is_pinned = self
+            .profiles
+            .iter()
+            .any(|p| p.group.as_deref() == Some(group) && p.pinned);
+        if group_is_pinned {
+            self.reconcile().await
+        } else {
+            self.ensure_group(group).await
+        }
+    }
 }
 
 /// Build the HTTP client for one spawned server's management API.

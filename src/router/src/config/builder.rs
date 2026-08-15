@@ -263,6 +263,16 @@ impl RouterConfig {
                 None
             };
 
+            // Unparseable classifier responses are dumped to
+            // `<log_dir>/classifier_failures/` for review (diagnostic corpus
+            // that drives repair heuristics). Mock/injected backends never
+            // dump — canned transcripts cannot produce real model output.
+            let failure_dir = if injected_backend {
+                None
+            } else {
+                Some(self.logging.log_dir.clone())
+            };
+
             let stage = if let Some(tree) = &self.classification {
                 // Classification tree drives the classifier stage. The
                 // injected backend (mock/transcript) is always the default
@@ -297,6 +307,7 @@ impl RouterConfig {
                     Arc::new(engine),
                     target_matcher,
                     self.classifier_failure_policy,
+                    failure_dir,
                 )
             } else {
                 crate::stages::classifier::ClassifierStage::new(
@@ -310,6 +321,7 @@ impl RouterConfig {
                     limiter,
                     target_matcher,
                     self.classifier_failure_policy,
+                    failure_dir,
                 )
             };
             // When configured, wrap the classifier in the retry decorator

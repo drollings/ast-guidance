@@ -280,6 +280,46 @@ fn begin_session_step(
     })
 }
 
+/// On-demand residency for the classifier, mirroring the dispatch path's
+/// `ensure_target_ready` + allocate-on-miss guarantee.
+///
+/// The classifier's LLM call runs through a plain sync `LlmClient` with no
+/// sidecar access, so when its work-pool group has no resident member the
+/// fork answers `400 model or instance not found: '<group>'` and every
+/// request is rejected. Before the pipeline runs, ensure the classifier's
+/// managed model is loaded and its work-pool group exists — created on demand
+/// exactly as the dispatch path would. Everything is derived from config
+/// (`RouterConfig.classifier_model` → the model entry's `pool_qualifier`);
+/// nothing is hardcoded. Best-effort: a load/allocate failure degrades to the
+/// classifier's own error path below.
+async fn ensure_classifier_ready(
+    classifier: Option<&(String, ModelEntry)>,
+    instance_pool: Option<&Arc<crate::instances::InstancePool>>,
+) {
+    let (Some((key, entry)), Some(pool)) = (classifier, instance_pool) else {
+        return;
+    };
+    if !entry.is_managed() {
+        return;
+    }
+    let Some(group) = entry.pool_qualifier() else {
+        return;
+    };
+    let Some(manager) = pool.manager_for_url(&entry.endpoint) else {
+        return;
+    };
+    pool.ensure_target_ready(&entry.endpoint, None).await;
+    if let Err(e) = manager.ensure_group_ready(&group).await {
+        tracing::warn!(
+            target: "router.server",
+            classifier_model = %entry.name.as_deref().unwrap_or(key),
+            group = %group,
+            error = %e,
+            "classifier work-pool ensure failed",
+        );
+    }
+}
+
 async fn handle_chat_completion(
     req: hyper::Request<hyper::body::Incoming>,
     deps: ServerDeps,
@@ -471,6 +511,11 @@ async fn handle_chat_completion(
         }
     }
 
+    // On-demand residency for the classifier: ensure its managed model is
+    // loaded and its work-pool group is resident before the pipeline's
+    // (sync, sidecar-less) classifier LLM call would 400 on a missing group.
+    ensure_classifier_ready(classifier.as_ref(), instance_pool.as_ref()).await;
+
     let pipeline_result =
         resolve_pipeline(&model_name, &routes, &models, &pipelines, &router_request);
 
@@ -498,7 +543,7 @@ async fn handle_chat_completion(
         record_ledger_result(
             ledger.as_ref(),
             ledger_node_id,
-            false,
+            is_stream,
             Some(0.0),
             reason.to_string(),
         )
@@ -506,7 +551,7 @@ async fn handle_chat_completion(
 
         if let Some(ref step) = session_step {
             step.complete(
-                false,
+                is_stream,
                 Some(0.0),
                 reason.to_string(),
                 Some(reason.to_string()),
@@ -599,7 +644,7 @@ async fn handle_chat_completion(
             &model_name,
             &user_text,
             mock_dispatch.as_ref(),
-            false,
+            is_stream,
             &dispatch_deps,
         )
         .await?;

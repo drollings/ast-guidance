@@ -500,6 +500,7 @@ mod tests {
             api_key_env: None,
             liveness_poll_interval_s: 30,
             liveness_failures_before_restart: 3,
+            max_restarts: 5,
         }
     }
 
@@ -1098,6 +1099,181 @@ mod tests {
         assert_eq!(body["ctx_size"], 16384);
         let name = body["name"].as_str().unwrap();
         assert!(name.starts_with("swarm-"), "unique name generated: {name}");
+    }
+
+    #[tokio::test]
+    async fn ensure_group_ready_is_noop_when_member_present() {
+        // A resident member -> no management write, idempotent.
+        let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
+            |method, path, _body| {
+                if method == "GET" && path == "/instances" {
+                    (
+                        200,
+                        serde_json::json!({
+                            "instances": [ instance_info("swarm-0", "swarm", true, 1) ],
+                            "snapshots": [],
+                            "total": { "model": 1000, "context": 200, "compute": 200, "total": 1400 }
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    (200, "{}".into())
+                }
+            },
+        );
+        let stub = StubServer::start(handler);
+        let client = InstanceClient::new(reqwest::Client::new(), stub.base_url(), None);
+        let profiles = vec![InstanceProfile {
+            name: Some("swarm".into()),
+            group: Some("swarm".into()),
+            count: 2,
+            num_ctx: 16384,
+            parallel: None,
+            pinned: true,
+            no_sleep: true,
+            sleep_idle_seconds: None,
+            default: false,
+            resume: false,
+            params: None,
+        }];
+        let manager = InstanceManager::new("base", client, profiles, sidecar_policy());
+        manager
+            .ensure_group_ready("swarm")
+            .await
+            .expect("group already resident");
+        let writes = stub
+            .recorded()
+            .into_iter()
+            .filter(|(m, _, _)| m == "POST")
+            .collect::<Vec<_>>();
+        assert!(writes.is_empty(), "no allocation when a member exists");
+    }
+
+    #[tokio::test]
+    async fn ensure_group_ready_reconciles_pinned_group_when_absent() {
+        // The pinned `swarm` group has no resident member while the default
+        // `ledger` instance is resident -> reconcile creates only the missing
+        // pinned member and never re-creates a resident one.
+        let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
+            |method, path, _body| {
+                if method == "GET" && path == "/instances" {
+                    (
+                        200,
+                        serde_json::json!({
+                            "instances": [ instance_info("ledger", "ledger", true, 0) ],
+                            "snapshots": [],
+                            "total": { "model": 1000, "context": 200, "compute": 200, "total": 1400 }
+                        })
+                        .to_string(),
+                    )
+                } else if method == "POST" && path == "/instances" {
+                    (201, "{}".into())
+                } else {
+                    (404, "{}".into())
+                }
+            },
+        );
+        let stub = StubServer::start(handler);
+        let client = InstanceClient::new(reqwest::Client::new(), stub.base_url(), None);
+        let profiles = vec![
+            InstanceProfile {
+                name: Some("ledger".into()),
+                group: Some("ledger".into()),
+                count: 1,
+                num_ctx: 131072,
+                parallel: None,
+                pinned: true,
+                no_sleep: true,
+                sleep_idle_seconds: None,
+                default: true,
+                resume: false,
+                params: None,
+            },
+            InstanceProfile {
+                name: Some("swarm".into()),
+                group: Some("swarm".into()),
+                count: 2,
+                num_ctx: 16384,
+                parallel: None,
+                pinned: true,
+                no_sleep: true,
+                sleep_idle_seconds: None,
+                default: false,
+                resume: false,
+                params: None,
+            },
+        ];
+        let manager = InstanceManager::new("base", client, profiles, sidecar_policy());
+        manager
+            .ensure_group_ready("swarm")
+            .await
+            .expect("reconcile creates the missing pinned member");
+        let creates = stub
+            .recorded()
+            .into_iter()
+            .filter(|(m, p, _)| m == "POST" && p == "/instances")
+            .map(|(_, _, b)| serde_json::from_str::<serde_json::Value>(&b).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(creates.len(), 1, "reconcile creates only the missing pinned member");
+        assert!(
+            creates.iter().any(|b| b["name"] == "swarm" && b["group"] == "swarm"),
+            "pinned swarm member created"
+        );
+        assert!(
+            creates.iter().all(|b| b["name"] != "ledger"),
+            "resident ledger member is not needlessly re-created"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_group_ready_allocates_unpinned_group_when_absent() {
+        // Unpinned group with no resident member -> a fresh member is allocated
+        // on demand (the "even unpinned, load on demand" guarantee).
+        let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
+            |method, path, _body| {
+                if method == "GET" && path == "/instances" {
+                    (
+                        200,
+                        serde_json::json!({
+                            "instances": [],
+                            "snapshots": [],
+                            "total": { "model": 1000, "context": 200, "compute": 200, "total": 1400 }
+                        })
+                        .to_string(),
+                    )
+                } else if method == "POST" && path == "/instances" {
+                    (201, "{}".into())
+                } else {
+                    (404, "{}".into())
+                }
+            },
+        );
+        let stub = StubServer::start(handler);
+        let client = InstanceClient::new(reqwest::Client::new(), stub.base_url(), None);
+        let profiles = vec![InstanceProfile {
+            name: Some("scratch".into()),
+            group: Some("scratch".into()),
+            count: 1,
+            num_ctx: 131072,
+            parallel: None,
+            pinned: false,
+            no_sleep: true,
+            sleep_idle_seconds: None,
+            default: false,
+            resume: false,
+            params: None,
+        }];
+        let manager = InstanceManager::new("base", client, profiles, sidecar_policy());
+        manager
+            .ensure_group_ready("scratch")
+            .await
+            .expect("unpinned group allocated on demand");
+        let creates = stub
+            .recorded()
+            .into_iter()
+            .filter(|(m, p, _)| m == "POST" && p == "/instances")
+            .collect::<Vec<_>>();
+        assert_eq!(creates.len(), 1, "one fresh member allocated");
     }
 
     #[tokio::test]

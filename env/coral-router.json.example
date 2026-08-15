@@ -4,12 +4,42 @@
             "deterministic_prefilter": true,
             "classifier": true,
             "router": true,
-            "coherence_threshold": 0.5,
-            "classifier_model": "swarm",
+            "coherence_threshold": 0.2,
+            "classifier_model": "lfm2.5-2.6b",
             "blacklist": "env/pii-patterns.json"
         }
     },
+    "default_params": {
+        "num_ctx": 16384,
+        "batch_size": 4096,
+        "ubatch_size": 1024,
+        "cache_type_k": "q8_0",
+        "cache_type_v": "q8_0",
+        "flash_attn": "on",
+        "n_gpu_layers": 999,
+        "n_cpu_moe": 0,
+        "sleep_idle_seconds": 15,
+        "stream": true,
+        "filter_thinking": true,
+        "params": { "temperature": 0.4 }
+    },
     "models": {
+        "lfm2.5-350m": {
+            "endpoint": "http://localhost:8080/v1/chat/completions",
+            "name": "liquidai/lfm2.5-350m",
+            "weights": "/app/ai/models/gguf/liquidai/lfm2.5-350m-gguf/latest.gguf",
+            "intelligence": 2,
+            "cost_input": 1e-06,
+            "cost_output": 6e-06,
+            "cost_cached_read": 4e-07,
+            "speed": 8,
+            "total_timeout_ms": 50000,
+            "idle_timeout_ms": 3000,
+            "stream": true,
+            "filter_thinking": true,
+            "retry_count": 2,
+            "retry_base_interval_s": 1
+        },
         "lfm2.5-1.2b": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
             "name": "unsloth/lfm2.5-1.2b-instruct",
@@ -25,37 +55,39 @@
             "retry_count": 2,
             "retry_base_interval_s": 1
         },
-        "swarm": {
+        "lfm2.5-2.6b": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
             "name": "abiray/lfm2.5-2.6b-heretic-abliterated",
+            "weights": "/app/ai/models/gguf/abiray/lfm2.5-2.6b-heretic-abliterated-gguf/latest.gguf",
             "intelligence": 2,
             "cost_input": 1e-06,
             "cost_output": 6e-06,
             "cost_cached_read": 4e-07,
             "speed": 8,
-            "total_timeout_ms": 20000,
+            "total_timeout_ms": 50000,
             "idle_timeout_ms": 3000,
             "stream": true,
             "filter_thinking": true,
             "retry_count": 2,
             "retry_base_interval_s": 1,
             "instances": {
-                "swarm": {
-                    "count": 3,
-                    "group": "swarm",
-                    "num_ctx": 16384,
-                    "warm": true,
-                    "params": { "temperature": 0.1 }
-                },
                 "ledger": {
                     "num_ctx": 131072,
                     "pinned": true,
                     "default": true,
+                    "resume": true,
+                    "params": { "temperature": 0.1 }
+                },
+                "swarm": {
+                    "count": 2,
+                    "pinned": true,
+                    "group": "swarm",
+                    "num_ctx": 8192,
                     "params": { "temperature": 0.1 }
                 },
                 "scratch": {
                     "num_ctx": 131072,
-                    "sleep_idle_seconds": 30,
+                    "sleep_idle_seconds": 1,
                     "params": { "temperature": 0.4 }
                 }
             }
@@ -63,7 +95,8 @@
         "qwen3.6-27b": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
             "name": "vinpix/ternary-bonsai-27b-stock-mtp",
-            "intelligence": 6,
+            "weights": "/app/ai/models/gguf/vinpix/ternary-bonsai-27b-stock-mtp-gguf/latest.gguf",
+            "intelligence": 5,
             "cost_input": 3e-06,
             "cost_output": 1.8e-05,
             "cost_cached_read": 1.2e-06,
@@ -83,7 +116,8 @@
         "gemma4-12b": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
             "name": "mradermacher/limn-alpha-12b-i1",
-            "intelligence": 2,
+            "weights": "/app/ai/models/gguf/mradermacher/limn-alpha-12b-i1-gguf/iq4_xs.gguf",
+            "intelligence": 4,
             "cost_input": 3e-06,
             "cost_output": 1.8e-05,
             "cost_cached_read": 1.2e-06,
@@ -101,6 +135,7 @@
         "embed": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
             "name": "google/embeddinggemma-300m",
+            "weights": "/app/ai/models/gguf/google/embeddinggemma-300m/latest.gguf",
             "intelligence": 1,
             "cost_input": 1e-06,
             "cost_output": 6e-06,
@@ -114,21 +149,25 @@
             "retry_base_interval_s": 1
         }
     },
+    "_comment_routes": "`always_route: true` means requests on that route are NEVER answered by the classifier model directly - the router forces dispatch to the route's group (compensating for the classifier's overconfidence in prose, code, translation, and specialized knowledge). Routes without it (local/extract/summarize) still let the classifier answer simple prompts directly.",
     "routes": {
         "local": {
             "group": "default",
             "pipelines": ["default"],
-            "description": "General Q&A, simple questions, chitchat, research queries"
+            "description": "General Q&A, simple questions, chitchat, research queries, brainstorming, and help formulating prompts. Answered directly by the classifier when simple.",
+            "always_route": false
         },
         "prose": {
             "group": "prose",
             "pipelines": ["default"],
-            "description": "Write a story, poem, essay, or letter"
+            "description": "Write a story, novel, poem, essay, screenplay, or letter - any substantial creative writing. Always dispatched to the dedicated writer model.",
+            "always_route": true
         },
         "code": {
             "group": "code",
             "pipelines": ["default"],
-            "description": "Programming, software development, Linux, bash, Python, Rust, dev-ops, debugging, and technical implementation"
+            "description": "Programming, software development, Linux, bash, Python, Rust, dev-ops, debugging, and technical implementation",
+            "always_route": true
         },
         "extract": {
             "group": "extract",
@@ -143,20 +182,38 @@
         "translation": {
             "group": "translation",
             "pipelines": ["default"],
-            "description": "Translate between different languages"
+            "description": "Translate between different languages",
+            "always_route": true
+        },
+        "science": {
+            "group": "science",
+            "pipelines": ["default"],
+            "description": "Physics, chemistry, biology, mathematics, engineering, and the natural sciences - explanations, derivations, and research questions. Always dispatched to the capable model.",
+            "always_route": true
+        },
+        "legal": {
+            "group": "legal",
+            "pipelines": ["default"],
+            "description": "Law, contracts, compliance, regulations, and legal drafting or analysis. Always dispatched to the capable model.",
+            "always_route": true
+        },
+        "medical": {
+            "group": "medical",
+            "pipelines": ["default"],
+            "description": "Medicine, pharmacology, anatomy, diagnostics, and health questions. Always dispatched to the capable model.",
+            "always_route": true
         }
     },
     "_comment_model_groups": "Each model_group is an ordered target-matching ladder (VISION 'Target selection within a group'): the cheapest candidate self-assesses the request's complexity first and defers to the next, more-intelligent member when the assessed complexity exceeds its `intelligence`. E.g. `default` = [swarm (intelligence 2), qwen3.6-27b (intelligence 6)]: swarm answers unless it assesses the request above complexity 2, in which case qwen3.6-27b re-classifies and answers. Single-member groups resolve statically. Controlled per pipeline via `pipelines.<name>.target_match` (\"self_assess\" default | \"static\") and `target_match_timeout_ms`.",
     "model_groups": {
         "default": [
-            "swarm",
-            "qwen3.6-27b"
+            "lfm2.5-2.6b"
         ],
         "extract": [
-            "swarm"
+            "lfm2.5-2.6b"
         ],
         "summarize": [
-            "swarm"
+            "lfm2.5-2.6b"
         ],
         "code": [
             "qwen3.6-27b"
@@ -165,19 +222,28 @@
             "qwen3.6-27b"
         ],
         "translation": [
-            "gemma4-12b"
+            "qwen3.6-27b"
         ],
         "prose": [
-            "gemma4-12b"
+            "qwen3.6-27b"
+        ],
+        "science": [
+            "qwen3.6-27b"
+        ],
+        "legal": [
+            "qwen3.6-27b"
+        ],
+        "medical": [
+            "qwen3.6-27b"
         ]
     },
-    "system_prompt": "You are Coral, a query classifier and safety router based on an amalgam of edge language models. Analyze the user's message and output JSON only.",
+    "system_prompt": "You are Coral, an AI assistant based on a team of edge language models. Analyze the user's message and output JSON only.",
     "safety_threshold": 0.3,
     "default_route": "local",
     "charts": {
         "dir": "env/workflows/charts",
         "index_path": "data/workflow_library.sqlite",
-        "selector_model": "swarm",
+        "selector_model": "lfm2.5-2.6b",
         "max_candidates": 5,
         "min_score": 0.6,
         "entity_context": true
@@ -186,6 +252,7 @@
         "workflow_extraction": false
     },
     "embedding_model": "embed",
+    "gguf_dir": "/app/ai/models/gguf",
     "server": {
         "bind_addr": "127.0.0.1:8079",
         "max_payload": 1048576
@@ -197,21 +264,8 @@
         "vram_total_bytes": null,
         "minimum_remaining_vram": 2147483648,
         "slot_save_path": "data/slots",
+        "resume_ttl_s": 3600,
         "api_key_env": null
-    },
-    "default_params": {
-        "num_ctx": 16384,
-        "batch_size": 4096,
-        "ubatch_size": 1024,
-        "cache_type_k": "q8_0",
-        "cache_type_v": "q8_0",
-        "flash_attn": "on",
-        "n_gpu_layers": 999,
-        "n_cpu_moe": 0,
-        "sleep_idle_seconds": 15,
-        "stream": true,
-        "filter_thinking": true,
-        "params": { "temperature": 0.4 }
     },
     "logging": {
         "log_dir": "logs",
