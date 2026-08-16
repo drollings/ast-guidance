@@ -393,4 +393,16 @@ impl InstanceClient {
     pub async fn props(&self) -> Option<Value> {
         self.request(reqwest::Method::GET, "/props", None).await.ok()
     }
+
+    /// `POST /abort` - ask the server to stop the generation running in a
+    /// slot. `id_slot` defaults to 0 (the default slot). The standard
+    /// llama.cpp abort contract; the fork answers non-2xx (or an error JSON
+    /// body) when no matching task is running, which surfaces as an
+    /// [`InstanceError`] for the caller to log and ignore.
+    pub async fn abort(&self, id_slot: Option<i32>) -> Result<(), InstanceError> {
+        let body = serde_json::json!({ "id_slot": id_slot.unwrap_or(0) });
+        self.request(reqwest::Method::POST, "/abort", Some(&body))
+            .await
+            .map(|_| ())
+    }
 }

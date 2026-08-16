@@ -26,6 +26,7 @@ futures-util = { workspace = true }
 time = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+http-body = { workspace = true }
 http-body-util = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }

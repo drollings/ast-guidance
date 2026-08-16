@@ -1,6 +1,6 @@
 use super::*;
 use crate::pool::{Limiter, PoolError, Queue, ResultPool, ResultPoolError, WorkerPool};
-use crate::queue::PriorityQueue;
+use crate::queue::{BoundedPriorityQueue, PriorityQueue};
 use crate::router::PartitionedRouter;
 use std::sync::Arc;
 
@@ -36,6 +36,22 @@ async fn test_queue_close_wakes_waiters() {
     tokio::task::yield_now().await;
     q2.close();
     handle.await.unwrap();
+}
+
+/// A bounded priority queue's `push_wait` returns `Closed` after `close()`,
+/// the sync `push` fast path rejects with `Closed`, and `pop` returns the
+/// remaining items then `None` once closed and drained.
+#[tokio::test(start_paused = true)]
+async fn test_bounded_priority_queue_push_wait_closed_after_close() {
+    let q = BoundedPriorityQueue::<i32>::new(1);
+    assert_eq!(q.push(1, 0), Ok(()));
+    assert_eq!(q.push(2, 0), Err(PoolError::Full));
+    assert_eq!(q.len(), 1);
+    q.close();
+    assert_eq!(q.push_wait(2, 0).await, Err(PoolError::Closed));
+    assert_eq!(q.push(2, 0), Err(PoolError::Closed));
+    assert_eq!(q.pop().await, Some(1));
+    assert_eq!(q.pop().await, None);
 }
 
 #[tokio::test(start_paused = true)]

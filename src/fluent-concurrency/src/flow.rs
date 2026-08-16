@@ -1,6 +1,13 @@
 //! Credit-based backpressure flow control with deferred credit support.
 //! Mirrors RabbitMQ's `credit_flow` semantics: a sender has a credit budget,
 //! the receiver periodically sends bumps when its counter reaches `more_after`.
+//!
+//! Note on locking: `CreditSender` guards its bump receiver with a
+//! `tokio::sync::Mutex` (not `std::sync::Mutex` like `Queue`/`PriorityJobQueue`
+//! in `pool.rs`) because the guard is held across `rx.recv().await` in
+//! `send`. Do not "fix" it to `std::sync::Mutex` — the guard crossing an await
+//! would make the future non-`Send` and the waker bookkeeping is justified
+//! here.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};

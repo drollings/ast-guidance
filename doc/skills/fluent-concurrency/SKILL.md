@@ -23,10 +23,10 @@ This document specifies `fluent-concurrency`, a thin, safe, composable extension
 The crate exports the following modules from `src/lib.rs:3-15`:
 
 ```text
-affinity  capability  flow  io  ladder  llm_queue  pool  queue  reserve  router  runtime  scope  thread_resource  batch
+affinity  capability  flow  io  ladder  llm_queue  pool  queue  reserve  router  runtime  scope  stream  thread_resource  batch
 ```
 
-Each is described below. The spec primitives are in §3.1–§3.9; the bonus primitives (`AffinityScheduler`, `ResultPool`, `PriorityResultPool`, `LlmRequestQueue`, `Reserve`, `thread_local_resource!`) are in §3.10; the canonical first-Ok fallback combinator (`first_accept_in_order`) is in §3.11.
+Each is described below. The spec primitives are in §3.1–§3.9; the bonus primitives (`AffinityScheduler`, `ResultPool`, `PriorityResultPool`, `LlmRequestQueue`, `Reserve`, `StreamAbort`, `thread_local_resource!`) are in §3.10; the canonical first-Ok fallback combinator (`first_accept_in_order`) is in §3.11.
 
 ### 3.1 `Capability` — Bounded Resource Access
 
@@ -76,7 +76,7 @@ A `SupervisedBatch` is a `Scope` plus a dependency graph, a typed event sink, re
 - `SupervisedBatch::new(runtime: Arc<dyn Runtime>, caps: CapabilitySet) -> Self` — defaults to `SupervisedBatchConfig::default()`.
 - `SupervisedBatch::new_with_config(runtime, caps, config: SupervisedBatchConfig) -> Self`.
 
-**Configuration** (`batch.rs:49-60`): `SupervisedBatchConfig { poll_budget: usize }` — maximum tasks polled per `SupervisedBatch::poll` invocation. Default `64`. When the budget is exhausted, the batch wakes itself with `cx.waker().wake_by_ref()` to prevent executor starvation.
+**Configuration** (`batch.rs:49-60`): `SupervisedBatchConfig { poll_budget: usize, is_retryable: fn(&WorkError) -> bool, backoff_base_ms: u64, backoff_jitter_ms: u64 }`. `poll_budget` is the maximum tasks polled per `SupervisedBatch::poll` invocation (default `64`); when the budget is exhausted, the batch wakes itself with `cx.waker().wake_by_ref()` to prevent executor starvation. `backoff_base_ms` (default `100`) and `backoff_jitter_ms` (default `50`) tune the retry cadence: they are forwarded to `common_core::retry::retry_async` as `base_ms` and `jitter_pct` respectively, preserving the pre-configuration `retry_async(..., 100, 50, ...)` schedule exactly.
 
 **Registration** (`batch.rs:148-172`):
 
@@ -145,7 +145,7 @@ impl<T: Send + Sync + 'static> WorkerPool<T> {
 }
 ```
 
-Internally it uses a `Queue<T>` (see below) and a `Notify` for close-wakes-waiters. Workers loop on `tokio::select! { shutdown.notified() | queue.pop() }`. If you don't need the result, this is the zero-allocation-per-submit primitive. For the result-returning variant, see `ResultPool` (§3.10).
+Internally it uses a `Queue<T>` (see below) and a `Notify` for close-wakes-waiters. Workers loop on `tokio::select! { shutdown.notified() | queue.pop() }`. If you don't need the result, this is the zero-allocation-per-submit primitive. For the result-returning variant, see `ResultPool` (§3.10). `Queue<T>`'s backing store is a `std::sync::Mutex<VecDeque<T>>` — the lock is never held across an await (every guard is scoped), so the async mutex's waker bookkeeping would be pure overhead; poison is recovered via `common_core::sync::lock`. (`CreditSender` in `flow.rs` is the one exception that must stay a `tokio::sync::Mutex` — its guard protects the bump receiver across `recv().await`.)
 
 **Why not `tokio::sync::Semaphore`?** A `Semaphore` is perfect for a *limiter* (see §3.5), but it does not provide a FIFO queue of jobs or dedicated workers. RabbitMQ's `worker_pool` explicitly wants workers to pull from a queue, allowing prioritization and monitoring of queue depth. Our `WorkerPool` gives exactly that.
 
@@ -167,7 +167,7 @@ impl Limiter {
 }
 ```
 
-`run_sync` first tries `tokio::runtime::Handle::try_current()`. Inside a running **multi-threaded** runtime (the router's HTTP handler does this) it drives the permit-acquire + closure via `tokio::task::block_in_place(|| handle.block_on(block))` — a bare `Handle::block_on` would panic with "Cannot start a runtime from within a runtime". Inside a current-thread runtime it uses `handle.block_on(block)`. With no active runtime it builds a dedicated current-thread runtime for the duration of the call. This is the right tool for synchronous callers (e.g., a CLI handler invoked outside an async context) that need to bound concurrency.
+`run_sync` first tries `tokio::runtime::Handle::try_current()`. Inside a running **multi-threaded** runtime (the router's HTTP handler does this) it drives the permit-acquire + closure via `tokio::task::block_in_place(|| handle.block_on(block))` — a bare `Handle::block_on` would panic with "Cannot start a runtime from within a runtime". Inside a current-thread runtime it uses `handle.block_on(block)`. With no active runtime it builds a dedicated current-thread runtime for the duration of the call. This is the right tool for synchronous callers (e.g., a CLI handler invoked outside an async context) that need to bound concurrency. **Caveat:** on the multi-thread scheduler `block_in_place` parks a worker thread for the duration of the call (the scheduler spins up a replacement thread, and the parked thread is unavailable for work stealing until it returns) — the correct sync↔async bridge, but not for throughput-critical paths; prefer the async `Limiter::run` there.
 
 This is the Rust equivalent of the `credit_flow` sender side: acquire a slot, run the work, release the slot on completion.
 
@@ -200,19 +200,7 @@ This is O(log P) for `push` and `pop`, where P is the number of distinct non-zer
 
 RabbitMQ's `credit_flow` module throttles publishers end-to-end. Our `CreditFlow` uses explicit message passing between sender and receiver, preserving the exact semantics (`flow.rs:13-98`).
 
-> **Status: compatibility surface (scaffold).** No production caller materializes
-> today. The LLM fan-out paths — coral's `LlmRequestQueue` and the router's
-> escalation team-mode parallel votes — are already bounded by `ResultPool`
-> (a `cap`-and-`queue_capacity`-limited worker pool whose `submit` provides the
-> backpressure), and team-mode's decomposer "subtasks" are counted for audit but
-> not dispatched to a pool, so there is no separate credit-token producer to
-> throttle. The only in-tree `CreditFlow` consumers are `flow.rs`'s own tests in
-> `fluent-concurrency/src/tests/m4.rs` and the unused `MemoryBatch` wrapper in
-> `memory-plugin` (which itself has no caller and whose receiver never calls
-> `recv()`, so it would exhaust and block past `initial` jobs). Keep it as the
-> credit-based backpressure seam for a genuine producer/consumer pipeline unless
-> the throwaway rule (fluent-wvr SKILL §20) is invoked to prune it. Do not
-> present it as load-bearing.
+> **Status: production.** The ledger tier feed consumes it in the router: `LedgerTierWorker` owns a `flow::new(CreditSpec)` pair whose `CreditSender` gates the async producer path (`LedgerAgentCoordinator::run_agent` step 5 → `enqueue_with_credit`, `ledger/tiering.rs`, `ledger/orchestrator.rs`) and whose `CreditReceiver::recv()` releases a token after each processed node — so a burst of agent turns cannot grow the feed without bound (the feed channel itself is a bounded `mpsc`; knobs `ledger.tier_credit_limit` / `ledger.tier_credit_more_after`). The other LLM fan-out paths — coral's `LlmRequestQueue` and the router's escalation team-mode parallel votes — are bounded by `ResultPool` (a `cap`-and-`queue_capacity`-limited worker pool whose `submit` provides the backpressure), and team-mode's decomposer "subtasks" are counted for audit but not dispatched to a pool, so there is no separate credit-token producer to throttle there. `flow.rs`'s own tests (`tests/m4.rs`) are the semantics baseline. (The `memory-plugin::MemoryBatch` stub that once consumed `flow::new` was pruned in the 2026-08-15 scaffold review — its body was a log-only stub and no caller constructed it.)
 
 **API**:
 
@@ -258,7 +246,7 @@ impl<K, J: Send + Sync + 'static> PartitionedRouter<K, J> {
 }
 ```
 
-The implementation is intentionally thin: it hashes once per submit and forwards to the appropriate shard. This preserves causal ordering: all jobs with the same key always go to the same shard. There is no per-shard statistics, no shard rebalancing, and no fail-over — the primitive is a shim, not a full delegate supervisor. If you need shard observability, build it on top.
+The implementation is intentionally thin: it hashes once per submit and forwards to the appropriate shard. This preserves causal ordering: all jobs with the same key always go to the same shard. There is no per-shard statistics, no shard rebalancing, and no fail-over — the primitive is a shim, not a full delegate supervisor. If you need shard observability, build it on top. **Status: compatibility surface (scaffold).** No production caller exists outside its own tests (`tests/m3.rs`) — the 2026-08-15 scaffold review kept it as the keyed-sharding seam (delete `router.rs` + its tests if a genuine second consumer never materializes).
 
 ### 3.9 `Runtime` Trait — Pluggable Backend
 
@@ -277,7 +265,7 @@ pub trait Runtime: Send + Sync + 'static {
 **Three backends** ship today:
 
 - `NoopRuntime` (in `fluent-wvr/src/runtime.rs:33-55`) — for `WorkContext::default()`. `spawn` panics with a clear message if called outside a tokio runtime; inside one, it spawns an empty future. `sleep` returns immediately. `now` returns `Instant::now()`.
-- `TokioRuntime` (in `fluent-concurrency/src/runtime/tokio.rs:11-26`) — production. Delegates to `tokio::spawn` and `tokio::time::sleep`. Constructed via the convenience function `fluent_concurrency::tokio_runtime() -> Arc<dyn Runtime>` (`lib.rs:19-21`).
+- `TokioRuntime` (in `fluent-concurrency/src/runtime/tokio.rs:11-26`) — production. Delegates to `tokio::spawn` and `tokio::time::sleep`. Constructed via the convenience function `fluent_concurrency::tokio_runtime() -> Arc<dyn Runtime>` (`lib.rs:19-21`). It also exposes an inherent generic `TokioRuntime::spawn<F>(future)` (`runtime/tokio.rs`) that skips the `Pin<Box<dyn Future>>` boxing — the future is inlined into tokio's task allocation. This is the **hot-path seam** for callers who hold `TokioRuntime` concretely; the trait method (which delegates to the inherent method) stays the `Arc<dyn Runtime>` abstraction.
 - `TestRuntime` (in `fluent-concurrency/src/runtime/test.rs:13-56`) — wraps a `tokio::runtime::Handle` plus a seeded `fastrand::Rng` for reproducible non-determinism. Use with `tokio::time::start_paused` for record-replay tests. Note: `TestRuntime::Clone` re-seeds from the stored `seed` field, so cloned runtimes reproduce the **same** deterministic PRNG sequence as the original (they do *not* advance a shared stream). Clones share the underlying `Handle`; the PRNG state is per-clone.
 
 ### 3.10 Bonus Primitives
@@ -293,13 +281,15 @@ impl<T, R, E> ResultPool<T, R, E> {
     pub fn new<F, Fut>(runtime, cap, queue_capacity, handler: F) -> Self;
     pub fn worker_count(&self) -> usize;
     pub async fn submit(&self, job: T) -> Result<R, ResultPoolError<E>>;
+    pub async fn submit_with_abort(&self, job: T, abort: Option<StreamAbort>)
+        -> Result<R, ResultPoolError<E>>; // abort cancels the in-flight handler
     pub async fn shutdown(self);
 }
 ```
 
 There is **no** fire-and-forget variant: because the worker protocol requires a `oneshot::Sender`, every submission — even one whose result is ignored — allocates a channel. If you need true fan-out with no result, use `WorkerPool` instead.
 
-**`PriorityResultPool<T, R, E>`** (`pool.rs:433-529`) — priority-ordered variant of `ResultPool`. Jobs are submitted with `submit(job, priority)`; higher priority values are dispatched first, FIFO within the same priority. Internally it uses the `PriorityQueue` from §3.6 wrapped in a `tokio::sync::Mutex`. Workers follow the **drain-then-wait** pattern
+**`PriorityResultPool<T, R, E>`** (`pool.rs:433-529`) — priority-ordered variant of `ResultPool`. Jobs are submitted with `submit(job, priority)`; higher priority values are dispatched first, FIFO within the same priority. Internally it uses the `BoundedPriorityQueue` from `queue.rs` — a `PriorityQueue` (ordering) behind a `std::sync::Mutex` (never held across an await, so the async mutex's waker bookkeeping would be pure overhead; poison recovered via `common_core::sync::lock`) with `Queue`-style close-wakes-waiters semantics. **`submit`/`submit_with_abort` apply backpressure**: they block while the queue is at capacity (`PoolError::Full` is the synchronous `BoundedPriorityQueue::push` fast path's error; `Pool(Closed)` surfaces from a submit after shutdown) instead of growing without bound. Workers follow the **drain-then-wait** pattern. `new(runtime, cap, handler)` sizes the queue to `cap * 4`; `with_queue_capacity(runtime, cap, queue_capacity, handler)` overrides it.
 
 **`LlmRequestQueue`** (`llm_queue.rs:156-185`) — typed wrapper over `ResultPool` for LLM chat completions. The crate is transport-agnostic: the `Fn(LlmTask) -> Result<String, LlmError>` handler is supplied at construction time; the default OpenAI-compatible HTTP handler lives in `guidance-llm`. This split keeps `reqwest` out of the boundary that downstream callers care about.
 
@@ -319,9 +309,13 @@ pub enum LlmError { Api(String), Http(String), NoResponse, RateLimited }
 
 `LlmConfig.extra_body_params` is arbitrary JSON merged into every request body (e.g. `num_ctx`, `temperature`, `stop`); `"model"`, `"messages"`, and `"stream"` keys are ignored because those are set explicitly by the chat-completion logic. `LlmConfig::new()` is a `bon` builder (`start_fn = new`).
 
-**`Reserve`** (`reserve.rs:7-94`) — RAII permit on a shared `Arc<AtomicUsize>`. `try_acquire(counter) -> Option<Self>` atomically decrements and returns the permit, or `None` if already at zero. `commit(self)` consumes the permit permanently; otherwise `Drop` returns it to the counter. This is a lower-level primitive than `Limiter`: it does not own the counter (the caller supplies it), and it does not run a closure. Use `Limiter` for "run this with a permit" and `Reserve` for "acquire now, release later" patterns. **Status: compatibility surface (scaffold)** — the crate's own tests are the only in-tree consumer today; keep it as the low-level permit seam unless the throwaway rule (fluent-wvr SKILL §20) is invoked to prune it.
+**`Reserve`** (`reserve.rs:7-94`) — RAII permit on a shared `Arc<AtomicUsize>`. `try_acquire(counter) -> Option<Self>` atomically decrements and returns the permit, or `None` if already at zero. `commit(self)` consumes the permit permanently; otherwise `Drop` returns it to the counter. This is a lower-level primitive than `Limiter`: it does not own the counter (the caller supplies it), and it does not run a closure. Use `Limiter` for "run this with a permit" and `Reserve` for "acquire now, release later" patterns. **Status: compatibility surface (scaffold)** — the crate's own tests are the only in-tree consumer today; the 2026-08-15 scaffold review kept it as the documented low-level permit seam (delete `reserve.rs` + its tests if a genuine second consumer never materializes).
 
-**`AffinityScheduler<T, R, E>`** (`affinity.rs:59-191`) — wraps `PriorityResultPool` with session-aware priority boosting and starvation aging. Tracks which session is currently "affine" and gives its tasks a priority bonus (`AgingConfig::affinity_bonus`, default +10). Starved tasks (different session) periodically increase in base priority at `AgingConfig::aging_rate` (default +2 per 5s tick) up to `AgingConfig::max_priority` (default 100). `set_affinity(Option<String>)` switches the active session. `submit(task: ScheduledTask<T>, base_priority)` computes the effective priority and delegates to the pool. Designed for multi-session agent dispatch where context-switching between sessions should be minimized. **Status: compatibility surface (scaffold).** No production boot path wires `with_affinity` today — the only in-tree caller is a test in `ledger/orchestrator.rs`. Keep it as the forward-compat seam for session-affine dispatch.
+**`StreamAbort`** (`stream.rs:1-...`) — a sticky, `Clone` cancellation signal for long-lived streams. Fires once (`cancel`, idempotent), wakes every currently- and future-waiting task (`cancelled`, sticky), and can be inspected (`is_cancelled`). Carries no I/O — transports drop their connections and management planes issue explicit aborts as a *reaction* to it. `Clone` is an `Arc` bump, so every task that touches a stream (the forwarding task, the downstream body-drop guard, the management-abort watcher) holds its own clone and observes the same state. The canonical wiring is the **body-lifetime rule**: the HTTP body handed to the client is wrapped so its `Drop` fires `cancel()` — the body's lifetime is the single source of truth for "the consumer is gone" — and the forwarding task `select!`s its upstream read against `cancelled()`. **Status: production.** Consumed by the router's streaming dispatch (`OpenAiChatBackend::stream_complete_with_abort`, `dispatch/backend.rs`), which selects its upstream read *and* its body sends against the signal so a blocked `send_data` never wedges the task.
+
+**Abort-aware pool submissions.** `ResultPool::submit_with_abort(job, abort)` and `PriorityResultPool::submit_with_abort(job, priority, abort)` race the handler future against the optional `StreamAbort`: when the signal fires mid-flight the handler future is dropped (an in-flight HTTP call is cancelled, the worker slot is freed) and the submitter observes `ResultPoolError::Canceled` — making that variant *reachable from the submitter side* (previously it fired only on worker panic/shutdown). `LlmRequestQueue::submit_with_abort(task, abort)` exposes the same seam for LLM calls; plain `submit` is unchanged (`None` abort). **Status: production** for the pool seam; `LlmRequestQueue::submit_with_abort` is currently a compatibility surface with no in-tree caller.
+
+**`AffinityScheduler<T, R, E>`** (`affinity.rs:59-191`) — wraps `PriorityResultPool` with session-aware priority boosting and starvation aging. Tracks which session is currently "affine" and gives its tasks a priority bonus (`AgingConfig::affinity_bonus`, default +10). Starved tasks (different session) periodically increase in base priority at `AgingConfig::aging_rate` (default +2 per 5s tick) up to `AgingConfig::max_priority` (default 100). `set_affinity(Option<String>)` switches the active session. `submit(task: ScheduledTask<T>, base_priority)` computes the effective priority and delegates to the pool. Designed for multi-session agent dispatch where context-switching between sessions should be minimized. **Status: production.** Wired at the ledger-agent coordinator's boot path: `ledger.orchestrator.affinity_cap: <cap>` on `RouterConfig` opts the boot into attaching a scheduler via `LedgerAgentCoordinator::build_affinity_scheduler(cap)` (composed through `build_ledger_coordinator`), so the active `run_agent` session is tracked as KV-affine for priority boosting.
 
 **`thread_local_resource!`** (`thread_resource.rs:37-45`) — macro that declares a thread-local `RefCell<Option<T>>` backed by `Default`. The `with_tlr(&STATIC, |res| ...)` accessor takes-or-defaults, calls the closure, and stores the value back after the closure returns. This is the canonical mechanism for per-thread pooled resources (e.g., AST parsers, string builders) that benefit from reuse across calls without allocating each time.
 

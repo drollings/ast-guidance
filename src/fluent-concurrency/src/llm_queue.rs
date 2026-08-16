@@ -182,6 +182,21 @@ impl LlmRequestQueue {
     pub async fn submit(&self, task: LlmTask) -> Result<String, LlmError> {
         self.pool.submit(task).await.map_err(map_pool_error)
     }
+
+    /// Submits a task with an abort signal and awaits the handler's result.
+    /// When the signal fires mid-flight the handler future is dropped — an
+    /// in-flight HTTP call is cancelled and the worker slot is freed — and the
+    /// call resolves to `LlmError::Http("queue response canceled")`.
+    pub async fn submit_with_abort(
+        &self,
+        task: LlmTask,
+        abort: crate::stream::StreamAbort,
+    ) -> Result<String, LlmError> {
+        self.pool
+            .submit_with_abort(task, Some(abort))
+            .await
+            .map_err(map_pool_error)
+    }
 }
 
 /// Maps a `ResultPoolError` to the appropriate `LlmError` variant.

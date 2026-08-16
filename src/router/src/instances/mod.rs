@@ -657,6 +657,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_abort_posts_slot_id_and_defaults_to_zero() {
+        let seen: Arc<std::sync::Mutex<Vec<(String, String, String)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
+            move |method, path, body| {
+                seen2
+                    .lock()
+                    .unwrap()
+                    .push((method.into(), path.into(), body.into()));
+                (200, "{}".into())
+            },
+        );
+        let stub = StubServer::start(handler);
+        let client = InstanceClient::new(reqwest::Client::new(), stub.base_url(), None);
+
+        client.abort(Some(3)).await.expect("abort slot 3");
+        client.abort(None).await.expect("abort default slot");
+
+        let recorded = stub.recorded();
+        let aborts: Vec<&(String, String, String)> = recorded
+            .iter()
+            .filter(|(m, p, _)| m == "POST" && p == "/abort")
+            .collect();
+        assert_eq!(aborts.len(), 2, "one /abort POST per call");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&aborts[0].2).unwrap()["id_slot"],
+            3,
+            "explicit id_slot forwarded"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&aborts[1].2).unwrap()["id_slot"],
+            0,
+            "absent id_slot defaults to 0"
+        );
+    }
+
+    #[tokio::test]
     async fn client_talks_directly_to_its_server() {
         // The client targets one spawned server directly: no `model` in the
         // create body and no `?model=` on per-instance ops (the llama.cpp

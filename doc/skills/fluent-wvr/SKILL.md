@@ -2380,7 +2380,7 @@ When writing new code in `rust-src/`:
 
 25. **Never add a new public API surface (function, type, error variant, or builder helper) without at least one in-tree production consumer.** The codebase has a documented rule against throwaway additions — three APIs shipped in a prior roadmap cycle (`Reserve`, `FieldError::ReadOnly`, `WorkContext::for_unit_in_batch`) had no production consumer on landing. The cost shows up in unused code paths, surprise behaviour, and dead documentation. If a feature must ship ahead of its consumer, file a tracking issue and link it from the API's doc comment.
 
-26. **Compatibility surface is a deliberate, marked exception.** A trait/type kept for forward compatibility (the `FieldAccess`/`Describable` reflection surface, `SchemaProvider`, `PersistableComponent`, `DynamicComponent`, `AffinityScheduler`) is not "throwaway" *when it is explicitly marked as such in its doc comment and in the §0 status taxonomy*. Marking is what distinguishes scaffold (keep, maintain contract) from dead code (prune). Any API that is neither production-composed nor marked scaffold is a throwaway-rule candidate and should be pruned.
+26. **Compatibility surface is a deliberate, marked exception.** A trait/type kept for forward compatibility (the `FieldAccess`/`Describable` reflection surface, `SchemaProvider`, `PersistableComponent`, `DynamicComponent`, `Reserve`, `PartitionedRouter`) is not "throwaway" *when it is explicitly marked as such in its doc comment and in the §0 status taxonomy*. Marking is what distinguishes scaffold (keep, maintain contract) from dead code (prune). Any API that is neither production-composed nor marked scaffold is a throwaway-rule candidate and should be pruned.
 
 ### Verification
 
@@ -2414,17 +2414,17 @@ runtime in `fluent-concurrency`. The full surface is documented in
 | `Runtime` (trait) | `fluent-concurrency/src/runtime/` | Pluggable backend: `TokioRuntime` (production), `TestRuntime` (deterministic, paused-time), `NoopRuntime` (in `fluent-wvr/src/runtime.rs`, init-only) |
 | `Capability` + `CapabilitySet` | `fluent-wvr/src/capability.rs` | Type-map of capability tokens; `with`/`get`/`remove`/`remove_as`/`contains`/`iter`/`len`/`is_empty` |
 | `Scope` | `fluent-concurrency/src/scope.rs` | Structured concurrency; `spawn` + `close().await` or `defer()`; drop-without-close panics |
-| `SupervisedBatch` | `fluent-concurrency/src/batch.rs` | `Scope` + dependency graph + panic/fail/cancel distinct tracking; `SupervisedBatchSummary { completed, panicked, failed, cancelled }`; `SupervisedBatch::register` returns `Result<_, SupervisedBatchError>`; `SupervisedBatchError::DuplicateName` |
+| `SupervisedBatch` | `fluent-concurrency/src/batch.rs` | `Scope` + dependency graph + panic/fail/cancel distinct tracking; `SupervisedBatchSummary { completed, panicked, failed, cancelled }`; `SupervisedBatch::register` returns `Result<_, SupervisedBatchError>`; `SupervisedBatchError::DuplicateName`; configurable retry backoff (`backoff_base_ms` / `backoff_jitter_ms`) |
 | `WorkerPool<T>` | `fluent-concurrency/src/pool.rs` | Bounded FIFO worker pool; capacity + backpressure |
 | `ResultPool<T, R, E>` | `fluent-concurrency/src/pool.rs` | Worker pool that returns a typed `Result<R, ResultPoolError<E>>`; `ResultPoolError` is `Inner(E) \| Canceled \| Pool(PoolError)` |
-| `PriorityResultPool<T, R, E>` | `fluent-concurrency/src/pool.rs` | Priority-ordered variant; workers drain fully before blocking on `Notify`; `submit` uses `notify_waiters` to avoid wakeup collapse |
+| `PriorityResultPool<T, R, E>` | `fluent-concurrency/src/pool.rs` | Priority-ordered variant, bounded (`BoundedPriorityQueue`, `std::sync::Mutex` backing, backpressured `submit`); `new` sizes the queue to `cap*4`, `with_queue_capacity` overrides; workers drain fully before blocking |
 | `Limiter` | `fluent-concurrency/src/pool.rs` | Concurrency cap (N-at-a-time), no queue |
-| `Queue<T>` | `fluent-concurrency/src/pool.rs` | Bounded async FIFO; `PoolError::Full` on overflow |
-| `PriorityQueue<T>` | `fluent-concurrency/src/queue.rs` | O(log P) for distinct priorities, O(1) for all-zero fast path |
-| `PartitionedRouter<K, J>` | `fluent-concurrency/src/router.rs` | Hash-based sharding; preserves causal ordering per key |
+| `Queue<T>` | `fluent-concurrency/src/pool.rs` | Bounded async FIFO; `PoolError::Full` on overflow; `std::sync::Mutex` backing (never held across an await) |
+| `PriorityQueue<T>` | `fluent-concurrency/src/queue.rs` | O(log P) for distinct priorities, O(1) for all-zero fast path; `BoundedPriorityQueue` adds the `Queue`-style close-wakes-waiters wrapper |
+| `PartitionedRouter<K, J>` | `fluent-concurrency/src/router.rs` | Hash-based sharding; preserves causal ordering per key; **compatibility surface (scaffold)** |
 | `first_accept_in_order` | `fluent-concurrency/src/ladder.rs` | Monomorphized first-Ok-wins fallback combinator ("try rungs in order, take the first success"); the canonical ladder primitive composed by `BackendChain`, `dispatch_real`, and the router's escalation ladder |
-| `CreditFlow` | `fluent-concurrency/src/flow.rs` | Sender/receiver backpressure with `CreditSpec { initial, more_after }`; **compatibility surface (scaffold)** — no production caller today (see `fluent-concurrency` SKILL §3.7) |
-| `Reserve` | `fluent-concurrency/src/reserve.rs` | RAII permit from a shared `AtomicUsize`; `try_acquire`/`commit`; **currently has no in-tree production consumer** (throwaway rule candidate) |
+| `CreditFlow` | `fluent-concurrency/src/flow.rs` | Sender/receiver backpressure with `CreditSpec { initial, more_after }`; **production** — gates the router's ledger tier feed (`LedgerTierWorker::enqueue_with_credit` / `recv()` per processed node) |
+| `Reserve` | `fluent-concurrency/src/reserve.rs` | RAII permit from a shared `AtomicUsize`; `try_acquire`/`commit`; **compatibility surface (scaffold)** — no in-tree production consumer; kept as the low-level permit seam |
 
 A `SupervisedBatch` is a `Scope` plus the `WorkUnit` integration: tasks implement
 `Component` and are registered with `batch.register(arc).unwrap()`.

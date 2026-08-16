@@ -319,8 +319,18 @@ impl LedgerAgentCoordinator {
             );
         }
 
-        // 5. Enqueue the new node for background LOD4/LOD5.
-        self.tiers.enqueue(node_id);
+        // 5. Enqueue the new node for background LOD4/LOD5. Credit-gated: a
+        // burst of agent turns cannot grow the tier feed without bound. A
+        // closed feed is not an agent-turn failure — the node's tiers are
+        // filled by the next boot backfill.
+        if let Err(e) = self.tiers.enqueue_with_credit(node_id).await {
+            tracing::warn!(
+                target: "router.ledger.orchestrator",
+                node_id = node_id.as_int(),
+                error = %e,
+                "tier enqueue skipped after the agent turn",
+            );
+        }
 
         // Audit the run (kind = "agent").
         crate::audit::emit(
@@ -856,6 +866,57 @@ mod tests {
         // not alter the restore decision or the transport).
         let outcome = coord.run_agent("sess", "model-a", &worker, "3").await.unwrap();
         assert!(outcome.kv_restored);
+
+        handle.abort();
+    }
+
+    /// The config-driven boot path: a coordinator built by
+    /// `RouterConfig::build_ledger_coordinator` with
+    /// `ledger.orchestrator.affinity_cap` set attaches the KV-affinity
+    /// scheduler, so `affinity_session()` reflects the session after a
+    /// `run_agent` (and stays `None` without the opt-in).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn affinity_cap_config_attaches_scheduler() {
+        let store = temp_store();
+        let sessions = Arc::new(test_registry());
+        let backend: Arc<dyn ChatBackend> =
+            Arc::new(StubChatBackend::new(vec!["a".into(), "b".into()]));
+        let tiers = Arc::new(LedgerTierWorker::new(
+            Arc::clone(&store),
+            Arc::new(StubChatBackend::always("SUMMARY: s\nDESCRIPTION: d")),
+            vec![4, 5],
+            TierConfig {
+                poll_interval_ms: 5,
+                ..Default::default()
+            },
+            fluent_concurrency::tokio_runtime(),
+        ));
+        let config: crate::config::RouterConfig = serde_json::from_str(
+            r#"{
+                "ledger": { "orchestrator": { "enabled": true, "affinity_cap": 2 } }
+            }"#,
+        )
+        .expect("valid config with affinity_cap");
+        let coord = config
+            .build_ledger_coordinator(
+                Arc::clone(&store),
+                Arc::clone(&sessions),
+                sessions.kv_cache().clone(),
+                Arc::clone(&tiers),
+                backend,
+            )
+            .expect("coordinator built from the config section");
+        store.set_tier_events(tiers.sender());
+        let handle = tiers.start();
+        let worker = WorkerContext::new("assistant", "");
+
+        assert_eq!(coord.affinity_session(), None, "no run yet -> no affine session");
+        let _ = coord.run_agent("sess", "model-a", &worker, "1").await.unwrap();
+        assert_eq!(
+            coord.affinity_session().as_deref(),
+            Some("sess"),
+            "affinity_cap-attached scheduler marks the run_agent session"
+        );
 
         handle.abort();
     }

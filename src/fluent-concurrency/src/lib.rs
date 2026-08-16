@@ -17,6 +17,7 @@ pub mod reserve;
 pub mod router;
 pub mod runtime;
 pub mod scope;
+pub mod stream;
 pub mod thread_resource;
 pub mod batch;
 

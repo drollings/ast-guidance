@@ -746,6 +746,57 @@ async fn test_batch_custom_retry_predicate_retries_execution() {
     );
 }
 
+/// A configured `backoff_base_ms`/`backoff_jitter_ms` drives the retry cadence.
+/// Two identical failing units with `max_retries=1` (one backoff sleep each)
+/// race: the configured fast config (base 10ms, jitter 0) must finish
+/// meaningfully sooner than the default config (base 100ms). This discriminates
+/// the configured value from the pre-configuration hardcode.
+#[tokio::test(start_paused = true)]
+async fn test_batch_config_backoff_honored() {
+    tokio::time::resume();
+    let fast_base_ms: u64 = 10;
+    let default_base_ms: u64 = SupervisedBatchConfig::default().backoff_base_ms;
+    assert!(
+        fast_base_ms < default_base_ms,
+        "test setup: configured base must be faster than the default"
+    );
+
+    async fn run_once(base_ms: u64, jitter_ms: u64) -> Duration {
+        let runtime = crate::tokio_runtime();
+        let caps = CapabilitySet::new();
+        let config = SupervisedBatchConfig {
+            backoff_base_ms: base_ms,
+            backoff_jitter_ms: jitter_ms,
+            ..SupervisedBatchConfig::default()
+        };
+        let mut batch = SupervisedBatch::new_with_config(runtime, caps, config);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let cnt = Arc::clone(&counter);
+        let unit = StubComponent::new("backoff").with_handler(move |_| {
+            cnt.fetch_add(1, Ordering::SeqCst);
+            Err(WorkError::Dependency("transient".into()))
+        });
+        let ctx = WorkContext {
+            max_retries: 1,
+            ..WorkContext::default()
+        };
+        batch.register_with_context(Arc::new(unit), ctx).unwrap();
+        let start = std::time::Instant::now();
+        let summary: SupervisedBatchSummary = (&mut batch).await;
+        assert_eq!(summary.failed.len(), 1);
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "2 attempts = 1 retry");
+        start.elapsed()
+    }
+
+    let fast_elapsed = run_once(fast_base_ms, 0).await;
+    let default_elapsed = run_once(default_base_ms, 0).await;
+    assert!(
+        fast_elapsed < default_elapsed,
+        "configured backoff (base {fast_base_ms}ms → {fast_elapsed:?}) must be \
+         honored, not the default (base {default_base_ms}ms → {default_elapsed:?})"
+    );
+}
+
 /// BatchConfig with poll_budget=1: the minimum valid budget works.
 #[tokio::test(start_paused = true)]
 async fn test_batch_config_budget_one() {

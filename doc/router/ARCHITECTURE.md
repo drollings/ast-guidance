@@ -245,7 +245,21 @@ pub trait ChatBackend: Send + Sync {
         idle_timeout_ms: u64,
         total_timeout_ms: u64,
         filter_thinking: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<StreamResult, DispatchError>> + Send>>;
+    ) -> Pin<Box<dyn Future<Output = Result<StreamHandle, DispatchError>> + Send>> {
+        // No abort signal: delegates to stream_complete_with_abort with None.
+        self.stream_complete_with_abort(request, model, params, idle_timeout_ms,
+            total_timeout_ms, filter_thinking, None)
+    }
+    fn stream_complete_with_abort(
+        &self,
+        request: RouterRequest,
+        model: String,
+        params: Option<Value>,
+        idle_timeout_ms: u64,
+        total_timeout_ms: u64,
+        filter_thinking: bool,
+        abort: Option<fluent_concurrency::stream::StreamAbort>,
+    ) -> Pin<Box<dyn Future<Output = Result<StreamHandle, DispatchError>> + Send>>;
 }
 ```
 
@@ -261,9 +275,27 @@ route-resolution time by `RoutingConfig::all_dispatch_targets` from the
 route's group plus cross-group models, ordered by intelligence proximity to
 the request complexity (primary group first, cost as tie-break) — not backups
 for the classifier. Streaming flows through `StreamingHandler` over an
-`http_body_util` channel. Request bodies are built by the canonical
+`http_body_util` channel, wrapped in a `StreamBody` whose `Drop` fires a
+`StreamAbort` (see `dispatch/backend.rs`). `RetryBackend` and `BackendChain`
+**forward** the abort token unchanged — the wrapper-delegation rule — so a
+downstream abort reaches the transport through any retry/fallback layer.
+Request bodies are built by the canonical
 `fluent_llm::openai::build_openai_chat_body` (which carries the
 `chat_template_kwargs: {"enable_thinking": false}` default).
+
+**Abort propagation (streaming).** The body the router hands to the client is
+a `StreamBody` (a `Channel` receiver + `StreamAbort`); when the client stops
+consuming, hyper drops that body and the `StreamAbort` fires. The forwarding
+task `select!`s its upstream read *and* its `send_data` against the signal, so
+a downstream disconnect (a) drops the upstream `reqwest::Response` — closing
+the connection, which the llama-server fork reads as a slot interrupt — and
+(b) finalizes the `StreamAnswer` with whatever content streamed so far, so the
+ledger records the partial answer rather than a stub label. Because Coral
+Router is the process owner of the fleet, `dispatch_to_single_target` also
+arms a watcher on the same signal that issues an explicit `POST /abort`
+(`InstanceClient::abort`, `id_slot` from the target) to the owning server —
+belt-and-suspenders on top of the transport close, best-effort when the slot
+is no longer running.
 
 `dispatch/escalation/` owns the ladder runtime. After every local model in a
 `model_group` chain fails, `try_escalate` consults the deterministic
@@ -761,6 +793,18 @@ downgrades it back (never repeats work it already did). Enabled only when
 `ledger.background_tiering = true` — otherwise the lazy on-read derivation
 described above is unchanged.
 
+The tier feed is bounded: it is a `tokio::sync::mpsc` channel
+(`queue_capacity`, default 1024) plus a `CreditFlow` gate. The async producer
+path (`run_agent` step 5 → `enqueue_with_credit`) acquires a credit token
+before forwarding a `NodeId` — blocking while exhausted — and the worker
+releases a token after each processed node (`credit_receiver.recv()`), so a
+burst of agent turns cannot grow the feed without bound. Knobs:
+`ledger.tier_credit_limit` (default 256) and `ledger.tier_credit_more_after`
+(default 8). The store's synchronous write paths enqueue via the bounded
+channel's non-blocking `try_send` (skipping on a full feed; agent nodes are
+still covered by the credit-gated enqueue, and boot backfill catches
+stragglers).
+
 ### Prompt assembly (`ledger/prompt.rs`) — pure function object
 
 `LedgerPromptAssembler` builds a fidelity-budget-fit prompt from a session's
@@ -777,15 +821,24 @@ restore a KV snapshot (`KvSnapshotPolicy`: never / always / restore-if-same-mode
 or assemble the prompt → execute the LLM call (on a blocking task, session
 guard dropped — never held across the call) → record the exchange → snapshot
 the KV state (`advance_and_snapshot` → `SnapshotStore`) → enqueue a tier
-derivation → complete the step. `last_resident_model` is session-scoped (walks
-the session's own checkpoint-node index, not all sessions' nodes). Enabled
-only when `ledger.orchestrator.enabled = true`; config supplies the backend,
-adapter, prompt-budget, and snapshot policy. `node_plan` metadata on recorded
-nodes feeds a future workflow-learning replay.
+derivation (credit-gated, see above) → complete the step. `last_resident_model`
+is session-scoped (walks the session's own checkpoint-node index, not all
+sessions' nodes). Enabled only when `ledger.orchestrator.enabled = true`;
+config supplies the backend, adapter, prompt-budget, and snapshot policy.
+`node_plan` metadata on recorded nodes feeds a future workflow-learning replay.
+
+KV-affinity scheduling is an opt-in layer on the coordinator: setting
+`ledger.orchestrator.affinity_cap = <cap>` attaches an `AffinityScheduler`
+(bounded by `cap` concurrent agent turns) via
+`LedgerAgentCoordinator::build_affinity_scheduler(cap)` in
+`build_ledger_coordinator`. The scheduler marks each `run_agent` session as
+KV-affine (`affinity_session()`), giving its turns a priority bonus (minimize
+context switches) while starved sessions age up. `None` (default) leaves
+affinity bookkeeping off.
 
 Both opt-in layers reuse the shared primitives (`ContentNodeStore`,
 `SnapshotStore`, `DependencySession`/`CheckpointedStepGraph`, `Limiter`,
-`AffinityScheduler`) rather than adding a parallel store.
+`AffinityScheduler`, `CreditFlow`) rather than adding a parallel store.
 
 ## Logging: two-stream architecture
 

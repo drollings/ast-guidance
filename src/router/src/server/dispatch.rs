@@ -277,14 +277,60 @@ async fn dispatch_to_single_target(
     );
 
     if stream {
+        // The downstream abort signal: the body drop-guard fires it when the
+        // client stops consuming, and it is what (a) the forwarding task
+        // selects on to drop the upstream connection and (b) this watcher
+        // reacts to with an explicit management-plane abort.
+        let abort = fluent_concurrency::stream::StreamAbort::new();
+
+        // Approach C — the router is the process owner of the fleet, so on a
+        // downstream disconnect it also asks the owning server to stop the
+        // generation explicitly (belt-and-suspenders on top of the transport
+        // close the forwarding task performs on the same signal). Best-effort:
+        // a server that does not expose `/abort`, or a slot id that is not
+        // mid-generation, answers non-2xx and is logged and ignored.
+        if let Some(mgr) = deps
+            .instance_pool
+            .as_ref()
+            .and_then(|pool| pool.manager_for_url(&target.url))
+        {
+            let mgr = mgr.clone();
+            let abort_watch = abort.clone();
+            let model = target.model.clone();
+            let url = target.url.clone();
+            let id_slot = target.id_slot;
+            tokio::spawn(async move {
+                abort_watch.cancelled().await;
+                crate::audit::emit(
+                    "stream",
+                    serde_json::json!({
+                        "stage": "dispatch",
+                        "verdict": "aborted",
+                        "model": model,
+                        "url": url,
+                        "id_slot": id_slot,
+                    }),
+                );
+                if let Err(e) = mgr.abort_generation(id_slot).await {
+                    tracing::debug!(
+                        target: "router.dispatch",
+                        model = %model,
+                        error = %e,
+                        "management abort best-effort"
+                    );
+                }
+            });
+        }
+
         let result = backend
-            .stream_complete(
+            .stream_complete_with_abort(
                 router_request.clone(),
                 target.model.clone(),
                 params,
                 target.idle_timeout_ms,
                 target.total_timeout_ms,
                 target.filter_thinking,
+                Some(abort),
             )
             .await?;
         let mut resp = hyper::Response::new(result.body.boxed_unsync());

@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use crate::metrics::FailureClass;
@@ -8,7 +9,9 @@ use bytes::Bytes;
 use common_core::drain_sse_lines;
 use common_core::hash::uuid_v4;
 use fluent_concurrency::ladder::first_accept_in_order;
+use fluent_concurrency::stream::StreamAbort;
 use fluent_llm::HttpClass;
+use http_body::Frame;
 use serde_json::Value;
 
 use crate::dispatch::frontier::{DispatchError, OpenAiBackend};
@@ -19,15 +22,62 @@ use crate::types::{RouterRequest, RouterResponse};
 // Public types
 // ---------------------------------------------------------------------------
 
+/// The client-facing SSE response body. An `http_body_util::channel::Channel`
+/// receiver whose `Drop` fires the stream's [`StreamAbort`].
+///
+/// The body's lifetime is the single source of truth for "the consumer is
+/// gone": hyper drops it the moment it detects the client is no longer reading
+/// (its next socket write fails), and the forwarding task — which holds a clone
+/// of the same signal — reacts by dropping the upstream connection (and, via
+/// the dispatch layer, issuing a management-plane abort). Without this, the
+/// forwarding task would keep draining the upstream generation to the end.
+pub struct StreamBody {
+    inner: http_body_util::channel::Channel<Bytes, std::convert::Infallible>,
+    abort: StreamAbort,
+}
+
+impl Drop for StreamBody {
+    fn drop(&mut self) {
+        self.abort.cancel();
+    }
+}
+
+impl http_body::Body for StreamBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 /// Streaming result - a channel that receives SSE-formatted response data
-/// in a spawned background task.
-pub struct StreamResult {
+/// in a spawned background task, plus the abort surface shared by that task
+/// and the downstream body drop-guard.
+pub struct StreamHandle {
     pub model: String,
-    pub body: http_body_util::channel::Channel<Bytes, std::convert::Infallible>,
+    /// The body handed to the client; dropping it fires [`Self::abort`].
+    pub body: StreamBody,
     /// Best-effort finalization sink for the assembled answer text.
     /// The streaming task writes `filtered_content()` here when the stream
-    /// ends; `None` for backends/stubs that don't accumulate content.
+    /// ends (including on abort, so the ledger records the partial answer);
+    /// `None` for backends/stubs that don't accumulate content.
     pub answer: Option<crate::streaming::StreamAnswer>,
+    /// The cancellation signal: fires when the client stops consuming the
+    /// body, and is what the forwarding task and the management-abort watcher
+    /// wait on.
+    pub abort: StreamAbort,
 }
 
 // ---------------------------------------------------------------------------
@@ -47,6 +97,8 @@ pub trait ChatBackend: Send + Sync {
         filter_thinking: bool,
     ) -> Pin<Box<dyn Future<Output = Result<RouterResponse, DispatchError>> + Send>>;
 
+    /// Stream a completion with no abort signal. Delegates to
+    /// [`Self::stream_complete_with_abort`] with `None`.
     fn stream_complete(
         &self,
         request: RouterRequest,
@@ -55,7 +107,39 @@ pub trait ChatBackend: Send + Sync {
         idle_timeout_ms: u64,
         total_timeout_ms: u64,
         filter_thinking: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<StreamResult, DispatchError>> + Send>>;
+    ) -> Pin<Box<dyn Future<Output = Result<StreamHandle, DispatchError>> + Send>> {
+        self.stream_complete_with_abort(
+            request,
+            model,
+            params,
+            idle_timeout_ms,
+            total_timeout_ms,
+            filter_thinking,
+            None,
+        )
+    }
+
+    /// Stream a completion, optionally carrying the downstream abort signal.
+    ///
+    /// The `abort` token is the forward-facing cancellation: when the client
+    /// stops consuming the response body, the token fires, the backend drops
+    /// its upstream connection (the fork then interrupts the slot task), and
+    /// the dispatch layer may issue an explicit management-plane abort.
+    ///
+    /// Wrapper backends (`RetryBackend`, `BackendChain`) MUST forward this
+    /// token to the inner backend unchanged — the transparent-delegation rule
+    /// from the fluent-wvr wrapper pattern — so a downstream abort reaches the
+    /// transport regardless of how many retry/fallback layers sit in between.
+    fn stream_complete_with_abort(
+        &self,
+        request: RouterRequest,
+        model: String,
+        params: Option<Value>,
+        idle_timeout_ms: u64,
+        total_timeout_ms: u64,
+        filter_thinking: bool,
+        abort: Option<StreamAbort>,
+    ) -> Pin<Box<dyn Future<Output = Result<StreamHandle, DispatchError>> + Send>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -312,7 +396,7 @@ impl ChatBackend for OpenAiChatBackend {
         })
     }
 
-    fn stream_complete(
+    fn stream_complete_with_abort(
         &self,
         request: RouterRequest,
         model: String,
@@ -320,7 +404,8 @@ impl ChatBackend for OpenAiChatBackend {
         idle_timeout_ms: u64,
         total_timeout_ms: u64,
         filter_thinking: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<StreamResult, DispatchError>> + Send>> {
+        abort: Option<StreamAbort>,
+    ) -> Pin<Box<dyn Future<Output = Result<StreamHandle, DispatchError>> + Send>> {
         let url = dispatch_url(&self.endpoint_url);
         let client = self.client.clone();
         let model_for_task = model.clone();
@@ -376,10 +461,25 @@ impl ChatBackend for OpenAiChatBackend {
 
             let (mut tx, rx) = http_body_util::channel::Channel::new(32);
 
+            // The abort token. `Some` when the dispatch layer passed one in
+            // (it arms a management-plane abort on the same signal); a private
+            // one when a bare `stream_complete` caller is driving, so the body
+            // drop-guard still stops the upstream in that case too.
+            let abort = abort.unwrap_or_default();
+            // The body fires `abort` when hyper drops it (client gone); the
+            // body's lifetime is the single source of truth for that fact.
+            let body = StreamBody {
+                inner: rx,
+                abort: abort.clone(),
+            };
+
             // Assemble the streamed answer and finalize it when the stream
-            // ends so the handler can record it into the ledger + session step.
+            // ends (including on abort, so the ledger records the partial
+            // answer) so the handler can record it into the ledger + session
+            // step.
             let answer = crate::streaming::StreamAnswer::new();
             let answer_for_task = answer.clone();
+            let abort_for_task = abort.clone();
 
             tokio::spawn(async move {
                 let mut handler = StreamingHandler::new(&request_id, &model_for_task)
@@ -392,35 +492,54 @@ impl ChatBackend for OpenAiChatBackend {
                 };
 
                 loop {
-                    let chunk = match with_total_timeout(
-                        idle_timeout_ms,
-                        "idle timeout waiting for stream chunk",
-                        async {
-                            response
-                                .chunk()
-                                .await
-                                .map_err(|e| DispatchError::Http(e.to_string()))
+                    // Park point 1 — the upstream read, racing the downstream
+                    // abort. The idle timeout still bounds a stalled read; the
+                    // abort arm fires the moment the client's body is dropped
+                    // (`StreamBody::drop` -> cancel) and `return`s, dropping
+                    // `response` so the upstream connection closes and the
+                    // fork interrupts the slot's generation.
+                    let chunk = tokio::select! {
+                        res = with_total_timeout(
+                            idle_timeout_ms,
+                            "idle timeout waiting for stream chunk",
+                            async {
+                                response
+                                    .chunk()
+                                    .await
+                                    .map_err(|e| DispatchError::Http(e.to_string()))
+                            },
+                        ) => match res {
+                            Ok(Some(b)) => Some(b),
+                            Ok(None) => break,
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "router.dispatch",
+                                    model = %model_for_task,
+                                    error = %e,
+                                    error_class = FailureClass::from(&e).label(),
+                                    idle_timeout_ms = idle_timeout_ms,
+                                    "stream read error or idle timeout"
+                                );
+                                finalize(&handler);
+                                if sent_first_chunk {
+                                    let _ = tx.send_data(Bytes::from(handler.format_done())).await;
+                                }
+                                return;
+                            }
                         },
-                    )
-                    .await
-                    {
-                        Ok(Some(b)) => b,
-                        Ok(None) => break,
-                        Err(e) => {
-                            tracing::warn!(
+                        () = abort_for_task.cancelled() => {
+                            tracing::info!(
                                 target: "router.dispatch",
                                 model = %model_for_task,
-                                error = %e,
-                                error_class = FailureClass::from(&e).label(),
-                                idle_timeout_ms = idle_timeout_ms,
-                                "stream read error or idle timeout"
+                                "downstream disconnected - aborting upstream stream"
                             );
                             finalize(&handler);
-                            if sent_first_chunk {
-                                let _ = tx.send_data(Bytes::from(handler.format_done())).await;
-                            }
                             return;
                         }
+                    };
+
+                    let Some(chunk) = chunk else {
+                        continue;
                     };
 
                     for line in drain_sse_lines(&mut buf, &chunk) {
@@ -443,7 +562,15 @@ impl ChatBackend for OpenAiChatBackend {
                             if let Some(fr) = &delta.finish_reason {
                                 let s = handler.format_chunk(&delta.delta, Some(fr));
                                 if !s.is_empty() {
-                                    let _ = tx.send_data(Bytes::from(s)).await;
+                                    // Park point 2 — a blocked send is released
+                                    // with `Err` the moment hyper drops the
+                                    // receiver, so a dead client never wedges
+                                    // the task; treat a failed send as
+                                    // downstream-gone.
+                                    if tx.send_data(Bytes::from(s)).await.is_err() {
+                                        finalize(&handler);
+                                        return;
+                                    }
                                 }
                                 let _ = tx.send_data(Bytes::from(handler.format_done())).await;
                                 finalize(&handler);
@@ -461,7 +588,10 @@ impl ChatBackend for OpenAiChatBackend {
                                         "stream first chunk"
                                     );
                                 }
-                                let _ = tx.send_data(Bytes::from(s)).await;
+                                if tx.send_data(Bytes::from(s)).await.is_err() {
+                                    finalize(&handler);
+                                    return;
+                                }
                             }
                         }
                     }
@@ -472,10 +602,11 @@ impl ChatBackend for OpenAiChatBackend {
                 }
             });
 
-            Ok(StreamResult {
+            Ok(StreamHandle {
                 model,
-                body: rx,
+                body,
                 answer: Some(answer),
+                abort,
             })
         })
     }
@@ -538,7 +669,7 @@ impl ChatBackend for RetryBackend {
         })
     }
 
-    fn stream_complete(
+    fn stream_complete_with_abort(
         &self,
         request: RouterRequest,
         model: String,
@@ -546,7 +677,8 @@ impl ChatBackend for RetryBackend {
         idle_timeout_ms: u64,
         total_timeout_ms: u64,
         filter_thinking: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<StreamResult, DispatchError>> + Send>> {
+        abort: Option<StreamAbort>,
+    ) -> Pin<Box<dyn Future<Output = Result<StreamHandle, DispatchError>> + Send>> {
         let inner = self.inner.clone();
         let max_attempts = (self.retry_count + 1).max(1);
         let base_ms = self.retry_base_interval_s * 1000;
@@ -554,22 +686,27 @@ impl ChatBackend for RetryBackend {
         Box::pin(async move {
             // The streaming path applies the total-timeout on each connection
             // attempt; a connection that fails to open within the budget is
-            // retried like any other retryable failure.
+            // retried like any other retryable failure. The abort token is
+            // forwarded unchanged to the inner backend (a downstream abort
+            // cannot fire before a stream handle exists, so the retry loop is
+            // not resurrecting a dead stream).
             common_core::retry::retry_async(
                 max_attempts,
                 base_ms,
                 0,
                 DispatchError::is_retryable,
                 || async {
+                    let abort = abort.clone();
                     match tokio::time::timeout(
                         Duration::from_millis(total_timeout_ms),
-                        inner.stream_complete(
+                        inner.stream_complete_with_abort(
                             request.clone(),
                             model.clone(),
                             params.clone(),
                             idle_timeout_ms,
                             total_timeout_ms,
                             filter_thinking,
+                            abort,
                         ),
                     )
                     .await
@@ -660,7 +797,7 @@ impl ChatBackend for BackendChain {
         })
     }
 
-    fn stream_complete(
+    fn stream_complete_with_abort(
         &self,
         request: RouterRequest,
         model: String,
@@ -668,7 +805,8 @@ impl ChatBackend for BackendChain {
         idle_timeout_ms: u64,
         total_timeout_ms: u64,
         filter_thinking: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<StreamResult, DispatchError>> + Send>> {
+        abort: Option<StreamAbort>,
+    ) -> Pin<Box<dyn Future<Output = Result<StreamHandle, DispatchError>> + Send>> {
         let backends = self.backends.clone();
 
         Box::pin(async move {
@@ -678,15 +816,17 @@ impl ChatBackend for BackendChain {
                     let request = request.clone();
                     let model = model.clone();
                     let params = params.clone();
+                    let abort = abort.clone();
                     async move {
                         backend
-                            .stream_complete(
+                            .stream_complete_with_abort(
                                 request,
                                 model,
                                 params,
                                 idle_timeout_ms,
                                 total_timeout_ms,
                                 filter_thinking,
+                                abort,
                             )
                             .await
                             .map(Some)
@@ -769,7 +909,7 @@ mod tests {
             Box::pin(async move { result })
         }
 
-        fn stream_complete(
+        fn stream_complete_with_abort(
             &self,
             _request: RouterRequest,
             _model: String,
@@ -777,17 +917,23 @@ mod tests {
             _idle_timeout_ms: u64,
             _total_timeout_ms: u64,
             _filter_thinking: bool,
-        ) -> Pin<Box<dyn Future<Output = Result<StreamResult, DispatchError>> + Send>> {
+            _abort: Option<StreamAbort>,
+        ) -> Pin<Box<dyn Future<Output = Result<StreamHandle, DispatchError>> + Send>> {
             let mut guard = self.responses.lock().unwrap();
             let result = guard.remove(0);
             Box::pin(async move {
                 match result {
                     Ok(_) => {
+                        let abort = StreamAbort::new();
                         let (_, rx) = http_body_util::channel::Channel::new(32);
-                        Ok(StreamResult {
+                        Ok(StreamHandle {
                             model: "test".into(),
-                            body: rx,
+                            body: StreamBody {
+                                inner: rx,
+                                abort: abort.clone(),
+                            },
                             answer: None,
+                            abort,
                         })
                     }
                     Err(e) => Err(e),
@@ -1152,6 +1298,126 @@ mod tests {
         assert!(
             matches!(&err, DispatchError::InstanceGroupMiss { group } if group == "swarm"),
             "expected InstanceGroupMiss(swarm), got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Abort propagation tests
+    // -----------------------------------------------------------------------
+
+    /// A stub upstream that streams one SSE chunk and then holds the connection
+    /// open, recording whether the router closed it (the abort must drop the
+    /// upstream connection instead of draining the generation to the end).
+    #[tokio::test]
+    async fn stream_abort_drops_upstream_and_finalizes_partial_answer() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer_closed = Arc::new(AtomicBool::new(false));
+        let peer_closed_task = peer_closed.clone();
+
+        let _server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            {
+                let mut reader = BufReader::new(&mut stream);
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).await.is_err() {
+                    return;
+                }
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.is_err() {
+                        return;
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = line.to_lowercase().strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                if content_length > 0 && reader.read_exact(&mut body).await.is_err() {
+                    return;
+                }
+            } // drop the reader so the response can be written
+
+            // One SSE chunk, then keep the connection open (no last-chunk), so
+            // the router's forwarding task parks on the next `chunk()`.
+            let chunk1 = r#"data: {"id":"x","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n",
+                chunk1.len(),
+                chunk1,
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+            let _ = stream.flush().await;
+
+            // Detect the router closing the connection on abort.
+            let mut sink = [0u8; 64];
+            loop {
+                match stream.read(&mut sink).await {
+                    Ok(0) => {
+                        peer_closed_task.store(true, AtomicOrdering::SeqCst);
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let backend = OpenAiChatBackend::new(reqwest::Client::new(), format!("http://{addr}"));
+        let abort = StreamAbort::new();
+        let handle = backend
+            .stream_complete_with_abort(
+                make_test_request("hi"),
+                "m".into(),
+                None,
+                5000,
+                30000,
+                false,
+                Some(abort),
+            )
+            .await
+            .expect("stream connects");
+        assert!(!handle.abort.is_cancelled());
+
+        // Simulate the client abort: hyper drops the response body. The body
+        // drop-guard fires the signal, and the forwarding task closes the
+        // upstream connection.
+        drop(handle.body);
+        assert!(handle.abort.is_cancelled(), "body drop fires the abort signal");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !peer_closed.load(AtomicOrdering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("router closed the upstream connection on abort");
+
+        // The partial answer is finalized so the ledger records what was
+        // streamed before the abort rather than a stub label. Whether the
+        // first chunk was consumed before the abort is a scheduling race, so
+        // accept either the full partial content or (if the abort won the
+        // race) an empty-but-finalized answer — the load-bearing assertion is
+        // that `finalize` ran on the abort path at all.
+        let answer = handle.answer.as_ref().expect("answer present");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while answer.get().is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("partial answer finalized on abort");
+        let content = answer.get().expect("finalized on abort");
+        assert!(
+            content.is_empty() || content == "hello",
+            "partial answer must be a prefix of the streamed content, got: {content:?}"
         );
     }
 }

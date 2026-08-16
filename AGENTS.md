@@ -134,4 +134,6 @@ src/
   - ./src/fluent-wvr
   - ./src/fluent-concurrency
 
+* Removing suspected unused primitives from shared crates without specific user approval.  Do not ask for such approval without extensive code review.
+
 * Referencing transient roadmaps or milestones in documentation or comments

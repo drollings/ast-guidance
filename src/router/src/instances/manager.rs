@@ -130,6 +130,16 @@ impl InstanceManager {
         );
     }
 
+    /// Ask this model's server to stop the generation running in a slot.
+    /// Invoked on a downstream streaming disconnect (the abort arm of the
+    /// dispatch path), as belt-and-suspenders on top of the transport close:
+    /// the router is the process owner, so it can reach the owning server's
+    /// `/abort` directly. Best-effort — a non-running slot or an unreachable
+    /// server is logged and ignored.
+    pub async fn abort_generation(&self, id_slot: Option<i32>) -> Result<(), InstanceError> {
+        self.client.abort(id_slot).await
+    }
+
     /// The resident footprint of a plain (no-instance-grammar) managed model.
     ///
     /// The fork exposes no `/instances` for these servers, so Coral Router

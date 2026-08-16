@@ -777,6 +777,15 @@ pub struct LedgerConfig {
     /// Tier worker poll interval (ms).
     #[serde(default = "default_tier_poll_interval_ms")]
     pub tier_poll_interval_ms: u64,
+    /// Credit granted to the tier feed's producer up front: the max
+    /// outstanding `NodeId`s the async (credit-gated) enqueue path may have in
+    /// flight before it blocks, bounding a burst of agent turns. Default 256.
+    #[serde(default = "default_tier_credit_limit")]
+    pub tier_credit_limit: usize,
+    /// How many processed nodes the tier worker waits for before bumping
+    /// credit back to the producer. Default 8.
+    #[serde(default = "default_tier_credit_more_after")]
+    pub tier_credit_more_after: usize,
     /// Ledger-agent coordinator section. `enabled = true` opts the boot
     /// path into attaching a `LedgerAgentCoordinator` to the server so a
     /// request with a session + ledger runs through its synchronization loop
@@ -806,6 +815,14 @@ const fn default_tier_poll_interval_ms() -> u64 {
     100
 }
 
+const fn default_tier_credit_limit() -> usize {
+    256
+}
+
+const fn default_tier_credit_more_after() -> usize {
+    8
+}
+
 impl Default for LedgerConfig {
     fn default() -> Self {
         Self {
@@ -818,6 +835,8 @@ impl Default for LedgerConfig {
             lod5_max_chars: default_lod5_max_chars(),
             tier_batch_size: default_tier_batch_size(),
             tier_poll_interval_ms: default_tier_poll_interval_ms(),
+            tier_credit_limit: default_tier_credit_limit(),
+            tier_credit_more_after: default_tier_credit_more_after(),
             orchestrator: OrchestratorSection::default(),
         }
     }
@@ -842,6 +861,13 @@ pub struct OrchestratorSection {
     /// Default role recorded for agent output nodes.
     #[serde(default = "default_orchestrator_role")]
     pub role: String,
+    /// Optional concurrency cap for the coordinator's KV-affinity scheduler.
+    /// `Some(cap)` attaches an `AffinityScheduler` bounded by `cap` concurrent
+    /// agent turns: the active session's turns get a priority bonus (minimize
+    /// context switches) while starved sessions age up. `None` (the default)
+    /// leaves affinity bookkeeping off — existing deployments are untouched.
+    #[serde(default)]
+    pub affinity_cap: Option<usize>,
 }
 
 const fn default_orchestrator_prompt_budget_chars() -> usize {
@@ -859,6 +885,7 @@ impl Default for OrchestratorSection {
             kv_policy: crate::dag_session::KvSnapshotPolicy::RestoreIfSameModel,
             prompt_budget_chars: default_orchestrator_prompt_budget_chars(),
             role: default_orchestrator_role(),
+            affinity_cap: None,
         }
     }
 }

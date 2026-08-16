@@ -174,7 +174,7 @@ mod tests {
     use crate::types::{RouterMessage, RouterMessageContent, RouterRequest, RouterResponse};
     use crate::dag_session::{SessionStep, StepResult};
     use crate::dispatch::backend::ChatBackend;
-    use crate::dispatch::backend::StreamResult;
+    use crate::dispatch::backend::StreamHandle;
     use crate::testing::mock::TranscriptProvider;
     use fluent_types::ContextHit;
     use std::collections::VecDeque;
@@ -269,7 +269,7 @@ mod tests {
             Box::pin(async move { resp })
         }
 
-        fn stream_complete(
+        fn stream_complete_with_abort(
             &self,
             _request: RouterRequest,
             _model: String,
@@ -277,7 +277,8 @@ mod tests {
             _idle_timeout_ms: u64,
             _total_timeout_ms: u64,
             _filter_thinking: bool,
-        ) -> Pin<Box<dyn Future<Output = Result<StreamResult, DispatchError>> + Send>> {
+            _abort: Option<fluent_concurrency::stream::StreamAbort>,
+        ) -> Pin<Box<dyn Future<Output = Result<StreamHandle, DispatchError>> + Send>> {
             Box::pin(async move { Err(DispatchError::AllBackendsFailed) })
         }
     }

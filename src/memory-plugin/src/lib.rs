@@ -21,10 +21,8 @@ pub mod plugins;
 pub mod registry;
 pub mod traits;
 pub mod types;
-pub mod batch;
 
 pub use capability::MemoryCapability;
 pub use registry::MemoryPluginRegistry;
 pub use traits::{MemoryOps, MemoryPlugin};
 pub use types::*;
-pub use batch::MemoryBatch;

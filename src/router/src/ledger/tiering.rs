@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use fluent_concurrency::flow::{self, CreditReceiver, CreditSender, CreditSpec};
 use fluent_llm::client::ChatBackend;
 use fluent_llm::{ChatMessage, LlmError};
 use fluent_types::NodeId;
@@ -44,6 +45,14 @@ pub struct TierConfig {
     pub queue_capacity: usize,
     /// Max concurrent LLM derivations (the `Limiter` cap).
     pub max_concurrent: usize,
+    /// Credit granted to the feed's producer up front: the max outstanding
+    /// `NodeId`s the async (credit-gated) enqueue path may have in flight
+    /// before it blocks. The `CreditSender`'s `is_blocked()` reflects
+    /// exhaustion. Default 256.
+    pub credit_limit: usize,
+    /// How many processed nodes the consumer waits for before bumping credit
+    /// back to the producer (`flow::CreditSpec.more_after`). Default 8.
+    pub credit_more_after: usize,
 }
 
 impl Default for TierConfig {
@@ -55,6 +64,8 @@ impl Default for TierConfig {
             poll_interval_ms: 100,
             queue_capacity: 1024,
             max_concurrent: 8,
+            credit_limit: 256,
+            credit_more_after: 8,
         }
     }
 }
@@ -69,6 +80,9 @@ pub enum TierError {
     /// A transient backend error — re-enqueue with bounded retry.
     #[error("backend error: {0}")]
     Backend(#[from] LlmError),
+    /// The pending-node feed is closed (the worker has been torn down).
+    #[error("tier feed closed")]
+    FeedClosed,
 }
 
 /// A fully derived LOD4 + LOD5 pair for one node.
@@ -83,11 +97,17 @@ pub struct LedgerTierWorker {
     target_levels: Vec<u8>,
     config: TierConfig,
     runtime: Arc<dyn Runtime>,
-    /// The pending-node feed sender (exposed to the store via `set_tier_events`,
-    /// and reused for bounded re-enqueue).
-    sender: tokio::sync::mpsc::UnboundedSender<NodeId>,
+    /// The bounded pending-node feed sender (exposed to the store via
+    /// `set_tier_events`, and reused for bounded re-enqueue).
+    sender: tokio::sync::mpsc::Sender<NodeId>,
     /// The feed receiver, taken once by the background task at `start`.
-    receiver: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<NodeId>>>,
+    receiver: Mutex<Option<tokio::sync::mpsc::Receiver<NodeId>>>,
+    /// Credit gate for the async producer path (`enqueue_with_credit`): a
+    /// credit token is consumed per `NodeId` forwarded and returned when the
+    /// consumer processes the node (`recv()`), so a burst of agent turns
+    /// cannot grow the feed without bound.
+    credit: CreditSender,
+    credit_receiver: CreditReceiver,
     limiter: Arc<fluent_concurrency::pool::Limiter>,
     /// Bounded re-enqueue attempt counts (avoid infinite retry loops).
     retries: Mutex<HashMap<NodeId, u32>>,
@@ -107,7 +127,11 @@ impl LedgerTierWorker {
         config: TierConfig,
         runtime: Arc<dyn Runtime>,
     ) -> Arc<Self> {
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = tokio::sync::mpsc::channel(config.queue_capacity);
+        let (credit, credit_receiver) = flow::new(CreditSpec {
+            initial: config.credit_limit,
+            more_after: config.credit_more_after,
+        });
         let limiter = Arc::new(fluent_concurrency::pool::Limiter::new(
             config.max_concurrent.max(1),
         ));
@@ -119,6 +143,8 @@ impl LedgerTierWorker {
             runtime,
             sender,
             receiver: Mutex::new(Some(receiver)),
+            credit,
+            credit_receiver,
             limiter,
             retries: Mutex::new(HashMap::new()),
             max_retries: 3,
@@ -134,14 +160,58 @@ impl LedgerTierWorker {
 
     /// The pending-node feed sender; attach to the store via
     /// `store.set_tier_events(worker.sender())`.
-    pub fn sender(&self) -> tokio::sync::mpsc::UnboundedSender<NodeId> {
+    pub fn sender(&self) -> tokio::sync::mpsc::Sender<NodeId> {
         self.sender.clone()
     }
 
     /// Enqueue a node for background derivation (also used for bounded
-    /// re-enqueue of transient failures).
+    /// re-enqueue of transient failures). Non-blocking: on a full feed it
+    /// skips with a debug log — the credit-gated `enqueue_with_credit` path
+    /// (agent turns) and the next boot backfill cover the stragglers.
     pub fn enqueue(&self, id: NodeId) {
-        let _ = self.sender.send(id);
+        match self.sender.try_send(id) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                tracing::debug!(
+                    target: "router.ledger.tier",
+                    node_id = id.as_int(),
+                    "tier feed full - skipping enqueue",
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!(
+                    target: "router.ledger.tier",
+                    node_id = id.as_int(),
+                    "tier feed closed - skipping enqueue",
+                );
+            }
+        }
+    }
+
+    /// Enqueue a node with chain backpressure: acquires a credit token
+    /// (blocking while exhausted) before forwarding the `NodeId`, so a burst
+    /// of agent turns cannot grow the feed without bound. The consumer
+    /// releases the token via `recv()` after processing each node.
+    ///
+    /// `Err(FeedClosed)` when the feed is closed (the worker is torn down) —
+    /// the caller logs and continues; the node's tiers are filled by the next
+    /// boot backfill.
+    pub async fn enqueue_with_credit(&self, id: NodeId) -> Result<(), TierError> {
+        self.credit
+            .send(|| async {
+                self.sender
+                    .send(id)
+                    .await
+                    .map_err(|_| TierError::FeedClosed)
+            })
+            .await
+    }
+
+    /// Whether the credit-gated producer is currently blocked waiting for a
+    /// credit bump (i.e. the feed is saturated and the consumer has not yet
+    /// processed enough nodes).
+    pub fn producer_blocked(&self) -> bool {
+        self.credit.is_blocked()
     }
 
     /// The target LOD levels this worker derives.
@@ -166,7 +236,7 @@ impl LedgerTierWorker {
         }))
     }
 
-    async fn run(self: Arc<Self>, mut receiver: tokio::sync::mpsc::UnboundedReceiver<NodeId>) {
+    async fn run(self: Arc<Self>, mut receiver: tokio::sync::mpsc::Receiver<NodeId>) {
         // Boot backfill: any existing node missing its target tiers.
         for id in self.store.node_ids_needing_tier(&self.target_levels) {
             self.enqueue(id);
@@ -233,6 +303,10 @@ impl LedgerTierWorker {
                     still_needs.push(id);
                 }
             }
+            // Release the producer's credit token: this node has been fully
+            // processed (derived, degraded, or retried), so the credit-gated
+            // producer may forward the next one.
+            self.credit_receiver.recv();
         }
 
         // Bounded re-enqueue for nodes still missing tiers.
@@ -710,6 +784,76 @@ mod tests {
             worker.metrics().count() > 0,
             "tier derivation must record a latency observation"
         );
+        handle.abort();
+    }
+
+    /// Chain backpressure: with `credit_limit=1` the credit-gated producer
+    /// (`enqueue_with_credit`) blocks once the token is consumed, and the
+    /// consumer's `recv()` after processing a node releases it. The store's
+    /// sync enqueue feed is deliberately NOT attached so the credit accounting
+    /// is isolated from it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enqueue_with_credit_blocks_then_releases() {
+        let store = temp_store();
+        let backend: Arc<dyn ChatBackend> = repeating(
+            "SUMMARY: short summary here\nDESCRIPTION: a description",
+            32,
+        );
+        let cfg = TierConfig {
+            credit_limit: 1,
+            credit_more_after: 1,
+            poll_interval_ms: 5,
+            batch_size: 1,
+            ..Default::default()
+        };
+        let worker = LedgerTierWorker::new(
+            Arc::clone(&store),
+            backend,
+            vec![4, 5],
+            cfg,
+            fluent_concurrency::tokio_runtime(),
+        );
+        let id1 = store
+            .record_request("sess", "r1", "first node to derive")
+            .unwrap();
+        let id2 = store
+            .record_request("sess", "r2", "second node to derive")
+            .unwrap();
+
+        // First enqueue consumes the single credit token.
+        worker.enqueue_with_credit(id1).await.unwrap();
+        assert!(!worker.producer_blocked(), "credit available -> not blocked");
+
+        // Second enqueue must block: credit exhausted and the worker (not yet
+        // started) cannot process anything to release it.
+        let w = Arc::clone(&worker);
+        let blocked = tokio::spawn(async move { w.enqueue_with_credit(id2).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !blocked.is_finished(),
+            "producer must block while credit is exhausted"
+        );
+        assert!(
+            worker.producer_blocked(),
+            "is_blocked() reflects the exhausted credit"
+        );
+
+        // Starting the worker lets it process id1; the consumer's recv()
+        // releases the token, the blocked enqueue forwards id2, and the worker
+        // derives it.
+        let handle = worker.start();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if store.snapshot(id2).is_some_and(|n| !n.lod[4].is_empty()) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "id2 never derived after credit release"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        blocked.await.unwrap().unwrap();
         handle.abort();
     }
 }

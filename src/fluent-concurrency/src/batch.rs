@@ -57,6 +57,14 @@ pub struct SupervisedBatchConfig {
     /// SupervisedBatch units wrap genuinely transient failures in
     /// `WorkError::Execution` (e.g. chart targets whose LLM call failed).
     pub is_retryable: fn(&WorkError) -> bool,
+    /// Base delay (ms) of the jittered-exponential backoff between retry
+    /// attempts, forwarded to `common_core::retry::retry_async` as `base_ms`.
+    /// Default `100` — the schedule before this was configurable.
+    pub backoff_base_ms: u64,
+    /// Jitter of the backoff, forwarded to
+    /// `common_core::retry::retry_async` as `jitter_pct`: a percentage (0–100)
+    /// of the current backoff delay added on top of it. Default `50`.
+    pub backoff_jitter_ms: u64,
 }
 
 impl PartialEq for SupervisedBatchConfig {
@@ -65,6 +73,8 @@ impl PartialEq for SupervisedBatchConfig {
         // addresses are not guaranteed unique, so equality compares the
         // numeric tuning only.
         self.poll_budget == other.poll_budget
+            && self.backoff_base_ms == other.backoff_base_ms
+            && self.backoff_jitter_ms == other.backoff_jitter_ms
     }
 }
 
@@ -75,6 +85,8 @@ impl Default for SupervisedBatchConfig {
         Self {
             poll_budget: 64,
             is_retryable: WorkError::is_retryable,
+            backoff_base_ms: 100,
+            backoff_jitter_ms: 50,
         }
     }
 }
@@ -196,9 +208,20 @@ impl SupervisedBatch {
         let max_retries = ctx.max_retries;
         let timeout_ms = ctx.timeout_ms;
         let is_retryable = self.config.is_retryable;
+        let backoff_base_ms = self.config.backoff_base_ms;
+        let backoff_jitter_ms = self.config.backoff_jitter_ms;
 
         let abort = self.join_set.spawn(async move {
-            execute_with_timeout_and_retry(unit, ctx, max_retries, timeout_ms, is_retryable).await
+            execute_with_timeout_and_retry(
+                unit,
+                ctx,
+                max_retries,
+                timeout_ms,
+                is_retryable,
+                backoff_base_ms,
+                backoff_jitter_ms,
+            )
+            .await
         });
 
         let id = abort.id();
@@ -344,6 +367,8 @@ async fn execute_with_timeout_and_retry(
     max_retries: u32,
     timeout_ms: u64,
     is_retryable: fn(&WorkError) -> bool,
+    backoff_base_ms: u64,
+    backoff_jitter_ms: u64,
 ) -> Result<WorkOutput, WorkError> {
     // Yield to allow pending abort signals to be processed before
     // executing the synchronous work unit body.
@@ -351,8 +376,8 @@ async fn execute_with_timeout_and_retry(
     let fut = async {
         common_core::retry::retry_async(
             max_retries.saturating_add(1).max(1),
-            100,
-            50,
+            backoff_base_ms,
+            backoff_jitter_ms as u32,
             is_retryable,
             || async {
                 // Allow abort signals to be processed before each attempt.

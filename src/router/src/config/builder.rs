@@ -689,6 +689,8 @@ impl RouterConfig {
             lod5_max_chars: ledger.lod5_max_chars,
             batch_size: ledger.tier_batch_size,
             poll_interval_ms: ledger.tier_poll_interval_ms,
+            credit_limit: ledger.tier_credit_limit,
+            credit_more_after: ledger.tier_credit_more_after,
             ..Default::default()
         })
     }
@@ -721,7 +723,7 @@ impl RouterConfig {
             lod_spec: crate::ledger::prompt::LodSpec::full(),
             role: section.role,
         };
-        Some(crate::ledger::orchestrator::LedgerAgentCoordinator::new(
+        let mut coordinator = crate::ledger::orchestrator::LedgerAgentCoordinator::new(
             store,
             sessions,
             kv,
@@ -729,7 +731,21 @@ impl RouterConfig {
             crate::ledger::prompt::LedgerPromptAssembler,
             backend,
             config,
-        ))
+        );
+        // Opt-in KV-affinity scheduler: when `affinity_cap` is set, attach an
+        // `AffinityScheduler` so the active session's turns get a priority
+        // bonus (minimize context switches) while starved sessions age up.
+        if let Some(cap) = section.affinity_cap {
+            tracing::info!(
+                target: "router.config",
+                affinity_cap = cap,
+                "ledger-agent KV-affinity scheduler attached",
+            );
+            coordinator = coordinator.with_affinity(
+                crate::ledger::orchestrator::LedgerAgentCoordinator::build_affinity_scheduler(cap),
+            );
+        }
+        Some(coordinator)
     }
 
     /// Build the target-matching ladder's per-candidate backend set (DIP -

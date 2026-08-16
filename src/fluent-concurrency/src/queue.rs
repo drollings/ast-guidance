@@ -1,6 +1,12 @@
 //! A priority queue with a fast path for zero-priority items.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
+use tokio::sync::Notify;
+
+use crate::pool::PoolError;
 
 /// A priority queue combining O(1) fast path for priority-0 items
 /// with a `BTreeMap`-backed ordered queue for non-zero priorities.
@@ -141,5 +147,112 @@ impl<T> PriorityQueue<T> {
 impl<T> Default for PriorityQueue<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// A bounded, concurrent priority queue with close-wakes-waiters semantics.
+///
+/// Mirrors `crate::pool::Queue` (the FIFO bounded queue): same
+/// close-wakes-waiters discipline, same anti-missed-wakeup pattern (register
+/// `notified()` *before* taking the lock), same `std::sync::Mutex` backing
+/// (never held across an await — the async mutex's waker bookkeeping would be
+/// pure overhead). The only difference is the ordering: items are popped by
+/// [`PriorityQueue`]'s priority order (descending, FIFO within a priority,
+/// priority-0 fast path). Keep this type in sync with `Queue` when either
+/// changes the close/wake discipline.
+///
+/// Ordering (LSP): identical to `PriorityQueue` — priority desc, FIFO within
+/// priority, priority-0 fast path.
+pub struct BoundedPriorityQueue<T> {
+    inner: Mutex<PriorityQueue<T>>,
+    capacity: usize,
+    closed: AtomicBool,
+    notify: Notify,
+    space_notify: Notify,
+}
+
+impl<T: Send + 'static> BoundedPriorityQueue<T> {
+    /// Creates a new bounded priority queue with the given capacity.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inner: Mutex::new(PriorityQueue::new()),
+            capacity,
+            closed: AtomicBool::new(false),
+            notify: Notify::new(),
+            space_notify: Notify::new(),
+        }
+    }
+
+    /// Pushes an item with the given priority. Returns `Err(Full)` if at
+    /// capacity, `Err(Closed)` if closed. Synchronous fast path.
+    pub fn push(&self, item: T, priority: i32) -> Result<(), PoolError> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(PoolError::Closed);
+        }
+        let mut inner = common_core::sync::lock(&self.inner);
+        if inner.len() >= self.capacity {
+            return Err(PoolError::Full);
+        }
+        inner.push(item, priority);
+        self.notify.notify_one();
+        Ok(())
+    }
+
+    /// Pushes an item, waiting if the queue is at capacity.
+    /// Returns `Err(Closed)` if the queue is closed before space becomes available.
+    pub async fn push_wait(&self, item: T, priority: i32) -> Result<(), PoolError> {
+        let mut item = Some(item);
+        loop {
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(PoolError::Closed);
+            }
+            let waited = self.space_notify.notified();
+            {
+                let mut inner = common_core::sync::lock(&self.inner);
+                if inner.len() < self.capacity {
+                    inner.push(item.take().unwrap(), priority);
+                    self.notify.notify_one();
+                    return Ok(());
+                }
+            }
+            waited.await;
+        }
+    }
+
+    /// Pops the highest-priority item, awaiting if empty. Returns `None`
+    /// when closed and empty. Frees a blocked `push_wait` submitter on pop
+    /// (the same shape as `Queue::pop`).
+    pub async fn pop(&self) -> Option<T> {
+        loop {
+            let notified = self.notify.notified();
+            {
+                let mut inner = common_core::sync::lock(&self.inner);
+                if let Some(item) = inner.pop() {
+                    self.space_notify.notify_one();
+                    return Some(item);
+                }
+                if self.closed.load(Ordering::SeqCst) {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// Closes the queue, waking all waiters. Subsequent `pop`s return `None`.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+        self.space_notify.notify_waiters();
+    }
+
+    /// Returns the number of items currently queued.
+    pub fn len(&self) -> usize {
+        common_core::sync::lock(&self.inner).len()
+    }
+
+    /// Returns true if the queue holds no items.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }

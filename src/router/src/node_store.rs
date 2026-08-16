@@ -63,8 +63,9 @@ pub struct ContentNodeStore {
     /// `LedgerTierWorker` drains to fill LOD4/LOD5. `None` (the default) leaves
     /// today's behavior — a store with no attached worker is byte-identical to
     /// before. `Mutex` for interior mutability so it can be attached after the
-    /// store is `Arc`-shared.
-    tier_events: Mutex<Option<tokio::sync::mpsc::UnboundedSender<NodeId>>>,
+    /// store is `Arc`-shared. The bounded channel (not an unbounded one) is the
+    /// memory bound for a burst of writes faster than the worker can derive.
+    tier_events: Mutex<Option<tokio::sync::mpsc::Sender<NodeId>>>,
 }
 
 impl ContentNodeStore {
@@ -136,17 +137,37 @@ impl ContentNodeStore {
     /// (`insert_node`, `record_result`) enqueue any node whose LOD4/LOD5 is
     /// empty so the background `LedgerTierWorker` can fill them. A store with
     /// no sender keeps today's behavior (opt-in).
-    pub fn set_tier_events(&self, sender: tokio::sync::mpsc::UnboundedSender<NodeId>) {
+    pub fn set_tier_events(&self, sender: tokio::sync::mpsc::Sender<NodeId>) {
         *lock(&self.tier_events) = Some(sender);
     }
 
     /// Enqueue `node_id` on the tier-event feed if its LOD4 or LOD5 is empty
-    /// and a sender is attached. No-op when no sender is attached.
+    /// and a sender is attached. No-op when no sender is attached. The
+    /// synchronous write path cannot await a credit bump, so it uses the
+    /// bounded channel's non-blocking `try_send`; a full feed skips the
+    /// enqueue (agent nodes are still covered by `run_agent`'s credit-gated
+    /// `enqueue_with_credit`, and the next boot backfill catches stragglers).
     fn enqueue_if_needs_tier(&self, node_id: NodeId) {
         let sender = lock(&self.tier_events).clone();
         if let Some(sender) = sender {
             if self.needs_tier(node_id) {
-                let _ = sender.send(node_id);
+                match sender.try_send(node_id) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        tracing::debug!(
+                            target: "router.ledger.tier",
+                            node_id = node_id.as_int(),
+                            "tier feed full - skipping sync enqueue",
+                        );
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::warn!(
+                            target: "router.ledger.tier",
+                            node_id = node_id.as_int(),
+                            "tier feed closed - skipping sync enqueue",
+                        );
+                    }
+                }
             }
         }
     }
