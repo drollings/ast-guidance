@@ -116,6 +116,7 @@ classifier output, the expected route, and a canned dispatch response:
 | `user_message` | yes | Exact user message text — lookup key |
 | `classifier_response` | yes | JSON string matching `ClassifierOutput` schema |
 | `expected_route` | no | Route name the request must be dispatched to (null if rejected) |
+| `expect_model_group` | no | `model_groups` name the target must have dispatched through (intent→model_group check) |
 | `dispatch_response` | no | Canned response from the target model |
 | `rejected` | no | `true` if the pipeline should reject this request |
 | `reject_reason_contains` | no | Substring expected in the rejection reason |
@@ -136,7 +137,7 @@ cargo run -p coral-router -- start --config env/coral-router.json
 ```sh
 curl -s -X POST http://127.0.0.1:8079/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"fast","messages":[{"role":"user","content":"What is 2+2?"}]}'
+  -d '{"model":"local","messages":[{"role":"user","content":"What is 2+2?"}]}'
 # → {"choices":[{"message":{"content":"2 + 2 = 4",...}}],...}
 ```
 
@@ -144,15 +145,31 @@ curl -s -X POST http://127.0.0.1:8079/v1/chat/completions \
 
 Mock mode validates after each request:
 - **Route match**: the pipeline's `routing_target` must match `expected_route`
+- **Model-group match**: the resolved `routing_target.group` must equal `expect_model_group`
 - **Rejection match**: if `rejected: true`, the pipeline must reject with a reason containing `reject_reason_contains`
 - **Dispatch interception**: instead of calling an actual model, the server returns `dispatch_response` directly
 
 Failures are collected in memory during server operation.
 
-## Manual smoke tests
+## Config-synced integration tests (replaces the former curl smoke suite)
+
+`make router-mock` runs the in-crate suite in `config_route_tests.rs` instead of
+the old `bin/router-mock-tests.sh` shell smoke checks (which drifted from the
+config — it hardcoded model names like `fast`/`tiny` that no longer exist).
+The suite is derived from `env/coral-router.json` at runtime, so it cannot fall
+out of sync:
+
+- `config_route_groups_resolve_to_models` — every route's `group` names a
+  non-empty `model_groups` ladder of declared models.
+- `route_intents_dispatch_to_their_model_groups` — boots an in-process mock
+  server, probes every route (intent), and asserts the router's own route +
+  model-group validation records zero mismatches (HTTP 200 + canned answer).
+- `mock_transcript_fixture_stays_synced_with_config` — `env/mock-transcripts.json`
+  (the `--mock` binary's fixture) must not reference a route/model the config
+  no longer declares.
 
 ```sh
-make router-mock   # 18 curl smoke tests against live server
+make router-mock
 ```
 
 ## Adding a new test case

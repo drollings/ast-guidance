@@ -24,15 +24,12 @@ CORAL_ROUTER_CONFIG := env/coral-router.json
 # fallback when the config is unreadable at parse time.
 CORAL_ROUTER_BIND_ADDR := $(shell python3 -c "import json; print(json.load(open('$(CORAL_ROUTER_CONFIG)'))['server']['bind_addr'])" 2>/dev/null || echo "127.0.0.1:8079")
 CORAL_ROUTER_HEALTH_URL := http://$(CORAL_ROUTER_BIND_ADDR)/health
-CORAL_ROUTER_MOCK_HEALTH_URL := http://127.0.0.1:8078/health
 # How long to poll /health after (re)starting the router. Real mode spawns
 # managed llama-servers at boot, so the default is generous; override with
 # ROUTER_START_TIMEOUT_S=<n>. Mock mode skips supervision and boots fast.
 ROUTER_START_TIMEOUT_S ?= 300
-ROUTER_MOCK_TIMEOUT_S ?= 30
 ROUTER_WAIT_SCRIPT := bin/router-wait-health.sh
 ROUTER_LOG := /tmp/coral-router.out
-ROUTER_MOCK_LOG := /tmp/coral-router-mock.out
 CONFIG      := .guidance/guidance-config.json
 INSTALLDIR  := $(HOME)/.local/bin
 
@@ -207,8 +204,6 @@ router-test-all: $(CORAL_ROUTER_BIN) ## router-test + coral-context HNSW benchma
 	$(Q)echo "Validating coral-router --help"
 	$(Q)$(CORAL_ROUTER_BIN) --help > /dev/null && echo "All router tests passed." || echo "ERRROR: coral-router did NOT successfully run."
 
-ROUTER_MOCK_TEST_SCRIPT := bin/router-mock-tests.sh
-
 .PHONY: router-start
 router-start: $(CORAL_ROUTER_BIN) ## Build (if needed), (re)start coral-router in real mode on :8079, and wait for /health (stops the old tree first)
 	$(stop-router)
@@ -217,11 +212,10 @@ router-start: $(CORAL_ROUTER_BIN) ## Build (if needed), (re)start coral-router i
 	$(Q)bash $(ROUTER_WAIT_SCRIPT) $(CORAL_ROUTER_HEALTH_URL) $(ROUTER_START_TIMEOUT_S) $(ROUTER_LOG)
 
 .PHONY: router-mock
-router-mock: $(CORAL_ROUTER_BIN) $(ROUTER_MOCK_TEST_SCRIPT) ## Build, start a mock router on :8078, run the 29 curl smoke-tests (leaves that server running)
+router-mock: ## Run the config-synced routing integration tests (intent -> model_group, derived from env/coral-router.json; replaces the former bin/router-mock-tests.sh curl smoke suite)
 	$(stop-router)
-	$(Q)nohup $(CORAL_ROUTER_BIN) start -c $(CORAL_ROUTER_CONFIG) --host 127.0.0.1 --port 8078 --mock env/mock-transcripts.json > $(ROUTER_MOCK_LOG) 2>&1 &
-	$(Q)bash $(ROUTER_WAIT_SCRIPT) $(CORAL_ROUTER_MOCK_HEALTH_URL) $(ROUTER_MOCK_TIMEOUT_S) $(ROUTER_MOCK_LOG)
-	$(Q)ROUTER_BASE_URL=http://127.0.0.1:8078 bash $(ROUTER_MOCK_TEST_SCRIPT)
+	$(Q)echo "Running config-synced routing integration tests (intent -> model_group)"
+	$(Q)cargo test -p fluent-router config_route_tests -- --nocapture
 
 # ── Standard Targets ──────────────────────────────────────────────────────────
 

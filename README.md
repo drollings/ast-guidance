@@ -125,8 +125,8 @@ cargo clippy --workspace -- -D warnings
 ```
 
 Coral Router's own loop: `make router` (build), `make router-start` (build and
-restart on `:8079`), `make router-test` (tests), `make router-mock` (mock
-server + smoke checks).
+restart on `:8079`), `make router-test` (tests), `make router-mock`
+(config-synced routing integration tests, derived from `env/coral-router.json`).
 
 ## Projects
 

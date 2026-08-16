@@ -21,14 +21,17 @@ is the priority.
 2. **TEST** — `make router-test` runs the fluent-router unit/golden/e2e suites
    and a `--help` dry-run of the built binary.
 
-3. **SMOKE** — `make router-mock` runs a standalone mock server on `:8078` and
-   the 29 curl smoke checks, then leaves that server running. Spot-check a live
-   server:
+3. **SMOKE** — `make router-mock` runs the config-synced routing integration
+   tests in `fluent-router` (`src/router/src/config_route_tests.rs`): every
+   intent/route declared in `env/coral-router.json` is probed against an
+   in-process mock server and must dispatch through the `model_group` its
+   `routes` entry maps to. Expectations are derived from the config at runtime,
+   so the suite cannot drift from it. Spot-check a live server:
    ```
    curl -s http://127.0.0.1:8079/health
    curl -s -X POST http://127.0.0.1:8079/v1/chat/completions \
      -H "Content-Type: application/json" \
-     -d '{"model":"fast","messages":[{"role":"user","content":"What is 2+2?"}]}'
+     -d '{"model":"local","messages":[{"role":"user","content":"What is 2+2?"}]}'
    ```
 
 4. **VERIFY** — the full gate before landing:
@@ -66,7 +69,8 @@ is the priority.
   `ROUTER_START_TIMEOUT_S` (default 300s) for `/health` and fails loudly with
   the log tail on timeout.
 - `--mock` mode skips supervision entirely (canned dispatch needs no real
-  model), so `router-mock` boots fast and is independent of `router-start`.
+  model), so the config-synced routing suite boots fast in-process and is
+  independent of `router-start`.
 
 ## Make targets
 
@@ -76,7 +80,7 @@ is the priority.
 | `make router-start` | Build + (re)start on `:8079`, waiting for `/health` (kills old tree first) |
 | `make router-test` | Kill server + fluent-router unit/golden/e2e tests + `--help` dry-run |
 | `make router-test-all` | `router-test` + coral-context HNSW benchmarks (slow) |
-| `make router-mock` | Standalone mock server on `:8078` + 29 curl smoke tests; leaves server running |
+| `make router-mock` | Config-synced routing integration tests (intent → model_group, derived from `env/coral-router.json`) |
 
 ## Import boundaries
 

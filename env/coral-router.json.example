@@ -24,37 +24,6 @@
         "params": { "temperature": 0.4 }
     },
     "models": {
-        "lfm2.5-350m": {
-            "endpoint": "http://localhost:8080/v1/chat/completions",
-            "name": "liquidai/lfm2.5-350m",
-            "weights": "/app/ai/models/gguf/liquidai/lfm2.5-350m-gguf/latest.gguf",
-            "intelligence": 2,
-            "cost_input": 1e-06,
-            "cost_output": 6e-06,
-            "cost_cached_read": 4e-07,
-            "speed": 8,
-            "total_timeout_ms": 50000,
-            "idle_timeout_ms": 3000,
-            "stream": true,
-            "filter_thinking": true,
-            "retry_count": 2,
-            "retry_base_interval_s": 1
-        },
-        "lfm2.5-1.2b": {
-            "endpoint": "http://localhost:8080/v1/chat/completions",
-            "name": "unsloth/lfm2.5-1.2b-instruct",
-            "intelligence": 1,
-            "cost_input": 1e-06,
-            "cost_output": 6e-06,
-            "cost_cached_read": 4e-07,
-            "speed": 8,
-            "total_timeout_ms": 40000,
-            "idle_timeout_ms": 8000,
-            "stream": true,
-            "filter_thinking": true,
-            "retry_count": 2,
-            "retry_base_interval_s": 1
-        },
         "lfm2.5-2.6b": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
             "name": "abiray/lfm2.5-2.6b-heretic-abliterated",
@@ -115,8 +84,8 @@
         },
         "gemma4-12b": {
             "endpoint": "http://localhost:8080/v1/chat/completions",
-            "name": "mradermacher/limn-alpha-12b-i1",
-            "weights": "/app/ai/models/gguf/mradermacher/limn-alpha-12b-i1-gguf/iq4_xs.gguf",
+            "name": "unsloth/gemma-4-12b-it",
+            "weights": "/app/ai/models/gguf/unsloth/gemma-4-12b-it-gguf/latest.gguf",
             "intelligence": 4,
             "cost_input": 3e-06,
             "cost_output": 1.8e-05,
@@ -225,7 +194,7 @@
             "qwen3.6-27b"
         ],
         "prose": [
-            "qwen3.6-27b"
+            "nyx-rp-mini"
         ],
         "science": [
             "qwen3.6-27b"

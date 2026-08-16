@@ -65,6 +65,8 @@ mod server_tests;
 #[cfg(test)]
 mod stage_tests;
 #[cfg(test)]
+mod config_route_tests;
+#[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]
 pub(crate) mod test_stubs;

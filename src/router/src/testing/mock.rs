@@ -85,6 +85,13 @@ pub struct MockTranscriptEntry {
     pub classifier_response: String,
     #[serde(default)]
     pub expected_route: Option<String>,
+    /// When set, the resolved routing target must have dispatched through this
+    /// `model_groups` name (i.e. `RoutingTarget.group` equals it). This is the
+    /// intent→model_group assertion hook for the config-synced integration
+    /// tests: `expected_route` proves the *route* resolved, this proves the
+    /// dispatch went through the *group* the route maps to in the config.
+    #[serde(default)]
+    pub expect_model_group: Option<String>,
     #[serde(default)]
     pub dispatch_response: Option<String>,
     #[serde(default)]
@@ -181,6 +188,23 @@ impl MockDispatchContext {
 
         if let Err(msg) = result {
             lock(&self.failures).push(msg);
+        }
+
+        // Independent model-group check: when the entry declares the expected
+        // `model_groups` name, verify the resolved target was dispatched
+        // through exactly that group (intent → model_group, config-derived).
+        if let (Some(expected_group), Some(actual)) = (&entry.expect_model_group, routing_target) {
+            let actual_group = actual.group.as_deref().unwrap_or("");
+            if actual_group != expected_group {
+                lock(&self.failures).push(format!(
+                    "group mismatch for '{}': expected model_group '{}', got '{}' (route={}, model={})",
+                    entry.user_message,
+                    expected_group,
+                    actual_group,
+                    actual.target_name.as_deref().unwrap_or(""),
+                    actual.model,
+                ));
+            }
         }
     }
 

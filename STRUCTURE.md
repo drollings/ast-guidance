@@ -46,7 +46,6 @@ Then you you must read
 ├── bin/
 │   ├── coral-router-test.py  # #!/usr/bin/env python3
 │   ├── gen_simhash_projections.py  # #!/usr/bin/env python3
-│   ├── router-mock-tests.sh
 │   └── router-wait-health.sh
 ├── data/
 │   └── yamake.json
