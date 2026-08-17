@@ -46,3 +46,6 @@ pub mod sync {
     pub mod json_writer;
     pub mod staleness;
 }
+
+#[cfg(test)]
+mod tests;

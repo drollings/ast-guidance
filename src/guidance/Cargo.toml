@@ -32,6 +32,10 @@ dirs = { workspace = true }
 [dev-dependencies]
 httpmock = { workspace = true }
 fluent-wvr-testutil = { path = "../fluent-wvr-testutil" }
+tempfile = { workspace = true }
+
+[features]
+live-ai = []
 
 [lints]
 workspace = true

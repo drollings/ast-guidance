@@ -101,6 +101,7 @@ impl LlmFilterBackend for NoopLlmFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::common::make_test_doc;
     use fluent_types::{GuidanceDoc, Member, MemberType, Meta};
 
     #[test]
@@ -109,9 +110,8 @@ mod tests {
 
         let doc = GuidanceDoc {
             meta: Meta {
-                module: "test".into(),
                 source: "test.zig".into(),
-                language: "zig".into(),
+                ..make_test_doc().meta
             },
             members: vec![
                 Member {
@@ -127,7 +127,7 @@ mod tests {
                     ..Member::default()
                 },
             ],
-            ..GuidanceDoc::default()
+            ..make_test_doc()
         };
 
         let results = filter.filter_candidates("hello", &doc, 5).expect("filter");

@@ -74,3 +74,24 @@ impl super::Library {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn init_schema_is_idempotent() {
+        let lib = crate::db::Library::open_in_memory().expect("in-memory db");
+        lib.init_schema().expect("first init");
+        lib.init_schema().expect("second init (IF NOT EXISTS)");
+        // Core tables are queryable after init.
+        lib.insert_node(&crate::tests::common::make_node("a", "s")).expect("insert");
+        assert_eq!(lib.node_count().expect("count"), 1);
+    }
+
+    #[test]
+    fn open_in_memory_initializes_schema() {
+        let lib = crate::db::Library::open_in_memory().expect("in-memory db");
+        // The embedding-cache table created by init_schema is usable.
+        lib.cache_embedding("k", "q", &[0.1]).expect("cache");
+        assert!(lib.get_cached_embedding("k").expect("get").is_some());
+    }
+}

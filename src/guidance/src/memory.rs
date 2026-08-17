@@ -135,3 +135,65 @@ pub fn init_memory_bridge() -> Option<MemoryBridge> {
 
     Some(MemoryBridge::new(capability, session_id))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use memory_plugin::capability::MemoryCapability;
+
+    // A bridge over an empty registry (no active plugin). This exercises the
+    // deterministic "no plugin configured" happy/error paths that a
+    // production deployment without the memory plugin always lands on.
+    fn empty_bridge() -> MemoryBridge {
+        let registry = Arc::new(tokio::sync::RwLock::new(MemoryPluginRegistry::new()));
+        MemoryBridge::new(
+            MemoryCapability::new(registry),
+            SessionId::new("test-session"),
+        )
+    }
+
+    #[tokio::test]
+    async fn prefetch_with_no_active_plugin_returns_empty() {
+        let bridge = empty_bridge();
+        assert_eq!(bridge.prefetch_context("what is x").await, "");
+    }
+
+    #[tokio::test]
+    async fn tool_schemas_with_no_active_plugin_is_empty() {
+        let bridge = empty_bridge();
+        assert!(bridge.tool_schemas().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_tool_call_errors_without_active_plugin() {
+        let bridge = empty_bridge();
+        let err = bridge
+            .handle_tool_call("tool", &serde_json::json!({}))
+            .await
+            .expect_err("no plugin -> error");
+        assert!(matches!(err, MemoryError::NotAvailable(_)));
+    }
+
+    #[tokio::test]
+    async fn search_errors_without_active_plugin() {
+        let bridge = empty_bridge();
+        let req = MemorySearchRequest {
+            query: "x".into(),
+            category: None,
+            min_trust: 0.0,
+            limit: 5,
+            strategy: memory_plugin::types::SearchStrategy::FtsKeyword,
+        };
+        assert!(bridge.search(&req).await.is_err());
+    }
+
+    #[test]
+    fn initialize_is_noop_ok() {
+        assert!(empty_bridge().initialize().is_ok());
+    }
+
+    #[test]
+    fn session_id_is_preserved() {
+        assert_eq!(empty_bridge().session_id.as_str(), "test-session");
+    }
+}

@@ -29,6 +29,7 @@ extism = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
+fluent-wvr-testutil = { path = "../fluent-wvr-testutil" }
 
 [lints]
 workspace = true

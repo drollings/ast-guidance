@@ -116,10 +116,7 @@ pub fn transaction<T>(
 mod tests {
     use super::*;
     use common_core::sqlite::in_clause;
-
-    fn conn() -> Connection {
-        common_core::sqlite::open_in_memory().unwrap()
-    }
+    use crate::tests::common::conn;
 
     fn seed(conn: &Connection) {
         conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
@@ -250,39 +247,34 @@ mod tests {
         assert_eq!(last_insert_rowid(&conn), 7);
     }
 
-    #[test]
-    fn transaction_commits_on_ok() {
-        let mut conn = conn();
-        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
-            .unwrap();
-        transaction(&mut conn, |tx| {
-            tx.execute("INSERT INTO t (id) VALUES (?1)", rusqlite::params![1])?;
-            Ok(())
+    #[tokio::test]
+    async fn transaction_commit_and_rollback() {
+        use crate::tests::common::assert_transaction_commit_rollback;
+        assert_transaction_commit_rollback(|commit| {
+            Box::pin(async move {
+                let mut conn = conn();
+                conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                    .unwrap();
+                let result: Result<(), DbError> = transaction(&mut conn, |tx| {
+                    tx.execute("INSERT INTO t (id) VALUES (?1)", rusqlite::params![7])?;
+                    if commit {
+                        Ok(())
+                    } else {
+                        Err(DbError::Other("boom".into()))
+                    }
+                });
+                if commit {
+                    result.unwrap();
+                } else {
+                    assert!(result.is_err());
+                }
+                query_row(&conn, "SELECT COUNT(*) FROM t", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+                .unwrap()
+            })
         })
-        .unwrap();
-        let count = query_row(&conn, "SELECT COUNT(*) FROM t", [], |row| {
-            row.get::<_, i64>(0)
-        })
-        .unwrap()
-        .unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn transaction_rolls_back_on_err() {
-        let mut conn = conn();
-        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
-            .unwrap();
-        let result: Result<(), DbError> = transaction(&mut conn, |tx| {
-            tx.execute("INSERT INTO t (id) VALUES (?1)", rusqlite::params![1])?;
-            Err(DbError::Other("boom".into()))
-        });
-        assert!(result.is_err());
-        let count = query_row(&conn, "SELECT COUNT(*) FROM t", [], |row| {
-            row.get::<_, i64>(0)
-        })
-        .unwrap()
-        .unwrap();
-        assert_eq!(count, 0, "transaction must roll back on error");
+        .await;
     }
 }

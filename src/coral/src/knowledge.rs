@@ -74,6 +74,7 @@ impl KnowledgeCapability for Library {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::common::make_node;
     use fluent_wvr::capability::CURRENT_CAPS;
     use fluent_wvr::CapabilitySet;
 
@@ -90,11 +91,7 @@ mod tests {
         let lib = lib();
         assert!(KnowledgeCapability::get_node(&lib, NodeId::from_int(1)).is_none());
         assert!(KnowledgeCapability::get_session_nodes(&lib, "s", 10).is_empty());
-        let node = ContentNode {
-            name: "n".into(),
-            source: "test".into(),
-            ..Default::default()
-        };
+        let node = make_node("n", "test");
         assert!(matches!(
             KnowledgeCapability::insert_node(&lib, &node),
             Err(KnowledgeError::Other(_))
@@ -111,11 +108,9 @@ mod tests {
         CURRENT_CAPS
             .scope(caps(), async {
                 let mut node = ContentNode {
-                    name: "test-node".into(),
-                    source: "test".into(),
                     lod: vec!["coral content".into()],
                     embedding: Some(vec![1.0, 0.0, 0.0, 0.0]),
-                    ..Default::default()
+                    ..make_node("test-node", "test")
                 };
                 let id = KnowledgeCapability::insert_node(&lib, &mut node).unwrap();
                 let fetched = KnowledgeCapability::get_node(&lib, id).unwrap();

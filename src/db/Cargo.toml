@@ -23,7 +23,6 @@ anndists = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-fluent-wvr-testutil = { path = "../fluent-wvr-testutil" }
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

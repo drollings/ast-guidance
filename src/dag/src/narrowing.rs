@@ -101,23 +101,11 @@ pub(crate) fn ambiguous_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitvec::vec::BitVec;
+    use crate::tests::common::make_bitset;
     use common_core::interner::CapabilityRegistry;
     use fluent_types::{ExecutorKind, TargetType};
 
     use crate::target::Target;
-
-    fn make_bitset(bits: &[usize]) -> BitVec {
-        let max = bits.iter().max().copied().unwrap_or(0) + 1;
-        let mut bv = BitVec::with_capacity(max);
-        bv.resize(max, false);
-        for &bit in bits {
-            if bit < bv.len() {
-                bv.set(bit, true);
-            }
-        }
-        bv
-    }
 
     fn t(id: i64, name: &str, depends: &[usize], provides: &[usize], essential: bool) -> Target {
         Target::new()

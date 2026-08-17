@@ -145,4 +145,7 @@ impl Component for Arc<dyn Component> {
 }
 
 #[cfg(test)]
+mod test_support;
+
+#[cfg(test)]
 mod tests;

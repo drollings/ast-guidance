@@ -26,3 +26,4 @@ ptree = "0.5"
 [dev-dependencies]
 tempfile = { workspace = true }
 fluent-wvr-testutil = { path = "../../fluent-wvr-testutil" }
+httpmock = { workspace = true }

@@ -339,7 +339,7 @@ pub fn enhance_doc(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluent_types::{GuidanceDoc, Member, MemberType, Meta};
+    use fluent_types::{GuidanceDoc, Member, MemberType};
 
     #[test]
     fn test_score_docstring_short() {
@@ -379,11 +379,6 @@ mod tests {
     #[test]
     fn test_enhance_doc_no_llm_fallback() {
         let mut doc = GuidanceDoc {
-            meta: Meta {
-                module: "test".into(),
-                source: "src/test.zig".into(),
-                language: "zig".into(),
-            },
             comment: None,
             members: vec![Member {
                 type_name: MemberType::FnDecl,
@@ -392,7 +387,7 @@ mod tests {
                 comment: None,
                 ..Member::default()
             }],
-            ..GuidanceDoc::default()
+            ..crate::tests::common::make_test_doc()
         };
 
         // No LLM available, so enhance should gracefully skip all members

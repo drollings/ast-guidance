@@ -95,6 +95,7 @@ mod tests {
 
     use super::*;
     use crate::cache_l1::CacheTier;
+    use crate::tests::common::make_node;
 
     fn make_router() -> ParallelRouter {
         let lib = Arc::new(Library::open_in_memory().expect("db"));
@@ -102,15 +103,7 @@ mod tests {
     }
 
     fn insert_test_node(lib: &Arc<Library>, name: &str, source: &str) {
-        let node = ContentNode {
-            id: None,
-            name: name.into(),
-            source: source.into(),
-            lod: vec![],
-            embedding: None,
-            capabilities: None,
-            ..Default::default()
-        };
+        let node = make_node(name, source);
         lib.insert_node(&node).expect("insert node");
     }
 
@@ -164,13 +157,8 @@ mod tests {
         let lib = Arc::new(Library::open_in_memory().expect("db"));
         let emb = vec![0.1, 0.2, 0.3, 0.4];
         let node = ContentNode {
-            id: None,
-            name: "target_node".into(),
-            source: "source".into(),
-            lod: vec![],
             embedding: Some(emb.clone()),
-            capabilities: None,
-            ..Default::default()
+            ..make_node("target_node", "source")
         };
         lib.insert_node(&node).expect("insert");
 

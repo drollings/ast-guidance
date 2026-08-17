@@ -108,6 +108,7 @@ fn apply_insertions(source: &str, mut insertions: Vec<(usize, Vec<String>)>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::common::make_test_doc;
     use fluent_types::{GuidanceDoc, Member, MemberType, Meta};
 
     #[test]
@@ -115,9 +116,8 @@ mod tests {
         let source = "pub fn hello() void {\n    return;\n}\n";
         let doc = GuidanceDoc {
             meta: Meta {
-                module: "test".into(),
                 source: "test.zig".into(),
-                language: "zig".into(),
+                ..make_test_doc().meta
             },
             members: vec![Member {
                 type_name: MemberType::FnDecl,
@@ -126,7 +126,7 @@ mod tests {
                 line: Some(1),
                 ..Member::default()
             }],
-            ..GuidanceDoc::default()
+            ..make_test_doc()
         };
 
         let insertions = collect_comment_insertions(source, &doc, None);
@@ -139,9 +139,8 @@ mod tests {
         let source = "/// Existing doc\npub fn foo() void {}\n";
         let doc = GuidanceDoc {
             meta: Meta {
-                module: "test".into(),
                 source: "test.zig".into(),
-                language: "zig".into(),
+                ..make_test_doc().meta
             },
             members: vec![Member {
                 type_name: MemberType::FnDecl,
@@ -150,7 +149,7 @@ mod tests {
                 line: Some(2),
                 ..Member::default()
             }],
-            ..GuidanceDoc::default()
+            ..make_test_doc()
         };
 
         let insertions = collect_comment_insertions(source, &doc, None);
@@ -165,9 +164,8 @@ mod tests {
         let source = "pub fn foo() void {}\n";
         let doc = GuidanceDoc {
             meta: Meta {
-                module: "test".into(),
                 source: "test.zig".into(),
-                language: "zig".into(),
+                ..make_test_doc().meta
             },
             members: vec![Member {
                 type_name: MemberType::FnDecl,
@@ -176,7 +174,7 @@ mod tests {
                 line: Some(1),
                 ..Member::default()
             }],
-            ..GuidanceDoc::default()
+            ..make_test_doc()
         };
 
         let insertions = collect_comment_insertions(source, &doc, None);

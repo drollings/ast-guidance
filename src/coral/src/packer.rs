@@ -107,6 +107,7 @@ impl ContextPackerExt for ContextPacker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::common::make_node;
 
     #[test]
     fn test_select_lod_by_distance() {
@@ -121,12 +122,8 @@ mod tests {
     fn test_get_lod_text() {
         let node = ContentNode {
             id: Some(NodeId(1)),
-            name: "test".into(),
-            source: String::new(),
             lod: vec!["detail".into(), "summary".into()],
-            embedding: None,
-            capabilities: None,
-            ..Default::default()
+            ..make_node("test", "")
         };
         assert_eq!(get_lod_text(&node, 0), "detail");
         assert_eq!(get_lod_text(&node, 1), "summary");
@@ -135,12 +132,7 @@ mod tests {
         // No LOD falls back to name
         let bare = ContentNode {
             id: Some(NodeId(2)),
-            name: "bare".into(),
-            source: String::new(),
-            lod: vec![],
-            embedding: None,
-            capabilities: None,
-            ..Default::default()
+            ..make_node("bare", "")
         };
         assert_eq!(get_lod_text(&bare, 0), "bare");
     }
@@ -149,24 +141,14 @@ mod tests {
     fn test_pack_respects_budget() {
         let lib = Library::open_in_memory().expect("db");
         let focus = ContentNode {
-            id: None,
-            name: "focus".into(),
-            source: String::new(),
             lod: vec!["focus detailed text".into()],
-            embedding: None,
-            capabilities: None,
-            ..Default::default()
+            ..make_node("focus", "")
         };
         let focus_id = lib.insert_node(&focus).expect("insert");
 
         let child = ContentNode {
-            id: None,
-            name: "child".into(),
-            source: String::new(),
             lod: vec!["child detailed content here".into()],
-            embedding: None,
-            capabilities: None,
-            ..Default::default()
+            ..make_node("child", "")
         };
         let child_id = lib.insert_node(&child).expect("insert");
         lib.insert_edge(focus_id, child_id, "depends", 1.0)

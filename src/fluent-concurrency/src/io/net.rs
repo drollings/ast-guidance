@@ -145,6 +145,9 @@ impl NetCapability {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scope::CURRENT_CAPS;
+    use fluent_wvr::CapabilitySet;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn net_config_defaults() {
@@ -160,5 +163,60 @@ mod tests {
     fn net_capability_default_via_default_trait() {
         let _cap = NetCapability::default();
         let _cap2 = NetCapability::new();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_connect_echo_roundtrip() {
+        // A `TcpListener`-backed echo server on loopback: the capability-gated
+        // `tcp_connect` must establish the connection and round-trip bytes.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let echo = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 64];
+            let n = sock.read(&mut buf).await.expect("read");
+            sock.write_all(&buf[..n]).await.expect("echo");
+        });
+
+        let net = NetCapability::new();
+        let caps = CapabilitySet::new().with(NetCapability::new());
+        let echoed = CURRENT_CAPS
+            .scope(caps, async {
+                let mut stream = net.tcp_connect(addr).await.expect("connect");
+                stream.write_all(b"ping").await.expect("write");
+                let mut buf = [0u8; 4];
+                stream.read_exact(&mut buf).await.expect("read echo");
+                buf.to_vec()
+            })
+            .await;
+        echo.await.expect("echo task");
+        assert_eq!(echoed, b"ping".to_vec());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_connect_refused_errors() {
+        // `127.0.0.1:1` is a refused loopback port: the connect must error, not
+        // hang or fire anything.
+        let net = NetCapability::new();
+        let caps = CapabilitySet::new().with(NetCapability::new());
+        let result = CURRENT_CAPS
+            .scope(caps, async { net.tcp_connect("127.0.0.1:1").await })
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_connect_without_capability_is_denied() {
+        // Outside a `CURRENT_CAPS` scope the capability check fails with
+        // `PermissionDenied` before any network I/O occurs.
+        let net = NetCapability::new();
+        let err = net.tcp_connect("127.0.0.1:1").await.expect_err("denied");
+        assert_eq!(err.0.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err.0.to_string().contains("missing capability"));
+    }
+
+    #[test]
+    fn net_capability_name() {
+        assert_eq!(NetCapability::new().name(), "net");
     }
 }

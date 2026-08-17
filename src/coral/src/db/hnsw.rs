@@ -87,3 +87,68 @@ impl super::Library {
         self.hnsw.len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::common::make_node;
+    use fluent_types::ContentNode;
+
+    fn lib() -> crate::db::Library {
+        crate::db::Library::open_in_memory().expect("in-memory db")
+    }
+
+    fn insert_embedded(lib: &crate::db::Library, name: &str, emb: Vec<f32>) -> NodeId {
+        lib.insert_node(&ContentNode {
+            embedding: Some(emb),
+            ..make_node(name, "s")
+        })
+        .expect("insert embedded")
+    }
+
+    #[test]
+    fn index_is_not_built_until_rebuilt() {
+        let lib = lib();
+        assert!(!lib.has_hnsw());
+        assert_eq!(lib.hnsw_len(), 0);
+    }
+
+    #[test]
+    fn rebuild_hnsw_indexes_embedded_nodes() {
+        let lib = lib();
+        insert_embedded(&lib, "a", vec![1.0, 0.0]);
+        insert_embedded(&lib, "b", vec![0.0, 1.0]);
+        let count = lib.rebuild_hnsw().expect("rebuild");
+        assert_eq!(count, 2);
+        assert!(lib.has_hnsw());
+        assert_eq!(lib.hnsw_len(), 2);
+    }
+
+    #[test]
+    fn hnsw_search_routes_to_nearest_embedding() {
+        let lib = lib();
+        insert_embedded(&lib, "right", vec![1.0, 0.0]);
+        insert_embedded(&lib, "up", vec![0.0, 1.0]);
+        lib.rebuild_hnsw().expect("rebuild");
+
+        let hits = lib.hnsw_search(&[0.9, 0.0], 1).expect("hnsw search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name.as_str(), "right");
+        assert!(hits[0].distance < 0.1, "nearest distance is small");
+
+        // k larger than the index returns all neighbours.
+        let hits = lib.hnsw_search(&[0.9, 0.0], 10).expect("hnsw search all");
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn rebuild_overwrites_previous_index() {
+        let lib = lib();
+        insert_embedded(&lib, "a", vec![1.0]);
+        lib.rebuild_hnsw().expect("rebuild");
+        assert_eq!(lib.hnsw_len(), 1);
+        // A second build on the same rows keeps the index coherent.
+        lib.rebuild_hnsw().expect("rebuild again");
+        assert_eq!(lib.hnsw_len(), 1);
+    }
+}

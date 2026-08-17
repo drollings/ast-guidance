@@ -151,14 +151,10 @@ mod tests {
     #![allow(deprecated)]
     use super::*;
     use fluent_wvr::capability::CURRENT_CAPS;
-    use fluent_wvr::CapabilitySet;
+    use crate::tests::common::db_caps;
 
     fn db() -> DbCapability {
         DbCapability::open(":memory:").unwrap()
-    }
-
-    fn db_caps() -> CapabilitySet {
-        CapabilitySet::new().with(db())
     }
 
     #[tokio::test]

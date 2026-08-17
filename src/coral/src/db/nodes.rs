@@ -329,3 +329,140 @@ impl super::Library {
         Ok(fused.into_iter().take(k).map(|(_, hit)| hit).collect())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::common::make_node;
+
+    fn lib() -> crate::db::Library {
+        crate::db::Library::open_in_memory().expect("in-memory db")
+    }
+
+    #[test]
+    fn insert_and_get_round_trip() {
+        let lib = lib();
+        let node = ContentNode {
+            embedding: Some(vec![0.1, 0.2, 0.3]),
+            ..make_node("n1", "s1")
+        };
+        let id = lib.insert_node(&node).expect("insert");
+        assert!(id.as_int() > 0);
+        let back = lib.get_node(id).expect("get").expect("exists");
+        assert_eq!(back.id, Some(id));
+        assert_eq!(back.name.as_str(), "n1");
+        assert_eq!(back.source, "s1");
+        assert_eq!(back.embedding, Some(vec![0.1, 0.2, 0.3]));
+        assert_eq!(lib.node_count().expect("count"), 1);
+        // Missing node -> None.
+        assert!(lib.get_node(NodeId::from_int(999)).expect("missing").is_none());
+    }
+
+    #[test]
+    fn insert_round_trips_lod_and_capabilities() {
+        let lib = lib();
+        let node = ContentNode {
+            lod: vec!["a".into(), "b".into()],
+            capabilities: Some(vec![0b0000_0011]),
+            ..make_node("n2", "s2")
+        };
+        let id = lib.insert_node(&node).expect("insert");
+        let back = lib.get_node(id).expect("get").expect("exists");
+        assert_eq!(back.lod, vec!["a", "b"]);
+        assert_eq!(back.capabilities, Some(vec![0b0000_0011]));
+    }
+
+    #[test]
+    fn find_by_name_and_batch_resolution() {
+        let lib = lib();
+        let a = lib.insert_node(&make_node("alpha", "src-a")).expect("insert a");
+        let b = lib.insert_node(&make_node("beta", "src-b")).expect("insert b");
+        assert_eq!(lib.find_node_by_name("alpha").expect("find"), Some(a));
+        assert!(lib.find_node_by_name("nope").expect("find").is_none());
+
+        let map = lib
+            .find_node_ids_by_names(&["alpha", "beta", "missing"])
+            .expect("batch");
+        assert_eq!(map.get("alpha").copied(), Some(a));
+        assert_eq!(map.get("beta").copied(), Some(b));
+        assert!(!map.contains_key("missing"));
+        // Empty lookup is a no-op.
+        assert!(lib.find_node_ids_by_names(&[]).expect("empty").is_empty());
+    }
+
+    #[test]
+    fn batch_insert_commits_all_rows() {
+        let lib = lib();
+        let nodes: Vec<ContentNode> = (0..5)
+            .map(|i| make_node(&format!("n{i}"), "src"))
+            .collect();
+        lib.insert_nodes_batch(&nodes).expect("batch insert");
+        assert_eq!(lib.node_count().expect("count"), 5);
+        assert_eq!(lib.get_all_node_ids().expect("ids").len(), 5);
+    }
+
+    #[test]
+    fn keyword_search_matches_name_and_source() {
+        let lib = lib();
+        lib.insert_node(&make_node("bug-triage", "jira ticket 42")).expect("insert");
+        lib.insert_node(&make_node("review", "unrelated")).expect("insert");
+        let hits = lib.keyword_search("jira").expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name.as_str(), "bug-triage");
+        let hits = lib.keyword_search("bug").expect("search name");
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn wasm_tools_insert_and_find_by_capability() {
+        let lib = lib();
+        lib.insert_wasm_tool(&WasmTool {
+            name: "search".into(),
+            path: "/opt/tools/search.wasm".into(),
+            capabilities: vec!["search".into(), "web".into()],
+        })
+        .expect("insert tool");
+        lib.insert_wasm_tool(&WasmTool {
+            name: "scorer".into(),
+            path: "/opt/tools/scorer.wasm".into(),
+            capabilities: vec!["score".into()],
+        })
+        .expect("insert tool");
+        let hits = lib.find_wasm_tools_by_capability("search").expect("find");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name.as_str(), "search");
+        assert!(lib.find_wasm_tools_by_capability("nope").expect("find").is_empty());
+    }
+
+    #[test]
+    fn embedded_node_count_only_counts_embedded() {
+        let lib = lib();
+        lib.insert_node(&make_node("plain", "s")).expect("insert plain");
+        lib.insert_node(&ContentNode {
+            embedding: Some(vec![0.5]),
+            ..make_node("embedded", "s")
+        })
+        .expect("insert embedded");
+        assert_eq!(lib.embedded_node_count().expect("count"), 1);
+    }
+
+    #[test]
+    fn knn_search_returns_nearest_embeddings() {
+        let lib = lib();
+        lib.insert_node(&ContentNode {
+            embedding: Some(vec![1.0, 0.0]),
+            ..make_node("right", "s")
+        })
+        .expect("insert");
+        lib.insert_node(&ContentNode {
+            embedding: Some(vec![0.0, 1.0]),
+            ..make_node("up", "s")
+        })
+        .expect("insert");
+        let hits = lib.knn_search(&[0.9, 0.0], 1, None).expect("knn");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name.as_str(), "right");
+        // Empty query vec -> no results.
+        assert!(lib.knn_search(&[], 5, None).expect("knn empty").is_empty());
+    }
+}

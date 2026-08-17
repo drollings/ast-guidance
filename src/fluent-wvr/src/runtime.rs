@@ -81,4 +81,33 @@ mod tests {
             "panic message should suggest fix, got: {msg}"
         );
     }
+
+    #[tokio::test]
+    async fn noop_runtime_sleep_returns_immediately() {
+        let rt = NoopRuntime;
+        let start = std::time::Instant::now();
+        rt.sleep(Duration::from_secs(3600)).await;
+        // A one-hour sleep must return without waiting (the elapsed time is a
+        // tiny fraction of the requested duration).
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "NoopRuntime sleep must not block"
+        );
+    }
+
+    #[tokio::test]
+    async fn noop_runtime_spawn_inside_tokio_completes() {
+        let rt = NoopRuntime;
+        let handle = rt.spawn(Box::pin(async {}));
+        handle.await.expect("spawned future completes");
+    }
+
+    #[test]
+    fn noop_runtime_now_returns_instant() {
+        // `now` just answers the monotonic clock; two calls move forward.
+        let rt = NoopRuntime;
+        let a = rt.now();
+        let b = rt.now();
+        assert!(b >= a);
+    }
 }

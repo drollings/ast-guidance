@@ -24,3 +24,6 @@ pub mod wvr;
 
 #[cfg(test)]
 pub(crate) mod test_stubs;
+
+#[cfg(test)]
+mod tests;

@@ -6,6 +6,7 @@
 //! - `golden` — golden test set (labeled corpus)
 //! - `e2e_tests` — end-to-end pipeline tests (mock mode)
 
+pub mod common;
 pub mod e2e_tests;
 pub mod golden;
 pub mod rubric_fixtures;

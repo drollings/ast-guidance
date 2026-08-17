@@ -313,19 +313,9 @@ pub fn save_guidance(path: &Path, doc: &GuidanceDoc) -> Result<(), JsonError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::common::make_test_member;
     use fluent_types::{GuidanceDoc, Member, MemberType, Meta};
     use fluent_wvr_testutil::tempdir;
-
-    fn make_test_member(name: &str, sig: &str, hash: &str, comment: Option<&str>) -> Member {
-        Member {
-            type_name: MemberType::FnDecl,
-            name: name.into(),
-            signature: Some(sig.into()),
-            match_hash: Some(hash.into()),
-            comment: comment.map(SmolStr::from),
-            ..Member::default()
-        }
-    }
 
     #[test]
     fn test_merge_member_preserves_comment() {

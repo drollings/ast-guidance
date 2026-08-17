@@ -371,41 +371,9 @@ fn resolve_stage_lines(stages: &mut [Stage], parser: &mut ast_parser::AstParser)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::common::make_test_doc;
     use fluent_knowledge::word_index::WordIndex;
-    use fluent_types::{GuidanceDoc, Member, MemberType, Meta};
     use fluent_wvr_testutil::tempdir;
-
-    fn make_test_doc() -> GuidanceDoc {
-        GuidanceDoc {
-            meta: Meta {
-                module: "test".into(),
-                source: "src/test.zig".into(),
-                language: "zig".into(),
-            },
-            comment: Some("Test module for query engine.".into()),
-            members: vec![
-                Member {
-                    type_name: MemberType::FnDecl,
-                    name: "helloWorld".into(),
-                    signature: Some("fn helloWorld() void".into()),
-                    comment: Some("Prints hello world.".into()),
-                    is_pub: true,
-                    line: Some(1),
-                    ..Member::default()
-                },
-                Member {
-                    type_name: MemberType::FnDecl,
-                    name: "addNumbers".into(),
-                    signature: Some("fn addNumbers(a: i32, b: i32) i32".into()),
-                    comment: Some("Adds two integers.".into()),
-                    is_pub: true,
-                    line: Some(5),
-                    ..Member::default()
-                },
-            ],
-            ..GuidanceDoc::default()
-        }
-    }
 
     #[test]
     fn test_explain_identifier() {

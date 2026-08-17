@@ -42,3 +42,47 @@ pub fn emit(kind: &'static str, fields: serde_json::Value) {
         "audit record",
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_record_constructs() {
+        let r = AuditRecord::new("filter", serde_json::json!({"pattern": "pii"}));
+        assert_eq!(r.kind, "filter");
+        assert_eq!(r.detail["pattern"], "pii");
+    }
+
+    #[test]
+    fn emit_renders_kind_and_json_detail() {
+        // The audit shape contract: every emitted record carries the `kind`
+        // field plus a JSON `detail` payload, rendered into the single
+        // `router.audit` tracing target. Capture the formatted line and assert
+        // both invariants hold so the durable-audit consumer's expectations
+        // cannot silently drift.
+        let (_, lines) = crate::test_support::capture_logs(|| {
+            emit("filter", serde_json::json!({"pattern": "ssn", "scope": "any"}));
+        });
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("router.audit"),
+            "audit record must land on the router.audit target, got:\n{joined}"
+        );
+        assert!(
+            joined.contains("\"kind\":") || joined.contains("kind="),
+            "audit record must carry a kind field, got:\n{joined}"
+        );
+        assert!(
+            joined.contains("\"pattern\":\"ssn\"") && joined.contains("\"scope\":\"any\""),
+            "audit detail must be JSON, got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn audit_target_constant_is_stable() {
+        // The durable-audit subscription is keyed on this exact target; a
+        // change here silently drops every record from the audit file.
+        assert_eq!(AUDIT_TARGET, "router.audit");
+    }
+}

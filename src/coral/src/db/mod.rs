@@ -120,6 +120,7 @@ impl<'a> HydrationPipeline<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::common::make_node;
     use fluent_types::{ContentNode, WasmTool};
     use rusqlite::params;
 
@@ -145,13 +146,8 @@ mod tests {
     fn test_insert_and_get_node() {
         let lib = Library::open_in_memory().expect("in-memory db");
         let node = ContentNode {
-            id: None,
-            name: "test_node".into(),
-            source: "full_source_text".into(),
             lod: vec!["summary".into(), "brief".into()],
-            embedding: None,
-            capabilities: None,
-            ..Default::default()
+            ..make_node("test_node", "full_source_text")
         };
         let node_id = lib.insert_node(&node).expect("insert");
         assert!(node_id.as_int() > 0);
@@ -168,13 +164,9 @@ mod tests {
         let lib = Library::open_in_memory().expect("in-memory db");
         let emb: Vec<f32> = vec![0.1, 0.2, 0.3];
         let node = ContentNode {
-            id: None,
-            name: "roundtrip_node".into(),
-            source: "source_text".into(),
             lod: vec!["full".into(), "summary".into(), "brief".into()],
             embedding: Some(emb.clone()),
-            capabilities: None,
-            ..Default::default()
+            ..make_node("roundtrip_node", "source_text")
         };
         let node_id = lib.insert_node(&node).expect("insert");
 
@@ -196,13 +188,8 @@ mod tests {
 
         for (name, emb) in &items {
             let node = ContentNode {
-                id: None,
-                name: name.as_str().into(),
-                source: "source".into(),
-                lod: vec![],
                 embedding: Some(emb.clone()),
-                capabilities: None,
-                ..Default::default()
+                ..make_node(name, "source")
             };
             lib.insert_node(&node).expect("insert");
         }
@@ -217,37 +204,13 @@ mod tests {
     fn test_traverse_from() {
         let lib = Library::open_in_memory().expect("in-memory db");
 
-        let root = ContentNode {
-            id: None,
-            name: "root".into(),
-            source: "root".into(),
-            lod: vec![],
-            embedding: None,
-            capabilities: None,
-            ..Default::default()
-        };
+        let root = make_node("root", "root");
         let root_id = lib.insert_node(&root).expect("insert");
 
-        let child = ContentNode {
-            id: None,
-            name: "child".into(),
-            source: "child".into(),
-            lod: vec![],
-            embedding: None,
-            capabilities: None,
-            ..Default::default()
-        };
+        let child = make_node("child", "child");
         let child_id = lib.insert_node(&child).expect("insert");
 
-        let grandchild = ContentNode {
-            id: None,
-            name: "grandchild".into(),
-            source: "grandchild".into(),
-            lod: vec![],
-            embedding: None,
-            capabilities: None,
-            ..Default::default()
-        };
+        let grandchild = make_node("grandchild", "grandchild");
         let grandchild_id = lib.insert_node(&grandchild).expect("insert");
 
         lib.insert_edge(root_id, child_id, "depends", 1.0)
@@ -295,35 +258,23 @@ mod tests {
         let lib = Library::open_in_memory().expect("in-memory db");
 
         let node_a = ContentNode {
-            id: None,
-            name: "node_a".into(),
-            source: "a".into(),
-            lod: vec![],
             embedding: Some(vec![0.1, 0.2, 0.3, 0.4]),
             capabilities: Some(vec![0b0001]),
-            ..Default::default()
+            ..make_node("node_a", "a")
         };
         lib.insert_node(&node_a).expect("insert");
 
         let node_b = ContentNode {
-            id: None,
-            name: "node_b".into(),
-            source: "b".into(),
-            lod: vec![],
             embedding: Some(vec![0.5, 0.6, 0.7, 0.8]),
             capabilities: Some(vec![0b0010]),
-            ..Default::default()
+            ..make_node("node_b", "b")
         };
         lib.insert_node(&node_b).expect("insert");
 
         let node_c = ContentNode {
-            id: None,
-            name: "node_c".into(),
-            source: "c".into(),
-            lod: vec![],
             embedding: Some(vec![0.9, 1.0, 1.1, 1.2]),
             capabilities: Some(vec![0b0100]),
-            ..Default::default()
+            ..make_node("node_c", "c")
         };
         lib.insert_node(&node_c).expect("insert");
 
@@ -355,15 +306,7 @@ mod tests {
     #[test]
     fn test_is_a_duck_typing() {
         let lib = Library::open_in_memory().expect("db");
-        let node = ContentNode {
-            id: None,
-            name: "alice".into(),
-            source: "source".into(),
-            lod: vec![],
-            embedding: None,
-            capabilities: None,
-            ..Default::default()
-        };
+        let node = make_node("alice", "source");
         let node_id = lib.insert_node(&node).expect("insert");
 
         lib.insert_entity_type(node_id, "http://schema.org/Person")
@@ -390,13 +333,8 @@ mod tests {
         let pipeline = HydrationPipeline::new(&lib, embedder);
 
         let mut node = ContentNode {
-            id: None,
-            name: "hydrate_test".into(),
-            source: "test source".into(),
             lod: vec!["some text to embed".into()],
-            embedding: None,
-            capabilities: None,
-            ..Default::default()
+            ..make_node("hydrate_test", "test source")
         };
         let node_id = pipeline.insert_and_hydrate(&mut node).expect("hydrate");
         assert!(node_id.as_int() > 0, "should get a valid node ID");
@@ -424,15 +362,7 @@ mod tests {
     #[test]
     fn test_duplicate_node_maps_to_typed_variant() {
         let lib = Library::open_in_memory().expect("db");
-        let node = ContentNode {
-            id: None,
-            name: "dup_name".into(),
-            source: "a".into(),
-            lod: vec![],
-            embedding: None,
-            capabilities: None,
-            ..Default::default()
-        };
+        let node = make_node("dup_name", "a");
         lib.insert_node(&node).expect("first insert");
         let err = lib.insert_node(&node).expect_err("second insert must fail");
         assert!(
@@ -446,25 +376,15 @@ mod tests {
         let lib = Library::open_in_memory().expect("db");
         for i in 0..5 {
             let node = ContentNode {
-                id: None,
-                name: format!("hnsw_{i}").into(),
-                source: "s".into(),
-                lod: vec![],
                 embedding: Some(vec![i as f32, 1.0, 1.0, 1.0]),
-                capabilities: None,
-                ..Default::default()
+                ..make_node(&format!("hnsw_{i}"), "s")
             };
             lib.insert_node(&node).expect("insert into hnsw");
         }
         let batch_nodes: Vec<ContentNode> = (0..3)
             .map(|i| ContentNode {
-                id: None,
-                name: format!("batch_{i}").into(),
-                source: "s".into(),
-                lod: vec![],
                 embedding: Some(vec![10.0 + i as f32, 1.0, 1.0, 1.0]),
-                capabilities: None,
-                ..Default::default()
+                ..make_node(&format!("batch_{i}"), "s")
             })
             .collect();
         lib.insert_nodes_batch(&batch_nodes).expect("batch insert");
@@ -492,15 +412,7 @@ mod tests {
     fn test_find_node_ids_by_names_batch_resolution() {
         let lib = Library::open_in_memory().expect("db");
         for name in ["alpha", "beta", "gamma"] {
-            let node = ContentNode {
-                id: None,
-                name: name.into(),
-                source: "s".into(),
-                lod: vec![],
-                embedding: None,
-                capabilities: None,
-                ..Default::default()
-            };
+            let node = make_node(name, "s");
             lib.insert_node(&node).expect("insert");
         }
         let map = lib
@@ -530,13 +442,8 @@ mod tests {
                     .map(|j| ((i.wrapping_mul(j.wrapping_add(1))) % 997) as f32 / 997.0)
                     .collect();
                 ContentNode {
-                    id: None,
-                    name: format!("n{i:06}").into(),
-                    source: String::new(),
-                    lod: vec![],
                     embedding: Some(emb),
-                    capabilities: None,
-                    ..Default::default()
+                    ..make_node(&format!("n{i:06}"), "")
                 }
             })
             .collect();

@@ -500,7 +500,7 @@ mod tests {
     fn classifier_reject_policy_rejects_on_parse_failure() {
         let stage = classifier_stage_with_policy(
             Arc::new(FixedResponseBackend {
-                response: "this is not json".into(),
+                response: "".into(),
             }),
             crate::config::ClassifierFailurePolicy::Reject,
         );
@@ -510,6 +510,87 @@ mod tests {
             .data_as()
             .expect("data_as");
         assert_eq!(decision.verdict, StageVerdict::Rejected);
+        assert!(decision.reason.contains("classifier failure"));
+    }
+
+    /// A pure-prose classifier response (no JSON envelope at all) is a direct
+    /// answer on a route that permits direct answering (`always_route: false`):
+    /// the model answered the user, it just dropped the JSON. This is the
+    /// failure class from the `classifier_failures/` dumps, recovered with
+    /// zero extra LLM calls.
+    #[test]
+    fn classifier_prose_response_becomes_direct_answer() {
+        let stage = classifier_stage_with_policy(
+            Arc::new(FixedResponseBackend {
+                response: "I'm built on a hybrid architecture combining gated short \
+                           convolutions with grouped-query attention.".into(),
+            }),
+            crate::config::ClassifierFailurePolicy::Reject,
+        );
+        let decision: StageDecision = stage
+            .execute(&classifier_ctx())
+            .expect("execute")
+            .data_as()
+            .expect("data_as");
+        assert_eq!(decision.verdict, StageVerdict::Passed);
+        let meta = decision.metadata.as_object().expect("metadata object");
+        assert_eq!(meta.get("action").and_then(|v| v.as_str()), Some("respond"));
+        assert_eq!(
+            meta.get("fallback").and_then(|v| v.as_bool()),
+            Some(false),
+            "a prose direct answer is complete, not a retryable fallback"
+        );
+        assert!(meta.get("response").is_some(), "prose must be delivered as the response");
+    }
+
+    /// On an `always_route` route the classifier is never allowed to answer
+    /// directly, so prose remains a hard parse failure even though it is
+    /// non-empty and answer-like.
+    #[test]
+    fn classifier_prose_stays_failure_on_always_route() {
+        let mut routing_config = crate::config::RoutingConfig {
+            routes: std::collections::HashMap::new(),
+            models: std::collections::HashMap::new(),
+            model_groups: std::collections::HashMap::new(),
+            system_prompt: String::new(),
+            safety_threshold: 0.5,
+            default_route: "fast".into(),
+            score_matrix: None,
+        };
+        routing_config.routes.insert(
+            "test".into(),
+            crate::config::RouteRef {
+                group: "fast".into(),
+                pipelines: vec!["default".into()],
+                description: String::new(),
+                always_route: true,
+            },
+        );
+        let stage = crate::stages::classifier::ClassifierStage::new(
+            Arc::new(FixedResponseBackend {
+                response: "I'm built on a hybrid architecture, chosen for fast inference.".into(),
+            }),
+            routing_config,
+            0.7,
+            None,
+            false,
+            1,
+            "fast",
+            Arc::new(fluent_concurrency::pool::Limiter::new(4)),
+            None,
+            crate::config::ClassifierFailurePolicy::Reject,
+            None,
+        );
+        let decision: StageDecision = stage
+            .execute(&classifier_ctx())
+            .expect("execute")
+            .data_as()
+            .expect("data_as");
+        assert_eq!(
+            decision.verdict,
+            StageVerdict::Rejected,
+            "always_route must not let prose become a classifier answer"
+        );
         assert!(decision.reason.contains("classifier failure"));
     }
 
@@ -991,7 +1072,7 @@ mod tests {
                     .map(|m| m.content.clone()),
             );
             if self.calls.load(std::sync::atomic::Ordering::SeqCst) < 3 {
-                Ok("this is definitely not json".into())
+                Ok("".into())
             } else {
                 Ok(self.success_response.clone())
             }
@@ -1113,7 +1194,7 @@ mod tests {
             &self,
             _messages: &[fluent_llm::ChatMessage],
         ) -> Result<String, fluent_llm::LlmError> {
-            Ok("not json at all".into())
+            Ok("".into())
         }
     }
 
@@ -1468,6 +1549,14 @@ mod tests {
     }
 
     // ── Route-level `always_route`: never let the classifier answer directly ─
+    //
+    // Unit tier — owns the *mechanism* (respond→route override, no direct
+    // response, dispatch to the route's group/model) and the *prompt rule*
+    // (the system prompt teaches "ALWAYS dispatch"). The end-to-end,
+    // config-derived always_route probe (that every declared always_route
+    // route in env/coral-router.json actually dispatches) is owned by
+    // `config_route_tests.rs::always_route_routes_force_dispatch_over_classifier_respond`
+    // (see ROADMAP M2.4).
 
     #[test]
     fn always_route_forces_dispatch_over_classifier_respond() {

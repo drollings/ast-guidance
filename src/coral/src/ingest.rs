@@ -245,34 +245,19 @@ impl BatchIngestor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::common::make_node;
 
     #[test]
     fn test_batch_ingestor_buffers_then_flushes() {
         let lib = Arc::new(Library::open_in_memory().expect("db"));
         let mut ingestor = BatchIngestor::new(Arc::clone(&lib), 100);
 
-        let node1 = ContentNode {
-            id: None,
-            name: "batched_1".into(),
-            source: "source".into(),
-            lod: vec![],
-            embedding: None,
-            capabilities: None,
-            ..Default::default()
-        };
+        let node1 = make_node("batched_1", "source");
         let id = ingestor.add(node1).expect("add");
         assert!(id.is_none());
         assert_eq!(ingestor.pending_count(), 1);
 
-        let node2 = ContentNode {
-            id: None,
-            name: "batched_2".into(),
-            source: "source".into(),
-            lod: vec![],
-            embedding: None,
-            capabilities: None,
-            ..Default::default()
-        };
+        let node2 = make_node("batched_2", "source");
         let id = ingestor.add(node2).expect("add");
         assert!(id.is_none());
         assert_eq!(ingestor.pending_count(), 2);
@@ -290,13 +275,8 @@ mod tests {
         let mut ingestor = BatchIngestor::new(Arc::clone(&lib), 100);
 
         let node = ContentNode {
-            id: None,
-            name: "embedded_node".into(),
-            source: "source".into(),
-            lod: vec![],
             embedding: Some(vec![0.1, 0.2, 0.3]),
-            capabilities: None,
-            ..Default::default()
+            ..make_node("embedded_node", "source")
         };
         let id = ingestor.add(node).expect("add");
         assert!(id.is_none());
@@ -310,27 +290,11 @@ mod tests {
         let lib = Arc::new(Library::open_in_memory().expect("db"));
         let mut ingestor = BatchIngestor::new(Arc::clone(&lib), 2);
 
-        let node1 = ContentNode {
-            id: None,
-            name: "full_1".into(),
-            source: "s".into(),
-            lod: vec![],
-            embedding: None,
-            capabilities: None,
-            ..Default::default()
-        };
+        let node1 = make_node("full_1", "s");
         ingestor.add(node1).expect("add");
         assert_eq!(ingestor.pending_count(), 1);
 
-        let node2 = ContentNode {
-            id: None,
-            name: "full_2".into(),
-            source: "s".into(),
-            lod: vec![],
-            embedding: None,
-            capabilities: None,
-            ..Default::default()
-        };
+        let node2 = make_node("full_2", "s");
         ingestor.add(node2).expect("add");
         assert_eq!(ingestor.pending_count(), 0);
 

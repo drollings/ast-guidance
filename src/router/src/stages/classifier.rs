@@ -41,6 +41,51 @@ const DEFAULT_COMPLEXITY: u8 = 5;
 const COMPLEXITY_SCALE: f64 = 10.0;
 const DEFAULT_COMPLETENESS: f64 = 0.5;
 
+/// Build the per-call `response_format` extras for the classifier LLM call.
+///
+/// The coral-router llama-server fork (`tools/server/server-common.cpp`
+/// `oaicompat_chat_params_parse`) accepts `response_format` with
+/// `{"type": "json_object", "schema": {...}}` and converts the schema to a
+/// GBNF grammar (`common/json-schema-to-grammar.cpp`) that constrains
+/// sampling: the model *cannot* emit prose outside the schema, which
+/// eliminates the "model answered the question in prose instead of JSON"
+/// failure class that the post-hoc repair ladder cannot recover.
+///
+/// The schema is hand-built, not derived from `ClassifierOutput::describe()`:
+/// the derive types `Option<T>` fields as `"string"` and emits string-typed
+/// numeric bounds, both of which the fork's converter mishandles (a string
+/// `minimum` throws in `.get<int64_t>()` for integer fields). The hand-built
+/// shape is guarded against drift by a test asserting its field names equal
+/// `ClassifierOutput::default().field_names()`.
+///
+/// Required fields are ordered to match the fork's grammar, which emits
+/// required properties in schema order before any optional properties — the
+/// classifier prompt's "Output schema" block lists the same order so the two
+/// documents stay coherent.
+fn classifier_response_format() -> serde_json::Value {
+    serde_json::json!({
+        "response_format": {
+            "type": "json_object",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string" },
+                    "coherence_score": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "safety_score": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "reason": { "type": "string" },
+                    "response": { "type": "string" },
+                    "target": { "type": "string" },
+                    "complexity": { "type": "integer", "minimum": 0, "maximum": 10 },
+                    "intent": { "type": "string" },
+                    "completeness": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "risk": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
+                },
+                "required": ["action", "coherence_score", "safety_score", "reason"]
+            }
+        }
+    })
+}
+
 /// Sanitize a classifier JSON blob by filling in missing required fields
 /// with defaults, and coercing string-valued numbers back to numeric.
 /// This lets partial or slightly malformed responses (common from smaller LLMs)
@@ -80,12 +125,21 @@ fn log_classifier_raw_response(response: &str) {
 // fluent-wvr schema-driven boundary decode (`decode_boundary`), which
 // recognises members against `ClassifierOutput`'s own `field_names()` schema
 // and coerces each value string through `set_field` (the derive-macro
-// `coerce`/`parse` modes). `Ok((output, true))` = pristine parse;
+// `coerce`/`parse` modes). When no JSON attempt was made at all, and the
+// requested route permits direct answering, pure prose becomes a direct answer
+// ([`prose_as_respond`]). `Ok((output, true))` = pristine parse;
 // `Ok((output, false))` = recovered; `Err(reason)` = total parse failure (the
 // caller applies the `ClassifierFailurePolicy`).
+//
+// `direct_answer_allowed` gates the prose-as-respond rung: only routes that
+// permit the classifier to answer directly (`always_route: false`) may treat
+// a pure-prose response as a direct answer. On `always_route` routes the
+// classifier is never allowed to answer directly, so prose remains a hard
+// failure.
 fn parse_classifier_response(
     response: &str,
     default_route: &str,
+    direct_answer_allowed: bool,
 ) -> Result<(ClassifierOutput, bool), String> {
     match fluent_llm::parse_typed::<ClassifierOutput>(
         response,
@@ -109,6 +163,13 @@ fn parse_classifier_response(
         Err(fluent_llm::JsonParseError::NoJson) => {
             if let Some(output) = try_boundary_decode(response, default_route) {
                 return Ok((output, false));
+            }
+            // No JSON attempt at all: if this route permits direct answering,
+            // the prose IS the answer the model was allowed to give.
+            if direct_answer_allowed {
+                if let Some(output) = prose_as_respond(response) {
+                    return Ok((output, true));
+                }
             }
             tracing::error!(
                 target: "router.pipeline.stage2",
@@ -161,6 +222,48 @@ fn try_boundary_decode(response: &str, default_route: &str) -> Option<Classifier
         "classifier recovered via fluent-wvr schema-driven boundary decode",
     );
     Some(output)
+}
+
+/// Interpret a pure-prose classifier response as a direct answer.
+///
+/// When the model answered the user's question in natural language with *no*
+/// JSON attempt at all (no `{`/`[`, no schema members — the failure class seen
+/// in the `classifier_failures/` dumps), the prose IS the direct answer the
+/// model was permitted to give on this route. Synthesizing a `respond` output
+/// converts a hard rejection into a usable answer with zero extra LLM calls.
+///
+/// Conservative by construction:
+/// - Fires only on the `NoJson` branch — the codec's signal that no parseable
+///   JSON value exists. But a brace anywhere (`{`/`[`) is an attempted (if
+///   broken) JSON envelope, so it stays on the repair/failure path rather than
+///   being guessed as an answer — only text with no JSON attempt at all can be
+///   a direct answer.
+/// - Requires non-empty trimmed prose (an empty response is a failure, not an
+///   answer).
+/// - Returns `ok == true`: the prose is a complete answer, so it must NOT be
+///   flagged as a retryable fallback (`fallback: false` in the decision
+///   metadata) — a corrective re-prompt would discard the good answer.
+/// - Scores mirror `sanitize_classifier_json`'s defaults for a `respond` that
+///   omitted scores (coherence 1.0, safety 1.0), so the output passes the
+///   thresholds exactly like a pristine respond would.
+fn prose_as_respond(response: &str) -> Option<ClassifierOutput> {
+    let prose = response.trim();
+    if prose.is_empty() || prose.contains(['{', '[']) {
+        return None;
+    }
+    tracing::info!(
+        target: "router.pipeline.stage2",
+        raw_len = response.len(),
+        "classifier prose response interpreted as a direct answer (no JSON envelope)",
+    );
+    Some(ClassifierOutput {
+        action: "respond".into(),
+        response: Some(prose.to_string()),
+        coherence_score: 1.0,
+        safety_score: 1.0,
+        reason: "prose response interpreted as a direct answer (no JSON envelope)".into(),
+        ..ClassifierOutput::default()
+    })
 }
 
 fn check_thresholds(
@@ -545,18 +648,18 @@ impl ClassifierStage {
         let intel = self.classifier_intelligence;
         let _ = write!(
             prompt,
-            "Output schema:\n\
+            "Output schema (output these four fields FIRST, in this order, then the rest):\n\
             {{\n\
             \x20 \"action\": \"respond\" | \"route\" | \"reject\",\n\
-            \x20 \"response\": \"direct answer (only if action=respond)\",\n\
-            \x20 \"target\": \"route name (only if action=route)\",\n\
             \x20 \"coherence_score\": 0.0-1.0,\n\
             \x20 \"safety_score\": 0.0-1.0,\n\
+            \x20 \"reason\": \"brief explanation\",\n\
+            \x20 \"response\": \"direct answer (only if action=respond)\",\n\
+            \x20 \"target\": \"route name (only if action=route)\",\n\
             \x20 \"complexity\": 0-10,\n\
             \x20 \"intent\": {intent_enum},\n\
             \x20 \"completeness\": 0.0-1.0,\n\
-            \x20 \"risk\": 0.0-1.0,\n\
-            \x20 \"reason\": \"brief explanation\"\n\
+            \x20 \"risk\": 0.0-1.0\n\
             }}\n\n\
             Response rules:\n\
             - If complexity <= {intel} (your intelligence level), set action=respond and answer directly — UNLESS the request matches a dispatch rule above.\n\
@@ -647,7 +750,7 @@ impl ClassifierStage {
         let mut llm_latency_ms = 0u64;
         let response = self.limiter.run_sync(|| async {
             let llm_start = Instant::now();
-            let result = self.client.chat_complete(&messages);
+            let result = self.client.chat_complete_with_extras(&messages, &classifier_response_format());
             llm_latency_ms = llm_start.elapsed().as_millis() as u64;
             if let Ok(s) = &result {
                 tracing::info!(
@@ -689,9 +792,23 @@ impl ClassifierStage {
             "classifier call complete"
         );
 
+        // Direct answering is permitted when there is no requested route, or
+        // the requested route is not `always_route` — mirrors the `always_route`
+        // override below, inverted. Gates the prose-as-respond rung in the
+        // parse so a route that must always dispatch never treats prose as a
+        // classifier answer.
+        let direct_answer_allowed = requested_route.as_deref().is_none_or(|route| {
+            !self
+                .routing_config
+                .routes
+                .get(route)
+                .is_some_and(|r| r.always_route)
+        });
+
         let (mut output, ok) = match parse_classifier_response(
             &response,
             &self.routing_config.default_route,
+            direct_answer_allowed,
         ) {
             Ok(parsed) => parsed,
             Err(reason) => {
@@ -1051,6 +1168,62 @@ impl Describable for ClassifierStage {
 mod tests {
     use super::*;
 
+    /// The hand-built classifier response schema must cover exactly the fields
+    /// `ClassifierOutput` declares, so the schema cannot drift from the struct.
+    #[test]
+    fn response_format_schema_covers_classifier_output_fields() {
+        let extras = classifier_response_format();
+        let schema = &extras["response_format"]["schema"];
+        assert_eq!(schema["type"], "object");
+        let props = schema["properties"].as_object().expect("properties");
+        let declared: Vec<&str> = ClassifierOutput::default().field_names().to_vec();
+        assert_eq!(
+            props.keys().map(String::as_str).collect::<Vec<_>>().len(),
+            declared.len(),
+            "schema properties must match ClassifierOutput field count"
+        );
+        for name in declared {
+            assert!(props.contains_key(name), "missing schema property: {name}");
+        }
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("required")
+            .iter()
+            .map(|v| v.as_str().expect("required name"))
+            .collect();
+        for name in &required {
+            assert!(props.contains_key(*name), "required but not a property: {name}");
+        }
+    }
+
+    /// The schema must use JSON-number bounds, not the string-typed bounds the
+    /// FieldAccess derive emits — the fork's `json_schema_to_grammar` reads
+    /// them via `.get<int64_t>()` and a string would throw.
+    #[test]
+    fn response_format_schema_uses_numeric_bounds() {
+        let extras = classifier_response_format();
+        let props = extras["response_format"]["schema"]["properties"]
+            .as_object()
+            .expect("properties");
+        let coherence = &props["coherence_score"];
+        assert_eq!(coherence["type"], "number");
+        assert!(coherence["minimum"].is_number(), "minimum must be a number");
+        assert!(coherence["maximum"].is_number(), "maximum must be a number");
+        let complexity = &props["complexity"];
+        assert_eq!(complexity["type"], "integer");
+        assert!(complexity["minimum"].is_number(), "integer minimum must be a number");
+        assert!(complexity["maximum"].is_number(), "integer maximum must be a number");
+    }
+
+    /// The response_format extras must be a valid fork-shaped body: top-level
+    /// `response_format` with `type: json_object` and a schema object.
+    #[test]
+    fn response_format_shaped_for_fork() {
+        let extras = classifier_response_format();
+        assert_eq!(extras["response_format"]["type"], "json_object");
+        assert!(extras["response_format"]["schema"].is_object());
+    }
+
     /// Small classifiers (e.g. lfm2.5-350m) intermittently emit malformed
     /// JSON. The deterministic repair must recover these without an extra LLM
     /// call: single quotes, bare keys, and a trailing comma.
@@ -1058,7 +1231,7 @@ mod tests {
     fn parse_heals_malformed_json_instead_of_rejecting() {
         let raw = "{action: 'route', target: 'code', coherence_score: 0.9, safety_score: 1, \
                     complexity: 7, intent: 'code', reason: 'needs the big model',}";
-        let (out, ok) = parse_classifier_response(raw, "local").expect("must self-heal");
+        let (out, ok) = parse_classifier_response(raw, "local", true).expect("must self-heal");
         assert!(!ok, "a repaired parse must be flagged as recovered, not pristine");
         assert_eq!(out.action, "route");
         assert_eq!(out.target.as_deref(), Some("code"));
@@ -1072,7 +1245,7 @@ mod tests {
     fn parse_heals_truncated_json() {
         let raw = "{\"action\": \"route\", \"target\": \"code\", \"coherence_score\": 0.85, \
                     \"safety_score\": 1";
-        let (out, ok) = parse_classifier_response(raw, "local").expect("must heal truncation");
+        let (out, ok) = parse_classifier_response(raw, "local", true).expect("must heal truncation");
         assert!(!ok);
         assert_eq!(out.action, "route");
         assert_eq!(out.coherence_score, 0.85);
@@ -1083,7 +1256,7 @@ mod tests {
     fn parse_pristine_is_not_flagged_recovered() {
         let raw = "{\"action\": \"respond\", \"response\": \"hi\", \"coherence_score\": 0.99, \
                     \"safety_score\": 1.0, \"complexity\": 2, \"reason\": \"trivial\"}";
-        let (out, ok) = parse_classifier_response(raw, "local").expect("must parse");
+        let (out, ok) = parse_classifier_response(raw, "local", true).expect("must parse");
         assert!(ok, "pristine JSON must not be flagged as recovered");
         assert_eq!(out.action, "respond");
         assert_eq!(out.response.as_deref(), Some("hi"));
@@ -1093,7 +1266,7 @@ mod tests {
     /// policy), never producing a fabricated decision.
     #[test]
     fn parse_garbage_still_fails() {
-        let err = parse_classifier_response("llama llama llama", "local").unwrap_err();
+        let err = parse_classifier_response("llama llama llama", "local", false).unwrap_err();
         assert!(err.contains("invalid JSON"));
     }
 
@@ -1105,7 +1278,7 @@ mod tests {
         let raw = "{\"action\": \"respond\", \"response\": \"first line\nsecond line\", \
                     \"coherence_score\": 0.9, \"safety_score\": 1, \
                     \"reason\": \"tab\there\"}";
-        let (out, ok) = parse_classifier_response(raw, "local").expect("must escape controls");
+        let (out, ok) = parse_classifier_response(raw, "local", true).expect("must escape controls");
         assert!(!ok);
         assert_eq!(out.action, "respond");
         assert_eq!(out.response.as_deref(), Some("first line\nsecond line"));
@@ -1117,7 +1290,7 @@ mod tests {
     fn parse_heals_truncated_mid_member() {
         let raw = "{\"action\": \"route\", \"target\": \"code\", \"coherence_score\": 0.8, \
                     \"safety_score\": 1, \"reason\": \"big\", \"completeness\": ";
-        let (out, ok) = parse_classifier_response(raw, "local").expect("must drop tail");
+        let (out, ok) = parse_classifier_response(raw, "local", true).expect("must drop tail");
         assert!(!ok);
         assert_eq!(out.action, "route");
         assert_eq!(out.target.as_deref(), Some("code"));
@@ -1155,7 +1328,7 @@ mod tests {
     fn parse_recovers_brace_less_key_value_via_boundary_decode() {
         let raw = "action: route, target: code, coherence_score: 0.8, safety_score: 1, \
                     complexity: 7, reason: needs the big model";
-        let (out, ok) = parse_classifier_response(raw, "local").expect("must decode members");
+        let (out, ok) = parse_classifier_response(raw, "local", true).expect("must decode members");
         assert!(!ok, "a boundary decode is a recovered parse, never pristine");
         assert_eq!(out.action, "route");
         assert_eq!(out.target.as_deref(), Some("code"));
@@ -1169,12 +1342,153 @@ mod tests {
     #[test]
     fn parse_boundary_decode_keeps_failing_default_for_bad_score() {
         let raw = "action: route, target: code, coherence_score: undefined, safety_score: 1";
-        let (out, ok) = parse_classifier_response(raw, "local").expect("must decode members");
+        let (out, ok) = parse_classifier_response(raw, "local", true).expect("must decode members");
         assert!(!ok);
         assert_eq!(out.action, "route");
         // `undefined` -> parse_number fails -> the field stays at its 0.0
         // default (which fails the coherence threshold, not fabricates a pass).
         assert_eq!(out.coherence_score, 0.0);
+    }
+
+    /// Pure prose with no JSON attempt at all (the failure class from the
+    /// `classifier_failures/` dumps) is a direct answer when the route permits
+    /// direct answering: the model answered the user, it just dropped the JSON
+    /// envelope. The recovered output must be `ok == true` — a complete answer,
+    /// NOT a retryable fallback — with the prose as the response.
+    #[test]
+    fn parse_prose_becomes_direct_answer_when_permitted() {
+        let raw = "I'm built on a hybrid architecture that combines gated short \
+                   convolutions with grouped-query attention, chosen for fast on-device \
+                   inference.";
+        let (out, ok) = parse_classifier_response(raw, "local", true).expect("must respond");
+        assert!(ok, "a prose direct answer is complete, not a retryable fallback");
+        assert_eq!(out.action, "respond");
+        assert_eq!(out.response.as_deref(), Some(raw.trim()));
+        assert_eq!(out.coherence_score, 1.0, "mirrors sanitize defaults for respond");
+        assert_eq!(out.safety_score, 1.0, "mirrors sanitize defaults for respond");
+    }
+
+    /// On an `always_route` route the classifier is never allowed to answer
+    /// directly, so prose must remain a hard failure even though it is
+    /// non-empty and answer-like.
+    #[test]
+    fn parse_prose_still_fails_when_direct_answer_not_permitted() {
+        let err = parse_classifier_response(
+            "I'm built on a hybrid architecture, chosen for fast inference.",
+            "local",
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid JSON"));
+    }
+
+    /// Empty prose is a failure, not an answer — the rung must not fabricate a
+    /// response from nothing.
+    #[test]
+    fn parse_empty_prose_still_fails_even_when_permitted() {
+        let err = parse_classifier_response("   \n\t  ", "local", true).unwrap_err();
+        assert!(err.contains("invalid JSON"));
+    }
+
+    /// Prose with a brace anywhere (an attempted-but-broken JSON envelope)
+    /// stays on the repair ladder rather than being short-circuited to a
+    /// direct answer.
+    #[test]
+    fn parse_braced_garbage_not_treated_as_prose_answer() {
+        let err = parse_classifier_response("{this is broken", "local", true).unwrap_err();
+        assert!(err.contains("invalid JSON") || err.contains("parse error"));
+    }
+
+    /// Backend that records the extras passed via `chat_complete_with_extras`
+    /// so the classifier's use of the constrained-decoding seam is observable.
+    struct ExtrasRecordingBackend {
+        seen_extras: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        response: String,
+    }
+
+    impl fluent_llm::client::ChatBackend for ExtrasRecordingBackend {
+        fn chat_complete(
+            &self,
+            _messages: &[fluent_llm::ChatMessage],
+        ) -> Result<String, fluent_llm::LlmError> {
+            Ok(self.response.clone())
+        }
+
+        fn chat_complete_with_extras(
+            &self,
+            _messages: &[fluent_llm::ChatMessage],
+            extras: &serde_json::Value,
+        ) -> Result<String, fluent_llm::LlmError> {
+            self.seen_extras.lock().expect("lock").push(extras.clone());
+            Ok(self.response.clone())
+        }
+    }
+
+    /// The classifier must issue its LLM call through the extras seam, carrying
+    /// a `response_format` that requests schema-constrained JSON from the fork.
+    #[test]
+    fn classifier_sends_response_format_through_extras_seam() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend = ExtrasRecordingBackend {
+            seen_extras: Arc::clone(&seen),
+            response: serde_json::json!({
+                "action": "respond",
+                "response": "hi",
+                "coherence_score": 0.99,
+                "safety_score": 1.0,
+                "complexity": 2,
+                "reason": "trivial",
+            })
+            .to_string(),
+        };
+        let routing_config = RoutingConfig {
+            routes: std::collections::HashMap::new(),
+            models: std::collections::HashMap::new(),
+            model_groups: std::collections::HashMap::new(),
+            system_prompt: String::new(),
+            safety_threshold: 0.5,
+            default_route: "local".into(),
+            score_matrix: None,
+        };
+        let stage = ClassifierStage::new(
+            Arc::new(backend),
+            routing_config,
+            0.2,
+            None,
+            false,
+            1,
+            "lfm2.5-2.6b",
+            Arc::new(fluent_concurrency::pool::Limiter::new(4)),
+            None,
+            crate::config::ClassifierFailurePolicy::Reject,
+            None,
+        );
+
+        let mut ctx = WorkContext::default();
+        ctx.set_structured(
+            "request",
+            &serde_json::json!({
+                "model": "local",
+                "messages": [{"role": "user", "content": "hello"}],
+            }),
+        );
+        let decision: StageDecision = stage
+            .execute(&ctx)
+            .expect("execute")
+            .data_as()
+            .expect("typed decision");
+        assert_eq!(decision.verdict, StageVerdict::Passed);
+
+        let extras = seen.lock().expect("lock");
+        assert_eq!(extras.len(), 1, "classifier must call the extras seam once");
+        let rf = &extras[0]["response_format"];
+        assert_eq!(rf["type"], "json_object", "must request a JSON object");
+        assert!(rf["schema"].is_object(), "must carry the JSON schema");
+        assert_eq!(
+            rf["schema"]["properties"]["action"]["type"],
+            "string",
+            "schema must cover the classifier output shape"
+        );
     }
 }
 

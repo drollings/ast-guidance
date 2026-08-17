@@ -18,185 +18,20 @@ use bytes::Bytes;
 use common_core::sync::lock;
 use http_body_util::BodyExt;
 use http_body_util::Full;
-use hyper::body::Incoming;
-use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
+use crate::tests::common::{
+    install_audit_capture, make_config, mock_for, post_chat, rigor_test_deps, spawn_mock_upstream,
+    spawn_test_server, spawn_test_server_with_deps, spawn_test_server_with_ledger,
+    spawn_test_server_with_sessions, test_deps, test_deps_with_ledger, TestServer,
+};
 use crate::config::RouterConfig;
 use crate::routes::plan::PlanRoute;
 use crate::routes::rigor::RigorRoute;
-use crate::server::handler::ServerDeps;
-use crate::server::responses::{ResponseBody, ServerStats};
 use crate::server::serve_http;
 use crate::testing::mock::{MockDispatchContext, MockTranscriptEntry, TranscriptProvider};
 use fluent_llm::client::ChatBackend;
-
-/// Upstream responder: given the parsed request body, produce an HTTP response.
-type UpstreamRespond = Arc<dyn Fn(&Value) -> hyper::Response<ResponseBody> + Send + Sync>;
-
-/// Assemble the `ServerDeps` request context for a test server. `pipelines`
-/// are prebuilt (usually with a `TranscriptProvider` classifier); optional
-/// mock/sessions/plan_route escalate through the ladder only when wired.
-fn test_deps(
-    pipelines: Arc<std::collections::HashMap<String, Arc<crate::pipeline::PipelineOrchestrator>>>,
-    config: &RouterConfig,
-    mock: Option<Arc<MockDispatchContext>>,
-    sessions: Option<Arc<crate::dag_session::SessionRegistry>>,
-    plan_route: Option<Arc<PlanRoute>>,
-    ladders: std::collections::HashMap<String, Arc<crate::dispatch::escalation::Ladder>>,
-    context_cache: Option<Arc<dyn fluent_types::ContextCache>>,
-) -> ServerDeps {
-    ServerDeps {
-        pipelines,
-        routes: Arc::new(config.routes.clone()),
-        models: Arc::new(config.models.clone()),
-        stats: Arc::new(ServerStats::new()),
-        max_payload: config.server.max_payload,
-        classifier: None,
-        mock_dispatch: mock,
-        ledger: None,
-        cache: None,
-        plan_route,
-        rigor_route: None,
-        sessions,
-        http_client: Arc::new(reqwest::Client::new()),
-        ladders,
-        context_cache,
-        instance_pool: None,
-        api_key_env_name: None,
-        supervisor: None,
-        coordinator: None,
-    }
-}
-
-/// A running router server bound to an ephemeral port.
-struct TestServer {
-    addr: std::net::SocketAddr,
-    handle: tokio::task::JoinHandle<()>,
-}
-
-impl TestServer {
-    fn base_url(&self) -> String {
-        format!("http://{}", self.addr)
-    }
-}
-
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        self.handle.abort();
-    }
-}
-
-/// Build a `RouterConfig` with a single `default` pipeline, a single `fast`
-/// model/route/group, and the given upstream + dispatch settings.
-fn make_config(
-    endpoint: &str,
-    stream: bool,
-    filter_thinking: bool,
-    total_timeout_ms: u64,
-    idle_timeout_ms: u64,
-) -> RouterConfig {
-    let value = json!({
-        "pipelines": {"default": {"deterministic_prefilter": true, "classifier": true}},
-        "models": {"fast": {
-            "endpoint": endpoint,
-            "name": "fast",
-            "intelligence": 1,
-            "cost_input": 0.000001,
-            "cost_output": 0.000006,
-            "cost_cached_read": 0.0000004,
-            "speed": 10,
-            "total_timeout_ms": total_timeout_ms,
-            "idle_timeout_ms": idle_timeout_ms,
-            "stream": stream,
-            "filter_thinking": filter_thinking,
-            "retry_count": 0,
-            "retry_base_interval_s": 1
-        }},
-        "model_groups": {"fast": ["fast"]},
-        "routes": {"fast": {"group": "fast", "pipelines": ["default"]}},
-        "default_route": "fast"
-    });
-    serde_json::from_value(value).expect("valid test config")
-}
-
-/// Spawn the real server (ephemeral port) with a transcript classifier and an
-/// optional dispatch mock. The default transcript classifier routes to the
-/// `fast` target.
-async fn spawn_test_server(config: RouterConfig, mock: Option<MockDispatchContext>) -> TestServer {
-    spawn_test_server_with_sessions(config, mock, None).await
-}
-
-/// `spawn_test_server` with an optional `SessionRegistry` (session-step
-/// tracking on the dispatch path).
-async fn spawn_test_server_with_sessions(
-    config: RouterConfig,
-    mock: Option<MockDispatchContext>,
-    sessions: Option<std::sync::Arc<crate::dag_session::SessionRegistry>>,
-) -> TestServer {
-    spawn_test_server_with_ledger(config, mock, sessions, None).await
-}
-
-/// `spawn_test_server` with an optional `SessionRegistry` and/or ledger
-/// (Answer-recording tests wire both). A `Some` ledger makes the matched
-/// target's answer read-back via `ContentNodeLedger::get_node` load-bearing.
-async fn spawn_test_server_with_ledger(
-    config: RouterConfig,
-    mock: Option<MockDispatchContext>,
-    sessions: Option<std::sync::Arc<crate::dag_session::SessionRegistry>>,
-    ledger: Option<Arc<crate::ledger::ContentNodeLedger>>,
-) -> TestServer {
-    let provider = TranscriptProvider::new(HashMap::new());
-    let backend: Arc<dyn ChatBackend> = Arc::new(provider);
-    let pipelines = Arc::new(config.build_all_pipelines_with_backend(Some(&backend)));
-    let mock = mock.map(Arc::new);
-
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral port");
-    let addr = listener.local_addr().expect("local addr");
-
-    let deps = test_deps_with_ledger(pipelines, &config, mock, sessions, ledger);
-    let handle = tokio::spawn(async move {
-        if let Err(e) = serve_http(listener, deps, None).await {
-            tracing::error!(target: "router.test", error = %e, "test server failed");
-        }
-    });
-
-    TestServer { addr, handle }
-}
-
-/// `test_deps` with a session registry and/or ledger wired.
-fn test_deps_with_ledger(
-    pipelines: Arc<std::collections::HashMap<String, Arc<crate::pipeline::PipelineOrchestrator>>>,
-    config: &RouterConfig,
-    mock: Option<Arc<MockDispatchContext>>,
-    sessions: Option<Arc<crate::dag_session::SessionRegistry>>,
-    ledger: Option<Arc<crate::ledger::ContentNodeLedger>>,
-) -> ServerDeps {
-    ServerDeps {
-        pipelines,
-        routes: Arc::new(config.routes.clone()),
-        models: Arc::new(config.models.clone()),
-        stats: Arc::new(ServerStats::new()),
-        max_payload: config.server.max_payload,
-        classifier: None,
-        mock_dispatch: mock,
-        ledger,
-        cache: None,
-        plan_route: None,
-        rigor_route: None,
-        sessions,
-        http_client: Arc::new(reqwest::Client::new()),
-        ladders: HashMap::new(),
-        context_cache: None,
-        instance_pool: None,
-        api_key_env_name: None,
-        supervisor: None,
-        coordinator: None,
-    }
-}
 
 /// Spawn a server with a plan route (interview round-trip tests). The
 /// chart store is seeded with `bug_triage`; no selector backend is attached,
@@ -305,41 +140,6 @@ async fn post_plan(
     .await
     .map_err(|_| "plan request timed out".to_string())?
     .map_err(|e| format!("plan request failed: {e}"))
-}
-
-/// A dispatch mock with a single canned entry.
-fn mock_for(user_message: &str, dispatch_response: &str) -> MockDispatchContext {
-    MockDispatchContext::new(
-        vec![MockTranscriptEntry {
-            user_message: user_message.to_string(),
-            classifier_response: String::new(),
-            expected_route: None,
-            expect_model_group: None,
-            dispatch_response: Some(dispatch_response.to_string()),
-            rejected: false,
-            reject_reason_contains: None,
-        }],
-        vec![],
-    )
-}
-
-/// POST an OpenAI-style chat completion body, bounded by an overall timeout.
-async fn post_chat(
-    base_url: &str,
-    body: Value,
-    timeout_ms: u64,
-) -> Result<reqwest::Response, String> {
-    let client = reqwest::Client::new();
-    tokio::time::timeout(
-        Duration::from_millis(timeout_ms),
-        client
-            .post(format!("{base_url}/v1/chat/completions"))
-            .json(&body)
-            .send(),
-    )
-    .await
-    .map_err(|_| "request timed out".to_string())?
-    .map_err(|e| format!("request failed: {e}"))
 }
 
 /// Extract the concatenated `delta.content` from each `data:` SSE line.
@@ -967,27 +767,8 @@ async fn classifier_fallback_dispatch_honors_stream_flag() {
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
-    let deps = ServerDeps {
-        pipelines,
-        routes: Arc::new(config.routes.clone()),
-        models: Arc::new(config.models.clone()),
-        stats: Arc::new(ServerStats::new()),
-        max_payload: config.server.max_payload,
-        classifier: Some(("fast".to_string(), classifier_entry)),
-        mock_dispatch: Some(mock),
-        ledger: None,
-        cache: None,
-        plan_route: None,
-        rigor_route: None,
-        sessions: None,
-        http_client: Arc::new(reqwest::Client::new()),
-        ladders: HashMap::new(),
-        context_cache: None,
-        instance_pool: None,
-        api_key_env_name: None,
-        supervisor: None,
-        coordinator: None,
-    };
+    let mut deps = test_deps(pipelines, &config, Some(mock), None, None, HashMap::new(), None);
+    deps.classifier = Some(("fast".to_string(), classifier_entry));
     let handle = tokio::spawn(async move {
         if let Err(e) = serve_http(listener, deps, None).await {
             tracing::error!(target: "router.test", error = %e, "test server failed");
@@ -1020,43 +801,6 @@ async fn classifier_fallback_dispatch_honors_stream_flag() {
 }
 
 // -- Scenario 7a: filter_thinking - buffered strip ------------------------
-
-/// Spawn an in-process mock upstream that answers every request via `respond`.
-async fn spawn_mock_upstream(respond: UpstreamRespond) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind upstream");
-    let addr = listener.local_addr().expect("upstream addr");
-
-    tokio::spawn(async move {
-        loop {
-            let Ok((stream, _peer)) = listener.accept().await else {
-                break;
-            };
-            let io = TokioIo::new(stream);
-            let respond = respond.clone();
-            let service = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
-                let respond = respond.clone();
-                async move {
-                    let body_bytes = req
-                        .collect()
-                        .await
-                        .map(http_body_util::Collected::to_bytes)
-                        .unwrap_or_default();
-                    let value = serde_json::from_slice::<Value>(&body_bytes).unwrap_or(Value::Null);
-                    Ok::<_, std::convert::Infallible>(respond(&value))
-                }
-            });
-            tokio::spawn(async move {
-                let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(io, service)
-                    .await;
-            });
-        }
-    });
-
-    format!("http://{addr}")
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn filter_thinking_stripped_from_buffered_response() {
@@ -1418,14 +1162,6 @@ async fn successful_dispatch_distills_a_draft_chart() {
 
 // -- Escalation ladder - integration -----------------------------------
 
-/// Install (once) the process-wide global subscriber and return its capture
-/// buffer. The escalation tests assert on the `router.audit` lines it
-/// records; the buffer is shared with `test_support::capture_logs` so the
-/// once-only `set_global_default` can never starve either consumer.
-fn install_audit_capture() -> Arc<Mutex<Vec<String>>> {
-    crate::test_support::install_global_subscriber()
-}
-
 /// A config whose `fast` group carries an escalation ladder (turnover) pointed
 /// at `frontier_url`. The local `fast` model's endpoint is dead
 /// (`127.0.0.1:1`) so the local chain always exhausts into the ladder.
@@ -1457,21 +1193,6 @@ fn escalated_config(frontier_url: &str) -> RouterConfig {
         "default_route": "fast"
     });
     serde_json::from_value(value).expect("valid escalated test config")
-}
-
-/// Spawn a server from prebuilt `ServerDeps` (escalation tests need ladders
-/// and/or a context cache that `spawn_test_server` does not wire).
-async fn spawn_test_server_with_deps(deps: ServerDeps) -> TestServer {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral port");
-    let addr = listener.local_addr().expect("local addr");
-    let handle = tokio::spawn(async move {
-        if let Err(e) = serve_http(listener, deps, None).await {
-            tracing::error!(target: "router.test", error = %e, "test server failed");
-        }
-    });
-    TestServer { addr, handle }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1605,38 +1326,6 @@ async fn context_cache_short_circuits_before_frontier_integration() {
 }
 
 // -- /v1/rigor server round-trip ------------------------------------
-
-/// Assemble `ServerDeps` with a rigor route + session registry + ledger wired
-/// (checkpoint/rewind + red-team view are load-bearing in the server path).
-fn rigor_test_deps(
-    pipelines: Arc<std::collections::HashMap<String, Arc<crate::pipeline::PipelineOrchestrator>>>,
-    config: &RouterConfig,
-    rigor_route: Option<Arc<RigorRoute>>,
-    sessions: Option<Arc<crate::dag_session::SessionRegistry>>,
-    ledger: Option<Arc<crate::ledger::ContentNodeLedger>>,
-) -> ServerDeps {
-    ServerDeps {
-        pipelines,
-        routes: Arc::new(config.routes.clone()),
-        models: Arc::new(config.models.clone()),
-        stats: Arc::new(ServerStats::new()),
-        max_payload: config.server.max_payload,
-        classifier: None,
-        mock_dispatch: None,
-        ledger,
-        cache: None,
-        plan_route: None,
-        rigor_route,
-        sessions,
-        http_client: Arc::new(reqwest::Client::new()),
-        ladders: HashMap::new(),
-        context_cache: None,
-        instance_pool: None,
-        api_key_env_name: None,
-        supervisor: None,
-        coordinator: None,
-    }
-}
 
 /// Spawn a server with a rigor route whose three role backends are stubs.
 async fn spawn_rigor_server(blue: Vec<&str>, red: Vec<&str>, judge: Vec<&str>) -> TestServer {
@@ -2106,5 +1795,99 @@ async fn graceful_shutdown_drains_tracked_connections_within_timeout() {
         drained.is_ok(),
         "graceful shutdown must stop accepting and drain tracked connection tasks within timeout"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn instances_api_key_auth_401_without_200_with() {
+    // The management `/instances` contract is API-key gated when
+    // `api_key_env_name` names an env var. `api_key_env_name` is None at every
+    // other test assembly site, so this is the sole exercise of the auth path.
+    let stub = crate::instances::stub::StubServer::start(instance_stub_handler());
+
+    use crate::config::SidecarConfig;
+    use crate::instances::{InstanceClient, InstanceManager, InstancePool};
+    let mut managers = HashMap::new();
+    managers.insert(
+        "swarm".into(),
+        Arc::new(InstanceManager::new(
+            "swarm",
+            InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
+            Vec::new(),
+            SidecarConfig::default(),
+        )),
+    );
+    let pool = InstancePool::from_managers(managers, None);
+
+    // Register the key in a uniquely-named env var so parallel tests can't
+    // clobber each other; removed after the test.
+    let key_var = "ROUTER_TEST_API_KEY_9f7c";
+    unsafe { std::env::set_var(key_var, "s3cret-key") };
+
+    let config = make_config("http://127.0.0.1:1", false, false, 5000, 2000);
+    let pipelines = Arc::new(config.build_all_pipelines_with_backend(None));
+    let mut deps = test_deps(pipelines, &config, None, None, None, HashMap::new(), None);
+    deps.instance_pool = Some(Arc::new(pool));
+    deps.api_key_env_name = Some(key_var.into());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let handle = tokio::spawn(async move {
+        let _ = serve_http(listener, deps, None).await;
+    });
+    let server = TestServer { addr, handle };
+    let base = server.base_url();
+
+    let client = reqwest::Client::new();
+    // No Authorization header -> 401.
+    let resp = client
+        .get(format!("{base}/instances"))
+        .send()
+        .await
+        .expect("GET /instances");
+    assert_eq!(resp.status(), 401);
+    // Wrong key -> 401.
+    let resp = client
+        .get(format!("{base}/instances"))
+        .header("authorization", "Bearer wrong")
+        .send()
+        .await
+        .expect("GET /instances");
+    assert_eq!(resp.status(), 401);
+    // Correct key -> 200.
+    let resp = client
+        .get(format!("{base}/instances"))
+        .header("authorization", "Bearer s3cret-key")
+        .send()
+        .await
+        .expect("GET /instances");
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.expect("instances json");
+    assert_eq!(body["instances"][0]["id"], "swarm:ledger");
+
+    // A per-instance sub-resource is also gated.
+    let resp = client
+        .delete(format!("{base}/instances/swarm:ledger"))
+        .send()
+        .await
+        .expect("DELETE /instances (no key)");
+    assert_eq!(resp.status(), 401);
+    let resp = client
+        .delete(format!("{base}/instances/swarm:ledger"))
+        .header("authorization", "Bearer s3cret-key")
+        .send()
+        .await
+        .expect("DELETE /instances (key)");
+    assert_eq!(resp.status(), 200);
+
+    // Non-management endpoints (e.g. /v1/models) are NOT gated.
+    let resp = client
+        .get(format!("{base}/v1/models"))
+        .send()
+        .await
+        .expect("GET /v1/models");
+    assert_eq!(resp.status(), 200);
+
+    unsafe { std::env::remove_var(key_var) };
 }
 

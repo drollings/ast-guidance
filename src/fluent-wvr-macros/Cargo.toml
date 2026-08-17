@@ -10,3 +10,8 @@ proc-macro = true
 syn = { workspace = true }
 quote = { workspace = true }
 proc-macro2 = { workspace = true }
+
+[dev-dependencies]
+fluent-wvr = { path = "../fluent-wvr" }
+serde_json = { workspace = true }
+internment = { workspace = true, features = ["arc"] }

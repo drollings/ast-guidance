@@ -29,4 +29,21 @@ mod tests {
         let err = CacheError::PersistFailed("disk full".into());
         assert_eq!(format!("{err}"), "persist failed: disk full");
     }
+
+    #[test]
+    fn cache_error_miss() {
+        assert_eq!(format!("{}", CacheError::Miss), "cache miss");
+    }
+
+    #[test]
+    fn cache_error_invalid_capacity() {
+        let err = CacheError::InvalidCapacity(0);
+        assert_eq!(format!("{err}"), "invalid cache capacity: 0");
+    }
+
+    #[test]
+    fn cache_error_embedding() {
+        let err = CacheError::Embedding("no dims".into());
+        assert_eq!(format!("{err}"), "embedding error: no dims");
+    }
 }

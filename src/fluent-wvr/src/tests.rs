@@ -1,54 +1,6 @@
 use crate::*;
+use crate::test_support::TestComponent;
 use internment::ArcIntern;
-
-struct TestComponent {
-    name: ArcIntern<str>,
-    value: i32,
-}
-
-impl FieldAccess for TestComponent {
-    fn set_field(&mut self, name: &str, value: &str) -> Result<(), FieldError> {
-        match name {
-            "value" => {
-                self.value = value.parse().map_err(|_| FieldError::Parse(value.into()))?;
-                Ok(())
-            }
-            _ => Err(FieldError::NotFound(name.into())),
-        }
-    }
-    fn get_field(&self, name: &str) -> Result<String, FieldError> {
-        match name {
-            "value" => Ok(self.value.to_string()),
-            _ => Err(FieldError::NotFound(name.into())),
-        }
-    }
-    fn field_names(&self) -> &'static [&'static str] {
-        &["value"]
-    }
-}
-
-impl Describable for TestComponent {
-    fn describe(&self) -> serde_json::Value {
-        serde_json::json!({"name": &*self.name, "value": self.value})
-    }
-}
-
-impl WorkUnit for TestComponent {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn depends(&self) -> &[ArcIntern<str>] {
-        &[]
-    }
-    fn provides(&self) -> &[ArcIntern<str>] {
-        &[]
-    }
-    fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-        Ok(WorkOutput::ok(format!("computed: {}", self.value * 2)))
-    }
-}
-
-impl_component!(TestComponent);
 
 #[test]
 fn test_field_access() {

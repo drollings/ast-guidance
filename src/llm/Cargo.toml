@@ -22,5 +22,8 @@ lru = { workspace = true }
 [dev-dependencies]
 httpmock = { workspace = true }
 
+[features]
+live-ai = []
+
 [lints]
 workspace = true

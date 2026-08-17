@@ -287,3 +287,114 @@ fn get_available_skills(guidance_dir: &Path) -> Vec<String> {
     skills.sort();
     skills
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluent_types::{GuidanceDoc, Skill};
+    use std::sync::Mutex;
+
+    // `generate` reads git-tracked files from the CURRENT working directory,
+    // so the shell-out test below temporarily changes it. The lock serializes
+    // that mutation against any other test that might depend on the cwd.
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        assert_eq!(truncate("hello", 40), "hello");
+    }
+
+    #[test]
+    fn truncate_long_string_adds_ellipsis() {
+        assert_eq!(truncate(&"a".repeat(100), 10), "aaaaaaa...");
+    }
+
+    #[test]
+    fn truncate_tiny_max_never_panics() {
+        assert_eq!(truncate("hello", 1), "h");
+        assert_eq!(truncate("hello", 2), "he");
+        assert_eq!(truncate("hello", 3), "hel");
+    }
+
+    #[test]
+    fn first_line_returns_only_first_line() {
+        assert_eq!(first_line("one\ntwo"), "one");
+        assert_eq!(first_line("single"), "single");
+        assert_eq!(first_line(""), "");
+    }
+
+    #[test]
+    fn extract_skills_matches_only_available_skills() {
+        let doc = GuidanceDoc {
+            skills: vec![
+                Skill { ref_path: "skills/zig-current/SKILL.md".into(), context: None },
+                Skill { ref_path: "skills/gof-patterns/SKILL.md".into(), context: None },
+                Skill { ref_path: "skills/unknown/SKILL.md".into(), context: None },
+            ],
+            ..GuidanceDoc::default()
+        };
+        let available = vec!["zig-current".to_string(), "gof-patterns".to_string()];
+        assert_eq!(extract_skills(&doc, &available), vec!["zig-current", "gof-patterns"]);
+    }
+
+    #[test]
+    fn get_available_skills_lists_skill_dirs_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skills = dir.path().join("skills");
+        std::fs::create_dir_all(skills.join("zig-current")).expect("mkdir");
+        std::fs::create_dir_all(skills.join("gof")).expect("mkdir");
+        // A plain file under skills must be ignored (dirs only).
+        std::fs::write(skills.join("NOT_A_DIR"), "x").expect("write");
+        assert_eq!(get_available_skills(dir.path()), vec!["gof", "zig-current"]);
+        // No skills dir -> empty.
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert!(get_available_skills(empty.path()).is_empty());
+    }
+
+    #[test]
+    fn insert_path_builds_nested_tree() {
+        let mut root: BTreeMap<String, Node> = BTreeMap::new();
+        insert_path(&mut root, &["src", "main.zig"], "src/main.zig");
+        insert_path(&mut root, &["src", "lib", "util.zig"], "src/lib/util.zig");
+        insert_path(&mut root, &["README.md"], "README.md");
+        assert!(root.contains_key("src"));
+        assert!(root.contains_key("README.md"));
+        match &root["src"] {
+            Node::Dir(children) => {
+                assert!(children.contains_key("main.zig"));
+                assert!(children.contains_key("lib"));
+                assert!(matches!(children["lib"], Node::Dir(_)));
+            }
+            _ => panic!("src should be a dir node"),
+        }
+        assert!(matches!(root["README.md"], Node::File { .. }));
+    }
+
+    #[test]
+    fn generate_renders_git_tracked_files() {
+        // Guard: the test shells out to `git`; skip cleanly when absent.
+        if common_core::shell::run_capture(&["git", "--version"]).is_err() {
+            eprintln!("git not available; skipping structure generate test");
+            return;
+        }
+        let _guard = CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let old = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(tmp.path()).expect("set cwd to tempdir");
+
+        let result = (|| -> Result<String, Box<dyn std::error::Error>> {
+            common_core::shell::run_capture(&["git", "init", "-q"])?;
+            common_core::shell::run_capture(&["git", "config", "user.email", "t@example.com"])?;
+            common_core::shell::run_capture(&["git", "config", "user.name", "t"])?;
+            std::fs::create_dir_all(tmp.path().join("src"))?;
+            std::fs::write(tmp.path().join("src/main.zig"), "pub fn main() void {}\n")?;
+            common_core::shell::run_capture(&["git", "add", "-A"])?;
+            let _ = common_core::shell::run_capture(&["git", "commit", "-q", "-m", "init"]);
+            generate(tmp.path())
+        })();
+
+        std::env::set_current_dir(&old).expect("restore cwd");
+        let output = result.expect("generate");
+        assert!(output.contains("main.zig"), "tree must include the tracked file:\n{output}");
+    }
+}

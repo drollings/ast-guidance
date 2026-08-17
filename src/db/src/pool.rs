@@ -484,16 +484,10 @@ mod tests {
     use super::*;
 
     use fluent_wvr::capability::CURRENT_CAPS;
-    use fluent_wvr::CapabilitySet;
+    use crate::tests::common::{db_caps, in_memory_pool};
 
     fn pool() -> Arc<SqlitePool> {
-        Arc::new(SqlitePool::open_in_memory(&PoolConfig::default()).unwrap())
-    }
-
-    /// A `CapabilitySet` carrying a `DbCapability` token, for the typed-helper
-    /// tests that now re-check the task-local (nit 4).
-    fn db_caps() -> CapabilitySet {
-        CapabilitySet::new().with(crate::capability::DbCapability::open(":memory:").unwrap())
+        in_memory_pool()
     }
 
     #[tokio::test]
@@ -515,21 +509,30 @@ mod tests {
     async fn poisoned_idle_connections_mutex_still_serves_acquire() {
         // The pool's idle-connections lock must recover from poison via
         // `common_core::sync::lock`, mirroring `store.rs::poison_recovery_via_lock`.
-        // A panic while holding a guard obtained via `.lock().unwrap()` poisons
-        // the mutex; a subsequent `acquire` must still serve a usable connection.
-        let pool = pool();
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = pool.connections.lock().unwrap();
-            panic!("boom");
-        }));
-        assert!(panic.is_err(), "expected the closure to panic");
-        CURRENT_CAPS
-            .scope(db_caps(), async {
-                let conn = pool.acquire().await.unwrap();
-                conn.execute_batch("CREATE TABLE t (id INTEGER)").unwrap();
-                conn.execute_batch("INSERT INTO t (id) VALUES (1)").unwrap();
-            })
-            .await;
+        use crate::tests::common::{assert_poison_recovery, db_caps, in_memory_pool};
+        let pool = in_memory_pool();
+        let poisoned = Arc::clone(&pool);
+        assert_poison_recovery(
+            move || {
+                // A panic while holding a guard obtained via `.lock().unwrap()`
+                // poisons the mutex.
+                let _guard = poisoned.connections.lock().unwrap();
+                panic!("boom");
+            },
+            || {
+                Box::pin(async move {
+                    CURRENT_CAPS
+                        .scope(db_caps(), async {
+                            // A subsequent `acquire` must still serve a usable connection.
+                            let conn = pool.acquire().await.unwrap();
+                            conn.execute_batch("CREATE TABLE t (id INTEGER)").unwrap();
+                            conn.execute_batch("INSERT INTO t (id) VALUES (1)").unwrap();
+                        })
+                        .await;
+                })
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -567,45 +570,47 @@ mod tests {
 
     #[tokio::test]
     async fn execute_and_query_round_trip() {
-        CURRENT_CAPS
-            .scope(db_caps(), async {
-                let pool = pool();
-                pool.execute_batch("CREATE TABLE t (id INTEGER, name TEXT)")
+        use crate::tests::common::{assert_execute_query_round_trip, db_caps, in_memory_pool};
+        assert_execute_query_round_trip(|| {
+            Box::pin(async move {
+                CURRENT_CAPS
+                    .scope(db_caps(), async {
+                        let pool = in_memory_pool();
+                        pool.execute_batch("CREATE TABLE t (id INTEGER, name TEXT)")
+                            .await
+                            .unwrap();
+                        let n = pool
+                            .execute(
+                                "INSERT INTO t (id, name) VALUES (?1, ?2)",
+                                vec![
+                                    rusqlite::types::Value::Integer(1),
+                                    rusqlite::types::Value::Text("hello".into()),
+                                ],
+                            )
+                            .await
+                            .unwrap();
+                        let name = pool
+                            .query_row(
+                                "SELECT name FROM t WHERE id = ?1",
+                                vec![rusqlite::types::Value::Integer(1)],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .await
+                            .unwrap();
+                        let rows = pool
+                            .query_rows(
+                                "SELECT id, name FROM t ORDER BY id",
+                                Vec::<rusqlite::types::Value>::new(),
+                                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                            )
+                            .await
+                            .unwrap();
+                        (n, name, rows)
+                    })
                     .await
-                    .unwrap();
-                let n = pool
-                    .execute(
-                        "INSERT INTO t (id, name) VALUES (?1, ?2)",
-                        vec![
-                            rusqlite::types::Value::Integer(1),
-                            rusqlite::types::Value::Text("hello".into()),
-                        ],
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(n, 1);
-
-                let name = pool
-                    .query_row(
-                        "SELECT name FROM t WHERE id = ?1",
-                        vec![rusqlite::types::Value::Integer(1)],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(name.as_deref(), Some("hello"));
-
-                let rows = pool
-                    .query_rows(
-                        "SELECT id, name FROM t ORDER BY id",
-                        Vec::<rusqlite::types::Value>::new(),
-                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(rows, vec![(1, "hello".to_string())]);
             })
-            .await;
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -677,60 +682,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transaction_commits_on_ok() {
-        CURRENT_CAPS
-            .scope(db_caps(), async {
-                let pool = pool();
-                pool.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
-                    .await
-                    .unwrap();
-                pool.transaction(|tx| {
-                    tx.execute("INSERT INTO t (id) VALUES (?1)", rusqlite::params![7])?;
-                    Ok(())
-                })
-                .await
-                .unwrap();
-                let count = pool
-                    .query_row(
-                        "SELECT COUNT(*) FROM t",
-                        Vec::<rusqlite::types::Value>::new(),
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(count, 1, "committed transaction persists its writes");
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn transaction_rolls_back_on_err() {
-        CURRENT_CAPS
-            .scope(db_caps(), async {
-                let pool = pool();
-                pool.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
-                    .await
-                    .unwrap();
-                let result: Result<(), DbError> = pool
-                    .transaction(|tx| {
-                        tx.execute("INSERT INTO t (id) VALUES (?1)", rusqlite::params![7])?;
-                        Err(DbError::Other("boom".into()))
+    async fn transaction_commit_and_rollback() {
+        use crate::tests::common::{assert_transaction_commit_rollback, db_caps, in_memory_pool};
+        assert_transaction_commit_rollback(|commit| {
+            Box::pin(async move {
+                CURRENT_CAPS
+                    .scope(db_caps(), async {
+                        let pool = in_memory_pool();
+                        pool.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                            .await
+                            .unwrap();
+                        let result: Result<(), DbError> = pool
+                            .transaction(move |tx| {
+                                tx.execute(
+                                    "INSERT INTO t (id) VALUES (?1)",
+                                    rusqlite::params![7],
+                                )?;
+                                if commit {
+                                    Ok(())
+                                } else {
+                                    Err(DbError::Other("boom".into()))
+                                }
+                            })
+                            .await;
+                        if commit {
+                            result.unwrap();
+                        } else {
+                            assert!(result.is_err());
+                        }
+                        pool.query_row(
+                            "SELECT COUNT(*) FROM t",
+                            Vec::<rusqlite::types::Value>::new(),
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap()
                     })
-                    .await;
-                assert!(result.is_err());
-                let count = pool
-                    .query_row(
-                        "SELECT COUNT(*) FROM t",
-                        Vec::<rusqlite::types::Value>::new(),
-                        |row| row.get::<_, i64>(0),
-                    )
                     .await
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(count, 0, "transaction must roll back on error");
             })
-            .await;
+        })
+        .await;
     }
 
     #[tokio::test]

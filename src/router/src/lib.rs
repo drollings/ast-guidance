@@ -67,6 +67,8 @@ mod stage_tests;
 #[cfg(test)]
 mod config_route_tests;
 #[cfg(test)]
+mod supervisor_integration_tests;
+#[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]
 pub(crate) mod test_stubs;

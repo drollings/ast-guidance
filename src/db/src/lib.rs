@@ -61,3 +61,6 @@ pub mod store;
 pub mod vector;
 #[cfg(feature = "sqlite")]
 pub mod wvr;
+
+#[cfg(all(test, feature = "sqlite"))]
+mod tests;

@@ -16,3 +16,6 @@ pub mod type_inference;
 pub mod work_unit;
 pub mod wvr;
 pub mod yamake_loader;
+
+#[cfg(test)]
+mod tests;

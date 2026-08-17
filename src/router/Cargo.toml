@@ -37,5 +37,8 @@ search-vector = { path = "../search-vector" }
 [dev-dependencies]
 tempfile = { workspace = true }
 
+[features]
+live-ai = []
+
 [lints]
 workspace = true

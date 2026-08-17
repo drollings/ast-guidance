@@ -192,15 +192,9 @@ pub fn tempdir() -> tempfile::TempDir {
 /// Create a directory tree with the given files and directories.
 ///
 /// Files are created as empty. Parent directories are created automatically.
+///
+/// Single implementation lives in `common_core::walk::make_tree`; this is a
+/// delegation so the workspace never carries a second tree-scaffolding body.
 pub fn make_tree(root: &std::path::Path, files: &[&str], dirs: &[&str]) {
-    for d in dirs {
-        common_core::ensure_dir(root.join(d)).unwrap();
-    }
-    for f in files {
-        let p = root.join(f);
-        if let Some(parent) = p.parent() {
-            common_core::ensure_dir(parent).unwrap();
-        }
-        std::fs::write(&p, "").unwrap();
-    }
+    common_core::walk::make_tree(root, files, dirs);
 }

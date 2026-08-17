@@ -463,53 +463,20 @@ mod tests {
     }
 
     // -- Deterministic self-healing (repair_json) ---------------------------
+    //
+    // `repair_json` delegates its structural repair to
+    // `fluent_wvr::boundary::repair_boundary` (schema-blind lenient mode), so
+    // the shared-repair behaviors — trailing commas, bare keys/values,
+    // single-quote conversion, comment stripping, non-JSON literals,
+    // control-character escaping, braces-inside-strings — are asserted once in
+    // `fluent-wvr/src/boundary.rs` (the owning module) and are NOT duplicated
+    // here (DRY). The cases below cover only llm-specific post-processing that
+    // `repair_boundary` deliberately does not do: truncation closing
+    // (`close_open_containers`), mid-member tail dropping
+    // (`drop_incomplete_tail`), first-value re-extraction, and the None case.
 
     fn repaired(raw: &str) -> Value {
         serde_json::from_str(&repair_json(raw).expect("must repair")).expect("repaired output parses")
-    }
-
-    #[test]
-    fn repair_heals_trailing_commas() {
-        assert_eq!(
-            repaired(r#"{"a": 1, "b": [1, 2,],}"#),
-            serde_json::json!({"a": 1, "b": [1, 2]})
-        );
-    }
-
-    #[test]
-    fn repair_quotes_bare_keys_and_values() {
-        assert_eq!(
-            repaired(r#"{action: route, target: code}"#),
-            serde_json::json!({"action": "route", "target": "code"})
-        );
-    }
-
-    #[test]
-    fn repair_converts_single_quotes() {
-        assert_eq!(
-            repaired("{'a': 'it\\'s', 'b': \"ok\"}"),
-            serde_json::json!({"a": "it's", "b": "ok"})
-        );
-    }
-
-    #[test]
-    fn repair_strips_comments() {
-        assert_eq!(
-            repaired("{\"a\": 1, // note\n \"b\": 2 /* inline */}"),
-            serde_json::json!({"a": 1, "b": 2})
-        );
-    }
-
-    #[test]
-    fn repair_normalizes_non_json_literals() {
-        assert_eq!(
-            repaired(
-                r#"{"a": undefined, "b": NaN, "c": Infinity, "d": -Infinity, "e": None, "f": true}"#
-            ),
-            serde_json::json!({
-                "a": null, "b": null, "c": null, "d": null, "e": null, "f": true
-            })
-        );
     }
 
     #[test]
@@ -541,25 +508,6 @@ mod tests {
     }
 
     #[test]
-    fn repair_escapes_raw_control_chars_in_strings() {
-        // Literal newline and tab inside a string value (very common from
-        // small models); the raw chars must be escaped to parse.
-        assert_eq!(
-            repaired("{\"response\": \"line one\nline two\"}"),
-            serde_json::json!({"response": "line one\nline two"})
-        );
-        assert_eq!(
-            repaired("{\"response\": \"tab\there\"}"),
-            serde_json::json!({"response": "tab\there"})
-        );
-        // And inside single-quoted strings.
-        assert_eq!(
-            repaired("{'response': 'a\nb'}"),
-            serde_json::json!({"response": "a\nb"})
-        );
-    }
-
-    #[test]
     fn repair_handles_dangling_backslash() {
         // A string truncated right after a backslash: the trailing `\` must be
         // escaped so the closing quote terminates the string.
@@ -586,14 +534,6 @@ mod tests {
     #[test]
     fn repair_extracts_from_leading_prose() {
         assert_eq!(repaired("Sure! {a: 1}"), serde_json::json!({"a": 1}));
-    }
-
-    #[test]
-    fn repair_preserves_braces_inside_strings() {
-        assert_eq!(
-            repaired(r#"{"a": "text { with brace", "b": "}"}"#),
-            serde_json::json!({"a": "text { with brace", "b": "}"})
-        );
     }
 
     #[test]

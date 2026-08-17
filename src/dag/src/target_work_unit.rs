@@ -130,24 +130,13 @@ mod tests {
     use super::*;
     use crate::resolver::DependencyResolver;
     use crate::target::{Target, TargetRegistry};
+    use crate::tests::common::make_bitset;
     use bitvec::vec::BitVec;
     use fluent_concurrency::tokio_runtime;
     use fluent_concurrency::batch::{SupervisedBatch, SupervisedBatchSummary};
     use fluent_types::{ExecutorKind, TargetType};
     use std::sync::Arc;
     use tempfile::tempdir;
-
-    fn make_bitset(bits: &[usize]) -> BitVec {
-        let max = bits.iter().max().copied().unwrap_or(0) + 1;
-        let mut bv = BitVec::with_capacity(max);
-        bv.resize(max, false);
-        for &bit in bits {
-            if bit < bv.len() {
-                bv.set(bit, true);
-            }
-        }
-        bv
-    }
 
     /// Builds the same 3-target chain used by the former
     /// `executor::test_execute_noop_targets`, with capability names registered

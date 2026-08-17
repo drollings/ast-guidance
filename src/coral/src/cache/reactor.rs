@@ -330,6 +330,7 @@ impl QueueReactor {
 mod tests {
     use super::*;
     use crate::test_stubs::{StubChatBackend, StubDecomposer, StubEmbedder};
+    use crate::tests::common::make_node;
     use fluent_types::ContentNode;
     use std::collections::HashMap;
 
@@ -340,13 +341,9 @@ mod tests {
 
     fn insert_node_with_embedding(lib: &Library, name: &str, embedding: Vec<f32>) {
         let node = ContentNode {
-            id: None,
-            name: name.into(),
-            source: format!("source for {name}"),
             lod: vec![format!("lod for {name}")],
             embedding: Some(embedding),
-            capabilities: None,
-            ..Default::default()
+            ..make_node(name, &format!("source for {name}"))
         };
         lib.insert_node(&node).expect("insert node");
     }
@@ -371,15 +368,7 @@ mod tests {
     #[test]
     fn test_reactor_l1_miss_falls_through_to_tiers() {
         let lib = Arc::new(Library::open_in_memory().expect("db"));
-        let node = ContentNode {
-            id: None,
-            name: "test_node".into(),
-            source: "source".into(),
-            lod: vec![],
-            embedding: None,
-            capabilities: None,
-            ..Default::default()
-        };
+        let node = make_node("test_node", "source");
         lib.insert_node(&node).expect("insert");
 
         let reactor = make_reactor(lib);
@@ -391,15 +380,7 @@ mod tests {
     #[test]
     fn test_reactor_route_uses_l3_when_data_exists() {
         let lib = Arc::new(Library::open_in_memory().expect("db"));
-        let node = ContentNode {
-            id: None,
-            name: "zig_compiler".into(),
-            source: "Zig compiler documentation".into(),
-            lod: vec![],
-            embedding: None,
-            capabilities: None,
-            ..Default::default()
-        };
+        let node = make_node("zig_compiler", "Zig compiler documentation");
         lib.insert_node(&node).expect("insert");
 
         let reactor = make_reactor(Arc::clone(&lib));
@@ -639,15 +620,7 @@ mod tests {
     #[test]
     fn test_coral_stats_records_l3_hit() {
         let lib = Arc::new(Library::open_in_memory().expect("db"));
-        let node = ContentNode {
-            id: None,
-            name: "test_node".into(),
-            source: "source".into(),
-            lod: vec![],
-            embedding: None,
-            capabilities: None,
-            ..Default::default()
-        };
+        let node = make_node("test_node", "source");
         lib.insert_node(&node).expect("insert");
 
         let reactor = make_reactor(Arc::clone(&lib));
@@ -718,47 +691,11 @@ mod tests {
 
     #[test]
     fn component_adapter_name_override_reports_new_name() {
-        struct StubUnit {
-            name: ArcIntern<str>,
-        }
-        impl WorkUnit for StubUnit {
-            fn name(&self) -> &str {
-                &self.name
-            }
-            fn depends(&self) -> &[ArcIntern<str>] {
-                &[]
-            }
-            fn provides(&self) -> &[ArcIntern<str>] {
-                &[]
-            }
-            fn execute(
-                &self,
-                _ctx: &fluent_wvr::WorkContext,
-            ) -> Result<fluent_wvr::WorkOutput, fluent_wvr::WorkError> {
-                Ok(fluent_wvr::WorkOutput::ok("from_stub"))
-            }
-        }
-        impl FieldAccess for StubUnit {
-            fn set_field(&mut self, _: &str, _: &str) -> Result<(), FieldError> {
-                Ok(())
-            }
-            fn get_field(&self, _: &str) -> Result<String, FieldError> {
-                Err(FieldError::NotFound("none".into()))
-            }
-            fn field_names(&self) -> &'static [&'static str] {
-                &[]
-            }
-        }
-        impl fluent_wvr::Describable for StubUnit {
-            fn describe(&self) -> serde_json::Value {
-                serde_json::json!({"name": &*self.name})
-            }
-        }
-        impl_component!(StubUnit);
+        use fluent_wvr_testutil::StubComponent;
 
-        let stub = StubUnit {
-            name: ArcIntern::from("inner_unit"),
-        };
+        let stub = StubComponent::ok("inner_unit").with_handler(|_| {
+            Ok(fluent_wvr::WorkOutput::ok("from_stub"))
+        });
         let adapted = ComponentAdapter::new(Arc::new(stub)).with_name_override("coral.l3.graph");
         assert_eq!(adapted.name(), "coral.l3.graph");
 

@@ -113,16 +113,11 @@ impl Formatter for DebugFormatter {
 mod tests {
     use super::*;
     use crate::query::synthesize::Synthesizer;
-    use fluent_types::{GuidanceDoc, Member, MemberType, Meta};
+    use crate::tests::common::make_test_doc;
+    use fluent_types::{GuidanceDoc, Member, MemberType};
 
     fn test_stages() -> Vec<Stage> {
         let doc = GuidanceDoc {
-            meta: Meta {
-                module: "test".into(),
-                source: "src/test.zig".into(),
-                language: "zig".into(),
-            },
-            comment: Some("A test module.".into()),
             members: vec![Member {
                 type_name: MemberType::FnDecl,
                 name: "hello".into(),
@@ -131,7 +126,7 @@ mod tests {
                 line: Some(1),
                 ..Member::default()
             }],
-            ..GuidanceDoc::default()
+            ..make_test_doc()
         };
         Synthesizer::synthesize("hello", &doc, &["hello".to_string()])
     }

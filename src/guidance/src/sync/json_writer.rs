@@ -152,37 +152,11 @@ pub fn doc_to_json_string(doc: &GuidanceDoc) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluent_types::{GuidanceDoc, Member, MemberType, Meta, Param};
-
-    fn make_test_doc() -> GuidanceDoc {
-        GuidanceDoc {
-            meta: Meta {
-                module: "test_module".into(),
-                source: "src/test.zig".into(),
-                language: "zig".into(),
-            },
-            comment: Some("A test module.".into()),
-            members: vec![Member {
-                type_name: MemberType::FnDecl,
-                name: "hello".into(),
-                signature: Some("fn hello(name: []const u8) -> []const u8".into()),
-                params: vec![Param {
-                    name: "name".into(),
-                    type_name: Some("[]const u8".into()),
-                    default: None,
-                }],
-                returns: Some("[]const u8".into()),
-                is_pub: true,
-                line: Some(3),
-                ..Member::default()
-            }],
-            ..GuidanceDoc::default()
-        }
-    }
+    use crate::tests::common::make_test_doc_hello;
 
     #[test]
     fn test_json_round_trip() {
-        let doc = make_test_doc();
+        let doc = make_test_doc_hello();
         let json_str = doc_to_json_string(&doc);
         assert!(json_str.contains("test_module"));
         assert!(json_str.contains("hello"));
@@ -191,7 +165,7 @@ mod tests {
 
     #[test]
     fn test_json_sorted_keys() {
-        let doc = make_test_doc();
+        let doc = make_test_doc_hello();
         let json_str = doc_to_json_string(&doc);
         let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("should parse");
         assert_eq!(parsed["meta"]["module"], "test_module");

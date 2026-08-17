@@ -605,7 +605,11 @@ impl_component!(SuffixedComponent);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::test_support::{
+        AdapterHost, CloneableUnit, ConstrainedHost, DepProvider, FieldedHost, MockUnit,
+        failing_unit, ok_unit,
+    };
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
     #[test]
@@ -648,100 +652,6 @@ mod tests {
         // We can't assert strict inequality due to timer resolution, but
         // we can assert both are positive which proves the delays fired.
     }
-
-    #[derive(Clone)]
-    struct CloneableUnit;
-
-    impl WorkUnit for CloneableUnit {
-        fn name(&self) -> &str {
-            "cloneable"
-        }
-        fn depends(&self) -> &[ArcIntern<str>] {
-            &[]
-        }
-        fn provides(&self) -> &[ArcIntern<str>] {
-            &[]
-        }
-        fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-            Ok(WorkOutput::ok("ok"))
-        }
-    }
-
-    impl FieldAccess for CloneableUnit {
-        fn set_field(&mut self, _: &str, _: &str) -> Result<(), FieldError> {
-            Ok(())
-        }
-        fn get_field(&self, _: &str) -> Result<String, FieldError> {
-            Ok(String::new())
-        }
-        fn field_names(&self) -> &'static [&'static str] {
-            &[]
-        }
-    }
-
-    impl Describable for CloneableUnit {
-        fn describe(&self) -> serde_json::Value {
-            serde_json::Value::Object(serde_json::Map::new())
-        }
-    }
-
-    impl_component!(CloneableUnit);
-
-    struct MockUnit {
-        name: ArcIntern<str>,
-        should_fail: bool,
-        call_count: AtomicUsize,
-    }
-
-    impl MockUnit {
-        fn ok(name: &str) -> Self {
-            Self {
-                name: ArcIntern::from(name),
-                should_fail: false,
-                call_count: AtomicUsize::new(0),
-            }
-        }
-    }
-
-    impl WorkUnit for MockUnit {
-        fn name(&self) -> &str {
-            &self.name
-        }
-        fn depends(&self) -> &[ArcIntern<str>] {
-            &[]
-        }
-        fn provides(&self) -> &[ArcIntern<str>] {
-            &[]
-        }
-        fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
-            if self.should_fail {
-                Err(WorkError::Execution("failed".into()))
-            } else {
-                Ok(WorkOutput::ok("done"))
-            }
-        }
-    }
-
-    impl FieldAccess for MockUnit {
-        fn set_field(&mut self, _: &str, _: &str) -> Result<(), FieldError> {
-            Ok(())
-        }
-        fn get_field(&self, _: &str) -> Result<String, FieldError> {
-            Err(FieldError::NotFound("test type: no fields".into()))
-        }
-        fn field_names(&self) -> &'static [&'static str] {
-            &[]
-        }
-    }
-
-    impl Describable for MockUnit {
-        fn describe(&self) -> serde_json::Value {
-            serde_json::json!({})
-        }
-    }
-
-    impl_component!(MockUnit);
 
     #[test]
     fn instrumented_delegates() {
@@ -801,54 +711,6 @@ mod tests {
     }
 
     // --- ComponentAdapter tests ---
-
-    /// A `Component` that is NOT a `MockUnit` — used to confirm the
-    /// adapter works when wrapping through `Arc<dyn Component>`.
-    struct AdapterHost {
-        name: ArcIntern<str>,
-        last_message: Arc<std::sync::Mutex<String>>,
-    }
-    impl AdapterHost {
-        fn new(name: &str) -> Self {
-            Self {
-                name: ArcIntern::from(name),
-                last_message: Arc::new(std::sync::Mutex::new(String::new())),
-            }
-        }
-    }
-    impl FieldAccess for AdapterHost {
-        fn set_field(&mut self, _name: &str, _value: &str) -> Result<(), FieldError> {
-            Ok(())
-        }
-        fn get_field(&self, _name: &str) -> Result<String, FieldError> {
-            Err(FieldError::NotFound("no fields".into()))
-        }
-        fn field_names(&self) -> &'static [&'static str] {
-            &[]
-        }
-    }
-    impl Describable for AdapterHost {
-        fn describe(&self) -> serde_json::Value {
-            serde_json::json!({"name": &*self.name})
-        }
-    }
-    impl_component!(AdapterHost);
-    impl WorkUnit for AdapterHost {
-        fn name(&self) -> &str {
-            &self.name
-        }
-        fn depends(&self) -> &[ArcIntern<str>] {
-            &[]
-        }
-        fn provides(&self) -> &[ArcIntern<str>] {
-            &[]
-        }
-        fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-            let mut g = self.last_message.lock().unwrap();
-            *g = "from_inner".to_string();
-            Ok(WorkOutput::ok("from_inner"))
-        }
-    }
 
     #[test]
     fn adapter_delegates_by_default() {
@@ -939,42 +801,6 @@ mod tests {
     fn adapter_propagates_depends_and_provides_from_inner() {
         // A Component whose depends/provides are non-empty — confirm
         // delegation rather than pass-through to the empty default.
-        struct DepProvider {
-            name: ArcIntern<str>,
-            deps: Vec<ArcIntern<str>>,
-            provs: Vec<ArcIntern<str>>,
-        }
-        impl WorkUnit for DepProvider {
-            fn name(&self) -> &str {
-                &self.name
-            }
-            fn depends(&self) -> &[ArcIntern<str>] {
-                &self.deps
-            }
-            fn provides(&self) -> &[ArcIntern<str>] {
-                &self.provs
-            }
-            fn execute(&self, _: &WorkContext) -> Result<WorkOutput, WorkError> {
-                Ok(WorkOutput::ok("ok"))
-            }
-        }
-        impl FieldAccess for DepProvider {
-            fn set_field(&mut self, _: &str, _: &str) -> Result<(), FieldError> {
-                Ok(())
-            }
-            fn get_field(&self, _: &str) -> Result<String, FieldError> {
-                Err(FieldError::NotFound("none".into()))
-            }
-            fn field_names(&self) -> &'static [&'static str] {
-                &[]
-            }
-        }
-        impl Describable for DepProvider {
-            fn describe(&self) -> serde_json::Value {
-                serde_json::json!({})
-            }
-        }
-        impl_component!(DepProvider);
         let inner = DepProvider {
             name: ArcIntern::from("dp"),
             deps: vec![ArcIntern::from("a"), ArcIntern::from("b")],
@@ -993,41 +819,6 @@ mod tests {
     /// delegates to `self.inner.field_names()` rather than returning `&[]`.
     #[test]
     fn adapter_field_names_forwards_from_inner() {
-        struct FieldedHost {
-            name: ArcIntern<str>,
-        }
-        impl WorkUnit for FieldedHost {
-            fn name(&self) -> &str {
-                &self.name
-            }
-            fn depends(&self) -> &[ArcIntern<str>] {
-                &[]
-            }
-            fn provides(&self) -> &[ArcIntern<str>] {
-                &[]
-            }
-            fn execute(&self, _: &WorkContext) -> Result<WorkOutput, WorkError> {
-                Ok(WorkOutput::ok("ok"))
-            }
-        }
-        impl FieldAccess for FieldedHost {
-            fn set_field(&mut self, _: &str, _: &str) -> Result<(), FieldError> {
-                Ok(())
-            }
-            fn get_field(&self, _: &str) -> Result<String, FieldError> {
-                Err(FieldError::NotFound("none".into()))
-            }
-            fn field_names(&self) -> &'static [&'static str] {
-                &["host_a", "host_b", "host_c"]
-            }
-        }
-        impl Describable for FieldedHost {
-            fn describe(&self) -> serde_json::Value {
-                serde_json::json!({})
-            }
-        }
-        impl_component!(FieldedHost);
-
         let inner = FieldedHost {
             name: ArcIntern::from("fielded"),
         };
@@ -1037,58 +828,6 @@ mod tests {
         assert_eq!(names[0], "host_a");
         assert_eq!(names[1], "host_b");
         assert_eq!(names[2], "host_c");
-    }
-
-    /// A `Component` with a max constraint on `port` (max=1024).
-    struct ConstrainedHost {
-        port: u16,
-    }
-    impl FieldAccess for ConstrainedHost {
-        fn set_field(&mut self, name: &str, value: &str) -> Result<(), FieldError> {
-            if name == "port" {
-                let v: u16 = value
-                    .parse()
-                    .map_err(|_| FieldError::Parse(format!("invalid u16 for 'port': {value}")))?;
-                if v > 1024 {
-                    return Err(FieldError::Constraint(
-                        "port: value above maximum 1024".into(),
-                    ));
-                }
-                self.port = v;
-                Ok(())
-            } else {
-                Err(FieldError::NotFound(name.into()))
-            }
-        }
-        fn get_field(&self, name: &str) -> Result<String, FieldError> {
-            match name {
-                "port" => Ok(self.port.to_string()),
-                _ => Err(FieldError::NotFound(name.into())),
-            }
-        }
-        fn field_names(&self) -> &'static [&'static str] {
-            &["port"]
-        }
-    }
-    impl Describable for ConstrainedHost {
-        fn describe(&self) -> serde_json::Value {
-            serde_json::json!({})
-        }
-    }
-    impl_component!(ConstrainedHost);
-    impl WorkUnit for ConstrainedHost {
-        fn name(&self) -> &str {
-            "constrained_host"
-        }
-        fn depends(&self) -> &[ArcIntern<str>] {
-            &[]
-        }
-        fn provides(&self) -> &[ArcIntern<str>] {
-            &[]
-        }
-        fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-            Ok(WorkOutput::ok("done"))
-        }
     }
 
     #[test]
@@ -1203,18 +942,6 @@ mod tests {
     }
 
     // --- ComponentCascade tests ---
-
-    fn failing_unit(name: &str) -> Arc<dyn Component> {
-        Arc::new(MockUnit {
-            name: ArcIntern::from(name),
-            should_fail: true,
-            call_count: AtomicUsize::new(0),
-        })
-    }
-
-    fn ok_unit(name: &str) -> Arc<dyn Component> {
-        Arc::new(MockUnit::ok(name))
-    }
 
     #[test]
     fn cascade_returns_first_ok_and_short_circuits() {

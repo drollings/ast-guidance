@@ -125,3 +125,82 @@ impl super::Library {
         Ok(count.unwrap_or(0))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::common::make_node;
+
+    fn lib() -> crate::db::Library {
+        crate::db::Library::open_in_memory().expect("in-memory db")
+    }
+
+    fn insert(lib: &crate::db::Library, name: &str) -> NodeId {
+        lib.insert_node(&make_node(name, "src")).expect("insert node")
+    }
+
+    #[test]
+    fn insert_edge_and_count() {
+        let lib = lib();
+        let a = insert(&lib, "a");
+        let b = insert(&lib, "b");
+        lib.insert_edge(a, b, "depends", 1.0).expect("insert edge");
+        assert_eq!(lib.edge_count().expect("count"), 1);
+    }
+
+    #[test]
+    fn traverse_from_respects_depth_and_ordering() {
+        let lib = lib();
+        let a = insert(&lib, "a");
+        let b = insert(&lib, "b");
+        let c = insert(&lib, "c");
+        lib.insert_edge(a, b, "depends", 1.0).expect("e1");
+        lib.insert_edge(b, c, "depends", 1.0).expect("e2");
+
+        // Depth 0: only the seed itself.
+        let hops = lib.traverse_from(a, 0).expect("traverse");
+        assert_eq!(hops.len(), 1);
+        assert_eq!(hops[0].name.as_str(), "a");
+        assert_eq!(hops[0].depth, 0);
+
+        // Depth 1: seed + immediate neighbour.
+        let hops = lib.traverse_from(a, 1).expect("traverse");
+        let names: Vec<&str> = hops.iter().map(|g| g.name.as_str()).collect();
+        assert!(names.contains(&"a") && names.contains(&"b"));
+        assert!(!names.contains(&"c"));
+
+        // Depth 2: the full chain.
+        let hops = lib.traverse_from(a, 2).expect("traverse");
+        let names: Vec<&str> = hops.iter().map(|g| g.name.as_str()).collect();
+        assert!(names.contains(&"a") && names.contains(&"b") && names.contains(&"c"));
+    }
+
+    #[test]
+    fn traverse_all_nodes_starts_at_roots() {
+        let lib = lib();
+        let a = insert(&lib, "a");
+        let b = insert(&lib, "b");
+        let c = insert(&lib, "c");
+        lib.insert_edge(a, b, "depends", 1.0).expect("e1");
+        lib.insert_edge(b, c, "depends", 1.0).expect("e2");
+        // `a` is the only root (nothing points at it).
+        let hops = lib.traverse_all_nodes(3).expect("traverse all");
+        let names: Vec<&str> = hops.iter().map(|g| g.name.as_str()).collect();
+        assert!(names.contains(&"a") && names.contains(&"b") && names.contains(&"c"));
+        assert_eq!(hops.iter().find(|g| g.name.as_str() == "a").expect("a").depth, 0);
+    }
+
+    #[test]
+    fn entity_type_and_is_a_hierarchy() {
+        let lib = lib();
+        let node = insert(&lib, "dog");
+        lib.insert_entity_type(node, "http://schema/Mammal").expect("type");
+        lib.insert_entity_hierarchy("http://schema/Mammal", "http://schema/Animal")
+            .expect("hierarchy");
+        lib.insert_entity_hierarchy("http://schema/Dog", "http://schema/Mammal")
+            .expect("hierarchy");
+        assert!(lib.is_a(node, "http://schema/Mammal").expect("direct"));
+        assert!(lib.is_a(node, "http://schema/Animal").expect("transitive"));
+        assert!(!lib.is_a(node, "http://schema/Plant").expect("unrelated"));
+    }
+}

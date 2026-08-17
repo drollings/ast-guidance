@@ -10,7 +10,6 @@ use std::sync::Arc;
 use crate::config::RouterConfig;
 use crate::pipeline::{PipelineOrchestrator, PipelineResult};
 use crate::pipeline_types::{PipelineStage, StageVerdict};
-use crate::session::StepStatus;
 use crate::testing::mock::TranscriptProvider;
 use crate::testing::test_request;
 use crate::types::{RouterMessage, RouterMessageContent, RouterRequest};
@@ -163,95 +162,6 @@ fn test_e2e_garbage_rejected_by_classifier() {
             .is_some_and(|r| r.contains("coherence")),
         "rejection reason should mention coherence, got: {:?}",
         result.reject_reason
-    );
-}
-
-// ── Command Dispatch ────────────────────────────────────────────────────
-
-#[test]
-fn test_e2e_help_command_dispatch() {
-    let pipeline = make_pipeline(default_provider());
-    let request = make_request("/help");
-    let result = route(&pipeline, &request).expect("pipeline should handle command");
-
-    assert!(result.rejected, "command should be intercepted");
-    assert_eq!(result.decisions.len(), 1);
-    assert_eq!(
-        result.decisions[0].stage,
-        PipelineStage::DeterministicPreFilter
-    );
-    assert_eq!(result.decisions[0].verdict, StageVerdict::Rejected);
-    assert!(
-        result.decisions[0].reason.contains("help"),
-        "reason should mention 'help', got: {}",
-        result.decisions[0].reason
-    );
-}
-
-#[test]
-fn test_e2e_stats_command_dispatch() {
-    let pipeline = make_pipeline(default_provider());
-    let request = make_request(".stats");
-    let result = route(&pipeline, &request).expect("pipeline should handle command");
-
-    assert!(result.rejected, "command should be intercepted");
-    assert_eq!(result.decisions.len(), 1);
-    assert_eq!(
-        result.decisions[0].stage,
-        PipelineStage::DeterministicPreFilter
-    );
-}
-
-#[test]
-fn test_e2e_unknown_command_dispatch() {
-    let pipeline = make_pipeline(default_provider());
-    let request = make_request("/nonexistent");
-    let result = route(&pipeline, &request).expect("pipeline should handle unknown command");
-
-    assert!(result.rejected);
-    assert!(
-        result
-            .reject_reason
-            .unwrap_or_default()
-            .contains("unknown command"),
-        "reject reason should mention unknown command"
-    );
-}
-
-// ── PII Flagging ────────────────────────────────────────────────────────
-
-#[test]
-fn test_e2e_pii_flagging_detected() {
-    let pipeline = make_pipeline(default_provider());
-    let request = make_request("My email is user@example.com and SSN is 123-45-6789");
-    let result = route(&pipeline, &request).expect("pipeline should complete");
-
-    // PII patterns are scoped to frontier_bound; at stage 1 we don't know
-    // the destination, so PII passes through without flagging.
-    assert!(!result.rejected, "PII should not be rejected at stage 1");
-
-    let stage1 = &result.decisions[0];
-    assert_eq!(stage1.stage, PipelineStage::DeterministicPreFilter);
-    assert_eq!(stage1.verdict, StageVerdict::Passed);
-    assert!(
-        stage1.reason.contains("no command"),
-        "should pass through: {}",
-        stage1.reason
-    );
-}
-
-#[test]
-fn test_e2e_pii_not_flagged_for_clean_input() {
-    let pipeline = make_pipeline(default_provider());
-    let request = make_request("What is the capital of France?");
-    let result = route(&pipeline, &request).expect("pipeline should complete");
-
-    let stage1 = &result.decisions[0];
-    assert_eq!(stage1.stage, PipelineStage::DeterministicPreFilter);
-    let reason = &stage1.reason;
-    assert!(
-        reason.contains("no command") || reason.contains("no PII"),
-        "should indicate no PII, got: {reason}"
     );
 }
 
@@ -420,23 +330,6 @@ fn make_tree_pipeline(provider: TranscriptProvider) -> PipelineOrchestrator {
 }
 
 #[test]
-fn test_e2e_tree_config_routes_to_terminal() {
-    let mut entries = HashMap::new();
-    entries.insert("help me debug rust".into(), tree_verdict("code", 6));
-    let pipeline = make_tree_pipeline(TranscriptProvider::new(entries));
-    let result =
-        route(&pipeline, &make_request("help me debug rust")).expect("pipeline should complete");
-
-    assert!(!result.rejected, "tree should route, not reject");
-    let rt = result
-        .routing_target
-        .expect("tree should produce a routing target");
-    assert_eq!(rt.target_name.as_deref(), Some("code"));
-    assert_eq!(rt.model, "code-model");
-    assert_eq!(rt.group.as_deref(), Some("code"));
-}
-
-#[test]
 fn test_e2e_tree_config_unknown_route_uses_fallback() {
     let mut entries = HashMap::new();
     entries.insert("hello there".into(), tree_verdict("does-not-exist", 2));
@@ -451,95 +344,7 @@ fn test_e2e_tree_config_unknown_route_uses_fallback() {
     assert_eq!(rt.model, "fast");
 }
 
-#[test]
-fn test_e2e_tree_config_rejects_incoherent() {
-    let mut entries = HashMap::new();
-    entries.insert(
-        "asdfghjkl qwerty".into(),
-        serde_json::to_string(&serde_json::json!({
-            "route": "code",
-            "coherence": 0.1,
-            "safety": 0.9,
-            "complexity": 1,
-            "reason": "garbage",
-        }))
-        .unwrap(),
-    );
-    let pipeline = make_tree_pipeline(TranscriptProvider::new(entries));
-    let result =
-        route(&pipeline, &make_request("asdfghjkl qwerty")).expect("pipeline should complete");
-
-    assert!(
-        result.rejected,
-        "below-threshold tree verdict should reject"
-    );
-    assert!(
-        result
-            .reject_reason
-            .as_ref()
-            .is_some_and(|r| r.contains("coherence")),
-        "rejection reason should mention coherence, got: {:?}",
-        result.reject_reason
-    );
-}
-
 // ── Checkpoint/Rewind Cycle (DAG session-level) ─────────────────────────
-
-#[tokio::test]
-async fn test_e2e_dag_session_checkpoint_rewind() {
-    use crate::dag_session::{DependencySession, SessionStep, StepResult};
-
-    let mut session = DependencySession::new("e2e-session");
-
-    session
-        .add_step(SessionStep::new("step1", "Initial research"))
-        .expect("add step1");
-    session
-        .add_step(SessionStep::new("step2", "Analysis").with_depends(vec!["step1".into()]))
-        .expect("add step2");
-    session
-        .add_step(
-            SessionStep::new("step3", "Implementation")
-                .with_depends(vec!["step2".into()])
-                .with_checkpoint(),
-        )
-        .expect("add step3");
-    session
-        .add_step(SessionStep::new("step4", "Testing").with_depends(vec!["step3".into()]))
-        .expect("add step4");
-
-    let ok = |content: &str| StepResult {
-        content: content.into(),
-        accepted: true,
-        score: Some(1.0),
-        latency_ms: 100,
-        error: None,
-    };
-
-    session
-        .complete_step("step1", ok("Research complete"))
-        .expect("complete step1");
-    session
-        .complete_step("step2", ok("Analysis complete"))
-        .expect("complete step2");
-
-    let checkpoints = session.checkpoints();
-    assert!(!checkpoints.is_empty(), "step3 should be a checkpoint");
-
-    session
-        .complete_step("step3", ok("Implementation complete"))
-        .expect("complete step3");
-
-    session.rewind_to_checkpoint("step3").expect("rewind");
-
-    assert_eq!(
-        session.get_step("step3").map(|s| s.status),
-        Some(StepStatus::Pending),
-        "step3 should be reset to Pending after rewind"
-    );
-    assert_eq!(
-        session.get_step("step4").map(|s| s.status),
-        Some(StepStatus::Pending),
-        "step4 should be reset to Pending after rewind"
-    );
-}
+// Note: the checkpoint→rewind→status-reset behavior is owned by the inline
+// `dag_session.rs` tests (`test_rewind_to_checkpoint`, `test_checkpoint_listing`),
+// which subsume this formerly-duplicated e2e coverage. See ROADMAP M2.4.

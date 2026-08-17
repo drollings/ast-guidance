@@ -20,6 +20,7 @@ fluent-wvr-testutil = { path = "../fluent-wvr-testutil" }
 fluent-concurrency = { path = "../fluent-concurrency" }
 tokio = { workspace = true }
 tempfile = { workspace = true }
+rusqlite = { workspace = true }
 
 [lints]
 workspace = true

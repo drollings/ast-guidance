@@ -206,3 +206,133 @@ impl From<serde_json::Value> for StageMetadata {
         Self(v)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pipeline_stage_serde_round_trip() {
+        for stage in [
+            PipelineStage::DeterministicPreFilter,
+            PipelineStage::Classifier,
+            PipelineStage::Router,
+        ] {
+            let json = serde_json::to_string(&stage).expect("serialize");
+            let back: PipelineStage = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, stage, "round trip for {json}");
+        }
+        // The `Router` marker exists only for telemetry/rejection paths.
+        assert_eq!(
+            serde_json::from_str::<PipelineStage>("\"Router\"").unwrap(),
+            PipelineStage::Router
+        );
+    }
+
+    #[test]
+    fn stage_verdict_serde_round_trip() {
+        for verdict in [
+            StageVerdict::Passed,
+            StageVerdict::Rejected,
+            StageVerdict::Rerouted,
+            StageVerdict::Skipped,
+            StageVerdict::Error,
+        ] {
+            let json = serde_json::to_string(&verdict).expect("serialize");
+            let back: StageVerdict = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, verdict, "round trip for {json}");
+        }
+    }
+
+    #[test]
+    fn stage_decision_builders_and_serde() {
+        let d = StageDecision::new(PipelineStage::DeterministicPreFilter, StageVerdict::Rejected, "blocked")
+            .with_score(0.9)
+            .with_latency(12)
+            .with_metadata(serde_json::json!({"x": 1}));
+        assert_eq!(d.score, Some(0.9));
+        assert_eq!(d.latency_ms, 12);
+        assert_eq!(d.metadata["x"], 1);
+        let back: StageDecision =
+            serde_json::from_str(&serde_json::to_string(&d).expect("serialize")).expect("deserialize");
+        assert_eq!(back.stage, d.stage);
+        assert_eq!(back.verdict, d.verdict);
+        assert_eq!(back.score, d.score);
+    }
+
+    #[test]
+    fn pii_verdict_serde_round_trip() {
+        let v = PiiVerdict {
+            pattern: "email".into(),
+            action: FilterAction::Anonymize,
+            codewords: [("a".to_string(), "b".to_string())].into_iter().collect(),
+            matches: vec![RegexMatch {
+                pattern_name: "email".into(),
+                matched_text: "x@y.z".into(),
+                start: 0,
+                end: 6,
+                action: FilterAction::Redact,
+            }],
+        };
+        let back: PiiVerdict =
+            serde_json::from_str(&serde_json::to_string(&v).expect("serialize")).expect("deserialize");
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    fn stage_metadata_typed_accessors() {
+        let mut m = StageMetadata::new(serde_json::json!({}));
+        m.set_response("hello");
+        m.set_rewritten_request("rewritten");
+        m.set_command_result("result");
+        m.set_fallback(true);
+        assert_eq!(m.response(), Some("hello"));
+        assert_eq!(m.rewritten_request(), Some("rewritten"));
+        assert_eq!(m.command_result(), Some("result"));
+        assert_eq!(m.fallback(), Some(true));
+
+        let pii = PiiVerdict {
+            pattern: "ssn".into(),
+            action: FilterAction::Redact,
+            codewords: Default::default(),
+            matches: vec![],
+        };
+        m.set_pii_filter(&pii);
+        assert_eq!(m.pii_filter().expect("pii"), pii);
+
+        // `RoutingTarget`'s non-defaulted fields are `url`/`model`; serde
+        // fills the rest with the struct's `#[serde(default)]`s.
+        let rt: RoutingTarget = serde_json::from_value(serde_json::json!({
+            "url": "http://upstream",
+            "model": "fast",
+        }))
+        .expect("routing target from json");
+        assert_eq!(rt.model, "fast");
+        m.set_routing_target(&rt);
+        assert_eq!(m.routing_target().expect("routing target").model, "fast");
+
+        m.insert("custom", serde_json::json!(true));
+        assert_eq!(m.as_value()["custom"], true);
+        // `into_value` unwraps to the underlying map.
+        assert_eq!(m.into_value()["response"], "hello");
+    }
+
+    #[test]
+    fn stage_metadata_missing_accessors_return_none() {
+        let m = StageMetadata::new(serde_json::json!({}));
+        assert!(m.routing_target().is_none());
+        assert_eq!(m.response(), None);
+        assert!(m.pii_filter().is_none());
+        assert_eq!(m.fallback(), None);
+    }
+
+    #[test]
+    fn stage_metadata_from_value_and_transparent_serde() {
+        // `#[serde(transparent)]` means the wrapper (de)serializes as the
+        // underlying JSON value alone.
+        let json = serde_json::json!({"routing_target": {"model": "fast", "group": "fast"}});
+        let m: StageMetadata = serde_json::from_value(json.clone()).expect("from value");
+        let back = serde_json::to_value(m).expect("to value");
+        assert_eq!(back, json);
+    }
+}

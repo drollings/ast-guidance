@@ -81,6 +81,17 @@ is the priority.
 | `make router-test` | Kill server + fluent-router unit/golden/e2e tests + `--help` dry-run |
 | `make router-test-all` | `router-test` + coral-context HNSW benchmarks (slow) |
 | `make router-mock` | Config-synced routing integration tests (intent → model_group, derived from `env/coral-router.json`) |
+| `make test-<crate>` | One crate's Tier-0/1/2 suite, hermetic (e.g. `test-router`, `test-llm`, `test-db`) |
+| `make test-live` | **The only pathway that runs real AI inference** — `#[ignore]` + `live-ai`-gated tests, skips cleanly without env |
+| `make <crate>-test-live` | Live-AI tests for one crate (e.g. `router-test-live`, `llm-test-live`) |
+| `make lint-live-ai` | Hermeticity guard: every `#[ignore]` has a `reason`; no hermetic test dials a non-loopback host |
+
+See `doc/TESTING.md` for the full testing convention and the `test-<crate>` /
+`test-live` Make target table.
+
+**AI-inference tests must be `#[ignore]` + `live-ai`-gated and run only via
+`make test-live`.** No test in `make test` / `make router-test` /
+`make router-mock` / CI may dial a real inference endpoint.
 
 ## Import boundaries
 

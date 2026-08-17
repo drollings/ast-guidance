@@ -11,6 +11,21 @@ use crate::http_class::HttpClass;
 /// Implemented by `LlmClient` (production) and test stubs.
 pub trait ChatBackend: Send + Sync {
     fn chat_complete(&self, messages: &[ChatMessage]) -> Result<String, LlmError>;
+
+    /// Chat completion with per-call extra body parameters merged on top of
+    /// the backend's configured defaults (e.g. `response_format` for
+    /// constrained decoding). The default implementation ignores `extras` and
+    /// delegates to [`chat_complete`](Self::chat_complete), so stubs, mock
+    /// backends, and transports without a per-call extras seam keep working
+    /// unchanged — only backends that honor per-call extras need to override.
+    fn chat_complete_with_extras(
+        &self,
+        messages: &[ChatMessage],
+        extras: &serde_json::Value,
+    ) -> Result<String, LlmError> {
+        let _ = extras;
+        self.chat_complete(messages)
+    }
 }
 
 pub struct LlmClient {
@@ -102,11 +117,37 @@ impl LlmClient {
     /// — this is fully async, so it composes correctly with `tokio::spawn`,
     /// `Scope::spawn`, and `Limiter::run` without requiring `Handle::block_on`.
     pub async fn chat_complete_async(&self, messages: &[ChatMessage]) -> Result<String, LlmError> {
+        self.chat_complete_with_extra_async(messages, None).await
+    }
+
+    /// Async chat completion with per-call extra body parameters merged on top
+    /// of the client's configured `extra_body_params`. This is the seam that
+    /// lets callers request constrained decoding (`response_format` /
+    /// `json_schema`) for a single call without changing the shared config.
+    pub async fn chat_complete_with_extras_async(
+        &self,
+        messages: &[ChatMessage],
+        extras: &serde_json::Value,
+    ) -> Result<String, LlmError> {
+        self.chat_complete_with_extra_async(messages, Some(extras)).await
+    }
+
+    /// Core async chat completion. `extras` (per-call body params) are merged
+    /// on top of the client's configured `extra_body_params`; `None` sends the
+    /// configured defaults unchanged.
+    async fn chat_complete_with_extra_async(
+        &self,
+        messages: &[ChatMessage],
+        extras: Option<&serde_json::Value>,
+    ) -> Result<String, LlmError> {
+        let merged = merge_extra_params(self.config.extra_body_params.as_ref(), extras);
         match &self.queue {
             Some(q) => {
+                let mut config = self.config.clone();
+                config.extra_body_params = merged;
                 let task = fluent_concurrency::llm_queue::LlmTask {
                     messages: messages.to_vec(),
-                    config: self.config.clone(),
+                    config,
                 };
                 q.submit(task).await
             }
@@ -117,7 +158,7 @@ impl LlmClient {
                     &self.model,
                     self.config.think,
                     self.config.timeout_ms,
-                    self.config.extra_body_params.as_ref(),
+                    merged.as_ref(),
                     self.config.debug,
                     self.config.show_prompts,
                 )
@@ -134,11 +175,58 @@ impl LlmClient {
         let messages = messages.to_vec();
         block_on(client.chat_complete_async(&messages))
     }
+
+    /// Sync adapter for `chat_complete_with_extras_async` — the per-call
+    /// extras seam for synchronous callers (e.g. the classifier stage).
+    pub fn chat_complete_with_extras(
+        &self,
+        messages: &[ChatMessage],
+        extras: &serde_json::Value,
+    ) -> Result<String, LlmError> {
+        let client = self.clone();
+        let messages = messages.to_vec();
+        let extras = extras.clone();
+        block_on(client.chat_complete_with_extras_async(&messages, &extras))
+    }
 }
 
 impl ChatBackend for LlmClient {
     fn chat_complete(&self, messages: &[ChatMessage]) -> Result<String, LlmError> {
         self.chat_complete(messages)
+    }
+
+    fn chat_complete_with_extras(
+        &self,
+        messages: &[ChatMessage],
+        extras: &serde_json::Value,
+    ) -> Result<String, LlmError> {
+        self.chat_complete_with_extras(messages, extras)
+    }
+}
+
+/// Merge per-call `extras` on top of the client's configured `base`
+/// `extra_body_params` (extras win on key conflicts). Returns `None` only when
+/// both are absent; non-object values degrade to an empty object so the merge
+/// never drops configured params.
+fn merge_extra_params(
+    base: Option<&serde_json::Value>,
+    extras: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let mut merged = base
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(extras) = extras {
+        if let Some(obj) = extras.as_object() {
+            for (k, v) in obj {
+                merged.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    if merged.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(merged))
     }
 }
 
@@ -551,6 +639,85 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_extra_params_none_both() {
+        assert_eq!(merge_extra_params(None, None), None);
+    }
+
+    #[test]
+    fn test_merge_extra_params_base_only() {
+        let base = serde_json::json!({"temperature": 0.5});
+        assert_eq!(
+            merge_extra_params(Some(&base), None),
+            Some(serde_json::json!({"temperature": 0.5}))
+        );
+    }
+
+    #[test]
+    fn test_merge_extra_params_extras_only() {
+        let extras = serde_json::json!({"response_format": {"type": "json_object"}});
+        assert_eq!(
+            merge_extra_params(None, Some(&extras)),
+            Some(extras.clone())
+        );
+    }
+
+    #[test]
+    fn test_merge_extra_params_extras_win_on_conflict() {
+        let base = serde_json::json!({"temperature": 0.5, "num_ctx": 8192});
+        let extras = serde_json::json!({"temperature": 0.1});
+        assert_eq!(
+            merge_extra_params(Some(&base), Some(&extras)),
+            Some(serde_json::json!({"temperature": 0.1, "num_ctx": 8192}))
+        );
+    }
+
+    #[test]
+    fn test_merge_extra_params_merges_disjoint_keys() {
+        let base = serde_json::json!({"temperature": 0.5});
+        let extras = serde_json::json!({"response_format": {"type": "json_object"}});
+        assert_eq!(
+            merge_extra_params(Some(&base), Some(&extras)),
+            Some(serde_json::json!({
+                "temperature": 0.5,
+                "response_format": {"type": "json_object"}
+            }))
+        );
+    }
+
+    #[test]
+    fn test_merge_extra_params_non_object_base_degrades_to_empty() {
+        // A non-object base must not panic or leak; extras still win.
+        let base = serde_json::json!(42);
+        let extras = serde_json::json!({"response_format": {"type": "json_object"}});
+        assert_eq!(
+            merge_extra_params(Some(&base), Some(&extras)),
+            Some(extras.clone())
+        );
+    }
+
+    #[test]
+    fn test_merge_extra_params_non_object_extras_ignored() {
+        let base = serde_json::json!({"temperature": 0.5});
+        let extras = serde_json::json!("not-an-object");
+        assert_eq!(
+            merge_extra_params(Some(&base), Some(&extras)),
+            Some(serde_json::json!({"temperature": 0.5}))
+        );
+    }
+
+    #[test]
+    fn test_chat_complete_with_extras_invokes_seam() {
+        // The seam must be the same callable surface as chat_complete for a
+        // queue-less client: it compiles and routes through the shared async
+        // path (unreachable endpoint here, so we assert the error shape only).
+        let client = LlmClient::new("http://127.0.0.1:1/v1", "llama3");
+        let messages = vec![ChatMessage { role: "user".into(), content: "hi".into() }];
+        let extras = serde_json::json!({"response_format": {"type": "json_object"}});
+        let result = client.chat_complete_with_extras(&messages, &extras);
+        assert!(result.is_err(), "unreachable endpoint must surface an error");
+    }
+
+    #[test]
     fn test_model_name_strips_prefix() {
         assert_eq!(model_name("ollama:embeddinggemma"), "embeddinggemma");
         assert_eq!(model_name("model"), "model");
@@ -661,5 +828,98 @@ mod tests {
         assert!(is_blank_or_plausible("Computes the hash."));
         assert!(!is_blank_or_plausible("ab"));
         assert!(!is_blank_or_plausible("function"));
+    }
+
+    fn chat_body() -> serde_json::Value {
+        serde_json::json!({
+            "id": "cmpl-1", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "hello world"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+        })
+    }
+
+    fn one_message() -> Vec<ChatMessage> {
+        vec![ChatMessage { role: "user".into(), content: "hi".into() }]
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_chat_complete_http_happy_path() {
+        let server = httpmock::MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method("POST").path("/chat/completions");
+            then.status(200).json_body(chat_body());
+        });
+        let client = LlmClient::new(&server.base_url(), "m");
+        let result = client.chat_complete(&one_message()).expect("chat complete");
+        assert_eq!(result, "hello world");
+        mock.assert_hits(1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_chat_complete_http_rate_limited_is_retryable() {
+        let server = httpmock::MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method("POST").path("/chat/completions");
+            then.status(503)
+                .json_body(serde_json::json!({"error": {"message": "overloaded"}}));
+        });
+        let client = LlmClient::new(&server.base_url(), "m");
+        let err = client.chat_complete(&one_message()).expect_err("rate limited");
+        assert_eq!(err, LlmError::RateLimited);
+        assert!(err.is_retryable());
+        mock.assert_hits(1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_chat_complete_http_client_error_is_api() {
+        let server = httpmock::MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method("POST").path("/chat/completions");
+            then.status(404).body("not found");
+        });
+        let client = LlmClient::new(&server.base_url(), "m");
+        let err = client.chat_complete(&one_message()).expect_err("404");
+        assert!(matches!(err, LlmError::Api(_)));
+        assert!(!err.is_retryable());
+        mock.assert_hits(1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_chat_complete_empty_content_is_no_response() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method("POST").path("/chat/completions");
+            then.status(200).json_body(serde_json::json!({
+                "id": "cmpl-1", "object": "chat.completion", "created": 0, "model": "m",
+                "choices": [{"index": 0, "finish_reason": "stop",
+                             "message": {"role": "assistant", "content": ""}}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            }));
+        });
+        let client = LlmClient::new(&server.base_url(), "m");
+        let err = client.chat_complete(&one_message()).expect_err("empty content");
+        assert_eq!(err, LlmError::NoResponse);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_chat_complete_malformed_json_is_api_error() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method("POST").path("/chat/completions");
+            then.status(200).body("this is not json");
+        });
+        let client = LlmClient::new(&server.base_url(), "m");
+        let err = client.chat_complete(&one_message()).expect_err("malformed");
+        assert!(matches!(err, LlmError::Api(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_chat_complete_unreachable_endpoint_is_http_error() {
+        // A refused loopback port is a transport failure -> Http (retryable).
+        let client = LlmClient::new("http://127.0.0.1:1", "m");
+        let err = client.chat_complete(&one_message()).expect_err("refused");
+        assert!(matches!(err, LlmError::Http(_)));
+        assert!(err.is_retryable());
     }
 }

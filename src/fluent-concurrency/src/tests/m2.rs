@@ -1,6 +1,6 @@
 use super::*;
 use crate::scope::Scope;
-use crate::batch::{CancelReason, SupervisedBatch, SupervisedBatchConfig, SupervisedBatchError, SupervisedBatchEvent, SupervisedBatchSummary};
+use crate::batch::{CancelReason, SupervisedBatchConfig, SupervisedBatchError, SupervisedBatchEvent, SupervisedBatchSummary};
 #[tokio::test(start_paused = true)]
 async fn test_scope_close_drains_tasks() {
     tokio::time::resume();
@@ -118,28 +118,8 @@ async fn test_scope_defer_aborts_tasks() {
 /// JoinError::Panic and trigger dependency-aware cancellation.
 #[tokio::test(start_paused = true)]
 async fn test_batch_panic_propagates_as_join_error() {
-    let runtime = crate::tokio_runtime();
-    let caps = CapabilitySet::new();
-    let mut batch = SupervisedBatch::new(runtime, caps);
-
-    struct PanicOnExecute;
-    impl WorkUnit for PanicOnExecute {
-        fn name(&self) -> &str {
-            "panicker"
-        }
-        fn depends(&self) -> &[ArcIntern<str>] {
-            &[]
-        }
-        fn provides(&self) -> &[ArcIntern<str>] {
-            &[]
-        }
-        fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-            panic!("execute panic");
-        }
-    }
-    impl_component_for_test!(PanicOnExecute);
-
-    batch.register(Arc::new(PanicOnExecute)).unwrap();
+    let mut batch = make_batch();
+    batch.register(Arc::new(StubComponent::panic("panicker"))).unwrap();
     let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(
         summary.panicked.len(),
@@ -158,109 +138,14 @@ async fn test_batch_panic_propagates_as_join_error() {
 }
 
 /// SupervisedBatch: a panic in a provider task must cancel all transitively dependent tasks.
-#[tokio::test(start_paused = true)]
-async fn test_batch_panic_cancels_transitive_dependents() {
-    let runtime = crate::tokio_runtime();
-    let caps = CapabilitySet::new();
-    let mut batch = SupervisedBatch::new(runtime, caps);
-
-    struct PanicProvider {
-        provides: Vec<ArcIntern<str>>,
-    }
-    impl WorkUnit for PanicProvider {
-        fn name(&self) -> &str {
-            "provider"
-        }
-        fn depends(&self) -> &[ArcIntern<str>] {
-            &[]
-        }
-        fn provides(&self) -> &[ArcIntern<str>] {
-            &self.provides
-        }
-        fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-            panic!("provider panic");
-        }
-    }
-    impl_component_for_test!(PanicProvider);
-
-    struct WaitingDep {
-        name: String,
-        deps: Vec<ArcIntern<str>>,
-    }
-    impl WorkUnit for WaitingDep {
-        fn name(&self) -> &str {
-            &self.name
-        }
-        fn depends(&self) -> &[ArcIntern<str>] {
-            &self.deps
-        }
-        fn provides(&self) -> &[ArcIntern<str>] {
-            &[]
-        }
-        fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-            // Fail on first attempt so the retry path kicks in with an
-            // async sleep.  With paused time the sleep never completes,
-            // keeping the task pending until abort_cancel reaches it.
-            // `Dependency` is the transient (retryable) error — a permanent
-            // `Execution` failure would complete immediately and never be
-            // cancellable by the provider's panic.
-            Err(WorkError::Dependency("awaiting dependency".into()))
-        }
-    }
-    impl_component_for_test!(WaitingDep);
-
-    let asset = ArcIntern::<str>::from("asset");
-    batch.register(Arc::new(PanicProvider {
-        provides: vec![asset.clone()],
-    }))
-    .unwrap();
-    batch.register_with_context(
-        Arc::new(WaitingDep {
-            name: "dep1".into(),
-            deps: vec![asset.clone()],
-        }),
-        WorkContext {
-            max_retries: 10,
-            ..WorkContext::default()
-        },
-    )
-    .unwrap();
-    batch.register_with_context(
-        Arc::new(WaitingDep {
-            name: "dep2".into(),
-            deps: vec![asset],
-        }),
-        WorkContext {
-            max_retries: 10,
-            ..WorkContext::default()
-        },
-    )
-    .unwrap();
-
-    let summary: SupervisedBatchSummary = (&mut batch).await;
-    assert_eq!(summary.panicked.len(), 1, "provider must panic");
-    assert_eq!(
-        summary.cancelled.len(),
-        2,
-        "both dependents must be cancelled"
-    );
-    let names: Vec<String> = summary
-        .cancelled
-        .iter()
-        .map(|e| match e {
-            SupervisedBatchEvent::Cancelled { name, .. } => name.to_string(),
-            _ => String::new(),
-        })
-        .collect();
-    assert!(names.contains(&"dep1".to_string()));
-    assert!(names.contains(&"dep2".to_string()));
-}
+// Note: this assertion is owned by the e2e suite's
+// `test_e2e_panic_cascade_with_independent_neighbors`, which folds in the
+// "one panic cancels multiple sibling dependents" check and also asserts that
+// independent neighbors complete. See ROADMAP M2.5.
 
 #[tokio::test(start_paused = true)]
 async fn test_batch_normal_completion() {
-    let runtime = crate::tokio_runtime();
-    let caps = CapabilitySet::new();
-    let mut batch = SupervisedBatch::new(runtime, caps);
+    let mut batch = make_batch();
     batch.register(Arc::new(StubComponent::ok("task1"))).unwrap();
     batch.register(Arc::new(StubComponent::ok("task2"))).unwrap();
     let summary: SupervisedBatchSummary = (&mut batch).await;
@@ -271,9 +156,7 @@ async fn test_batch_normal_completion() {
 
 #[tokio::test(start_paused = true)]
 async fn test_batch_panic_containment() {
-    let runtime = crate::tokio_runtime();
-    let caps = CapabilitySet::new();
-    let mut batch = SupervisedBatch::new(runtime, caps);
+    let mut batch = make_batch();
     batch.register(Arc::new(StubComponent::ok("good"))).unwrap();
     batch.register(Arc::new(StubComponent::fail("bad"))).unwrap();
     let summary: SupervisedBatchSummary = (&mut batch).await;
@@ -285,9 +168,7 @@ async fn test_batch_panic_containment() {
 #[tokio::test(start_paused = true)]
 async fn test_batch_real_timeout() {
     tokio::time::resume();
-    let runtime = crate::tokio_runtime();
-    let caps = CapabilitySet::new();
-    let mut batch = SupervisedBatch::new(runtime, caps);
+    let mut batch = make_batch();
     // The unit fails with a transient error, so the retry backoff keeps it
     // alive past the 50ms wall-clock budget — the outer timeout fires and
     // records a `Timeout` cancellation. (A permanent Execution failure would
@@ -317,40 +198,18 @@ async fn test_batch_real_timeout() {
 #[tokio::test(start_paused = true)]
 async fn test_batch_retry_with_max_retries() {
     tokio::time::resume();
-    let runtime = crate::tokio_runtime();
-    let caps = CapabilitySet::new();
-    let mut batch = SupervisedBatch::new(Arc::clone(&runtime), caps.clone());
+    let mut batch = make_batch();
     let counter = Arc::new(AtomicUsize::new(0));
-    let counter_clone = Arc::clone(&counter);
-
-    struct RetryCounter {
-        name: String,
-        counter: Arc<AtomicUsize>,
-    }
-    impl WorkUnit for RetryCounter {
-        fn name(&self) -> &str {
-            &self.name
-        }
-        fn depends(&self) -> &[ArcIntern<str>] {
-            &[]
-        }
-        fn provides(&self) -> &[ArcIntern<str>] {
-            &[]
-        }
-        fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-            self.counter.fetch_add(1, Ordering::SeqCst);
-            // `Dependency` is transient/retryable, so the SupervisedBatch retries up to
-            // `max_retries` times. A permanent `Execution` failure would
-            // short-circuit on the first attempt.
+    let cnt = Arc::clone(&counter);
+    // `Dependency` is transient/retryable, so the SupervisedBatch retries up to
+    // `max_retries` times. A permanent `Execution` failure would short-circuit
+    // on the first attempt.
+    let unit = Arc::new(
+        StubComponent::new("retry_test").with_handler(move |_| {
+            cnt.fetch_add(1, Ordering::SeqCst);
             Err(WorkError::Dependency("retry fail".into()))
-        }
-    }
-    impl_component_for_test!(RetryCounter);
-
-    let unit = Arc::new(RetryCounter {
-        name: "retry_test".into(),
-        counter: counter_clone,
-    });
+        }),
+    );
     let ctx = WorkContext {
         max_retries: 2,
         ..WorkContext::default()
@@ -370,37 +229,15 @@ async fn test_batch_retry_with_max_retries() {
 #[tokio::test(start_paused = true)]
 async fn test_batch_permanent_error_does_not_retry() {
     tokio::time::resume();
-    let runtime = crate::tokio_runtime();
-    let caps = CapabilitySet::new();
-    let mut batch = SupervisedBatch::new(Arc::clone(&runtime), caps.clone());
+    let mut batch = make_batch();
     let counter = Arc::new(AtomicUsize::new(0));
-    let counter_clone = Arc::clone(&counter);
-
-    struct PermanentFail {
-        name: String,
-        counter: Arc<AtomicUsize>,
-    }
-    impl WorkUnit for PermanentFail {
-        fn name(&self) -> &str {
-            &self.name
-        }
-        fn depends(&self) -> &[ArcIntern<str>] {
-            &[]
-        }
-        fn provides(&self) -> &[ArcIntern<str>] {
-            &[]
-        }
-        fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-            self.counter.fetch_add(1, Ordering::SeqCst);
+    let cnt = Arc::clone(&counter);
+    let unit = Arc::new(
+        StubComponent::new("permanent_fail").with_handler(move |_| {
+            cnt.fetch_add(1, Ordering::SeqCst);
             Err(WorkError::Execution("permanent failure".into()))
-        }
-    }
-    impl_component_for_test!(PermanentFail);
-
-    let unit = Arc::new(PermanentFail {
-        name: "permanent_fail".into(),
-        counter: counter_clone,
-    });
+        }),
+    );
     let ctx = WorkContext {
         max_retries: 5,
         ..WorkContext::default()
@@ -418,9 +255,7 @@ async fn test_batch_permanent_error_does_not_retry() {
 
 #[tokio::test(start_paused = true)]
 async fn test_batch_real_panic() {
-    let runtime = crate::tokio_runtime();
-    let caps = CapabilitySet::new();
-    let mut batch = SupervisedBatch::new(runtime, caps);
+    let mut batch = make_batch();
 
     batch.register(Arc::new(StubComponent::ok("good"))).unwrap();
     batch.register(Arc::new(StubComponent::panic("panic")))
@@ -435,29 +270,32 @@ async fn test_batch_real_panic() {
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn test_batch_dependency_cancellation() {
-    let runtime = crate::tokio_runtime();
-    let caps = CapabilitySet::new();
-    let mut batch = SupervisedBatch::new(runtime, caps);
-
-    batch.register(Arc::new(
-        StubComponent::fail("parent").with_provides("shared"),
-    ))
-    .unwrap();
-    let child = Arc::new(StubComponent::dep_fail("child").with_dep("shared"));
+/// A parent that provides a shared asset and then fails (permanent) or panics
+/// must cancel its dependent. The single assertion body is shared by the two
+/// parent-outcome tests below (see ROADMAP M2.5).
+async fn assert_parent_outcome_cancels_dependent(parent: StubComponent) {
+    let parent_panics = parent.panic;
+    let mut batch = make_batch();
+    batch.register(Arc::new(parent)).unwrap();
     batch.register_with_context(
-        child,
+        Arc::new(StubComponent::dep_fail("child").with_dep("shared")),
         WorkContext {
             max_retries: 10,
             ..WorkContext::default()
         },
     )
     .unwrap();
+
     let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(summary.completed.len(), 0);
-    assert_eq!(summary.failed.len(), 1);
-    assert_eq!(summary.cancelled.len(), 1);
+    if parent_panics {
+        assert_eq!(summary.panicked.len(), 1, "parent must panic");
+        assert_eq!(summary.failed.len(), 0);
+    } else {
+        assert_eq!(summary.failed.len(), 1, "parent must fail");
+        assert_eq!(summary.panicked.len(), 0);
+    }
+    assert_eq!(summary.cancelled.len(), 1, "child must be cancelled");
     if let SupervisedBatchEvent::Cancelled {
         ref name,
         ref reason,
@@ -471,27 +309,104 @@ async fn test_batch_dependency_cancellation() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn test_batch_drop_cancels_tasks() {
+async fn test_batch_dependency_cancellation() {
+    assert_parent_outcome_cancels_dependent(
+        StubComponent::fail("parent").with_provides("shared"),
+    )
+    .await;
+}
+
+/// Dropping a `SupervisedBatch` with in-flight, pending, or already-completed
+/// tasks must be safe — it aborts the tasks without hanging or panicking (and
+/// no orphaned task ever completes). Parametrized over the batch shapes that
+/// previously lived as five separate `test_batch_drop_*` fns (see ROADMAP M2.5).
+#[tokio::test(start_paused = true)]
+async fn test_batch_drop_is_safe() {
     tokio::time::resume();
-    let runtime = crate::tokio_runtime();
-    let caps = CapabilitySet::new();
-    let mut batch = SupervisedBatch::new(runtime, caps);
-    let unit = Arc::new(StubComponent::fail("slow"));
-    let ctx = WorkContext {
-        max_retries: 100,
-        ..WorkContext::default()
-    };
-    batch.register_with_context(unit, ctx).unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    drop(batch);
-    // If we got here without hanging, the SupervisedBatch dropped correctly
+
+    // Single pending task retrying on a transient failure.
+    {
+        let mut batch = make_batch();
+        let unit = Arc::new(StubComponent::fail("slow"));
+        let ctx = WorkContext {
+            max_retries: 100,
+            ..WorkContext::default()
+        };
+        batch.register_with_context(unit, ctx).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(batch);
+        // Reaching here without hanging means the drop aborted cleanly.
+    }
+
+    // A task that would complete immediately, dropped before the batch awaits.
+    {
+        let mut batch = make_batch();
+        batch.register(Arc::new(StubComponent::ok("fast"))).unwrap();
+        drop(batch);
+    }
+
+    // Many pending tasks that would each retry indefinitely.
+    {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut batch = make_batch();
+        for i in 0..10 {
+            let cnt = Arc::clone(&counter);
+            let unit = StubComponent::new(&format!("task_{i}")).with_handler(move |_| {
+                cnt.fetch_add(1, Ordering::SeqCst);
+                Err(WorkError::Dependency("retry".into()))
+            });
+            let ctx = WorkContext {
+                max_retries: 100,
+                ..WorkContext::default()
+            };
+            batch.register_with_context(Arc::new(unit), ctx).unwrap();
+        }
+        drop(batch);
+        // The tasks would each try to execute many times; after abort_all()
+        // they are stopped. Reaching here proves none hung the drop.
+        let _ = counter.load(Ordering::SeqCst);
+    }
+
+    // A dependency graph of pending tasks (provider + dependent), dropped whole.
+    {
+        let mut batch = make_batch();
+        let provider = StubComponent::dep_fail("provider").with_provides("shared_asset");
+        batch
+            .register_with_context(
+                Arc::new(provider),
+                WorkContext {
+                    max_retries: 100,
+                    ..WorkContext::default()
+                },
+            )
+            .unwrap();
+        let dependent = StubComponent::dep_fail("dependent").with_dep("shared_asset");
+        batch
+            .register_with_context(
+                Arc::new(dependent),
+                WorkContext {
+                    max_retries: 100,
+                    ..WorkContext::default()
+                },
+            )
+            .unwrap();
+        drop(batch);
+    }
+
+    // Drop after natural completion: the done=true guard in Drop prevents a
+    // spurious abort_all() on an already-drained JoinSet.
+    {
+        let mut batch = make_batch();
+        batch.register(Arc::new(StubComponent::ok("task"))).unwrap();
+        let summary: SupervisedBatchSummary = (&mut batch).await;
+        assert_eq!(summary.completed.len(), 1);
+        drop(batch);
+    }
 }
 
 #[tokio::test(start_paused = true)]
 async fn test_batch_builder_chaining() {
-    let runtime = crate::tokio_runtime();
-    let caps = CapabilitySet::new();
-    let mut batch = SupervisedBatch::new(runtime, caps);
+    let mut batch = make_batch();
     batch.register(Arc::new(StubComponent::ok("a")))
         .unwrap()
         .register(Arc::new(StubComponent::ok("b")))
@@ -503,9 +418,7 @@ async fn test_batch_builder_chaining() {
 #[tokio::test(start_paused = true)]
 async fn test_batch_transitive_cancellation() {
     tokio::time::resume();
-    let runtime = crate::tokio_runtime();
-    let caps = CapabilitySet::new();
-    let mut batch = SupervisedBatch::new(runtime, caps);
+    let mut batch = make_batch();
 
     batch.register(Arc::new(StubComponent::fail("A").with_provides("a_out")))
         .unwrap();
@@ -549,44 +462,15 @@ async fn test_batch_transitive_cancellation() {
 
 #[tokio::test(start_paused = true)]
 async fn test_batch_panic_cancels_dependents() {
-    let runtime = crate::tokio_runtime();
-    let caps = CapabilitySet::new();
-    let mut batch = SupervisedBatch::new(runtime, caps);
-
-    batch.register(Arc::new(
+    assert_parent_outcome_cancels_dependent(
         StubComponent::panic("parent").with_provides("shared"),
-    ))
-    .unwrap();
-    batch.register_with_context(
-        Arc::new(StubComponent::dep_fail("child").with_dep("shared")),
-        WorkContext {
-            max_retries: 10,
-            ..WorkContext::default()
-        },
     )
-    .unwrap();
-
-    let summary: SupervisedBatchSummary = (&mut batch).await;
-    assert_eq!(summary.completed.len(), 0);
-    assert_eq!(summary.panicked.len(), 1);
-    assert_eq!(summary.cancelled.len(), 1);
-    if let SupervisedBatchEvent::Cancelled {
-        ref name,
-        ref reason,
-    } = summary.cancelled[0]
-    {
-        assert_eq!(&**name, "child");
-        assert!(matches!(reason, CancelReason::DependencyFailed));
-    } else {
-        panic!("expected Cancelled event");
-    }
+    .await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn test_batch_budget_exhaustion() {
-    let runtime = crate::tokio_runtime();
-    let caps = CapabilitySet::new();
-    let mut batch = SupervisedBatch::new(runtime, caps);
+    let mut batch = make_batch();
 
     for i in 0..250 {
         batch.register(Arc::new(StubComponent::ok(&format!("fast_{i}"))))
@@ -600,42 +484,12 @@ async fn test_batch_budget_exhaustion() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn test_batch_drop_aborts_all_tasks() {
-    tokio::time::resume();
-    let runtime = crate::tokio_runtime();
-    let caps = CapabilitySet::new();
-    let mut batch = SupervisedBatch::new(runtime, caps);
-
-    struct SlowUnit;
-    impl WorkUnit for SlowUnit {
-        fn name(&self) -> &str {
-            "slow"
-        }
-        fn depends(&self) -> &[ArcIntern<str>] {
-            &[]
-        }
-        fn provides(&self) -> &[ArcIntern<str>] {
-            &[]
-        }
-        fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-            Ok(WorkOutput::ok("done"))
-        }
-    }
-    impl_component_for_test!(SlowUnit);
-
-    batch.register(Arc::new(SlowUnit)).unwrap();
-    drop(batch);
-}
-
-#[tokio::test(start_paused = true)]
 async fn test_batch_config_custom_budget() {
-    let runtime = crate::tokio_runtime();
-    let caps = CapabilitySet::new();
     let config = SupervisedBatchConfig {
         poll_budget: 32,
         ..SupervisedBatchConfig::default()
     };
-    let mut batch = SupervisedBatch::new_with_config(runtime, caps, config);
+    let mut batch = make_batch_with_config(config);
     batch.register(Arc::new(StubComponent::ok("task"))).unwrap();
     let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(summary.completed.len(), 1);
@@ -645,9 +499,7 @@ async fn test_batch_config_custom_budget() {
 /// go to `summary.panicked` — they are distinct paths.
 #[tokio::test(start_paused = true)]
 async fn test_batch_failed_vs_panic_distinct() {
-    let runtime = crate::tokio_runtime();
-    let caps = CapabilitySet::new();
-    let mut batch = SupervisedBatch::new(runtime, caps);
+    let mut batch = make_batch();
 
     batch.register(Arc::new(StubComponent::fail("fail_task")))
         .unwrap();
@@ -667,19 +519,6 @@ async fn test_batch_failed_vs_panic_distinct() {
         .panicked
         .iter()
         .any(|e| matches!(e, SupervisedBatchEvent::Panicked { name, .. } if &**name == "panic_task")));
-}
-
-/// Drop after natural completion: the SupervisedBatch's done=true guard in Drop
-/// prevents abort_all() from being called on an empty JoinSet.
-#[tokio::test(start_paused = true)]
-async fn test_batch_drop_completed_batch_is_safe() {
-    let runtime = crate::tokio_runtime();
-    let caps = CapabilitySet::new();
-    let mut batch = SupervisedBatch::new(runtime, caps);
-    batch.register(Arc::new(StubComponent::ok("task"))).unwrap();
-    let summary: SupervisedBatchSummary = (&mut batch).await;
-    assert_eq!(summary.completed.len(), 1);
-    drop(batch);
 }
 
 /// BatchConfig satisfies Debug, Clone, Copy, PartialEq, Eq.
@@ -717,15 +556,13 @@ fn test_batch_config_default_retry_predicate() {
 #[tokio::test(start_paused = true)]
 async fn test_batch_custom_retry_predicate_retries_execution() {
     tokio::time::resume();
-    let runtime = crate::tokio_runtime();
-    let caps = CapabilitySet::new();
     // Opt-in predicate: retry even `Execution` failures (legacy unconditional
     // behavior), as chart batches do for their LLM-call failures.
     let config = SupervisedBatchConfig {
         is_retryable: |_: &WorkError| true,
         ..SupervisedBatchConfig::default()
     };
-    let mut batch = SupervisedBatch::new_with_config(runtime, caps, config);
+    let mut batch = make_batch_with_config(config);
     let counter = Arc::new(AtomicUsize::new(0));
     let cnt = Arc::clone(&counter);
     let unit = StubComponent::new("retry_exec").with_handler(move |_| {
@@ -762,14 +599,12 @@ async fn test_batch_config_backoff_honored() {
     );
 
     async fn run_once(base_ms: u64, jitter_ms: u64) -> Duration {
-        let runtime = crate::tokio_runtime();
-        let caps = CapabilitySet::new();
         let config = SupervisedBatchConfig {
             backoff_base_ms: base_ms,
             backoff_jitter_ms: jitter_ms,
             ..SupervisedBatchConfig::default()
         };
-        let mut batch = SupervisedBatch::new_with_config(runtime, caps, config);
+        let mut batch = make_batch_with_config(config);
         let counter = Arc::new(AtomicUsize::new(0));
         let cnt = Arc::clone(&counter);
         let unit = StubComponent::new("backoff").with_handler(move |_| {
@@ -800,13 +635,11 @@ async fn test_batch_config_backoff_honored() {
 /// BatchConfig with poll_budget=1: the minimum valid budget works.
 #[tokio::test(start_paused = true)]
 async fn test_batch_config_budget_one() {
-    let runtime = crate::tokio_runtime();
-    let caps = CapabilitySet::new();
     let config = SupervisedBatchConfig {
         poll_budget: 1,
         ..SupervisedBatchConfig::default()
     };
-    let mut batch = SupervisedBatch::new_with_config(runtime, caps, config);
+    let mut batch = make_batch_with_config(config);
     batch.register(Arc::new(StubComponent::ok("task"))).unwrap();
     let summary: SupervisedBatchSummary = (&mut batch).await;
     assert_eq!(summary.completed.len(), 1);
@@ -815,73 +648,10 @@ async fn test_batch_config_budget_one() {
 /// Verify that registering a duplicate name returns `Err(BatchError::DuplicateName)`.
 #[tokio::test(start_paused = true)]
 async fn test_batch_register_duplicate_returns_error() {
-    let runtime = crate::tokio_runtime();
-    let caps = CapabilitySet::new();
-    let mut batch = SupervisedBatch::new(runtime, caps);
+    let mut batch = make_batch();
     batch.register(Arc::new(StubComponent::ok("dup"))).unwrap();
     match batch.register(Arc::new(StubComponent::fail("dup"))) {
         Err(SupervisedBatchError::DuplicateName(n)) => assert_eq!(n, ArcIntern::from("dup")),
         _ => panic!("expected DuplicateName error"),
     }
-}
-
-/// Drop with multiple pending tasks that would retry indefinitely:
-/// abort_all() prevents any from leaking or completing as orphans.
-#[tokio::test(start_paused = true)]
-async fn test_batch_drop_multiple_pending_tasks() {
-    tokio::time::resume();
-    let runtime = crate::tokio_runtime();
-    let caps = CapabilitySet::new();
-    let counter = Arc::new(AtomicUsize::new(0));
-    let mut batch = SupervisedBatch::new(runtime, caps);
-    for i in 0..10 {
-        let cnt = Arc::clone(&counter);
-        let unit = StubComponent::new(&format!("task_{i}")).with_handler(move |_| {
-            cnt.fetch_add(1, Ordering::SeqCst);
-            Err(WorkError::Dependency("retry".into()))
-        });
-        let ctx = WorkContext {
-            max_retries: 100,
-            ..WorkContext::default()
-        };
-        batch.register_with_context(Arc::new(unit), ctx).unwrap();
-    }
-    drop(batch);
-    // The tasks would each try to execute many times.
-    // After abort_all(), they are stopped. If any completed normally,
-    // they would have incremented the counter. The counter at 0 proves
-    // all were aborted before any succeed path.
-    // With the test reaching here, no hang — abort_all() released all.
-    let _ = counter.load(Ordering::SeqCst);
-}
-
-/// Drop with a dependency graph: all tasks in the graph are aborted,
-/// no matter their dependency level.
-#[tokio::test(start_paused = true)]
-async fn test_batch_drop_dependency_graph() {
-    tokio::time::resume();
-    let runtime = crate::tokio_runtime();
-    let caps = CapabilitySet::new();
-    let mut batch = SupervisedBatch::new(runtime, caps);
-    // Provider task that fails and retries
-    let provider = StubComponent::dep_fail("provider").with_provides("shared_asset");
-    batch.register_with_context(
-        Arc::new(provider),
-        WorkContext {
-            max_retries: 100,
-            ..WorkContext::default()
-        },
-    )
-    .unwrap();
-    // Dependent task that depends on the provider's asset
-    let dependent = StubComponent::dep_fail("dependent").with_dep("shared_asset");
-    batch.register_with_context(
-        Arc::new(dependent),
-        WorkContext {
-            max_retries: 100,
-            ..WorkContext::default()
-        },
-    )
-    .unwrap();
-    drop(batch);
 }

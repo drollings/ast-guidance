@@ -362,4 +362,78 @@ mod tests {
     fn test_tokio_runtime_worker_count() {
         let _ = TokioRuntime;
     }
+
+    fn make_task(content: &str) -> LlmTask {
+        LlmTask {
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: content.into(),
+            }],
+            config: LlmConfig::new()
+                .api_url("http://127.0.0.1:1".into())
+                .model("test".into())
+                .build(),
+        }
+    }
+
+    /// Handler that fails transiently on the first call, then succeeds — the
+    /// caller-driven retry pattern. Verifies the transient error is surfaced
+    /// and classified `is_retryable`, and that a retry lands on the success.
+    #[tokio::test]
+    async fn test_queue_transient_error_then_retry_succeeds() {
+        let runtime = tokio_runtime();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = Arc::clone(&attempts);
+        let queue = Arc::new(LlmRequestQueue::new(
+            runtime,
+            &LlmQueueConfig {
+                worker_count: 1,
+                queue_capacity: 10,
+            },
+            move |_task: LlmTask| {
+                let counter = Arc::clone(&attempts_clone);
+                async move {
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        Err(LlmError::RateLimited)
+                    } else {
+                        Ok("recovered".to_string())
+                    }
+                }
+            },
+        ));
+
+        let first = queue.submit(make_task("x")).await;
+        assert_eq!(first, Err(LlmError::RateLimited));
+        assert!(first.unwrap_err().is_retryable(), "RateLimited is retryable");
+        // Caller retries the same logical request.
+        let second = queue.submit(make_task("x")).await;
+        assert_eq!(second, Ok("recovered".to_string()));
+    }
+
+    /// Handler that never completes: a fired `StreamAbort` must cancel the
+    /// in-flight call, freeing the worker slot and resolving to a canceled
+    /// error rather than hanging.
+    #[tokio::test]
+    async fn test_queue_submit_with_abort_cancels_inflight() {
+        let runtime = tokio_runtime();
+        let queue = LlmRequestQueue::new(
+            runtime,
+            &LlmQueueConfig {
+                worker_count: 1,
+                queue_capacity: 10,
+            },
+            |_task: LlmTask| async move {
+                // A real LLM call that never returns.
+                std::future::pending::<Result<String, LlmError>>().await
+            },
+        );
+        let abort = crate::stream::StreamAbort::new();
+        abort.cancel();
+        let result = queue.submit_with_abort(make_task("x"), abort).await;
+        assert!(
+            matches!(result, Err(LlmError::Http(_))),
+            "canceled in-flight call maps to an HTTP/transport error, got {result:?}"
+        );
+    }
 }

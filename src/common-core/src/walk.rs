@@ -86,7 +86,9 @@ fn collect_ext_recursive(dir: &Path, exts: &mut HashSet<String>) {
 }
 
 /// Test helper: create a directory tree with the given files and directories.
-#[cfg(test)]
+///
+/// Public so the cross-crate test-support crate (`fluent-wvr-testutil`) can
+/// delegate to it — the single implementation of tree scaffolding.
 pub fn make_tree(root: &Path, files: &[&str], dirs: &[&str]) {
     for d in dirs {
         std::fs::create_dir_all(root.join(d)).unwrap();

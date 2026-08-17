@@ -89,58 +89,14 @@ pub(crate) fn transitive_closure(
 mod tests {
     use super::*;
     use crate::target::{Target, TargetRegistry};
+    use crate::tests::common::{make_bitset, make_registry};
     use bitvec::vec::BitVec;
     use common_core::interner::CapabilityRegistry;
     use fluent_types::{ExecutorKind, TargetType};
 
-    fn make_bitset(bits: &[usize]) -> BitVec {
-        let max = bits.iter().max().copied().unwrap_or(0) + 1;
-        let mut bv = BitVec::with_capacity(max);
-        bv.resize(max, false);
-        for &bit in bits {
-            if bit < bv.len() {
-                bv.set(bit, true);
-            }
-        }
-        bv
-    }
-
-    fn make_registry(targets: Vec<Target>) -> TargetRegistry {
-        let mut reg = TargetRegistry::new();
-        for t in targets {
-            reg.register(t).unwrap();
-        }
-        reg
-    }
-
     #[test]
     fn test_linear_chain() {
-        let targets = vec![
-            Target::new()
-                .id(0)
-                .name("compile".into())
-                .target_type(TargetType::File)
-                .executor(ExecutorKind::Native)
-                .depends(BitVec::new())
-                .provides(make_bitset(&[0]))
-                .build(),
-            Target::new()
-                .id(1)
-                .name("link".into())
-                .target_type(TargetType::File)
-                .executor(ExecutorKind::Native)
-                .depends(make_bitset(&[0]))
-                .provides(make_bitset(&[1]))
-                .build(),
-            Target::new()
-                .id(2)
-                .name("build".into())
-                .target_type(TargetType::File)
-                .executor(ExecutorKind::Native)
-                .depends(make_bitset(&[1]))
-                .provides(make_bitset(&[2]))
-                .build(),
-        ];
+        let targets = crate::tests::common::linear_chain();
         let reg = make_registry(targets);
         let ctx = ClosureCtx {
             registry: &reg,
@@ -156,40 +112,7 @@ mod tests {
 
     #[test]
     fn test_diamond() {
-        let targets = vec![
-            Target::new()
-                .id(0)
-                .name("base".into())
-                .target_type(TargetType::File)
-                .executor(ExecutorKind::Native)
-                .depends(BitVec::new())
-                .provides(make_bitset(&[0]))
-                .build(),
-            Target::new()
-                .id(1)
-                .name("left".into())
-                .target_type(TargetType::File)
-                .executor(ExecutorKind::Native)
-                .depends(make_bitset(&[0]))
-                .provides(make_bitset(&[1]))
-                .build(),
-            Target::new()
-                .id(2)
-                .name("right".into())
-                .target_type(TargetType::File)
-                .executor(ExecutorKind::Native)
-                .depends(make_bitset(&[0]))
-                .provides(make_bitset(&[2]))
-                .build(),
-            Target::new()
-                .id(3)
-                .name("top".into())
-                .target_type(TargetType::File)
-                .executor(ExecutorKind::Native)
-                .depends(make_bitset(&[1, 2]))
-                .provides(make_bitset(&[3]))
-                .build(),
-        ];
+        let targets = crate::tests::common::diamond();
         let reg = make_registry(targets);
         let ctx = ClosureCtx {
             registry: &reg,
@@ -204,14 +127,7 @@ mod tests {
 
     #[test]
     fn test_self_providing_target() {
-        let targets = vec![Target::new()
-            .id(0)
-            .name("self_provider".into())
-            .target_type(TargetType::File)
-            .executor(ExecutorKind::Native)
-            .depends(make_bitset(&[0]))
-            .provides(make_bitset(&[0]))
-            .build()];
+        let targets = crate::tests::common::self_providing();
         let reg = make_registry(targets);
         let ctx = ClosureCtx {
             registry: &reg,

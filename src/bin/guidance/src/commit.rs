@@ -464,44 +464,18 @@ diff --git a/b.rs b/b.rs
 
     #[test]
     fn test_generate_commit_message_e2e() {
-        use std::io::{BufRead, BufReader, Write};
-
+        let server = httpmock::MockServer::start();
         let llm_response = "* Added staged diff parser for multi-file commit context\n\
                              * Integrated guidance JSON context to enrich commit messages";
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let reader = BufReader::new(stream.try_clone().unwrap());
-                let mut content_length: usize = 0;
-                for line in reader.lines().map_while(Result::ok) {
-                    if line.is_empty() {
-                        break;
-                    }
-                    if let Some(val) = line.strip_prefix("Content-Length:") {
-                        content_length = val.trim().parse().unwrap_or(0);
-                    }
-                }
-                let mut body = vec![0u8; content_length];
-                std::io::Read::read_exact(&mut stream, &mut body).ok();
-
-                let json = serde_json::json!({
-                    "choices": [{
-                        "message": { "content": llm_response }
-                    }]
-                });
-                let resp_body = serde_json::to_string(&json).unwrap();
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{resp_body}",
-                    resp_body.len()
-                );
-                stream.write_all(resp.as_bytes()).ok();
-            }
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/chat/completions");
+            then.status(200).json_body(serde_json::json!({
+                "choices": [{ "message": { "content": llm_response } }]
+            }));
         });
 
-        let api_url = format!("http://{addr}");
+        let api_url = server.base_url();
         let diff = "diff --git a/src/main.rs b/src/main.rs\n\
                      --- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+new\n";
         let context =
@@ -519,45 +493,19 @@ diff --git a/b.rs b/b.rs
 
     #[test]
     fn test_generate_commit_message_multibyte_e2e() {
-        use std::io::{BufRead, BufReader, Write};
-
+        let server = httpmock::MockServer::start();
         // Response containing multi-byte UTF-8 characters (─ box-drawing)
         let llm_response = "* cmdCommit: added ── separator for commit message display\n\
                              * loadContext: parsed ─── unicode boundaries safely";
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let reader = BufReader::new(stream.try_clone().unwrap());
-                let mut content_length: usize = 0;
-                for line in reader.lines().map_while(Result::ok) {
-                    if line.is_empty() {
-                        break;
-                    }
-                    if let Some(val) = line.strip_prefix("Content-Length:") {
-                        content_length = val.trim().parse().unwrap_or(0);
-                    }
-                }
-                let mut body = vec![0u8; content_length];
-                std::io::Read::read_exact(&mut stream, &mut body).ok();
-
-                let json = serde_json::json!({
-                    "choices": [{
-                        "message": { "content": llm_response }
-                    }]
-                });
-                let resp_body = serde_json::to_string(&json).unwrap();
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{resp_body}",
-                    resp_body.len()
-                );
-                stream.write_all(resp.as_bytes()).ok();
-            }
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/chat/completions");
+            then.status(200).json_body(serde_json::json!({
+                "choices": [{ "message": { "content": llm_response } }]
+            }));
         });
 
-        let api_url = format!("http://{addr}");
+        let api_url = server.base_url();
         let diff = "diff --git a/src/main.rs b/src/main.rs\n\
                      --- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+new\n";
         let context = "### Functions in src/main.rs:\n- cmdCommit (line 10)\n";

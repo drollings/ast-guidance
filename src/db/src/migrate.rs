@@ -83,10 +83,7 @@ pub fn migrate(conn: &Connection, migrations: &[&dyn Migration]) -> Result<(), D
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn conn() -> Connection {
-        common_core::sqlite::open_in_memory().unwrap()
-    }
+    use crate::tests::common::conn;
 
     struct TestMigration {
         version: u32,

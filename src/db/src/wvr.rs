@@ -209,33 +209,12 @@ mod tests {
 
     use common_core::metrics::LatencyHistogram;
     use fluent_wvr::wrapper::Instrumented;
-    use fluent_wvr::CapabilitySet;
 
     use super::*;
+    use crate::tests::common::{db_caps, in_memory_pool, store_with_t};
 
     fn store() -> Arc<SqliteStore> {
-        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        store
-            .init_schema("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
-            .unwrap();
-        store
-            .execute(
-                "INSERT INTO t (id, name) VALUES (?1, ?2)",
-                rusqlite::params![1, "hello"],
-            )
-            .unwrap();
-        store
-    }
-
-    /// A `CapabilitySet` carrying a `DbCapability` token (the pool's
-    /// `acquire` path is gated, so tests that check out a connection must scope
-    /// one).
-    fn db_caps() -> CapabilitySet {
-        CapabilitySet::new().with(crate::capability::DbCapability::open(":memory:").unwrap())
-    }
-
-    fn in_memory_pool() -> Arc<SqlitePool> {
-        Arc::new(SqlitePool::open_in_memory(&crate::pool::PoolConfig::default()).unwrap())
+        store_with_t()
     }
 
     #[test]

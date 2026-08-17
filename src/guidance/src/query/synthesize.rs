@@ -112,17 +112,12 @@ impl Synthesizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluent_types::{GuidanceDoc, Member, MemberType, Meta};
+    use crate::tests::common::make_test_doc;
+    use fluent_types::{GuidanceDoc, Member, MemberType};
 
     #[test]
     fn test_synthesize_with_matches() {
         let doc = GuidanceDoc {
-            meta: Meta {
-                module: "test".into(),
-                source: "src/test.zig".into(),
-                language: "zig".into(),
-            },
-            comment: Some("A test module.".into()),
             members: vec![Member {
                 type_name: MemberType::FnDecl,
                 name: "hello".into(),
@@ -131,7 +126,7 @@ mod tests {
                 line: Some(1),
                 ..Member::default()
             }],
-            ..GuidanceDoc::default()
+            ..make_test_doc()
         };
 
         let stages = Synthesizer::synthesize("hello", &doc, &["hello".to_string()]);

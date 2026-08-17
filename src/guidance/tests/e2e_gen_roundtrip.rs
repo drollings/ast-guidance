@@ -1,7 +1,8 @@
 use fluent_types::MemberType;
-use fluent_wvr_testutil::tempdir;
 use guidance_core::sync::json_store;
-use guidance_core::sync_engine::SyncEngine;
+
+mod common;
+use common::make_engine;
 
 const FIXTURE_ZIG: &str = r#"/// Sample Zig file for AST parsing tests
 const std = @import("std");
@@ -30,16 +31,11 @@ class Calculator:
 
 #[test]
 fn e2e_zig_gen_roundtrip() {
-    let dir = tempdir();
-    let source_dir = dir.path().join("src");
-    let guidance_dir = dir.path().join(".guidance");
-    std::fs::create_dir_all(&source_dir).expect("create src");
-    std::fs::create_dir_all(&guidance_dir).expect("create guidance");
-
-    let zig_file = source_dir.join("main.zig");
+    let fx = make_engine();
+    let zig_file = fx.source_dir.join("main.zig");
     std::fs::write(&zig_file, FIXTURE_ZIG).expect("write fixture");
 
-    let mut engine = SyncEngine::new(guidance_dir.clone(), source_dir);
+    let mut engine = fx.engine;
     let doc = engine.gen(&zig_file).expect("gen");
 
     // Verify structure matches Zig output (2 members: fn greet + struct Config)
@@ -57,7 +53,7 @@ fn e2e_zig_gen_roundtrip() {
     assert_eq!(config.unwrap().type_name, MemberType::Struct);
 
     // Verify JSON serialization round-trip
-    let json_path = guidance_dir.join("src").join("main.zig.json");
+    let json_path = fx.guidance_dir.join("src").join("main.zig.json");
     assert!(json_path.exists(), "JSON file should exist");
 
     let loaded = json_store::load_guidance(&json_path)
@@ -74,16 +70,11 @@ fn e2e_zig_gen_roundtrip() {
 
 #[test]
 fn e2e_python_gen_roundtrip() {
-    let dir = tempdir();
-    let source_dir = dir.path().join("src");
-    let guidance_dir = dir.path().join(".guidance");
-    std::fs::create_dir_all(&source_dir).expect("create src");
-    std::fs::create_dir_all(&guidance_dir).expect("create guidance");
-
-    let py_file = source_dir.join("main.py");
+    let fx = make_engine();
+    let py_file = fx.source_dir.join("main.py");
     std::fs::write(&py_file, FIXTURE_PYTHON).expect("write fixture");
 
-    let mut engine = SyncEngine::new(guidance_dir.clone(), source_dir);
+    let mut engine = fx.engine;
     let doc = engine.gen(&py_file).expect("gen python");
 
     assert_eq!(doc.meta.language.as_str(), "python");
@@ -97,16 +88,11 @@ fn e2e_python_gen_roundtrip() {
 
 #[test]
 fn e2e_incremental_sync() {
-    let dir = tempdir();
-    let source_dir = dir.path().join("src");
-    let guidance_dir = dir.path().join(".guidance");
-    std::fs::create_dir_all(&source_dir).expect("create src");
-    std::fs::create_dir_all(&guidance_dir).expect("create guidance");
-
-    let zig_file = source_dir.join("lib.zig");
+    let fx = make_engine();
+    let zig_file = fx.source_dir.join("lib.zig");
     std::fs::write(&zig_file, "pub fn alpha() void {}\n").expect("write");
 
-    let mut engine = SyncEngine::new(guidance_dir.clone(), source_dir);
+    let mut engine = fx.engine;
 
     // First gen
     assert!(engine.gen_if_stale(&zig_file).expect("gen if stale first"));
@@ -134,16 +120,11 @@ fn e2e_incremental_sync() {
 
 #[test]
 fn e2e_sync_status_clean() {
-    let dir = tempdir();
-    let source_dir = dir.path().join("src");
-    let guidance_dir = dir.path().join(".guidance");
-    std::fs::create_dir_all(&source_dir).expect("create src");
-    std::fs::create_dir_all(&guidance_dir).expect("create guidance");
-
-    let zig_file = source_dir.join("foo.zig");
+    let fx = make_engine();
+    let zig_file = fx.source_dir.join("foo.zig");
     std::fs::write(&zig_file, "pub fn foo() void {}\n").expect("write");
 
-    let mut engine = SyncEngine::new(guidance_dir, source_dir);
+    let mut engine = fx.engine;
     assert!(engine.gen_if_stale(&zig_file).expect("gen if stale"));
 
     let status = engine.status().expect("status");

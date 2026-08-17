@@ -58,6 +58,7 @@ pub fn find_members_by_signature<'a>(doc: &'a GuidanceDoc, query: &str) -> Vec<&
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::common::make_test_doc;
 
     #[test]
     fn test_detect_camel_case() {
@@ -95,9 +96,8 @@ mod tests {
 
         let doc = GuidanceDoc {
             meta: Meta {
-                module: "test".into(),
                 source: "test.zig".into(),
-                language: "zig".into(),
+                ..make_test_doc().meta
             },
             members: vec![
                 Member {
@@ -113,7 +113,7 @@ mod tests {
                     ..Member::default()
                 },
             ],
-            ..GuidanceDoc::default()
+            ..make_test_doc()
         };
 
         let found = find_members_by_name(&doc, "HELLO");
@@ -127,9 +127,8 @@ mod tests {
 
         let doc = GuidanceDoc {
             meta: Meta {
-                module: "test".into(),
                 source: "test.zig".into(),
-                language: "zig".into(),
+                ..make_test_doc().meta
             },
             members: vec![Member {
                 type_name: MemberType::FnDecl,
@@ -137,7 +136,7 @@ mod tests {
                 signature: Some("fn add(a: i32, b: i32) i32".into()),
                 ..Member::default()
             }],
-            ..GuidanceDoc::default()
+            ..make_test_doc()
         };
 
         let found = find_members_by_signature(&doc, "i32");

@@ -217,6 +217,57 @@ router-mock: ## Run the config-synced routing integration tests (intent -> model
 	$(Q)echo "Running config-synced routing integration tests (intent -> model_group)"
 	$(Q)cargo test -p fluent-router config_route_tests -- --nocapture
 
+# ── Per-Crate Test Targets ──────────────────────────────────────────────────
+# Run one crate's Tier-0/1/2 suite (unit + integration) WITHOUT enabling
+# `live-ai`, so they stay hermetic. Package names are the Cargo package ids
+# (`rg '^name' <crate>/Cargo.toml`). See doc/TESTING.md §5.
+
+TEST_CRATES := \
+	router:fluent-router \
+	concurrency:fluent-concurrency \
+	wvr:fluent-wvr \
+	db:fluent-db \
+	dag:fluent-dag \
+	coral:coral-context \
+	guidance:guidance-core \
+	llm:fluent-llm \
+	macros:fluent-wvr-macros
+
+define test-crate-rule
+.PHONY: test-$(1)
+test-$(1): ## Run the $(2) Tier-0/1/2 suite (hermetic; no live-AI)
+	$(Q)cargo test -p $(2)
+endef
+$(foreach pair,$(TEST_CRATES),$(eval $(call test-crate-rule,$(firstword $(subst :, ,$(pair))),$(lastword $(subst :, ,$(pair))))))
+
+# ── Live-AI Test Pathway ────────────────────────────────────────────────────
+# THE ONLY pathway that runs real inference. Every live test is `#[ignore]` +
+# `live-ai`-gated (in `tests/live/`); these targets enable the feature and run
+# ONLY the ignored tests in the `live` test target. They NEVER run under
+# `make test` / `make router-test` / `make router-mock` / CI. Live tests skip
+# cleanly (early `return`) when the env contract (LLM_BASE_URL/LLM_MODEL) is
+# absent, per the skip-not-fail policy in doc/TESTING.md §4.
+
+LIVE_CRATES := \
+	router:fluent-router \
+	guidance:guidance-core \
+	llm:fluent-llm
+
+define live-crate-rule
+.PHONY: $(1)-test-live
+$(1)-test-live: ## Run the live-AI (real model) tests for $(2); skip-not-fail without env
+	$(Q)cargo test -p $(2) --features live-ai --test live -- --ignored
+endef
+$(foreach pair,$(LIVE_CRATES),$(eval $(call live-crate-rule,$(firstword $(subst :, ,$(pair))),$(lastword $(subst :, ,$(pair))))))
+
+.PHONY: test-live
+test-live: ## Run ALL live-AI tests (the ONLY real-inference pathway); skips cleanly without env
+	$(Q)for pair in $(LIVE_CRATES); do \
+		pkg="$${pair##*:}"; \
+		echo "==> live-AI tests for $${pkg}"; \
+		cargo test -p "$${pkg}" --features live-ai --test live -- --ignored || exit 1; \
+	done
+
 # ── Standard Targets ──────────────────────────────────────────────────────────
 
 .PHONY: test
@@ -226,6 +277,10 @@ test: ## Run unit tests across the Rust source in src
 .PHONY: lint
 lint: ## Run clippy across the Rust source in src on all .rs files
 	$(Q)cargo clippy --workspace -- -D warnings
+
+.PHONY: lint-live-ai
+lint-live-ai: ## Hermeticity guard: every #[ignore] has a reason; no hermetic test dials a non-loopback host
+	$(Q)bin/live-ai-guard.sh
 
 .PHONY: health
 health: ## Run cargo tarpaulin and verify 85% coverage
