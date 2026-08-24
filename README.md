@@ -120,9 +120,8 @@ packed WASM IPC structs in `wasm_ipc`.
 ## Quick start
 
 ```bash
-cargo build --workspace
-cargo test --workspace
-cargo clippy --workspace -- -D warnings
+make
+make router
 ```
 
 Coral Router's own loop: `make router` (build), `make router-start` (build and
