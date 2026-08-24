@@ -18,27 +18,28 @@ router and process owner of a local inference fleet. Coral Context, Guidance,
 and the supporting libraries extend the same backbone.
 
 Its concurrent operations are built on **Fluent Concurrency**, a lightweight
-layer of guardrails over Tokio, hyper, and reqwest that keeps async I/O and
+layer over Tokio, hyper, and reqwest that keeps async I/O and
 inference for agentic LLM applications fast, guardrailed, and rooted in the
 battle-tested Rust ecosystem.
 
-Its foundation is the **Fluent WVR** set of design patterns:
+Its foundational design patterns are a collection termed **Fluent WVR**:
 
 `Fluent, Wrapped, Verified, Reflected`
 
-These patterns allow for single sources of truth for of metadata and validated
-input constraints.  In turn, this enhances composable, reliable code, made
-polymorphic and flexible at control pane-facing objects where it counts,
-with zero cost to the hot paths.
+These are proven patterns from C++ and Python codebases, reinterpreted into
+idiomatic Rust.  They allow for single sources of truth for of metadata,  
+validated input constraints, and composable control objects which allow for 
+polymorphic flexibility where it counts, and poses zero cost to the hot paths.
 
 ## Coral Router - an agentic swarm orchestrator
 
-Coral Router exposes an OpenAI-compatible HTTP API on `:8079` and runs
-route-dispatched requests through a **two-stage pipeline** - a deterministic
+Coral Router exposes an OpenAI-compatible HTTP API and runs
+route-dispatched requests through a **multi-stage pipeline** - a deterministic
 pre-filter, then a classifier (see `src/router/src/pipeline_types.rs`) - that
-resolves to a direct response, a routing target, or a rejection. Requests that
-address a managed model directly (`model:instance`) dispatch to that model
-without running the pipeline.
+resolves to appropriate deterministic, LLM-optional workflows, or delegate to
+stronger LLMs at other OpenAI endpoints. Requests that route to a locally 
+managed model dispatch to that model while managing its VRAM footprint, allowing 
+efficient local agentic teams.
 
 It is built for use with a branch of llama.cpp that allows
 parallel inference across context windows with their own sizes, parameters,
