@@ -512,10 +512,10 @@
         "text": "ran"
       },
       {
-        "dep": "mark",
+        "dep": "cc",
         "head": 1,
         "lemma": "but",
-        "pos": "sconj",
+        "pos": "cconj",
         "text": "but"
       },
       {
@@ -620,10 +620,10 @@
         "text": "fast"
       },
       {
-        "dep": "conj",
+        "dep": "cc",
         "head": 1,
         "lemma": "or",
-        "pos": "sconj",
+        "pos": "cconj",
         "text": "or"
       },
       {

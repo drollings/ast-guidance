@@ -583,13 +583,36 @@ fn adjective_headed_sconj_does_not_mark() {
 }
 
 #[test]
-fn dual_class_after_stays_prepositional() {
-    // Must-NOT-fire (boundary): "after" lexes ADP, so the SCONJ-keyed mark
-    // arm cannot fire — after-disambiguation is its own rule.
+fn clausal_after_is_sconj_mark() {
+    // Refs (UD subordinate-05/10): after → sconj/mark → spoke|scored,
+    // he|she → nsubj → spoke|scored. The closed map lexes every `after`
+    // as ADP, so the clausal reading never reaches the mark arm and the
+    // subject misattaches as pobj.
     let (_doc, set) = parse("The game ended after she scored.");
     let pos = pos_of(&set);
+    let deps = deps(&set);
     let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
-    assert_eq!(pos[at("after")], "adp", "pos: {pos:?}");
+    let (after, she, scored) = (at("after"), at("she"), at("scored"));
+    assert_eq!(pos[after], "sconj", "pos: {pos:?}");
+    assert_eq!(deps[after], "mark", "deps: {deps:?}");
+    assert_eq!(after as i32 + set.0[after].head, scored as i32);
+    assert_eq!(deps[she], "nsubj", "deps: {deps:?}");
+    assert_eq!(she as i32 + set.0[she].head, scored as i32);
+}
+
+#[test]
+fn nominal_after_stays_prepositional() {
+    // Must-NOT-fire: nominal `after` (`after lunch`) is a true preposition
+    // — no clause follows, so the SCONJ upgrade must leave it alone.
+    let (_doc, set) = parse("The meeting ended after lunch.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (after, lunch) = (at("after"), at("lunch"));
+    assert_eq!(pos[after], "adp", "pos: {pos:?}");
+    assert_eq!(deps[after], "prep", "deps: {deps:?}");
+    assert_eq!(deps[lunch], "pobj", "deps: {deps:?}");
+    assert_eq!(lunch as i32 + set.0[lunch].head, after as i32);
 }
 
 #[test]
@@ -1246,6 +1269,77 @@ fn relative_matrix_verb_that_clause_is_verb() {
 }
 
 #[test]
+fn because_clause_verb_attaches_ccomp() {
+    // Refs (UD subordinate-02/07): snowed → ccomp → stayed. The clause verb
+    // strands in repair-dep: the matrix verb reduces before the subordinate
+    // arrives, so the (Verb, Verb) pair never meets.
+    let (_doc, set) = parse("We stayed because it snowed.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (stayed, snowed) = (at("stayed"), at("snowed"));
+    assert_eq!(deps[snowed], "ccomp", "deps: {deps:?}");
+    assert_eq!(snowed as i32 + set.0[snowed].head, stayed as i32);
+}
+
+#[test]
+fn when_clause_verb_attaches_advcl() {
+    // Refs (UD subordinate-03/08): works → advcl → sings. Same stranding as
+    // the because-frame, with marker-based label discrimination (when → advcl,
+    // because → ccomp).
+    let (_doc, set) = parse("She sings when she works.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (sings, works) = (at("sings"), at("works"));
+    assert_eq!(deps[works], "advcl", "deps: {deps:?}");
+    assert_eq!(works as i32 + set.0[works].head, sings as i32);
+}
+
+#[test]
+fn complement_clause_without_subordinator_gets_no_ccomp() {
+    // Must-NOT-fire: verb-headed "that" is DET (complementizer), so no SCONJ
+    // stands between know and play — neither ccomp nor advcl may fire, and
+    // the parataxis arm (no boundary) stays out too.
+    let (_doc, set) = parse("I know that they play soccer.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_ne!(deps[at("play")], "ccomp", "deps: {deps:?}");
+    assert_ne!(deps[at("play")], "advcl", "deps: {deps:?}");
+    assert_ne!(deps[at("play")], "parataxis", "deps: {deps:?}");
+}
+
+#[test]
+fn coordinated_nominals_attach_conj() {
+    // Refs (UD coordination-01/06/07/12): the first conjunct heads the
+    // phrase (Cats → nsubj → play), the second depends on the first
+    // (dogs → conj → Cats), the marker on the second (and → cc → dogs).
+    // The parser has no conj arm: the first conjunct strands in repair-dep
+    // and the second steals its role.
+    let (_doc, set) = parse("Cats and dogs play.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (cats, and, dogs, play) = (at("Cats"), at("and"), at("dogs"), at("play"));
+    assert_eq!(deps[cats], "nsubj", "deps: {deps:?}");
+    assert_eq!(cats as i32 + set.0[cats].head, play as i32);
+    assert_eq!(deps[dogs], "conj", "deps: {deps:?}");
+    assert_eq!(dogs as i32 + set.0[dogs].head, cats as i32);
+    assert_eq!(deps[and], "cc", "deps: {deps:?}");
+    assert_eq!(and as i32 + set.0[and].head, dogs as i32);
+}
+
+#[test]
+fn bare_nominal_pair_without_conjunction_stays_compound() {
+    // Must-NOT-fire: a bare nominal pair with no CCONJ between (chase/red
+    // cars) stays on the compound path — the conj arm needs an intervening
+    // conjunction, and the compound gate must keep firing without one.
+    let (_doc, set) = parse("Dogs chase red cars.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (red, cars) = (at("red"), at("cars"));
+    assert_eq!(deps[red], "compound", "deps: {deps:?}");
+    assert_eq!(red as i32 + set.0[red].head, cars as i32);
+}
+
+#[test]
 fn complement_that_object_stays_noun() {
     // Must-NOT-fire: "that" headed by a VERB (know) is a complementizer,
     // not a relativizer — "soccer" is a true nominal object and stays NOUN.
@@ -1266,4 +1360,91 @@ fn relative_frame_titlecase_final_stays_noun() {
     let pos = pos_of(&set);
     let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
     assert_eq!(pos[at("Anna")], "noun", "pos: {pos:?}");
+}
+
+/// End-to-end Track B probe: deterministic confidence + frame ambiguity for
+/// one input text, through the public seams only (no synthetic margins).
+fn ambiguity_of(
+    text: &str,
+) -> (
+    spacy_rs::ParseConfidence,
+    spacy_rs::FrameAnalysis,
+    Vec<spacy_rs::FrameKey>,
+) {
+    let vocab = en_vocab();
+    let tokenizer = spacy_rs::lang::en::tokenizer(vocab.clone()).expect("tokenizer");
+    let mut doc = tokenizer.tokenize(text).expect("tokenize");
+    let annotator = ArcEagerAnnotator::en_default(vocab.clone());
+    let (result, conf) = annotator.annotate_with_confidence(&doc).expect("parse");
+    let margins = result.oracle_margins.clone().unwrap_or_default();
+    spacy_rs::llm::attach(&mut doc, &result.records).expect("attach");
+    spacy_rs::Sentencizer::new().process(&mut doc);
+    let store: std::sync::Arc<spacy_rs::InMemoryConceptStore> =
+        std::sync::Arc::new(spacy_rs::InMemoryConceptStore::new());
+    let resolver = std::sync::Arc::new(spacy_rs::InterlinguaResolver::new(
+        store.clone() as std::sync::Arc<dyn spacy_rs::ConceptStore>,
+        std::sync::Arc::clone(vocab.strings()),
+    ));
+    let ex = spacy_rs::FrameExtractor::new(
+        resolver,
+        store.clone() as std::sync::Arc<dyn spacy_rs::ConceptStore>,
+    );
+    let analysis = ex.extract(&doc, Some(&margins));
+    let keys = ex.keys(&doc, &analysis);
+    (conf, analysis, keys)
+}
+
+#[test]
+fn verbless_concessive_emits_attachment_tie() {
+    // Track B (positive): "Although tired" has no finite verb in the child
+    // span, so the marker's attachment is underdetermined. The oracle must
+    // record a near-tie (→ RefineReason::Confidence(Ties)) and the frame
+    // stage must emit AttachmentNearTie with a provisional key — never a
+    // confident silent misparse. Heads/labels are unchanged (Shift wins
+    // ties by stable order); only the margin drops.
+    let (conf, analysis, keys) = ambiguity_of("Although tired, she kept pace.");
+    assert!(
+        conf.oracle_tie_count >= 1,
+        "verbless concessive must tie: {conf:?}"
+    );
+    assert!(
+        conf.oracle_margins
+            .iter()
+            .any(|m| m.abs() <= spacy_rs::TIE_MARGIN_EPSILON),
+        "near-zero margin expected: {conf:?}"
+    );
+    assert!(
+        analysis
+            .ambiguities
+            .iter()
+            .any(|a| a.kind == spacy_rs::AmbiguityKind::AttachmentNearTie),
+        "AttachmentNearTie expected: {analysis:?}"
+    );
+    assert!(
+        keys.iter().any(|k| k.provisional),
+        "ambiguous frame mints a provisional key"
+    );
+    // Parse-stability pin: the tie must not re-head anything.
+    let (_doc, set) = parse("Although tired, she kept pace.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(deps[at("Although")], "dep", "deps: {deps:?}");
+    assert_eq!(deps[at("tired")], "nsubj", "deps: {deps:?}");
+}
+
+#[test]
+fn clean_subordinate_emits_no_tie() {
+    // Track B (must-NOT-fire control): an overt-subject subordinate clause
+    // ("because it snowed") is fully determined — no tie, no ambiguity
+    // entry, permanent key.
+    let (conf, analysis, keys) = ambiguity_of("We stayed because it snowed.");
+    assert_eq!(conf.oracle_tie_count, 0, "clean clause must not tie: {conf:?}");
+    assert!(
+        analysis.ambiguities.is_empty(),
+        "no ambiguity on a clean clause: {analysis:?}"
+    );
+    assert!(
+        keys.iter().all(|k| !k.provisional),
+        "clean frames mint permanent keys"
+    );
 }

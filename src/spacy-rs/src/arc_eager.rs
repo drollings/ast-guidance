@@ -425,6 +425,37 @@ fn refine_pos_where_marker(texts: &[String], pos: &mut [Upos]) {
     }
 }
 
+/// Dual-class `after` (`The game ended after she scored` vs `after
+/// lunch`). The closed map lexes every `after` as ADP, so a clausal
+/// complement reads as a prepositional phrase: the Sconj-keyed mark arm
+/// never fires and the subject misattaches as `pobj`. Upgrades an ADP
+/// `after` to SCONJ only with a clausal complement ahead — a nominal
+/// subject (PRON/NOUN/PROPN, or DET + NOUN/PROPN) directly followed by a
+/// VERB. Guards: nominal complements (`after lunch`, `after the meeting`
+/// — no verb ahead) never match. Sequenced after the pronoun-subject
+/// pass so clause verbs upgraded there (`spoke`, `scored`) are visible
+/// as the VERB host. Known boundary: `before` is the same dual class
+/// with no corpus instance — left out until one appears.
+fn refine_pos_clausal_after(texts: &[String], pos: &mut [Upos]) {
+    for i in 0..texts.len() {
+        if pos[i] != Upos::Adp || !texts[i].eq_ignore_ascii_case("after") {
+            continue;
+        }
+        // Pattern A: nominal subject + verb (`after he spoke`).
+        let bare = i + 2 < texts.len()
+            && matches!(pos[i + 1], Upos::Pron | Upos::Noun | Upos::Propn)
+            && pos[i + 2] == Upos::Verb;
+        // Pattern B: determiner-led subject + verb (`after the meeting ended`).
+        let det_led = i + 3 < texts.len()
+            && pos[i + 1] == Upos::Det
+            && matches!(pos[i + 2], Upos::Noun | Upos::Propn)
+            && pos[i + 3] == Upos::Verb;
+        if bare || det_led {
+            pos[i] = Upos::Sconj;
+        }
+    }
+}
+
 /// Closed-class time/manner adverbials in sentence-final position (`The
 /// dog barks loudly`, `She reads books daily`, `Work hard, play fair`).
 /// The tagger has no adverb lexicon, so these fall through to NOUN — and
@@ -970,7 +1001,11 @@ impl ArcEagerState {
                     // ones are apposition — handled by the Right arm below
                     // (the appositive follows its anchor, so it attaches
                     // rightward); offering compound here too would tie.
-                    if ((s + 1)..b).all(|k| pos[k] != Upos::Punct) {
+                    // Conjoined ones (cats and dogs) are coordination —
+                    // handled by the conj arm below; a conjunction between
+                    // the pair is never compounding, so this arm stands
+                    // down there too and the two never tie.
+                    if ((s + 1)..b).all(|k| pos[k] != Upos::Punct && pos[k] != Upos::Cconj) {
                         out.push(Self::act(ArcEagerMove::Left, labels.compound));
                     }
                 }
@@ -1005,6 +1040,25 @@ impl ArcEagerState {
                         out.push(Self::act(ArcEagerMove::Left, labels.mark));
                     }
                 }
+                // A subordinator facing a nominal with no finite verb before
+                // the clause boundary (Although tired, …): the marker's
+                // attachment is underdetermined — no predicate exists to
+                // host `mark`. Offer a `dep` rival at Shift parity so
+                // `best_with_margin` records a near-tie (→
+                // `RefineReason::Confidence(Ties)` → `AttachmentNearTie`
+                // downstream) instead of a confident Shift. Clauses with an
+                // overt verb (because it snowed) never match, so clean
+                // subordinates stay tie-free. Shift still wins ties by
+                // stable order, so heads/labels are unchanged — only the
+                // margin drops (Track B: flag, don't guess).
+                (Upos::Sconj, Upos::Noun | Upos::Propn | Upos::Pron) => {
+                    let verbless = !(b..texts.len())
+                        .take_while(|&j| pos[j] != Upos::Punct)
+                        .any(|j| pos[j] == Upos::Verb);
+                    if verbless {
+                        out.push(Self::act(ArcEagerMove::Left, labels.dep));
+                    }
+                }
                 _ => {}
             }
         }
@@ -1029,7 +1083,10 @@ impl ArcEagerState {
                 // both a clause boundary and an intervening subject must
                 // separate the pair. Adjacent verbs (called left, relative
                 // clause), bare participles (smiling, took), and complement
-                // clauses (said he left, no punctuation) never match.
+                // clauses (said he left, no punctuation) never match. A
+                // subordinator between the pair owns its own arm below, so a
+                // punctuated subordinate (he left, because she cried) keeps
+                // the incumbent parataxis reading.
                 (Upos::Verb, Upos::Verb) => {
                     let boundary = ((s + 1)..b).any(|k| pos[k] == Upos::Punct);
                     let subject = ((s + 1)..b).any(|k| {
@@ -1037,16 +1094,62 @@ impl ArcEagerState {
                     });
                     if boundary && subject {
                         out.push(Self::act(ArcEagerMove::Right, labels.parataxis));
+                    } else if let Some(marker) =
+                        (s + 1..b).rfind(|&m| pos[m] == Upos::Sconj)
+                    {
+                        // A subordinate clause verb governed by the matrix
+                        // verb (stayed because it snowed: snowed → ccomp →
+                        // stayed). The innermost (nearest-b) subordinator
+                        // decides the label, answering to the UD refs:
+                        // `because` complements (ccomp), `when`/`if`/`after`
+                        // adjoin (advcl); `as`/`although` (comment/verbless
+                        // frames) keep their own dynamics. An overt nominal
+                        // subject must stand between marker and verb —
+                        // subject-less fragments never match. Needs the Verb
+                        // Sconj wait below so the matrix verb survives until
+                        // the clause verb arrives.
+                        let word = texts[marker].as_str();
+                        let has_subject = ((marker + 1)..b).any(|k| {
+                            matches!(pos[k], Upos::Noun | Upos::Propn | Upos::Pron)
+                        });
+                        if has_subject {
+                            if word.eq_ignore_ascii_case("because") {
+                                out.push(Self::act(ArcEagerMove::Right, labels.ccomp));
+                            } else if word.eq_ignore_ascii_case("when")
+                                || word.eq_ignore_ascii_case("if")
+                                || word.eq_ignore_ascii_case("after")
+                            {
+                                out.push(Self::act(ArcEagerMove::Right, labels.advcl));
+                            }
+                        }
                     }
                 }
                 // A comma-delimited nominal follows its anchor (My brother, a
                 // doctor): the appositive attaches rightward. The Left
                 // compound arm above stands down for punctuated pairs, so the
                 // two never compete. Needs the NOUN Reduce wait below so the
-                // anchor survives the appositive's determiner.
+                // anchor survives the appositive's determiner. A conjoined
+                // nominal (cats and dogs: dogs → conj → cats) attaches the
+                // same way, gated on a conjunction strictly between the
+                // pair — bare compounds never compete (the compound arm
+                // stands down for conjoined pairs), and a pair with both a
+                // comma and a conjunction keeps the incumbent appos reading
+                // (appos is offered first). The anchor must not itself be
+                // comma-adjacent (red in "car, red and fast"): comma-opened
+                // nominals are appositive material owned by the appos frame
+                // — coordination inside apposition is its own rule. Needs
+                // the nominal CCONJ wait below so the anchor survives the
+                // marker. Scoped to nominal pairs — conjoined verbs need
+                // conjunct-agreement POS knowledge (their second conjunct
+                // tags NOUN today), not this attachment arm.
                 (Upos::Noun | Upos::Propn, Upos::Noun | Upos::Propn) => {
                     if ((s + 1)..b).any(|k| pos[k] == Upos::Punct) {
                         out.push(Self::act(ArcEagerMove::Right, labels.appos));
+                    }
+                    if s == 0 || texts[s - 1] != "," {
+                        if ((s + 1)..b).any(|k| pos[k] == Upos::Cconj) {
+                            out.push(Self::act(ArcEagerMove::Right, labels.conj));
+                        }
                     }
                 }
                 // The relcl predicate depends on its nominal anchor (called →
@@ -1126,6 +1229,21 @@ impl ArcEagerState {
         // verb arrives, and the obj arm above never meets its pair. Scoped
         // to pronouns directly after a nominal-headed marker — subject
         // markers attach immediately, complement frames never match.
+        // And a matrix verb waits for its subordinate clause (stayed
+        // [because]): popping on the subordinator strands the verb before
+        // the clause verb arrives, and the ccomp/advcl arm above never
+        // meets its pair. Scoped to subordinator buffers — complementizer
+        // `that` is DET (never matches), bare complements (`said he left`,
+        // no marker) and comment/verbless frames (`as`, `although`) keep
+        // the old dynamics.
+        // And a nominal anchor waits for its conjunct (cats [and]): popping
+        // on the conjunction strands the first conjunct before the second
+        // arrives, and the conj arm above never meets its pair. Scoped to
+        // BARE nominal stack tops (no dependents yet — a nominal already
+        // governing dependents is phrasally saturated, e.g. the clause
+        // predicate in "Grades dropped yet spirits rose", which must reduce
+        // so the second clause can form) with conjunction buffers — verbs
+        // keep their own waits, pronouns their greedy Right arms.
         if self.right_children[s].is_empty()
             && ps != Upos::Adp
             && !matches!(pb, Upos::Aux | Upos::Part)
@@ -1151,6 +1269,11 @@ impl ArcEagerState {
                 && b >= 2
                 && is_relative_marker(texts[b - 1].as_str())
                 && matches!(pos[b - 2], Upos::Noun | Upos::Propn))
+            && !(ps == Upos::Verb && pb == Upos::Sconj)
+            && !(matches!(ps, Upos::Noun | Upos::Propn)
+                && pb == Upos::Cconj
+                && self.left_children[s].is_empty()
+                && self.right_children[s].is_empty())
         {
             out.push(ArcEagerAction {
                 move_type: ArcEagerMove::Reduce,
@@ -1408,7 +1531,39 @@ impl DeterministicOracle {
                             5.0
                         }
                     }
+                    // The subordinate clause verb depends on its matrix verb
+                    // (snowed → ccomp → stayed, works → advcl → sings).
+                    // Parataxis-level confidence; the candidate arm above is
+                    // the gate, so these weights only ever rank
+                    // marker-framed pairs.
+                    l if l == labels.ccomp => {
+                        if pos[s] == Upos::Verb && pos[b] == Upos::Verb {
+                            90.0
+                        } else {
+                            5.0
+                        }
+                    }
+                    l if l == labels.advcl => {
+                        if pos[s] == Upos::Verb && pos[b] == Upos::Verb {
+                            90.0
+                        } else {
+                            5.0
+                        }
+                    }
                     l if l == labels.appos => {
+                        if matches!(pos[s], Upos::Noun | Upos::Propn)
+                            && matches!(pos[b], Upos::Noun | Upos::Propn)
+                        {
+                            60.0
+                        } else {
+                            5.0
+                        }
+                    }
+                    // The conjunct depends on its anchor (dogs → conj →
+                    // cats): coordination-level confidence, matching the
+                    // compound/appos pair it disjoins from by gate. Ungated
+                    // here by design — the candidate arm above is the gate.
+                    l if l == labels.conj => {
                         if matches!(pos[s], Upos::Noun | Upos::Propn)
                             && matches!(pos[b], Upos::Noun | Upos::Propn)
                         {
@@ -1504,6 +1659,9 @@ pub struct DepLabels {
     pub xcomp: u64,
     pub relcl: u64,
     pub obj: u64,
+    pub ccomp: u64,
+    pub advcl: u64,
+    pub conj: u64,
 }
 
 impl DepLabels {
@@ -1535,6 +1693,9 @@ impl DepLabels {
             xcomp: intern("xcomp"),
             relcl: intern("relcl"),
             obj: intern("obj"),
+            ccomp: intern("ccomp"),
+            advcl: intern("advcl"),
+            conj: intern("conj"),
         }
     }
 
@@ -1718,6 +1879,12 @@ impl ArcEagerAnnotator {
         // refine reads SCONJ positionally (the initial-noun blocker keys on
         // the word, order-free).
         refine_pos_where_marker(&texts, &mut pos);
+        // Clausal-after pass: ADP after + subject + verb → SCONJ so the
+        // existing mark arm fires. Sequenced after the pronoun-subject pass
+        // (clause verbs upgraded there are the VERB host) with the other
+        // SCONJ-frame passes; nominal complements never match, so prep/pobj
+        // frames are untouched.
+        refine_pos_clausal_after(&texts, &mut pos);
         // Final-adverbial pass: closed time/manner set + -ly finals →
         // ADV. Targets are disjoint from the comma-adverbial pass (which
         // owns comma -ly with its clause-edge host guard; this pass skips
