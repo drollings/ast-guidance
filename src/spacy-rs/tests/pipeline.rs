@@ -383,12 +383,14 @@ fn process_sync_deterministic_star_parse() {
     let doc = pipeline.process_sync("show me the report", None).expect("sync");
     assert_eq!(doc.len(), 4);
     // Attached + sentence boundaries set → extractable signal. The parser
-    // rung detects "show" as the verb predicate and "me" as its object.
+    // rung detects "show" as the verb predicate and "report" (the theme,
+    // UD's direct object — the recipient "me" is iobj, which the parser
+    // tags dobj pending a dedicated iobj arm, so last-dobj-wins surfaces
+    // the theme) as its direct object.
     let signals = crate::routing::extract_routing_signals(&doc);
     assert_eq!(signals.len(), 1);
     assert_eq!(signals[0].predicate, "show");
-    assert_eq!(signals[0].direct_object.as_deref(), Some("me"));
-    assert!(signals[0].dependents.contains(&"report".to_string()));
+    assert_eq!(signals[0].direct_object.as_deref(), Some("report"));
 }
 
 #[test]
@@ -2190,10 +2192,12 @@ fn llm_refine_frame_regression_keeps_base() {
     // the §2.3 adoption gate, not just the pseudocode.
     let (pipeline, _store) = en_pipeline_with_resolver();
     let calls = Arc::new(AtomicUsize::new(0));
-    // Base ArcEager parse of "show me the report": token 1 ("me") carries the
-    // dobj role. Amending its dep to the neutral "dep" keeps the set valid
-    // (the gate passes) but drops the direct-object frame slot.
-    let reply = r#"{"corrections":[{"token_index":1,"field":"dep","new_value":"dep"}]}"#;
+    // Base ArcEager parse of "show me the report": tokens 1 ("me") and 3
+    // ("report") both carry dobj roles (the parser has no iobj arm yet, so
+    // the recipient and the theme share the dobj tag). Amending both deps
+    // to the neutral "dep" keeps the set valid (the gate passes) but drops
+    // every direct-object frame slot.
+    let reply = r#"{"corrections":[{"token_index":1,"field":"dep","new_value":"dep"},{"token_index":3,"field":"dep","new_value":"dep"}]}"#;
     let seams = RefineSeams {
         llm_focused: Some(focused_fetch(reply, calls.clone())),
         ..RefineSeams::default()

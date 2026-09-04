@@ -763,7 +763,7 @@
         "dep": "cop",
         "head": 2,
         "lemma": "be",
-        "pos": "verb",
+        "pos": "aux",
         "text": "is"
       },
       {
@@ -1864,7 +1864,7 @@
         "dep": "root",
         "head": 0,
         "lemma": "be",
-        "pos": "verb",
+        "pos": "aux",
         "text": "is"
       },
       {
@@ -1966,7 +1966,7 @@
         "dep": "cop",
         "head": 3,
         "lemma": "be",
-        "pos": "verb",
+        "pos": "aux",
         "text": "is"
       },
       {
@@ -5207,7 +5207,7 @@
         "dep": "root",
         "head": 0,
         "lemma": "be",
-        "pos": "verb",
+        "pos": "aux",
         "text": "is"
       },
       {
@@ -5308,7 +5308,7 @@
         "dep": "cop",
         "head": 2,
         "lemma": "be",
-        "pos": "verb",
+        "pos": "aux",
         "text": "Is"
       },
       {

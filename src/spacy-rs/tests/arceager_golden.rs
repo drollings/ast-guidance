@@ -1340,6 +1340,46 @@ fn bare_nominal_pair_without_conjunction_stays_compound() {
 }
 
 #[test]
+fn determiner_before_closed_verb_is_nominal() {
+    // Refs (UD question-06): report → noun/nsubj → arrive, arrive → verb
+    // root. The closed verb list fires before any nominal guard, so a
+    // determiner-led noun that collides with the list ("the report") tags
+    // VERB, steals root, and strands the true predicate. A determiner never
+    // governs a finite verb, so DET + closed-verb-form reads nominal —
+    // which also unblocks the initial-noun rule (DET+NOUN+NOUN → the third
+    // position upgrades to VERB).
+    let (_doc, set) = parse("Did the report arrive?");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (report, arrive) = (at("report"), at("arrive"));
+    assert_eq!(pos[report], "noun", "pos: {pos:?}");
+    assert_eq!(deps[at("the")], "det", "deps: {deps:?}");
+    assert_eq!(at("the") as i32 + set.0[at("the")].head, report as i32);
+    // Attachment (report → nsubj → arrive, arrive → verb root) needs the
+    // question-inversion verb rule — its own iteration, deliberately
+    // unasserted here beyond the nominal half it stands on.
+    let _ = arrive;
+}
+
+#[test]
+fn bare_closed_verb_without_determiner_stays_verb() {
+    // Must-NOT-fire: the nominal reading needs an overt determiner —
+    // "bark" after a subject noun stays VERB, and "sales" (never
+    // VERB-tagged) stays NOUN with or without one.
+    let (_doc, set) = parse("Dogs bark loudly.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("bark")], "verb", "pos: {pos:?}");
+    assert_eq!(deps[at("bark")], "root");
+    let (_doc, set) = parse("Show me the sales report.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("sales")], "noun", "pos: {pos:?}");
+}
+
+#[test]
 fn complement_that_object_stays_noun() {
     // Must-NOT-fire: "that" headed by a VERB (know) is a complementizer,
     // not a relativizer — "soccer" is a true nominal object and stays NOUN.

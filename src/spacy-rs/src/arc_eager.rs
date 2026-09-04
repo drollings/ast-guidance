@@ -126,6 +126,28 @@ fn is_closed_verb(text: &str) -> bool {
     )
 }
 
+/// Determiner-led nominal colliding with the closed verb list (`the
+/// report`, `a saw`). The closed verb check in [`infer_pos`] fires before
+/// any nominal guard, so a determiner-led noun that shares a form with the
+/// list tags VERB, steals root, and strands the true predicate. A
+/// determiner never governs a finite verb, so DET + closed-verb-form reads
+/// nominal. Downgrades VERB to NOUN only directly after a DET, sequenced
+/// FIRST among the refines so only [`infer_pos`] verbs (the closed list)
+/// are candidates — every VERB-upgrade pass below reads the corrected
+/// tags, and no upgrade output is ever touched. Guards: bare verbs (`Dogs
+/// bark`, `Close your books` — no determiner) never match. Known
+/// boundary: determiner-shaped relativizers (`the book that reports…`)
+/// have no corpus instance — `that`-headed verb disambiguation is its own
+/// rule.
+fn refine_pos_det_closed_verb(_texts: &[String], pos: &mut [Upos]) {
+    for i in 1..pos.len() {
+        if pos[i] != Upos::Verb || pos[i - 1] != Upos::Det {
+            continue;
+        }
+        pos[i] = Upos::Noun;
+    }
+}
+
 /// Hosts that govern a bare infinitive: do-support and the modals, plus the
 /// `n't`-split stubs the tokenizer emits (`wo`/`n't`, `ca`/`n't`). Checked
 /// case-insensitively without allocating (`eq_ignore_ascii_case`).
@@ -1853,6 +1875,11 @@ impl ArcEagerAnnotator {
             .enumerate()
             .map(|(i, text)| infer_pos(doc.token(i).lexeme.flags, text))
             .collect();
+        // Contextual pass over the lexeme-only tags: determiner-led nominals
+        // colliding with the closed verb list. Runs first so only infer_pos
+        // verbs are candidates and every VERB-upgrade below reads corrected
+        // tags.
+        refine_pos_det_closed_verb(&texts, &mut pos);
         // Contextual pass over the lexeme-only tags: bare infinitive after a
         // do-modal host. Runs before root-picking so the oracle sees verbs.
         refine_pos_bare_infinitive(&texts, &mut pos);
