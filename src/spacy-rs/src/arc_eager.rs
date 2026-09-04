@@ -226,6 +226,248 @@ fn refine_pos_pronoun_subject_verb(texts: &[String], pos: &mut [Upos]) {
     }
 }
 
+/// Whether `text` is a nominal relativizer with corpus evidence (`who`,
+/// `that`, `where`). Only forms attested in the bench; `which`/`whom` have
+/// no instance and stay out until one appears.
+fn is_relative_marker(text: &str) -> bool {
+    text.eq_ignore_ascii_case("who")
+        || text.eq_ignore_ascii_case("that")
+        || text.eq_ignore_ascii_case("where")
+}
+
+/// Matrix finite verb after a relative clause (`The man who called left`,
+/// `The book that I bought vanished`). The closed verb list misses the
+/// matrix predicate, so it falls through to NOUN and the relcl verb steals
+/// root. Upgrades a sentence-final alpha-fallback NOUN to VERB only when it
+/// directly follows the FIRST verb after a nominal-headed who/that/where
+/// (the relcl predicate — closed-list or pronoun-rule-upgraded). The
+/// first-verb scope is load-bearing: a second verb after the marker is the
+/// matrix verb itself, so a nominal following it is its adverbial/object
+/// (`work hard`: hard stays NOUN, its dobj→work head was already right).
+/// Guards: complementizer `that` headed by a verb (`I know that they play
+/// soccer`) never matches; title-case finals (`called Anna`, the §8.2
+/// proper-noun class) never match; interrogative initials (`Who called
+/// earlier?`) have no nominal head. Known boundary: medial matrix verbs
+/// with a trailing predicate nominal/adverbial (`stands empty`, `improve
+/// fast`) and DET-headed relcl verbs (`that cried`) are out of scope — they
+/// need verb-capability or relcl-subject knowledge, not this frame.
+fn refine_pos_relative_matrix_verb(texts: &[String], pos: &mut [Upos]) {
+    // Nominal-headed relativizer positions (the relative-frame gate).
+    let markers: Vec<usize> = (1..texts.len())
+        .filter(|&r| {
+            is_relative_marker(texts[r].as_str()) && matches!(pos[r - 1], Upos::Noun | Upos::Propn)
+        })
+        .collect();
+    if markers.is_empty() {
+        return;
+    }
+    for i in 1..texts.len() {
+        if pos[i] != Upos::Noun || pos[i - 1] != Upos::Verb {
+            continue;
+        }
+        // A finite matrix verb is never capitalized.
+        if !texts[i].chars().next().is_some_and(|c| c.is_lowercase()) {
+            continue;
+        }
+        // Sentence-final: only trailing punctuation may follow.
+        if !texts[i + 1..].iter().all(|t| {
+            let w = t.as_str();
+            matches!(w, "." | "!" | "?" | ";" | ":" | "," | "—" | "--")
+        }) {
+            continue;
+        }
+        // The host verb must be the first verb after some marker: no other
+        // VERB may stand between that marker and the host.
+        let closes_relcl = markers.iter().any(|&r| {
+            r < i - 1 && (r + 1..i - 1).all(|j| pos[j] != Upos::Verb)
+        });
+        if closes_relcl {
+            pos[i] = Upos::Verb;
+        }
+    }
+}
+
+/// Comma-framed `-ly` adverbial (`Sadly, …`, `…, frankly, …`). The tagger
+/// has no ADV path, so sentence/manner adverbials fall through to NOUN —
+/// and sentence-initial ones even steal root. Upgrades an alpha-fallback
+/// NOUN to ADV only for an `-ly` form (allocation-free suffix check, same
+/// shape as the be-predicate `-ing` check) immediately followed by a comma
+/// and hosted by a clause edge (sentence start or a preceding comma).
+/// Guards: temporal `-ly` nominals after a preposition (`In July, …`) and
+/// determiner-headed ones (`The family …`) never match. Known boundary:
+/// non-`ly` adverbials (`early`, `still`, `always`, `daily`, `hard`) need an
+/// adverb lexicon, not a suffix frame.
+fn refine_pos_comma_adverbial(texts: &[String], pos: &mut [Upos]) {
+    for i in 0..texts.len() {
+        if pos[i] != Upos::Noun {
+            continue;
+        }
+        let word = texts[i].as_str();
+        if word.len() <= 4
+            || !word
+                .get(word.len() - 2..)
+                .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ly"))
+        {
+            continue;
+        }
+        if !texts.get(i + 1).is_some_and(|next| next == ",") {
+            continue;
+        }
+        if i > 0 && texts[i - 1] != "," {
+            continue;
+        }
+        pos[i] = Upos::Adv;
+    }
+}
+
+/// Relativizer `that` and its clause verb (`The baby that cried slept`,
+/// `The dog that barked ran off`). The closed map lexes every `that` as
+/// DET, so a nominal-headed relativizer never reads as PRON — and its
+/// clause verb (`cried`) strands as NOUN, unseen by every subject rule. Two
+/// guarded upgrades in one frame pass, same shape as the contracted-be
+/// rule: nominal-headed `that` (DET-tagged only) → PRON, then an
+/// alpha-fallback NOUN directly after that PRON-`that` → VERB (the clause
+/// predicate, mirroring the pronoun-subject rule for a marker the closed
+/// list never pronounces). Guards: verb-headed `that` (complementizer: `I
+/// know that they play`) and headless `that` (demonstrative: `That book`)
+/// never match; the verb upgrade keys on the word `that`, so bare DET+NOUN
+/// pairs (`the sales report`) and other pronouns (`he left`) never match.
+/// Known boundary: `fact`-complements (`The fact that he left`) tag `that`
+/// PRON where UD reads SCONJ — complementizer disambiguation is its own
+/// rule.
+fn refine_pos_that_relative(texts: &[String], pos: &mut [Upos]) {
+    for i in 1..texts.len() {
+        if pos[i] == Upos::Det
+            && texts[i].eq_ignore_ascii_case("that")
+            && matches!(pos[i - 1], Upos::Noun | Upos::Propn)
+        {
+            pos[i] = Upos::Pron;
+        }
+    }
+    for i in 1..texts.len() {
+        if pos[i] != Upos::Noun || pos[i - 1] != Upos::Pron {
+            continue;
+        }
+        if texts[i - 1].eq_ignore_ascii_case("that") {
+            pos[i] = Upos::Verb;
+        }
+    }
+}
+
+/// Locative relativizer `where` (`The store where we met closed`). The
+/// tagger leaves it NOUN, so the Sconj-keyed mark arm — which fires for
+/// `when`/`because` — never sees it, and the anchor compounds onto it.
+/// Upgrades a NOUN `where` to SCONJ only with a nominal head (the relative
+/// anchor). Guards: sentence-initial interrogatives (`Where is my bag?`)
+/// and verb-hosted uses never match. Known divergence: refs pin ADP for
+/// `where` while the sibling `as`-frame refs pin SCONJ; the rule follows
+/// the functional (mark-taking) reading, so UPOS stays divergent either
+/// way and only the attachment is claimed. Disjoint from the `that` frame
+/// above (different word, different target tag).
+fn refine_pos_where_marker(texts: &[String], pos: &mut [Upos]) {
+    for i in 1..texts.len() {
+        if pos[i] != Upos::Noun || !texts[i].eq_ignore_ascii_case("where") {
+            continue;
+        }
+        if matches!(pos[i - 1], Upos::Noun | Upos::Propn) {
+            pos[i] = Upos::Sconj;
+        }
+    }
+}
+
+/// Closed-class time/manner adverbials in sentence-final position (`The
+/// dog barks loudly`, `She reads books daily`, `Work hard, play fair`).
+/// The tagger has no adverb lexicon, so these fall through to NOUN — and
+/// with the verb directly on the stack the existing Right-advmod arm then
+/// misfires as dobj. Upgrades an alpha-fallback NOUN to ADV for a curated
+/// set (every form bench-attested with an ADV ref) plus `-ly` forms, in
+/// final position or before a comma. Guards: determiner hosts (`a daily`)
+/// and conjunction hosts (`red and fast`, coordination frames) never match;
+/// `late` additionally excludes AUX hosts (copular predicates: `was late`,
+/// `'re late` stay ADJ). Deliberately outside the set: `today` (frozen refs
+/// irreconcilable — NOUN/advmod vs ADV), `later`/`earlier` (golden-pinned
+/// NOUN), `still` (pre-verbal frame only — predicative `be still` must not
+/// match), WH-initials (`Why`/`Where`, interrogative frame), and
+/// coordination-`or` slots (`Run daily or quit` — CC-disambiguation is its
+/// own rule). Same O(n) frame-scan shape as the other refines.
+fn refine_pos_final_adverbial(texts: &[String], pos: &mut [Upos]) {
+    const ADVERBS: &[&str] = &[
+        "now", "early", "again", "always", "hard", "fast", "well", "fair", "here", "daily", "much",
+        "yet", "late",
+    ];
+    for i in 0..texts.len() {
+        if pos[i] != Upos::Noun {
+            continue;
+        }
+        let word = texts[i].as_str();
+        let in_set = ADVERBS.iter().any(|a| word.eq_ignore_ascii_case(a));
+        let ly = !in_set
+            && word.len() > 4
+            && word
+                .get(word.len() - 2..)
+                .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ly"));
+        if !in_set && !ly {
+            continue;
+        }
+        // Copular `late` is adjectival, never adverbial.
+        if word.eq_ignore_ascii_case("late") && i > 0 && pos[i - 1] == Upos::Aux {
+            continue;
+        }
+        if i > 0 && matches!(pos[i - 1], Upos::Det | Upos::Cconj) {
+            continue;
+        }
+        let trailing_punct = texts[i + 1..].iter().all(|t| {
+            let w = t.as_str();
+            matches!(w, "." | "!" | "?" | ";" | ":" | "," | "—" | "--")
+        });
+        // `-ly` forms upgrade only sentence-finally (the comma frame belongs
+        // to the comma-adverbial pass, whose clause-edge host guard keeps
+        // `July`-class nominals out); set members also fire before a comma
+        // (`as always,`, `Work hard,`), but never sentence-initially there.
+        let comma_next = !ly && texts.get(i + 1).is_some_and(|next| next == ",") && i > 0;
+        if trailing_punct || comma_next {
+            pos[i] = Upos::Adv;
+        }
+    }
+}
+
+/// Sensory linking frame (`Dinner smells great`, `The soup tastes salty`,
+/// `The movie sounds boring`). Bare-initial sensory verbs fall outside
+/// every subject rule, and their predicate complements strand as nominal
+/// objects. Two guarded upgrades in one frame pass (contracted-be shape):
+/// a NOUN sensory word (taste/sound/smell, base + -s only — corpus
+/// evidence; look is closed-listed already, feel/seem unattested) with a
+/// nominal following it → VERB, then an alpha-fallback NOUN directly after
+/// a sensory VERB → ADJ (the predicate complement, mirroring the
+/// be-predicate rule for a host the closed list never pronounces).
+/// Guards: determiner-led objects (`Taste the soup`) never match either
+/// upgrade — transitivity reads through the determiner. Known boundaries:
+/// bare transitives (`smells smoke`) and attributive sensory nouns (`taste
+/// buds`) are positionally identical with no bench instance — lexical
+/// subcategorization is its own rule.
+fn refine_pos_linking_predicate(texts: &[String], pos: &mut [Upos]) {
+    const SENSORY: &[&str] = &[
+        "taste", "tastes", "sound", "sounds", "smell", "smells",
+    ];
+    let is_sensory = |w: &str| SENSORY.iter().any(|s| w.eq_ignore_ascii_case(s));
+    for i in 0..texts.len() {
+        if pos[i] != Upos::Noun || !is_sensory(texts[i].as_str()) {
+            continue;
+        }
+        if texts.len() > i + 1 && matches!(pos[i + 1], Upos::Noun | Upos::Propn) {
+            pos[i] = Upos::Verb;
+        }
+    }
+    for i in 1..texts.len() {
+        if pos[i] != Upos::Noun || pos[i - 1] != Upos::Verb {
+            continue;
+        }
+        if is_sensory(texts[i - 1].as_str()) {
+            pos[i] = Upos::Adj;
+        }
+    }
+}
+
 /// Whether `text` is a WH-relativizer that can never host a matrix verb in
 /// subject position (`The store where …`). Only forms with corpus evidence;
 /// `when`/`that`/`who` lex out of NOUN already and need no guard.
@@ -624,9 +866,18 @@ impl ArcEagerState {
 
         if b_free {
             match (ps, pb) {
+                // A verb governs its nominal argument rightward — but never
+                // across a clause boundary (He cooks, she cleans): a nominal
+                // past punctuation is the next clause's subject, not this
+                // verb's object. Withholding both arcs lets it shift into
+                // Left-nsubj from its own predicate; the parataxis/appos
+                // arms above own the punctuated pairs, so nothing else
+                // competes. Same boundary idiom throughout.
                 (Upos::Verb, Upos::Noun | Upos::Propn | Upos::Pron) => {
-                    out.push(Self::act(ArcEagerMove::Right, labels.dobj));
-                    out.push(Self::act(ArcEagerMove::Right, labels.nsubj));
+                    if ((s + 1)..b).all(|k| pos[k] != Upos::Punct) {
+                        out.push(Self::act(ArcEagerMove::Right, labels.dobj));
+                        out.push(Self::act(ArcEagerMove::Right, labels.nsubj));
+                    }
                 }
                 // A second finite verb across a punctuation + nominal boundary
                 // (She texted; he called) is parataxis, not a complement:
@@ -651,6 +902,21 @@ impl ArcEagerState {
                 (Upos::Noun | Upos::Propn, Upos::Noun | Upos::Propn) => {
                     if ((s + 1)..b).any(|k| pos[k] == Upos::Punct) {
                         out.push(Self::act(ArcEagerMove::Right, labels.appos));
+                    }
+                }
+                // The relcl predicate depends on its nominal anchor (called →
+                // relcl → man). Gated on a nominal-headed who/that/where
+                // strictly between the pair, so true subjects (Dogs bark,
+                // no marker) never compete: the Left nsubj arm above simply
+                // isn't rivaled there. Needs the marker Reduce wait below so
+                // the anchor survives its relativizer (Reduce outbids Shift).
+                (Upos::Noun | Upos::Propn, Upos::Verb) => {
+                    if ((s + 1)..b).any(|m| {
+                        m > 0
+                            && is_relative_marker(texts[m].as_str())
+                            && matches!(pos[m - 1], Upos::Noun | Upos::Propn)
+                    }) {
+                        out.push(Self::act(ArcEagerMove::Right, labels.relcl));
                     }
                 }
                 (Upos::Verb, Upos::Adv) => {
@@ -694,6 +960,22 @@ impl ArcEagerState {
         // doctor): popping on the DET ([brother], a) strands the anchor
         // before the appositive arrives. Scoped to bare nouns — verbs keep
         // their own waits, pronouns their greedy Right arms.
+        // And a nominal anchor waits for its relativizer (The man [who]):
+        // popping on the marker strands the anchor before the clause verb
+        // arrives, and the relcl arm above never meets its pair. Scoped to
+        // nominal-headed markers — complementizer that (verb-headed) and
+        // bare interrogatives keep the old dynamics. The wait spans the
+        // embedded subject too (The book that [I]): object relatives strand
+        // the anchor a second time on the subject pronoun, so a PRON
+        // directly after a nominal-headed marker extends the same wait —
+        // the pronoun itself still reduces normally (only nominal stack
+        // tops wait), and complement frames never match (verb-headed that).
+        // And an auxiliary waits for its clause to form (Can [you]): with
+        // no arc pairing (Aux, nominal), Reduce pops the aux on its subject
+        // and it strands into repair-dep — while the Left-aux arm below
+        // would have attached it had the pair met. Scoped to nominal-ish
+        // buffers (subject/determiner arriving); verbs, adjectives, and
+        // auxiliaries keep the old dynamics (cop/neg/progressive paths).
         if self.right_children[s].is_empty()
             && ps != Upos::Adp
             && !matches!(pb, Upos::Aux | Upos::Part)
@@ -703,6 +985,17 @@ impl ArcEagerState {
                 && !is_closed_verb(&texts[s]))
             && !(ps == Upos::Sconj && matches!(pb, Upos::Pron | Upos::Noun | Upos::Propn | Upos::Det))
             && !(ps == Upos::Noun && pb == Upos::Det)
+            && !(matches!(ps, Upos::Noun | Upos::Propn)
+                && b > 0
+                && is_relative_marker(texts[b].as_str())
+                && matches!(pos[b - 1], Upos::Noun | Upos::Propn))
+            && !(matches!(ps, Upos::Noun | Upos::Propn)
+                && pb == Upos::Pron
+                && b >= 2
+                && is_relative_marker(texts[b - 1].as_str())
+                && matches!(pos[b - 2], Upos::Noun | Upos::Propn))
+            && !(ps == Upos::Aux
+                && matches!(pb, Upos::Pron | Upos::Noun | Upos::Propn | Upos::Det))
         {
             out.push(ArcEagerAction {
                 move_type: ArcEagerMove::Reduce,
@@ -955,6 +1248,20 @@ impl DeterministicOracle {
                             5.0
                         }
                     }
+                    // The relcl arc outbids the subject-Left (100): inside a
+                    // marker frame the anchor is never the clause verb's
+                    // subject (the relativizer or its pronoun is), and
+                    // attaching the anchor Left would both mishead it and pop
+                    // it before the matrix verb arrives. Ungated here by
+                    // design — the candidate arm above is the gate, so this
+                    // weight only ever ranks marker-framed pairs.
+                    l if l == labels.relcl => {
+                        if matches!(pos[s], Upos::Noun | Upos::Propn) && pos[b] == Upos::Verb {
+                            105.0
+                        } else {
+                            5.0
+                        }
+                    }
                     l if l == labels.aux => {
                         if pos[s] == Upos::Verb && pos[b] == Upos::Aux {
                             85.0
@@ -1026,6 +1333,7 @@ pub struct DepLabels {
     pub parataxis: u64,
     pub acomp: u64,
     pub xcomp: u64,
+    pub relcl: u64,
 }
 
 impl DepLabels {
@@ -1055,6 +1363,7 @@ impl DepLabels {
             parataxis: intern("parataxis"),
             acomp: intern("acomp"),
             xcomp: intern("xcomp"),
+            relcl: intern("relcl"),
         }
     }
 
@@ -1226,6 +1535,40 @@ impl ArcEagerAnnotator {
         // Disjoint from all above (PRON prev never matches aux/clitic/
         // initial triggers).
         refine_pos_pronoun_subject_verb(&texts, &mut pos);
+        // That-relative pass: nominal-headed that → PRON, then the NOUN
+        // after that- PRON → VERB. Sequenced after the pronoun pass (whose
+        // nominative list never pronounces that) and before the
+        // relative-matrix pass, whose VERB-host gate reads the clause verbs
+        // upgraded here (cried → slept). Disjoint targets from both.
+        refine_pos_that_relative(&texts, &mut pos);
+        // Where-marker pass: nominal-headed where → SCONJ so the existing
+        // mark arm fires. Sequenced with the other frame passes; targets
+        // (NOUN-where) are disjoint from every verb/ADJ upgrade, and no
+        // refine reads SCONJ positionally (the initial-noun blocker keys on
+        // the word, order-free).
+        refine_pos_where_marker(&texts, &mut pos);
+        // Final-adverbial pass: closed time/manner set + -ly finals →
+        // ADV. Targets are disjoint from the comma-adverbial pass (which
+        // owns comma -ly with its clause-edge host guard; this pass skips
+        // comma -ly), and ADV outputs feed no verb/ADJ upgrade.
+        refine_pos_final_adverbial(&texts, &mut pos);
+        // Linking-predicate pass: bare-initial sensory verb → VERB, then
+        // the NOUN after a sensory VERB → ADJ. Sequenced with the frame
+        // passes; targets (sensory words, their complements) are disjoint
+        // from every relativizer/adverbial trigger, and ADJ outputs feed
+        // nothing upstream of the be-predicate pass.
+        refine_pos_linking_predicate(&texts, &mut pos);
+        // Relative-matrix pass: sentence-final NOUN after a relcl VERB with
+        // a nominal-headed who/that/where earlier. Sequenced after the
+        // pronoun pass so relcl verbs upgraded there (wait, study, sang)
+        // are visible as the VERB host; disjoint targets (sentence-final
+        // only) from the initial-noun positions.
+        refine_pos_relative_matrix_verb(&texts, &mut pos);
+        // Adverbial pass: comma-framed -ly NOUN → ADV. Sequenced after the
+        // verb passes; targets (NOUN) are disjoint from every verb/ADJ
+        // upgrade above, and comma-framed adverbials never feed those
+        // triggers (no DET+NOUN initials, no PRON hosts, no be hosts).
+        refine_pos_comma_adverbial(&texts, &mut pos);
         // Initial noun-subject pass: DET+NOUN+NOUN / NOUN+NOUN at the start.
         // Disjoint (targets positions the earlier passes leave as NOUN).
         refine_pos_initial_noun_verb(&texts, &mut pos);
@@ -1246,7 +1589,7 @@ impl ArcEagerAnnotator {
         let mut sentence_roots = Vec::new();
 
         for (s, e) in sentences {
-            let root = pick_root(&pos, s, e);
+            let root = pick_root(&pos, &texts, s, e);
             sentence_roots.push(root);
             state.reset_for_sentence(s, e, root, self.labels.root);
             while !state.is_final() {
@@ -1403,13 +1746,39 @@ fn partition_sentences(starts: &[bool], len: usize) -> Vec<(usize, usize)> {
     out
 }
 
-/// The sentence root: the leftmost verb; else the leftmost adjective
-/// (copular predicates head their clause); else the leftmost NOUN/PROPN/PRON;
-/// else the first token (the minimal star fallback for degenerate sentences).
-fn pick_root(pos: &[Upos], s: usize, e: usize) -> usize {
+/// The sentence root: the leftmost verb that does not close a relative
+/// clause; else the leftmost adjective (copular predicates head their
+/// clause); else the leftmost NOUN/PROPN/PRON; else the first token (the
+/// minimal star fallback for degenerate sentences).
+///
+/// The first rung is a first-accept walk with a skip predicate, not a bare
+/// leftmost pick: a verb pending after a nominal-headed who/that/where is
+/// the relcl predicate, never the matrix root (`The man who called left`
+/// roots at `left`). The skip resets at every verb, so only the clause the
+/// marker opens is skipped — a matrix-first verb (`I know the man who
+/// called`) still wins, and complementizer `that` (verb-headed) or
+/// sentence-initial interrogatives (no nominal head) never arm the skip.
+/// Load-bearing for the relcl arm: a pre-designated root is excluded from
+/// re-attachment, so the label arm can only fire once the crown moves.
+fn pick_root(pos: &[Upos], texts: &[String], s: usize, e: usize) -> usize {
+    let mut rel_pending = false;
+    for i in s..e {
+        if pos[i] == Upos::Verb {
+            if !rel_pending {
+                return i;
+            }
+            rel_pending = false;
+            continue;
+        }
+        if i > 0
+            && is_relative_marker(texts[i].as_str())
+            && matches!(pos[i - 1], Upos::Noun | Upos::Propn)
+        {
+            rel_pending = true;
+        }
+    }
     (s..e)
-        .find(|&i| pos[i] == Upos::Verb)
-        .or_else(|| (s..e).find(|&i| pos[i] == Upos::Adj))
+        .find(|&i| pos[i] == Upos::Adj)
         .or_else(|| (s..e).find(|&i| matches!(pos[i], Upos::Noun | Upos::Propn | Upos::Pron)))
         .unwrap_or(s)
 }

@@ -699,3 +699,398 @@ fn medial_compound_pair_is_not_appos() {
     let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
     assert_ne!(deps[at("report")], "appos", "deps: {deps:?}");
 }
+
+#[test]
+fn comma_framed_initial_ly_adverbial_is_adv() {
+    // Refs (UD parenthetical-12): Sadly → adv/advmod → ended. The tagger has
+    // no ADV path, so comma-framed -ly adverbials fall through to NOUN (and
+    // even steal root). Attachment needs an (Adv, Aux/Verb) clause arm —
+    // later work, deliberately unasserted beyond connectivity.
+    let (_doc, set) = parse("Sadly, the trip ended early.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("Sadly")], "adv", "pos: {pos:?}");
+    let abs = at("Sadly") as i32 + set.0[at("Sadly")].head;
+    assert!((0..set.len() as i32).contains(&abs), "Sadly headed");
+}
+
+#[test]
+fn comma_framed_medial_ly_adverbial_is_adv() {
+    // Refs (UD parenthetical-02): frankly → adv/advmod → was.
+    let (_doc, set) = parse("The report, frankly, was late.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("frankly")], "adv", "pos: {pos:?}");
+}
+
+#[test]
+fn month_ly_noun_after_prep_stays_noun() {
+    // Must-NOT-fire: "July" ends in -ly and precedes a comma, but its host
+    // is a preposition (temporal nominal), not a clause edge — stays NOUN.
+    let (_doc, set) = parse("In July, we met.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("July")], "noun", "pos: {pos:?}");
+    assert_eq!(pos[at("met")], "verb", "pos: {pos:?}");
+}
+
+#[test]
+fn det_ly_noun_stays_noun() {
+    // Must-NOT-fire: "family" ends in -ly but is a determiner-headed nominal
+    // — stays NOUN.
+    let (_doc, set) = parse("The family ate dinner.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("family")], "noun", "pos: {pos:?}");
+    assert_eq!(deps[at("family")], "nsubj", "deps: {deps:?}");
+}
+
+#[test]
+fn relative_matrix_verb_is_root() {
+    // Refs (UD relative-01): left → verb/root. The leftmost verb is the
+    // relcl predicate (called), which the root ladder must skip — the
+    // matrix verb closes the relative clause. The relcl attachment itself
+    // (called → relcl → man) needs its own oracle arm: later work,
+    // deliberately unasserted.
+    let (_doc, set) = parse("The man who called left.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (called, left) = (at("called"), at("left"));
+    assert_eq!(deps[left], "root", "deps: {deps:?}");
+    assert_eq!(set.0[left].head, 0);
+    assert_ne!(deps[called], "root", "deps: {deps:?}");
+}
+
+#[test]
+fn interrogative_who_does_not_shift_root() {
+    // Must-NOT-fire: sentence-initial "who" has no nominal head, so it is
+    // not a relativizer — the leftmost verb stays root.
+    let (_doc, set) = parse("Who called earlier?");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(deps[at("called")], "root", "deps: {deps:?}");
+}
+
+#[test]
+fn complementizer_that_does_not_shift_root() {
+    // Must-NOT-fire: "that" headed by a verb (know) is a complementizer —
+    // the leftmost verb stays root.
+    let (_doc, set) = parse("I know that they play soccer.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(deps[at("know")], "root", "deps: {deps:?}");
+}
+
+#[test]
+fn relcl_predicate_attaches_to_anchor() {
+    // Refs (UD relative-01): called → relcl → man, man → nsubj → left.
+    // The candidate set offers no relcl arc, so the clause verb strands
+    // into repair-dep; the anchor must additionally survive its relativizer
+    // (Reduce outbids Shift) for the pair to meet.
+    let (_doc, set) = parse("The man who called left.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (man, called, left) = (at("man"), at("called"), at("left"));
+    assert_eq!(deps[called], "relcl", "deps: {deps:?}");
+    assert_eq!(called as i32 + set.0[called].head, man as i32);
+    assert_eq!(deps[man], "nsubj", "deps: {deps:?}");
+    assert_eq!(man as i32 + set.0[man].head, left as i32);
+}
+
+#[test]
+fn complement_clause_verb_is_not_relcl() {
+    // Must-NOT-fire: verb-headed "that" is a complementizer — the embedded
+    // verb must not take relcl even though a that + verb frame is present.
+    let (_doc, set) = parse("She said that he left.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(deps[at("said")], "root", "deps: {deps:?}");
+    assert_ne!(deps[at("left")], "relcl", "deps: {deps:?}");
+}
+
+#[test]
+fn nominal_headed_that_is_pronoun_and_heads_clause_verb() {
+    // Refs (UD relative-11): that → pron/nsubj → cried, cried → verb/relcl
+    // → baby, slept → verb/root. The closed map lexes every "that" as DET,
+    // so the relativizer (and its DET-headed clause verb, which no
+    // subject-rule sees) strand. Two sequenced upgrades in one frame pass,
+    // same shape as the contracted-be rule.
+    let (_doc, set) = parse("The baby that cried slept.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (baby, that, cried, slept) = (at("baby"), at("that"), at("cried"), at("slept"));
+    assert_eq!(pos[that], "pron", "pos: {pos:?}");
+    assert_eq!(pos[cried], "verb", "pos: {pos:?}");
+    assert_eq!(deps[that], "nsubj", "deps: {deps:?}");
+    assert_eq!(that as i32 + set.0[that].head, cried as i32);
+    assert_eq!(deps[cried], "relcl", "deps: {deps:?}");
+    assert_eq!(cried as i32 + set.0[cried].head, baby as i32);
+    assert_eq!(deps[slept], "root", "deps: {deps:?}");
+}
+
+#[test]
+fn complement_that_stays_det() {
+    // Must-NOT-fire: verb-headed "that" is a complementizer — stays DET.
+    let (_doc, set) = parse("She said that he left.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("that")], "det", "pos: {pos:?}");
+}
+
+#[test]
+fn demonstrative_that_stays_det() {
+    // Must-NOT-fire: sentence-initial demonstrative "that" has no nominal
+    // head — stays DET.
+    let (_doc, set) = parse("That book is heavy.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("That")], "det", "pos: {pos:?}");
+}
+
+#[test]
+fn post_punct_clause_subject_waits_for_its_verb() {
+    // Refs (UD multiclause-05): she → nsubj → cleans, cleans → parataxis →
+    // cooks. The (Verb, nominal) Right arcs fire across the comma, so the
+    // second clause's subject misattaches as dobj to the first verb instead
+    // of shifting into Left-nsubj from its own predicate.
+    let (_doc, set) = parse("He cooks, she cleans.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (she, cleans) = (at("she"), at("cleans"));
+    assert_eq!(deps[she], "nsubj", "deps: {deps:?}");
+    assert_eq!(she as i32 + set.0[she].head, cleans as i32);
+}
+
+#[test]
+fn postverbal_pronoun_without_comma_stays_dobj() {
+    // Must-NOT-fire: with no clause boundary between verb and pronoun, the
+    // dobj reading stands.
+    let (_doc, set) = parse("Call me later.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(deps[at("me")], "dobj", "deps: {deps:?}");
+}
+
+#[test]
+fn nominal_headed_where_is_sconj_mark() {
+    // Refs (UD relative-10): where → mark → met. The tagger leaves `where`
+    // as NOUN (the §8.2-adjacent false negative), so the existing mark arm
+    // — which is Sconj-keyed, like `when`/`because` — never fires. The POS
+    // stays divergent (refs pin ADP, following the `as`-precedent's SCONJ
+    // functional reading instead); the attachment is the UD-substantive
+    // half and is asserted exactly.
+    let (_doc, set) = parse("The store where we met closed.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (where_, met) = (at("where"), at("met"));
+    assert_eq!(pos[where_], "sconj", "pos: {pos:?}");
+    assert_eq!(deps[where_], "mark", "deps: {deps:?}");
+    assert_eq!(where_ as i32 + set.0[where_].head, met as i32);
+}
+
+#[test]
+fn interrogative_where_stays_noun() {
+    // Must-NOT-fire: sentence-initial interrogative `where` has no nominal
+    // head — stays NOUN (its ADV reading belongs to the adverb-lexicon
+    // gap, explicitly out of scope).
+    let (_doc, set) = parse("Where is my bag?");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("Where")], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn object_relative_anchor_survives_embedded_subject() {
+    // Refs (UD relative-02): bought → relcl → book, book → nsubj →
+    // vanished. The anchor wait covers the marker ([book], that) but the
+    // anchor is popped again on the embedded subject ([book], I) — Reduce
+    // outbids Shift twice, so the relcl pair never meets and everything
+    // strands into repair-dep.
+    let (_doc, set) = parse("The book that I bought vanished.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (book, bought, vanished) = (at("book"), at("bought"), at("vanished"));
+    assert_eq!(deps[bought], "relcl", "deps: {deps:?}");
+    assert_eq!(bought as i32 + set.0[bought].head, book as i32);
+    assert_eq!(deps[book], "nsubj", "deps: {deps:?}");
+    assert_eq!(book as i32 + set.0[book].head, vanished as i32);
+}
+
+#[test]
+fn matrix_first_relative_frame_is_stable() {
+    // Must-NOT-fire (invariance): a matrix-first verb with a trailing
+    // subject-relative keeps its root and its relcl arc — the extended
+    // anchor wait must not reroute it.
+    let (_doc, set) = parse("I know the man who called.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(deps[at("know")], "root", "deps: {deps:?}");
+    assert_eq!(deps[at("called")], "relcl", "deps: {deps:?}");
+}
+
+#[test]
+fn final_manner_adverbial_is_adv() {
+    // Refs (UD svo-02): loudly → adv/advmod → barks. Closed-class
+    // time/manner adverbials in sentence-final position fall through to
+    // NOUN; with the verb directly on the stack the existing Right-advmod
+    // arm attaches them.
+    let (_doc, set) = parse("The dog barks loudly.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (barks, loudly) = (at("barks"), at("loudly"));
+    assert_eq!(pos[loudly], "adv", "pos: {pos:?}");
+    assert_eq!(deps[loudly], "advmod", "deps: {deps:?}");
+    assert_eq!(loudly as i32 + set.0[loudly].head, barks as i32);
+}
+
+#[test]
+fn coordinated_adverbial_candidate_stays_noun() {
+    // Must-NOT-fire (boundary): "daily" before a conjunction ("Run daily
+    // or quit") sits in a coordination frame, not a final/comma adverbial
+    // slot — CC-disambiguation is its own rule, so it stays NOUN even
+    // though the sibling ref reads ADV.
+    let (_doc, set) = parse("Run daily or quit.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("daily")], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn temporal_today_stays_noun() {
+    // Must-NOT-fire (boundary): "today" reads NOUN/advmod in its frozen ref
+    // ("Send the invoice today", the UD npadvmod analysis) while a sibling
+    // ref reads ADV — the refs are irreconcilable, so the word stays out of
+    // the adverbial set until they reconcile.
+    let (_doc, set) = parse("Send the invoice today.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("today")], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn preverb_aux_attaches_to_predicate() {
+    // Refs (UD question-04/10/12): Can → aux → help. The Left-aux arm
+    // exists, but Reduce pops the auxiliary on its subject (no arc pairs
+    // Aux with a nominal), so it strands into repair-dep with the right
+    // head and the wrong label. The anchor-style wait lets the pair meet.
+    let (_doc, set) = parse("Can you help me?");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (can, help) = (at("Can"), at("help"));
+    assert_eq!(deps[can], "aux", "deps: {deps:?}");
+    assert_eq!(can as i32 + set.0[can].head, help as i32);
+}
+
+#[test]
+fn modal_neg_aux_coexists() {
+    // Must-NOT-fire (invariance): "wo" keeps its aux arc to the predicate
+    // with "n't" taking neg — the new Left-aux arm must route through the
+    // same head the repair fallback found, not disturb the neg attachment.
+    let (_doc, set) = parse("She won't answer calls.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (wo, answer, nt) = (at("wo"), at("answer"), at("n't"));
+    assert_eq!(deps[wo], "aux", "deps: {deps:?}");
+    assert_eq!(wo as i32 + set.0[wo].head, answer as i32);
+    assert_eq!(deps[nt], "neg", "deps: {deps:?}");
+}
+
+#[test]
+fn copular_be_keeps_cop() {
+    // Must-NOT-fire: "is" before a predicate adjective stays cop — the aux
+    // arm scores below cop and never sees the (Aux, Adj) pair anyway.
+    let (_doc, set) = parse("Your fee is low.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(deps[at("is")], "cop", "deps: {deps:?}");
+}
+
+#[test]
+fn sensory_linking_frame_is_verbal() {
+    // Refs (UD copular-12): smells → verb/root, Dinner → nsubj → smells,
+    // great → adj/acomp → smells. Bare-initial sensory verbs fall outside
+    // every subject rule (the bare-initial boundary names weather and
+    // achievement verbs, never sensory perception with a following
+    // predicate nominal), and their complements strand as nominal objects.
+    // Two sequenced upgrades in one frame pass (contracted-be shape).
+    let (_doc, set) = parse("Dinner smells great.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (dinner, smells, great) = (at("Dinner"), at("smells"), at("great"));
+    assert_eq!(pos[smells], "verb", "pos: {pos:?}");
+    assert_eq!(deps[smells], "root", "deps: {deps:?}");
+    assert_eq!(deps[dinner], "nsubj", "deps: {deps:?}");
+    assert_eq!(dinner as i32 + set.0[dinner].head, smells as i32);
+    assert_eq!(pos[great], "adj", "pos: {pos:?}");
+    assert_eq!(deps[great], "acomp", "deps: {deps:?}");
+    assert_eq!(great as i32 + set.0[great].head, smells as i32);
+}
+
+#[test]
+fn transitive_sensory_object_stays_noun() {
+    // Must-NOT-fire: a determiner-led object ("the soup") is transitive,
+    // not a predicate complement — stays NOUN even after a sensory verb.
+    // (Bare transitives like "smells smoke" stay a documented boundary:
+    // no bench instance distinguishes them positionally.)
+    let (_doc, set) = parse("Taste the soup.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("soup")], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn relative_matrix_verb_after_relcl_is_verb() {
+    // Refs (UD relative-01): left → verb/root, man → nsubj → left. "left"
+    // is outside the closed verb list, so the matrix verb falls through to
+    // NOUN and the relcl verb steals root. This rule restores the verb tag;
+    // the root/relcl attachment half belongs to later work and is
+    // deliberately unasserted (only connectivity + no parataxis invent).
+    let (_doc, set) = parse("The man who called left.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (called, left) = (at("called"), at("left"));
+    assert_eq!(pos[called], "verb", "pos: {pos:?}");
+    assert_eq!(pos[left], "verb", "pos: {pos:?}");
+    assert_ne!(deps[left], "parataxis", "deps: {deps:?}");
+    let abs = left as i32 + set.0[left].head;
+    assert!((0..set.len() as i32).contains(&abs), "left headed: {deps:?}");
+}
+
+#[test]
+fn relative_matrix_verb_that_clause_is_verb() {
+    // Refs (UD relative-02): vanished → verb/root. "that" lexes DET with a
+    // nominal head (book) — the relative frame, not a complementizer.
+    let (_doc, set) = parse("The book that I bought vanished.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("vanished")], "verb", "pos: {pos:?}");
+}
+
+#[test]
+fn complement_that_object_stays_noun() {
+    // Must-NOT-fire: "that" headed by a VERB (know) is a complementizer,
+    // not a relativizer — "soccer" is a true nominal object and stays NOUN.
+    let (_doc, set) = parse("I know that they play soccer.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("soccer")], "noun", "pos: {pos:?}");
+    assert_eq!(deps[at("soccer")], "dobj", "deps: {deps:?}");
+}
+
+#[test]
+fn relative_frame_titlecase_final_stays_noun() {
+    // Must-NOT-fire: a title-case sentence-final nominal ("Anna") is the
+    // §8.2 proper-noun class, not a finite verb — the lowercase guard keeps
+    // it NOUN even inside a relative frame.
+    let (_doc, set) = parse("The man who called Anna.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("Anna")], "noun", "pos: {pos:?}");
+}
