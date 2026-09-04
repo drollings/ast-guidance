@@ -36,61 +36,10 @@ pub fn can_synthesize(stages: &[Stage]) -> bool {
     })
 }
 
-/// Extract all `file:line` citations from LLM output text.
-///
-/// Matches patterns like `src/foo.rs:42`, `src/foo.rs:42:10`, or `path/file.zig:7`.
-fn extract_citations(text: &str) -> Vec<String> {
-    let mut citations = Vec::new();
-    for line in text.lines() {
-        let mut search_start = 0;
-        while search_start < line.len() {
-            if let Some(colon_pos) = line[search_start..].find(':') {
-                let abs_pos = search_start + colon_pos;
-                if let Some(citation) = extract_citation_at(line, abs_pos) {
-                    citations.push(citation.clone());
-                    search_start = abs_pos + citation.len();
-                } else {
-                    search_start = abs_pos + 1;
-                }
-            } else {
-                break;
-            }
-        }
-    }
-    citations
-}
+pub use common_core::cite::{extract_citation_at, extract_citations, Citation};
 
-/// Try to extract a `file:line` citation at the given colon position.
-fn extract_citation_at(text: &str, colon_pos: usize) -> Option<String> {
-    let before = &text[..colon_pos];
-    let after = &text[colon_pos + 1..];
-
-    let file_start = before
-        .rfind(|c: char| {
-            !c.is_alphanumeric() && c != '/' && c != '\\' && c != '.' && c != '_' && c != '-'
-        })
-        .map_or(0, |p| p + 1);
-
-    let file_part = &before[file_start..];
-    if file_part.is_empty() || !file_part.contains('.') {
-        return None;
-    }
-
-    let mut digits_end = 0;
-    for (i, c) in after.char_indices() {
-        if c.is_ascii_digit() {
-            digits_end = i + c.len_utf8();
-        } else {
-            break;
-        }
-    }
-
-    if digits_end == 0 {
-        return None;
-    }
-
-    let line_number = &after[..digits_end];
-    Some(format!("{file_part}:{line_number}"))
+fn citation_to_string(c: &Citation) -> String {
+    format!("{}:{}", c.file, c.line)
 }
 
 /// Verify that all citations in LLM output trace to provided stages.
@@ -115,18 +64,19 @@ pub fn verify_citations(output: &str, stages: &[Stage]) -> GroundingResult {
     let mut unverified = Vec::new();
 
     for citation in &citations {
-        let citation_file = std::path::Path::new(citation.split(':').next().unwrap_or(""))
+        let citation_str = citation_to_string(citation);
+        let citation_file = std::path::Path::new(&citation.file)
             .file_name()
-            .map_or_else(|| citation.clone(), |f| f.to_string_lossy().to_string());
+            .map_or_else(|| citation.file.clone(), |f| f.to_string_lossy().to_string());
         let is_grounded = grounded_refs.iter().any(|ref_str| {
             let ref_file = ref_str.split(':').next().unwrap_or("");
             ref_file == citation_file
         });
 
         if is_grounded {
-            verified.push(citation.clone());
+            verified.push(citation_str.clone());
         } else {
-            unverified.push(citation.clone());
+            unverified.push(citation_str.clone());
         }
     }
 
@@ -205,15 +155,17 @@ mod tests {
     fn test_extract_citations_basic() {
         let text = "See src/main.rs:42 for details";
         let cites = extract_citations(text);
-        assert_eq!(cites, vec!["src/main.rs:42"]);
+        assert_eq!(cites.len(), 1);
+        assert_eq!(cites[0].file, "src/main.rs");
+        assert_eq!(cites[0].line, 42);
     }
 
     #[test]
     fn test_extract_citations_multiple() {
         let text = "Implemented in foo.rs:10 and bar.rs:20";
         let cites = extract_citations(text);
-        assert!(cites.contains(&"foo.rs:10".to_string()));
-        assert!(cites.contains(&"bar.rs:20".to_string()));
+        assert!(cites.iter().any(|c| c.file == "foo.rs" && c.line == 10));
+        assert!(cites.iter().any(|c| c.file == "bar.rs" && c.line == 20));
     }
 
     #[test]

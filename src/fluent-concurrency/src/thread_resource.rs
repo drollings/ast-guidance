@@ -45,23 +45,5 @@ macro_rules! thread_local_resource {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    thread_local_resource!(static COUNTER: usize);
-
-    #[test]
-    fn test_with_tlr() {
-        let r1 = with_tlr(&COUNTER, |c| {
-            *c += 1;
-            *c
-        });
-        assert_eq!(r1, 1);
-
-        let r2 = with_tlr(&COUNTER, |c| {
-            *c += 1;
-            *c
-        });
-        assert_eq!(r2, 2);
-    }
-}
+#[path = "../tests/thread_resource.rs"]
+mod tests;

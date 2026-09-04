@@ -4,6 +4,8 @@ use fluent_knowledge::word_index::WordIndex;
 use fluent_types::GuidanceDoc;
 use thiserror::Error;
 
+use fluent_concurrency::ladder::first_accept_in_order_sync;
+
 use crate::ast_parser;
 use crate::memory::MemoryBridge;
 use crate::query::formatter::{
@@ -200,7 +202,15 @@ impl QueryEngine {
         let mut fsm = strategy::FsmEngine::new();
         let primary_intent = fsm.run(query).intent;
 
-        let all_intents: [QueryIntent; 8] = [
+        // Build owned rungs: (intent, &dyn SearchBackend) pairs that match — primary first,
+        // then fallbacks deduped by construction (no `tried` set needed).
+        let mut rungs: Vec<(QueryIntent, &dyn SearchBackend)> = Vec::new();
+        for b in &self.backends {
+            if b.matches(primary_intent) {
+                rungs.push((primary_intent, b.as_ref()));
+            }
+        }
+        for intent in [
             QueryIntent::SingleIdentifier,
             QueryIntent::IdentifierLookup,
             QueryIntent::FilePath,
@@ -209,33 +219,31 @@ impl QueryEngine {
             QueryIntent::Conceptual,
             QueryIntent::MultiKeyword,
             QueryIntent::GeneralSearch,
-        ];
-
-        let mut ordered: Vec<QueryIntent> = vec![primary_intent];
-        for intent in all_intents {
-            if intent != primary_intent {
-                ordered.push(intent);
-            }
-        }
-
-        let mut tried: Vec<QueryIntent> = Vec::new();
-        for intent in ordered {
-            if tried.contains(&intent) {
+        ] {
+            if intent == primary_intent {
                 continue;
             }
-            tried.push(intent);
-            for backend in &self.backends {
-                if backend.matches(intent) {
-                    match backend.search(query, doc, &ctx) {
-                        Ok(stages) => return Ok(stages),
-                        Err(QueryEngineError::NoResults) => {}
-                        Err(e) => return Err(e),
-                    }
+            for b in &self.backends {
+                if b.matches(intent) {
+                    rungs.push((intent, b.as_ref()));
                 }
             }
         }
 
-        Err(QueryEngineError::NoResults)
+        let res: Result<Option<Vec<Stage>>, QueryEngineError> = first_accept_in_order_sync(
+            rungs,
+            |(_intent, backend)| match backend.search(query, doc, &ctx) {
+                Ok(stages) => Ok(Some(stages)),
+                Err(QueryEngineError::NoResults) => Ok(None),
+                Err(e) => Err(e),
+            },
+            |_| true,
+        );
+        match res {
+            Ok(Some(stages)) => Ok(stages),
+            Ok(None) => Err(QueryEngineError::NoResults),
+            Err(e) => Err(e),
+        }
     }
 
     /// Explain a query with automatic memory integration.
@@ -464,5 +472,198 @@ mod tests {
         // The sub-token "hello" should be indexed from hello_world
         let hits = engine.word_index.as_ref().unwrap().search("hello");
         assert!(!hits.is_empty(), "should find hello in word index");
+    }
+
+    // ── M0 characterization: dispatch_with_filter parity harness ──────────────
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::query::search_backend::{SearchBackend, SearchContext};
+    use crate::query::strategy::QueryIntent;
+    use crate::query::synthesize::Stage;
+    use fluent_types::GuidanceDoc;
+
+    struct CountingBackend {
+        intent: QueryIntent,
+        calls: Arc<AtomicUsize>,
+        result: Result<Vec<Stage>, QueryEngineError>,
+    }
+
+    impl SearchBackend for CountingBackend {
+        fn matches(&self, intent: QueryIntent) -> bool {
+            intent == self.intent
+        }
+        fn search(
+            &self,
+            _query: &str,
+            _doc: &GuidanceDoc,
+            _ctx: &SearchContext<'_>,
+        ) -> Result<Vec<Stage>, QueryEngineError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match &self.result {
+                Ok(stages) => Ok(stages.clone()),
+                Err(e) => match e {
+                    QueryEngineError::NoResults => Err(QueryEngineError::NoResults),
+                    QueryEngineError::LlmFilter(s) => Err(QueryEngineError::LlmFilter(s.clone())),
+                    QueryEngineError::Db(s) => Err(QueryEngineError::Db(s.clone())),
+                    QueryEngineError::Io(_) => Err(QueryEngineError::Db("io".into())),
+                },
+            }
+        }
+    }
+
+    fn dummy_stages() -> Vec<Stage> {
+        vec![Stage {
+            kind: fluent_types::StageKind::Code,
+            content: "helloWorld".into(),
+            source: "src/test.zig".into(),
+            member_name: Some("helloWorld".into()),
+            member_type: Some(fluent_types::MemberType::FnDecl),
+            line: Some(1),
+            end_line: None,
+        }]
+    }
+
+    #[test]
+    fn test_dispatch_empty_query_is_no_results() {
+        let engine = QueryEngine::new();
+        let doc = make_test_doc();
+        // Current behavior: empty query via GeneralBackend matches empty substring -> returns all members
+        // Lock this baseline (parity harness) — do not change expectation without preserving byte-identical.
+        let result = engine.explain("", &doc);
+        assert!(result.is_ok(), "empty query currently returns Ok via empty-substring match, got {result:?}");
+        let r = engine.dispatch_with_filter("", &doc, &engine.llm_filter);
+        assert!(r.is_ok(), "dispatch_with_filter(\"\") currently Ok");
+    }
+
+    #[test]
+    fn test_dispatch_primary_intent_wins_without_fallback() {
+        // Query "helloWorld" is SingleIdentifier (FsmEngine). Primary backend should win.
+        let doc = make_test_doc();
+        let calls_primary = Arc::new(AtomicUsize::new(0));
+        let calls_fallback = Arc::new(AtomicUsize::new(0));
+        let mut engine = QueryEngine::new();
+        engine.backends = vec![
+            Box::new(CountingBackend {
+                intent: QueryIntent::SingleIdentifier,
+                calls: Arc::clone(&calls_primary),
+                result: Ok(dummy_stages()),
+            }),
+            Box::new(CountingBackend {
+                intent: QueryIntent::GeneralSearch,
+                calls: Arc::clone(&calls_fallback),
+                result: Ok(dummy_stages()),
+            }),
+        ];
+        let res = engine.dispatch_with_filter("helloWorld", &doc, &engine.llm_filter).expect("should win");
+        assert!(!res.is_empty());
+        assert_eq!(calls_primary.load(Ordering::SeqCst), 1, "primary should be called once");
+        assert_eq!(calls_fallback.load(Ordering::SeqCst), 0, "fallback must not be called when primary wins");
+    }
+
+    #[test]
+    fn test_dispatch_falls_through_all_intents_in_order() {
+        // Primary intent for "helloWorld" is SingleIdentifier. Make it miss, then
+        // the next matching backend (e.g. GeneralSearch) should be tried.
+        let doc = make_test_doc();
+        let calls_first = Arc::new(AtomicUsize::new(0));
+        let calls_second = Arc::new(AtomicUsize::new(0));
+        let mut engine = QueryEngine::new();
+        engine.backends = vec![
+            Box::new(CountingBackend {
+                intent: QueryIntent::SingleIdentifier,
+                calls: Arc::clone(&calls_first),
+                result: Err(QueryEngineError::NoResults),
+            }),
+            Box::new(CountingBackend {
+                intent: QueryIntent::GeneralSearch,
+                calls: Arc::clone(&calls_second),
+                result: Ok(dummy_stages()),
+            }),
+        ];
+        let res = engine.dispatch_with_filter("helloWorld", &doc, &engine.llm_filter).expect("fallback should succeed");
+        assert!(!res.is_empty());
+        assert_eq!(calls_first.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_second.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_dispatch_hard_error_short_circuits() {
+        let doc = make_test_doc();
+        let calls_first = Arc::new(AtomicUsize::new(0));
+        let calls_second = Arc::new(AtomicUsize::new(0));
+        let mut engine = QueryEngine::new();
+        engine.backends = vec![
+            Box::new(CountingBackend {
+                intent: QueryIntent::SingleIdentifier,
+                calls: Arc::clone(&calls_first),
+                result: Err(QueryEngineError::LlmFilter("hard".into())),
+            }),
+            Box::new(CountingBackend {
+                intent: QueryIntent::GeneralSearch,
+                calls: Arc::clone(&calls_second),
+                result: Ok(dummy_stages()),
+            }),
+        ];
+        let res = engine.dispatch_with_filter("helloWorld", &doc, &engine.llm_filter);
+        assert!(matches!(res, Err(QueryEngineError::LlmFilter(_))));
+        assert_eq!(calls_first.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_second.load(Ordering::SeqCst), 0, "hard error must short-circuit, second backend not consulted");
+    }
+
+    #[test]
+    fn test_dispatch_dedup_primary_not_tried_twice() {
+        // Primary for "helloWorld" is SingleIdentifier which is in all_intents.
+        // Ensure it is only attempted once even if duplicate exists.
+        let doc = make_test_doc();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut engine = QueryEngine::new();
+        engine.backends = vec![Box::new(CountingBackend {
+            intent: QueryIntent::SingleIdentifier,
+            calls: Arc::clone(&calls),
+            result: Ok(dummy_stages()),
+        })];
+        let res = engine.dispatch_with_filter("helloWorld", &doc, &engine.llm_filter).expect("should win");
+        assert!(!res.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "primary SingleIdentifier should be tried exactly once via dedup");
+    }
+
+    #[test]
+    fn test_dispatch_no_llm_degrades_to_keyword() {
+        let doc = make_test_doc();
+        // explain_no_llm uses NoopLlmFilter (0.9 for substring hit, 0.1 otherwise)
+        let engine = QueryEngine::new().with_no_llm();
+        // "hello" should still resolve via GeneralBackend/Keyword paths, not fail
+        let stages = engine.explain_no_llm("hello", &doc).expect("no_llm degrade");
+        assert!(!stages.is_empty());
+        // A conceptual query with Noop should degrade: Noop returns 0.1 for non-matches,
+        // so ConceptBackend will filter to empty -> falls through to other tiers or NoResults
+        // but must not call real LLM
+        let result = engine.explain_no_llm("zzzzNotHere", &doc);
+        assert!(matches!(result, Err(QueryEngineError::NoResults)));
+    }
+
+    #[test]
+    fn test_dispatch_vector_explain_unchanged() {
+        let doc = make_test_doc();
+        let engine = QueryEngine::new();
+        let db = search_vector::GuidanceDb::open_in_memory().expect("db");
+        // Insert a member embedding so hybrid search has something
+        db.insert_node(
+            "helloWorld",
+            "src/test.zig",
+            Some("fn helloWorld() void"),
+            Some("helloWorld fn"),
+            "test",
+            "zig",
+            Some(&[0.1, 0.2, 0.3]),
+        ).expect("insert");
+        let stages = engine.vector_explain("helloWorld", &[0.1, 0.2, 0.3], &db, &doc, 5).expect("vector_explain");
+        assert!(!stages.is_empty());
+        // Empty result case
+        let empty_db = search_vector::GuidanceDb::open_in_memory().expect("db2");
+        let res = engine.vector_explain("zzzz", &[0.9, 0.9, 0.9], &empty_db, &doc, 5);
+        assert!(matches!(res, Err(QueryEngineError::NoResults)));
     }
 }

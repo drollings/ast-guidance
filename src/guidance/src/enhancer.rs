@@ -268,7 +268,7 @@ impl Enhancer {
         let client = self.client.clone();
         let fut = common_core::retry::retry_async(
             3,
-            common_core::constants::DEFAULT_RETRY_INTERVAL_S * 1000,
+            fluent_llm::constants::DEFAULT_RETRY_INTERVAL_S * 1000,
             0,
             fluent_llm::LlmError::is_retryable,
             || {

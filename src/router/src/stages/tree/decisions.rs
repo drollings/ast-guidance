@@ -28,11 +28,27 @@ pub struct TreeEvaluation {
     /// rejection for the pipeline handoff, plus the full `tree_path` of
     /// visited nodes in its metadata.
     pub decision: StageDecision,
+    /// The dispatch target by value (the typed handoff). `Some` exactly when
+    /// the outcome routed; the decision's JSON `routing_target` shim carries
+    /// the same value for wire compat.
+    pub target: Option<RoutingTarget>,
+}
+
+/// The pipeline-handoff pair: the final `StageDecision` plus the dispatch
+/// target by value. Producers still write the JSON shim inside the decision
+/// (unchanged bytes); they additionally return the target so the orchestrator
+/// can publish it once through the typed store.
+#[derive(Debug)]
+pub struct TreeHandoff {
+    /// The final classifier `StageDecision` for the pipeline handoff.
+    pub decision: StageDecision,
+    /// The dispatch target by value (`Some` on `Route`, `None` otherwise).
+    pub target: Option<RoutingTarget>,
 }
 
 /// Build the final pipeline-handoff `StageDecision` from the tree outcome,
 /// embedding every visited node's decision in `metadata.tree_path`.
-pub fn final_decision(outcome: TreeOutcome, visited: Vec<StageDecision>) -> StageDecision {
+pub fn final_decision(outcome: TreeOutcome, visited: Vec<StageDecision>) -> TreeHandoff {
     // The final decision's score is the last classifier node's coherence.
     let score = visited.iter().rev().find_map(|d| {
         d.metadata
@@ -49,34 +65,35 @@ pub fn final_decision(outcome: TreeOutcome, visited: Vec<StageDecision>) -> Stag
             .unwrap_or_default(),
     );
 
-    let mut metadata = StageMetadata::new(serde_json::json!({
+    let metadata = StageMetadata::new(serde_json::json!({
         "tree": true,
         "tree_path": tree_path,
     }));
 
-    let (verdict, reason) = match outcome {
+    let (verdict, reason, target) = match outcome {
         TreeOutcome::Route(rt) => {
-            metadata.set_routing_target(rt.as_ref());
             let name = rt.target_name.as_deref().unwrap_or(&rt.model);
-            (
-                StageVerdict::Passed,
-                format!("tree routed to {name} (model {})", rt.model),
-            )
+            let reason = format!("tree routed to {name} (model {})", rt.model);
+            (StageVerdict::Passed, reason, Some(*rt))
         }
-        TreeOutcome::Reject(reason) => (StageVerdict::Rejected, reason),
+        TreeOutcome::Reject(reason) => (StageVerdict::Rejected, reason, None),
         TreeOutcome::Pass => (
             StageVerdict::Rejected,
             "classification tree produced no decision".into(),
+            None,
         ),
     };
 
-    StageDecision {
-        stage: PipelineStage::Classifier,
-        verdict,
-        score,
-        reason,
-        latency_ms: 0,
-        metadata: metadata.into_value(),
+    TreeHandoff {
+        decision: StageDecision {
+            stage: PipelineStage::Classifier,
+            verdict,
+            score,
+            reason,
+            latency_ms: 0,
+            metadata: metadata.into_value(),
+        },
+        target,
     }
 }
 

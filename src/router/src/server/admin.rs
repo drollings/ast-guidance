@@ -34,6 +34,32 @@ pub async fn handle_unload_model(
     if key.is_empty() {
         return error_response(hyper::StatusCode::BAD_REQUEST, "missing 'model' field");
     }
+    // Onnx models with `Always` residency load once at boot and are never
+    // evicted or unloaded — refuse loudly instead of silently no-oping.
+    if let Some(onnx) = deps.onnx.as_ref() {
+        if onnx.refuses_unload(&key) {
+            return error_response(
+                hyper::StatusCode::CONFLICT,
+                &format!(
+                    "model '{key}' is an always-resident onnx model and cannot be unloaded"
+                ),
+            );
+        }
+    }
+    // Route through the unified fleet when attached: onnx `Unloadable` roles
+    // release through their `OnnxWeights`; llama through the supervisor
+    // adapter. The `Always`/pinned refusal above is preserved exactly.
+    if let Some(fleet) = deps.fleet.as_ref() {
+        if fleet.is_known_model(&key) {
+            return match fleet.unload(&key).await {
+                Ok(()) => json_response(
+                    hyper::StatusCode::OK,
+                    &serde_json::json!({ "status": "ok", "model": key }),
+                ),
+                Err(e) => error_response(hyper::StatusCode::BAD_GATEWAY, &e.to_string()),
+            };
+        }
+    }
     let Some(supervisor) = deps.supervisor.as_ref() else {
         return error_response(hyper::StatusCode::NOT_FOUND, "no managed models");
     };
@@ -169,33 +195,6 @@ fn text_response(body: String) -> HyperResponse {
     add_cors_headers(resp.headers_mut());
     resp
 }
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn url_origin_extracts_host_port() {
-        assert_eq!(
-            url_origin("http://127.0.0.1:1234/v1/chat/completions").as_deref(),
-            Some("http://127.0.0.1:1234")
-        );
-        assert_eq!(
-            url_origin("https://api.example.com/v1/chat/completions").as_deref(),
-            Some("https://api.example.com")
-        );
-        assert_eq!(url_origin("not a url"), None);
-    }
-
-    #[test]
-    fn dedupe_metric_docs_keeps_first_help_and_type() {
-        let body1 = "# HELP a count\n# TYPE a counter\na 1\n".to_string();
-        let body2 = "# HELP a count\n# TYPE a counter\n# TYPE b gauge\nb 2\n".to_string();
-        let merged = dedupe_metric_docs(vec![body1, body2]);
-        assert_eq!(merged.matches("# HELP a").count(), 1);
-        assert_eq!(merged.matches("# TYPE a").count(), 1);
-        assert_eq!(merged.matches("# TYPE b").count(), 1);
-        assert!(merged.contains("a 1"));
-        assert!(merged.contains("b 2"));
-    }
-}
+#[path = "../../tests/server_admin.rs"]
+mod tests;

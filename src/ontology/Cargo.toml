@@ -1,4 +1,6 @@
 [package]
+autotests = false
+autobenches = false
 name = "guidance-ontology"
 version.workspace = true
 edition.workspace = true
@@ -9,6 +11,16 @@ guidance-rdf = { path = "../rdf" }
 blake3 = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# 11.8: register YaGoLoader output through spacy-rs' ConceptStore + resolver
+# (dev-only; spacy-rs never depends on ontology — §15 boundary).
+spacy-rs = { path = "../spacy-rs" }
+
+[build-dependencies]
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

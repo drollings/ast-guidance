@@ -8,10 +8,9 @@
 //! - `pipeline` — `PipelineOrchestrator`, `PipelineResult`
 //! - `stages` — pipeline stage implementations (deterministic, classifier, router)
 //! - `transforms` — `TransformStrategy`, transforms (NoTransform, PiiAnonymize, etc.)
-//! - `dispatch` — `ChatBackend` + `OpenAiChatBackend`/`RetryBackend`/`BackendChain`
+//! - `dispatch` — `DispatchBackend` + `OpenAiChatBackend`/`RetryBackend`/`BackendChain`
 //! - `kv_cache` — `HotSnapshotIndex`, `ColdSnapshotIndex`, `SnapshotStore`
 //! - `summarization` — `ResultScorer`, `ScoredResult`, `Summarizer`
-//! - `scheduler` — `AffinityScheduler`, `ScheduledTask`, `AgingConfig`
 //! - `dag_session` — `DependencySession`, `SessionStep`, `StepResult`, `DagError`,
 //!   `SessionRegistry`
 //! - `ledger` — `ContentNodeLedger` (canonical `ContentNode` store; LOD0/LOD5
@@ -21,13 +20,13 @@
 pub mod audit;
 pub mod charts;
 pub mod cli;
+pub mod concept_store_sqlite;
 pub mod config;
 pub mod dag_session;
 pub mod dispatch;
 pub mod error;
 pub mod filters;
 pub mod frontier;
-pub mod hnsw;
 pub mod instances;
 pub mod knowledge;
 pub mod kv_cache;
@@ -37,10 +36,14 @@ pub mod logging;
 pub mod metrics;
 pub mod node_store;
 pub mod normalize;
+pub mod routing_context;
+pub mod ort;
+pub mod overlay;
 pub mod pipeline;
 pub mod pipeline_types;
+pub mod ranking;
+pub mod retrieval;
 pub mod routes;
-pub mod scheduler;
 pub mod score_matrix;
 pub mod server;
 pub mod session;
@@ -59,14 +62,22 @@ pub mod views;
 pub mod testing;
 
 #[cfg(test)]
+#[path = "../tests/server_http_tests.rs"]
 mod server_http_tests;
 #[cfg(test)]
+#[path = "../tests/server_tests.rs"]
 mod server_tests;
 #[cfg(test)]
+#[path = "../tests/stage_tests.rs"]
 mod stage_tests;
 #[cfg(test)]
+#[path = "../tests/config_route_tests.rs"]
 mod config_route_tests;
 #[cfg(test)]
+#[path = "../tests/deprecated_baseline.rs"]
+mod deprecated_baseline;
+#[cfg(test)]
+#[path = "../tests/supervisor_integration_tests.rs"]
 mod supervisor_integration_tests;
 #[cfg(test)]
 pub(crate) mod test_support;

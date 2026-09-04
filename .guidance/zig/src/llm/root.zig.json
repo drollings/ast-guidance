@@ -1,9 +1,0 @@
-{
-  "meta": {
-    "module": "src.llm.root",
-    "source": "src/llm/root.zig",
-    "language": "zig"
-  },
-  "comment": " llm — General-purpose LLM inference client.\n\n Provides:\n   LlmError    — error set for all LLM operations\n   LlmConfig   — endpoint, model, timeout, think-mode settings\n   LlmClient   — HTTP chat-completion client (OpenAI + Ollama)\n   LocalDecomposer, DecomposerConfig — query decomposition\n   stripThinkBlock, isMalformedResponse, extractCommentTag,\n   stripPreamble, isBlankOrPlausible — response post-processing\n\n All definitions live in llm.zig; this file re-exports them for\n convenient `@import(\"llm\")` access.",
-  "used_by": ["src/llm/root_tests.zig"]
-}

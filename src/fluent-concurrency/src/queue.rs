@@ -45,41 +45,68 @@ impl<T> PriorityQueue<T> {
     /// Higher positive priorities are popped first; priority-0 items are next;
     /// negative priorities are popped last.
     pub fn pop(&mut self) -> Option<T> {
-        // If highest priority > 0, pop from prioritized (higher than simple)
+        self.pop_entry().map(|(item, _)| item)
+    }
+
+    /// Shared ordering helper: which bucket holds the next item.
+    fn pick_bucket(&self) -> Pick {
         if let Some((&key, _)) = self.prioritized.last_key_value() {
             if key > 0 {
-                if let Some(items) = self.prioritized.get_mut(&key) {
-                    let item = items.pop_front();
-                    if items.is_empty() {
-                        self.prioritized.remove(&key);
-                    }
-                    if item.is_some() {
-                        self.count -= 1;
-                    }
-                    return item;
-                }
+                return Pick::Positive(key);
             }
         }
-        // Pop from simple (priority 0) first
-        if let Some(item) = self.simple.pop_front() {
-            self.count -= 1;
-            return Some(item);
+        if !self.simple.is_empty() {
+            return Pick::Simple;
         }
-        // Simple is empty, drain any remaining prioritized items (negative priorities)
         if let Some((&key, _)) = self.prioritized.last_key_value() {
-            if let Some(items) = self.prioritized.get_mut(&key) {
-                let item = items.pop_front();
-                if items.is_empty() {
-                    self.prioritized.remove(&key);
+            return Pick::Negative(key);
+        }
+        Pick::Empty
+    }
+
+    #[allow(clippy::redundant_closure_for_method_calls)]
+    fn pop_entry(&mut self) -> Option<(T, i32)> {
+        match self.pick_bucket() {
+            Pick::Positive(key) | Pick::Negative(key) => {
+                let item = self.prioritized.get_mut(&key).and_then(VecDeque::pop_front);
+                if let Some(q) = self.prioritized.get(&key) {
+                    if q.is_empty() {
+                        self.prioritized.remove(&key);
+                    }
                 }
                 if item.is_some() {
                     self.count -= 1;
                 }
-                return item;
+                item.map(|v| (v, key))
             }
+            Pick::Simple => {
+                let item = self.simple.pop_front();
+                if item.is_some() {
+                    self.count -= 1;
+                }
+                item.map(|v| (v, 0))
+            }
+            Pick::Empty => None,
         }
-        None
     }
+
+    fn peek_entry(&self) -> Option<(&T, i32)> {
+        match self.pick_bucket() {
+            Pick::Positive(key) | Pick::Negative(key) => self
+                .prioritized
+                .get(&key)
+                .and_then(|q| q.front().map(|v| (v, key))),
+            Pick::Simple => self.simple.front().map(|v| (v, 0)),
+            Pick::Empty => None,
+        }
+    }
+}
+
+enum Pick {
+    Positive(i32),
+    Simple,
+    Negative(i32),
+    Empty,
 }
 
 impl<T> PriorityQueue<T> {
@@ -95,18 +122,7 @@ impl<T> PriorityQueue<T> {
 
     /// Returns a reference to the highest-priority item without removing it.
     pub fn peek(&self) -> Option<(&T, i32)> {
-        if let Some((&key, queue)) = self.prioritized.last_key_value() {
-            if key > 0 {
-                return queue.front().map(|item| (item, key));
-            }
-        }
-        if let Some(item) = self.simple.front() {
-            return Some((item, 0));
-        }
-        if let Some((&key, queue)) = self.prioritized.last_key_value() {
-            return queue.front().map(|item| (item, key));
-        }
-        None
+        self.peek_entry()
     }
 
     /// Converts the queue into an iterator, consuming it.
@@ -174,6 +190,7 @@ pub struct BoundedPriorityQueue<T> {
 impl<T: Send + 'static> BoundedPriorityQueue<T> {
     /// Creates a new bounded priority queue with the given capacity.
     pub fn new(capacity: usize) -> Self {
+        debug_assert!(capacity > 0, "queue capacity must be >0");
         Self {
             inner: Mutex::new(PriorityQueue::new()),
             capacity,

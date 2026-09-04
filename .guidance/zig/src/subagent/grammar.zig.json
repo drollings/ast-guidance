@@ -1,9 +1,0 @@
-{
-  "meta": {
-    "module": "src.subagent.grammar",
-    "source": "src/subagent/grammar.zig",
-    "language": "zig"
-  },
-  "comment": " grammar.zig — GBNF grammar constraints for LLM structured output.\n\n Defines grammar strings used with Ollama's grammar-constrained generation\n to force LLM batch classification output into valid JSON.",
-  "used_by": ["src/subagent/root.zig"]
-}

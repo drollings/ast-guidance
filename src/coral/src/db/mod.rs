@@ -4,6 +4,10 @@ pub mod hnsw;
 pub mod nodes;
 pub mod schema;
 
+#[cfg(test)]
+#[path = "../../tests/error_hops.rs"]
+mod error_hops;
+
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::Arc;
@@ -406,6 +410,45 @@ mod tests {
             );
         }
         assert_eq!(hits.len(), names.len(), "merged result has duplicate ids");
+    }
+
+    #[test]
+    fn hybrid_search_merge_order_and_length() {
+        // Characterization (M3c): locks the HNSW∪brute-force merge tail's
+        // order (ascending distance) and length (fill to k / truncate).
+        // The keyword plane is empty for query "q" (no name/source contains
+        // it), so the fused output order is the vector-merge order.
+        let lib = Library::open_in_memory().expect("db");
+        for i in 0..5 {
+            let node = ContentNode {
+                embedding: Some(vec![i as f32, 1.0, 1.0, 1.0]),
+                ..make_node(&format!("hnsw_{i}"), "s")
+            };
+            lib.insert_node(&node).expect("insert into hnsw");
+        }
+        let batch_nodes: Vec<ContentNode> = (0..3)
+            .map(|i| ContentNode {
+                embedding: Some(vec![10.0 + i as f32, 1.0, 1.0, 1.0]),
+                ..make_node(&format!("batch_{i}"), "s")
+            })
+            .collect();
+        lib.insert_nodes_batch(&batch_nodes).expect("batch insert");
+
+        let query: Vec<f32> = vec![0.0, 1.0, 1.0, 1.0];
+        // k smaller than the corpus: head kept, ascending distance.
+        let top3 = lib.hybrid_search("q", Some(&query), 3).expect("hybrid");
+        assert_eq!(top3.len(), 3);
+        let dists: Vec<f32> = top3.iter().map(|h| h.distance).collect();
+        assert!(
+            dists.windows(2).all(|w| w[0] <= w[1]),
+            "merged tail sorts ascending distance: {dists:?}"
+        );
+        assert_eq!(top3[0].name.as_str(), "hnsw_0", "nearest first");
+        // k larger than the corpus: all 8 merged hits, still ordered.
+        let all = lib.hybrid_search("q", Some(&query), 20).expect("hybrid");
+        assert_eq!(all.len(), 8, "partial HNSW filled by brute force");
+        let dists: Vec<f32> = all.iter().map(|h| h.distance).collect();
+        assert!(dists.windows(2).all(|w| w[0] <= w[1]));
     }
 
     #[test]

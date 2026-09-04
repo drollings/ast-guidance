@@ -5,9 +5,18 @@ use internment::ArcIntern;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
+pub mod instance_id;
+pub mod interlingua;
 pub mod knowledge;
+pub mod provenance;
 
+pub use interlingua::{
+    id_for_namespace, lemma_id_for_str, local_id_of, property_id_for_iri,
+    yago_class_id_for_iri, yago_entity_id_for_iri, ConceptMetadata, InterlinguaId,
+    InterlinguaNamespace, LOCAL_BITS, LOCAL_MASK, NAMESPACE_BITS,
+};
 pub use knowledge::{KnowledgeCapability, KnowledgeError};
+pub use provenance::{AnnotationClaim, ClaimStatus, ProvenanceTier};
 
 pub const LOD_COUNT: usize = 6;
 
@@ -277,12 +286,255 @@ pub enum StepStatus {
     Cancelled,
 }
 
+/// The overlay kinds a node may carry (OVERLAYS §4.3).
+///
+/// The **source of truth** for each overlay's value is the corresponding node
+/// field (`annotation` / `metadata["llm_overlay"]` / `embedding`); these
+/// bookkeeping types are advisory/audit metadata stored under
+/// `ContentNode.metadata["overlays"]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayKind {
+    /// The `ArcReadyAnnotation` (deterministic spacy parse, cheap).
+    Spacy,
+    /// LLM enrichment (summary/description).
+    Llm,
+    /// Dense vector.
+    Embedding,
+}
+
+/// The lifecycle status of one overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayStatus {
+    /// Never asked for (the default).
+    Absent,
+    /// Derivation in flight.
+    Pending,
+    /// Derived and installed.
+    Ready,
+    /// Derivation failed; not retried until the node changes.
+    Failed,
+}
+
+/// One overlay's bookkeeping entry (OVERLAYS §4.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlayState {
+    pub kind: OverlayKind,
+    pub status: OverlayStatus,
+    /// Which rung / model / embedder produced it.
+    pub source: String,
+    /// Unix secs when computed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<u64>,
+}
+
+impl OverlayState {
+    /// A fully-specified state entry.
+    #[must_use]
+    pub fn new(
+        kind: OverlayKind,
+        status: OverlayStatus,
+        source: impl Into<String>,
+        at: Option<u64>,
+    ) -> Self {
+        Self {
+            kind,
+            status,
+            source: source.into(),
+            at,
+        }
+    }
+
+    /// The default "never asked" entry.
+    #[must_use]
+    pub fn absent(kind: OverlayKind) -> Self {
+        Self::new(kind, OverlayStatus::Absent, "", None)
+    }
+
+    /// A derivation now in flight.
+    #[must_use]
+    pub fn pending(kind: OverlayKind, source: impl Into<String>) -> Self {
+        Self::new(kind, OverlayStatus::Pending, source, None)
+    }
+
+    /// A completed derivation.
+    #[must_use]
+    pub fn ready(kind: OverlayKind, source: impl Into<String>, at: u64) -> Self {
+        Self::new(kind, OverlayStatus::Ready, source, Some(at))
+    }
+
+    /// A failed derivation (permanent until reset).
+    #[must_use]
+    pub fn failed(kind: OverlayKind, source: impl Into<String>, at: u64) -> Self {
+        Self::new(kind, OverlayStatus::Failed, source, Some(at))
+    }
+}
+
+/// A rejected [`ContentNode::transition_overlay`] — a status change the
+/// overlay lifecycle forbids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayTransitionError {
+    /// The overlay is already `Ready`; re-derivation is forbidden (at-most-once).
+    AlreadyReady(OverlayKind),
+    /// The overlay is `Failed`; permanent until the node changes (a reset to
+    /// `Absent`).
+    FailedPermanent(OverlayKind),
+}
+
+/// The `ContentNode.metadata` key under which the overlay bookkeeping lives.
+pub const OVERLAYS_META_KEY: &str = "overlays";
+
+/// A type-erased, `Arc`-shareable node overlay (the "ArcReady" overlay slot).
+///
+/// `ContentNode` lives in this crate, which must stay dependency-free of any
+/// overlay producer (e.g. `spacy-rs`, which depends back on `fluent-types`), so
+/// the overlay value is carried behind this opaque, downcastable slot instead
+/// of a concrete type. The owning process (the router) installs the concrete
+/// overlay behind an `Arc` and recovers it with [`NodeOverlay::as_any`] via the
+/// typed read helper [`ContentNode::annotation_as`]. Nothing in this crate
+/// knows a concrete overlay type.
+///
+/// Overlays are immutable after construction and never serialized with the node
+/// (the node is durable without them and each overlay is lazily re-derivable
+/// from LOD0), so no `Serialize`/`Deserialize` bound is required here.
+pub trait NodeOverlay: std::any::Any + std::fmt::Debug + Send + Sync + 'static {
+    /// Downcast the overlay to its concrete type.
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
+impl dyn NodeOverlay {
+    /// Recover an owned `Arc<T>` from the shared slot — the "ArcReady" handoff:
+    /// the caller takes the same `Arc` out of the node, drops the node lock,
+    /// and reads the immutable overlay lock-free. `None` when the slot holds a
+    /// different concrete overlay type.
+    #[must_use]
+    pub fn downcast_arc<T: NodeOverlay>(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<T>> {
+        let any: std::sync::Arc<dyn std::any::Any + Send + Sync> = self;
+        any.downcast::<T>().ok()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum OriginRole {
+    User,
+    System,
+    Assistant,
+    Tool,
+    Subagent,
+    SelfOrigin,
+    Other(String),
+}
+
+impl OriginRole {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::User => "user",
+            Self::System => "system",
+            Self::Assistant => "assistant",
+            Self::Tool => "tool",
+            Self::Subagent => "subagent",
+            Self::SelfOrigin => "self",
+            Self::Other(s) => s.as_str(),
+        }
+    }
+    pub fn is_user(&self) -> bool { matches!(self, Self::User) }
+    pub fn is_system(&self) -> bool { matches!(self, Self::System) }
+    pub fn is_assistant(&self) -> bool { matches!(self, Self::Assistant) }
+    pub fn is_tool(&self) -> bool { matches!(self, Self::Tool) }
+    pub fn is_subagent(&self) -> bool { matches!(self, Self::Subagent) }
+    pub fn is_self_origin(&self) -> bool { matches!(self, Self::SelfOrigin) }
+    pub fn is_other(&self) -> bool { matches!(self, Self::Other(_)) }
+}
+
+impl std::fmt::Display for OriginRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<String> for OriginRole {
+    fn from(s: String) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "user" => Self::User,
+            "system" => Self::System,
+            "assistant" => Self::Assistant,
+            "tool" => Self::Tool,
+            "subagent" => Self::Subagent,
+            "self" => Self::SelfOrigin,
+            _ => Self::Other(s),
+        }
+    }
+}
+impl From<&str> for OriginRole {
+    fn from(s: &str) -> Self { Self::from(s.to_string()) }
+}
+
+// Custom deserialize that maps unknown strings to Other while preserving case.
+fn deserialize_origin_role<'de, D>(deserializer: D) -> Result<OriginRole, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    Ok(match s.to_ascii_lowercase().as_str() {
+        "user" => OriginRole::User,
+        "system" => OriginRole::System,
+        "assistant" => OriginRole::Assistant,
+        "tool" => OriginRole::Tool,
+        "subagent" => OriginRole::Subagent,
+        "self" => OriginRole::SelfOrigin,
+        _ => OriginRole::Other(s),
+    })
+}
+
+fn deserialize_origin_role_opt<'de, D>(deserializer: D) -> Result<Option<OriginRole>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    Ok(opt.map(|s| match s.to_ascii_lowercase().as_str() {
+        "user" => OriginRole::User,
+        "system" => OriginRole::System,
+        "assistant" => OriginRole::Assistant,
+        "tool" => OriginRole::Tool,
+        "subagent" => OriginRole::Subagent,
+        "self" => OriginRole::SelfOrigin,
+        _ => OriginRole::Other(s),
+    }))
+}
+
+// Override Serialize to emit string form
+impl serde::Serialize for OriginRole {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for OriginRole {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_origin_role(deserializer)
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContentNode {
     // ── Core fields ──
     pub id: Option<NodeId>,
     pub name: SmolStr,
     pub source: String,
+    /// A stable hash of LOD0 (the full text), the **keying domain** for ledger
+    /// annotations (ROADMAP M4). Computed by the node store's single write
+    /// funnel; a mutation of LOD0 changes this hash and thereby invalidates the
+    /// node's cached annotations — no staleness scheduler. `0` when the node
+    /// has no LOD0 content (or has not yet been stamped).
+    #[serde(default)]
+    pub content_hash: u64,
     #[serde(default)]
     pub lod: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -294,8 +546,8 @@ pub struct ContentNode {
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_origin_role_opt", skip_serializing_if = "Option::is_none")]
+    pub role: Option<OriginRole>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_index: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -314,11 +566,98 @@ pub struct ContentNode {
     pub metadata: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<u64>,
+    // ── Overlay slot (in-memory only) ──
+    /// The node's derived overlay (e.g. the spacy-rs `ArcReadyAnnotation`),
+    /// shared behind an `Arc` so every holder of the node reads the same
+    /// immutable document without a copy or a lock. **Never serialized**
+    /// (`#[serde(skip)]`): the node is durable without it and the overlay is
+    /// lazily re-derivable from LOD0, so a reloaded node simply starts at
+    /// `None`. Reading it costs one `Arc` clone under the node's `RwLock` read
+    /// guard and is then lock-free.
+    #[serde(skip)]
+    pub annotation: Option<std::sync::Arc<dyn NodeOverlay>>,
 }
 
 impl ContentNode {
     pub fn content(&self) -> Option<&str> {
         self.lod.first().map(String::as_str)
+    }
+
+    /// The typed overlay (e.g. `ArcReadyAnnotation`), downcast from the
+    /// opaque slot. `None` when the node carries no overlay of type `T`.
+    #[must_use]
+    pub fn annotation_as<T: NodeOverlay>(&self) -> Option<&T> {
+        self.annotation
+            .as_deref()
+            .and_then(|o| o.as_any().downcast_ref())
+    }
+
+    /// The node's overlay bookkeeping, from `metadata["overlays"]` (empty when
+    /// absent or malformed — the metadata is advisory, never load-bearing).
+    #[must_use]
+    pub fn overlays(&self) -> Vec<OverlayState> {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get(OVERLAYS_META_KEY))
+            .and_then(|v| serde_json::from_value::<Vec<OverlayState>>(v.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    /// One overlay's bookkeeping, defaulting to `Absent` when never asked for.
+    #[must_use]
+    pub fn overlay(&self, kind: OverlayKind) -> OverlayState {
+        self.overlays()
+            .into_iter()
+            .find(|s| s.kind == kind)
+            .unwrap_or_else(|| OverlayState::absent(kind))
+    }
+
+    /// Upsert one overlay's bookkeeping into `metadata["overlays"]` (indexed
+    /// by kind; allocates the metadata object on first use).
+    pub fn set_overlay(&mut self, state: OverlayState) {
+        let meta = self.metadata.get_or_insert_with(|| serde_json::json!({}));
+        let mut states = meta
+            .get(OVERLAYS_META_KEY)
+            .and_then(|v| serde_json::from_value::<Vec<OverlayState>>(v.clone()).ok())
+            .unwrap_or_default();
+        if let Some(existing) = states.iter_mut().find(|s| s.kind == state.kind) {
+            *existing = state;
+        } else {
+            states.push(state);
+        }
+        meta[OVERLAYS_META_KEY] =
+            serde_json::to_value(states).expect("OverlayState serializes");
+    }
+
+    /// Transition one overlay's status through the lifecycle:
+    ///
+    /// `absent → pending → ready` and `absent → pending → failed` are the
+    /// normal paths. A `ready` overlay is never recomputed (at-most-once) and a
+    /// `failed` overlay is **permanent** — neither is retried. The only exit
+    /// from either terminal status is an explicit reset to `Absent` (the node
+    /// changed); equal-status no-ops are allowed.
+    ///
+    /// On success the transition is applied and the new entry returned.
+    pub fn transition_overlay(
+        &mut self,
+        kind: OverlayKind,
+        to: OverlayStatus,
+        source: impl Into<String>,
+        at: Option<u64>,
+    ) -> Result<OverlayState, OverlayTransitionError> {
+        let current = self.overlay(kind);
+        match current.status {
+            OverlayStatus::Ready if to != OverlayStatus::Ready && to != OverlayStatus::Absent => {
+                return Err(OverlayTransitionError::AlreadyReady(kind));
+            }
+            OverlayStatus::Failed if to != OverlayStatus::Failed && to != OverlayStatus::Absent => {
+                return Err(OverlayTransitionError::FailedPermanent(kind));
+            }
+            _ => {}
+        }
+        let next = OverlayState::new(kind, to, source, at);
+        self.set_overlay(next.clone());
+        Ok(next)
     }
 }
 
@@ -559,11 +898,122 @@ mod tests {
         assert_eq!(json, "\"wasm\"");
     }
     #[test]
+    fn overlay_status_absent_pending_ready() {
+        let mut node = ContentNode::default();
+        assert_eq!(node.overlay(OverlayKind::Spacy).status, OverlayStatus::Absent);
+        node.transition_overlay(OverlayKind::Spacy, OverlayStatus::Pending, "arceager", None)
+            .expect("pending");
+        assert_eq!(node.overlay(OverlayKind::Spacy).status, OverlayStatus::Pending);
+        let ready = node
+            .transition_overlay(OverlayKind::Spacy, OverlayStatus::Ready, "arceager", Some(1000))
+            .expect("ready");
+        assert_eq!(ready.status, OverlayStatus::Ready);
+        assert_eq!(ready.at, Some(1000));
+        assert_eq!(node.overlay(OverlayKind::Spacy).status, OverlayStatus::Ready);
+        // Other kinds stay untouched.
+        assert_eq!(node.overlay(OverlayKind::Llm).status, OverlayStatus::Absent);
+    }
+
+    #[test]
+    fn overlay_status_absent_pending_failed() {
+        let mut node = ContentNode::default();
+        node.transition_overlay(OverlayKind::Embedding, OverlayStatus::Pending, "bge", None)
+            .expect("pending");
+        let failed = node
+            .transition_overlay(OverlayKind::Embedding, OverlayStatus::Failed, "bge", Some(2000))
+            .expect("failed");
+        assert_eq!(failed.status, OverlayStatus::Failed);
+        assert_eq!(node.overlay(OverlayKind::Embedding).status, OverlayStatus::Failed);
+    }
+
+    #[test]
+    fn overlay_failed_is_permanent_until_reset() {
+        let mut node = ContentNode::default();
+        node.transition_overlay(OverlayKind::Llm, OverlayStatus::Pending, "llama", None)
+            .expect("pending");
+        node.transition_overlay(OverlayKind::Llm, OverlayStatus::Failed, "llama", Some(3000))
+            .expect("failed");
+        // A retry is rejected: a failed overlay is never re-derived.
+        assert_eq!(
+            node.transition_overlay(OverlayKind::Llm, OverlayStatus::Pending, "llama", None),
+            Err(OverlayTransitionError::FailedPermanent(OverlayKind::Llm))
+        );
+        assert_eq!(
+            node.transition_overlay(OverlayKind::Llm, OverlayStatus::Ready, "llama", Some(4000)),
+            Err(OverlayTransitionError::FailedPermanent(OverlayKind::Llm))
+        );
+        // The only exit is an explicit reset (the node changed) → re-derive.
+        node.transition_overlay(OverlayKind::Llm, OverlayStatus::Absent, "", None)
+            .expect("reset");
+        node.transition_overlay(OverlayKind::Llm, OverlayStatus::Pending, "llama", None)
+            .expect("re-pending after reset");
+        node.transition_overlay(OverlayKind::Llm, OverlayStatus::Ready, "llama", Some(5000))
+            .expect("re-ready after reset");
+        assert_eq!(node.overlay(OverlayKind::Llm).status, OverlayStatus::Ready);
+    }
+
+    #[test]
+    fn overlay_ready_is_not_recomputed() {
+        let mut node = ContentNode::default();
+        node.transition_overlay(OverlayKind::Spacy, OverlayStatus::Ready, "arceager", Some(1))
+            .expect("ready");
+        assert_eq!(
+            node.transition_overlay(OverlayKind::Spacy, OverlayStatus::Pending, "llm", None),
+            Err(OverlayTransitionError::AlreadyReady(OverlayKind::Spacy))
+        );
+        assert_eq!(
+            node.transition_overlay(OverlayKind::Spacy, OverlayStatus::Failed, "llm", Some(2)),
+            Err(OverlayTransitionError::AlreadyReady(OverlayKind::Spacy))
+        );
+        // Equal-status no-op is allowed.
+        node.transition_overlay(OverlayKind::Spacy, OverlayStatus::Ready, "arceager", Some(3))
+            .expect("no-op");
+        assert_eq!(node.overlay(OverlayKind::Spacy).status, OverlayStatus::Ready);
+    }
+
+    #[test]
+    fn overlay_state_serde_roundtrip() {
+        let state = OverlayState::ready(OverlayKind::Spacy, "arceager", 42);
+        let json = serde_json::to_string(&state).expect("serialize");
+        let back: OverlayState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, state);
+        // Wire names are snake_case.
+        assert_eq!(serde_json::to_string(&OverlayKind::Spacy).unwrap(), "\"spacy\"");
+        assert_eq!(serde_json::to_string(&OverlayKind::Embedding).unwrap(), "\"embedding\"");
+        assert_eq!(serde_json::to_string(&OverlayStatus::Pending).unwrap(), "\"pending\"");
+        assert_eq!(serde_json::to_string(&OverlayStatus::Failed).unwrap(), "\"failed\"");
+        // Absent entries drop the `at` field.
+        let absent = OverlayState::absent(OverlayKind::Llm);
+        let json = serde_json::to_string(&absent).expect("serialize");
+        assert!(!json.contains("\"at\""));
+        let back: OverlayState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, absent);
+    }
+
+    #[test]
+    fn overlay_bookkeeping_lives_in_metadata_overlays() {
+        let mut node = ContentNode::default();
+        node.set_overlay(OverlayState::pending(OverlayKind::Spacy, "arceager"));
+        // Stored under the namespaced key, as advisory JSON.
+        let meta = node.metadata.as_ref().expect("metadata allocated");
+        assert!(meta.get(OVERLAYS_META_KEY).is_some());
+        // Survives a ContentNode serde round-trip (the durable content_json).
+        let json = serde_json::to_string(&node).expect("serialize");
+        let back: ContentNode = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.overlay(OverlayKind::Spacy).status, OverlayStatus::Pending);
+        // Updating the same kind replaces, never duplicates.
+        node.set_overlay(OverlayState::ready(OverlayKind::Spacy, "arceager", 9));
+        assert_eq!(node.overlays().len(), 1);
+        assert_eq!(node.overlay(OverlayKind::Spacy).status, OverlayStatus::Ready);
+    }
+
+    #[test]
     fn content_node_defaults() {
         let node = ContentNode {
             id: None,
             name: SmolStr::new("root"),
             source: "full text".into(),
+            content_hash: 0,
             lod: vec!["hello".into()],
             embedding: None,
             capabilities: None,
@@ -579,10 +1029,107 @@ mod tests {
             step_status: None,
             metadata: None,
             created_at: None,
+            annotation: None,
         };
         assert_eq!(node.lod.len(), 1);
         assert_eq!(node.content(), Some("hello"));
         assert!(node.embedding.is_none());
+        assert!(node.annotation.is_none());
+    }
+
+    /// A concrete, dependency-free overlay for exercising the opaque slot.
+    #[derive(Debug, Clone)]
+    struct TestOverlay {
+        value: u64,
+    }
+
+    impl NodeOverlay for TestOverlay {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct OtherOverlay;
+
+    impl NodeOverlay for OtherOverlay {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn content_node_annotation_slot_downedcasts_and_shares() {
+        let overlay = TestOverlay { value: 42 };
+        let node = ContentNode {
+            annotation: Some(std::sync::Arc::new(overlay)),
+            ..ContentNode::default()
+        };
+        // Typed read through the opaque slot (the router's read path).
+        let got = node.annotation_as::<TestOverlay>().expect("downcast");
+        assert_eq!(got.value, 42);
+        // Unknown overlay types read as absent, not a panic.
+        assert!(node.annotation_as::<OtherOverlay>().is_none());
+        // Shared: two holders read the same immutable overlay without a lock.
+        let shared = node.annotation.clone().expect("shared slot");
+        assert_eq!(shared.as_any().downcast_ref::<TestOverlay>().unwrap().value, 42);
+        // The node remains Debug/Clone/Default with the slot populated.
+        let clone = node.clone();
+        assert_eq!(clone.annotation_as::<TestOverlay>().unwrap().value, 42);
+    }
+
+    #[test]
+    fn content_node_annotation_is_never_serialized() {
+        let node = ContentNode {
+            annotation: Some(std::sync::Arc::new(TestOverlay { value: 7 })),
+            ..ContentNode::default()
+        };
+        let json = serde_json::to_string(&node).expect("serialize");
+        assert!(
+            !json.contains("annotation"),
+            "the overlay is in-memory only and must not leak into content_json: {json}"
+        );
+        // A node deserialized from that durable JSON carries no overlay.
+        let back: ContentNode = serde_json::from_str(&json).expect("deserialize");
+        assert!(back.annotation.is_none());
+    }
+
+    #[test]
+    fn content_node_back_compat_pre_annotation_field() {
+        // A `ContentNode` serialized before the annotation slot existed (no
+        // `annotation` key, no `..Default` churn) deserializes correctly with
+        // `annotation: None` (OVERLAYS M4.2).
+        let pre_field_json = r#"{
+            "id": 7,
+            "name": "legacy",
+            "source": "old full text",
+            "lod": ["old full text", "old summary"],
+            "embedding": null,
+            "capabilities": null,
+            "session_id": null,
+            "request_id": null,
+            "role": null,
+            "turn_index": null,
+            "accepted": null,
+            "acceptance_score": null,
+            "active_lod": null,
+            "parent_id": null,
+            "step_id": null,
+            "step_status": null,
+            "metadata": null,
+            "created_at": null
+        }"#;
+        let node: ContentNode = serde_json::from_str(pre_field_json).expect("deserialize");
+        assert_eq!(node.name.as_str(), "legacy");
+        assert_eq!(node.lod.len(), 2);
+        assert!(node.annotation.is_none(), "legacy node has no overlay");
+        // The node round-trips through the store's content_json unchanged.
+        let json = serde_json::to_string(&node).expect("serialize");
+        let back: ContentNode = serde_json::from_str(&json).expect("round trip");
+        assert_eq!(back.name.as_str(), "legacy");
+        assert!(back.annotation.is_none());
+        // `content_hash` predates this node's serialization → defaults to 0.
+        assert_eq!(node.content_hash, 0, "missing content_hash back-compat defaults to 0");
     }
     #[test]
     fn wasm_tool_serde() {

@@ -9,4 +9,7 @@
 pub mod common;
 pub mod e2e_tests;
 pub mod golden;
+pub mod liveness_calibration;
+pub mod overlay_calibration;
 pub mod rubric_fixtures;
+pub mod threshold_calibration;

@@ -1,8 +1,0 @@
-{
-  "meta": {
-    "module": "src.dag.root",
-    "source": "src/dag/root.zig",
-    "language": "zig"
-  },
-  "comment": " dag — DAG execution engine for build systems.\n\n Provides:\n   Target       — Target/TargetType/ExecutorKind value types\n   TargetRegistry — DAG registry with TargetBuilder (fluent DSL)\n   DependencyResolver — Topological sort with cycle detection\n   DagExecutor  — Parallel DAG execution\n   BuildContext — Build execution context\n   Repl         — Interactive REPL\n   json_parser  — Target file parser"
-}

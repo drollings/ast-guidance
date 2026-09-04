@@ -33,6 +33,11 @@ ROUTER_LOG := /tmp/coral-router.out
 CONFIG      := .guidance/guidance-config.json
 INSTALLDIR  := $(HOME)/.local/bin
 
+# The MIGraphX-enabled ONNX Runtime dylib (AMD ROCm GPU EP) the router loads via
+# ort's `load-dynamic` for `execution_provider: "gpu"`. Override with
+# `make router-start ORT_DYLIB_PATH=/path/to/libonnxruntime.so`.
+ORT_DYLIB_PATH ?= /lib64/libonnxruntime.so.1.28.0
+
 RUST_SRC_DIR := src
 GUIDANCE_DIR  := .guidance
 GUIDANCE_DB   := .guidance.db
@@ -182,6 +187,19 @@ CORAL_ROUTER_TEST_SCRIPT := bin/coral-router-test.py
 router-benchmark: router-start ## Score the live router (routing accuracy, TTFT, VRAM) via bin/coral-router-test.py; reads env/coral-router.json for routes + expectations
 	$(Q)python3 $(CORAL_ROUTER_TEST_SCRIPT) --config $(CORAL_ROUTER_CONFIG)
 
+# ── spaCy vs spacy-rs Parity Benchmark ───────────────────────────────────────
+# Re-runs the tokenizer speed + memory comparison over the shared golden
+# corpus fixture (`src/spacy-rs/tests/data/en_tokenization.json`, pinned to
+# spaCy 3.8.15). Builds the in-repo Rust harness (`bin/spacy/benchmark/`), runs
+# both tokenizers over the same dataset, and prints a comparison table with a
+# parity gate. Hermetic to a python + spaCy install (no inference, no network).
+
+SPACY_BENCH_DIR := bin/spacy/benchmark
+
+.PHONY: spacy-benchmark
+spacy-benchmark: ## Re-run the spaCy vs spacy-rs parity benchmark (speed + memory over the shared golden corpus); env: SPACY_PYTHON=<python-with-spacy>, SPACY_BENCH_PASSES=<n>, SPACY_BENCH_REPS=<n>
+	$(Q)bash $(SPACY_BENCH_DIR)/run.sh
+
 .PHONY: doc-check
 doc-check: ## Doc consistency lint — types named in skill/router docs must exist in source
 	$(Q)bin/doc-check.sh --types
@@ -208,7 +226,7 @@ router-test-all: $(CORAL_ROUTER_BIN) ## router-test + coral-context HNSW benchma
 router-start: $(CORAL_ROUTER_BIN) ## Build (if needed), (re)start coral-router in real mode on :8079, and wait for /health (stops the old tree first)
 	$(stop-router)
 	$(Q)echo "Starting coral-router"
-	$(Q)nohup $(CORAL_ROUTER_BIN) start -c $(CORAL_ROUTER_CONFIG) > $(ROUTER_LOG) 2>&1 &
+	$(Q)nohup env ORT_DYLIB_PATH=$(ORT_DYLIB_PATH) $(CORAL_ROUTER_BIN) start -c $(CORAL_ROUTER_CONFIG) > $(ROUTER_LOG) 2>&1 &
 	$(Q)bash $(ROUTER_WAIT_SCRIPT) $(CORAL_ROUTER_HEALTH_URL) $(ROUTER_START_TIMEOUT_S) $(ROUTER_LOG)
 
 .PHONY: router-mock
@@ -216,6 +234,52 @@ router-mock: ## Run the config-synced routing integration tests (intent -> model
 	$(stop-router)
 	$(Q)echo "Running config-synced routing integration tests (intent -> model_group)"
 	$(Q)cargo test -p fluent-router config_route_tests -- --nocapture
+
+.PHONY: router-ledger
+router-ledger: ## Boot with --ledger-default and assert LOD0+LOD5 eager + LOD4 from LOD0 only + cache hit (M4)
+	$(stop-router)
+	$(Q)echo "Running ledger LOD lifecycle tests (ledger-default)"
+	$(Q)CORAL_LEDGER_DEFAULT=1 cargo test -p fluent-router ledger -- --nocapture
+	$(Q)cargo test -p fluent-router ledger_golden -- --nocapture
+
+.PHONY: router-tree
+router-tree: ## Run config-synced routing tests against the tree config (M7)
+	$(stop-router)
+	$(Q)echo "Running tree config routing tests (flat vs tree equivalence)"
+	$(Q)cargo test -p fluent-router flat_tree -- --nocapture
+
+# ── YaGO Taxonomy + Async Parse-Review ───────────────────────────────────────
+# The interlingua spine (ROADMAP_20260826_INTERLINGUA_V2): the YaGO 4.5 class
+# registry feeds the boot reconciliation (one loader, two homes — coral graph +
+# router SqliteConceptStore), and the async review worker is the corrective
+# write path (corrections atomic with the ledger).
+
+.PHONY: yago-load
+yago-load: ## Operator action: download the full YaGO 4.5 taxonomy and regenerate the embedded class registry (tools/download_yago_taxonomy.sh → src/ontology/data/yago_classes.json)
+	$(Q)tools/download_yago_taxonomy.sh
+
+.PHONY: review-test
+review-test: ## Run the async parse-review + interlingua suites: spacy-rs review types, the router review worker + /v1/sessions/{id}/review-parse endpoints, and the ontology loader/reconciliation
+	$(Q)echo "Running parse-review + interlingua suites"
+	$(Q)cargo test -p spacy-rs review
+	$(Q)cargo test -p fluent-router server::review
+	$(Q)cargo test -p fluent-router review_parse
+	$(Q)cargo test -p guidance-ontology
+	$(Q)cargo test -p coral-router boot::
+
+# ── ONNX GPU Provider Check ────────────────────────────────────────────────
+# Diagnostic: reports whether the *linked* ONNX Runtime exposes the AMD ROCm
+# GPU (MIGraphX) execution provider — i.e. whether `execution_provider: "gpu"`
+# in env/coral-router.json will actually engage the GPU. The ort prebuilt
+# binaries ship no AMD GPU EP (the ROCm EP was removed upstream in ORT 1.23;
+# MIGraphX is its successor), so a CPU-only report is expected unless a
+# MIGraphX-enabled onnxruntime (an AMD ROCm build) is linked via ORT_LIB_PATH
+# (static) or ORT_DYLIB_PATH (load-dynamic) and the crate rebuilt. See
+# doc/fluent-onnx/ARCHITECTURE.md §Execution-provider selection.
+
+.PHONY: onnx-gpu-check
+onnx-gpu-check: ## Probe the linked onnxruntime for the AMD ROCm GPU (MIGraphX) EP; CPU-only means `execution_provider: "gpu"` fails open to CPU
+	$(Q)cargo test -p fluent-onnx --features live-ai --test live gpu_provider_available -- --ignored --nocapture
 
 # ── Per-Crate Test Targets ──────────────────────────────────────────────────
 # Run one crate's Tier-0/1/2 suite (unit + integration) WITHOUT enabling
@@ -231,7 +295,9 @@ TEST_CRATES := \
 	coral:coral-context \
 	guidance:guidance-core \
 	llm:fluent-llm \
-	macros:fluent-wvr-macros
+	macros:fluent-wvr-macros \
+	spacy:spacy-rs \
+	ort:fluent-onnx
 
 define test-crate-rule
 .PHONY: test-$(1)
@@ -251,7 +317,9 @@ $(foreach pair,$(TEST_CRATES),$(eval $(call test-crate-rule,$(firstword $(subst 
 LIVE_CRATES := \
 	router:fluent-router \
 	guidance:guidance-core \
-	llm:fluent-llm
+	llm:fluent-llm \
+	spacy:spacy-rs \
+	ort:fluent-onnx
 
 define live-crate-rule
 .PHONY: $(1)-test-live
@@ -275,12 +343,28 @@ test: ## Run unit tests across the Rust source in src
 	$(Q)cargo test --workspace
 
 .PHONY: lint
-lint: ## Run clippy across the Rust source in src on all .rs files
+lint: lint-vector ## Run clippy across the Rust source in src on all .rs files
 	$(Q)cargo clippy --workspace -- -D warnings
+
+.PHONY: lint-vector
+lint-vector: ## Consolidation guard: raw HNSW types contained; no re-export shims, no second threshold/error source, no fresh distance closures
+	$(Q)bin/vector-check.sh
+
+.PHONY: lint-llm-boundary
+lint-llm-boundary: ## LLM-boundary guard (ROADMAP_20260903_LLM M0.1): no new common_core LLM-leak imports, no domain imports in llm/common-core (advisory until M1–M8 green)
+	$(Q)bin/llm-boundary-check.sh
 
 .PHONY: lint-live-ai
 lint-live-ai: ## Hermeticity guard: every #[ignore] has a reason; no hermetic test dials a non-loopback host
 	$(Q)bin/live-ai-guard.sh
+
+.PHONY: lint-no-dup
+lint-no-dup: ## Guardrail: no bespoke ladder/retry/eviction duplicates outside canonical primitives (advisory)
+	@echo "Checking for bespoke ladder duplicates..."
+	@! grep -R "for.*ordered.*for.*backend.*matches" src/ --include="*.rs" | grep -v ladder | grep -v "first_accept" || (echo "FAIL: bespoke ordered ladder found"; exit 1)
+	@! grep -R "if let Ok.*keyword_search" src/coral --include="*.rs" | grep -v ladder | grep -v "first_accept" || (echo "FAIL: bespoke keyword_search ladder found"; exit 1)
+	@! grep -R "tokio::time::sleep.*retry" src/guidance src/coral --include="*.rs" | grep -v "retry_async" | grep -v "retry::" || (echo "FAIL: raw sleep retry loop found"; exit 1)
+	@echo "ok: no bespoke ladder/retry duplicates"
 
 .PHONY: health
 health: ## Run cargo tarpaulin and verify 85% coverage

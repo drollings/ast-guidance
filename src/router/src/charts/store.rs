@@ -12,10 +12,14 @@ use std::sync::RwLock;
 use common_core::registry::ConcurrentRegistry;
 use common_core::sync::{lock_read, lock_write};
 use fluent_db::error::DbError;
-use fluent_db::hnsw::HnswIndex;
+use fluent_db::hnsw::{HnswIndex, HnswIndexHandle};
 use fluent_db::store::SqliteStore;
+// Canonical vector-math import (M4: the search-vector math shim is deleted;
+// the owner `fluent_db::vector` is consumed directly).
+use fluent_db::vector::{
+    distance_to_similarity_clamped, knn_brute_force, scored_hits, try_bytes_to_vec, vec_to_bytes,
+};
 use fluent_llm::EmbeddingProvider;
-use search_vector::math::{knn_brute_force, try_bytes_to_vec, vec_to_bytes};
 
 use super::{ChartDef, ChartError};
 
@@ -83,13 +87,13 @@ pub struct ChartStore {
     /// Chart name → runtime health (draft/staleness/demotion state).
     health: RwLock<HashMap<String, ChartHealth>>,
     /// workflow_library HNSW index path handle.
-    index: Option<crate::hnsw::HnswIndexHandle>,
+    index: Option<HnswIndexHandle>,
     /// Built index (HNSW graph + embedder), if `build_index` succeeded.
     built: RwLock<Option<Arc<ChartIndex>>>,
 }
 
 impl ChartStore {
-    pub fn new(index: Option<crate::hnsw::HnswIndexHandle>) -> Self {
+    pub fn new(index: Option<HnswIndexHandle>) -> Self {
         Self {
             charts: ConcurrentRegistry::new(),
             health: RwLock::new(HashMap::new()),
@@ -321,7 +325,7 @@ impl ChartStore {
     }
 
     /// Borrow the workflow_library index handle, if configured.
-    pub fn index_handle(&self) -> Option<&crate::hnsw::HnswIndexHandle> {
+    pub fn index_handle(&self) -> Option<&HnswIndexHandle> {
         self.index.as_ref()
     }
 
@@ -372,6 +376,11 @@ impl ChartStore {
         // The workflow_library persistence file is a `fluent_db::SqliteStore`
         // (connection lifecycle, schema init); the in-memory retrieval graph
         // is a `fluent_db::hnsw::HnswIndex`.
+        //
+        // NOTE (M9 decision): single-connection `SqliteStore`, not
+        // `SqlitePool` — this is a boot-time index build (sync, single
+        // writer, no concurrent serving traffic), and the cached-embedding
+        // lookup composes the canonical `with_conn` + `db::query` helpers.
         let store = SqliteStore::open(path).map_err(|e| ChartError::Index {
             reason: format!("open workflow_library db {}: {e}", path.display()),
         })?;
@@ -481,27 +490,39 @@ impl ChartStore {
 
         // Cosine HNSW graph; brute force is the canonical fallback when the
         // graph is empty or returns nothing for this query.
-        let mut hits: Vec<(String, f32)> = index
-            .hnsw
-            .search(&query, k)
-            .into_iter()
-            .filter_map(|(d_id, distance)| {
-                index
-                    .ids
-                    .get(d_id)
-                    .map(|name| (name.clone(), (1.0 - distance).max(0.0)))
+        // M6: deliberately NOT routed through `AdaptiveHnsw` — this corpus is
+        // small and always-indexed; adding a brute-force dispatch gate here
+        // would be a behavior change (an extra path), so the store keeps
+        // always-probe. The dispatch policy measures [B] cost/recall at
+        // `ContentNodeStore` scale only.
+        // M5: the HNSW probe + id resolution is the shared
+        // `fluent_db::hnsw::hnsw_lookup` (`None` = fall back). The inserted
+        // key is the `ids` position, so the resolved key indexes `ids`
+        // exactly as the external id did. Similarity mapping, sort/truncate,
+        // and the demotion filter below stay call-site code.
+        let mut hits: Vec<(String, f32)> = fluent_db::hnsw::hnsw_lookup(&index.hnsw, &query, k)
+            .map(|resolved| {
+                scored_hits(resolved, distance_to_similarity_clamped)
+                    .into_iter()
+                    .filter_map(|(key, similarity)| {
+                        index.ids.get(key as usize).map(|name| (name.clone(), similarity))
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
         if hits.is_empty() {
             // Borrow the flat list — no full-candidate clone per query; only
             // the top-K names are materialized into `String`s below.
-            hits = knn_brute_force(
-                &query,
-                index.flat.iter().map(|(n, e)| (n.as_str(), e.as_slice())),
-                k,
+            hits = scored_hits(
+                knn_brute_force(
+                    &query,
+                    index.flat.iter().map(|(n, e)| (n.as_str(), e.as_slice())),
+                    k,
+                ),
+                distance_to_similarity_clamped,
             )
             .into_iter()
-            .map(|(name, d)| (name.to_string(), (1.0 - d).max(0.0)))
+            .map(|(name, similarity)| (name.to_string(), similarity))
             .collect();
         }
         hits.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -573,269 +594,6 @@ pub fn chart_from_str(json: &str) -> Result<ChartDef, ChartError> {
     })?;
     Ok(chart)
 }
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    fn seed_chart(name: &str, provides: &[&str]) -> String {
-        let provides: Vec<String> = provides.iter().map(|p| format!("\"{p}\"")).collect();
-        format!(
-            r#"{{
-                "name": "{name}",
-                "description": "seed chart {name}",
-                "schema_version": 1,
-                "author_model": "human",
-                "targets": [
-                    {{
-                        "name": "target_a",
-                        "provides": [{}],
-                        "template": "do {{{{ request }}}}",
-                        "essential": true
-                    }}
-                ]
-            }}"#,
-            provides.join(", ")
-        )
-    }
-
-    #[test]
-    fn load_dir_with_seeded_tempdir() {
-        let dir = TempDir::new().unwrap();
-        std::fs::write(
-            dir.path().join("alpha.json"),
-            seed_chart("alpha", &["a_out"]),
-        )
-        .unwrap();
-        std::fs::write(dir.path().join("beta.json"), seed_chart("beta", &["b_out"])).unwrap();
-
-        let store = ChartStore::new(None);
-        store.load_dir(dir.path()).unwrap();
-        assert_eq!(store.len(), 2);
-        assert!(store.get("alpha").is_some());
-        assert!(store.get("beta").is_some());
-    }
-
-    #[test]
-    fn empty_dir_yields_empty_store() {
-        let dir = TempDir::new().unwrap();
-        let store = ChartStore::new(None);
-        store.load_dir(dir.path()).unwrap();
-        assert!(store.is_empty());
-        assert!(store.list().is_empty());
-    }
-
-    #[test]
-    fn missing_dir_yields_empty_store() {
-        let missing = std::path::Path::new("/nonexistent/charts/dir");
-        let store = ChartStore::new(None);
-        store.load_dir(missing).unwrap();
-        assert!(store.is_empty());
-    }
-
-    #[test]
-    fn invalid_file_is_hard_error() {
-        let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("broken.json"), "not json at all").unwrap();
-        let store = ChartStore::new(None);
-        let err = store.load_dir(dir.path()).unwrap_err();
-        assert!(matches!(err, ChartError::Parse { .. }));
-    }
-
-    #[test]
-    fn invalid_chart_fails_validation_at_load() {
-        let dir = TempDir::new().unwrap();
-        // Missing schema_version + a target with no template.
-        std::fs::write(
-            dir.path().join("bad.json"),
-            r#"{
-                "name": "bad",
-                "description": "bad",
-                "schema_version": 1,
-                "author_model": "human",
-                "targets": [
-                    { "name": "t", "provides": ["x"], "template": "" }
-                ]
-            }"#,
-        )
-        .unwrap();
-        let store = ChartStore::new(None);
-        let err = store.load_dir(dir.path()).unwrap_err();
-        assert!(matches!(err, ChartError::Invalid { .. }));
-    }
-
-    #[test]
-    fn upsert_inserts_and_replaces() {
-        let store = ChartStore::new(None);
-        let chart: ChartDef = chart_from_str(&seed_chart("alpha", &["a_out"])).unwrap();
-        store.upsert(chart.clone()).unwrap();
-        assert_eq!(store.len(), 1);
-
-        let mut replaced = chart.clone();
-        replaced.description = "updated".into();
-        store.upsert(replaced.clone()).unwrap();
-        assert_eq!(store.len(), 1);
-        assert_eq!(store.get("alpha").unwrap().description, "updated");
-    }
-
-    #[test]
-    fn non_json_files_are_ignored() {
-        let dir = TempDir::new().unwrap();
-        std::fs::write(
-            dir.path().join("chart.json"),
-            seed_chart("alpha", &["a_out"]),
-        )
-        .unwrap();
-        std::fs::write(dir.path().join("README.md"), "not a chart").unwrap();
-        let store = ChartStore::new(None);
-        store.load_dir(dir.path()).unwrap();
-        assert_eq!(store.len(), 1);
-    }
-
-    #[test]
-    fn golden_loads_real_seed_dir() {
-        // Load the real env/workflows/charts seed directory (Appendix A).
-        let seed_dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../env/workflows/charts");
-        let store = ChartStore::new(None);
-        store.load_dir(&seed_dir).expect("seed dir loads");
-        assert_eq!(store.len(), 2, "expected exactly 2 seed charts");
-        let mut names = store.list();
-        names.sort_unstable();
-        assert_eq!(names, vec!["bug_triage", "draft_doc"]);
-    }
-
-    // ── Idempotent upsert + draft gate ─────────────────────────────
-
-    fn indexed_store() -> (ChartStore, tempfile::TempDir) {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let handle = crate::hnsw::HnswIndexHandle {
-            name: "workflow_library".into(),
-            path: tmp
-                .path()
-                .join("workflow_library.sqlite")
-                .display()
-                .to_string(),
-        };
-        let store = ChartStore::new(Some(handle));
-        let chart = chart_from_str(&seed_chart("alpha", &["a_out"])).unwrap();
-        store.upsert(chart).unwrap();
-        store
-            .build_index(Arc::new(crate::test_stubs::HashEmbedder::new(256)))
-            .expect("index builds");
-        (store, tmp)
-    }
-
-    #[test]
-    fn upsert_idempotent_inserts_unrelated_chart_as_draft() {
-        let (store, _tmp) = indexed_store();
-        let new_chart = chart_from_str(&seed_chart("omega", &["o_out"])).unwrap();
-        let outcome = store
-            .upsert_idempotent(new_chart, CHART_SUBSUME_THRESHOLD)
-            .unwrap();
-        assert_eq!(outcome, UpsertOutcome::Inserted);
-        // The auto-extracted chart is a draft: present but not selectable.
-        assert!(store.is_draft("omega"));
-        assert!(
-            !store.charts_sorted().iter().any(|c| c.name == "omega"),
-            "drafts must not be selectable until rubric-validated"
-        );
-    }
-
-    #[test]
-    fn upsert_idempotent_subsumes_near_neighbor() {
-        let (store, _tmp) = indexed_store();
-        // A near-duplicate of `alpha` (same description/target assets) must be
-        // folded into it, not stored twice. Threshold is deliberately below
-        // the crude HashEmbedder's measured near-duplicate cosine (~0.61) —
-        // the production `CHART_SUBSUME_THRESHOLD` targets real embeddings.
-        let mut dup = chart_from_str(&seed_chart("alpha_copy", &["a_out"])).unwrap();
-        dup.description = "seed chart alpha".into(); // identical doc text
-        let outcome = store.upsert_idempotent(dup, 0.5).unwrap();
-        match outcome {
-            UpsertOutcome::Subsumed { by } => assert_eq!(by, "alpha"),
-            other @ UpsertOutcome::Inserted => panic!("expected subsume, got {other:?}"),
-        }
-        assert_eq!(store.len(), 1, "near-neighbor dedup must not duplicate");
-        assert!(store.get("alpha").is_some());
-        assert!(store.is_draft("alpha"), "subsumed chart is a draft");
-    }
-
-    #[test]
-    fn upsert_idempotent_subsumed_name_keeps_library_selectable() {
-        let (store, _tmp) = indexed_store();
-        let mut dup = chart_from_str(&seed_chart("alpha_copy", &["a_out"])).unwrap();
-        dup.description = "seed chart alpha".into();
-        store.upsert_idempotent(dup, 0.5).unwrap();
-        // Even as a draft, the original human chart vanished (replaced).
-        // After a rubric-validated run it becomes selectable again.
-        store.record_rubric_result("alpha", true);
-        assert!(store.charts_sorted().iter().any(|c| c.name == "alpha"));
-    }
-
-    // ── Staleness / demotion policy ────────────────────────────────
-
-    #[test]
-    fn record_rubric_result_demotes_after_stale_fails() {
-        let (store, _tmp) = indexed_store();
-        for i in 0..crate::charts::CHART_STALE_FAILS {
-            let demoted = store.record_rubric_result("alpha", false);
-            if i + 1 < crate::charts::CHART_STALE_FAILS {
-                assert!(demoted.is_none(), "not yet demoted");
-                assert!(!store.is_demoted("alpha"));
-            } else {
-                assert_eq!(
-                    demoted.as_deref(),
-                    Some("alpha"),
-                    "crossing the threshold demotes the chart"
-                );
-            }
-        }
-        assert!(store.is_demoted("alpha"));
-        assert_eq!(store.demoted_charts(), vec!["alpha".to_string()]);
-        assert!(
-            !store.charts_sorted().iter().any(|c| c.name == "alpha"),
-            "demoted charts are no longer selected"
-        );
-    }
-
-    #[test]
-    fn record_rubric_result_resets_streak_on_success() {
-        let (store, _tmp) = indexed_store();
-        store.record_rubric_result("alpha", false);
-        store.record_rubric_result("alpha", false);
-        // A passing run resets the streak before it crosses the threshold.
-        store.record_rubric_result("alpha", true);
-        assert!(!store.is_demoted("alpha"));
-        assert_eq!(store.health("alpha").unwrap().stale_failures, 0);
-    }
-
-    #[test]
-    fn record_rubric_result_promotes_draft_on_pass() {
-        let (store, _tmp) = indexed_store();
-        let new_chart = chart_from_str(&seed_chart("omega", &["o_out"])).unwrap();
-        store
-            .upsert_idempotent(new_chart, CHART_SUBSUME_THRESHOLD)
-            .unwrap();
-        assert!(store.is_draft("omega"));
-        // One rubric-validated run promotes the draft to selectable.
-        store.record_rubric_result("omega", true);
-        assert!(!store.is_draft("omega"));
-        assert!(store.charts_sorted().iter().any(|c| c.name == "omega"));
-    }
-
-    #[test]
-    fn demoted_chart_is_also_absent_from_hnsw_search() {
-        let (store, _tmp) = indexed_store();
-        store.record_rubric_result("alpha", false);
-        store.record_rubric_result("alpha", false);
-        store.record_rubric_result("alpha", false);
-        assert!(store.is_demoted("alpha"));
-        let hits = store.search("alpha", 5).unwrap();
-        assert!(
-            hits.iter().all(|(n, _)| n != "alpha"),
-            "demoted chart must not surface via HNSW retrieval"
-        );
-    }
-}
+#[path = "../../tests/charts_store.rs"]
+mod tests;

@@ -85,7 +85,8 @@ pub async fn get(base_url: &str, path: &str, timeout_ms: u64) -> Result<reqwest:
 }
 
 /// Build a `RouterConfig` with a single `default` pipeline, a single `fast`
-/// model/route/group, and the given upstream + dispatch settings.
+/// model/route/group, and the given upstream + dispatch settings. The route
+/// comes from the classification tree (M3c: no flat authoring).
 pub fn make_config(
     endpoint: &str,
     stream: bool,
@@ -111,7 +112,14 @@ pub fn make_config(
             "retry_base_interval_s": 1
         }},
         "model_groups": {"fast": ["fast"]},
-        "routes": {"fast": {"group": "fast", "pipelines": ["default"]}},
+        "classification": {"root": {
+            "type": "classifier",
+            "description": "test router",
+            "model": "fast",
+            "children": [
+                {"key": "fast", "description": "test route", "node": {"type": "terminal", "route": "fast", "group": "fast"}}
+            ]
+        }},
         "default_route": "fast"
     });
     serde_json::from_value(value).expect("valid test config")
@@ -131,7 +139,7 @@ pub fn test_deps(
 ) -> ServerDeps {
     ServerDeps {
         pipelines,
-        routes: Arc::new(config.routes.clone()),
+        routes: Arc::new(config.routes_view()),
         models: Arc::new(config.models.clone()),
         stats: Arc::new(ServerStats::new()),
         max_payload: config.server.max_payload,
@@ -149,6 +157,12 @@ pub fn test_deps(
         api_key_env_name: None,
         supervisor: None,
         coordinator: None,
+        review_worker: None,
+        review_fetch: None,
+        entity_link_worker: None,
+        onnx: None,
+        fleet: None,
+        onnx_llm_backend: None,
     }
 }
 

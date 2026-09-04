@@ -92,7 +92,7 @@ impl WorkUnit for SimplePassStage {
         WorkOutput::typed(
             "passed",
             &StageDecision {
-                stage: PipelineStage::Router,
+                stage: PipelineStage::DeterministicPreFilter,
                 verdict: StageVerdict::Passed,
                 score: None,
                 reason: self.reason.clone(),

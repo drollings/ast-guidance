@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use std::collections::HashMap;
-
 use fluent_db::error::DbError;
 use fluent_types::ContentNode;
 use fluent_types::NodeId;
@@ -194,45 +192,20 @@ impl BatchIngestor {
         let pending_nodes = mapper.drain_nodes();
         let pending_edges = mapper.drain_edges();
 
-        // Build hash_id → node name map for edge resolution
-        let mut id_to_name: HashMap<i64, String> = HashMap::new();
-        for pn in &pending_nodes {
-            let cn = pn.to_content_node();
-            let name = cn.name.to_string();
-            if !name.is_empty() {
-                id_to_name.insert(pn.id, name);
-            }
-        }
-
-        let added = self.add_pending_nodes(pending_nodes)?;
-        self.stats.nodes_created += added;
+        // `flush` counts batch.len() against stats.nodes_created, so the
+        // returned `added` count is intentionally not added here again.
+        self.add_pending_nodes(pending_nodes)?;
 
         self.flush()?;
 
-        // Resolve hash-based IDs to SQLite NodeIds via one batch query instead
-        // of a per-edge name lookup.
-        let names: Vec<&str> = id_to_name.values().map(String::as_str).collect();
-        let name_to_sql_id = self.library.find_node_ids_by_names(&names)?;
-
-        // Insert edges: resolve hash-based IDs to SQLite NodeIds via node name lookup
+        // The hash_iri values ARE the NodeIds now: `PendingNode.id` /
+        // `PendingEdge.from_id|to_id` are content addresses, and
+        // `insert_nodes_batch` preserved them as the primary key (§4.2), so
+        // edges reference the hash ids directly — no id→name round-trip.
         for edge in &pending_edges {
-            let (Some(from_name), Some(to_name)) =
-                (id_to_name.get(&edge.from_id), id_to_name.get(&edge.to_id))
-            else {
-                self.stats.errors_skipped += 1;
-                continue;
-            };
-            let (Some(from_sql_id), Some(to_sql_id)) = (
-                name_to_sql_id.get(from_name).copied(),
-                name_to_sql_id.get(to_name).copied(),
-            ) else {
-                self.stats.errors_skipped += 1;
-                continue;
-            };
-            match self
-                .library
-                .insert_edge(from_sql_id, to_sql_id, &edge.predicate, 1.0)
-            {
+            let from = NodeId::from_int(edge.from_id);
+            let to = NodeId::from_int(edge.to_id);
+            match self.library.insert_edge(from, to, &edge.predicate, 1.0) {
                 Ok(()) => self.stats.edges_created += 1,
                 Err(_) => self.stats.errors_skipped += 1,
             }
@@ -246,6 +219,79 @@ impl BatchIngestor {
 mod tests {
     use super::*;
     use crate::tests::common::make_node;
+
+    /// A YaGO-style fragment: two classes joined by `rdfs:subClassOf`, each
+    /// with a label. Content addresses come from `hash_iri`.
+    const FRAGMENT: &str = "\
+<http://yago-knowledge.org/resource/Person> <http://www.w3.org/2000/01/rdf-schema#label> \"Person\" .
+<http://yago-knowledge.org/resource/Artist> <http://www.w3.org/2000/01/rdf-schema#label> \"Artist\" .
+<http://yago-knowledge.org/resource/Artist> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://yago-knowledge.org/resource/Person> .
+";
+
+    fn write_fragment(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("fragment.ttl");
+        std::fs::write(&path, FRAGMENT).expect("write fragment");
+        path
+    }
+
+    #[test]
+    fn ingest_fragment_is_content_addressed_and_idempotent() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let lib = Arc::new(Library::open_in_memory().expect("db"));
+        let mut ingestor = BatchIngestor::new(Arc::clone(&lib), 100);
+        let stats = ingestor
+            .ingest_file(&write_fragment(dir.path()))
+            .expect("first ingest");
+        assert_eq!(stats.nodes_created, 2);
+        assert_eq!(stats.edges_created, 1);
+
+        // Re-ingesting the same file is idempotent: no new rows, no duplicate
+        // edges (the content-addressed INSERT OR IGNORE + unique edge index).
+        let mut ingestor = BatchIngestor::new(Arc::clone(&lib), 100);
+        let stats = ingestor
+            .ingest_file(&write_fragment(dir.path()))
+            .expect("second ingest");
+        assert_eq!(stats.nodes_created, 2);
+        assert_eq!(stats.edges_created, 1);
+        assert_eq!(lib.node_count().expect("count"), 2);
+        assert_eq!(lib.edge_count().expect("count"), 1);
+    }
+
+    #[test]
+    fn ingest_edges_reference_hash_ids_and_traverse() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let lib = Arc::new(Library::open_in_memory().expect("db"));
+        let mut ingestor = BatchIngestor::new(Arc::clone(&lib), 100);
+        ingestor
+            .ingest_file(&write_fragment(dir.path()))
+            .expect("ingest");
+
+        // The stored node ids ARE the content addresses (hash_iri).
+        let artist = NodeId::from_int(guidance_rdf::normalize::hash_iri(
+            "http://yago-knowledge.org/resource/Artist",
+        ));
+        let person = NodeId::from_int(guidance_rdf::normalize::hash_iri(
+            "http://yago-knowledge.org/resource/Person",
+        ));
+        assert_eq!(lib.get_node(artist).expect("artist").expect("exists").id, Some(artist));
+        assert_eq!(lib.get_node(person).expect("person").expect("exists").id, Some(person));
+
+        // traverse_from follows the subClassOf edge: Artist → Person.
+        let hops = lib.traverse_from(artist, 1).expect("traverse");
+        let names: Vec<&str> = hops.iter().map(|g| g.name.as_str()).collect();
+        assert!(names.contains(&"Artist") && names.contains(&"Person"));
+
+        // The `is_a` CTE traverses `entity_types` × `entity_hierarchy`, both
+        // keyed by the content-addressed node ids (roadmap 7.5).
+        lib.insert_entity_type(artist, "http://yago-knowledge.org/resource/Artist")
+            .expect("type");
+        lib.insert_entity_hierarchy(
+            "http://yago-knowledge.org/resource/Artist",
+            "http://yago-knowledge.org/resource/Person",
+        )
+        .expect("hierarchy");
+        assert!(lib.is_a(artist, "http://yago-knowledge.org/resource/Person").expect("is_a"));
+    }
 
     #[test]
     fn test_batch_ingestor_buffers_then_flushes() {

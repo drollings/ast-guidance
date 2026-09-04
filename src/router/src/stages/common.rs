@@ -2,6 +2,26 @@
 
 use serde_json::{Map, Value};
 
+use crate::pipeline::RoutingTarget;
+use crate::pipeline_types::StageDecision;
+
+/// Typed handoff key for the `RoutingTarget` channel.
+pub const ROUTING_TARGET_TYPED_KEY: &str = "routing_target.typed";
+
+/// Publish a `RoutingTarget` to the typed `WorkContext` store (zero-copy).
+/// This is the single call site that hands a `RoutingTarget` to the
+/// orchestrator; producers return the target by value and the orchestrator
+/// publishes it here.
+#[allow(clippy::needless_pass_by_value)]
+pub fn publish_routing_target(
+    ctx: &mut fluent_wvr::WorkContext,
+    _decision: &mut StageDecision,
+    rt: RoutingTarget,
+) {
+    // Typed channel (the only channel).
+    ctx.set(ROUTING_TARGET_TYPED_KEY, rt);
+}
+
 use fluent_wvr::prelude::*;
 
 use crate::types::{RouterMessageContent, RouterRequest};
@@ -113,101 +133,6 @@ pub fn get_metadata_string(ctx: &WorkContext, key: &str) -> Option<String> {
         _ => None,
     })
 }
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::{ContentPart, ImageUrl, RouterMessage, RouterMessageContent};
-
-    fn make_ctx_with_messages(messages: Vec<RouterMessage>) -> WorkContext {
-        let request = RouterRequest {
-            model: "test".into(),
-            messages,
-            temperature: None,
-            max_tokens: None,
-            stream: None,
-            tools: None,
-            tool_choice: None,
-            session_id: None,
-            agent_id: None,
-            adapter: None,
-            instance: None,
-            snapshot: None,
-            id_slot: None,
-            metadata: Default::default(),
-        };
-        let mut ctx = WorkContext::default();
-        ctx.set_structured("request", &request);
-        ctx
-    }
-
-    #[test]
-    fn extracts_last_text_message() {
-        let ctx = make_ctx_with_messages(vec![
-            RouterMessage {
-                role: "user".into(),
-                content: RouterMessageContent::Text("earlier".into()),
-                tool_calls: None,
-                tool_call_id: None,
-            },
-            RouterMessage {
-                role: "assistant".into(),
-                content: RouterMessageContent::Text("response".into()),
-                tool_calls: None,
-                tool_call_id: None,
-            },
-            RouterMessage {
-                role: "user".into(),
-                content: RouterMessageContent::Text("latest".into()),
-                tool_calls: None,
-                tool_call_id: None,
-            },
-        ]);
-        assert_eq!(extract_user_message(&ctx).unwrap(), "latest");
-    }
-
-    #[test]
-    fn extracts_text_from_content_parts() {
-        let ctx = make_ctx_with_messages(vec![RouterMessage {
-            role: "user".into(),
-            content: RouterMessageContent::Parts(vec![
-                ContentPart::Text {
-                    text: "About this user:".into(),
-                },
-                ContentPart::ImageUrl {
-                    image_url: ImageUrl {
-                        url: "https://example.test/x.png".into(),
-                    },
-                },
-                ContentPart::Text {
-                    text: "Daniel".into(),
-                },
-            ]),
-            tool_calls: None,
-            tool_call_id: None,
-        }]);
-        assert_eq!(
-            extract_user_message(&ctx).unwrap(),
-            "About this user: Daniel"
-        );
-    }
-
-    #[test]
-    fn errors_when_no_user_message() {
-        let ctx = make_ctx_with_messages(vec![RouterMessage {
-            role: "system".into(),
-            content: RouterMessageContent::Text("sys".into()),
-            tool_calls: None,
-            tool_call_id: None,
-        }]);
-        let err = extract_user_message(&ctx).unwrap_err();
-        assert!(err.to_string().contains("no user message found"));
-    }
-
-    #[test]
-    fn errors_when_request_missing() {
-        let ctx = WorkContext::default();
-        let err = extract_user_message(&ctx).unwrap_err();
-        assert!(err.to_string().contains("missing request"));
-    }
-}
+#[path = "../../tests/stages_common.rs"]
+mod tests;

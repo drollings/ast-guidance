@@ -63,4 +63,5 @@ pub mod vector;
 pub mod wvr;
 
 #[cfg(all(test, feature = "sqlite"))]
+#[path = "../tests/mod.rs"]
 mod tests;

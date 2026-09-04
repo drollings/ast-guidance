@@ -43,7 +43,7 @@ impl super::Library {
             );",
         )?;
         self.store.with_conn(|conn| {
-            common_core::sqlite::init_embedding_cache(conn).map_err(DbError::from)?;
+            fluent_llm::embeddings_cache::init_embedding_cache(conn).map_err(DbError::from)?;
             common_core::sqlite::run_batch(
                 conn,
                 "CREATE INDEX IF NOT EXISTS idx_nodes_name_source
@@ -64,6 +64,8 @@ impl super::Library {
 
                 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_node_id);
                 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_node_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_unique
+                    ON edges(source_node_id, target_node_id, edge_type);
                 CREATE INDEX IF NOT EXISTS idx_nodes_name ON context_nodes(name);
                 CREATE INDEX IF NOT EXISTS idx_entity_types_node ON entity_types(node_id);
                 CREATE INDEX IF NOT EXISTS idx_entity_types_iri ON entity_types(type_iri);",

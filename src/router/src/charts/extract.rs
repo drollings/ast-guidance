@@ -49,6 +49,28 @@ pub struct ChartAuditTranscript {
     pub steps: Vec<ChartAuditStep>,
 }
 
+/// ROADMAP §12.7 (C7): adapt a `parse_review` ledger node into a
+/// [`ChartAuditStep`], so a session whose transcript chains `parse → review →
+/// dispatch` folds the review into [`ChartAuditTranscript`] and
+/// [`extract_chart_from_audit`] distils the whole chain as a draft chart.
+/// Returns `None` for any non-`parse_review` node.
+pub fn parse_review_step(node: &fluent_types::ContentNode) -> Option<ChartAuditStep> {
+    let meta = node.metadata.as_ref()?;
+    if meta.get("kind")?.as_str() != Some(crate::ledger::nlp::PARSE_REVIEW_KIND) {
+        return None;
+    }
+    let node_id = node.id?.as_int();
+    let source_node_id = meta.get("source_node_id")?.as_i64()?;
+    Some(ChartAuditStep {
+        id: format!("review:{node_id}"),
+        purpose: "parse review".into(),
+        prompt: meta.get("prompt")?.as_str()?.to_string(),
+        response: meta.get("corrections_json")?.as_str()?.to_string(),
+        depends_on: vec![format!("parse:{source_node_id}")],
+        provides: vec!["reviewed_parse".into()],
+    })
+}
+
 /// Best-effort deterministic reconstruction of a `ChartDef` from an audit
 /// transcript.
 ///
@@ -152,22 +174,27 @@ pub(crate) fn template_from_prompt(prompt: &str, query: &str) -> String {
     format!("{prompt}\nUser request: {{{{ request }}}}")
 }
 
+/// Slug options reproducing [`slugify_chart_name`] byte-for-byte (P4).
+/// Domain constant: stays router-side, composed over
+/// `common_core::string::slugify_with`.
+pub const CHART_SLUG_OPTIONS: common_core::string::SlugOptions =
+    common_core::string::SlugOptions {
+        ascii_only: true,
+        separator: '_',
+        collapse_runs: true,
+        trim_leading: false,
+        trim_trailing: true,
+        max_chars: Some(super::CHART_EXTRACTED_NAME_MAX_CHARS),
+    };
+
 /// Slugify a query into a valid chart name: lowercase alphanumerics and
 /// `_`/`-` only, truncated to `CHART_EXTRACTED_NAME_MAX_CHARS`.
+///
+/// Thin wrapper over `common_core::string::slugify_with` with
+/// [`CHART_SLUG_OPTIONS`] (parity locked by
+/// `slugify_chart_name_characterization_table`).
 pub fn slugify_chart_name(query: &str) -> String {
-    let mut out = String::with_capacity(query.len());
-    for c in query.chars().map(|c| c.to_ascii_lowercase()) {
-        if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
-            out.push(c);
-        } else if !out.is_empty() && !out.ends_with('_') {
-            out.push('_');
-        }
-    }
-    while out.ends_with('_') {
-        out.pop();
-    }
-    out.truncate(super::CHART_EXTRACTED_NAME_MAX_CHARS);
-    out
+    common_core::string::slugify_with(query, &CHART_SLUG_OPTIONS)
 }
 
 /// Build the audit-shaped transcript for a single successful dispatch
@@ -310,248 +337,6 @@ impl WorkflowExtractor {
         }
     }
 }
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::charts::store::ChartStore;
-
-    fn transcript() -> ChartAuditTranscript {
-        ChartAuditTranscript {
-            query: "Draft a release plan for the v2 API".into(),
-            author_model: "claude-4".into(),
-            steps: vec![
-                ChartAuditStep {
-                    id: "plan".into(),
-                    purpose: "outline the release steps".into(),
-                    prompt: "Draft a release plan for the v2 API: list phases and owners.".into(),
-                    response: "Phase 1: ...".into(),
-                    depends_on: vec![],
-                    provides: vec!["release_plan".into()],
-                },
-                ChartAuditStep {
-                    id: "verify".into(),
-                    purpose: "check the plan is complete".into(),
-                    prompt: "Given the release plan, verify it covers rollback.".into(),
-                    response: "Add rollback step.".into(),
-                    depends_on: vec!["plan".into()],
-                    provides: vec!["verified_plan".into()],
-                },
-            ],
-        }
-    }
-
-    #[test]
-    fn extracts_valid_chart_from_transcript() {
-        let chart = extract_chart_from_audit(&transcript()).expect("extracts");
-        chart.validate().expect("draft validates");
-        assert_eq!(chart.author_model, "claude-4");
-        assert_eq!(chart.targets.len(), 2);
-        assert_eq!(chart.targets[0].name, "plan");
-        assert_eq!(chart.targets[1].name, "verify");
-        // depends_on edge becomes a Capability dep on the upstream step id.
-        match &chart.targets[1].depends[0] {
-            DepSpec::Capability { name } => assert_eq!(name, "plan"),
-            other @ DepSpec::EntityMatch { .. } => panic!("expected capability dep, got {other:?}"),
-        }
-        // The query text in the prompt is replaced with {{ request }}.
-        assert!(chart.targets[0].template.contains("{{ request }}"));
-        assert!(!chart.targets[0].template.contains("v2 API"));
-    }
-
-    #[test]
-    fn empty_query_is_rejected() {
-        let mut t = transcript();
-        t.query = "!!".into();
-        let err = extract_chart_from_audit(&t).unwrap_err();
-        assert!(matches!(err, ChartError::Invalid { .. }));
-    }
-
-    #[test]
-    fn no_steps_is_rejected() {
-        let mut t = transcript();
-        t.steps.clear();
-        let err = extract_chart_from_audit(&t).unwrap_err();
-        assert!(matches!(err, ChartError::Invalid { .. }));
-    }
-
-    #[test]
-    fn prompt_without_query_appends_request() {
-        let t = template_from_prompt("Produce a checklist.", "write a checklist");
-        assert!(t.contains("{{ request }}"));
-        assert!(t.contains("Produce a checklist."));
-    }
-
-    #[test]
-    fn prompt_repeating_the_query_replaces_only_first_occurrence() {
-        // Only the *first* occurrence is substituted; a prompt that repeats
-        // the query leaves later occurrences literal.
-        let t = template_from_prompt(
-            "write a checklist for write a checklist",
-            "write a checklist",
-        );
-        assert_eq!(t, "{{ request }} for write a checklist");
-    }
-
-    #[test]
-    fn slugify_normalizes_and_truncates() {
-        assert_eq!(slugify_chart_name("Hello, World!"), "hello_world");
-        assert_eq!(
-            slugify_chart_name("  multiple   spaces  "),
-            "multiple_spaces"
-        );
-        assert_eq!(slugify_chart_name("already-kebab"), "already-kebab");
-        assert!(
-            slugify_chart_name(&"a".repeat(200)).len()
-                <= super::super::CHART_EXTRACTED_NAME_MAX_CHARS
-        );
-    }
-
-    #[test]
-    fn every_target_self_provides_its_id() {
-        let mut t = transcript();
-        for step in &mut t.steps {
-            step.provides.clear();
-        }
-        let chart = extract_chart_from_audit(&t).expect("extracts");
-        // The DependencySession self-provide convention keeps the draft
-        // selectable even when the transcript records no explicit provides.
-        for target in &chart.targets {
-            assert!(
-                target.provides.iter().any(|p| p == &target.name),
-                "target '{}' must self-provide its id: {:?}",
-                target.name,
-                target.provides
-            );
-        }
-    }
-
-    // ── WorkflowExtractor (dispatch post-processing hook) ───────────
-
-    #[test]
-    fn transcript_from_dispatch_produces_single_step() {
-        let t = transcript_from_dispatch(
-            "write a release plan",
-            "system: You are a planner.\nuser: write a release plan",
-            "claude-4",
-            "Phase 1: ...",
-        );
-        assert_eq!(t.query, "write a release plan");
-        assert_eq!(t.author_model, "claude-4");
-        assert_eq!(t.steps.len(), 1);
-        assert_eq!(t.steps[0].id, "solve");
-        // LOD0 fidelity: the step prompt is the real prompt that was
-        // sent to the model — no synthesized "Solve the following request…"
-        // wrapper.
-        assert_eq!(
-            t.steps[0].prompt,
-            "system: You are a planner.\nuser: write a release plan"
-        );
-        assert!(!t.steps[0].prompt.contains("Solve the following request"));
-        let chart = extract_chart_from_audit(&t).expect("extracts");
-        assert!(
-            chart.targets[0].template.contains("{{ request }}"),
-            "query text must become a request placeholder"
-        );
-        // The template captures the real LOD0 prompt shape: the system line
-        // is preserved verbatim, only the query is substituted.
-        assert_eq!(
-            chart.targets[0].template,
-            "system: You are a planner.\nuser: {{ request }}"
-        );
-    }
-
-    #[test]
-    fn extractor_disabled_is_a_noop() {
-        let store = Arc::new(ChartStore::new(None));
-        let extractor = WorkflowExtractor::new(store.clone());
-        let outcome = extractor
-            .extract_from_transcript(&transcript())
-            .expect("disabled extraction never fails");
-        assert!(outcome.is_none());
-        assert!(store.is_empty(), "disabled extractor must not write charts");
-    }
-
-    #[test]
-    fn extractor_enabled_writes_draft_chart() {
-        let store = Arc::new(ChartStore::new(None));
-        let extractor = WorkflowExtractor::new(store.clone()).enabled(true);
-        let outcome = extractor
-            .extract_from_transcript(&transcript())
-            .expect("extracts")
-            .expect("enabled extractor writes");
-        assert_eq!(outcome, UpsertOutcome::Inserted);
-        assert_eq!(store.len(), 1);
-        let name = slugify_chart_name(&transcript().query);
-        assert!(
-            store.get(&name).is_some(),
-            "draft chart stored under its slug"
-        );
-        assert!(store.is_draft(&name), "extracted chart is a draft");
-    }
-
-    #[test]
-    fn extractor_record_success_swallows_extraction_failure() {
-        // A query that slugs to nothing must not panic or propagate — the
-        // request already succeeded and the learning loop is best-effort.
-        // `is_fallback = true` so the extraction is attempted under the
-        // default `Frontier` mode (the swallow path is what we test).
-        let store = Arc::new(ChartStore::new(None));
-        let extractor = WorkflowExtractor::new(store.clone()).enabled(true);
-        extractor.record_success("!!!", "user: !!!", "claude-4", "some answer", true);
-        assert!(store.is_empty());
-    }
-
-    // ── Extraction scope (frontier-assisted only by default) ────────
-
-    #[test]
-    fn frontier_mode_skips_primary_dispatch() {
-        let store = Arc::new(ChartStore::new(None));
-        let extractor = WorkflowExtractor::new(store.clone()).enabled(true);
-        extractor.record_success(
-            "write a release plan",
-            "user: write a release plan",
-            "claude-4",
-            "Phase 1: ...",
-            false,
-        );
-        assert!(
-            store.is_empty(),
-            "a primary-target success must not be distilled under Frontier mode"
-        );
-    }
-
-    #[test]
-    fn frontier_mode_extracts_fallback_dispatch() {
-        let store = Arc::new(ChartStore::new(None));
-        let extractor = WorkflowExtractor::new(store.clone()).enabled(true);
-        extractor.record_success(
-            "write a release plan",
-            "user: write a release plan",
-            "claude-4",
-            "Phase 1: ...",
-            true,
-        );
-        assert_eq!(store.len(), 1, "a fallback dispatch is distilled");
-    }
-
-    #[test]
-    fn all_mode_preserves_blanket_extraction() {
-        let store = Arc::new(ChartStore::new(None));
-        let extractor = WorkflowExtractor::new(store.clone())
-            .enabled(true)
-            .with_extraction_mode(WorkflowExtractionMode::All);
-        extractor.record_success(
-            "write a release plan",
-            "user: write a release plan",
-            "claude-4",
-            "Phase 1: ...",
-            false,
-        );
-        assert_eq!(
-            store.len(),
-            1,
-            "mode \"all\" keeps distilling primary-target successes"
-        );
-    }
-}
+#[path = "../../tests/charts_extract.rs"]
+mod tests;

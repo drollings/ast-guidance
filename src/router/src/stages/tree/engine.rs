@@ -12,6 +12,7 @@ use fluent_llm::ChatMessage;
 use fluent_wvr::prelude::*;
 use regex::Regex;
 
+use crate::config::classification::InterlinguaMatch;
 use crate::config::filters::FilterOutcome;
 use crate::config::{ClassificationNode, ClassificationTree, RoutingConfig};
 use crate::pipeline::RoutingTarget;
@@ -67,12 +68,29 @@ impl ClassificationEngine {
     }
 
     /// Evaluate the whole tree against the user message and produce the final
-    /// classifier `StageDecision`.
-    pub fn evaluate(&self, user_text: &str) -> Result<TreeEvaluation, WorkError> {
+    /// classifier `StageDecision`. `interlingua` is the `NlpStage` handoff
+    /// (ROADMAP §14.6, C6): when present, `Filter` nodes with
+    /// `match_interlingua` dispatch deterministically on the parse's ids.
+    /// `route_hints` is the overlay stage's handoff (ROADMAP_20260827_ORT
+    /// §2.6): scored route recommendations appended to classifier-node LLM
+    /// context as deterministic routing context.
+    pub fn evaluate(
+        &self,
+        user_text: &str,
+        interlingua: Option<&[spacy_rs::routing::InterlinguaSignal]>,
+        route_hints: Option<&[crate::pipeline_types::RouteHint]>,
+    ) -> Result<TreeEvaluation, WorkError> {
         let mut visited: Vec<StageDecision> = Vec::new();
         let siblings = HashMap::new();
-        let outcome =
-            self.evaluate_node(&self.tree.root, &siblings, user_text, None, &mut visited)?;
+        let outcome = self.evaluate_node(
+            &self.tree.root,
+            &siblings,
+            user_text,
+            interlingua,
+            route_hints,
+            None,
+            &mut visited,
+        )?;
 
         for d in &visited {
             crate::audit::emit(
@@ -85,8 +103,11 @@ impl ClassificationEngine {
             );
         }
 
-        let decision = final_decision(outcome, visited);
-        Ok(TreeEvaluation { decision })
+        let handoff = final_decision(outcome, visited);
+        Ok(TreeEvaluation {
+            decision: handoff.decision,
+            target: handoff.target,
+        })
     }
 
     fn evaluate_node(
@@ -94,6 +115,8 @@ impl ClassificationEngine {
         node: &ClassificationNode,
         siblings: &HashMap<String, ClassificationNode>,
         user_text: &str,
+        interlingua: Option<&[spacy_rs::routing::InterlinguaSignal]>,
+        route_hints: Option<&[crate::pipeline_types::RouteHint]>,
         complexity: Option<u8>,
         visited: &mut Vec<StageDecision>,
     ) -> Result<TreeOutcome, WorkError> {
@@ -112,12 +135,15 @@ impl ClassificationEngine {
                 children,
                 node,
                 user_text,
+                interlingua,
+                route_hints,
                 visited,
             ),
             ClassificationNode::Terminal {
                 route,
                 group,
                 description,
+                ..
             } => Ok(self.evaluate_terminal(
                 route,
                 group.as_deref(),
@@ -131,19 +157,29 @@ impl ClassificationEngine {
                 patterns,
                 outcome,
                 redirect_to,
+                match_interlingua,
             } => self.evaluate_filter(
                 description,
                 patterns,
+                match_interlingua.as_ref(),
                 outcome,
                 redirect_to.as_deref(),
                 siblings,
                 user_text,
+                interlingua,
+                route_hints,
                 complexity,
                 visited,
             ),
-            ClassificationNode::Fallback { node, .. } => {
-                self.evaluate_node(node, siblings, user_text, complexity, visited)
-            }
+            ClassificationNode::Fallback { node, .. } => self.evaluate_node(
+                node,
+                siblings,
+                user_text,
+                interlingua,
+                route_hints,
+                complexity,
+                visited,
+            ),
         }
     }
 
@@ -159,6 +195,8 @@ impl ClassificationEngine {
         children: &[crate::config::ClassificationChild],
         node: &ClassificationNode,
         user_text: &str,
+        interlingua: Option<&[spacy_rs::routing::InterlinguaSignal]>,
+        route_hints: Option<&[crate::pipeline_types::RouteHint]>,
         visited: &mut Vec<StageDecision>,
     ) -> Result<TreeOutcome, WorkError> {
         // Deterministic filter children short-circuit before any LLM call.
@@ -168,7 +206,15 @@ impl ClassificationEngine {
             .collect();
         for child in children {
             if let ClassificationNode::Filter { .. } = child.node {
-                match self.evaluate_node(&child.node, &siblings, user_text, None, visited)? {
+                match self.evaluate_node(
+                    &child.node,
+                    &siblings,
+                    user_text,
+                    interlingua,
+                    route_hints,
+                    None,
+                    visited,
+                )? {
                     TreeOutcome::Pass => {}
                     other => return Ok(other),
                 }
@@ -190,7 +236,7 @@ impl ClassificationEngine {
             return Ok(TreeOutcome::Reject(reason));
         };
 
-        let verdict = match self.call_classifier(model, &prompt, user_text) {
+        let verdict = match self.call_classifier(model, &prompt, user_text, route_hints) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
@@ -207,7 +253,7 @@ impl ClassificationEngine {
                         format!("classifier LLM error, falling back: {e}"),
                         serde_json::json!({ "model": model, "route": fb.key }),
                     ));
-                    return self.evaluate_node(&fb.node, &siblings, user_text, None, visited);
+                    return self.evaluate_node(&fb.node, &siblings, user_text, interlingua, route_hints, None, visited);
                 }
                 let reason = format!("classifier LLM error: {e}");
                 visited.push(node_decision(
@@ -271,6 +317,8 @@ impl ClassificationEngine {
                     &child.node,
                     &siblings,
                     user_text,
+                    interlingua,
+                    route_hints,
                     Some(verdict.complexity),
                     visited,
                 );
@@ -300,6 +348,8 @@ impl ClassificationEngine {
                 &fb.node,
                 &siblings,
                 user_text,
+                interlingua,
+                route_hints,
                 Some(verdict.complexity),
                 visited,
             );
@@ -436,14 +486,19 @@ impl ClassificationEngine {
             .iter()
             .filter(|k| {
                 self.routing
-                    .models
-                    .get(*k)
+                    .entry_for_key(k)
                     .is_some_and(|m| m.intelligence >= min_complexity.unwrap_or(0))
             })
             .collect();
         let cheapest = |a: &&String, b: &&String| {
-            let ca = self.routing.models.get(*a).map_or(f64::MAX, cost);
-            let cb = self.routing.models.get(*b).map_or(f64::MAX, cost);
+            let ca = self
+                .routing
+                .entry_for_key(a)
+                .map_or(f64::MAX, |m| m.cost_input + m.cost_output);
+            let cb = self
+                .routing
+                .entry_for_key(b)
+                .map_or(f64::MAX, |m| m.cost_input + m.cost_output);
             ca.partial_cmp(&cb).unwrap_or(std::cmp::Ordering::Equal)
         };
         let entry_key = if candidates.is_empty() {
@@ -451,57 +506,83 @@ impl ClassificationEngine {
         } else {
             candidates.into_iter().min_by(cheapest)?
         };
-        let entry = self.routing.models.get(entry_key)?;
-        let name = entry.name.clone().unwrap_or_else(|| entry_key.clone());
-        let mut rt = RoutingTarget::from_model_entry(&name, entry);
+        let mut rt = self.routing.target_for_key(entry_key)?;
         rt.group = Some(group.to_string());
         rt.target_name = Some(route.to_string());
         Some((rt, None))
     }
 
-    /// Filter node: deterministic short-circuit over the user message.
+    /// Filter node: deterministic short-circuit over the user message. With
+    /// `match_interlingua` set, dispatches on the request's parsed ids instead
+    /// of regexes (ROADMAP §14.6, C6) — same phrasing → same ids → same route,
+    /// zero tokens. When `interlingua` is `None` (NLP stage absent) an
+    /// interlingua filter is a non-match → Pass (graceful degradation,
+    /// identical to an invalid regex).
+    #[allow(clippy::too_many_arguments)]
     fn evaluate_filter(
         &self,
         description: &str,
         patterns: &[String],
+        match_interlingua: Option<&InterlinguaMatch>,
         outcome: &FilterOutcome,
         redirect_to: Option<&str>,
         siblings: &HashMap<String, ClassificationNode>,
         user_text: &str,
+        interlingua: Option<&[spacy_rs::routing::InterlinguaSignal]>,
+        route_hints: Option<&[crate::pipeline_types::RouteHint]>,
         complexity: Option<u8>,
         visited: &mut Vec<StageDecision>,
     ) -> Result<TreeOutcome, WorkError> {
-        if patterns.is_empty() {
-            visited.push(node_decision(
-                "filter",
-                description,
-                StageVerdict::Passed,
-                "filter has no patterns — passing through".into(),
-                serde_json::json!({}),
-            ));
-            return Ok(TreeOutcome::Pass);
-        }
-
-        let matched = patterns.iter().any(|p| {
-            Regex::new(p).map_or_else(
-                |e| {
-                    tracing::warn!(
-                        target: "router.pipeline.stage2.tree",
-                        pattern = %p,
-                        error = %e,
-                        "invalid filter regex — treated as non-match",
-                    );
-                    false
-                },
-                |re| re.is_match(user_text),
-            )
-        });
+        let matched = if let Some(m) = match_interlingua {
+            // Interlingua dispatch: AND of the set fields across any sentence,
+            // gated by the sentence confidence floor. `confidence_min` is
+            // fail-closed: a sentence whose parse carried no confidence is
+            // treated as below the floor (low-confidence parses escalate).
+            interlingua.is_some_and(|signals| {
+                signals.iter().any(|s| {
+                    m.predicate_id.is_none_or(|p| s.predicate_id == Some(p))
+                        && m.subject_id.is_none_or(|s_| s.subject_id == Some(s_))
+                        && m.object_id.is_none_or(|o| s.direct_object_id == Some(o))
+                        && m.confidence_min
+                            .is_none_or(|min| s.confidence.unwrap_or(0.0) >= min)
+                })
+            })
+        } else {
+            if patterns.is_empty() {
+                visited.push(node_decision(
+                    "filter",
+                    description,
+                    StageVerdict::Passed,
+                    "filter has no patterns — passing through".into(),
+                    serde_json::json!({}),
+                ));
+                return Ok(TreeOutcome::Pass);
+            }
+            patterns.iter().any(|p| {
+                Regex::new(p).map_or_else(
+                    |e| {
+                        tracing::warn!(
+                            target: "router.pipeline.stage2.tree",
+                            pattern = %p,
+                            error = %e,
+                            "invalid filter regex — treated as non-match",
+                        );
+                        false
+                    },
+                    |re| re.is_match(user_text),
+                )
+            })
+        };
         if !matched {
             visited.push(node_decision(
                 "filter",
                 description,
                 StageVerdict::Passed,
-                "filter did not match — passing through".into(),
+                if match_interlingua.is_some() {
+                    "interlingua filter did not match — passing through".into()
+                } else {
+                    "filter did not match — passing through".into()
+                },
                 serde_json::json!({}),
             ));
             return Ok(TreeOutcome::Pass);
@@ -529,7 +610,7 @@ impl ClassificationEngine {
                             format!("soft redirect to '{target}'"),
                             serde_json::json!({ "outcome": "soft_redirect", "redirect_to": target }),
                         ));
-                        return self.evaluate_node(node, siblings, user_text, complexity, visited);
+                        return self.evaluate_node(node, siblings, user_text, interlingua, route_hints, complexity, visited);
                     }
                     tracing::warn!(
                         target: "router.pipeline.stage2.tree",
@@ -563,16 +644,26 @@ impl ClassificationEngine {
 
     /// One classifier LLM call: build messages from the auto-constructed
     /// prompt, run through the shared limiter, and parse the three-axis verdict.
+    /// `route_hints` (the overlay handoff) is appended to the system message as
+    /// deterministic routing context (ROADMAP_20260827_ORT §2.6).
     fn call_classifier(
         &self,
         model: &str,
         prompt: &str,
         user_text: &str,
+        route_hints: Option<&[crate::pipeline_types::RouteHint]>,
     ) -> Result<TreeClassifierVerdict, WorkError> {
+        let mut system = prompt.to_string();
+        if let Some(hints) = route_hints.filter(|h| !h.is_empty()) {
+            system.push('\n');
+            system.push_str(
+                &crate::stages::classifier::ClassifierStage::route_hints_prompt_context(hints),
+            );
+        }
         let messages = vec![
             ChatMessage {
                 role: "system".into(),
-                content: prompt.to_string(),
+                content: system,
             },
             ChatMessage {
                 role: "user".into(),

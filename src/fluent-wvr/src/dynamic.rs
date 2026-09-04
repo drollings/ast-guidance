@@ -27,6 +27,7 @@ use crate::{impl_component, WorkUnit};
 pub type DynamicExecutor =
     Arc<dyn Fn(&WorkContext, &HashMap<String, String>) -> Result<WorkOutput, WorkError> + Send + Sync>;
 
+/// Compatibility surface (scaffold) — see ROADMAP_20260901_FIXES_4.md M0
 /// A runtime-assembled `Component`.
 ///
 /// Fields are stored in an interior `Mutex<HashMap<String, String>>` so
@@ -34,6 +35,8 @@ pub type DynamicExecutor =
 /// `field_names` returns the declared schema keys; unknown keys are still
 /// storable (the map is open-ended) but are reported as config entries in
 /// `describe`.
+#[doc(hidden)]
+#[allow(dead_code)]
 pub struct DynamicComponent {
     name: ArcIntern<str>,
     depends: Vec<ArcIntern<str>>,
@@ -141,64 +144,3 @@ impl WorkUnit for DynamicComponent {
 }
 
 impl_component!(DynamicComponent);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::component_downcast_ref;
-    use crate::prelude::*;
-
-    fn echo_executor(
-        _ctx: &WorkContext,
-        config: &HashMap<String, String>,
-    ) -> Result<WorkOutput, WorkError> {
-        let retries = config.get("retries").cloned().unwrap_or_default();
-        Ok(WorkOutput::ok_with_data(
-            format!("configured retries={retries}"),
-            serde_json::json!({ "retries": retries }),
-        ))
-    }
-
-    #[test]
-    fn assembles_and_executes_from_config_map() {
-        let mut comp = DynamicComponent::new(
-            "db.tool",
-            Arc::new(echo_executor) as DynamicExecutor,
-        )
-        .with_field_keys(&["retries", "timeout_ms"]);
-
-        comp.set_field("retries", "3").unwrap();
-        assert_eq!(comp.get_field("retries").unwrap(), "3");
-        assert_eq!(comp.field_names(), &["retries", "timeout_ms"]);
-
-        let ctx = WorkContext::default();
-        let out = comp.execute(&ctx).unwrap();
-        assert!(out.success);
-        assert_eq!(out.data["retries"], "3");
-    }
-
-    #[test]
-    fn unknown_field_errors_on_get() {
-        let comp = DynamicComponent::new(
-            "db.tool",
-            Arc::new(echo_executor) as DynamicExecutor,
-        );
-        assert!(matches!(
-            comp.get_field("missing"),
-            Err(FieldError::NotFound(_))
-        ));
-    }
-
-    #[test]
-    fn erases_to_uniform_handle() {
-        let comp = DynamicComponent::new(
-            "db.tool",
-            Arc::new(echo_executor) as DynamicExecutor,
-        );
-        let handle: Arc<dyn Component> = Arc::new(comp);
-        let ctx = WorkContext::default();
-        assert!(handle.execute(&ctx).is_ok());
-        assert!(handle.describe().get("type").is_some());
-        assert!(component_downcast_ref::<DynamicComponent>(&*handle).is_some());
-    }
-}

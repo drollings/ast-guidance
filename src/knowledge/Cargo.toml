@@ -1,4 +1,6 @@
 [package]
+autotests = false
+autobenches = false
 name = "fluent-knowledge"
 version.workspace = true
 edition.workspace = true

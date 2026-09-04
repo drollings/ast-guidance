@@ -1,9 +1,0 @@
-{
-  "meta": {
-    "module": "src.vector.root",
-    "source": "src/vector/root.zig",
-    "language": "zig"
-  },
-  "comment": " guidance vector module — cosine search, embeddings, hybrid merge.",
-  "used_by": ["src/vector/vector_db.zig", "src/vector/vector_db_tests.zig"]
-}

@@ -2,6 +2,7 @@
 name = "fluent-concurrency"
 version.workspace = true
 edition.workspace = true
+autotests = false
 
 [features]
 default = ["db"]
@@ -22,6 +23,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
 common-core = { path = "../common-core" }
+lru = { workspace = true }
 fastrand = { workspace = true }
 internment = { workspace = true, features = ["arc", "serde"] }
 futures-util = { workspace = true }

@@ -39,12 +39,11 @@ use std::time::{Duration, Instant};
 
 use common_core::string::contains_ignore_case;
 use common_core::LatencyHistogram;
-use fluent_concurrency::llm_queue::LlmQueueConfig;
 use fluent_concurrency::pool::Limiter;
 use fluent_concurrency::scope::Scope;
 use fluent_concurrency::tokio_runtime;
 use fluent_llm::llm_queue::build_default_queue;
-use fluent_llm::{strip_think_block, ChatMessage, LlmClient, LlmConfig, LlmRequestQueue};
+use fluent_llm::{strip_think_block, ChatMessage, LlmClient, LlmConfig, LlmQueueConfig, LlmRequestQueue};
 use fluent_types::{GuidanceDoc, MemberType, StageKind};
 use guidance_core::ast_parser;
 use guidance_core::config::ProjectConfig;

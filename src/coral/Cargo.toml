@@ -2,6 +2,7 @@
 name = "coral-context"
 version.workspace = true
 edition.workspace = true
+autotests = false
 
 [features]
 default = []

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "xtask",
     "src/fluent-wvr",
     "src/fluent-wvr-macros",
     "src/fluent-wvr-testutil",
@@ -24,10 +25,12 @@ members = [
     "src/bin/coral-router",
     "src/bin/yamake-coral",
     "src/db",
+    "src/spacy-rs",
+    "src/fluent-onnx",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [workspace.dependencies]
@@ -89,6 +92,23 @@ httpmock = "0.7"
 # Randomness
 fastrand = "2"
 
+# ONNX / tokenizers (fluent-onnx). `ort` is the safe ONNX Runtime wrapper; the
+# onnxruntime prebuilt binaries are fetched at build time via its
+# `download-binaries` feature. `tokenizers` (HuggingFace) supplies the LFM
+# tokenizer with char-offset output. Both are pinned here so every consumer
+# builds the same version.
+#
+# `migraphx` enables `ort::ep::MIGraphX` — the AMD ROCm GPU execution provider
+# (successor to the ROCm EP removed upstream in ORT 1.23) that the session
+# loader uses for `execution_provider: "gpu"`. `load-dynamic` makes ort load the
+# system onnxruntime dylib at runtime (via `ORT_DYLIB_PATH`, else
+# `libonnxruntime.so`), which is how the MIGraphX-enabled ORT 1.28 build at
+# `/lib64/libonnxruntime.so.1.28.0` is linked in for GPU inference; it also
+# disables the CPU-prebuilt download, so the loader probes the linked runtime at
+# load time and fails open to CPU with a loud warning when MIGraphX is absent.
+ort = { version = "2.0.0-rc.13", features = ["migraphx", "load-dynamic"] }
+tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
+
 # Macros
 syn = { version = "2", features = ["full"] }
 quote = "1"
@@ -103,6 +123,9 @@ memmap2 = "0.9"
 fs2 = "0.4"
 time = "0.3"
 regex = "1"
+# Lookbehind-capable regex engine for the tokenizer's affix patterns
+# (spacy/lang/punctuation.py uses `(?<=...)`), pure Rust, no unsafe.
+fancy-regex = "0.14"
 dashmap = "6"
 lru = "0.13"
 which = "4"

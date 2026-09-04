@@ -15,8 +15,9 @@ use super::client::{InstanceError, InstanceInfo, InstanceTotals, SnapshotInfo};
 use super::manager::{
     instance_name_from_server_id, resume_snapshot_name, InstanceManager,
 };
-use super::{instance_aliases, is_valid_instance_name};
+use super::instance_aliases;
 use super::pool::InstancePool;
+use fluent_types::instance_id::InstanceId;
 
 impl InstancePool {
 
@@ -25,12 +26,10 @@ impl InstancePool {
     /// model is unmanaged, the id has more than one `:`, or the instance name
     /// breaks the `[A-Za-z0-9._-]` grammar.
     pub fn resolve_instance_id(&self, id: &str) -> Option<(String, String)> {
-        let (model, name) = id.split_once(':')?;
-        if name.contains(':') || !is_valid_instance_name(name) {
-            return None;
-        }
-        self.managers.get(&model.to_string())?;
-        Some((model.to_string(), name.to_string()))    }
+        let parsed = InstanceId::parse(id).ok()?;
+        self.managers.get(&(**parsed.model()).to_string())?;
+        Some(((**parsed.model()).to_string(), (**parsed.name()).to_string()))
+    }
 
     /// `GET /instances` - the aggregate envelope across every managed model.
     /// `model: Some(...)` scopes the response to one model. Instance ids are
@@ -77,6 +76,13 @@ impl InstancePool {
                         "resume".into(),
                         Value::Bool(manager.resume_for(instance_name)),
                     );
+                    // Surface the weights-file identity so `coral-router ps`
+                    // shows `id`/`arch`/`quant` without the weights file on the
+                    // CLI's host. Overlaid per-instance (like `model_bytes`).
+                    let idn = manager.weights_identity();
+                    obj.insert("short_id".into(), Value::String(idn.short_id.clone()));
+                    obj.insert("arch".into(), Value::String(idn.arch.clone()));
+                    obj.insert("quant".into(), Value::String(idn.quant.clone()));
                 }
                 instances.push(entry);
             }

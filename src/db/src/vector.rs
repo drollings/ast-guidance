@@ -3,28 +3,34 @@
 //! The canonical home for cosine similarity, brute-force KNN, vector↔byte
 //! encoding, and int8 quantization. This module was moved verbatim from
 //! `search-vector::math` so that the dependency direction stays acyclic:
-//! `search-vector` and `coral` depend on `fluent-db`, never the reverse, and
-//! `search-vector::math` is now a re-export of this module.
+//! `search-vector` and `coral` depend on `fluent-db`, never the reverse
+//! (M4 deleted the `search-vector::math` / `search-vector::error` shims;
+//! consume this module directly).
+//!
+//! The generic scored top-K select lives in `common-core::score`
+//! (spacy-rs composes it from there — `fluent-db`'s sqlite/HNSW weight must
+//! not leak into the deterministic spine); it is re-exported here so
+//! `fluent-db` consumers have one import surface.
 
-/// Cosine similarity between two equal-length vectors. Returns `0.0` when the
-/// vectors have mismatched lengths or are empty.
-pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-    let mut dot = 0.0;
-    let mut na = 0.0;
-    let mut nb = 0.0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-    }
-    let mag = na.sqrt() * nb.sqrt();
-    if mag == 0.0 {
-        0.0
-    } else {
-        dot / mag
+pub use common_core::score::top_k_by_score;
+pub use common_core::vector_math::cosine_similarity_f32;
+
+/// Vector index abstraction (M7) — `knn` via cosine distance.
+pub trait VectorIndex {
+    fn knn(&self, query: &[f32], k: usize) -> Vec<fluent_types::KnnHit>;
+}
+
+/// Brute-force index wrapping `knn_brute_force`.
+pub struct BruteForceIndex {
+    pub entries: Vec<(fluent_types::NodeId, Vec<f32>, String)>,
+}
+impl VectorIndex for BruteForceIndex {
+    fn knn(&self, query: &[f32], k: usize) -> Vec<fluent_types::KnnHit> {
+        let results = knn_brute_force(query, self.entries.iter().map(|(id, emb, _)| (*id, emb.as_slice())), k);
+        results.into_iter().map(|(id, dist)| {
+            let name = self.entries.iter().find(|(nid,_,_)| *nid==id).map(|(_,_,n)| n.clone()).unwrap_or_default();
+            fluent_types::KnnHit { node_id: id, distance: dist, name: name.into() }
+        }).collect()
     }
 }
 
@@ -47,13 +53,40 @@ pub fn knn_brute_force<'a, Id: Clone>(
             if emb.len() != query.len() {
                 return None;
             }
-            let distance = 1.0 - cosine_similarity(query, emb);
+            let distance = 1.0 - cosine_similarity_f32(query, emb);
             Some((id, distance))
         })
         .collect();
     results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     results.truncate(k);
     results
+}
+
+/// Map a canonical cosine *distance* (`1 - cosine`, as returned by
+/// `HnswIndex`/`hnsw_lookup`/`knn_brute_force`) to cosine *similarity*.
+///
+/// Presentation-only and deliberately unclamped: out-of-range distances stay
+/// out-of-range so raw-distance shapes (`KnnHit.distance`, node-store probes)
+/// are preserved bit-for-bit. Call sites that already clamp compose
+/// [`distance_to_similarity_clamped`] instead — no new semantics either way.
+pub fn distance_to_similarity(d: f32) -> f32 {
+    1.0 - d
+}
+
+/// Clamped twin of [`distance_to_similarity`]: floors at `0.0` for the chart
+/// path that already clamps (`(1.0 - d).max(0.0)`). Exists *only* for that
+/// path — new call sites default to the unclamped mapping.
+pub fn distance_to_similarity_clamped(d: f32) -> f32 {
+    (1.0 - d).max(0.0)
+}
+
+/// Thin `hnsw_lookup` post-mapper: applies `map` (one of the two mappings
+/// above) to each resolved `(Id, distance)` pair, preserving ids and order.
+///
+/// Retires the per-site `1.0 - d` closures so the mapping lives in exactly
+/// one place. Sort/truncate/filter stay call-site code.
+pub fn scored_hits<Id: Clone>(resolved: Vec<(Id, f32)>, map: impl Fn(f32) -> f32) -> Vec<(Id, f32)> {
+    resolved.into_iter().map(|(id, d)| (id, map(d))).collect()
 }
 
 pub fn vec_to_bytes(v: &[f32]) -> Vec<u8> {
@@ -141,6 +174,21 @@ pub fn cosine_similarity_q8(a: &QuantizedEmbedding, b: &QuantizedEmbedding) -> f
 /// this is generic over the candidate item type — `search-vector`'s
 /// `SearchResult` and coral's `KnnHit` both fuse through this single
 /// implementation.
+/// Task relevance threshold (axis B) — cosine distance.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TaskRelevanceThreshold(pub f32);
+impl TaskRelevanceThreshold {
+    pub fn new(v: f32) -> Result<Self,String>{ if (0.0..=1.0).contains(&v){ Ok(Self(v))} else { Err(format!("TaskRelevanceThreshold {v} out of range")) } }
+    pub fn get(self)->f32{ self.0 }
+}
+/// Producer confidence threshold (axis A).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProducerConfidenceThreshold(pub f32);
+impl ProducerConfidenceThreshold {
+    pub fn new(v: f32) -> Result<Self,String>{ if (0.0..=1.0).contains(&v){ Ok(Self(v))} else { Err(format!("ProducerConfidenceThreshold {v} out of range")) } }
+    pub fn get(self)->f32{ self.0 }
+}
+
 pub fn rrf_merge<T>(
     keyword_results: Vec<(i64, T)>,
     vector_results: Vec<(i64, T)>,
@@ -165,160 +213,6 @@ pub fn rrf_merge<T>(
     merged
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_cosine_similarity_identical() {
-        let sim = cosine_similarity(&[1.0, 0.0, 0.0], &[1.0, 0.0, 0.0]);
-        assert!((sim - 1.0).abs() < 1e-6);
-    }
-    #[test]
-    fn test_cosine_similarity_orthogonal() {
-        assert!((cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]) - 0.0).abs() < 1e-6);
-    }
-    #[test]
-    #[allow(clippy::float_cmp)]
-    fn test_cosine_similarity_empty() {
-        assert_eq!(cosine_similarity(&[], &[]), 0.0);
-    }
-    #[test]
-    fn test_vec_bytes_round_trip() {
-        let v = vec![1.5, -2.5, 3.0, 0.0, -0.5];
-        let restored = bytes_to_vec(&vec_to_bytes(&v));
-        for (a, b) in v.iter().zip(restored.iter()) {
-            assert!((a - b).abs() < 1e-6);
-        }
-    }
-    #[test]
-    fn test_try_bytes_to_vec_valid() {
-        let v = vec![1.0, 2.0, 3.0, 4.0];
-        let bytes = vec_to_bytes(&v);
-        let restored = try_bytes_to_vec(&bytes).unwrap();
-        assert_eq!(restored.len(), 4);
-    }
-    #[test]
-    fn test_try_bytes_to_vec_invalid_length() {
-        assert!(try_bytes_to_vec(&[0u8; 3]).is_none());
-    }
-    #[test]
-    fn test_quantize_round_trip() {
-        let original = vec![0.5, -0.3, 0.8, -0.1, 0.0, 1.0, -1.0];
-        let q = QuantizedEmbedding::from_f32(&original);
-        let restored = q.to_f32();
-        for (a, b) in original.iter().zip(restored.iter()) {
-            assert!((a - b).abs() < 0.02);
-        }
-    }
-    #[test]
-    fn test_q8_cosine_similarity() {
-        let a = QuantizedEmbedding::from_f32(&[1.0, 0.0, 0.0]);
-        let b = QuantizedEmbedding::from_f32(&[1.0, 0.0, 0.0]);
-        assert!((cosine_similarity_q8(&a, &b) - 1.0).abs() < 0.02);
-    }
-    #[test]
-    #[allow(clippy::float_cmp)]
-    fn test_q8_cosine_empty() {
-        assert_eq!(
-            cosine_similarity_q8(
-                &QuantizedEmbedding::from_f32(&[]),
-                &QuantizedEmbedding::from_f32(&[])
-            ),
-            0.0
-        );
-    }
-
-    #[test]
-    fn knn_brute_force_returns_top_k() {
-        let query = vec![1.0, 0.0, 0.0];
-        let candidates = [
-            (1u32, vec![1.0, 0.0, 0.0]),
-            (2, vec![0.0, 1.0, 0.0]),
-            (3, vec![0.9, 0.1, 0.0]),
-        ];
-        let results = knn_brute_force(
-            &query,
-            candidates.iter().map(|(id, e)| (*id, e.as_slice())),
-            2,
-        );
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].0, 1);
-        assert!((results[0].1 - 0.0).abs() < 1e-5);
-        assert_eq!(results[1].0, 3);
-    }
-
-    #[test]
-    fn knn_brute_force_skips_mismatched_dimensions() {
-        let query = vec![1.0, 0.0];
-        let candidates = [(1u32, vec![1.0, 0.0]), (2, vec![1.0, 0.0, 0.0])];
-        let results = knn_brute_force(
-            &query,
-            candidates.iter().map(|(id, e)| (*id, e.as_slice())),
-            10,
-        );
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, 1);
-    }
-
-    #[test]
-    fn knn_brute_force_empty_query_returns_empty() {
-        let candidates = [(1u32, vec![1.0])];
-        let results = knn_brute_force(&[], candidates.iter().map(|(id, e)| (*id, e.as_slice())), 5);
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn knn_brute_force_zero_k_returns_empty() {
-        let query = vec![1.0, 0.0];
-        let candidates = [(1u32, vec![1.0, 0.0])];
-        let results = knn_brute_force(
-            &query,
-            candidates.iter().map(|(id, e)| (*id, e.as_slice())),
-            0,
-        );
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn knn_brute_force_empty_candidates() {
-        let query = vec![1.0, 0.0];
-        let results: Vec<(u32, f32)> = knn_brute_force(&query, std::iter::empty(), 5);
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn rrf_merge_single_result() {
-        let kw = vec![(1i64, "foo")];
-        let vec_results: Vec<(i64, &str)> = Vec::new();
-        let merged = rrf_merge(kw, vec_results, 60.0);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].1, "foo");
-    }
-
-    #[test]
-    fn rrf_merge_boosts_shared_results() {
-        let kw = vec![(1i64, "shared"), (2, "kw_only")];
-        let vec_results = vec![(1i64, "shared"), (3, "vec_only")];
-        let merged = rrf_merge(kw, vec_results, 60.0);
-        // shared (id=1) should be ranked first since it appears in both lists.
-        assert!(merged.len() >= 2);
-        assert_eq!(merged[0].1, "shared");
-        assert!(merged[0].0 > merged[1].0);
-    }
-
-    #[test]
-    fn rrf_merge_deduplicates() {
-        let kw = vec![(1i64, "dup")];
-        let vec_results = vec![(1i64, "dup")];
-        let merged = rrf_merge(kw.clone(), vec_results, 60.0);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].1, "dup");
-    }
-
-    #[test]
-    fn rrf_merge_empty_inputs() {
-        let merged: Vec<(f64, &str)> = rrf_merge(Vec::new(), Vec::new(), 60.0);
-        assert!(merged.is_empty());
-    }
-}
+#[cfg(all(test, feature = "sqlite"))]
+#[path = "../tests/vector.rs"]
+mod tests;

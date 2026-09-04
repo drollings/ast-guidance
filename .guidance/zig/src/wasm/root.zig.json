@@ -1,8 +1,0 @@
-{
-  "meta": {
-    "module": "src.wasm.root",
-    "source": "src/wasm/root.zig",
-    "language": "zig"
-  },
-  "comment": " wasm — WebAssembly Sandboxing (Extism)\n\n Provides:\n   ExtismPlugin    — Extism C-API bindings\n   WasmManifest     — WASM module metadata\n   WasmPlugin      — Loaded plugin handle\n   HostFunctionContext — Host function execution context\n   WasmExecutionResult — Execution result\n   ToolCompilerConfig — Tool compiler configuration\n   ToolGenerator  — ToolGenerator from WASM\n   WasmToolCache  — Cache for compiled tools"
-}

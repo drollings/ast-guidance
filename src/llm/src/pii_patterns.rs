@@ -33,6 +33,15 @@ pub static IPV6_RE: LazyLock<Regex> =
 /// The compiled statics above are the single source of truth. This table is
 /// derived from them so the names and regex strings can never drift from the
 /// compiled patterns used by `anonymize`.
+///
+/// M6: exactly 5 of the 12 statics are exposed here — deliberately, not an
+/// oversight. `RegexPiiDetector` (the review pre-filter baseline) consumes
+/// this table, and widening it would change which spans the pre-filter
+/// reports (a behavior change). The other 7 (`NINO_UK`, `SIN_CA`, `BEARER`,
+/// `AWS_KEY`, `GENERIC_API_KEY`, `IPV6`, `IPV4`) fire only inside
+/// `anonymize`, which references its statics directly. Closing the gap
+/// (unifying the two consumers on one table) is a behavior-change proposal,
+/// filed separately — see `tests/pii_patterns.rs` for the lock.
 pub struct PiiPattern {
     pub name: &'static str,
     pub regex: &'static LazyLock<Regex>,
@@ -65,34 +74,5 @@ pub fn pii_patterns() -> &'static [PiiPattern] {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn patterns_table_has_expected_shape() {
-        let patterns = pii_patterns();
-        let names: Vec<&str> = patterns.iter().map(|p| p.name).collect();
-        assert_eq!(names, ["ssn", "card_number", "email", "phone", "api_key"]);
-        for p in patterns {
-            assert!(!p.regex.as_str().is_empty());
-            let compiled = Regex::new(p.regex.as_str()).expect("table regex compiles");
-            assert_eq!(compiled.as_str(), p.regex.as_str());
-        }
-    }
-
-    #[test]
-    fn patterns_table_matches_statics() {
-        let patterns = pii_patterns();
-        assert_eq!(patterns[0].regex.as_str(), SSN_US_RE.as_str());
-        assert_eq!(patterns[1].regex.as_str(), CREDIT_CARD_RE.as_str());
-        assert_eq!(patterns[2].regex.as_str(), EMAIL_RE.as_str());
-        assert_eq!(patterns[3].regex.as_str(), PHONE_US_RE.as_str());
-        assert_eq!(patterns[4].regex.as_str(), API_KEY_RE.as_str());
-    }
-
-    #[test]
-    fn ssn_pattern_matches() {
-        assert!(SSN_US_RE.is_match("123-45-6789"));
-        assert!(!SSN_US_RE.is_match("1234-56-789"));
-    }
-}
+#[path = "../tests/pii_patterns.rs"]
+mod tests;

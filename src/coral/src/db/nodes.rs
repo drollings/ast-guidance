@@ -12,15 +12,36 @@ impl super::Library {
         let embedding_blob = node.embedding.as_ref().map(|v| vec_to_bytes(v));
         let capabilities_blob = node.capabilities.as_deref();
 
-        // INSERT + last_insert_rowid run under one connection lock so the
-        // returned id is the row this call wrote.
+        // INSERT + (last_insert_rowid) run under one connection lock so the
+        // returned id is the row this call wrote. Content-addressed callers
+        // supply `id` (the `hash_iri` value IS the primary key); `INSERT OR
+        // IGNORE` makes re-ingestion of the same content idempotent.
         let node_id = self.store.with_conn(|conn| {
-            fluent_db::query::execute(
-                conn,
-                "INSERT INTO context_nodes (name, source, lod, embedding, capabilities) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![node.name.as_str(), node.source, lod_json, embedding_blob, capabilities_blob],
-            )?;
-            Ok(NodeId::from_int(fluent_db::query::last_insert_rowid(conn)))
+            if let Some(nid) = node.id {
+                fluent_db::query::execute(
+                    conn,
+                    "INSERT OR IGNORE INTO context_nodes \
+                     (id, name, source, lod, embedding, capabilities) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        nid.as_int(),
+                        node.name.as_str(),
+                        node.source,
+                        lod_json,
+                        embedding_blob,
+                        capabilities_blob
+                    ],
+                )?;
+                Ok(nid)
+            } else {
+                // Legacy path (tests, non-content-addressed callers): autoincrement.
+                fluent_db::query::execute(
+                    conn,
+                    "INSERT INTO context_nodes (name, source, lod, embedding, capabilities) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![node.name.as_str(), node.source, lod_json, embedding_blob, capabilities_blob],
+                )?;
+                Ok(NodeId::from_int(fluent_db::query::last_insert_rowid(conn)))
+            }
         })?;
 
         // The connection lock is released before the index lock so the
@@ -145,10 +166,28 @@ impl super::Library {
                 let lod_json = serde_json::to_string(&node.lod).unwrap_or_default();
                 let embedding_blob = node.embedding.as_ref().map(|v| vec_to_bytes(v));
                 let capabilities_blob = node.capabilities.as_deref();
-                tx.execute(
-                    "INSERT INTO context_nodes (name, source, lod, embedding, capabilities) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![node.name.as_str(), node.source, lod_json, embedding_blob, capabilities_blob],
-                )?;
+                if let Some(nid) = node.id {
+                    // Content-addressed: hash_iri IS the primary key;
+                    // INSERT OR IGNORE keeps re-ingestion idempotent.
+                    tx.execute(
+                        "INSERT OR IGNORE INTO context_nodes \
+                         (id, name, source, lod, embedding, capabilities) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            nid.as_int(),
+                            node.name.as_str(),
+                            node.source,
+                            lod_json,
+                            embedding_blob,
+                            capabilities_blob
+                        ],
+                    )?;
+                } else {
+                    tx.execute(
+                        "INSERT INTO context_nodes (name, source, lod, embedding, capabilities) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![node.name.as_str(), node.source, lod_json, embedding_blob, capabilities_blob],
+                    )?;
+                }
             }
             Ok(())
         })?)
@@ -160,6 +199,20 @@ impl super::Library {
             .query_row("SELECT COUNT(*) FROM context_nodes", &[], |row| {
                 row.get::<_, i64>(0)
             })?;
+        Ok(count.unwrap_or(0))
+    }
+
+    /// Count nodes whose `source` starts with `prefix` — the scoped-count
+    /// primitive for boot reconciliation (L6): a shared coral DB may hold
+    /// unrelated content, so YaGO-content cross-checks must never use the total
+    /// `node_count()`.
+    pub fn count_nodes_by_source_prefix(&self, prefix: &str) -> Result<i64, LibraryError> {
+        let pattern = format!("{prefix}%");
+        let count = self.store.query_row(
+            "SELECT COUNT(*) FROM context_nodes WHERE source LIKE ?1",
+            params![pattern],
+            |row| row.get::<_, i64>(0),
+        )?;
         Ok(count.unwrap_or(0))
     }
 
@@ -300,14 +353,11 @@ impl super::Library {
                     }
                 }
             }
-            let mut hits: Vec<KnnHit> = merged.into_values().collect();
-            hits.sort_by(|a, b| {
-                a.distance
-                    .partial_cmp(&b.distance)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            hits.truncate(k);
-            hits
+            let hits: Vec<KnnHit> = merged.into_values().collect();
+            // Shared top-K tail (P2): ascending distance + truncate(k). The
+            // HNSW∪brute-force merge + `rrf_merge` staging above stays
+            // (domain logic, not eligible).
+            fluent_db::vector::top_k_by_score(hits, k, |h| h.distance, false)
         } else {
             Vec::new()
         };
@@ -444,6 +494,73 @@ mod tests {
         })
         .expect("insert embedded");
         assert_eq!(lib.embedded_node_count().expect("count"), 1);
+    }
+
+    #[test]
+    fn insert_with_explicit_id_uses_it_as_primary_key() {
+        let lib = lib();
+        let nid = NodeId::from_int(0x1234_5678_9abc_def0_i64 as i64);
+        let node = ContentNode {
+            id: Some(nid),
+            ..make_node("content-addressed", "s")
+        };
+        let back = lib.insert_node(&node).expect("insert");
+        assert_eq!(back, nid);
+        let fetched = lib.get_node(nid).expect("get").expect("exists");
+        assert_eq!(fetched.id, Some(nid));
+        assert_eq!(fetched.name.as_str(), "content-addressed");
+        assert_eq!(lib.node_count().expect("count"), 1);
+    }
+
+    #[test]
+    fn reinsert_same_content_id_is_idempotent() {
+        let lib = lib();
+        let nid = NodeId::from_int(hash_iri_fixture("http://example.org/dupe"));
+        let node = ContentNode {
+            id: Some(nid),
+            ..make_node("dupe", "s")
+        };
+        lib.insert_node(&node).expect("first insert");
+        let again = lib.insert_node(&node).expect("second insert");
+        assert_eq!(again, nid, "explicit id returned whether or not the row was inserted");
+        assert_eq!(lib.node_count().expect("count"), 1, "re-ingestion adds no row");
+    }
+
+    #[test]
+    fn batch_preserves_explicit_ids_and_is_idempotent() {
+        let lib = lib();
+        let nodes: Vec<ContentNode> = (0..3)
+            .map(|i| ContentNode {
+                id: Some(NodeId::from_int(hash_iri_fixture(&format!("http://example.org/b{i}")))),
+                ..make_node(&format!("b{i}"), "src")
+            })
+            .collect();
+        lib.insert_nodes_batch(&nodes).expect("first batch");
+        lib.insert_nodes_batch(&nodes).expect("second batch");
+        assert_eq!(lib.node_count().expect("count"), 3);
+        for n in &nodes {
+            let id = n.id.expect("id set");
+            assert_eq!(lib.get_node(id).expect("get").expect("exists").id, Some(id));
+        }
+    }
+
+    #[test]
+    fn explicit_and_autoincrement_ids_do_not_collide() {
+        let lib = lib();
+        let explicit = lib
+            .insert_node(&ContentNode {
+                id: Some(NodeId::from_int(hash_iri_fixture("http://example.org/x"))),
+                ..make_node("explicit", "s")
+            })
+            .expect("explicit");
+        let auto = lib.insert_node(&make_node("auto", "s")).expect("auto");
+        assert_eq!(explicit.as_int(), hash_iri_fixture("http://example.org/x"));
+        assert_ne!(explicit, auto);
+        assert_eq!(lib.node_count().expect("count"), 2);
+    }
+
+    fn hash_iri_fixture(s: &str) -> i64 {
+        guidance_rdf::normalize::hash_iri(s)
     }
 
     #[test]

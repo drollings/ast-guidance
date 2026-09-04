@@ -155,7 +155,7 @@ impl QueueReactor {
                     let workers = workers.max(1);
                     let queue = fluent_llm::llm_queue::build_default_queue(
                         fluent_concurrency::tokio_runtime(),
-                        &fluent_concurrency::llm_queue::LlmQueueConfig {
+                        &fluent_llm::protocol::LlmQueueConfig {
                             worker_count: workers,
                             queue_capacity: workers * 10,
                         },

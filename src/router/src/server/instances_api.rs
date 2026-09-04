@@ -87,16 +87,24 @@ fn body_or_query_model(
         .or_else(|| query_model(query).map(ToOwned::to_owned))
 }
 
+/// Whether a model key is known to the fleet: a llama manager or an onnx
+/// weights implementor.
+fn is_known_model(deps: &ServerDeps, key: &str) -> bool {
+    deps.instance_pool
+        .as_ref()
+        .is_some_and(|pool| pool.manager(key).is_some())
+        || deps
+            .fleet
+            .as_ref()
+            .is_some_and(|fleet| fleet.is_known_model(key))
+}
+
 /// Validate that `model` names a managed model (or `None` when exactly one
 /// managed model exists). Returns the model key.
 #[allow(clippy::result_large_err)]
 fn resolve_model(deps: &ServerDeps, model: Option<&str>) -> Result<String, HyperResponse> {
-    let pool = deps
-        .instance_pool
-        .as_ref()
-        .ok_or_else(|| error_response(hyper::StatusCode::NOT_FOUND, "no managed instances"))?;
     if let Some(m) = model {
-        if pool.manager(m).is_none() {
+        if !is_known_model(deps, m) {
             return Err(error_response(
                 hyper::StatusCode::BAD_REQUEST,
                 &format!("unknown model: '{m}'"),
@@ -114,23 +122,29 @@ fn resolve_model(deps: &ServerDeps, model: Option<&str>) -> Result<String, Hyper
 
 /// Resolve a per-instance operation to `(model, instance)`: the id grammar
 /// `<model_id>:<name>` wins; else `?model=` + the bare name; else the single
-/// running server.
+/// running server. Fleet-aware: onnx keys (`onnx/llm:default`) resolve through
+/// the unified fleet's id grammar too.
 #[allow(clippy::result_large_err)]
 fn resolve_instance_target(
     deps: &ServerDeps,
     path_name: &str,
     query: &[(String, String)],
 ) -> Result<(String, String), HyperResponse> {
-    let pool = deps
-        .instance_pool
-        .as_ref()
-        .ok_or_else(|| error_response(hyper::StatusCode::NOT_FOUND, "no managed instances"))?;
-    // Id grammar `<model_id>:<name>`.
+    let Some(pool) = deps.instance_pool.as_ref() else {
+        return Err(error_response(hyper::StatusCode::NOT_FOUND, "no managed instances"));
+    };
+    // Id grammar `<model_id>:<name>` — the llama pool first (byte-identical
+    // for llama keys), then the fleet for onnx keys.
     if let Some((model, name)) = pool.resolve_instance_id(path_name) {
         return Ok((model, name));
     }
+    if let Some(fleet) = deps.fleet.as_ref() {
+        if let Some((model, name)) = fleet.resolve_instance_id(path_name) {
+            return Ok((model, name));
+        }
+    }
     let model = resolve_model(deps, query_model(query))?;
-    if pool.manager(&model).is_none() {
+    if !is_known_model(deps, &model) {
         return Err(error_response(
             hyper::StatusCode::NOT_FOUND,
             &format!("instance not found: '{path_name}'"),
@@ -139,14 +153,26 @@ fn resolve_instance_target(
     Ok((model, path_name.to_string()))
 }
 
-/// The model key when exactly one managed model exists.
+/// The model key when exactly one managed model exists (llama pool + onnx
+/// fleet).
 fn single_model_key(deps: &ServerDeps) -> Option<String> {
-    let pool = deps.instance_pool.as_ref()?;
-    let mut keys: Vec<String> = pool
-        .managers_iter()
-        .into_iter()
-        .map(|m| m.model_key().to_string())
-        .collect();
+    let mut keys: Vec<String> = deps
+        .instance_pool
+        .as_ref()
+        .map(|pool| {
+            pool.managers_iter()
+                .into_iter()
+                .map(|m| m.model_key().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(fleet) = deps.fleet.as_ref() {
+        for w in fleet.weights() {
+            if w.eviction_policy() == fluent_llm::runtime::EvictionPolicy::LruLargest {
+                keys.push(w.model_key().to_string());
+            }
+        }
+    }
     keys.sort();
     keys.dedup();
     if keys.len() == 1 {
@@ -183,6 +209,22 @@ pub async fn handle_get_instances(
     query: &[(String, String)],
 ) -> HyperResponse {
     let model = query_model(query);
+    // The unified fleet (llama + onnx) when attached; the llama-only pool
+    // path is the byte-identical fallback for fleet-less builds.
+    if let Some(fleet) = deps.fleet.as_ref() {
+        if let Some(m) = model {
+            if !fleet.is_known_model(m) {
+                return error_response(
+                    hyper::StatusCode::BAD_REQUEST,
+                    &format!("unknown model: '{m}'"),
+                );
+            }
+        }
+        return match fleet.aggregate(model).await {
+            Ok(value) => json_response(hyper::StatusCode::OK, &value),
+            Err(e) => error_response(hyper::StatusCode::BAD_GATEWAY, &e.to_string()),
+        };
+    }
     let Some(pool) = deps.instance_pool.as_ref() else {
         return error_response(hyper::StatusCode::NOT_FOUND, "no managed instances");
     };
@@ -240,8 +282,8 @@ pub async fn handle_post_instances(
         .get("group")
         .and_then(serde_json::Value::as_str)
         .unwrap_or(name);
-    if !crate::instances::is_valid_instance_name(name)
-        || !crate::instances::is_valid_instance_name(group)
+    if !fluent_types::instance_id::is_valid_instance_name(name)
+        || !fluent_types::instance_id::is_valid_instance_name(group)
     {
         return error_response(
             hyper::StatusCode::BAD_REQUEST,
@@ -313,6 +355,25 @@ pub async fn handle_instance_op(
                 .get("ctx_size")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0);
+            // ROADMAP M7 §3: an onnx context resizes through `LlmContext::resize`
+            // (the onnx half of the unified facade). Llama contexts stay on the
+            // pool's `client.resize` path (byte-identical).
+            if let Some(fleet) = deps.fleet.as_ref() {
+                if fleet
+                    .weights()
+                    .iter()
+                    .any(|w| w.model_key() == model
+                        && w.eviction_policy() == fluent_llm::runtime::EvictionPolicy::LruLargest)
+                {
+                    return match fleet.resize_context(&model, &instance, ctx_size).await {
+                        Ok(()) => json_response(
+                            hyper::StatusCode::OK,
+                            &serde_json::json!({ "success": true }),
+                        ),
+                        Err(e) => runtime_error_response(&e),
+                    };
+                }
+            }
             pool.resize(&model, &instance, ctx_size).await
         }
         _ => unreachable!("unknown instance op"),
@@ -348,7 +409,7 @@ pub async fn handle_snapshot_op(
                 .get("name")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            if !crate::instances::is_valid_instance_name(name) {
+            if !fluent_types::instance_id::is_valid_instance_name(name) {
                 return error_response(
                     hyper::StatusCode::BAD_REQUEST,
                     "invalid snapshot name (allowed: [A-Za-z0-9._-])",
@@ -428,15 +489,40 @@ fn instance_op_response(result: Result<(), crate::instances::InstanceError>) -> 
     }
 }
 
+/// Map a shared runtime error (onnx `LlmContext`/`LlmKVCache` ops) to the same
+/// HTTP shapes the llama management contract uses: a `max_ctx` overflow is a
+/// 400 (the onnx `resize` refusal), an unloaded/unknown resource a 404.
+fn runtime_error_response(e: &fluent_llm::runtime::LlmRuntimeError) -> HyperResponse {
+    use fluent_llm::runtime::LlmRuntimeError;
+    match &e {
+        LlmRuntimeError::NotLoaded(_) => {
+            error_response(hyper::StatusCode::NOT_FOUND, &e.to_string())
+        }
+        LlmRuntimeError::Other(s) if s.contains("exceeds max_ctx") => {
+            error_response(hyper::StatusCode::BAD_REQUEST, s)
+        }
+        _ => error_response(hyper::StatusCode::BAD_GATEWAY, &e.to_string()),
+    }
+}
+
 /// `GET /memory` - compatibility reshape of the aggregate envelope.
 pub async fn handle_memory(deps: &ServerDeps) -> HyperResponse {
-    let pool = match deps.instance_pool.as_ref() {
-        Some(p) => p,
-        None => return error_response(hyper::StatusCode::NOT_FOUND, "no managed instances"),
-    };
-    let value = match pool.aggregate(None).await {
-        Ok(v) => v,
-        Err(e) => return error_response(hyper::StatusCode::BAD_GATEWAY, &e.to_string()),
+    // The unified fleet (llama + onnx) when attached; the llama-only pool
+    // path is the byte-identical fallback for fleet-less builds.
+    let value = if let Some(fleet) = deps.fleet.as_ref() {
+        match fleet.aggregate(None).await {
+            Ok(v) => v,
+            Err(e) => return error_response(hyper::StatusCode::BAD_GATEWAY, &e.to_string()),
+        }
+    } else {
+        let pool = match deps.instance_pool.as_ref() {
+            Some(p) => p,
+            None => return error_response(hyper::StatusCode::NOT_FOUND, "no managed instances"),
+        };
+        match pool.aggregate(None).await {
+            Ok(v) => v,
+            Err(e) => return error_response(hyper::StatusCode::BAD_GATEWAY, &e.to_string()),
+        }
     };
     let total: InstanceTotals =
         serde_json::from_value(value.get("total").cloned().unwrap_or_default())
@@ -453,6 +539,14 @@ pub async fn handle_memory(deps: &ServerDeps) -> HyperResponse {
 
 /// `GET /v1/models` / `GET /models` - one entry per instance plus aliases.
 pub async fn handle_list_models(deps: &ServerDeps) -> HyperResponse {
+    // The unified fleet (llama + onnx) when attached.
+    if let Some(fleet) = deps.fleet.as_ref() {
+        let data = fleet.list_models().await;
+        return json_response(
+            hyper::StatusCode::OK,
+            &serde_json::json!({ "object": "list", "data": data }),
+        );
+    }
     let Some(pool) = deps.instance_pool.as_ref() else {
         // No managed pool: fall back to the configured model keys.
         let created = common_core::now_secs();
@@ -620,70 +714,6 @@ pub(crate) fn apply_request_routing_fields(
     }
     t
 }
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_query_decodes_and_splits() {
-        let pairs = parse_query("model=swarm&instance=ledger%3A0&id_slot=2&blank=");
-        let map: std::collections::HashMap<&str, &str> = pairs
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        assert_eq!(map.get("model"), Some(&"swarm"));
-        assert_eq!(map.get("instance"), Some(&"ledger:0"));
-        assert_eq!(map.get("id_slot"), Some(&"2"));
-        assert_eq!(map.get("blank"), Some(&""));
-    }
-
-    #[test]
-    fn percent_decode_handles_plus_and_hex() {
-        assert_eq!(percent_decode("a+b"), "a b");
-        assert_eq!(percent_decode("a%20b"), "a b");
-        assert_eq!(percent_decode("%2F"), "/");
-        assert_eq!(percent_decode("plain"), "plain");
-    }
-
-    #[test]
-    fn apply_request_routing_overrides_target_fields() {
-        let target = crate::pipeline::RoutingTarget {
-            url: "http://x/v1/chat/completions".into(),
-            model: "base:ledger".into(),
-            group: None,
-            target_name: None,
-            params: None,
-            instance: Some("ledger".into()),
-            snapshot: None,
-            id_slot: None,
-            filter_thinking: false,
-            retry_count: 0,
-            retry_base_interval_s: 1,
-            stream: true,
-            idle_timeout_ms: 5000,
-            total_timeout_ms: 30000,
-            fallbacks: vec![],
-        };
-        let request = RouterRequest {
-            model: "base".into(),
-            messages: vec![],
-            temperature: None,
-            max_tokens: None,
-            stream: None,
-            tools: None,
-            tool_choice: None,
-            session_id: None,
-            agent_id: None,
-            adapter: None,
-            instance: Some("scratch".into()),
-            snapshot: Some("readfiles".into()),
-            id_slot: Some(3),
-            metadata: Default::default(),
-        };
-        let overlaid = apply_request_routing_fields(&target, &request);
-        assert_eq!(overlaid.instance.as_deref(), Some("scratch"));
-        assert_eq!(overlaid.snapshot.as_deref(), Some("readfiles"));
-        assert_eq!(overlaid.id_slot, Some(3));
-    }
-}
+#[path = "../../tests/server_instances_api.rs"]
+mod tests;

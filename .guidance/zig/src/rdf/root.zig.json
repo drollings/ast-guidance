@@ -1,7 +1,0 @@
-{
-  "meta": {
-    "module": "src.rdf.root",
-    "source": "src/rdf/root.zig",
-    "language": "zig"
-  }
-}

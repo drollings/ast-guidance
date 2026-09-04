@@ -1,3 +1,22 @@
+/// The ONE request-path anonymize entry (M6): twelve sequential regex
+/// replacements with stable `[TYPE]` placeholders.
+///
+/// KNOWN CALLERS (the exhaustive list — every upstream pipeline routes
+/// through this function, never a private copy):
+/// - `fluent-router` `transforms::pii_anonymize::PiiAnonymize` (+ reverse map)
+/// - `fluent-router` `transforms::DecomposeToAnonymizedHypothetical`
+/// - `fluent-router` `dispatch::escalation` question mode (hypotheticals)
+/// - `coral` `tier_units` (pre-LLM query scrub)
+///
+/// Deliberately SEPARATE vocabularies (not this function — do not merge;
+/// each is locked by its own goldens):
+/// - `SecretMask` (`****` transport masking, key-name preserving)
+/// - `CodewordAnonymizer` (`CODEWORD_<TYPE>_N`, session-scoped reversible)
+/// - `ledger_guard::scrub_for_ledger` (`[REDACTED:<pattern>]`, irreversible
+///   write-path policy driven by the filter engine)
+///
+/// Idempotent (fixed-point) and placeholder/codeword pass-through — locked
+/// by `tests/anonymize.rs` (M6.1 taxonomy + M6.2 golden table).
 pub fn anonymize(text: &str) -> String {
     use crate::pii_patterns::{
         API_KEY_RE, AWS_KEY_RE, BEARER_RE, CREDIT_CARD_RE, EMAIL_RE, GENERIC_API_KEY_RE, IPV4_RE,
@@ -19,90 +38,87 @@ pub fn anonymize(text: &str) -> String {
     text.to_string()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Rebuild the placeholder → original-value reverse map by byte-diffing
+/// `original` against its `anonymized` form (M6: extracted verbatim from
+/// `fluent-router` `transforms::pii_anonymize` — same walk, same keying).
+///
+/// Placeholders are `[...]` spans (≤64 chars) in the anonymized text; the
+/// first occurrence of a placeholder keys as the placeholder itself, repeats
+/// as `{placeholder}_{n}`. Entries accumulate into `map` (never cleared, so
+/// multi-message callers share one map). Pure string diff — PII-independent:
+/// it never consults a pattern table, only the two texts.
+///
+/// Callers must pass the exact `anonymize` output as `anonymized`; any other
+/// pairing yields a best-effort diff, never an error.
+pub fn build_anonymize_map(
+    original: &str,
+    anonymized: &str,
+    map: &mut std::collections::HashMap<String, String, impl std::hash::BuildHasher>,
+) {
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let orig_bytes = original.as_bytes();
+    let anon_bytes = anonymized.as_bytes();
+    let mut orig_idx = 0;
+    let mut anon_idx = 0;
 
-    #[test]
-    fn test_anonymize_email() {
-        let result = anonymize("Contact me at user@example.com");
-        assert_eq!(result, "Contact me at [EMAIL]");
-    }
+    while orig_idx < orig_bytes.len() && anon_idx < anon_bytes.len() {
+        if orig_bytes[orig_idx] == anon_bytes[anon_idx] {
+            orig_idx += 1;
+            anon_idx += 1;
+            continue;
+        }
 
-    #[test]
-    fn test_anonymize_credit_card() {
-        let result = anonymize("Card: 1234-5678-9012-3456");
-        assert!(result.contains("[CREDIT_CARD]"));
-    }
+        let remaining_orig = &original[orig_idx..];
+        let placeholder = extract_placeholder(&anonymized[anon_idx..]);
+        if let Some(ph) = placeholder {
+            let ph_len = ph.len();
+            let matched_len = find_matching_len(remaining_orig, ph);
+            if matched_len > 0 {
+                let original_value = &remaining_orig[..matched_len];
+                let count = counts.entry(ph).or_insert(0);
+                let key = if *count == 0 {
+                    ph.to_string()
+                } else {
+                    format!("{ph}_{count}")
+                };
+                *count += 1;
+                map.insert(key, original_value.to_string());
 
-    #[test]
-    fn test_anonymize_ssn_us() {
-        let result = anonymize("SSN: 123-45-6789");
-        assert!(result.contains("[SSN]"));
-        assert!(!result.contains("123-45-6789"));
-    }
+                orig_idx += matched_len;
+                anon_idx += ph_len;
+                continue;
+            }
+        }
 
-    #[test]
-    fn test_anonymize_nino_uk() {
-        let result = anonymize("NINO: AB123456C");
-        assert!(result.contains("[NINO]"));
-    }
-
-    #[test]
-    fn test_anonymize_sin_ca() {
-        let result = anonymize("SIN: 046-454-286");
-        assert!(result.contains("[SIN]"));
-    }
-
-    #[test]
-    fn test_anonymize_bearer_token() {
-        let result = anonymize("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9");
-        assert!(result.contains("[BEARER_TOKEN]"));
-    }
-
-    #[test]
-    fn test_anonymize_aws_key() {
-        let result = anonymize("Key: AKIAIOSFODNN7EXAMPLE");
-        assert!(result.contains("[AWS_KEY]"));
-        assert!(!result.contains("AKIAIOSFODNN7EXAMPLE"));
-    }
-
-    #[test]
-    fn test_anonymize_generic_api_key() {
-        let result = anonymize("api_key=abcdef1234567890abcdef1234567890");
-        assert!(result.contains("[API_KEY]"));
-    }
-
-    #[test]
-    fn test_anonymize_ipv6() {
-        let result = anonymize("IPv6: 2001:0db8:85a3:0000:0000:8a2e:0370:7334");
-        assert!(result.contains("[IPv6]"));
-    }
-
-    #[test]
-    fn test_anonymize_ipv4() {
-        let result = anonymize("Server at 192.168.1.1");
-        assert_eq!(result, "Server at [IP_ADDRESS]");
-    }
-
-    #[test]
-    fn test_anonymize_phone() {
-        let result = anonymize("Call 555-123-4567 for info");
-        assert!(result.contains("[PHONE]"));
-    }
-
-    #[test]
-    fn test_anonymize_multiple() {
-        let result = anonymize("user@test.com api_key=abcdefghijklmnop12345 from 10.0.0.1");
-        assert!(result.contains("[EMAIL]"));
-        assert!(result.contains("[REDACTED]"));
-        assert!(result.contains("[IP_ADDRESS]"));
-    }
-
-    #[test]
-    fn test_no_pii_unchanged() {
-        let text = "This is a normal sentence with no PII.";
-        let result = anonymize(text);
-        assert_eq!(result, text);
+        orig_idx += 1;
+        anon_idx += 1;
     }
 }
+
+fn extract_placeholder(s: &str) -> Option<&str> {
+    if s.starts_with('[') {
+        if let Some(end) = s.find(']') {
+            let candidate = &s[..=end];
+            if candidate.len() <= 64 {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn find_matching_len(text: &str, _placeholder: &str) -> usize {
+    let non_anon_end = text
+        .char_indices()
+        .find(|(_, c)| c.is_alphanumeric() || c.is_ascii_punctuation())
+        .map_or(text.len(), |(i, c)| i + c.len_utf8());
+    non_anon_end.max(1)
+}
+
+#[cfg(test)]
+#[path = "../tests/anonymize.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "../tests/anonymize_map.rs"]
+mod anonymize_map_tests;

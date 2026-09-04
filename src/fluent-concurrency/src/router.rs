@@ -1,9 +1,13 @@
 //! A partitioned router that distributes jobs across sharded worker pools.
+//! Compatibility surface (scaffold) — see ROADMAP_20260901_FIXES_4.md M0
 
 use crate::pool::{PoolError, WorkerPool};
 
+/// Compatibility surface (scaffold) — see ROADMAP_20260901_FIXES_4.md M0
 /// Routes jobs to sharded `WorkerPool` instances by hashing the key.
 /// All jobs with the same key go to the same shard (same pool).
+#[doc(hidden)]
+#[allow(dead_code)]
 pub struct PartitionedRouter<K, J: Send + 'static> {
     shards: Vec<WorkerPool<J>>,
     hash: fn(&K) -> usize,

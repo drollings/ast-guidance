@@ -1,7 +1,7 @@
 //! Default LLM request handler — wires the queue's `ResultPool` to the
 //! OpenAI-compatible HTTP transport in `fluent_llm::client`.
 //!
-//! The `LlmRequestQueue` primitive lives in `fluent_concurrency::llm_queue`
+//! The `LlmRequestQueue` primitive lives in `fluent_llm::protocol`
 //! and is transport-agnostic (it accepts any `Fn(LlmTask) -> Future<...>`
 //! handler). This module provides the handler that actually speaks the
 //! OpenAI-compatible chat-completions protocol, so callers can build a
@@ -9,7 +9,7 @@
 //!
 //! ```no_run
 //! use std::sync::Arc;
-//! use fluent_concurrency::llm_queue::{LlmQueueConfig, LlmRequestQueue};
+//! use fluent_llm::protocol::{LlmQueueConfig, LlmRequestQueue};
 //! use fluent_concurrency::tokio_runtime;
 //! use fluent_llm::llm_queue::default_handler;
 //!
@@ -27,7 +27,7 @@
 
 use std::sync::Arc;
 
-use fluent_concurrency::llm_queue::{LlmError, LlmQueueConfig, LlmRequestQueue, LlmTask};
+use crate::protocol::{LlmError, LlmQueueConfig, LlmRequestQueue, LlmTask};
 use fluent_wvr::Runtime;
 
 use crate::client::chat_complete_http_async;
@@ -87,39 +87,5 @@ pub fn build_default_queue(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use fluent_concurrency::llm_queue::{ChatMessage, LlmConfig};
-    use fluent_concurrency::tokio_runtime;
-
-    #[tokio::test]
-    async fn test_default_handler_routes_to_http() {
-        // Smoke test: ensure the handler compiles and returns Err when the
-        // LLM endpoint is unreachable. We don't make any actual HTTP call;
-        // we just verify the handler's future type matches the queue's bound.
-        let runtime = tokio_runtime();
-        let queue = build_default_queue(
-            runtime,
-            &LlmQueueConfig {
-                worker_count: 1,
-                queue_capacity: 10,
-            },
-        );
-        let task = LlmTask {
-            messages: vec![ChatMessage {
-                role: "user".into(),
-                content: "hi".into(),
-            }],
-            config: LlmConfig::new()
-                .api_url("http://127.0.0.1:1/v1".into())
-                .model("test".into())
-                .timeout_ms(50)
-                .build(),
-        };
-        let result = queue.submit(task).await;
-        assert!(
-            result.is_err(),
-            "unreachable endpoint must surface an error from the queue"
-        );
-    }
-}
+#[path = "../tests/llm_queue.rs"]
+mod tests;

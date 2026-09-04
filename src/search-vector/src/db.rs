@@ -1,8 +1,8 @@
 use std::path::Path;
 
-use crate::error::DbError;
-use crate::math;
+use fluent_db::error::DbError;
 use fluent_db::hnsw::HnswIndex;
+use fluent_db::vector;
 use fluent_db::store::SqliteStore;
 use rusqlite::params;
 use thiserror::Error;
@@ -70,7 +70,7 @@ impl GuidanceDb {
             );",
         )?;
         self.store.with_conn(|conn| {
-            common_core::sqlite::init_embedding_cache(conn).map_err(DbError::from)?;
+            fluent_llm::embeddings_cache::init_embedding_cache(conn).map_err(DbError::from)?;
             common_core::sqlite::run_batch(
                 conn,
                 "CREATE INDEX IF NOT EXISTS idx_nodes_name ON guidance_nodes(name);
@@ -94,7 +94,7 @@ impl GuidanceDb {
         language: &str,
         embedding: Option<&[f32]>,
     ) -> Result<i64, VectorDbError> {
-        let embedding_blob = embedding.map(math::vec_to_bytes);
+        let embedding_blob = embedding.map(vector::vec_to_bytes);
 
         // INSERT + last_insert_rowid run under one connection lock so the
         // returned id is the row this call wrote.
@@ -141,7 +141,7 @@ impl GuidanceDb {
 
         let count = rows.len();
         self.hnsw.rebuild_from(rows.into_iter(), |blob| {
-            let embedding = math::bytes_to_vec(blob);
+            let embedding = vector::bytes_to_vec(blob);
             if embedding.is_empty() {
                 None
             } else {
@@ -193,8 +193,8 @@ impl GuidanceDb {
             }
             let node_id = id_map[d_id];
 
-            // Convert cosine distance to similarity: dist = 1 - cos_sim
-            let similarity = 1.0 - distance;
+            // Convert cosine distance to similarity via the canonical kernel.
+            let similarity = vector::distance_to_similarity(distance);
 
             if let Ok(Some(row)) = self.store.query_row(
                 "SELECT name, source, signature FROM guidance_nodes WHERE id = ?1",
@@ -235,14 +235,14 @@ impl GuidanceDb {
             },
         )?;
 
-        let mut results: Vec<SearchResult> = rows
+        let results: Vec<SearchResult> = rows
             .into_iter()
             .filter_map(|(id, name, source, signature, embedding_blob)| {
-                let embedding = math::bytes_to_vec(&embedding_blob?);
+                let embedding = vector::bytes_to_vec(&embedding_blob?);
                 if embedding.len() != query_vec.len() {
                     return None;
                 }
-                let similarity = math::cosine_similarity(query_vec, &embedding);
+                let similarity = vector::cosine_similarity_f32(query_vec, &embedding);
                 Some(SearchResult {
                     id,
                     name,
@@ -253,12 +253,9 @@ impl GuidanceDb {
             })
             .collect();
 
-        results.sort_by(|a, b| {
-            b.similarity
-                .partial_cmp(&a.similarity)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        results.truncate(k);
+        // Shared top-K tail (P2): descending similarity + truncate(k). The
+        // row-metadata join above stays (domain logic, not eligible).
+        let results = common_core::score::top_k_by_score(results, k, |r| r.similarity, true);
 
         Ok(results)
     }
@@ -368,8 +365,8 @@ impl GuidanceDb {
         };
 
         // Generic ranked fusion over `(id, item)` pairs. Reached via the
-        // `search_vector::math` re-export of `fluent_db::vector::rrf_merge`.
-        let mut fused: Vec<SearchResult> = math::rrf_merge(
+        // Canonical `fluent_db::vector::rrf_merge` (M4: shim deleted).
+        let mut fused: Vec<SearchResult> = vector::rrf_merge(
             keyword_results.into_iter().map(|r| (r.id, r)).collect(),
             vector_results.into_iter().map(|r| (r.id, r)).collect(),
             60.0,
@@ -502,6 +499,10 @@ impl GuidanceDb {
 }
 
 #[cfg(test)]
+#[path = "../tests/error_hops.rs"]
+mod error_hops;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -578,6 +579,40 @@ mod tests {
         let db = make_db();
         let results = db.keyword_search("nonexistent").expect("search");
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn brute_force_order_truncation_and_tie_winner() {
+        // Characterization (M3b): locks the brute-force tail's order,
+        // k-truncation, and tie-break so the P2 migration must preserve them.
+        // "twin-a"/"twin-b" carry identical embeddings (a contested tie);
+        // the sort is stable over rowid-ordered rows, so insertion order wins.
+        let db = make_db();
+        let near = vec![1.0f32, 0.0, 0.0, 0.0];
+        let far = vec![0.0f32, 1.0, 0.0, 0.0];
+        db.insert_node("twin-a", "s", None, None, "m", "l", Some(&near))
+            .expect("insert");
+        db.insert_node("twin-b", "s", None, None, "m", "l", Some(&near))
+            .expect("insert");
+        db.insert_node("far", "s", None, None, "m", "l", Some(&far))
+            .expect("insert");
+
+        let all = db.bruteforce_vector_search(&near, 10).expect("search");
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].name, "twin-a", "tie: insertion order wins");
+        assert_eq!(all[1].name, "twin-b");
+        assert_eq!(all[2].name, "far");
+        assert!(all[0].similarity >= all[1].similarity);
+        assert!(all[1].similarity >= all[2].similarity);
+
+        // k truncation keeps the head in order.
+        let top2 = db.bruteforce_vector_search(&near, 2).expect("search");
+        assert_eq!(
+            top2.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["twin-a", "twin-b"]
+        );
+        // k == 0 → empty.
+        assert!(db.bruteforce_vector_search(&near, 0).expect("search").is_empty());
     }
 
     #[test]

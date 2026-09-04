@@ -8,16 +8,33 @@
 //! §"The Classification Tree"), so adding a route updates the prompt with no
 //! manual maintenance.
 //!
-//! The flat sections (`pipelines`, `routes`, `system_prompt`, `score_matrix`,
-//! `models`, `model_groups`) are unchanged and still load; when a tree is
-//! present the flat *views* the rest of the server expects (route→pipeline
-//! mapping, system prompt) are derived from it.
+//! The `pipelines` stage table, `models`, and `model_groups` are unchanged
+//! and still load; the flat *views* the rest of the server expects
+//! (route→pipeline mapping, system prompt) are derived from the tree (M3c:
+//! flat `routes` / `system_prompt` / root `score_matrix` are gone).
 
 use std::fmt::Write;
 
+use fluent_types::InterlinguaId;
 use serde::{Deserialize, Serialize};
 
 use crate::config::filters::FilterOutcome;
+
+/// The interlingua match for a `Filter` node (ROADMAP §14.6, C6): a
+/// deterministic dispatch on the request's parsed predicate/subject/object
+/// ids. Same phrasing → same ids → same route, zero tokens.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct InterlinguaMatch {
+    /// A predicate (root) lemma id; `None` = don't check.
+    pub predicate_id: Option<InterlinguaId>,
+    /// A subject lemma id; `None` = don't check.
+    pub subject_id: Option<InterlinguaId>,
+    /// A direct-object lemma id; `None` = don't check.
+    pub object_id: Option<InterlinguaId>,
+    /// Minimum sentence confidence for a match (default: any).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence_min: Option<f64>,
+}
 
 /// The top-level classification tree.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -55,6 +72,12 @@ impl ClassificationTree {
         let mut out = Vec::new();
         self.root.collect_terminals(&mut out);
         out
+    }
+
+    /// Whether the terminal for `route` forces dispatch (`always_route`).
+    /// `false` for unknown routes — the caller falls back to the default.
+    pub fn terminal_always_route(&self, route: &str) -> bool {
+        self.root.find_terminal(route).unwrap_or(false)
     }
 
     /// Auto-generate the classifier system prompt from the root node's
@@ -120,18 +143,24 @@ pub enum ClassificationNode {
         #[serde(default)]
         children: Vec<ClassificationChild>,
     },
-    /// A dispatch target. `route` names an entry in the flat `routes` map;
-    /// when the tree config has no such entry, `group` supplies one for the
-    /// derived flat view.
+    /// A dispatch target. `route` names the routed intent; `group` selects
+    /// the dispatch model group for the derived flat view. `always_route`
+    /// (default `false`) forces dispatch even when the classifier answers
+    /// directly — the tree-carried copy of the former flat flag (M3c).
     Terminal {
         route: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group: Option<String>,
         #[serde(default)]
         description: String,
+        /// Never let the classifier answer requests on this route directly.
+        #[serde(default)]
+        always_route: bool,
     },
     /// A deterministic regex check over the user message. Short-circuits the
-    /// enclosing classifier when a pattern matches.
+    /// enclosing classifier when a pattern matches. When `match_interlingua`
+    /// is set, it is evaluated **instead of** `patterns` — a Filter node is
+    /// regex **or** interlingua, never both (§14.6, C6).
     Filter {
         #[serde(default)]
         description: String,
@@ -143,6 +172,9 @@ pub enum ClassificationNode {
         /// classifier.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         redirect_to: Option<String>,
+        /// Deterministic dispatch on the request's interlingua ids (C6).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        match_interlingua: Option<InterlinguaMatch>,
     },
     /// A child of a classifier node, evaluated when the LLM picks no named
     /// child or the LLM call itself fails.
@@ -256,6 +288,7 @@ impl ClassificationNode {
                 route,
                 group,
                 description,
+                ..
             } => out.push((route.clone(), group.clone(), description.clone())),
             ClassificationNode::Classifier { children, .. } => {
                 for child in children {
@@ -266,260 +299,26 @@ impl ClassificationNode {
             ClassificationNode::Filter { .. } => {}
         }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::RouterConfig;
-
-    fn tree_json() -> &'static str {
-        r#"{
-            "root": {
-                "type": "classifier",
-                "description": "request router",
-                "model": "fast",
-                "coherence_threshold": 0.6,
-                "safety_threshold": 0.4,
-                "children": [
-                    {
-                        "key": "code",
-                        "description": "programming and implementation",
-                        "node": { "type": "terminal", "route": "code", "group": "code" }
-                    },
-                    {
-                        "key": "translation",
-                        "description": "translation between languages",
-                        "node": { "type": "terminal", "route": "translation", "group": "translation" }
-                    },
-                    {
-                        "key": "blocked",
-                        "description": "known-bad content",
-                        "node": {
-                            "type": "filter",
-                            "description": "blocks banned topics",
-                            "patterns": ["harmful pattern"],
-                            "outcome": "hard_reject"
-                        }
-                    },
-                    {
-                        "key": "general",
-                        "description": "everything else",
-                        "node": {
-                            "type": "fallback",
-                            "description": "default branch",
-                            "node": { "type": "terminal", "route": "local", "group": "question" }
-                        }
-                    }
-                ]
+    /// The `always_route` flag of the terminal named `route`, or `None`
+    /// when no terminal bears that name.
+    fn find_terminal(&self, route: &str) -> Option<bool> {
+        match self {
+            ClassificationNode::Terminal {
+                route: name,
+                always_route,
+                ..
+            } if name == route => Some(*always_route),
+            ClassificationNode::Classifier { children, .. } => {
+                children.iter().find_map(|c| c.node.find_terminal(route))
             }
-        }"#
-    }
-
-    #[test]
-    fn tree_json_parses_all_node_types() {
-        let tree: ClassificationTree = serde_json::from_str(tree_json()).unwrap();
-        let ClassificationNode::Classifier {
-            description,
-            model,
-            coherence_threshold,
-            safety_threshold,
-            children,
-        } = &tree.root
-        else {
-            panic!("root should be a classifier")
-        };
-        assert_eq!(description, "request router");
-        assert_eq!(model, "fast");
-        assert_eq!(*coherence_threshold, Some(0.6));
-        assert_eq!(*safety_threshold, Some(0.4));
-        assert_eq!(children.len(), 4);
-        assert!(matches!(
-            children[0].node,
-            ClassificationNode::Terminal { .. }
-        ));
-        assert!(matches!(
-            children[1].node,
-            ClassificationNode::Terminal { .. }
-        ));
-        assert!(matches!(
-            children[2].node,
-            ClassificationNode::Filter { .. }
-        ));
-        assert!(matches!(
-            children[3].node,
-            ClassificationNode::Fallback { .. }
-        ));
-    }
-
-    #[test]
-    fn tree_round_trips() {
-        let tree: ClassificationTree = serde_json::from_str(tree_json()).unwrap();
-        let serialized = serde_json::to_string(&tree).unwrap();
-        let back: ClassificationTree = serde_json::from_str(&serialized).unwrap();
-        match (&tree.root, &back.root) {
-            (
-                ClassificationNode::Classifier { children: a, .. },
-                ClassificationNode::Classifier { children: b, .. },
-            ) => {
-                assert_eq!(a.len(), b.len());
-                assert_eq!(a[0].key, b[0].key);
-                assert_eq!(
-                    &a[3].node,
-                    &ClassificationNode::Fallback {
-                        description: Some("default branch".into()),
-                        node: Box::new(ClassificationNode::Terminal {
-                            route: "local".into(),
-                            group: Some("question".into()),
-                            description: String::new()
-                        })
-                    }
-                );
-            }
-            _ => panic!("round-trip changed the root type"),
+            ClassificationNode::Fallback { node, .. } => node.find_terminal(route),
+            _ => None,
         }
     }
-
-    #[test]
-    fn router_config_parses_classification_section() {
-        let json = format!(
-            r#"{{ "classification": {tree}, "models": {{}}, "model_groups": {{}} }}"#,
-            tree = tree_json()
-        );
-        let cfg: RouterConfig = serde_json::from_str(&json).unwrap();
-        assert!(cfg.classification.is_some());
-    }
-
-    #[test]
-    fn flat_config_without_classification_is_none() {
-        let cfg: RouterConfig =
-            serde_json::from_str(r#"{"server": {"bind_addr": "127.0.0.1:0"}}"#).unwrap();
-        assert!(cfg.classification.is_none());
-    }
-
-    #[test]
-    fn root_classifier_model_resolved() {
-        let tree: ClassificationTree = serde_json::from_str(tree_json()).unwrap();
-        assert_eq!(tree.root_classifier_model(), Some("fast"));
-    }
-
-    #[test]
-    fn classifier_model_keys_dedup_across_depth() {
-        let json = r#"{
-            "root": {
-                "type": "classifier",
-                "description": "root",
-                "model": "fast",
-                "children": [
-                    {
-                        "key": "sub",
-                        "description": "sub",
-                        "node": {
-                            "type": "classifier",
-                            "description": "subdomain",
-                            "model": "small",
-                            "children": [
-                                {
-                                    "key": "code",
-                                    "description": "code",
-                                    "node": { "type": "terminal", "route": "code" }
-                                }
-                            ]
-                        }
-                    },
-                    {
-                        "key": "again",
-                        "description": "again",
-                        "node": {
-                            "type": "classifier",
-                            "description": "second small",
-                            "model": "small",
-                            "children": []
-                        }
-                    }
-                ]
-            }
-        }"#;
-        let tree: ClassificationTree = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            tree.classifier_model_keys(),
-            vec!["fast".to_string(), "small".to_string()]
-        );
-    }
-
-    #[test]
-    fn terminal_views_collect_routes_and_groups() {
-        let tree: ClassificationTree = serde_json::from_str(tree_json()).unwrap();
-        let mut views = tree.terminal_views();
-        views.sort_by(|a, b| a.0.cmp(&b.0));
-        assert_eq!(
-            views,
-            vec![
-                ("code".into(), Some("code".into()), String::new()),
-                ("local".into(), Some("question".into()), String::new()),
-                (
-                    "translation".into(),
-                    Some("translation".into()),
-                    String::new()
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn build_prompt_lists_only_routeable_children() {
-        let tree: ClassificationTree = serde_json::from_str(tree_json()).unwrap();
-        let prompt = tree.root.build_prompt(0.6, 0.4).expect("prompt");
-        assert!(prompt.contains("You are a request router."));
-        assert!(prompt.contains("- code: programming and implementation"));
-        assert!(prompt.contains("- translation: translation between languages"));
-        // The filter and fallback children are NOT LLM-choosable branches.
-        assert!(!prompt.contains("known-bad content"));
-        assert!(!prompt.contains("default branch"));
-        assert!(prompt.contains("\"route\": \"<exactly one of: code, translation>\""));
-        assert!(prompt.contains("\"coherence\": 0.0-1.0"));
-        assert!(prompt.contains("\"complexity\": 0-10"));
-        assert!(prompt.contains("coherence < 0.60"));
-        assert!(prompt.contains("safety < 0.40"));
-    }
-
-    #[test]
-    fn derive_system_prompt_uses_root_thresholds() {
-        let tree: ClassificationTree = serde_json::from_str(tree_json()).unwrap();
-        let prompt = tree.derive_system_prompt().unwrap();
-        assert!(prompt.contains("You are a request router."));
-        assert!(prompt.contains("coherence < 0.60"));
-    }
-
-    #[test]
-    fn derive_system_prompt_none_for_non_classifier_root() {
-        let tree: ClassificationTree =
-            serde_json::from_str(r#"{"root": {"type": "terminal", "route": "fast"}}"#).unwrap();
-        assert!(tree.derive_system_prompt().is_none());
-    }
-
-    #[test]
-    fn filter_node_parses_outcome_variants() {
-        let node: ClassificationNode =
-            serde_json::from_str(r#"{"type": "filter", "description": "d", "patterns": ["x"], "outcome": "soft_redirect", "redirect_to": "code"}"#).unwrap();
-        let ClassificationNode::Filter {
-            outcome,
-            redirect_to,
-            ..
-        } = node
-        else {
-            panic!("expected filter")
-        };
-        assert_eq!(outcome, FilterOutcome::SoftRedirect);
-        assert_eq!(redirect_to.as_deref(), Some("code"));
-    }
-
-    #[test]
-    fn fallback_node_parses_and_wraps() {
-        let node: ClassificationNode = serde_json::from_str(
-            r#"{"type": "fallback", "node": {"type": "terminal", "route": "local"}}"#,
-        )
-        .unwrap();
-        assert!(matches!(node, ClassificationNode::Fallback { .. }));
-    }
 }
+// M13a stub
+#[allow(dead_code)] pub fn prompt_from(_tree: &ClassificationTree) -> String { String::new() }
+#[cfg(test)]
+#[path = "../../tests/config_classification.rs"]
+mod tests;

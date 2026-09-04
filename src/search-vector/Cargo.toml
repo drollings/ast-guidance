@@ -2,10 +2,12 @@
 name = "search-vector"
 version.workspace = true
 edition.workspace = true
+autotests = false
 
 [dependencies]
 common-core = { path = "../common-core", features = ["sqlite"] }
 fluent-db = { path = "../db" }
+fluent-llm = { path = "../llm" }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

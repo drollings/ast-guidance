@@ -7,7 +7,6 @@ use fluent_llm::client::ChatBackend;
 use fluent_llm::{ChatMessage, LlmError};
 use serde::{Deserialize, Serialize};
 
-use crate::config::ClassifierOutput;
 use crate::pipeline::RoutingTarget;
 use crate::types::{RouterMessage, RouterMessageContent, RouterResponse, Usage};
 
@@ -30,20 +29,23 @@ impl TranscriptProvider {
         self
     }
 
+    /// Dual-shape pass response: the flat classifier reads `target`, the
+    /// tree engine reads `route` — both resolve identically so transcript
+    /// tests work whichever engine the config selects.
     fn default_pass_response() -> String {
-        serde_json::to_string(&ClassifierOutput {
-            action: "route".into(),
-            response: None,
-            target: Some("fast".into()),
-            coherence_score: 0.95,
-            safety_score: 0.9,
-            complexity: None,
-            intent: Some("question".into()),
-            reason: "well-formed factual query".into(),
-            completeness: None,
-            risk: None,
+        serde_json::json!({
+            "action": "route",
+            "target": "fast",
+            "route": "fast",
+            "coherence_score": 0.95,
+            "coherence": 0.95,
+            "safety_score": 0.9,
+            "safety": 0.9,
+            "complexity": 5,
+            "intent": "question",
+            "reason": "well-formed factual query",
         })
-        .unwrap_or_default()
+        .to_string()
     }
 }
 

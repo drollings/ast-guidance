@@ -20,6 +20,66 @@ pub enum PoolError {
     Closed,
 }
 
+// ─── Pool trait family (AFIT) ────────────────────────────────────────────
+// Native `async fn` in trait (AFIT, stable since 1.75) — no `async_trait`
+// crate, no hidden `Box`. These are control-plane traits (not hot-loop per-item
+// dispatch) and are deliberately **not** object-safe; pools are used
+// monomorphized via generics so the submit path stays zero-cost/inlinable
+// per `fluent-wvr/SKILL.md:70` "dyn at request boundary, concrete in tight loop".
+// See `doc/skills/fluent-concurrency/SKILL.md:7.1`.
+// `async_fn_in_trait` is allowed here — Send bounds are explicit via the
+// `+ Send + Sync + 'static` bounds on associated types and the `Send` on the
+// future is implied by the `Send + Sync` receiver; desugaring to
+// `-> impl Future + Send` would be noisy for no gain in this internal crate.
+
+/// Fire-and-forget pool — `WorkerPool` and `CreditGatedPool`.
+///
+/// `submit` enqueues without a per-job response channel (no `oneshot` alloc).
+#[allow(async_fn_in_trait)]
+pub trait SinkPool {
+    type Job: Send + 'static;
+    async fn submit(&self, job: Self::Job) -> Result<(), PoolError>;
+    fn worker_count(&self) -> usize;
+    async fn shutdown(self);
+}
+
+/// Request/response pool — `ResultPool` (one `oneshot` per submit).
+#[allow(async_fn_in_trait)]
+pub trait RequestPool {
+    type Job: Send + Sync + 'static;
+    type Output: Send + 'static;
+    type Error: Send + 'static;
+    async fn submit(&self, job: Self::Job) -> Result<Self::Output, ResultPoolError<Self::Error>>;
+    async fn submit_with_abort(
+        &self,
+        job: Self::Job,
+        abort: Option<crate::stream::StreamAbort>,
+    ) -> Result<Self::Output, ResultPoolError<Self::Error>>;
+    fn worker_count(&self) -> usize;
+    async fn shutdown(self);
+}
+
+/// Priority-ordered request/response pool — `PriorityResultPool`.
+#[allow(async_fn_in_trait)]
+pub trait PriorityRequestPool {
+    type Job: Send + Sync + 'static;
+    type Output: Send + 'static;
+    type Error: Send + 'static;
+    async fn submit(
+        &self,
+        job: Self::Job,
+        priority: i32,
+    ) -> Result<Self::Output, ResultPoolError<Self::Error>>;
+    async fn submit_with_abort(
+        &self,
+        job: Self::Job,
+        priority: i32,
+        abort: Option<crate::stream::StreamAbort>,
+    ) -> Result<Self::Output, ResultPoolError<Self::Error>>;
+    fn worker_count(&self) -> usize;
+    async fn shutdown(self);
+}
+
 struct QueueInner<T> {
     items: Mutex<VecDeque<T>>,
     capacity: usize,
@@ -45,8 +105,8 @@ struct QueueInner<T> {
 ///
 /// # async fn example() {
 /// let q = Queue::new(10);
-/// q.push(42).await.unwrap();
-/// q.push(99).await.unwrap();
+/// q.push(42).unwrap();
+/// q.push(99).unwrap();
 /// q.close();
 ///
 /// assert_eq!(q.pop().await, Some(42));
@@ -61,6 +121,7 @@ pub struct Queue<T> {
 impl<T: Send + 'static> Queue<T> {
     /// Creates a new bounded queue with the given capacity.
     pub fn new(capacity: usize) -> Self {
+        debug_assert!(capacity > 0, "queue capacity must be >0");
         Self {
             inner: Arc::new(QueueInner {
                 items: Mutex::new(VecDeque::with_capacity(capacity)),
@@ -74,11 +135,8 @@ impl<T: Send + 'static> Queue<T> {
 
     /// Pushes an item into the queue. Returns `Err(Full)` if at capacity.
     ///
-    /// The fast path is synchronous (never blocks), but the signature stays
-    /// `async` so callers can switch freely between `push` and `push_wait`
-    /// without churn.
-    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
-    pub async fn push(&self, item: T) -> Result<(), PoolError> {
+    /// The fast path is synchronous (never blocks).
+    pub fn push(&self, item: T) -> Result<(), PoolError> {
         if self.inner.closed.load(Ordering::SeqCst) {
             return Err(PoolError::Closed);
         }
@@ -195,8 +253,9 @@ impl<T: Send + Sync + 'static> WorkerPool<T> {
     }
 
     /// Tries to submit a job without waiting. Returns `Err(Full)` if the queue is at capacity.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn try_submit(&self, job: T) -> Result<(), PoolError> {
-        self.queue.push(job).await
+        self.queue.push(job)
     }
 
     /// Submits a job, waiting if the queue is full.
@@ -212,6 +271,19 @@ impl<T: Send + Sync + 'static> WorkerPool<T> {
         for w in self.workers {
             let _ = w.await;
         }
+    }
+}
+
+impl<T: Send + Sync + 'static> SinkPool for WorkerPool<T> {
+    type Job = T;
+    async fn submit(&self, job: Self::Job) -> Result<(), PoolError> {
+        WorkerPool::submit(self, job).await
+    }
+    fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+    async fn shutdown(self) {
+        WorkerPool::shutdown(self).await;
     }
 }
 
@@ -488,7 +560,7 @@ where
             result_tx: tx,
             abort,
         };
-        self.queue.push(wrapped).await?;
+        self.queue.push(wrapped)?;
         rx.await
             .map_err(|_| ResultPoolError::Canceled)?
             .map_err(ResultPoolError::Inner)
@@ -501,6 +573,33 @@ where
         for w in self.workers {
             let _ = w.await;
         }
+    }
+}
+
+impl<T, R, E> RequestPool for ResultPool<T, R, E>
+where
+    T: Send + Sync + 'static,
+    R: Send + 'static,
+    E: Send + 'static,
+{
+    type Job = T;
+    type Output = R;
+    type Error = E;
+    async fn submit(&self, job: Self::Job) -> Result<Self::Output, ResultPoolError<Self::Error>> {
+        ResultPool::submit(self, job).await
+    }
+    async fn submit_with_abort(
+        &self,
+        job: Self::Job,
+        abort: Option<crate::stream::StreamAbort>,
+    ) -> Result<Self::Output, ResultPoolError<Self::Error>> {
+        ResultPool::submit_with_abort(self, job, abort).await
+    }
+    fn worker_count(&self) -> usize {
+        ResultPool::worker_count(self)
+    }
+    async fn shutdown(self) {
+        ResultPool::shutdown(self).await;
     }
 }
 
@@ -724,220 +823,38 @@ where
     }
 }
 
-#[cfg(test)]
-mod priority_pool_tests {
-    use super::*;
-    use crate::tokio_runtime;
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn priority_pool_dispatches_high_first() {
-        let rt = tokio_runtime();
-        let pool = PriorityResultPool::<i32, String, String>::new(rt, 1, |job: i32| async move {
-            // Simulate work
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            Ok(format!("job_{job}"))
-        });
-
-        // Submit low priority first, then high priority.
-        // With a single worker, they process in queue order, but the
-        // priority queue ensures high-priority items are popped first.
-        let high = pool.submit(100, 10);
-        let low = pool.submit(1, 0);
-
-        let high_result = high.await.unwrap();
-        let low_result = low.await.unwrap();
-
-        // Both should complete successfully.
-        assert_eq!(high_result, "job_100");
-        assert_eq!(low_result, "job_1");
-
-        pool.shutdown().await;
+impl<T, R, E> PriorityRequestPool for PriorityResultPool<T, R, E>
+where
+    T: Send + Sync + 'static,
+    R: Send + 'static,
+    E: Send + 'static,
+{
+    type Job = T;
+    type Output = R;
+    type Error = E;
+    async fn submit(
+        &self,
+        job: Self::Job,
+        priority: i32,
+    ) -> Result<Self::Output, ResultPoolError<Self::Error>> {
+        PriorityResultPool::submit(self, job, priority).await
     }
-
-    #[tokio::test]
-    async fn test_priority_pool_burst_drains_all() {
-        let rt = tokio_runtime();
-        let pool = PriorityResultPool::<i32, i32, String>::new(
-            Arc::clone(&rt) as Arc<dyn Runtime>,
-            4,
-            |job: i32| async move { Ok(job * 2) },
-        );
-
-        // Submit 100 high-priority items back-to-back with 4 workers.
-        let mut handles = Vec::with_capacity(100);
-        for i in 0..100 {
-            handles.push(pool.submit(i, 10));
-        }
-
-        // All 100 results must resolve before timeout.
-        for (i, h) in handles.into_iter().enumerate() {
-            let result = tokio::time::timeout(Duration::from_secs(5), h)
-                .await
-                .expect("burst result must not hang")
-                .unwrap();
-            assert_eq!(result, i as i32 * 2);
-        }
-
-        pool.shutdown().await;
+    async fn submit_with_abort(
+        &self,
+        job: Self::Job,
+        priority: i32,
+        abort: Option<crate::stream::StreamAbort>,
+    ) -> Result<Self::Output, ResultPoolError<Self::Error>> {
+        PriorityResultPool::submit_with_abort(self, job, priority, abort).await
     }
-
-    #[tokio::test]
-    async fn priority_pool_dispatches_in_fifo_within_priority() {
-        let rt = tokio_runtime();
-        let pool =
-            PriorityResultPool::<u64, u64, String>::new(
-                rt,
-                1,
-                |job: u64| async move { Ok(job * 2) },
-            );
-
-        // Same priority — should be FIFO.
-        let r1 = pool.submit(1, 5);
-        let r2 = pool.submit(2, 5);
-        let r3 = pool.submit(3, 5);
-
-        assert_eq!(r1.await.unwrap(), 2);
-        assert_eq!(r2.await.unwrap(), 4);
-        assert_eq!(r3.await.unwrap(), 6);
-
-        pool.shutdown().await;
+    fn worker_count(&self) -> usize {
+        self.workers.len()
     }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_priority_pool_single_submit_wakes_sleeper() {
-        // A job submitted while every worker is parked (queue
-        // observed empty) must always wake one worker. The pre-fix worker
-        // registered its `notified()` future only *after* releasing the queue
-        // mutex, so a submit landing in that window notified nobody and the
-        // job sat until the next submit. Multi-threaded + repeated so the race
-        // window has a real chance to be exercised; on the fixed code every
-        // iteration completes within the timeout.
-        let rt = tokio_runtime();
-        for i in 0..64 {
-            let pool = PriorityResultPool::<i32, i32, String>::new(
-                Arc::clone(&rt) as Arc<dyn Runtime>,
-                2,
-                |job: i32| async move { Ok(job) },
-            );
-            // Give the workers a chance to pop-empty and park in the select.
-            tokio::task::yield_now().await;
-            let result = tokio::time::timeout(Duration::from_secs(5), pool.submit(i, 0))
-                .await
-                .expect("single submit to an idle pool must wake a sleeping worker")
-                .expect("handler must not error");
-            assert_eq!(result, i);
-            pool.shutdown().await;
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_priority_pool_single_submit_paused_time() {
-        // Deterministic variant under virtual time: the worker parks before the
-        // submit, so the pre-registered `notified()` future (created before the
-        // queue mutex is taken) is what the submit's `notify_one` fires.
-        tokio::time::resume();
-        let rt = tokio_runtime();
-        let pool = PriorityResultPool::<i32, i32, String>::new(
-            Arc::clone(&rt) as Arc<dyn Runtime>,
-            1,
-            |job: i32| async move { Ok(job) },
-        );
-        tokio::task::yield_now().await;
-        let result = tokio::time::timeout(Duration::from_secs(5), pool.submit(7, 0))
-            .await
-            .expect("single submit must resolve")
-            .unwrap();
-        assert_eq!(result, 7);
-        pool.shutdown().await;
-    }
-
-    /// The abort signal drops the in-flight handler future: the submitter
-    /// observes `Canceled` well before the (slow) handler would have finished.
-    #[tokio::test]
-    async fn result_pool_submit_with_abort_cancels_running_handler() {
-        let rt = tokio_runtime();
-        let pool = Arc::new(ResultPool::<i32, i32, String>::new(
-            rt,
-            1,
-            10,
-            |_: i32| async move {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                Ok(42)
-            },
-        ));
-        let abort = crate::stream::StreamAbort::new();
-        let p = Arc::clone(&pool);
-        let a = abort.clone();
-        let submitter = tokio::spawn(async move { p.submit_with_abort(1, Some(a)).await });
-        // Let the handler start its 500ms sleep, then abort it.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        abort.cancel();
-        let result = submitter
-            .await
-            .expect("submitter resolves")
-            .expect_err("aborted handler yields Canceled");
-        assert!(
-            matches!(result, ResultPoolError::Canceled),
-            "expected Canceled, got {result:?}"
-        );
-        if let Ok(pool) = Arc::try_unwrap(pool) {
-            pool.shutdown().await;
-        }
-    }
-
-    /// Without an abort signal the submit behaves exactly as before.
-    #[tokio::test]
-    async fn result_pool_submit_with_abort_none_is_noop() {
-        let rt = tokio_runtime();
-        let pool = ResultPool::<i32, i32, String>::new(
-            rt,
-            1,
-            10,
-            |job: i32| async move { Ok(job * 2) },
-        );
-        let result = pool.submit_with_abort(21, None).await.expect("no abort");
-        assert_eq!(result, 42);
-        pool.shutdown().await;
-    }
-
-    /// Backpressure: with `cap=1` worker and `queue_capacity=1`, a second
-    /// submit blocks while the queue is full (the worker is busy, the single
-    /// slot is held) and resolves only once a worker pops a queued job and
-    /// frees space.
-    #[tokio::test]
-    async fn priority_pool_submit_blocks_when_queue_full() {
-        let rt = tokio_runtime();
-        let pool = Arc::new(PriorityResultPool::<i32, i32, String>::with_queue_capacity(
-            Arc::clone(&rt) as Arc<dyn Runtime>,
-            1,
-            1,
-            |job: i32| async move {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                Ok(job)
-            },
-        ));
-        // Job 1 is picked up by the single worker; job 2 fills the one slot.
-        let p1 = Arc::clone(&pool);
-        let f1 = tokio::spawn(async move { p1.submit(1, 0).await });
-        let p2 = Arc::clone(&pool);
-        let f2 = tokio::spawn(async move { p2.submit(2, 0).await });
-        // Give the worker time to grab job 1 and job 2 to land in the queue.
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        // Job 3 must block: queue full, worker busy on job 1.
-        let p3 = Arc::clone(&pool);
-        let f3 = tokio::spawn(async move { p3.submit(3, 0).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            !f3.is_finished(),
-            "submit must block while the queue is full (worker busy, slot held)"
-        );
-        // Once the worker finishes job 1 it pops job 2, freeing space for job 3.
-        assert_eq!(f1.await.unwrap().unwrap(), 1);
-        assert_eq!(f2.await.unwrap().unwrap(), 2);
-        assert_eq!(f3.await.unwrap().unwrap(), 3);
-        if let Ok(pool) = Arc::try_unwrap(pool) {
-            pool.shutdown().await;
-        }
+    async fn shutdown(self) {
+        PriorityResultPool::shutdown(self).await;
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/pool.rs"]
+mod tests;

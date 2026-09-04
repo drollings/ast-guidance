@@ -1,8 +1,0 @@
-{
-  "meta": {
-    "module": "src.coral.root",
-    "source": "src/coral/root.zig",
-    "language": "zig"
-  },
-  "comment": " coral/root.zig — Public API re-exports for the coral module.\n\n This root.zig provides a unified import point for the coral module,\n re-exporting all public submodules for convenient access."
-}

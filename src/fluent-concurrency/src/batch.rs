@@ -210,19 +210,29 @@ impl SupervisedBatch {
         let is_retryable = self.config.is_retryable;
         let backoff_base_ms = self.config.backoff_base_ms;
         let backoff_jitter_ms = self.config.backoff_jitter_ms;
-
-        let abort = self.join_set.spawn(async move {
-            execute_with_timeout_and_retry(
-                unit,
-                ctx,
-                max_retries,
-                timeout_ms,
-                is_retryable,
-                backoff_base_ms,
-                backoff_jitter_ms,
-            )
-            .await
-        });
+        // Q2: install the batch's capability set into the task-local for the
+        // lifetime of the task, mirroring `Scope::spawn`. Without this, any
+        // `check_capability` call inside `unit.execute` would see an empty
+        // `CURRENT_CAPS` and fail with `PermissionDenied` even though the
+        // caller supplied caps via `WorkContext`/`SupervisedBatch::new`.
+        // `register_with_context` may carry per-unit overrides, so we clone
+        // from the effective `ctx` rather than `self.caps`.
+        let caps_for_task = ctx.caps.clone();
+        let abort = self.join_set.spawn(fluent_wvr::capability::CURRENT_CAPS.scope(
+            caps_for_task,
+            async move {
+                execute_with_timeout_and_retry(
+                    unit,
+                    ctx,
+                    max_retries,
+                    timeout_ms,
+                    is_retryable,
+                    backoff_base_ms,
+                    backoff_jitter_ms,
+                )
+                .await
+            },
+        ));
 
         let id = abort.id();
         self.task_names.insert(id, name.clone());

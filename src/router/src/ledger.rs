@@ -38,16 +38,28 @@
 //! column holding the full serialized `ContentNode` (single source of truth
 //! for LOD/role metadata).
 
+pub mod correction_index;
+pub mod span_cache;
+pub mod annotations;
+pub mod frame_index;
+pub mod nlp;
 pub mod orchestrator;
+pub mod overlay;
+pub mod overlay_worker;
 pub mod prompt;
 pub mod tiering;
+pub mod workflow;
+pub mod workflow_store;
+
+#[cfg(test)]
+mod overlay_acceptance;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use fluent_db::error::DbError;
 use fluent_db::migrate::{ensure_column, Migration};
-use fluent_types::{ContentNode, NodeId};
+use fluent_types::{AnnotationClaim, ClaimStatus, ContentNode, NodeId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -60,6 +72,7 @@ use crate::views::{Lod, ParallelLedger};
 /// Node-construction helper moved to `ContentNodeStore`. Re-exported here so the
 /// facade's tests keep compiling unchanged.
 #[cfg(test)]
+#[allow(unused_imports)]
 pub(crate) use crate::node_store::new_node;
 
 /// LOD level of the full text. Always eager at node creation.
@@ -237,6 +250,46 @@ impl ContentNodeLedger {
         self.store.snapshot(node_id)
     }
 
+    /// Update an existing node's `metadata` (the review worker's
+    /// `review_status` write, §12.6).
+    pub fn update_node_metadata(
+        &self,
+        node_id: NodeId,
+        metadata: serde_json::Value,
+    ) -> Result<(), LedgerError> {
+        self.store.update_node_metadata(node_id, metadata)
+    }
+
+    /// Atomic review write (ROADMAP §12.6/§12.7, C4): the parse node's
+    /// `review_status` metadata update, the `parse_review` node (on a miss),
+    /// and the `interlingua_index` correction rows all commit in **one SQLite
+    /// transaction**, so a crash mid-review never half-applies. See
+    /// [`ContentNodeStore::apply_review`] for the parameter semantics.
+    pub(crate) fn apply_review(
+        &self,
+        parse_node_id: NodeId,
+        parse_metadata: serde_json::Value,
+        review_node: Option<&ContentNode>,
+        correction_rows: &[crate::ledger::correction_index::CorrectionRow],
+    ) -> Result<Option<NodeId>, LedgerError> {
+        self.store
+            .apply_review(parse_node_id, parse_metadata, review_node, correction_rows)
+    }
+
+    /// Write a tiered annotation claim against a node's **current content
+    /// hash** (ROADMAP M4). The public writer surface for the frame / review /
+    /// enrichment producers: it resolves the node's hash and routes the claim
+    /// to the `AnnotationStore`, so a later content mutation (new hash) makes
+    /// the claim unreachable — invalidation is keying, never a scheduler.
+    /// `Ok(None)` when the store has no durable backing (fail-open).
+    pub fn write_annotation(
+        &self,
+        node_id: NodeId,
+        claim: &AnnotationClaim,
+    ) -> Result<Option<ClaimStatus>, LedgerError> {
+        self.store.write_annotation(node_id, claim)
+    }
+
     /// All nodes for a session (canonical `ContentNode`s), most recent first.
     pub fn get_session_nodes(
         &self,
@@ -267,6 +320,7 @@ impl ContentNodeLedger {
     /// Panic while holding the durable connection mutex (test-only): exercises
     /// the poison-recovery path in `SqliteStore`'s `common_core::sync::lock`.
     #[cfg(test)]
+    #[allow(dead_code)]
     fn poison_conn(&self) {
         self.store.poison_conn();
     }
@@ -289,17 +343,23 @@ fn emit_write_audit(pattern: Option<&str>) {
 ///
 /// One migration per schema step: the base table + session index, then the
 /// three LOD-era columns (`label`, `lod`, `content_json`) that pre-LOD
-/// databases lack. Each column migration is a no-op when the column already
-/// exists, so a fresh database and an upgraded one converge.
+/// databases lack, then migration 5 (the interlingua tables). Each column
+/// migration is a no-op when the column already exists, so a fresh database
+/// and an upgraded one converge.
 ///
 /// Shared with `ContentNodeStore` (4B), which owns the durable backing now — the
 /// schema stays here as the single source of truth.
-pub(crate) fn ledger_migrations() -> [&'static dyn Migration; 4] {
+pub(crate) fn ledger_migrations() -> [&'static dyn Migration; 9] {
     [
         &LedgerBaseSchema,
         &LedgerLabelColumn,
         &LedgerLodColumn,
         &LedgerContentJsonColumn,
+        &LedgerInterlinguaSchema,
+        &LedgerInterlinguaSchemaV2,
+        &LedgerOverlayCandidatesSchema,
+        &LedgerAnnotationSchema,
+        &LedgerSpanCacheHexKey,
     ]
 }
 
@@ -386,6 +446,295 @@ impl Migration for LedgerContentJsonColumn {
     }
 }
 
+/// Migration 5 (ROADMAP §14.2/§14.3): the interlingua tables.
+///
+/// - `interlingua_index` — the router's durable **correction index** (the
+///   `CorrectionIndex` impl, §12.5) and the audit of which ids were attached
+///   to which parse node. PK `(node_id, interlingua_id, role)`: a parse node
+///   references each id at most once per role; the same `InterlinguaId` can
+///   appear on many nodes (indexed for cross-node lookup).
+/// - `interlingua_concepts` — the `SqliteConceptStore`'s materialized index of
+///   the YaGO taxonomy (C3's second home, reconciled with coral at boot).
+struct LedgerInterlinguaSchema;
+
+impl Migration for LedgerInterlinguaSchema {
+    fn version(&self) -> u32 {
+        5
+    }
+    fn name(&self) -> &str {
+        "ledger-interlingua-schema"
+    }
+    fn up(&self, tx: &mut rusqlite::Transaction<'_>) -> Result<(), DbError> {
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS interlingua_index (
+                node_id INTEGER NOT NULL,
+                interlingua_id INTEGER NOT NULL,
+                interlingua_source TEXT NOT NULL DEFAULT 'spacy_lemma',
+                role TEXT NOT NULL DEFAULT 'lemma',
+                confidence REAL,
+                review_status TEXT NOT NULL DEFAULT 'unreviewed',
+                corrections TEXT,               -- JSON: pattern-level correction cache (§12.5)
+                PRIMARY KEY (node_id, interlingua_id, role)
+            );
+            CREATE INDEX IF NOT EXISTS idx_interlingua_id
+                ON interlingua_index(interlingua_id, interlingua_source);
+
+            CREATE TABLE IF NOT EXISTS interlingua_concepts (
+                id INTEGER PRIMARY KEY,          -- InterlinguaId.as_i64()
+                namespace INTEGER NOT NULL,      -- u16
+                canonical_name TEXT NOT NULL,
+                yago_iri TEXT,
+                yago_class_iri TEXT,
+                label TEXT,
+                node_id INTEGER,                 -- full 64-bit NodeId (F5)
+                parent_class_id INTEGER,         -- InterlinguaId of the rdfs:subClassOf parent
+                UNIQUE (namespace, canonical_name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_concepts_namespace
+                ON interlingua_concepts(namespace);",
+        )
+        .map_err(DbError::from)?;
+        Ok(())
+    }
+}
+
+/// Migration 6 (red-team round 4, M2/M3): rebuild the two interlingua tables
+/// so columns mean what they say and a truncated-id collision no longer drops
+/// a canonical.
+///
+/// - **`interlingua_index`** gains a real `entity_id` column and the PK
+///   becomes `(node_id, interlingua_id, role, entity_id)`. The old schema
+///   overloaded `review_status` to hold the cache-scoping entity id as a
+///   string on the pattern-cache rows (`node_id = 0`, `role = 'correction'`);
+///   those are mapped to the real column with `review_status = 'cached'`.
+/// - **`interlingua_concepts`** keys on `(namespace, canonical_name)` (the
+///   canonical string, which resolves collisions) and `id` becomes a plain
+///   indexed column — two canonicals that collide on the 48-bit local id are
+///   both stored, matching the in-memory store's first-wins-with-both-canonicals
+///   semantics.
+///
+/// Table-rebuild (create-new → copy → drop → rename) so existing rows are
+/// preserved.
+struct LedgerInterlinguaSchemaV2;
+
+impl Migration for LedgerInterlinguaSchemaV2 {
+    fn version(&self) -> u32 {
+        6
+    }
+    fn name(&self) -> &str {
+        "ledger-interlingua-schema-v2"
+    }
+    fn up(&self, tx: &mut rusqlite::Transaction<'_>) -> Result<(), DbError> {
+        tx.execute_batch(
+            "-- Index names are schema-global in SQLite: drop the migration-5
+             -- indexes before recreating them on the rebuilt tables.
+             DROP INDEX IF EXISTS idx_interlingua_id;
+             DROP INDEX IF EXISTS idx_concepts_namespace;
+
+             CREATE TABLE interlingua_index_v2 (
+                node_id INTEGER NOT NULL,
+                interlingua_id INTEGER NOT NULL,
+                interlingua_source TEXT NOT NULL DEFAULT 'spacy_lemma',
+                role TEXT NOT NULL DEFAULT 'lemma',
+                entity_id INTEGER NOT NULL DEFAULT 0,   -- 0 = not entity-scoped
+                confidence REAL,
+                review_status TEXT NOT NULL DEFAULT 'unreviewed',
+                corrections TEXT,
+                PRIMARY KEY (node_id, interlingua_id, role, entity_id)
+            );
+            CREATE INDEX idx_interlingua_id
+                ON interlingua_index_v2(interlingua_id, interlingua_source);
+
+            -- Pattern-cache rows stored the entity id as a string in
+            -- `review_status`; map it to the real column and mark them cached.
+            INSERT INTO interlingua_index_v2
+                (node_id, interlingua_id, interlingua_source, role, entity_id,
+                 confidence, review_status, corrections)
+            SELECT node_id, interlingua_id, interlingua_source, role,
+                   CASE WHEN node_id = 0 AND role = 'correction'
+                        THEN CAST(COALESCE(NULLIF(review_status, ''), '0') AS INTEGER)
+                        ELSE 0 END,
+                   confidence,
+                   CASE WHEN node_id = 0 AND role = 'correction'
+                        THEN 'cached'
+                        ELSE review_status END,
+                   corrections
+            FROM interlingua_index;
+            DROP TABLE interlingua_index;
+            ALTER TABLE interlingua_index_v2 RENAME TO interlingua_index;
+
+            CREATE TABLE interlingua_concepts_v2 (
+                id INTEGER NOT NULL,                -- InterlinguaId.as_i64()
+                namespace INTEGER NOT NULL,         -- u16
+                canonical_name TEXT NOT NULL,
+                yago_iri TEXT,
+                yago_class_iri TEXT,
+                label TEXT,
+                node_id INTEGER,                    -- full 64-bit NodeId (F5)
+                parent_class_id INTEGER,            -- InterlinguaId of the rdfs:subClassOf parent
+                PRIMARY KEY (namespace, canonical_name)
+            );
+            CREATE INDEX idx_concepts_id ON interlingua_concepts_v2(id);
+            CREATE INDEX idx_concepts_namespace ON interlingua_concepts_v2(namespace);
+
+            INSERT INTO interlingua_concepts_v2
+                (id, namespace, canonical_name, yago_iri, yago_class_iri, label,
+                 node_id, parent_class_id)
+            SELECT id, namespace, canonical_name, yago_iri, yago_class_iri, label,
+                   node_id, parent_class_id
+            FROM interlingua_concepts;
+            DROP TABLE interlingua_concepts;
+            ALTER TABLE interlingua_concepts_v2 RENAME TO interlingua_concepts;",
+        )
+        .map_err(DbError::from)?;
+        Ok(())
+    }
+}
+
+/// Migration 7 (ROADMAP_20260827_ORT §6.1): the overlay/candidate plane.
+///
+/// `overlay_candidates` is the durable surface for async overlay outputs —
+/// entity links, PII-shaped spans, parse corrections, concept summaries. The
+/// async entity-link worker (M6.2) and future overlays write **candidates**
+/// here, never a runtime write to `TokenRecord.interlingua_entity_id` /
+/// `concept_ids`. It mirrors the `interlingua_index` conventions:
+///
+/// - **First-wins** on `(node_id, span_start, kind, entity_id)` — `INSERT OR
+///   IGNORE` keeps the first candidate for a given span/kind/entity, so a
+///   duplicate overlay pass never overwrites an accepted candidate.
+/// - **Id-membership**: a non-zero `entity_id` must resolve in
+///   `interlingua_concepts` (reconciled at boot — see `ledger/overlay.rs`).
+///
+/// `entity_id` is `0` when the candidate is not entity-shaped (e.g. a PII or
+/// parse-correction candidate), matching the `interlingua_index.entity_id`
+/// default-0 sentinel.
+struct LedgerOverlayCandidatesSchema;
+
+impl Migration for LedgerOverlayCandidatesSchema {
+    fn version(&self) -> u32 {
+        7
+    }
+    fn name(&self) -> &str {
+        "ledger-overlay-candidates-schema"
+    }
+    fn up(&self, tx: &mut rusqlite::Transaction<'_>) -> Result<(), DbError> {
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS overlay_candidates (
+                node_id INTEGER NOT NULL,
+                span_start INTEGER NOT NULL,
+                span_end INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                entity_id INTEGER NOT NULL DEFAULT 0,   -- 0 = not entity-shaped
+                score REAL,
+                source TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                PRIMARY KEY (node_id, span_start, kind, entity_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_overlay_node_kind
+                ON overlay_candidates(node_id, kind);
+            CREATE INDEX IF NOT EXISTS idx_overlay_status
+                ON overlay_candidates(status, entity_id);",
+        )
+        .map_err(DbError::from)?;
+        Ok(())
+    }
+}
+
+/// Migration 8 (ROADMAP M4): the tiered annotation table.
+///
+/// `ledger_annotations` is the durable surface for `AnnotationStore` claims —
+/// every annotation keyed to the node's `content_hash` (the version identity)
+/// and stamped with a producing `ProvenanceTier` and a `ClaimStatus`. One row
+/// per claim per node version (`claim_id`), so a higher-tier claim supersedes
+/// (never deletes) its predecessor and a hash change makes the old rows
+/// unreachable — no staleness scheduler.
+struct LedgerAnnotationSchema;
+
+impl Migration for LedgerAnnotationSchema {
+    fn version(&self) -> u32 {
+        8
+    }
+    fn name(&self) -> &str {
+        "ledger-annotations-schema"
+    }
+    fn up(&self, tx: &mut rusqlite::Transaction<'_>) -> Result<(), DbError> {
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS ledger_annotations (
+                content_hash INTEGER NOT NULL,   -- the node version identity (LOD0 hash)
+                claim_key TEXT NOT NULL,         -- the claim's identity within a version
+                claim_id INTEGER NOT NULL,       -- monotonic version within (hash, key)
+                tier TEXT NOT NULL,              -- ProvenanceTier (snake_case)
+                status TEXT NOT NULL,            -- ClaimStatus (provisional|confirmed|superseded)
+                payload TEXT NOT NULL,           -- the claim value (JSON)
+                produced_by TEXT NOT NULL,       -- legible producer label
+                produced_at INTEGER NOT NULL,    -- unix seconds
+                PRIMARY KEY (content_hash, claim_key, claim_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_ledger_annotations_active
+                ON ledger_annotations(content_hash, claim_key, claim_id);",
+        )
+        .map_err(DbError::from)?;
+        Ok(())
+    }
+}
+
+/// Migration 9 (R10): span-cache key as fixed-width hex TEXT (F7).
+///
+/// Stores the `u64` span key as `span_key TEXT = format!("{:016x}", key)` for
+/// `role='span_cache'` rows — the `i64` cast (`key as i64`) silently corrupts
+/// the upper half of the `u64` space (negative `interlingua_id`). Migration
+/// rebuilds `interlingua_index` to include `span_key` in the primary key so
+/// span-cache rows are keyed by hex (no `i64` truncation) while other roles
+/// keep `span_key = ''`.
+struct LedgerSpanCacheHexKey;
+
+impl Migration for LedgerSpanCacheHexKey {
+    fn version(&self) -> u32 {
+        9
+    }
+    fn name(&self) -> &str {
+        "ledger-span-cache-hex-key"
+    }
+    fn up(&self, tx: &mut rusqlite::Transaction<'_>) -> Result<(), DbError> {
+        tx.execute_batch(
+            "DROP INDEX IF EXISTS idx_interlingua_id;
+             DROP INDEX IF EXISTS idx_interlingua_span_key;
+             DROP INDEX IF EXISTS idx_interlingua_span_cache;
+             CREATE TABLE interlingua_index_new (
+                 node_id INTEGER NOT NULL,
+                 interlingua_id INTEGER NOT NULL DEFAULT 0,
+                 interlingua_source TEXT NOT NULL DEFAULT 'spacy_lemma',
+                 role TEXT NOT NULL DEFAULT 'lemma',
+                 entity_id INTEGER NOT NULL DEFAULT 0,
+                 confidence REAL,
+                 review_status TEXT NOT NULL DEFAULT 'unreviewed',
+                 corrections TEXT,
+                 span_key TEXT NOT NULL DEFAULT '',
+                 PRIMARY KEY (node_id, interlingua_id, span_key, role, entity_id)
+             );
+             CREATE INDEX idx_interlingua_id
+                 ON interlingua_index_new(interlingua_id, interlingua_source);
+             CREATE INDEX idx_interlingua_span_key
+                 ON interlingua_index_new(span_key);
+             CREATE UNIQUE INDEX idx_interlingua_span_cache
+                 ON interlingua_index_new(node_id, span_key, role, entity_id)
+                 WHERE role = 'span_cache';
+             INSERT INTO interlingua_index_new
+                 (node_id, interlingua_id, interlingua_source, role, entity_id,
+                  confidence, review_status, corrections, span_key)
+             SELECT node_id, interlingua_id, interlingua_source, role, entity_id,
+                    confidence, review_status, corrections,
+                    CASE WHEN role = 'span_cache' THEN printf('%016x', interlingua_id) ELSE '' END
+             FROM interlingua_index;
+             DROP TABLE interlingua_index;
+             ALTER TABLE interlingua_index_new RENAME TO interlingua_index;",
+        )
+        .map_err(DbError::from)?;
+        Ok(())
+    }
+}
+
 // ── LOD compaction policy ─────────────────────────────────────────────────
 //
 // Moved here from the deleted standalone `compaction.rs`: compaction is
@@ -445,374 +794,5 @@ impl CompactionStrategy for NoopCompaction {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use common_core::hash::uuid_v4;
-    use crate::test_support::capture_logs;
-
-    fn temp_ledger() -> ContentNodeLedger {
-        let dir = std::env::temp_dir().join(format!("coral-router-ledger-{}", uuid_v4()));
-        let ledger = ContentNodeLedger::open(&dir).unwrap();
-        let _ = std::fs::remove_file(&dir);
-        ledger
-    }
-
-    #[test]
-    fn record_and_fetch_roundtrip() {
-        let ledger = temp_ledger();
-        let id = ledger.record_request("sess-1", "req-1", "hello").unwrap();
-        ledger.record_result(id, true, Some(1.0), "reply").unwrap();
-        let entries = ledger.get_session_entries("sess-1", 10).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].content, "reply");
-        assert!(entries[0].accepted);
-    }
-
-    #[test]
-    fn get_node_single_format_no_flat_hydration_fallback() {
-        let ledger = temp_ledger();
-        // Simulate a migrated pre-LOD row: the flat projection is populated
-        // but `content_json` is still the '{}' placeholder. The canonical
-        // read (`get_node`) must return `None` — the dual-format hydration
-        // fallback is retired; only `get_session_entries` (the flat
-        // audit view) reads columns directly. The row is inserted after
-        // hydration, so the in-memory maps never see it.
-        let store = ledger.node_store().durable().unwrap();
-        store
-            .execute(
-                "INSERT INTO ledger (node_id, session_id, request_id, role, content,
-                                     turn_index, accepted, active_lod, metadata, created_at,
-                                     label, lod, content_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                rusqlite::params![
-                    99_i64,
-                    "sess-pre-lod",
-                    "req-pre-lod",
-                    "user",
-                    "legacy flat content",
-                    0_i64,
-                    1_i64,
-                    0_i64,
-                    "{}",
-                    0_i64,
-                    "legacy label",
-                    "[]",
-                    "{}",
-                ],
-            )
-            .unwrap();
-
-        let id = NodeId::from_int(99);
-        assert!(
-            ledger.get_node(id).is_none(),
-            "unparseable content_json -> None"
-        );
-
-        let entries = ledger.get_session_entries("sess-pre-lod", 10).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].content, "legacy flat content");
-    }
-
-    #[test]
-    fn poisoned_db_mutex_recovers() {
-        let ledger = temp_ledger();
-        // Poison the db mutex by panicking while it is held.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ledger.poison_conn();
-        }));
-        // Subsequent calls must still succeed via the poison-recovery helper.
-        let id = ledger
-            .record_request("sess-p", "req-p", "after-poison")
-            .unwrap();
-        ledger
-            .record_result(id, false, Some(0.0), "recovered")
-            .unwrap();
-        let entries = ledger.get_session_entries("sess-p", 10).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].content, "recovered");
-    }
-
-    #[test]
-    fn lod0_and_lod5_eager_at_creation() {
-        let ledger = temp_ledger();
-        let id = ledger
-            .record_request(
-                "sess-1",
-                "req-1",
-                "Hello world. This is a longer user message.",
-            )
-            .unwrap();
-        let node = ledger.get_node(id).unwrap();
-
-        // LOD0 full text + LOD5 label eager.
-        assert_eq!(node.lod[0], "Hello world. This is a longer user message.");
-        assert_eq!(node.lod[5], "Hello world.");
-        // LOD1–4 stay empty until derived lazily.
-        assert!(node.lod[1].is_empty());
-        assert!(node.lod[4].is_empty());
-        assert_eq!(node.active_lod, Some(LOD0_FULL_TEXT));
-    }
-
-    #[test]
-    fn record_content_node_stores_canonical_type() {
-        let ledger = temp_ledger();
-        let mut node = new_node(
-            NodeId::from_int(7),
-            "sess-2",
-            "req-2",
-            "assistant",
-            "An accepted assistant answer.",
-            Some(true),
-        );
-        node.acceptance_score = Some(0.9);
-        node.step_id = Some("step-1".into());
-        let id = ledger.record_content_node(&node).unwrap();
-
-        let fetched = ledger.get_node(id).unwrap();
-        assert_eq!(fetched.role.as_deref(), Some("assistant"));
-        assert_eq!(fetched.acceptance_score, Some(0.9));
-        assert_eq!(fetched.step_id.as_deref(), Some("step-1"));
-        assert_eq!(fetched.lod[5], "An accepted assistant answer.");
-        // LOD0/LOD5 guaranteed even if the caller forgot them.
-        assert_eq!(fetched.lod[0], "An accepted assistant answer.");
-    }
-
-    #[test]
-    fn session_nodes_most_recent_first() {
-        let ledger = temp_ledger();
-        ledger.record_request("sess-3", "r1", "first").unwrap();
-        ledger.record_request("sess-3", "r2", "second").unwrap();
-
-        let nodes = ledger.get_session_nodes("sess-3", 10).unwrap();
-        assert_eq!(nodes.len(), 2);
-        assert_eq!(nodes[0].request_id.as_deref(), Some("r2"));
-        assert_eq!(nodes[1].request_id.as_deref(), Some("r1"));
-    }
-
-    #[test]
-    fn ensure_lod_requires_summarizer() {
-        let ledger = temp_ledger();
-        let id = ledger.record_request("sess-4", "r1", "some text").unwrap();
-        assert!(matches!(
-            ledger.ensure_lod(id, 2),
-            Err(LedgerError::NoSummarizer)
-        ));
-        assert!(matches!(
-            ledger.ensure_lod(id, 0),
-            Err(LedgerError::InvalidLod(0))
-        ));
-    }
-
-    #[test]
-    fn ensure_lod_derives_from_lod0_and_caches() {
-        use crate::test_stubs::StubChatBackend;
-        use std::sync::Arc;
-
-        let client: Arc<dyn fluent_llm::client::ChatBackend> =
-            Arc::new(StubChatBackend::always("lazy LOD summary"));
-        let summarizer = Summarizer::new(client, 20);
-        let ledger = temp_ledger().with_summarizer(summarizer);
-
-        let id = ledger
-            .record_request(
-                "sess-5",
-                "r1",
-                "The full text that must be summarized from LOD0 only.",
-            )
-            .unwrap();
-
-        let node = ledger.ensure_lod(id, 2).unwrap();
-        assert_eq!(node.lod[2], "lazy LOD summary");
-        // Cached: a second derivation hits the cache, not the LLM.
-        let node2 = ledger.ensure_lod(id, 2).unwrap();
-        assert_eq!(node2.lod[2], "lazy LOD summary");
-        // LOD0 is untouched by derivation (never chained from a lower tier).
-        let node3 = ledger.get_node(id).unwrap();
-        assert_eq!(
-            node3.lod[0],
-            "The full text that must be summarized from LOD0 only."
-        );
-    }
-
-    #[test]
-    fn compact_session_demotes_oldest_nodes() {
-        let ledger = temp_ledger();
-        for i in 0..5 {
-            ledger
-                .record_request("sess-6", &format!("r{i}"), &format!("message {i}"))
-                .unwrap();
-        }
-
-        let demoted = ledger.compact_session("sess-6", 4).unwrap();
-        assert!(!demoted.is_empty(), "some nodes must be demoted");
-        let nodes = ledger.get_session_nodes("sess-6", 10).unwrap();
-        // Newest node stays at full detail; oldest is demoted to LOD3.
-        let newest = nodes
-            .iter()
-            .find(|n| n.request_id.as_deref() == Some("r4"))
-            .unwrap();
-        assert_eq!(newest.active_lod, Some(0));
-        let oldest = nodes
-            .iter()
-            .find(|n| n.request_id.as_deref() == Some("r0"))
-            .unwrap();
-        assert_eq!(oldest.active_lod, Some(3));
-    }
-
-    #[test]
-    fn recency_compaction_under_max() {
-        let nodes = make_nodes(3);
-        let lods = RecencyCompaction.select_lod(&nodes, 10);
-        assert_eq!(lods, vec![0, 0, 0]);
-    }
-
-    #[test]
-    fn recency_compaction_over_max() {
-        let nodes = make_nodes(8);
-        let lods = RecencyCompaction.select_lod(&nodes, 4);
-        assert_eq!(lods[0], 3);
-        assert_eq!(lods[1], 3);
-        assert_eq!(lods[7], 0);
-    }
-
-    #[test]
-    fn noop_compaction() {
-        let nodes = make_nodes(100);
-        let lods = NoopCompaction.select_lod(&nodes, 10);
-        assert!(lods.iter().all(|&l| l == 0));
-    }
-
-    fn make_nodes(count: usize) -> Vec<ContentNode> {
-        (0..count)
-            .map(|i| {
-                new_node(
-                    NodeId::from_int(i as i64),
-                    "test",
-                    &format!("req-{i}"),
-                    "user",
-                    &format!("node {i}"),
-                    Some(true),
-                )
-            })
-            .collect()
-    }
-
-    // ── Write-path guard (facade scrub) ────────────────────────────────
-
-    #[test]
-    fn record_request_scrubs_email_and_emits_audit() {
-        let ledger = temp_ledger();
-        let (id, logs) = capture_logs(|| {
-            ledger
-                .record_request("sess-guard", "r1", "Contact user@example.com now")
-                .unwrap()
-        });
-        let _ = id;
-        let joined = logs.join("\n");
-        assert!(
-            joined.contains("router.audit")
-                && joined.contains("write_path")
-                && joined.contains("email"),
-            "flagged write must emit a write-path audit, logs:\n{joined}"
-        );
-
-        let entries = ledger.get_session_entries("sess-guard", 10).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].content, "Contact [REDACTED:email] now");
-        assert!(
-            !entries[0].content.contains("user@example.com"),
-            "durable content must be scrubbed"
-        );
-    }
-
-    #[test]
-    fn record_result_scrubs_phone() {
-        let ledger = temp_ledger();
-        let id = ledger
-            .record_request("sess-guard-r", "r1", "What number?")
-            .unwrap();
-        ledger
-            .record_result(id, true, Some(1.0), "Call 555-123-4567 to reach us.")
-            .unwrap();
-
-        let node = ledger.get_node(id).unwrap();
-        assert_eq!(node.lod[0], "Call [REDACTED:phone] to reach us.");
-        let entries = ledger.get_session_entries("sess-guard-r", 10).unwrap();
-        assert_eq!(entries[0].content, "Call [REDACTED:phone] to reach us.");
-    }
-
-    #[test]
-    fn record_content_node_scrubs_api_key_to_reject_marker() {
-        let ledger = temp_ledger();
-        let mut node = new_node(
-            NodeId::from_int(101),
-            "sess-guard-c",
-            "r1",
-            "assistant",
-            "the token is api_key = super_secret_value_123",
-            Some(true),
-        );
-        node.acceptance_score = Some(0.9);
-        let id = ledger.record_content_node(&node).unwrap();
-
-        let fetched = ledger.get_node(id).unwrap();
-        assert_eq!(fetched.lod[0], "[rejected: api_key]");
-        assert_eq!(fetched.acceptance_score, Some(0.9));
-    }
-
-    #[test]
-    fn clean_write_is_not_flagged() {
-        let ledger = temp_ledger();
-        let (_, logs) = capture_logs(|| {
-            ledger
-                .record_request("sess-guard-clean", "r1", "plain text, no pii")
-                .unwrap()
-        });
-        let joined = logs.join("\n");
-        assert!(
-            !joined.contains("write_path"),
-            "clean writes must not emit a write-path audit, logs:\n{joined}"
-        );
-        let entries = ledger.get_session_entries("sess-guard-clean", 10).unwrap();
-        assert_eq!(entries[0].content, "plain text, no pii");
-    }
-
-    #[test]
-    fn render_session_renders_three_nodes_as_three_lines() {
-        let ledger = temp_ledger();
-        ledger
-            .record_request("sess-render", "r1", "first node text")
-            .unwrap();
-        ledger
-            .record_request("sess-render", "r2", "second node text")
-            .unwrap();
-        ledger
-            .record_request("sess-render", "r3", "third node text")
-            .unwrap();
-
-        let rendered = ledger.render_session("sess-render", Lod::LOD0);
-        let lines: Vec<&str> = rendered.lines().collect();
-        assert_eq!(lines.len(), 3, "3 nodes -> 3 lines, got: {rendered}");
-        assert!(lines.contains(&"first node text"));
-        assert!(lines.contains(&"second node text"));
-        assert!(lines.contains(&"third node text"));
-    }
-
-    #[test]
-    fn render_session_renders_collapsed_node_lod0() {
-        let ledger = temp_ledger();
-        let id = ledger
-            .record_request("sess-collapse", "r1", "original long content")
-            .unwrap();
-        ledger
-            .collapse_node(id, "collapsed summary", LOD0_FULL_TEXT)
-            .unwrap();
-
-        // Compaction mutates LOD0, so a LOD0 view shows the collapsed text —
-        // the fidelity policy never "defeats" compaction.
-        assert_eq!(
-            ledger.render_session("sess-collapse", Lod::LOD0),
-            "collapsed summary"
-        );
-    }
-}
+#[path = "../tests/ledger.rs"]
+mod tests;

@@ -842,3 +842,82 @@ fn impl_fieldless_generic_arm_works() {
     assert!(wrapped.field_names().is_empty());
     assert!(wrapped.get_field("x").is_err());
 }
+
+#[test]
+fn scaffold_types_still_compile() {
+    // Assert each scaffold type is Send+Sync and appears in compilation.
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<crate::traits::FieldSchema>();
+    assert_send_sync::<crate::dynamic::DynamicComponent>();
+    // Ensure scaffold trait names exist (compiles if traits exist, even without impls).
+    #[allow(dead_code)]
+    fn assert_trait_exists<T: crate::traits::PersistableComponent + Send + Sync>() {}
+    #[allow(dead_code)]
+    fn assert_schema_provider<T: crate::traits::SchemaProvider + Send + Sync>() {}
+    // Types from fluent-concurrency are checked via their own crate tests; here we just ensure this crate's scaffolds compile.
+    let _ = crate::traits::FieldSchema {
+        name: "x".into(),
+        type_name: "String".into(),
+        description: None,
+        min: None,
+        max: None,
+        required: true,
+        format: None,
+        max_len: None,
+        sanitize: None,
+        pattern: None,
+        coerce: None,
+        parse: None,
+    };
+}
+
+#[test]
+fn scaffold_sunset_doc_has_five_rows() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../..//doc/ROADMAP_SCAFFOLD_SUNSET.md");
+    // Try two relative locations: crate manifest is src/fluent-wvr, doc is at workspace root.
+    let candidates = [
+        std::path::Path::new(path),
+        std::path::Path::new("doc/ROADMAP_SCAFFOLD_SUNSET.md"),
+        std::path::Path::new("../doc/ROADMAP_SCAFFOLD_SUNSET.md"),
+        std::path::Path::new("../../doc/ROADMAP_SCAFFOLD_SUNSET.md"),
+    ];
+    let mut content = None;
+    for p in candidates {
+        if let Ok(s) = std::fs::read_to_string(p) {
+            content = Some(s);
+            break;
+        }
+    }
+    // Fallback: try workspace root via current dir
+    let content = content
+        .or_else(|| std::fs::read_to_string("doc/ROADMAP_SCAFFOLD_SUNSET.md").ok())
+        .or_else(|| {
+            // cargo test runs with cwd = crate dir? try parent traversal
+            std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../doc/ROADMAP_SCAFFOLD_SUNSET.md"),
+            )
+            .ok()
+        })
+        .expect("ROADMAP_SCAFFOLD_SUNSET.md should exist");
+    // Count data rows: lines starting with "| " that are not header/separator and contain scaffold type names.
+    let data_rows = content
+        .lines()
+        .filter(|l| {
+            l.starts_with("| ") || l.starts_with("|1") || l.starts_with("|2") || l.starts_with("|3")
+        })
+        .filter(|l| l.contains("PersistableComponent") || l.contains("SchemaProvider") || l.contains("DynamicComponent") || l.contains("PartitionedRouter") || l.contains("Reserve"))
+        .count();
+    // Alternative: count table rows that are data (exclude header)
+    let total_pipe_rows = content.lines().filter(|l| l.trim_start().starts_with('|')).count();
+    // Header + separator + 5 data rows = 7 pipe rows (or more if extra). Ensure at least 5 scaffold entries.
+    assert!(
+        data_rows >= 5 || total_pipe_rows >= 7,
+        "expected 5 scaffold rows in ROADMAP_SCAFFOLD_SUNSET.md, got data_rows={data_rows} total_pipe_rows={total_pipe_rows} content:\n{content}"
+    );
+    assert!(content.contains("PersistableComponent"));
+    assert!(content.contains("SchemaProvider"));
+    assert!(content.contains("DynamicComponent"));
+    assert!(content.contains("PartitionedRouter"));
+    assert!(content.contains("Reserve"));
+}

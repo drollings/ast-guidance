@@ -96,7 +96,12 @@ routed onward after the local ladder has failed.
   frontier decision produces a legible reason alongside its verdict, written
   to a durably-retained audit stream distinct from routine operational logs.
   A rejected, redirected, or escalated request should be explainable after
-  the fact without guesswork.
+  the fact without guesswork. Ledger annotations carry provenance tiers
+  (`Deterministic < LocalModel < Frontier < HumanReview`, in `fluent-types`):
+  a higher-tier claim supersedes a lower one for the same node version (never
+  silently coexists), and claims are keyed to the node's content hash so a
+  content mutation invalidates them by keying — a ledger that can always say
+  *who decided what, and when it stopped being current*.
 
 - **Own the serving processes, route everything else.** Coral Router spawns
   and supervises one `llama-server` per model weights file — found on `$PATH`
@@ -332,7 +337,10 @@ one-time cost that amortizes across similar queries.
 
 > **Status: Implemented.** One `llama-server` per weights file, free localhost
 > ports, on-demand residency with LRU+size eviction, and graceful shutdown are
-> all live — see ARCHITECTURE.md §Instance pools.
+> all live — see ARCHITECTURE.md §Instance pools. The in-process ONNX fleet on
+> the CPU shares the same `LlmWeights`/`LlmContext`/`LlmKVCache` base, the same
+> residency engine, and the single `ChatBackend` wiring point — see "The ONNX
+> fleet" below.
 
 Local models are not reached through a third-party gateway: Coral Router owns
 the serving processes. It spawns and supervises one `llama-server` process per
@@ -411,19 +419,64 @@ This is what makes the fleet coherent: the router keeps the fastest, most
 relevant model resident for the traffic it actually serves, and spends the
 rest of device memory the moment a request earns it — never before.
 
+### The ONNX fleet: a CPU-resident sibling with the same residency policy
+
+> **Status: Implemented.** One generative `CausalLm` session per declared
+> `onnx` role, served in-process by the `ort` runtime on the CPU, with the
+> same unload-from-memory residency semantics as the llama fleet — driven by
+> the same shared `LlmWeights`/`LlmContext`/`LlmKVCache` base and the single
+> `LlmResidencyEngine` (`fluent-llm::runtime`), not a sibling task.
+
+The generative ONNX model is a first-class serving surface, not a bolted-on
+classifier: an `ort` session (currently the general-purpose LFM2.5-2.6B
+checkpoint at `/ai/models/lfm2/2.6b/LiquidAI/LFM2.5-2.6B-ONNX`, q4) runs
+**in-process on the CPU** (`execution_provider: cpu`, `intra_threads: 1` for
+deterministic decode) and is reached exclusively through the
+`fluent_llm::client::ChatBackend` seam — the **single wiring point** for the
+LLM annotation rung, the review worker, and ledger enrichment. Nothing in the
+router reaches the onnx session by any other path, so a future task-specific
+backend drops in behind the same seam without touching the consumers.
+
+- **Shared runtime base.** Both fleets present through the same
+  `fluent-llm::runtime` traits — `LlmWeights` (one loaded weights instance),
+  `LlmContext` (one named context window with its own KV), `LlmKVCache`
+  (snapshot/restore/list/delete). The generative onnx role serves **named
+  contexts** from an in-process `OnnxContextPool` (one weights load, N context
+  windows, per-context KV — the defining capability of the llama fork), and a
+  single `LlmResidencyEngine` runs one pass over the whole fleet with injected
+  per-fleet budgets (VRAM for llama, CPU RAM for onnx) and eviction orderings.
+- **Residency parity.** The shared engine applies the same policy the VRAM
+  fleet has: idle release past a per-role `sleep_idle_seconds`, LRU-largest
+  working-set eviction against `onnx_working_set_budget_bytes`, and
+  `pinned`/`Always` entries never released. A model that is not earning its
+  memory is unloaded again — parity for CPU RAM, in the same loop.
+- **CPU/GPU concurrency.** Because onnx sessions live in-process on the CPU and
+  the llama fleet owns the GPU, both run concurrently. A CPU decode is bounded
+  by the router's `Limiter` (the thread-budget rule) and runs on worker
+  threads, so it never blocks the async executor or starves a GPU dispatch.
+- **Grammar-constrained decoding.** Every structured call through the onnx
+  backend (annotation, review, frame resolution, ranking) requests
+  `response_format.schema`; the decode is constrained by a structural JSON
+  automaton so invalid output shapes are prevented at generation time, not
+  rejected post-hoc.
+
 - **Routing fields.** Every generation request may carry `model`, `instance`,
-  `snapshot`, and `id_slot` from the JSON body or the query string (the body
-  wins). Coral Router resolves the model id to its owning server and forwards
-  the remainder, so a conversation can switch KV snapshots in and out of a
-  slot without re-prefilling.
+  `snapshot`, `id_slot`, and `num_ctx` from the JSON body or the query string
+  (the body wins). Coral Router resolves the model id to its owning server and
+  forwards the remainder, so a conversation can switch KV snapshots in and out
+  of a slot without re-prefilling. A `num_ctx` need beyond a context's `max_ctx`
+  is rejected loudly (resize-to-demand grows the window up to `max_ctx`; the
+  cap bounds it), never silently truncated.
 
 ## The Ledger: Content Nodes and levels of detail
 
 > **Status: Implemented (core) + Partial (agent layer).** The store, LOD
 > lifecycle, views, and scrub path are live. The background tier worker and
 > agent coordinator (`ledger/{tiering,prompt,orchestrator}.rs`) exist but are
-> opt-in via config; the workflow-learning replay from recorded `node_plan`
-> metadata is Design-only. See ARCHITECTURE.md §Ledger.
+> opt-in via config; the arc_ready annotation overlays (spacy annotation, LLM
+> enrichment, embedding — `ledger/overlay_worker.rs`, opt-in via
+> `overlay.arc_ready`) are live; the workflow-learning replay from recorded
+> `node_plan` metadata is Design-only. See ARCHITECTURE.md §Ledger.
 
 Every paragraph, prompt, tool result, or intermediate artifact is stored as a
 **Content Node** — the game-engine concept of level-of-detail applied to

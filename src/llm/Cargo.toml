@@ -1,4 +1,6 @@
 [package]
+autotests = false
+autobenches = false
 name = "fluent-llm"
 version.workspace = true
 edition.workspace = true
@@ -18,12 +20,62 @@ reqwest = { workspace = true }
 bon = { workspace = true }
 async-trait = { workspace = true }
 lru = { workspace = true }
+rusqlite = { workspace = true }
 
 [dev-dependencies]
 httpmock = { workspace = true }
+# Test-only unification: the `embeddings_cache` parity test exercises the
+# M5–M10 deprecated `common_core::sqlite` shims, which need the `sqlite`
+# feature. Normal builds keep `common-core` at `["http"]` only.
+common-core = { path = "../common-core", features = ["sqlite"] }
 
 [features]
 live-ai = []
+
+[[test]]
+name = "constants"
+path = "tests/constants.rs"
+
+[[test]]
+name = "no_domain_imports"
+path = "tests/no_domain_imports.rs"
+
+[[test]]
+name = "openai"
+path = "tests/openai.rs"
+
+[[test]]
+name = "thinking"
+path = "tests/thinking.rs"
+
+[[test]]
+name = "sse"
+path = "tests/sse.rs"
+
+[[test]]
+name = "cache"
+path = "tests/cache.rs"
+
+[[test]]
+name = "embeddings_cache"
+path = "tests/embeddings_cache.rs"
+
+[[test]]
+name = "tokens"
+path = "tests/tokens.rs"
+
+[[test]]
+name = "telemetry"
+path = "tests/telemetry.rs"
+
+[[test]]
+name = "protocol_parity"
+path = "tests/protocol_parity.rs"
+
+[[test]]
+name = "calibration"
+path = "tests/calibration.rs"
+
 
 [lints]
 workspace = true

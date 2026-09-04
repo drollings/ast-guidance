@@ -1,8 +1,0 @@
-{
-  "meta": {
-    "module": "src.vector.simhash_projections",
-    "source": "src/vector/simhash_projections.zig",
-    "language": "zig"
-  },
-  "used_by": ["src/vector/simhash.zig"]
-}

@@ -11,18 +11,11 @@ pub(super) fn emit_audit(
     trigger: &str,
     extra: &serde_json::Value,
 ) {
-    let mut record = serde_json::json!({
-        "mode": mode,
-        "accepted": accepted,
-        "payload": payload,
-        "raw_response": raw_response,
-        "trigger": trigger,
-        "timestamp": common_core::now_secs(),
-    });
+    let mut base = crate::audit::AuditRecord::escalation(mode, accepted, payload, raw_response, trigger);
     if let Some(obj) = extra.as_object() {
         for (k, v) in obj {
-            record[k] = v.clone();
+            base.detail[k] = v.clone();
         }
     }
-    crate::audit::emit("escalation", record);
+    base.emit();
 }

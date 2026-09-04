@@ -2,6 +2,7 @@
 //! Router through its HTTP API.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -85,49 +86,136 @@ pub async fn ps(ctx: &CliContext, api_url: Option<&str>, config_path: Option<&Pa
     Ok(())
 }
 
-fn print_weight_block(
+pub(crate) fn print_weight_block(
     config: Option<&RouterConfig>,
     gguf_dir: &Path,
     model_key: &str,
     insts: &[Value],
 ) {
+    print!("{}", render_weight_block(config, gguf_dir, model_key, insts));
+}
+
+/// Render one model's `ps` block. The llama block is byte-identical to the
+/// pre-M4 layout (weights / instances / total resident, `ctx-mem` = VRAM); an
+/// onnx key (rows carry `runtime: onnx`) renders the same layout with a
+/// `(onnx)` marker and the RAM memory column (`ram-mem` from `total_bytes`).
+pub(crate) fn render_weight_block(
+    config: Option<&RouterConfig>,
+    gguf_dir: &Path,
+    model_key: &str,
+    insts: &[Value],
+) -> String {
+    let mut out = String::new();
     // Weights footprint: the router's reported shared-weights bytes
     // (`model_bytes`, carried on every instance) is authoritative for a
     // managed model; fall back to the configured weights file size, then the
     // GGUF layout, for standalone/remote models with no instance detail.
     let weights_bytes = model_weights_bytes(insts, config, gguf_dir, model_key);
-    let gguf_file = config_weights_path(config, model_key).or_else(|| gguf_weights_path(gguf_dir, model_key));
+    // An onnx model's rows carry `runtime: onnx` (the unified `/instances`
+    // envelope): its memory column is RAM (`total_bytes`) not VRAM.
+    let is_onnx = insts
+        .iter()
+        .any(|i| i.get("runtime").and_then(Value::as_str) == Some("onnx"));
     let ctx_mem_sum: u64 = insts
         .iter()
-        .map(|i| i.get("vram_bytes").and_then(Value::as_u64).unwrap_or(0))
+        .map(|i| {
+            let mem = if is_onnx { "total_bytes" } else { "vram_bytes" };
+            i.get(mem).and_then(Value::as_u64).unwrap_or(0)
+        })
         .sum();
 
-    let (short_id, arch) = match &gguf_file {
-        Some(path) => (
-            compute_short_id(path),
-            read_gguf_metadata(path)
-                .get("general.architecture")
-                .and_then(Value::as_str)
-                .unwrap_or("?")
-                .to_string(),
-        ),
-        None => ("?".repeat(12), "?".to_string()),
-    };
-    let tag = gguf_file
-        .as_ref()
-        .and_then(|p| p.file_stem())
-        .map_or_else(String::new, |s| s.to_string_lossy().to_lowercase());
-    let quant = if tag.is_empty() || tag == "latest" {
-        "-".to_string()
-    } else {
-        tag.clone()
-    };
-    let display = ollama_display(model_key, &tag);
+    if is_onnx {
+        // Onnx block: same layout/labels as llama except the runtime marker
+        // and the RAM memory column. Added only for onnx keys.
+        let _ = writeln!(out, "{}  (onnx)", ollama_display(model_key, ""));
+        let _ = writeln!(out, "  weights   {:>12}", format_size(weights_bytes));
+        if !insts.is_empty() {
+            out.push_str("  instances\n");
+            for inst in insts {
+                let raw_id = inst.get("id").and_then(Value::as_str).unwrap_or_default();
+                let name = raw_id
+                    .strip_prefix(&format!("{model_key}:"))
+                    .unwrap_or(raw_id)
+                    .to_string();
+                let n_ctx = inst
+                    .get("n_ctx")
+                    .and_then(Value::as_u64)
+                    .map_or_else(|| "?".to_string(), |v| v.to_string());
+                let par = inst
+                    .get("parallel")
+                    .and_then(Value::as_u64)
+                    .map_or_else(|| "?".to_string(), |v| v.to_string());
+                let state = inst.get("state").and_then(Value::as_str).unwrap_or("?");
+                let sleep = inst_sleep_label(inst);
+                let mem = format_size(inst.get("total_bytes").and_then(Value::as_u64).unwrap_or(0));
+                let resume = if inst.get("resume").and_then(Value::as_bool).unwrap_or(false) {
+                    "resume"
+                } else {
+                    "-"
+                };
+                let _ = writeln!(
+                    out,
+                    "    {name:<16}  ctx {n_ctx:>7}  par {par:>3}  resume {resume:<6}  sleep {sleep:<9}  state {state:<9}  ram-mem {mem:>10}"
+                );
+            }
+        }
+        let _ = writeln!(
+            out,
+            "  total     {:>12} resident (weights + contexts)",
+            format_size(weights_bytes.saturating_add(ctx_mem_sum))
+        );
+        out.push('\n');
+        return out;
+    }
 
-    println!("{display}  (id={short_id}, arch={arch}, quant={quant})");
-    println!("  weights   {:>12}", format_size(weights_bytes));
+    let gguf_file = config_weights_path(config, model_key).or_else(|| gguf_weights_path(gguf_dir, model_key));
+
+    // Weights identity. The router overlays `short_id`/`arch`/`quant` on the
+    // `/instances` rows from the file IT loaded — authoritative even when the
+    // weights file isn't on the CLI's host. Fall back to local resolution
+    // (config path or GGUF layout) only when the router didn't report it.
+    let identity_from_insts = insts
+        .iter()
+        .find(|i| {
+            i.get("short_id")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        });
+    let (short_id, arch, quant) = if let Some(inst) = identity_from_insts {
+        (
+            inst.get("short_id").and_then(Value::as_str).unwrap_or("").to_string(),
+            inst.get("arch").and_then(Value::as_str).unwrap_or("").to_string(),
+            inst.get("quant").and_then(Value::as_str).unwrap_or("").to_string(),
+        )
+    } else {
+        let (sid, arc) = match &gguf_file {
+            Some(path) => (
+                compute_short_id(path),
+                read_gguf_metadata(path)
+                    .get("general.architecture")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string(),
+            ),
+            None => ("?".repeat(12), "?".to_string()),
+        };
+        let tag = gguf_file
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map_or_else(String::new, |s| s.to_string_lossy().to_lowercase());
+        let quant = if tag.is_empty() || tag == "latest" {
+            "-".to_string()
+        } else {
+            tag.clone()
+        };
+        (sid, arc, quant)
+    };
+    let display = ollama_display(model_key, &quant);
+
+    let _ = writeln!(out, "{display}  (id={short_id}, arch={arch}, quant={quant})");
+    let _ = writeln!(out, "  weights   {:>12}", format_size(weights_bytes));
     if !insts.is_empty() {
-        println!("  instances");
+        out.push_str("  instances\n");
         for inst in insts {
             let raw_id = inst.get("id").and_then(Value::as_str).unwrap_or_default();
             let name = raw_id
@@ -150,16 +238,19 @@ fn print_weight_block(
             } else {
                 "-"
             };
-            println!(
+            let _ = writeln!(
+                out,
                 "    {name:<16}  ctx {n_ctx:>7}  par {par:>3}  resume {resume:<6}  sleep {sleep:<9}  state {state:<9}  ctx-mem {mem:>10}"
             );
         }
     }
-    println!(
+    let _ = writeln!(
+        out,
         "  total     {:>12} resident (weights + contexts)",
         format_size(weights_bytes.saturating_add(ctx_mem_sum))
     );
-    println!();
+    out.push('\n');
+    out
 }
 
 /// The configured `weights` path for a model key, if the entry declares one.
@@ -437,7 +528,7 @@ fn resolve_speedtest_model(config: Option<&RouterConfig>, arg: &str) -> String {
         return arg.to_string();
     }
     if let Some(cfg) = config {
-        if let Some(route) = cfg.routes.get(&cfg.default_route) {
+        if let Some(route) = cfg.routes_view().get(&cfg.default_route) {
             if let Some(group) = cfg.model_groups.get(&route.group) {
                 if let Some(first) = group.models().first() {
                     return first.clone();

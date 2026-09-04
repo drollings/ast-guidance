@@ -37,6 +37,9 @@ use crate::stages::common::{coerce_float, coerce_string, coerce_u8, extract_user
 use crate::stages::tree::ClassificationEngine;
 use crate::target_match::TargetMatcher;
 
+pub mod action;
+pub use action::{ClassifierAction, UnknownAction};
+
 const DEFAULT_COMPLEXITY: u8 = 5;
 const COMPLEXITY_SCALE: f64 = 10.0;
 const DEFAULT_COMPLETENESS: f64 = 0.5;
@@ -150,6 +153,10 @@ fn parse_classifier_response(
             // `true` iff the raw text directly deserialized (the codec's fast
             // path); a small re-parse of the already-owned string, once per
             // classifier call — not on any hot loop.
+            //
+            // M2: this `from_str` is a pristine/recovered *label* only, never
+            // a parse gate — the actual parse above already went through the
+            // tolerant codec. Do not "migrate" it; there is nothing to migrate.
             let ok = serde_json::from_str::<ClassifierOutput>(response).is_ok();
             let output = ClassifierOutput {
                 target: o
@@ -206,10 +213,8 @@ fn parse_classifier_response(
 /// `action` (else there is nothing to route on), and it is always flagged
 /// recovered (`ok == false`). Returns `None` when nothing decodes.
 fn try_boundary_decode(response: &str, default_route: &str) -> Option<ClassifierOutput> {
-    let schema = ClassifierOutput::default().field_names();
-    let opts = fluent_wvr::BoundaryOptions::for_schema(schema);
     let (mut output, decoded) =
-        fluent_wvr::decode_boundary::<ClassifierOutput>(response, &opts).ok()?;
+        fluent_wvr::boundary::decode_boundary_typed::<ClassifierOutput>(response).ok()?;
     if output.action.is_empty() {
         return None;
     }
@@ -354,38 +359,32 @@ fn resolve_via_matcher(
     routing_config.routing_target(route, complexity)
 }
 
-/// Resolve a classifier output to a typed `RoutingTarget`.
+/// Typed resolver for `ClassifierAction` — exhaustive, no stringly fallback.
 ///
-/// Only the three standard `action` values are honored:
-/// - `respond` → `None` (direct response, handled by the caller),
-/// - `route` → the explicit `target` or `default_route`,
-/// - anything else → a warning and the `default_route` fallback.
-///
-/// The cleanup deleted `normalize_classifier_action`'s route-name
-/// guessing from `action`/`intent` strings — route selection is the
-/// classification tree's job now. Complexity-based model selection still flows
-/// through the shared target resolver (`resolve_via_matcher`), which runs the
-/// self-assessment ladder when the pipeline opts in.
-fn resolve_routing_target(
-    action: &str,
+/// Unknown `action` values are **not** coerced to `Route` — they surface as
+/// `Err(UnknownAction)` so the caller can map them to `StageVerdict::Error`
+/// and `AuditKind::Route { verdict: Error }` (confidence vs task-value: a
+/// confused classifier must not look decisive).
+fn try_resolve_routing_target(
+    action: &ClassifierAction,
     output: &ClassifierOutput,
     routing_config: &RoutingConfig,
     matcher: Option<&TargetMatcher>,
     user_text: &str,
 ) -> Option<RoutingTarget> {
-    if action == "respond" {
-        tracing::info!(target: "router.pipeline.stage2", "direct response — no dispatch");
-        return None;
-    }
-
-    let route = if action == "route" {
-        output
-            .target
+    let route = match action {
+        ClassifierAction::Respond(_) => {
+            tracing::info!(target: "router.pipeline.stage2", "direct response — no dispatch");
+            return None;
+        }
+        ClassifierAction::Route { target } => target
             .as_deref()
-            .unwrap_or(&routing_config.default_route)
-    } else {
-        tracing::warn!(target: "router.pipeline.stage2", action = %action, fallback_route = %routing_config.default_route, "unknown action, falling back to default route");
-        &routing_config.default_route
+            .or(output.target.as_deref())
+            .unwrap_or(&routing_config.default_route),
+        ClassifierAction::Reject { .. } => {
+            // Reject handled by caller; no routing target
+            return None;
+        }
     };
 
     if let Some(rt) = resolve_via_matcher(routing_config, matcher, route, output.complexity, user_text) {
@@ -405,6 +404,22 @@ fn resolve_routing_target(
     }
     tracing::warn!(target: "router.pipeline.stage2", route = %route, "resolve_route returned None — no dispatch target");
     None
+}
+
+/// Strict stringly wrapper — unknown `action` returns `Err(UnknownAction)` instead of silent fallback to default route.
+fn resolve_routing_target(
+    action: &str,
+    output: &ClassifierOutput,
+    routing_config: &RoutingConfig,
+    matcher: Option<&TargetMatcher>,
+    user_text: &str,
+) -> Result<Option<RoutingTarget>, UnknownAction> {
+    let typed = ClassifierAction::from_output(output)?;
+    // Guard against caller passing mismatched action string vs output.action (defensive)
+    if typed.is_respond() && action != "respond" || typed.is_route() && action != "route" || typed.is_reject() && action != "reject" {
+        // Still respect the typed output — the string arg is just for parity with old call sites
+    }
+    Ok(try_resolve_routing_target(&typed, output, routing_config, matcher, user_text))
 }
 
 pub struct ClassifierStage {
@@ -576,7 +591,51 @@ impl ClassifierStage {
         }
     }
 
-    fn build_system_prompt(&self) -> String {
+    /// The deterministic parsed-grammar context folded into the classifier prompt
+/// (ROADMAP §14.5, C1): the per-sentence interlingua ids, so the router LLM is
+/// given the parse rather than re-deriving it. Additive; never a gate.
+fn interlingua_prompt_context(
+    interlingua: &[spacy_rs::routing::InterlinguaSignal],
+) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Parsed grammar (deterministic interlingua ids — trust these for routing):"
+    );
+    for (i, s) in interlingua.iter().enumerate() {
+        let id = |v: Option<fluent_types::InterlinguaId>| {
+            v.map_or_else(|| "null".to_string(), |id| id.as_i64().to_string())
+        };
+        let _ = writeln!(
+            out,
+            "  sentence {i}: predicate_id={} subject_id={} object_id={}",
+            id(s.predicate_id),
+            id(s.subject_id),
+            id(s.direct_object_id),
+        );
+    }
+    out
+}
+
+/// The overlay stage's route hints as deterministic routing context
+    /// (ROADMAP_20260827_ORT §2.6): scored route recommendations the classifier
+    /// merges like the interlingua frames — a deterministic input, never a gate.
+    /// Hints are already sorted highest-score-first by the overlay stage.
+    pub(crate) fn route_hints_prompt_context(hints: &[crate::pipeline_types::RouteHint]) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Route hints (deterministic overlay scores — weigh the top routes when deciding):"
+    );
+    for h in hints {
+        let _ = writeln!(out, "  - {}: {:.3}", h.route, h.score);
+    }
+    out
+}
+
+fn build_system_prompt(&self) -> String {
         let mut prompt = String::new();
 
         // Preamble from config — variable substitution still applies
@@ -690,13 +749,18 @@ impl WorkUnit for ClassifierStage {
     }
 
     fn execute(&self, ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
-        let (message, decision) = self.decide(ctx)?;
+        let (message, decision, _target) = self.decide(ctx, None, None)?;
         WorkOutput::typed(message, &decision)
     }
 }
 
 impl ClassifierStage {
-    fn decide(&self, ctx: &WorkContext) -> Result<(String, StageDecision), WorkError> {
+    fn decide(
+        &self,
+        ctx: &WorkContext,
+        interlingua: Option<&[spacy_rs::routing::InterlinguaSignal]>,
+        route_hints: Option<&[crate::pipeline_types::RouteHint]>,
+    ) -> Result<(String, StageDecision, Option<RoutingTarget>), WorkError> {
         let input = extract_user_message(ctx)?;
         // The route the client requested (the request's `model`). Used to
         // enforce route-level `always_route`: a route configured to always
@@ -709,10 +773,13 @@ impl ClassifierStage {
 
         // Classification-tree mode — the engine produces the final
         // `StageDecision` directly (routing target, rejection, or the
-        // `tree_path` of visited nodes in metadata).
+        // `tree_path` of visited nodes in metadata). The interlingua handoff
+        // (C6) lets `match_interlingua` Filter nodes short-circuit on the
+        // parse's ids before any LLM call; route hints feed the classifier
+        // nodes' LLM context (§2.6).
         if let Some(engine) = &self.tree_engine {
-            let evaluation = engine.evaluate(&input)?;
-            return Ok(("classified".into(), evaluation.decision));
+            let evaluation = engine.evaluate(&input, interlingua, route_hints)?;
+            return Ok(("classified".into(), evaluation.decision, evaluation.target));
         }
 
         let system_prompt = ctx
@@ -723,6 +790,25 @@ impl ClassifierStage {
                 _ => None,
             })
             .unwrap_or_else(|| self.build_system_prompt());
+
+        // C1 (§14.5): the NLP layer steers routing — the classifier LLM is
+        // *given* the parsed grammar as deterministic context rather than
+        // re-deriving it. Additive; never a gate.
+        let system_prompt = match interlingua {
+            Some(il) if !il.is_empty() => {
+                format!("{system_prompt}\n{}", Self::interlingua_prompt_context(il))
+            }
+            _ => system_prompt,
+        };
+
+        // §2.6: the overlay stage's route hints are the same kind of
+        // deterministic context — merged when present, never a gate.
+        let system_prompt = match route_hints {
+            Some(h) if !h.is_empty() => {
+                format!("{system_prompt}\n{}", Self::route_hints_prompt_context(h))
+            }
+            _ => system_prompt,
+        };
 
         let messages = vec![
             ChatMessage {
@@ -847,7 +933,7 @@ impl ClassifierStage {
                 reason = %decision.reason,
                 "classifier threshold rejection"
             );
-            return Ok(("rejected".into(), decision));
+            return Ok(("rejected".into(), decision, None));
         }
 
         if output.action == "reject" {
@@ -865,7 +951,7 @@ impl ClassifierStage {
                     "reason": output.reason,
                 }),
             };
-            return Ok(("rejected".into(), decision));
+            return Ok(("rejected".into(), decision, None));
         }
 
         // Route-level `always_route` (config): a route configured to always
@@ -936,13 +1022,38 @@ impl ClassifierStage {
             }
         }
 
-        let routing_target = resolve_routing_target(
+        let routing_target = match resolve_routing_target(
             &output.action,
             &output,
             &self.routing_config,
             self.target_matcher.as_ref(),
             &input,
-        );
+        ) {
+            Ok(rt) => rt,
+            Err(e) => {
+                let reason = format!("unknown classifier action: {}", e.0);
+                crate::audit::AuditRecord::route(
+                    PipelineStage::Classifier,
+                    StageVerdict::Error,
+                    None,
+                    None,
+                    Some(&reason),
+                )
+                .emit();
+                let decision = StageDecision {
+                    stage: PipelineStage::Classifier,
+                    verdict: StageVerdict::Error,
+                    score: None,
+                    reason: reason.clone(),
+                    latency_ms: 0,
+                    metadata: serde_json::json!({
+                        "action": output.action,
+                        "error": e.0,
+                    }),
+                };
+                return Ok(("error".into(), decision, None));
+            }
+        };
 
         Ok(Self::build_decision(
             &output,
@@ -953,9 +1064,8 @@ impl ClassifierStage {
     }
 
     /// Apply the `ClassifierFailurePolicy` to a classifier outage (LLM error or
-    /// total parse failure). The single DRY decision point — both fail-open
-    /// paths funnel here.
-    fn failure_decision(&self, reason: &str) -> (String, StageDecision) {
+    /// total parse failure). The single DRY decision point for the outage path.
+    fn failure_decision(&self, reason: &str) -> (String, StageDecision, Option<RoutingTarget>) {
         match self.failure_policy {
             ClassifierFailurePolicy::Reject => {
                 tracing::warn!(
@@ -981,7 +1091,7 @@ impl ClassifierStage {
                         "fallback": true,
                     }),
                 };
-                ("rejected".into(), decision)
+                ("rejected".into(), decision, None)
             }
             ClassifierFailurePolicy::RouteToDefaultTruthful => {
                 let output = ClassifierOutput {
@@ -1002,34 +1112,9 @@ impl ClassifierStage {
                     &self.routing_config,
                     self.target_matcher.as_ref(),
                     "",
-                );
-                Self::build_decision(
-                    &output,
-                    fallback_rt.as_ref(),
-                    false,
-                    self.score_matrix.as_ref(),
                 )
-            }
-            ClassifierFailurePolicy::LegacyFailOpen => {
-                let output = ClassifierOutput {
-                    action: "route".into(),
-                    response: None,
-                    target: Some(self.routing_config.default_route.clone()),
-                    coherence_score: 1.0,
-                    safety_score: 1.0,
-                    complexity: None,
-                    intent: None,
-                    reason: reason.into(),
-                    completeness: None,
-                    risk: None,
-                };
-                let fallback_rt = resolve_routing_target(
-                    &output.action,
-                    &output,
-                    &self.routing_config,
-                    self.target_matcher.as_ref(),
-                    "",
-                );
+                .ok()
+                .flatten();
                 Self::build_decision(
                     &output,
                     fallback_rt.as_ref(),
@@ -1049,9 +1134,51 @@ impl StageDecisionProducer for ClassifierStage {
     fn evaluate(
         &self,
         ctx: &WorkContext,
-        _prior: &[StageDecision],
+        prior: &[StageDecision],
     ) -> Result<StageDecision, WorkError> {
-        Ok(self.decide(ctx)?.1)
+        Ok(self.evaluate_with_target(ctx, prior)?.0)
+    }
+}
+
+impl ClassifierStage {
+    /// Typed evaluation: the decision plus the dispatch target by value.
+    /// The orchestrator's producer path calls this so the target reaches the
+    /// typed store without a JSON round-trip; the `StageDecisionProducer`
+    /// boundary (`evaluate`) keeps returning the decision alone.
+    pub(crate) fn evaluate_with_target(
+        &self,
+        ctx: &WorkContext,
+        prior: &[StageDecision],
+    ) -> Result<(StageDecision, Option<RoutingTarget>), WorkError> {
+        // The NlpStage ran first; its interlingua handoff steers the tree's
+        // `match_interlingua` filters (C6). `None` when the NLP stage was
+        // absent or skipped — interlingua filters then pass through.
+        let interlingua = prior
+            .iter()
+            .filter_map(|d| StageMetadata::from(d.metadata.clone()).nlp_interlingua())
+            .flatten()
+            .collect::<Vec<_>>();
+        // The OverlayStage ran between nlp and classifier; its route hints are
+        // merged as deterministic routing context (§2.6).
+        let route_hints = prior
+            .iter()
+            .filter_map(|d| StageMetadata::from(d.metadata.clone()).overlay_route_hints())
+            .flatten()
+            .collect::<Vec<_>>();
+        let (_, decision, target) = self.decide(
+            ctx,
+            if interlingua.is_empty() {
+                None
+            } else {
+                Some(&interlingua)
+            },
+            if route_hints.is_empty() {
+                None
+            } else {
+                Some(&route_hints)
+            },
+        )?;
+        Ok((decision, target))
     }
 }
 
@@ -1080,7 +1207,7 @@ impl ClassifierStage {
         routing_target: Option<&RoutingTarget>,
         ok: bool,
         score_matrix: Option<&ScoreMatrix>,
-    ) -> (String, StageDecision) {
+    ) -> (String, StageDecision, Option<RoutingTarget>) {
         let scored_routes = score_matrix.map(|sm| sm.resolve(&Self::score_vector(output)));
 
         let mut metadata = StageMetadata::from(serde_json::json!({
@@ -1124,11 +1251,11 @@ impl ClassifierStage {
             );
         }
 
-        if let Some(rt) = routing_target {
+        if routing_target.is_some() {
             // When we have a routing target, the response is from a misbehaving
             // LLM that output both action=respond + code.  Don't store it as a
-            // classifier response — the handler will dispatch instead.
-            metadata.set_routing_target(rt);
+            // classifier response — the handler will dispatch instead (the
+            // target itself travels by value to the orchestrator's typed store).
         } else if let Some(ref resp) = output.response {
             metadata.set_response(resp.clone());
         }
@@ -1148,6 +1275,7 @@ impl ClassifierStage {
                 latency_ms: 0,
                 metadata: metadata.into_value(),
             },
+            routing_target.cloned(),
         )
     }
 }
@@ -1163,333 +1291,7 @@ impl Describable for ClassifierStage {
         })
     }
 }
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The hand-built classifier response schema must cover exactly the fields
-    /// `ClassifierOutput` declares, so the schema cannot drift from the struct.
-    #[test]
-    fn response_format_schema_covers_classifier_output_fields() {
-        let extras = classifier_response_format();
-        let schema = &extras["response_format"]["schema"];
-        assert_eq!(schema["type"], "object");
-        let props = schema["properties"].as_object().expect("properties");
-        let declared: Vec<&str> = ClassifierOutput::default().field_names().to_vec();
-        assert_eq!(
-            props.keys().map(String::as_str).collect::<Vec<_>>().len(),
-            declared.len(),
-            "schema properties must match ClassifierOutput field count"
-        );
-        for name in declared {
-            assert!(props.contains_key(name), "missing schema property: {name}");
-        }
-        let required: Vec<&str> = schema["required"]
-            .as_array()
-            .expect("required")
-            .iter()
-            .map(|v| v.as_str().expect("required name"))
-            .collect();
-        for name in &required {
-            assert!(props.contains_key(*name), "required but not a property: {name}");
-        }
-    }
-
-    /// The schema must use JSON-number bounds, not the string-typed bounds the
-    /// FieldAccess derive emits — the fork's `json_schema_to_grammar` reads
-    /// them via `.get<int64_t>()` and a string would throw.
-    #[test]
-    fn response_format_schema_uses_numeric_bounds() {
-        let extras = classifier_response_format();
-        let props = extras["response_format"]["schema"]["properties"]
-            .as_object()
-            .expect("properties");
-        let coherence = &props["coherence_score"];
-        assert_eq!(coherence["type"], "number");
-        assert!(coherence["minimum"].is_number(), "minimum must be a number");
-        assert!(coherence["maximum"].is_number(), "maximum must be a number");
-        let complexity = &props["complexity"];
-        assert_eq!(complexity["type"], "integer");
-        assert!(complexity["minimum"].is_number(), "integer minimum must be a number");
-        assert!(complexity["maximum"].is_number(), "integer maximum must be a number");
-    }
-
-    /// The response_format extras must be a valid fork-shaped body: top-level
-    /// `response_format` with `type: json_object` and a schema object.
-    #[test]
-    fn response_format_shaped_for_fork() {
-        let extras = classifier_response_format();
-        assert_eq!(extras["response_format"]["type"], "json_object");
-        assert!(extras["response_format"]["schema"].is_object());
-    }
-
-    /// Small classifiers (e.g. lfm2.5-350m) intermittently emit malformed
-    /// JSON. The deterministic repair must recover these without an extra LLM
-    /// call: single quotes, bare keys, and a trailing comma.
-    #[test]
-    fn parse_heals_malformed_json_instead_of_rejecting() {
-        let raw = "{action: 'route', target: 'code', coherence_score: 0.9, safety_score: 1, \
-                    complexity: 7, intent: 'code', reason: 'needs the big model',}";
-        let (out, ok) = parse_classifier_response(raw, "local", true).expect("must self-heal");
-        assert!(!ok, "a repaired parse must be flagged as recovered, not pristine");
-        assert_eq!(out.action, "route");
-        assert_eq!(out.target.as_deref(), Some("code"));
-        assert_eq!(out.coherence_score, 0.9);
-        assert_eq!(out.complexity, Some(7));
-    }
-
-    /// Truncated responses (missing closing brace / string) are the common
-    /// small-model failure; the repair must close the dangling containers.
-    #[test]
-    fn parse_heals_truncated_json() {
-        let raw = "{\"action\": \"route\", \"target\": \"code\", \"coherence_score\": 0.85, \
-                    \"safety_score\": 1";
-        let (out, ok) = parse_classifier_response(raw, "local", true).expect("must heal truncation");
-        assert!(!ok);
-        assert_eq!(out.action, "route");
-        assert_eq!(out.coherence_score, 0.85);
-    }
-
-    /// Pristine JSON stays on the fast path (ok == true), untouched by repair.
-    #[test]
-    fn parse_pristine_is_not_flagged_recovered() {
-        let raw = "{\"action\": \"respond\", \"response\": \"hi\", \"coherence_score\": 0.99, \
-                    \"safety_score\": 1.0, \"complexity\": 2, \"reason\": \"trivial\"}";
-        let (out, ok) = parse_classifier_response(raw, "local", true).expect("must parse");
-        assert!(ok, "pristine JSON must not be flagged as recovered");
-        assert_eq!(out.action, "respond");
-        assert_eq!(out.response.as_deref(), Some("hi"));
-    }
-
-    /// Garbage that cannot be repaired still fails closed (the `Reject`
-    /// policy), never producing a fabricated decision.
-    #[test]
-    fn parse_garbage_still_fails() {
-        let err = parse_classifier_response("llama llama llama", "local", false).unwrap_err();
-        assert!(err.contains("invalid JSON"));
-    }
-
-    /// Raw control characters inside string values (literal newlines/tabs) are
-    /// the other common small-model artifact; they must be escaped, not
-    /// rejected.
-    #[test]
-    fn parse_heals_raw_control_chars() {
-        let raw = "{\"action\": \"respond\", \"response\": \"first line\nsecond line\", \
-                    \"coherence_score\": 0.9, \"safety_score\": 1, \
-                    \"reason\": \"tab\there\"}";
-        let (out, ok) = parse_classifier_response(raw, "local", true).expect("must escape controls");
-        assert!(!ok);
-        assert_eq!(out.action, "respond");
-        assert_eq!(out.response.as_deref(), Some("first line\nsecond line"));
-    }
-
-    /// Truncation mid-member (`"b":` with no value) must drop the dangling
-    /// tail rather than fail.
-    #[test]
-    fn parse_heals_truncated_mid_member() {
-        let raw = "{\"action\": \"route\", \"target\": \"code\", \"coherence_score\": 0.8, \
-                    \"safety_score\": 1, \"reason\": \"big\", \"completeness\": ";
-        let (out, ok) = parse_classifier_response(raw, "local", true).expect("must drop tail");
-        assert!(!ok);
-        assert_eq!(out.action, "route");
-        assert_eq!(out.target.as_deref(), Some("code"));
-        assert_eq!(out.reason, "big");
-    }
-
-    /// A parse failure dumps the raw response to `<dir>/classifier_failures/`
-    /// for review; the dump is a file, never the ledger.
-    #[test]
-    fn parse_failure_dumps_raw_response_for_review() {
-        let dir = std::env::temp_dir().join(format!(
-            "coral-classifier-fail-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        let failures = dir.join("classifier_failures");
-        dump_classifier_failure(&dir, "lfm2.5-350m", "invalid JSON in LLM response", "{\"a\": ");
-        let entries: Vec<_> = std::fs::read_dir(&failures)
-            .expect("failures dir must exist")
-            .flatten()
-            .collect();
-        assert_eq!(entries.len(), 1, "exactly one dump file expected");
-        let body = std::fs::read_to_string(entries[0].path()).expect("dump must be readable");
-        assert!(body.contains("lfm2.5-350m"));
-        assert!(body.contains("invalid JSON in LLM response"));
-        assert!(body.contains("\\\"a\\\""));
-        assert!(body.contains("{\\\"a\\\": "));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Brace-less `key: value` output (no `{` / `}` at all) defeats the whole
-    /// repair pipeline; the fluent-wvr schema-driven boundary decode recovers
-    /// it member-by-member through `set_field`, flagged recovered.
-    #[test]
-    fn parse_recovers_brace_less_key_value_via_boundary_decode() {
-        let raw = "action: route, target: code, coherence_score: 0.8, safety_score: 1, \
-                    complexity: 7, reason: needs the big model";
-        let (out, ok) = parse_classifier_response(raw, "local", true).expect("must decode members");
-        assert!(!ok, "a boundary decode is a recovered parse, never pristine");
-        assert_eq!(out.action, "route");
-        assert_eq!(out.target.as_deref(), Some("code"));
-        assert_eq!(out.coherence_score, 0.8);
-        assert_eq!(out.complexity, Some(7));
-    }
-
-    /// A member that fails to coerce (e.g. a null-ish gating score) keeps its
-    /// failing default rather than fabricating a passing value; the recovered
-    /// output still rejects on the coherence gate downstream.
-    #[test]
-    fn parse_boundary_decode_keeps_failing_default_for_bad_score() {
-        let raw = "action: route, target: code, coherence_score: undefined, safety_score: 1";
-        let (out, ok) = parse_classifier_response(raw, "local", true).expect("must decode members");
-        assert!(!ok);
-        assert_eq!(out.action, "route");
-        // `undefined` -> parse_number fails -> the field stays at its 0.0
-        // default (which fails the coherence threshold, not fabricates a pass).
-        assert_eq!(out.coherence_score, 0.0);
-    }
-
-    /// Pure prose with no JSON attempt at all (the failure class from the
-    /// `classifier_failures/` dumps) is a direct answer when the route permits
-    /// direct answering: the model answered the user, it just dropped the JSON
-    /// envelope. The recovered output must be `ok == true` — a complete answer,
-    /// NOT a retryable fallback — with the prose as the response.
-    #[test]
-    fn parse_prose_becomes_direct_answer_when_permitted() {
-        let raw = "I'm built on a hybrid architecture that combines gated short \
-                   convolutions with grouped-query attention, chosen for fast on-device \
-                   inference.";
-        let (out, ok) = parse_classifier_response(raw, "local", true).expect("must respond");
-        assert!(ok, "a prose direct answer is complete, not a retryable fallback");
-        assert_eq!(out.action, "respond");
-        assert_eq!(out.response.as_deref(), Some(raw.trim()));
-        assert_eq!(out.coherence_score, 1.0, "mirrors sanitize defaults for respond");
-        assert_eq!(out.safety_score, 1.0, "mirrors sanitize defaults for respond");
-    }
-
-    /// On an `always_route` route the classifier is never allowed to answer
-    /// directly, so prose must remain a hard failure even though it is
-    /// non-empty and answer-like.
-    #[test]
-    fn parse_prose_still_fails_when_direct_answer_not_permitted() {
-        let err = parse_classifier_response(
-            "I'm built on a hybrid architecture, chosen for fast inference.",
-            "local",
-            false,
-        )
-        .unwrap_err();
-        assert!(err.contains("invalid JSON"));
-    }
-
-    /// Empty prose is a failure, not an answer — the rung must not fabricate a
-    /// response from nothing.
-    #[test]
-    fn parse_empty_prose_still_fails_even_when_permitted() {
-        let err = parse_classifier_response("   \n\t  ", "local", true).unwrap_err();
-        assert!(err.contains("invalid JSON"));
-    }
-
-    /// Prose with a brace anywhere (an attempted-but-broken JSON envelope)
-    /// stays on the repair ladder rather than being short-circuited to a
-    /// direct answer.
-    #[test]
-    fn parse_braced_garbage_not_treated_as_prose_answer() {
-        let err = parse_classifier_response("{this is broken", "local", true).unwrap_err();
-        assert!(err.contains("invalid JSON") || err.contains("parse error"));
-    }
-
-    /// Backend that records the extras passed via `chat_complete_with_extras`
-    /// so the classifier's use of the constrained-decoding seam is observable.
-    struct ExtrasRecordingBackend {
-        seen_extras: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
-        response: String,
-    }
-
-    impl fluent_llm::client::ChatBackend for ExtrasRecordingBackend {
-        fn chat_complete(
-            &self,
-            _messages: &[fluent_llm::ChatMessage],
-        ) -> Result<String, fluent_llm::LlmError> {
-            Ok(self.response.clone())
-        }
-
-        fn chat_complete_with_extras(
-            &self,
-            _messages: &[fluent_llm::ChatMessage],
-            extras: &serde_json::Value,
-        ) -> Result<String, fluent_llm::LlmError> {
-            self.seen_extras.lock().expect("lock").push(extras.clone());
-            Ok(self.response.clone())
-        }
-    }
-
-    /// The classifier must issue its LLM call through the extras seam, carrying
-    /// a `response_format` that requests schema-constrained JSON from the fork.
-    #[test]
-    fn classifier_sends_response_format_through_extras_seam() {
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let backend = ExtrasRecordingBackend {
-            seen_extras: Arc::clone(&seen),
-            response: serde_json::json!({
-                "action": "respond",
-                "response": "hi",
-                "coherence_score": 0.99,
-                "safety_score": 1.0,
-                "complexity": 2,
-                "reason": "trivial",
-            })
-            .to_string(),
-        };
-        let routing_config = RoutingConfig {
-            routes: std::collections::HashMap::new(),
-            models: std::collections::HashMap::new(),
-            model_groups: std::collections::HashMap::new(),
-            system_prompt: String::new(),
-            safety_threshold: 0.5,
-            default_route: "local".into(),
-            score_matrix: None,
-        };
-        let stage = ClassifierStage::new(
-            Arc::new(backend),
-            routing_config,
-            0.2,
-            None,
-            false,
-            1,
-            "lfm2.5-2.6b",
-            Arc::new(fluent_concurrency::pool::Limiter::new(4)),
-            None,
-            crate::config::ClassifierFailurePolicy::Reject,
-            None,
-        );
-
-        let mut ctx = WorkContext::default();
-        ctx.set_structured(
-            "request",
-            &serde_json::json!({
-                "model": "local",
-                "messages": [{"role": "user", "content": "hello"}],
-            }),
-        );
-        let decision: StageDecision = stage
-            .execute(&ctx)
-            .expect("execute")
-            .data_as()
-            .expect("typed decision");
-        assert_eq!(decision.verdict, StageVerdict::Passed);
-
-        let extras = seen.lock().expect("lock");
-        assert_eq!(extras.len(), 1, "classifier must call the extras seam once");
-        let rf = &extras[0]["response_format"];
-        assert_eq!(rf["type"], "json_object", "must request a JSON object");
-        assert!(rf["schema"].is_object(), "must carry the JSON schema");
-        assert_eq!(
-            rf["schema"]["properties"]["action"]["type"],
-            "string",
-            "schema must cover the classifier output shape"
-        );
-    }
-}
-
+#[path = "../../tests/stages_classifier.rs"]
+mod tests;
 impl_component!(ClassifierStage);

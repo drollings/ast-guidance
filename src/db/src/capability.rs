@@ -11,14 +11,7 @@
 //! `CURRENT_CAPS` task-local installed by `fluent-concurrency`'s
 //! `Scope`/`SupervisedBatch`. This crate's `DbCapability` is the *token*; the gating
 //! seam stays in `fluent-wvr`.
-//!
-//! The lossy all-values-as-strings `query` / `execute` methods are **deprecated**:
-//! new code should use the typed `SqlitePool::query_row` /
-//! `query_rows` / `execute` helpers with typed row mappers. Both surfaces share
-//! the `DbError` error type — the deprecated methods return `DbError`, not
-//! `IoError`, so callers see one error taxonomy across the whole crate.
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -76,139 +69,8 @@ impl DbCapability {
     pub fn pool(&self) -> &Arc<SqlitePool> {
         &self.pool
     }
-
-    /// Executes a SQL query and returns rows as `Vec<HashMap<String, String>>`
-    /// (all values stringified).
-    ///
-    /// **Deprecated**: this lossy string-map shape is superseded by the typed
-    /// `SqlitePool::query_row` / `query_rows` helpers. Kept so existing
-    /// callers compile unchanged.
-    #[deprecated = "use SqlitePool::query_rows/query_row with typed row mappers instead"]
-    pub async fn query(&self, sql: &str) -> Result<Vec<HashMap<String, String>>, DbError> {
-        check_db_capability()?;
-        let sql = sql.to_string();
-        let pool = Arc::clone(&self.pool);
-        let conn = pool.acquire_ungated().await?;
-        let result = tokio::task::spawn_blocking(move || {
-            let mut stmt = conn.prepare(&sql).map_err(DbError::from)?;
-
-            let columns: Vec<String> = stmt
-                .column_names()
-                .iter()
-                .map(ToString::to_string)
-                .collect();
-
-            let mut rows = Vec::new();
-            let mut rows_iter = stmt.query([]).map_err(DbError::from)?;
-
-            while let Some(row) = rows_iter.next().map_err(DbError::from)? {
-                let mut map = HashMap::new();
-                for (i, col) in columns.iter().enumerate() {
-                    let value: String = match row.get::<_, rusqlite::types::Value>(i) {
-                        Ok(rusqlite::types::Value::Integer(n)) => n.to_string(),
-                        Ok(rusqlite::types::Value::Real(f)) => f.to_string(),
-                        Ok(rusqlite::types::Value::Text(s)) => s,
-                        Ok(rusqlite::types::Value::Blob(b)) => format!("<blob {} bytes>", b.len()),
-                        _ => String::new(),
-                    };
-                    map.insert(col.clone(), value);
-                }
-                rows.push(map);
-            }
-
-            Ok(rows)
-        })
-        .await
-        .map_err(|e| DbError::Other(format!("blocking query task failed: {e}")))?;
-        result
-    }
-
-    /// Executes a SQL statement (INSERT, UPDATE, DELETE) and returns the
-    /// number of rows affected.
-    ///
-    /// **Deprecated**: superseded by the typed `SqlitePool::execute`. Kept so
-    /// existing callers compile unchanged.
-    #[deprecated = "use SqlitePool::execute with typed params instead"]
-    pub async fn execute(&self, sql: &str) -> Result<usize, DbError> {
-        check_db_capability()?;
-        let sql = sql.to_string();
-        let pool = Arc::clone(&self.pool);
-        let conn = pool.acquire_ungated().await?;
-        let result = tokio::task::spawn_blocking(move || {
-            let rows_affected = conn.execute(&sql, []).map_err(DbError::from)?;
-            Ok(rows_affected)
-        })
-        .await
-        .map_err(|e| DbError::Other(format!("blocking execute task failed: {e}")))?;
-        result
-    }
 }
 
-#[cfg(test)]
-mod tests {
-    // The deprecated `query`/`execute` are exercised here as the behavior
-    // oracle for legacy callers.
-    #![allow(deprecated)]
-    use super::*;
-    use fluent_wvr::capability::CURRENT_CAPS;
-    use crate::tests::common::db_caps;
-
-    fn db() -> DbCapability {
-        DbCapability::open(":memory:").unwrap()
-    }
-
-    #[tokio::test]
-    async fn open_and_pool_round_trip() {
-        let db = db();
-        let caps = db_caps();
-        CURRENT_CAPS
-            .scope(caps, async {
-                let conn = db.pool().acquire().await.unwrap();
-                conn.execute_batch("CREATE TABLE t (id INTEGER)").unwrap();
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn query_execute_round_trip_within_capability() {
-        let db = db();
-        let caps = db_caps();
-        CURRENT_CAPS
-            .scope(caps, async {
-                db.execute("CREATE TABLE t (id INTEGER, name TEXT)")
-                    .await
-                    .unwrap();
-                db.execute("INSERT INTO t VALUES (1, 'hello')")
-                    .await
-                    .unwrap();
-                let rows = db.query("SELECT * FROM t").await.unwrap();
-                assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0]["id"], "1");
-                assert_eq!(rows[0]["name"], "hello");
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn query_without_capability_denied() {
-        let db = db();
-        let result = db.query("SELECT 1").await;
-        let err = result.unwrap_err();
-        assert!(matches!(err, DbError::PermissionDenied(_)), "got {err:?}");
-        assert!(err.to_string().contains("missing"));
-    }
-
-    #[tokio::test]
-    async fn execute_without_capability_denied() {
-        let db = db();
-        let result = db.execute("CREATE TABLE t (id INTEGER)").await;
-        let err = result.unwrap_err();
-        assert!(matches!(err, DbError::PermissionDenied(_)), "got {err:?}");
-        assert!(err.to_string().contains("missing"));
-    }
-
-    #[tokio::test]
-    async fn capability_name_is_db() {
-        assert_eq!(db().name(), "db");
-    }
-}
+#[cfg(all(test, feature = "sqlite"))]
+#[path = "../tests/capability.rs"]
+mod tests;

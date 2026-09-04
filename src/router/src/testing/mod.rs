@@ -1,4 +1,7 @@
+pub mod calibration;
+pub mod ledger_golden;
 pub mod mock;
+pub mod vector_index;
 
 pub use mock::{
     default_transcript, load_transcript_file, transcript_provider_from_entries,

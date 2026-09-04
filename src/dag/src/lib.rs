@@ -18,4 +18,5 @@ pub mod wvr;
 pub mod yamake_loader;
 
 #[cfg(test)]
+#[path = "../tests/mod.rs"]
 mod tests;

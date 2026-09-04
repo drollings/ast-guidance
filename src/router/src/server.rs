@@ -2,16 +2,19 @@
 //! Uses hyper for HTTP with SSE streaming support via http-body-util::channel.
 
 pub mod admin;
+pub mod cors;
 pub mod dispatch;
+pub mod entity_link;
 pub mod handler;
 pub mod instances_api;
 pub mod responses;
+pub mod review;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common_core::ResponseCache;
+use fluent_llm::cache::ResponseCache;
 use fluent_wvr::prelude::*;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -23,6 +26,7 @@ use crate::ledger::ContentNodeLedger;
 use crate::pipeline::PipelineOrchestrator;
 use crate::routes::plan::PlanRoute;
 use crate::routes::rigor::RigorRoute;
+use crate::server::review::{ReviewWorker, ReviewFetch};
 use crate::testing::mock::MockDispatchContext;
 
 pub struct RouterServer {
@@ -62,6 +66,37 @@ pub struct RouterServer {
     /// The `LedgerAgentCoordinator`, when the operator opts in. `None`
     /// keeps dispatch unchanged.
     coordinator: Option<Arc<crate::ledger::orchestrator::LedgerAgentCoordinator>>,
+    /// The async review worker (ROADMAP §12.6, C4). Owned by the server,
+    /// spawned into the tracked task set, drained on graceful shutdown.
+    review_worker: Option<Arc<ReviewWorker>>,
+    /// The review-model fetch seam for the review worker.
+    review_fetch: Option<ReviewFetch>,
+    /// The async entity-link overlay worker (ROADMAP_20260827_ORT §6.2).
+    /// Owned by the server, drained on graceful shutdown.
+    entity_link_worker: Option<Arc<crate::server::entity_link::EntityLinkWorker>>,
+    /// The arc_ready annotation-overlay worker (OVERLAYS §7). Owned by the
+    /// server, drained on graceful shutdown so in-flight derivations complete.
+    overlay_worker: Option<Arc<crate::ledger::overlay_worker::OverlayWorker>>,
+    /// The ort ONNX session registry (ROADMAP_20260827_ORT §0.5): one session
+    /// per onnx-declared model. The llama.cpp supervisor, sidecar, and
+    /// `/instances` never touch onnx models; the registry backs
+    /// `/models/unload` refusals for `Always`-resident models.
+    onnx: Option<Arc<fluent_onnx::OrtSessionRegistry>>,
+    /// The unified weights facade (ROADMAP M4): llama adapters + onnx
+    /// implementors behind the shared `LlmWeights` surface. Backs the
+    /// `/instances` + `/v1/models` aggregation (onnx rows), `ps`, and the
+    /// onnx branch of `POST /models/unload`.
+    fleet: Option<Arc<crate::instances::traits::LlmFleet>>,
+    /// The in-process onnx generative `ChatBackend` (the `onnx/llm` routing
+    /// model). Routes whose `model_groups` resolve to an onnx role dispatch
+    /// through it. Wired by the composition root alongside the onnx registry.
+    onnx_llm_backend: Option<Arc<dyn fluent_llm::client::ChatBackend>>,
+    /// The shared residency engine (ROADMAP M5): ONE loop over the fleet's
+    /// weights (llama adapters + onnx implementors), replacing both the llama
+    /// sidecar task and the onnx residency sibling. Built in the composition
+    /// root (where the sidecar knobs live), spawned in `serve`, aborted on
+    /// graceful shutdown.
+    residency_engine: Option<Arc<fluent_llm::runtime::LlmResidencyEngine>>,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
@@ -95,6 +130,14 @@ impl RouterServer {
             api_key_env_name: None,
             tier_worker: None,
             coordinator: None,
+            review_worker: None,
+            review_fetch: None,
+            entity_link_worker: None,
+            overlay_worker: None,
+            onnx: None,
+            fleet: None,
+            onnx_llm_backend: None,
+            residency_engine: None,
             depends: vec![],
             provides: vec![ArcIntern::from("http.endpoint")],
         }
@@ -212,6 +255,94 @@ impl RouterServer {
         self
     }
 
+    /// Attach the async review worker (ROADMAP §12.6, C4). The worker is
+    /// spawned into the server's tracked task set and drained on graceful
+    /// shutdown so in-flight corrections + status writes complete.
+    #[must_use]
+    pub fn with_review_worker(mut self, worker: Arc<ReviewWorker>) -> Self {
+        self.review_worker = Some(worker);
+        self
+    }
+
+    /// Attach the review-model fetch seam for the review worker.
+    #[must_use]
+    pub fn with_review_fetch(mut self, fetch: ReviewFetch) -> Self {
+        self.review_fetch = Some(fetch);
+        self
+    }
+
+    /// Attach the async entity-link overlay worker (ROADMAP_20260827_ORT §6.2).
+    /// Drained on graceful shutdown like the review worker.
+    #[must_use]
+    pub fn with_entity_link_worker(
+        mut self,
+        worker: Arc<crate::server::entity_link::EntityLinkWorker>,
+    ) -> Self {
+        self.entity_link_worker = Some(worker);
+        self
+    }
+
+    /// Attach the arc_ready annotation-overlay worker (OVERLAYS §7). Drained
+    /// on graceful shutdown so in-flight derivations complete before exit.
+    #[must_use]
+    pub fn with_overlay_worker(
+        mut self,
+        worker: Arc<crate::ledger::overlay_worker::OverlayWorker>,
+    ) -> Self {
+        self.overlay_worker = Some(worker);
+        self
+    }
+
+    /// Attach the ort ONNX session registry. Backs `/models/unload` refusals
+    /// for `Always`-resident onnx models and the onnx `EmbeddingProvider`
+    /// branch of the chart embedder. `None` (the default) leaves dispatch
+    /// unchanged — onnx models degrade to plain HTTP entries (fail-open).
+    #[must_use]
+    pub fn with_onnx_registry(
+        mut self,
+        onnx: Option<Arc<fluent_onnx::OrtSessionRegistry>>,
+    ) -> Self {
+        self.onnx = onnx;
+        self
+    }
+
+    /// Attach the in-process onnx generative `ChatBackend` (the `onnx/llm`
+    /// routing model) so routes whose `model_groups` resolve to an onnx role
+    /// dispatch through it. Wired by the composition root alongside the onnx
+    /// registry; `None` leaves onnx targets unserved (mock intercepts first in
+    /// tests).
+    #[must_use]
+    pub fn with_onnx_llm_backend(
+        mut self,
+        backend: Option<Arc<dyn fluent_llm::client::ChatBackend>>,
+    ) -> Self {
+        self.onnx_llm_backend = backend;
+        self
+    }
+
+    /// Attach the shared residency engine (ROADMAP M5). `None` (the default)
+    /// leaves both fleets resident until the process exits. When attached,
+    /// `serve` spawns it as the single residency loop over the fleet's weights
+    /// (llama adapters + onnx implementors) and aborts it on graceful shutdown.
+    #[must_use]
+    pub fn with_residency_engine(
+        mut self,
+        engine: Option<Arc<fluent_llm::runtime::LlmResidencyEngine>>,
+    ) -> Self {
+        self.residency_engine = engine;
+        self
+    }
+
+    /// Attach the unified weights facade (ROADMAP M4): llama adapters + onnx
+    /// implementors behind the shared `LlmWeights` surface. Backs the
+    /// `/instances` + `/v1/models` aggregation (onnx rows), `ps`, and the
+    /// onnx branch of `POST /models/unload`.
+    #[must_use]
+    pub fn with_fleet(mut self, fleet: Arc<crate::instances::traits::LlmFleet>) -> Self {
+        self.fleet = Some(fleet);
+        self
+    }
+
     #[must_use]
     pub fn with_mock(mut self, mock_dispatch: MockDispatchContext) -> Self {
         tracing::info!(
@@ -276,17 +407,18 @@ impl RouterServer {
             api_key_env_name: self.api_key_env_name.clone(),
             supervisor: self.supervisor.clone(),
             coordinator: self.coordinator.clone(),
+            review_worker: self.review_worker.clone(),
+            review_fetch: self.review_fetch.clone(),
+            entity_link_worker: self.entity_link_worker.clone(),
+            onnx: self.onnx.clone(),
+            onnx_llm_backend: self.onnx_llm_backend.clone(),
+            fleet: self.fleet.clone(),
         };
 
         // Reconcile configured pinned instances at boot (retrying until the
-        // managed server's management API is reachable) per manager, then run
-        // one device-wide residency loop (poll all /instances, evict
-        // LRU-largest unpinned when over the VRAM budget, unload empty
-        // models). Best-effort: a failed reconcile/residency poll logs and
-        // continues.
-        //
-        // These are process-lifetime background tasks owned by the server:
-        // they run in a `JoinSet` that is drained on shutdown, never detached.
+        // managed server's management API is reachable) per manager. These are
+        // process-lifetime background tasks owned by the server: they run in a
+        // `JoinSet` that is drained on shutdown, never detached.
         let mut background = tokio::task::JoinSet::new();
         if let Some(pool) = &self.instance_pool {
             for manager in pool.managers_iter() {
@@ -295,23 +427,46 @@ impl RouterServer {
                     manager.bootstrap().await;
                 });
             }
-            let pool = pool.clone();
-            background.spawn(async move {
-                // The residency loop reads the ROCm sysfs VRAM total
-                // through a capability-gated `read_dir`; install the
-                // `FsCapability` grant for the life of the task.
-                fluent_wvr::CURRENT_CAPS
-                    .scope(
-                        fluent_wvr::CapabilitySet::new().with(fluent_wvr::FsCapability::new()),
-                        async move {
-                            pool.run_residency().await;
-                        },
-                    )
-                    .await;
-            });
+        }
+        // The shared residency engine (M5): ONE loop over the fleet's weights
+        // (llama adapters + onnx implementors), replacing both the llama
+        // sidecar task and the onnx residency sibling. It runs on an injected
+        // `Runtime` (no ambient `tokio::spawn`); its join handle is held and
+        // aborted at graceful shutdown so no detached task survives the server.
+        let mut residency_engine_handle: Option<tokio::task::JoinHandle<()>> = None;
+        if let (Some(engine), Some(fleet)) = (&self.residency_engine, &self.fleet) {
+            let weights = fleet.weights();
+            if !weights.is_empty() {
+                let weights = Arc::new(weights.to_vec());
+                let runtime = fluent_concurrency::tokio_runtime();
+                residency_engine_handle = Some(engine.start(&runtime, weights));
+                tracing::info!(
+                    target: "router.server",
+                    weights_count = fleet.weights().len(),
+                    "shared residency engine started (llama + onnx in one loop)",
+                );
+            }
         }
 
         let result = run_http(&self.bind_addr, deps, shutdown).await;
+
+        // Graceful shutdown: drain the review worker (C4) so in-flight
+        // corrections + status writes complete before the router exits.
+        if let Some(worker) = &self.review_worker {
+            Arc::clone(worker).drain().await;
+        }
+
+        // Graceful shutdown: drain the entity-link overlay worker (M6.2) so
+        // in-flight candidates land before the router exits.
+        if let Some(worker) = &self.entity_link_worker {
+            Arc::clone(worker).drain().await;
+        }
+
+        // Graceful shutdown: drain the arc_ready annotation-overlay worker
+        // (OVERLAYS §9) so in-flight derivations complete before exit.
+        if let Some(worker) = &self.overlay_worker {
+            Arc::clone(worker).drain().await;
+        }
 
         // Graceful shutdown: abort the background tasks and await their
         // completion so no process-lifetime task is left detached.
@@ -320,6 +475,14 @@ impl RouterServer {
             while background.join_next().await.is_some() {}
         })
         .await;
+
+        // Graceful shutdown: abort the shared residency engine (its task runs on
+        // the injected `Runtime`, outside the JoinSet, so it is aborted
+        // explicitly — never left detached).
+        if let Some(handle) = residency_engine_handle {
+            handle.abort();
+            let _ = handle.await;
+        }
 
         result
     }
@@ -359,6 +522,12 @@ impl WorkUnit for RouterServer {
             api_key_env_name: self.api_key_env_name.clone(),
             supervisor: self.supervisor.clone(),
             coordinator: self.coordinator.clone(),
+            review_worker: self.review_worker.clone(),
+            review_fetch: self.review_fetch.clone(),
+            entity_link_worker: self.entity_link_worker.clone(),
+            onnx: self.onnx.clone(),
+            onnx_llm_backend: self.onnx_llm_backend.clone(),
+            fleet: self.fleet.clone(),
         };
         let rt = ctx.rt.clone();
 

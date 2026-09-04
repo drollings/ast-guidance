@@ -70,9 +70,40 @@ pub(crate) fn install_global_subscriber() -> Arc<Mutex<Vec<String>>> {
                     .with_target(true),
             );
             let _ = tracing::subscriber::set_global_default(subscriber);
+            // Un-poison the callsite-interest cache: any `tracing` callsite
+            // (e.g. `audit::emit`) first observed on a subscriber-less thread
+            // is cached process-wide as `Interest::never()` and silently
+            // dropped by every later subscriber. Rebuilding here recomputes
+            // interest against the just-installed global, so audit tests that
+            // lose the install race still observe emissions. Without this,
+            // `wait_for_audit` can poll a full deadline for lines that will
+            // never arrive while statuses flip normally.
+            tracing::callsite::rebuild_interest_cache();
             capture
         })
         .clone()
+}
+
+/// Snapshot the current length of the shared global buffer. Audit tests
+/// record this right after install and scan only the suffix: node ids
+/// restart in every fresh store, so a whole-buffer scan can match a sibling
+/// test's stale lines and unblock a wait (or an assertion) before this
+/// test's own worker has emitted anything. Suffix-scoping keeps parallel
+/// tests sound without clearing (which would drop a sibling's lines).
+pub(crate) fn global_capture_len(capture: &Arc<Mutex<Vec<String>>>) -> usize {
+    capture.lock().map(|lines| lines.len()).unwrap_or(0)
+}
+
+/// Lines appended to the shared global buffer since `base` (see
+/// [`global_capture_len`]).
+pub(crate) fn global_capture_since(
+    capture: &Arc<Mutex<Vec<String>>>,
+    base: usize,
+) -> Vec<String> {
+    capture
+        .lock()
+        .map(|lines| lines.iter().skip(base).cloned().collect())
+        .unwrap_or_default()
 }
 
 /// Run `f` under a scoped subscriber that formats into a fresh capture,

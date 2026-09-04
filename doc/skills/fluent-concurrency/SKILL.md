@@ -15,18 +15,25 @@ This document specifies `fluent-concurrency`, a thin, safe, composable extension
 | Question | Resolution | Rationale |
 |----------|------------|-----------|
 | **Q1 — Supervision restart** | **Containment-only.** A `SupervisedBatch` catches task panics, emits a typed `SupervisedBatchEvent`, and cancels dependent tasks. It does **not** automatically restart. | Restarting async tasks from arbitrary state is a checkpoint-semantics problem. RabbitMQ's `supervisor2` gets away with it because Erlang processes are stateless on restart. Rust async tasks carry arbitrary stack state; automatic restart is a trap. We add restart only when profiling proves it necessary. |
-| **Q2 — Capability granularity** | **Per-scope establishment with task-local inheritance.** Entering a `Scope` (which the `SupervisedBatch` builds on top of) installs a `CapabilitySet` into `tokio::task_local! CURRENT_CAPS`. All `Scope::spawn` calls capture the current set and reinstall it in the child task via `CURRENT_CAPS.scope(caps, future)`. | Per-call `&Capability` at every `spawn` site adds ceremony without meaningful security gain when scope boundaries are already enforced. Effect *entry points* (e.g., `fs::read`, `db::query`) still require an explicit `&Capability` parameter in their signature, and the gating check (`check_capability`) reads `CURRENT_CAPS.try_with` to enforce presence. |
+| **Q2 — Capability granularity** | **Per-scope/batch establishment with task-local inheritance.** Entering a `Scope` or a `SupervisedBatch` installs a `CapabilitySet` into `tokio::task_local! CURRENT_CAPS`. `Scope::spawn` captures the current set and reinstalls it via `CURRENT_CAPS.scope(caps, future)` (`scope.rs:68-76`); `SupervisedBatch::spawn_unit` captures the effective `WorkContext.caps` (the batch caps plus per-unit overrides) and reinstalls it the same way (`batch.rs:206-235`). A task that bypasses these two entry points (raw `tokio::spawn`, `spawn_blocking`, or channel handoff without an explicit `scope`) sees an empty `CURRENT_CAPS` and fails closed with `PermissionDenied` — there is no fallback to ambient/default capabilities. | Per-call `&Capability` at every `spawn` site adds ceremony without meaningful security gain when scope/batch boundaries are already enforced. Effect *entry points* (e.g., `fs::read`, `db::query`) still require an explicit `&Capability` parameter in their signature, and the gating check (`check_capability`) reads `CURRENT_CAPS.try_with` to enforce presence; absence is a hard `Missing` error, not a silent default. |
 | **Q3 — Deterministic testing** | **Both, phased.** The `Runtime` trait supports a `TestRuntime` that uses Tokio's `start_paused` virtual time + a seeded `fastrand::Rng` for **record-replay**. For **combinatorial exploration**, the trait is designed to swap in a future `LoomRuntime` backend. The initial stack ships record-replay; loom integration is a future primitive. | A full loom-compatible async executor is a research project. Shipping it now would violate the "no academic abstraction inflation" red flag. The trait boundary is wide enough to add it later without breaking user code. |
 
 ## 3. Core Primitives
 
-The crate exports the following modules from `src/lib.rs:3-15`:
+The crate exports the following modules from `src/lib.rs:3-24`:
 
 ```text
-affinity  capability  flow  io  ladder  llm_queue  pool  queue  reserve  router  runtime  scope  stream  thread_resource  batch
+affinity  capability  credit_pool  feed_worker  flow  io  ladder  pool  queue  reserve  router  runtime  scope  stream  thread_resource  batch
 ```
 
-Each is described below. The spec primitives are in §3.1–§3.9; the bonus primitives (`AffinityScheduler`, `ResultPool`, `PriorityResultPool`, `LlmRequestQueue`, `Reserve`, `StreamAbort`, `thread_local_resource!`) are in §3.10; the canonical first-Ok fallback combinator (`first_accept_in_order`) is in §3.11.
+Each is described below. The spec primitives are in §3.1–§3.9; the bonus primitives (`AffinityScheduler`, `ResultPool`, `PriorityResultPool`, `Reserve`, `StreamAbort`, `thread_local_resource!`) are in §3.10; the canonical first-Ok fallback combinator (`first_accept_in_order`) is in §3.11.
+
+> ROADMAP_20260903_LLM M11 removed the `llm_queue` module. The LLM
+> protocol types (`ChatMessage`, `LlmConfig`, `LlmError`, `LlmTask`,
+> `LlmQueueConfig`) and `LlmRequestQueue` are owned by
+> `fluent_llm::protocol` (a thin wrapper over this crate's generic
+> `ResultPool`, composed — not re-implemented). Import LLM queue types
+> from `fluent_llm`, never from here.
 
 ### 3.1 `Capability` — Bounded Resource Access
 
@@ -43,7 +50,7 @@ Every high-overhead effect (file system, database, AI inference endpoint, blocki
 - `default_capability_set() -> CapabilitySet` — pre-populated with `FsCapability` and `NetCapability`.
 - `capability_set_with_db(path) -> Result<CapabilitySet, DbError>` — also adds a `DbCapability` rooted at `path` (error type is `fluent_db::error::DbError`).
 
-**Gating**: `check_capability<C: Capability>(cap: &C)` (canonical home `fluent_wvr::capability::check_capability`, re-exported from `fluent_concurrency::io`) reads `CURRENT_CAPS.try_with(|caps| caps.get::<C>().is_some())`. If absent, returns `Err(io::Error::new(PermissionDenied, CapabilityError::Missing { name: cap.name() }))`. The `name()` field on the trait is informational only; `CapabilitySet::get` uses `TypeId::of::<C>()` for the actual lookup. `CURRENT_CAPS` is a `tokio::task_local!` owned by `fluent-wvr` (re-exported from `fluent_concurrency::scope`) so both this crate and `fluent-db` read the same variable without a dependency cycle.
+**Gating**: `check_capability<C: Capability>(cap: &C)` (canonical home `fluent_wvr::capability::check_capability`, re-exported from `fluent_concurrency::io`) reads `CURRENT_CAPS.try_with(|caps| caps.get::<C>().is_some())`. If absent (no enclosing `Scope`/`SupervisedBatch` or a raw `tokio::spawn` that bypassed them), returns `Err(io::Error::new(PermissionDenied, CapabilityError::Missing { name: cap.name() }))` — fail-closed, no ambient fallback. `check_capability` is never a silent `default()` grant; an un-scoped task is denied, not allowed. The `name()` field on the trait is informational only; `CapabilitySet::get` uses `TypeId::of::<C>()` for the actual lookup. `CURRENT_CAPS` is a `tokio::task_local!` owned by `fluent-wvr` (re-exported from `fluent_concurrency::scope`) so both this crate and `fluent-db` read the same variable without a dependency cycle.
 
 **Error type** (`fluent_wvr::capability::CapabilityError`, re-exported unchanged
 from `fluent_concurrency::io`): `CapabilityError::{Missing { name }, Exhausted { name, detail }}`. The `Exhausted` variant is currently only used by `DbCapability`'s pool-empty branch.
@@ -61,7 +68,7 @@ A `Scope` is the fundamental owner of tasks. It is **`#[must_use]`** and require
 - `close_graceful(&mut self, timeout: Duration).await` — waits up to `timeout` for tasks to complete naturally, then aborts and drains any stragglers.
 - `defer(&mut self) -> ScopeGuard<'_>` — returns an RAII guard whose `Drop` calls `close_sync()`. The canonical ergonomic alternative to manual `close().await`. Note: the guard does **not** spawn a `close` task; it uses `close_sync()` directly to avoid a fire-and-forget task that could itself be aborted if the runtime drops.
 
-**Spawn and propagation** (`scope.rs:67-75`): `Scope::spawn` captures the current `CURRENT_CAPS` (defaulting to `CapabilitySet::default()` outside a task-local) and re-installs it in the child task via `CURRENT_CAPS.scope(caps, future)`. This is the load-bearing mechanism for the Q2 design decision.
+**Spawn and propagation** (`scope.rs:68-76`, `batch.rs:206-235`): `Scope::spawn` captures the current `CURRENT_CAPS` (defaulting to `CapabilitySet::default()` outside a task-local) and re-installs it in the child task via `CURRENT_CAPS.scope(caps, future)`. `SupervisedBatch::spawn_unit` does the same — it clones the effective `WorkContext.caps` for the unit (batch caps plus any per-`register_with_context` overrides) and spawns `CURRENT_CAPS.scope(caps_for_task, execute_with_timeout_and_retry(...))` into its `JoinSet`. Both are the load-bearing mechanism for the Q2 design decision; any `tokio::spawn`/`spawn_blocking` that bypasses them sees an empty `CURRENT_CAPS` and is denied at the first gated I/O call (fail-closed).
 
 **Drop semantics** (`scope.rs:148-168`): dropping a `Scope` without closing it panics with a structured-concurrency violation message. The panic is suppressed during a panic unwind to let the original panic propagate; instead, an `error!` is logged and tasks are aborted.
 
@@ -69,33 +76,33 @@ A `Scope` is the fundamental owner of tasks. It is **`#[must_use]`** and require
 
 ### 3.3 `SupervisedBatch` — Failure Containment & Supervision
 
-A `SupervisedBatch` is a `Scope` plus a dependency graph, a typed event sink, retry-with-backoff, and per-task timeouts. It is **also** a `Future<Output = SupervisedBatchSummary>` (`batch.rs:207-310`), so the canonical use is `let summary: SupervisedBatchSummary = batch.await`.
+A `SupervisedBatch` mirrors `Scope`'s ownership and capability-propagation discipline but owns its own `JoinSet` plus a dependency graph, a typed event sink, retry-with-backoff, and per-task timeouts (it does not wrap `Scope` — both install `CURRENT_CAPS` the same way). It is **also** a `Future<Output = SupervisedBatchSummary>` (`batch.rs:251-365`), so the canonical use is `let summary: SupervisedBatchSummary = batch.await`.
 
-**Construction** (`batch.rs:115-140`):
+**Construction** (`batch.rs:147-172`):
 
 - `SupervisedBatch::new(runtime: Arc<dyn Runtime>, caps: CapabilitySet) -> Self` — defaults to `SupervisedBatchConfig::default()`.
 - `SupervisedBatch::new_with_config(runtime, caps, config: SupervisedBatchConfig) -> Self`.
 
-**Configuration** (`batch.rs:49-60`): `SupervisedBatchConfig { poll_budget: usize, is_retryable: fn(&WorkError) -> bool, backoff_base_ms: u64, backoff_jitter_ms: u64 }`. `poll_budget` is the maximum tasks polled per `SupervisedBatch::poll` invocation (default `64`); when the budget is exhausted, the batch wakes itself with `cx.waker().wake_by_ref()` to prevent executor starvation. `backoff_base_ms` (default `100`) and `backoff_jitter_ms` (default `50`) tune the retry cadence: they are forwarded to `common_core::retry::retry_async` as `base_ms` and `jitter_pct` respectively, preserving the pre-configuration `retry_async(..., 100, 50, ...)` schedule exactly.
+**Configuration** (`batch.rs:48-92`): `SupervisedBatchConfig { poll_budget: usize, is_retryable: fn(&WorkError) -> bool, backoff_base_ms: u64, backoff_jitter_ms: u64 }`. `poll_budget` is the maximum ready `JoinSet` entries drained per `SupervisedBatch::poll` invocation (default `64`); only when that budget is exhausted on *ready* completions does `poll` call `cx.waker().wake_by_ref()` and return `Pending` to prevent one batch starving the executor (`batch.rs:343-346`). When the `JoinSet` is `Pending` (all remaining children still I/O-bound), `poll` returns `Pending` without a self-wake — there is no tight spinning on delayed tasks. `backoff_base_ms` (default `100`) and `backoff_jitter_ms` (default `50`) tune the retry cadence: they are forwarded to `common_core::retry::retry_async` as `base_ms` and `jitter_pct` respectively, preserving the pre-configuration `retry_async(..., 100, 50, ...)` schedule exactly.
 
-**Registration** (`batch.rs:148-172`):
+**Registration** (`batch.rs:189-204`):
 
 - `register(unit: Arc<dyn Component>) -> Result<&mut Self, SupervisedBatchError>` — builds a `WorkContext` via `WorkContext::for_unit_in_batch(&self.runtime, &self.caps, |_| {})` and forwards.
-- `register_with_context(unit, ctx: WorkContext) -> Result<&mut Self, SupervisedBatchError>` — explicit context.
+- `register_with_context(unit, ctx: WorkContext) -> Result<&mut Self, SupervisedBatchError>` — explicit context (its `ctx.caps` is the `CURRENT_CAPS` installed for that task, so per-unit overrides are honored).
 - `SupervisedBatchError::DuplicateName(ArcIntern<str>)` — duplicate `name()` rejection. The signature is `Result`, not panicking, so callers can decide.
 
-**Dependency tracking** (`batch.rs:98-113, 189-204, 207-310`): each registered unit contributes to a `DependencyGraph<ArcIntern<str>>` composed from `fluent_dag::dep_graph` (`batch.rs:105`), plus two maps for the abort side effects: `task_names: HashMap<task::Id, ArcIntern<str>>` and `abort_handles: HashMap<ArcIntern<str>, AbortHandle>`.
+**Dependency tracking** (`batch.rs:130-145, 233-248, 251-365`): each registered unit contributes to a `DependencyGraph<ArcIntern<str>>` composed from `fluent_dag::dep_graph` (`batch.rs:137`), plus two maps for the abort side effects: `task_names: HashMap<task::Id, ArcIntern<str>>` and `abort_handles: HashMap<ArcIntern<str>, AbortHandle>`.
 
 When a unit fails/panics/times out, `cancel_dependents_of(name)` (`batch.rs:189-204`) calls `DependencyGraph::dependents_of(name)` — a cycle-resilient DFS — and aborts each transitive dependent's handle. A back-edge into the DFS active path emits a `tracing::warn!` rather than panicking — the cycle is left in place but the offending dependents are not double-cancelled.
 
-**Retry and timeout** (`batch.rs:320-362`): each registered unit is wrapped in `execute_with_timeout_and_retry` which:
+**Retry and timeout** (`batch.rs:364-416`): each registered unit is wrapped in `execute_with_timeout_and_retry` which:
 
 - Yields once before the first attempt so pending abort signals are processed.
-- Calls `unit.execute(&ctx)`.
-- On `Err(WorkError)`, sleeps the shared jittered-exponential backoff
-- Wraps the whole thing in `tokio::time::timeout(timeout_ms, …)`; on timeout returns `Err(WorkError::Timeout { duration_ms, unit })`.
+- Calls `unit.execute(&ctx)` *inside the installed `CURRENT_CAPS` scope* (`batch.rs:214-232`), so any capability-gated I/O sees the batch's `CapabilitySet`.
+- On `Err(WorkError)`, sleeps the shared jittered-exponential backoff via `common_core::retry::retry_async`
+- Wraps the whole thing in `tokio::time::timeout(timeout_ms, …)`; on timeout returns `Err(WorkError::Timeout { duration_ms, unit })` and `poll` records it as `Cancelled(Timeout)`.
 
-**Panic propagation**: panics are *not* caught via `catch_unwind`. They propagate through `JoinSet` as `JoinError::Panic`, which `SupervisedBatch::poll` intercepts (`batch.rs:256-285`) and records as `SupervisedBatchEvent::Panicked`. This is deliberate: a `catch_unwind` would lose the panic site and prevent the dependency-aware cancellation graph from firing.
+**Panic propagation**: panics are *not* caught via `catch_unwind`. They propagate through `JoinSet` as `JoinError::Panic`, which `SupervisedBatch::poll` intercepts (`batch.rs:300-330`) and records as `SupervisedBatchEvent::Panicked`. This is deliberate: a `catch_unwind` would lose the panic site and prevent the dependency-aware cancellation graph from firing.
 
 **Event taxonomy** (`batch.rs:20-75`):
 
@@ -145,13 +152,15 @@ impl<T: Send + Sync + 'static> WorkerPool<T> {
 }
 ```
 
-Internally it uses a `Queue<T>` (see below) and a `Notify` for close-wakes-waiters. Workers loop on `tokio::select! { shutdown.notified() | queue.pop() }`. If you don't need the result, this is the zero-allocation-per-submit primitive. For the result-returning variant, see `ResultPool` (§3.10). `Queue<T>`'s backing store is a `std::sync::Mutex<VecDeque<T>>` — the lock is never held across an await (every guard is scoped), so the async mutex's waker bookkeeping would be pure overhead; poison is recovered via `common_core::sync::lock`. (`CreditSender` in `flow.rs` is the one exception that must stay a `tokio::sync::Mutex` — its guard protects the bump receiver across `recv().await`.)
+Internally it uses a `Queue<T>` (see below) and a `Notify` for close-wakes-waiters. Workers loop on `tokio::select! { shutdown.notified() | queue.pop() }`. If you don't need the result, this is the zero-allocation-per-submit primitive. For the result-returning variant, see `ResultPool` (§3.10). `Queue<T>`'s backing store is a `std::sync::Mutex<VecDeque<T>>` — the lock is never held across an await (every guard is scoped and dropped before the future yields), so the async `Mutex`'s waker bookkeeping would be pure overhead; a `std::sync::Mutex` with a microsecond critical section (`VecDeque::push_back`/`pop_front`) is the Tokio-recommended choice for this shape. Poison is recovered via `common_core::sync::lock` (`common_core::sync::lock`) rather than `unwrap` — the queue never runs user code while locked, so the only panic-while-locked path is allocator OOM (which leaves `VecDeque` in a valid state); wedging the pool on poison would be a worse availability failure than recovering the valid deque. (`CreditSender` in `flow.rs` is the one exception that must stay a `tokio::sync::Mutex` — its guard protects the bump receiver across `recv().await`.)
+
+**Credit-gated variant — `CreditGatedPool<J>`** (`credit_pool.rs`): a `WorkerPool` whose `submit` path acquires a credit token before enqueuing and whose handler releases it once per processed job. Extracted from the router's two structurally-identical workers (`ReviewWorker`, `EntityLinkWorker`); a third credit-gated worker MUST compose it rather than re-copying the `CreditSpec`/cap scaffolding (the worker cap `2` and the `CreditSpec { max(1), max(1) }` formulas are load-bearing). API: `new(runtime, credit_limit, queue_capacity, handler)`, `submit(job) -> Result<(), PoolError>` (blocks only when credit is exhausted), `is_blocked()`, `drain()`, `worker_count()`. **Status: production** (both workers migrated).
 
 **Why not `tokio::sync::Semaphore`?** A `Semaphore` is perfect for a *limiter* (see §3.5), but it does not provide a FIFO queue of jobs or dedicated workers. RabbitMQ's `worker_pool` explicitly wants workers to pull from a queue, allowing prioritization and monitoring of queue depth. Our `WorkerPool` gives exactly that.
 
 ### 3.5 `Limiter` — Lightweight Concurrency Cap
 
-For cases where you don't need a dedicated worker pool, just a cap on concurrent executions, the `Limiter` is a `Semaphore`-backed wrapper (`pool.rs:363-420`).
+For cases where you don't need a dedicated worker pool, just a cap on concurrent executions, the `Limiter` is a `Semaphore`-backed wrapper (`pool.rs:534-597`).
 
 **API**:
 
@@ -167,7 +176,7 @@ impl Limiter {
 }
 ```
 
-`run_sync` first tries `tokio::runtime::Handle::try_current()`. Inside a running **multi-threaded** runtime (the router's HTTP handler does this) it drives the permit-acquire + closure via `tokio::task::block_in_place(|| handle.block_on(block))` — a bare `Handle::block_on` would panic with "Cannot start a runtime from within a runtime". Inside a current-thread runtime it uses `handle.block_on(block)`. With no active runtime it builds a dedicated current-thread runtime for the duration of the call. This is the right tool for synchronous callers (e.g., a CLI handler invoked outside an async context) that need to bound concurrency. **Caveat:** on the multi-thread scheduler `block_in_place` parks a worker thread for the duration of the call (the scheduler spins up a replacement thread, and the parked thread is unavailable for work stealing until it returns) — the correct sync↔async bridge, but not for throughput-critical paths; prefer the async `Limiter::run` there.
+`run_sync` first tries `tokio::runtime::Handle::try_current()`. Inside a running **multi-threaded** runtime (the router's HTTP handler does this) it drives the permit-acquire + closure via `tokio::task::block_in_place(|| handle.block_on(block))` — a bare `Handle::block_on` would panic with "Cannot start a runtime from within a runtime". Inside a current-thread runtime it uses `handle.block_on(block)`. With no active runtime it builds a dedicated current-thread runtime for the duration of the call. This is the right tool for synchronous callers (e.g., a CLI handler invoked outside an async context) that need to bound concurrency. **Caveat:** on the multi-thread scheduler `block_in_place` *parks the calling worker thread* for the duration of the call (the scheduler spins up a replacement thread and the parked thread is unavailable for work stealing until it returns) — `Limiter::run_sync` is therefore the correct sync↔async bridge, but it is **not for throughput-critical paths**; bound its use to control-plane callers that genuinely cannot `await` (`pool.rs:567-595`) and prefer the async `Limiter::run` everywhere else. Burst calling `run_sync` on the runtime would inflate the thread pool, which is exactly why the async path exists.
 
 This is the Rust equivalent of the `credit_flow` sender side: acquire a slot, run the work, release the slot on completion.
 
@@ -200,7 +209,7 @@ This is O(log P) for `push` and `pop`, where P is the number of distinct non-zer
 
 RabbitMQ's `credit_flow` module throttles publishers end-to-end. Our `CreditFlow` uses explicit message passing between sender and receiver, preserving the exact semantics (`flow.rs:13-98`).
 
-> **Status: production.** The ledger tier feed consumes it in the router: `LedgerTierWorker` owns a `flow::new(CreditSpec)` pair whose `CreditSender` gates the async producer path (`LedgerAgentCoordinator::run_agent` step 5 → `enqueue_with_credit`, `ledger/tiering.rs`, `ledger/orchestrator.rs`) and whose `CreditReceiver::recv()` releases a token after each processed node — so a burst of agent turns cannot grow the feed without bound (the feed channel itself is a bounded `mpsc`; knobs `ledger.tier_credit_limit` / `ledger.tier_credit_more_after`). The other LLM fan-out paths — coral's `LlmRequestQueue` and the router's escalation team-mode parallel votes — are bounded by `ResultPool` (a `cap`-and-`queue_capacity`-limited worker pool whose `submit` provides the backpressure), and team-mode's decomposer "subtasks" are counted for audit but not dispatched to a pool, so there is no separate credit-token producer to throttle there. `flow.rs`'s own tests (`tests/m4.rs`) are the semantics baseline. (The `memory-plugin::MemoryBatch` stub that once consumed `flow::new` was pruned in the 2026-08-15 scaffold review — its body was a log-only stub and no caller constructed it.)
+> **Status: production.** The ledger tier feed consumes it in the router: `LedgerTierWorker` owns a `flow::new(CreditSpec)` pair whose `CreditSender` gates the async producer path (`LedgerAgentCoordinator::run_agent` step 5 → `enqueue_with_credit`, `ledger/tiering.rs`, `ledger/orchestrator.rs`) and whose `CreditReceiver::recv()` releases a token after each processed node — so a burst of agent turns cannot grow the feed without bound (the feed channel itself is a bounded `mpsc`; knobs `ledger.tier_credit_limit` / `ledger.tier_credit_more_after`). The review and entity-link workers are the other CreditFlow consumers, but both now compose the shared `CreditGatedPool` (§3.4) rather than constructing a `flow::new` pair by hand — the `CreditSpec` formulas live in one place. The remaining LLM fan-out paths — coral's `LlmRequestQueue` and the router's escalation team-mode parallel votes — are bounded by `ResultPool` (a `cap`-and-`queue_capacity`-limited worker pool whose `submit` provides the backpressure), and team-mode's decomposer "subtasks" are counted for audit but not dispatched to a pool, so there is no separate credit-token producer to throttle there. `flow.rs`'s own tests (`tests/m4.rs`) are the semantics baseline. (The `memory-plugin::MemoryBatch` stub that once consumed `flow::new` was pruned in the 2026-08-15 scaffold review — its body was a log-only stub and no caller constructed it.)
 
 **API**:
 
@@ -291,20 +300,21 @@ There is **no** fire-and-forget variant: because the worker protocol requires a 
 
 **`PriorityResultPool<T, R, E>`** (`pool.rs:433-529`) — priority-ordered variant of `ResultPool`. Jobs are submitted with `submit(job, priority)`; higher priority values are dispatched first, FIFO within the same priority. Internally it uses the `BoundedPriorityQueue` from `queue.rs` — a `PriorityQueue` (ordering) behind a `std::sync::Mutex` (never held across an await, so the async mutex's waker bookkeeping would be pure overhead; poison recovered via `common_core::sync::lock`) with `Queue`-style close-wakes-waiters semantics. **`submit`/`submit_with_abort` apply backpressure**: they block while the queue is at capacity (`PoolError::Full` is the synchronous `BoundedPriorityQueue::push` fast path's error; `Pool(Closed)` surfaces from a submit after shutdown) instead of growing without bound. Workers follow the **drain-then-wait** pattern. `new(runtime, cap, handler)` sizes the queue to `cap * 4`; `with_queue_capacity(runtime, cap, queue_capacity, handler)` overrides it.
 
-**`LlmRequestQueue`** (`llm_queue.rs:156-185`) — typed wrapper over `ResultPool` for LLM chat completions. The crate is transport-agnostic: the `Fn(LlmTask) -> Result<String, LlmError>` handler is supplied at construction time; the default OpenAI-compatible HTTP handler lives in `guidance-llm`. This split keeps `reqwest` out of the boundary that downstream callers care about.
+**`LlmRequestQueue`** — MOVED (ROADMAP_20260903_LLM M9/M11). The typed
+`ResultPool` wrapper for LLM chat completions (`LlmRequestQueue`,
+`LlmTask`, `LlmConfig`, `ChatMessage`, `LlmQueueConfig`, `LlmError`) is
+owned by `fluent_llm::protocol`; the `Fn(LlmTask) ->
+Result<String, LlmError>` handler is supplied at construction time and the
+default OpenAI-compatible HTTP handler lives in
+`fluent_llm::llm_queue`. This crate stays transport-agnostic: compose the
+generic `ResultPool` / `PriorityResultPool` / `StreamAbort` primitives
+below for non-LLM work, and import LLM queue types from `fluent_llm`.
 
 ```rust
-pub struct LlmRequestQueue { pool: Arc<ResultPool<LlmTask, String, LlmError>> }
-
-pub struct LlmTask    { pub messages: Vec<ChatMessage>, pub config: LlmConfig }
-pub struct LlmConfig  { pub api_url: String, pub model: String, pub think: Option<bool>,
-                        pub timeout_ms: u64 (default 2000),
-                        pub extra_body_params: Option<serde_json::Value>,
-                        pub debug: bool, pub show_prompts: bool }
-pub struct ChatMessage { pub role: String, pub content: String }
-pub struct LlmQueueConfig { pub worker_count: usize, pub queue_capacity: usize }
-
-pub enum LlmError { Api(String), Http(String), NoResponse, RateLimited }
+// Canonical paths (M11 deleted fluent_concurrency::llm_queue):
+use fluent_llm::protocol::{
+    ChatMessage, LlmConfig, LlmError, LlmQueueConfig, LlmRequestQueue, LlmTask,
+};
 ```
 
 `LlmConfig.extra_body_params` is arbitrary JSON merged into every request body (e.g. `num_ctx`, `temperature`, `stop`); `"model"`, `"messages"`, and `"stream"` keys are ignored because those are set explicitly by the chat-completion logic. `LlmConfig::new()` is a `bon` builder (`start_fn = new`).
@@ -313,7 +323,7 @@ pub enum LlmError { Api(String), Http(String), NoResponse, RateLimited }
 
 **`StreamAbort`** (`stream.rs:1-...`) — a sticky, `Clone` cancellation signal for long-lived streams. Fires once (`cancel`, idempotent), wakes every currently- and future-waiting task (`cancelled`, sticky), and can be inspected (`is_cancelled`). Carries no I/O — transports drop their connections and management planes issue explicit aborts as a *reaction* to it. `Clone` is an `Arc` bump, so every task that touches a stream (the forwarding task, the downstream body-drop guard, the management-abort watcher) holds its own clone and observes the same state. The canonical wiring is the **body-lifetime rule**: the HTTP body handed to the client is wrapped so its `Drop` fires `cancel()` — the body's lifetime is the single source of truth for "the consumer is gone" — and the forwarding task `select!`s its upstream read against `cancelled()`. **Status: production.** Consumed by the router's streaming dispatch (`OpenAiChatBackend::stream_complete_with_abort`, `dispatch/backend.rs`), which selects its upstream read *and* its body sends against the signal so a blocked `send_data` never wedges the task.
 
-**Abort-aware pool submissions.** `ResultPool::submit_with_abort(job, abort)` and `PriorityResultPool::submit_with_abort(job, priority, abort)` race the handler future against the optional `StreamAbort`: when the signal fires mid-flight the handler future is dropped (an in-flight HTTP call is cancelled, the worker slot is freed) and the submitter observes `ResultPoolError::Canceled` — making that variant *reachable from the submitter side* (previously it fired only on worker panic/shutdown). `LlmRequestQueue::submit_with_abort(task, abort)` exposes the same seam for LLM calls; plain `submit` is unchanged (`None` abort). **Status: production** for the pool seam; `LlmRequestQueue::submit_with_abort` is currently a compatibility surface with no in-tree caller.
+**Abort-aware pool submissions.** `ResultPool::submit_with_abort(job, abort)` and `PriorityResultPool::submit_with_abort(job, priority, abort)` race the handler future against the optional `StreamAbort`: when the signal fires mid-flight the handler future is dropped (an in-flight HTTP call is cancelled, the worker slot is freed) and the submitter observes `ResultPoolError::Canceled` — making that variant *reachable from the submitter side* (previously it fired only on worker panic/shutdown). `fluent_llm::protocol::LlmRequestQueue::submit_with_abort(task, abort)` exposes the same seam for LLM calls; plain `submit` is unchanged (`None` abort). **Status: production** for the pool seam; the protocol queue's abort seam is currently a compatibility surface with no in-tree caller.
 
 **`AffinityScheduler<T, R, E>`** (`affinity.rs:59-191`) — wraps `PriorityResultPool` with session-aware priority boosting and starvation aging. Tracks which session is currently "affine" and gives its tasks a priority bonus (`AgingConfig::affinity_bonus`, default +10). Starved tasks (different session) periodically increase in base priority at `AgingConfig::aging_rate` (default +2 per 5s tick) up to `AgingConfig::max_priority` (default 100). `set_affinity(Option<String>)` switches the active session. `submit(task: ScheduledTask<T>, base_priority)` computes the effective priority and delegates to the pool. Designed for multi-session agent dispatch where context-switching between sessions should be minimized. **Status: production.** Wired at the ledger-agent coordinator's boot path: `ledger.orchestrator.affinity_cap: <cap>` on `RouterConfig` opts the boot into attaching a scheduler via `LedgerAgentCoordinator::build_affinity_scheduler(cap)` (composed through `build_ledger_coordinator`), so the active `run_agent` session is tracked as KV-affine for priority boosting.
 
@@ -338,6 +348,21 @@ where
     R: Send + 'static,
 ```
 
+**Sync twin** (`ladder.rs`, same module): `first_accept_in_order_sync` mirrors the async semantics exactly (`Ok(Some)` wins, `Ok(None)` skips, `Err(e)` continues unless `stop(&e)`, exhaustion returns the last `Err` or `Ok(None)`) for non-async callers:
+
+```rust
+pub fn first_accept_in_order_sync<T, R, E, F, Stop>(
+    rungs: impl IntoIterator<Item = T>,
+    run: F,
+    stop: Stop,
+) -> Result<Option<R>, E>
+where
+    F: FnMut(T) -> Result<Option<R>, E>,
+    Stop: FnMut(&E) -> bool,
+```
+
+Its one consumer today is the `spacy-rs` synchronous annotation ladder (`run_ladder_sync`), which previously hand-rolled the same first-accept walk with a sequential `if let Some(fetch) … if let Some(encoder) … ArcEager … rule` chain.
+
 - `rungs` — the ordered fallback candidates (owned; no clones or `&mut` counters needed by the caller).
 - `run` — one attempt per rung; returned `Ok(r)` short-circuits to `Ok(Some(r))`.
 - `stop` — when `true` for an `Err(e)`, the walk **aborts immediately** with `Err(e)` (the terminal error is first-class — no silent swallow). When `false`, the rung is skipped and the next is tried.
@@ -350,8 +375,10 @@ where
 | `BackendChain` | `complete`/`stream_complete` fallback across backends | `router/src/dispatch/backend.rs` |
 | `dispatch_real` | model fallback walk with attempt counter | `router/src/server/dispatch.rs` |
 | `Ladder::try_escalate` | escalation-mode walk (`stop = |_| false`, `.ok().flatten()`) | `router/src/dispatch/escalation/mod.rs` |
+| spacy-rs annotation ladder | async `run_ladder_for` over `[LLM, encoder, ArcEager, rule]` | `spacy-rs/src/pipeline.rs` |
+| spacy-rs sync annotation ladder | `first_accept_in_order_sync`, `stop = |_| false` | `spacy-rs/src/pipeline.rs` (`run_ladder_sync`) |
 
-**Rule:** any ordered first-success walk must use `first_accept_in_order`. The router's `match_target` is the one documented exception (start-index skip + last-always-wins + per-rung audit — a different shape; see `target_match.rs`).
+**Rule:** any ordered first-success walk must use `first_accept_in_order` (or its sync twin). The router's `match_target` is the one documented exception (start-index skip + last-always-wins + per-rung audit — a different shape; see `target_match.rs`).
 
 ## 4. Control Plane / Data Plane Integration (Fluent WVR)
 
@@ -391,14 +418,15 @@ with dependency cancellation, whereas the helper is per-call.
 | Hot Path | Technique | Why |
 |----------|-----------|-----|
 | Task scheduling | Tokio's local queue + LIFO slot | We do not add indirection. |
-| Worker pool job dispatch | `VecDeque` in `Mutex` | One lock per pop; workers sleep on `Notify`. No `dyn` dispatch per job. |
+| Worker pool job dispatch | `VecDeque` in `std::sync::Mutex` (scoped, never across `await`) | One short lock per pop; `tokio::sync::Mutex` would add waker overhead for no gain; workers sleep on `Notify`. No `dyn` dispatch per job. |
 | Result pool per-submit | `oneshot::channel` per submit | One allocation per job; the worker sends the result through the channel. |
 | Priority queue (all same priority) | `VecDeque` fast path | Zero overhead for the common case. |
-| SupervisedBatch dependency lookup | Inverted index `provides_to_dependents: HashMap<asset, Vec<task>>` | O(1) dependent lookup at cancellation time; avoids scanning the full DAG. |
-| SupervisedBatch poll budget | `cx.waker().wake_by_ref()` after N polls | Prevents one batch from starving the executor when many tasks complete in the same wake. |
-| Capability gating | `HashMap<TypeId, Arc<dyn Any>>` lookup on `CURRENT_CAPS` | `TypeId` is pointer-sized; no string comparison. `name()` is informational only. |
+| SupervisedBatch dependency lookup | `DependencyGraph::dependents_of` (cycle-resilient DFS) | Transitive dependents without scanning the full DAG; cycle is `warn!`-ed, not panicked. |
+| SupervisedBatch poll budget | `poll_budget=64`, `wake_by_ref` only when ready-budget exhausted | Prevents one batch starving the executor when many tasks complete in the same wake; no spin when `JoinSet` is `Pending`. |
+| Capability gating | `HashMap<TypeId, Arc<dyn Any>>` lookup on `CURRENT_CAPS` via `try_with` | `TypeId` is pointer-sized; no string comparison. `name()` is informational only; absence is `PermissionDenied` (fail-closed). |
 | Data transformation | Concrete enums + pattern matching | `WorkUnit::execute` is one vtable call per task; inside it, all work is monomorphized. |
 | `Reserve` permit | `AtomicUsize` `fetch_sub`/`fetch_add` | Lock-free, no heap allocation. |
+| Poison recovery | `common_core::sync::lock` (`into_inner` on poison) | Queue holds only `VecDeque`/`BTreeMap` with `push`/`pop` that leaves structure valid; wedging on poison would be worse availability loss than recovering the valid deque. |
 
 ## 6. Crate Layout (Actual)
 
@@ -424,12 +452,12 @@ The crate is no longer "proposed" — it ships. The current `Cargo.toml`:
 - `tempfile` — for filesystem-based tests
 - `fluent-wvr-testutil` — `impl_component_for_test!` and `StubComponent` for unit-test scaffolding
 
-No `async-trait`, no `bumpalo`, no `crossbeam`. Tokio's channels, `Notify`, and `Semaphore` are sufficient. (One macro: `impl_component!` lives in `fluent-wvr`, not here; derive macros for `FieldAccess` and `Describable` live in `fluent-wvr-macros`.)
+No `async-trait` crate (native AFIT is used for the `Pool` traits — no proc-macro, no hidden `Box`), no `bumpalo`, no `crossbeam`. Tokio's channels, `Notify`, and `Semaphore` are sufficient. (One macro: `impl_component!` lives in `fluent-wvr`, not here; derive macros for `FieldAccess` and `Describable` live in `fluent-wvr-macros`.)
 
 ## 7. Anti-Patterns Explicitly Rejected
 
-1. **No `#[async_trait]` or macro-heavy execution.** The framework uses manual `Future` impls and `async fn` where the compiler can see the boundaries. The `SupervisedBatch` is a hand-written `impl Future` (`batch.rs:207-310`); `Scope` uses `tokio::task::JoinSet` directly.
-2. **No `tokio::spawn` without a scope.** The `tokio::spawn` calls in the crate are limited to: `Scope::close` (drain) and `Scope::close_graceful` (drain); `SupervisedBatch`'s `JoinSet`; `WorkerPool`/`ResultPool`/`PriorityResultPool` worker loops; and `DbCapability::query`/`execute` in `fluent-db` (which `spawn_blocking` for sync `rusqlite` work). Every async effect outside these sites flows through `Scope::spawn` (which tracks the handle) or through a pool (which tracks workers).
+1. **No `async_trait` crate; native AFIT allowed for control-plane traits.** `fluent-concurrency` forbids the `async_trait` proc-macro crate (its `Box<dyn Future>` hides an allocation per call). Native `async fn` in trait (AFIT/RPITIT, stable since Rust 1.75) is allowed for non-object-safe, non-hot-loop control-plane traits — the canonical example is the `Pool` family (`SinkPool`/`RequestPool`/`PriorityRequestPool` in `pool.rs`/`credit_pool.rs`). Hot-loop dispatch (`Limiter::run`, queue `pop`, per-item work) stays concrete generics per `fluent-wvr/SKILL.md:70` ("dyn at request boundary, concrete in tight loop"). The orchestration core (`SupervisedBatch` hand-written `impl Future` `batch.rs:251-365`; `Scope` via `JoinSet`) stays manual `Future` so poll budgets, dependency cancellation, and capability propagation remain compiler-visible.
+2. **No `tokio::spawn` without a scope/batch.** The `tokio::spawn` calls in the crate are limited to: `Scope::spawn` (which installs `CURRENT_CAPS`); `SupervisedBatch::spawn_unit` (which installs `CURRENT_CAPS` from `WorkContext.caps`, `batch.rs:206-235`); `Scope::close`/`close_graceful` drains; `WorkerPool`/`ResultPool`/`PriorityResultPool` worker loops; and `DbCapability::query`/`execute` in `fluent-db` (which `spawn_blocking` for sync `rusqlite` work). Every async effect outside these sites flows through `Scope::spawn` or `SupervisedBatch` (both capability-scoped and handle-tracked) or through a pool (which tracks workers). Raw `tokio::spawn` without a scope is an anti-pattern because it loses `CURRENT_CAPS` and is denied at the first gated I/O.
 3. **No `dyn Trait` in a per-item loop.** The `PartitionedRouter` hashes once per submit; `PriorityQueue` dispatches via `BTreeMap` keys, not vtables; `CapabilitySet::get` uses `TypeId` (pointer-sized) rather than string comparison; `PartitionedRouter` does no per-job vtable dispatch.
 4. **No ambient `tokio::fs::read` or `tokio::time::sleep`.** All I/O is called through a capability method (`FsCapability::read`, `NetCapability::http_get`, `DbCapability::query`, etc.) which calls `check_capability(self)` first. `tokio::time::sleep` is allowed in the framework's own internals (SupervisedBatch retry, SupervisedBatch timeout) and in the `Runtime::sleep` backend, but consumer code is expected to use `Limiter::run`, `common_core::retry`, or `SupervisedBatch` rather than calling it directly.
 5. **No automatic restart.** SupervisedBatch instances contain; they do not restart. Restart is a deliberate operator action.

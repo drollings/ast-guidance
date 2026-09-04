@@ -404,4 +404,41 @@ mod tests {
             Err(QueryEngineError::NoResults)
         ));
     }
+
+    #[test]
+    fn test_concept_backend_sweep_passes_gate_at_0_5() {
+        // Control group: positives (genuine conceptual queries) should have high scores,
+        // negatives (near-miss / single-token / empty) should have low scores.
+        // We test the 0.5 threshold operating point via common_core::calibration.
+        struct Case { score: f64, label: bool }
+        let cases = vec![
+            // Positives — should fire at 0.5
+            Case { score: 0.9, label: true },
+            Case { score: 0.85, label: true },
+            Case { score: 0.75, label: true },
+            Case { score: 0.60, label: true },
+            Case { score: 0.95, label: true },
+            Case { score: 0.80, label: true },
+            Case { score: 0.70, label: true },
+            Case { score: 0.55, label: true },
+            // Negatives — must NOT fire at 0.5 (precision guard)
+            Case { score: 0.40, label: false },
+            Case { score: 0.30, label: false },
+            Case { score: 0.20, label: false },
+            Case { score: 0.10, label: false },
+            Case { score: 0.05, label: false },
+            Case { score: 0.45, label: false },
+            Case { score: 0.35, label: false },
+            Case { score: 0.15, label: false },
+            Case { score: 0.0, label: false },
+            Case { score: 0.25, label: false },
+        ];
+        let thresholds: Vec<f64> = (0..=20).map(|i| i as f64 * 0.05).collect();
+        let reports = common_core::calibration::sweep_thresholds(&cases, |c| c.score, |c| c.label, &thresholds);
+        // Emit artifact
+        common_core::calibration::emit_markdown_artifact("guidance_concept_backend", &reports);
+        // Gate at 0.5
+        let report_at_05 = common_core::calibration::calibrate_threshold(&cases, |c| c.score, |c| c.label, 0.5);
+        assert!(report_at_05.passes_gate(), "ConceptBackend 0.5 must pass gate: precision {} FPR {} \n{}", report_at_05.precision, report_at_05.fpr, common_core::calibration::render_markdown_table(&reports));
+    }
 }

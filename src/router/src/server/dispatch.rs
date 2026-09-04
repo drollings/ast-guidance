@@ -2,12 +2,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use common_core::ResponseCache;
 use fluent_concurrency::ladder::first_accept_in_order;
+use fluent_llm::cache::ResponseCache;
 use http_body_util::BodyExt;
 
 use crate::dag_session::DependencySession;
-use crate::dispatch::backend::ChatBackend;
+use crate::dispatch::backend::DispatchBackend;
 use crate::dispatch::backend::OpenAiChatBackend;
 use crate::dispatch::backend::RetryBackend;
 use crate::dispatch::escalation::{EscalationContext, Ladder};
@@ -21,7 +21,7 @@ use crate::server::responses::ServerStats;
 use crate::streaming::StreamAnswer;
 use crate::testing::mock::MockDispatchContext;
 use crate::types::{RouterMessageContent, RouterRequest, RouterResponse};
-use common_core::string::strip_thinking_blocks;
+use fluent_llm::thinking::strip_thinking_blocks;
 
 use crate::charts::extract::WorkflowExtractor;
 
@@ -55,6 +55,11 @@ pub struct DispatchDeps {
     pub context_cache: Option<Arc<dyn fluent_types::ContextCache>>,
     pub session: Option<Arc<Mutex<DependencySession>>>,
     pub instance_pool: Option<crate::instances::InstancePool>,
+    /// The in-process onnx generative `ChatBackend` (the `onnx/llm` routing
+    /// model). Onnx `RoutingTarget`s are served through it. `None` (e.g. mock
+    /// mode, no onnx fleet) leaves onnx targets unserved — the mock intercepts
+    /// first in tests.
+    pub onnx_llm_backend: Option<Arc<dyn fluent_llm::client::ChatBackend>>,
 }
 
 #[allow(clippy::implicit_hasher)]
@@ -199,11 +204,23 @@ pub async fn handle_dispatch(
     .await
 }
 
-/// Build a `ChatBackend` (optionally wrapped in `RetryBackend`) for a single
-/// routing target.
-fn make_backend(http_client: &reqwest::Client, target: &RoutingTarget) -> Arc<dyn ChatBackend> {
-    let base: Arc<dyn ChatBackend> =
-        Arc::new(OpenAiChatBackend::new(http_client.clone(), &target.url));
+/// Build a `DispatchBackend` (optionally wrapped in `RetryBackend`) for a single
+/// routing target. An onnx target (`is_onnx`) is served by the in-process onnx
+/// `ChatBackend`; every other target goes over HTTP to `target.url`.
+fn make_backend(deps: &DispatchDeps, target: &RoutingTarget) -> Arc<dyn DispatchBackend> {
+    if target.is_onnx {
+        if let Some(onnx) = &deps.onnx_llm_backend {
+            return Arc::new(crate::dispatch::backend::OnnxDispatchBackend::new(onnx.clone()));
+        }
+        tracing::warn!(
+            target: "router.dispatch",
+            model = %target.model,
+            "onnx dispatch target but no onnx backend wired — dispatch will fail open",
+        );
+    }
+    let base: Arc<dyn DispatchBackend> = Arc::new(
+        OpenAiChatBackend::new((*deps.http_client).clone(), &target.url).with_api_key(target.api_key.clone()),
+    );
     if target.retry_count > 0 {
         Arc::new(RetryBackend::new(
             base,
@@ -267,7 +284,7 @@ async fn dispatch_to_single_target(
     user_text: &str,
     deps: &DispatchDeps,
 ) -> Result<DispatchOutcome, DispatchError> {
-    let backend = make_backend(&deps.http_client, target);
+    let backend = make_backend(deps, target);
 
     let params = crate::dispatch::backend::params_with_routing_fields(
         target.params.clone(),
@@ -450,6 +467,29 @@ pub async fn dispatch_real(
                     pool.ensure_target_ready(&target.url, target.instance.as_deref())
                         .await;
                 }
+                // ROADMAP M7 resize-to-demand: a caller that declares a bigger
+                // context window than the targeted instance is allocated gets
+                // the instance resized to fit (bounded by `max_ctx`); a need
+                // beyond `max_ctx` fails loudly with the same shape a too-large
+                // llama request gets. Best-effort on the resize failure.
+                if let Some(pool) = deps.instance_pool.as_ref() {
+                    let num_ctx = router_request
+                        .metadata
+                        .get("num_ctx")
+                        .and_then(serde_json::Value::as_u64);
+                    if let Err(e) = pool
+                        .resize_to_demand(&target.url, target.instance.as_deref(), num_ctx)
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "router.instances",
+                            model = %target.model,
+                            instance = ?target.instance,
+                            error = %e,
+                            "resize-to-demand failed",
+                        );
+                    }
+                }
 
                 let attempt_start = Instant::now();
                 match dispatch_to_single_target(
@@ -464,18 +504,14 @@ pub async fn dispatch_real(
                 .await
                 {
                     Ok(outcome) => {
-                        crate::audit::emit(
-                            "route",
-                            serde_json::json!({
-                                "stage": "dispatch",
-                                "verdict": "dispatched",
-                                "model": target.model,
-                                "url": target.url,
-                                "attempt": i + 1,
-                                "total": total,
-                                "outcome": "success",
-                            }),
-                        );
+                        crate::audit::AuditRecord::route(
+                            crate::pipeline_types::PipelineStage::Classifier,
+                            crate::pipeline_types::StageVerdict::Passed,
+                            Some(target),
+                            None,
+                            Some("dispatched"),
+                        )
+                        .emit();
                         Ok(Some(outcome))
                     }
                     Err(e) => {
@@ -599,169 +635,6 @@ pub async fn dispatch_real(
         stream_answer: None,
     })
 }
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn base_target() -> RoutingTarget {
-        crate::pipeline::RoutingTarget {
-            url: "http://x/v1/chat/completions".into(),
-            model: "base:swarm".into(),
-            group: None,
-            target_name: Some("swarm".into()),
-            params: None,
-            instance: None,
-            snapshot: None,
-            id_slot: None,
-            filter_thinking: false,
-            retry_count: 0,
-            retry_base_interval_s: 1,
-            stream: true,
-            idle_timeout_ms: 5000,
-            total_timeout_ms: 30000,
-            fallbacks: vec![],
-        }
-    }
-
-    #[test]
-    fn apply_pending_snapshot_sets_request_fields() {
-        let rt = apply_pending_snapshot(&base_target(), "readfiles".into(), Some("scratch".into()), 2);
-        assert_eq!(rt.snapshot.as_deref(), Some("readfiles"));
-        assert_eq!(rt.instance.as_deref(), Some("scratch"));
-        assert_eq!(rt.id_slot, Some(2));
-    }
-
-    #[test]
-    fn apply_pending_snapshot_preserves_existing_instance() {
-        let mut t = base_target();
-        t.instance = Some("ledger".into());
-        let rt = apply_pending_snapshot(&t, "readfiles".into(), Some("scratch".into()), 0);
-        assert_eq!(rt.instance.as_deref(), Some("ledger"), "existing instance wins");
-        assert_eq!(rt.snapshot.as_deref(), Some("readfiles"));
-    }
-
-    /// A stub that serves both the chat-completions endpoint and the
-    /// management `/instances` endpoint from one listener: the chat path
-    /// returns a 503 group-miss on the first call and a success completion on
-    /// the second; `/instances` allocates (201). Used to assert the
-    /// allocate-on-503 retry.
-    #[tokio::test]
-    async fn allocate_on_503_creates_instance_and_retries_once() {
-        use crate::instances::stub::StubServer;
-        use crate::instances::{management_base_url, InstanceClient, InstanceManager, InstancePool};
-        use crate::config::InstanceProfile;
-        use std::sync::Arc as StdArc;
-        use std::sync::Mutex;
-
-        let chat_calls = StdArc::new(Mutex::new(0usize));
-        let chat_calls_c = chat_calls.clone();
-        let handler: StdArc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> =
-            StdArc::new(move |method, path, _body| {
-                if method == "POST" && path.ends_with("/chat/completions") {
-                    let mut n = chat_calls_c.lock().unwrap();
-                    *n += 1;
-                    if *n == 1 {
-                        // The fork's 503 group-miss payload.
-                        return (
-                            503,
-                            r#"{"error":{"code":503,"message":"no free instance in group 'swarm'","type":"unavailable_error"}}"#
-                                .into(),
-                        );
-                    }
-                    return (
-                        200,
-                        r#"{"id":"x","object":"chat.completion","model":"base:swarm","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#
-                            .into(),
-                    );
-                }
-                (201, "{}".into())
-            });
-        let stub = StubServer::start(handler);
-
-        let endpoint = format!("{}/v1/chat/completions", stub.base_url());
-        let mut target = base_target();
-        target.url = endpoint.clone();
-        target.instance = Some("swarm".into());
-        target.stream = false; // buffered dispatch for simplicity
-
-        // A manager whose client points at the same server's management API.
-        let client = InstanceClient::new(
-            reqwest::Client::new(),
-            management_base_url(&endpoint),
-            None,
-        );
-        let profile = InstanceProfile {
-            name: Some("swarm0".into()),
-            group: Some("swarm".into()),
-            count: 1,
-            num_ctx: 16384,
-            parallel: None,
-            pinned: false,
-            no_sleep: true,
-            sleep_idle_seconds: None,
-            default: false,
-            resume: false,
-            params: None,
-        };
-        let manager = Arc::new(InstanceManager::new(
-            "base",
-            client,
-            vec![profile],
-            crate::config::SidecarConfig::default(),
-        ));
-        let mut managers = std::collections::HashMap::new();
-        managers.insert("base".into(), manager);
-        let pool = InstancePool::from_managers(managers, None);
-
-        let request = crate::types::RouterRequest {
-            model: "base".into(),
-            messages: vec![crate::types::RouterMessage {
-                role: "user".into(),
-                content: crate::types::RouterMessageContent::Text("hello".into()),
-                tool_calls: None,
-                tool_call_id: None,
-            }],
-            temperature: None,
-            max_tokens: None,
-            stream: None,
-            tools: None,
-            tool_choice: None,
-            session_id: None,
-            agent_id: None,
-            adapter: None,
-            instance: None,
-            snapshot: None,
-            id_slot: None,
-            metadata: Default::default(),
-        };
-        let deps = DispatchDeps {
-            http_client: Arc::new(reqwest::Client::new()),
-            cache: None,
-            stats: Arc::new(ServerStats::default()),
-            extractor: None,
-            ladders: std::collections::HashMap::new(),
-            context_cache: None,
-            session: None,
-            instance_pool: Some(pool),
-        };
-        let outcome = dispatch_real(&target, &request, "base", &deps, false, "hello")
-            .await
-            .expect("dispatch_real is infallible");
-        assert!(outcome.response.status().is_success(), "retry succeeded");
-
-        let recorded = stub.recorded();
-        // Exactly two chat calls (first group-miss, then retry) and one
-        // management `POST /instances` in between.
-        let chat_hits = recorded
-            .iter()
-            .filter(|(m, p, _)| m == "POST" && p.ends_with("/chat/completions"))
-            .count();
-        let create_hits = recorded
-            .iter()
-            .filter(|(m, p, _)| m == "POST" && p == "/instances")
-            .count();
-        assert_eq!(chat_hits, 2, "group-miss then retry");
-        assert_eq!(create_hits, 1, "a fresh instance was allocated between");
-    }
-}
+#[path = "../../tests/server_dispatch.rs"]
+mod tests;

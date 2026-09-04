@@ -119,6 +119,15 @@ impl Default for DeterministicPreFilter {
 pub(crate) fn builtin_filter_engine() -> DeterministicFilterEngine {
     use crate::config::{PatternEntry, RejectPatterns};
 
+    // M6: single-sourced from `fluent_llm::pii_patterns` — the ssn/email/
+    // phone/api_key regex strings come from the canonical table via `pii_map`
+    // (the hardcoded fallbacks only fire if the table ever drops a name, in
+    // which case the engine keeps working on the last-known-good string).
+    // `card_number` deliberately keeps its own Luhn-gated pattern (a domain
+    // confidence policy, not a duplication — do not "unify" it into the
+    // table). Downstream, `CodewordAnonymizer` and `ledger_guard` consume
+    // THIS engine's matches, so the whole request/write path shares one
+    // pattern source.
     let pii_patterns = fluent_llm::pii_patterns::pii_patterns();
     let pii_map: std::collections::HashMap<&str, &str> = pii_patterns
         .iter()
@@ -251,14 +260,12 @@ impl DeterministicPreFilter {
                     match handler(&args) {
                         Ok(result) => {
                             tracing::info!(target: "router.pipeline.stage1", command = %cmd, "command dispatched");
-                            crate::audit::emit(
-                                "filter",
-                                serde_json::json!({
-                                    "stage": "deterministic",
-                                    "verdict": "command_dispatched",
-                                    "command": cmd,
-                                }),
-                            );
+                            crate::audit::AuditRecord::filter(
+                                PipelineStage::DeterministicPreFilter,
+                                "command_dispatched",
+                                Some(cmd),
+                            )
+                            .emit();
                             let mut metadata = StageMetadata::default();
                             metadata.set_command_result(&result);
                             metadata.insert("command", serde_json::Value::String(cmd.into()));

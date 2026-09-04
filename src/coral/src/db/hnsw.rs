@@ -12,7 +12,7 @@ impl super::Library {
 
     pub fn rebuild_hnsw(&self) -> Result<usize, LibraryError> {
         let rows = self.store.query_rows(
-            "SELECT id, embedding FROM context_nodes WHERE embedding IS NOT NULL",
+            "SELECT id, embedding FROM context_nodes WHERE embedding IS NOT NULL ORDER BY id",
             &[],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )?;
@@ -22,21 +22,26 @@ impl super::Library {
     }
 
     pub(crate) fn hnsw_search(&self, query_vec: &[f32], k: usize) -> Option<Vec<KnnHit>> {
-        let neighbours = self.hnsw.search(query_vec, k);
+        // M2: the HNSW probe + id resolution is the shared
+        // `fluent_db::hnsw::hnsw_lookup` (caller keys + cosine distances).
+        // Lock ordering is preserved: `hnsw_lookup` releases the
+        // `hnsw`/`id_map` guards before returning, and only then do we touch
+        // the connection (hnsw → id_map → conn, never inverted — R9).
+        //
+        // Boundary (deliberate, preserved): coral maps the shared `None`
+        // (unbuilt / malformed probe / unresolvable) to `Some(vec![])`.
+        // The shared contract means "fall back to brute force"; coral has no
+        // brute-force path here, so empty — not absent — is the answer, and
+        // callers treat `None` as a store error. Do NOT "fix" this to `None`.
+        let neighbours: Vec<(i64, f32)> =
+            fluent_db::hnsw::hnsw_lookup(&self.hnsw, query_vec, k).unwrap_or_default();
         if neighbours.is_empty() {
             return Some(Vec::new());
         }
 
-        // Lock ordering is preserved: `HnswIndex::search` releases the
-        // `hnsw`/`id_map` guards before returning, and only then do we touch
-        // the connection (hnsw → id_map → conn, never inverted — R9).
-        let id_map = self.hnsw.id_map_snapshot();
-
         let mut node_ids: Vec<i64> = Vec::with_capacity(neighbours.len());
-        for (d_id, _distance) in &neighbours {
-            if *d_id < id_map.len() {
-                node_ids.push(id_map[*d_id]);
-            }
+        for (node_id, _distance) in &neighbours {
+            node_ids.push(*node_id);
         }
         if node_ids.is_empty() {
             return Some(Vec::new());
@@ -62,11 +67,7 @@ impl super::Library {
         };
 
         let mut results = Vec::with_capacity(neighbours.len());
-        for (d_id, distance) in neighbours {
-            if d_id >= id_map.len() {
-                continue;
-            }
-            let node_id = id_map[d_id];
+        for (node_id, distance) in neighbours {
             let Some(name) = name_by_id.get(&node_id) else {
                 continue;
             };
@@ -122,6 +123,27 @@ mod tests {
         assert_eq!(count, 2);
         assert!(lib.has_hnsw());
         assert_eq!(lib.hnsw_len(), 2);
+    }
+
+    #[test]
+    fn hnsw_search_unbuilt_returns_some_empty() {
+        // M2 golden: coral's `Some(vec![])`-on-empty boundary — an unbuilt
+        // index (and a malformed probe) yields `Some(vec![])`, never `None`.
+        let lib = lib();
+        let hits = lib.hnsw_search(&[1.0, 0.0], 5).expect("unbuilt → Some");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn hnsw_search_empty_query_returns_some_empty() {
+        // M2 golden: a malformed probe must not panic — it surfaces as
+        // `Some(vec![])` through the same boundary.
+        let lib = lib();
+        insert_embedded(&lib, "right", vec![1.0, 0.0]);
+        insert_embedded(&lib, "up", vec![0.0, 1.0]);
+        lib.rebuild_hnsw().expect("rebuild");
+        let hits = lib.hnsw_search(&[], 5).expect("empty query → Some");
+        assert!(hits.is_empty());
     }
 
     #[test]

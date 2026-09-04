@@ -112,8 +112,13 @@ impl WorkUnit for ResultScorer {
             .chat_complete(&messages)
             .map_err(|e| WorkError::Execution(format!("scorer error: {e}")))?;
 
-        let mut scored: ScoredResult = serde_json::from_str(&response_text)
-            .map_err(|e| WorkError::Execution(format!("scorer parse error: {e}")))?;
+        // M2: LLM-produced text goes through the shared tolerant codec
+        // (`parse_typed`: pristine fast path → fence-strip → extract →
+        // repair). Pristine JSON takes the fast path with identical values;
+        // fence/prose-wrapped replies are recovered instead of erroring.
+        let mut scored: ScoredResult =
+            fluent_llm::parse_typed(&response_text, &serde_json::Value::Null, |_| {})
+                .map_err(|e| WorkError::Execution(format!("scorer parse error: {e}")))?;
 
         scored.content = response;
         scored.accepted = scored.score >= self.acceptance_threshold;
@@ -245,55 +250,5 @@ impl Describable for Summarizer {
 impl_component!(Summarizer);
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_stubs::StubChatBackend;
-
-    fn test_client() -> Arc<dyn ChatBackend> {
-        Arc::new(StubChatBackend::always(
-            r#"{"score": 0.5, "accepted": false, "reason": "test", "summary": "test summary"}"#,
-        ))
-    }
-
-    #[test]
-    fn test_result_scorer_name() {
-        let scorer = ResultScorer::new(test_client(), 0.7);
-        assert_eq!(scorer.name(), "pipeline.scorer");
-    }
-
-    #[test]
-    fn test_result_scorer_describable() {
-        let scorer = ResultScorer::new(test_client(), 0.7);
-        let desc = scorer.describe();
-        assert_eq!(desc["type"], "object");
-    }
-
-    #[test]
-    fn test_result_scorer_missing_response() {
-        let scorer = ResultScorer::new(test_client(), 0.7);
-        let ctx = WorkContext::default();
-        let result = scorer.execute(&ctx);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_summarizer_name() {
-        let summarizer = Summarizer::new(test_client(), 50);
-        assert_eq!(summarizer.name(), "pipeline.summarizer");
-    }
-
-    #[test]
-    fn test_summarizer_describable() {
-        let summarizer = Summarizer::new(test_client(), 50);
-        let desc = summarizer.describe();
-        assert_eq!(desc["type"], "object");
-    }
-
-    #[test]
-    fn test_summarizer_missing_content() {
-        let summarizer = Summarizer::new(test_client(), 50);
-        let ctx = WorkContext::default();
-        let result = summarizer.execute(&ctx);
-        assert!(result.is_err());
-    }
-}
+#[path = "../tests/summarization.rs"]
+mod tests;

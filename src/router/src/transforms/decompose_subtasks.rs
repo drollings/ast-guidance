@@ -3,6 +3,12 @@ use fluent_llm::Decomposer;
 use crate::transforms::{TransformError, TransformStrategy};
 use crate::types::{RouterMessage, RouterMessageContent, RouterRequest};
 
+/// NOTE (ROADMAP C2): this transform intentionally does NOT use
+/// `insert_string_map` — its metadata payload is a structured `subtasks` JSON
+/// object (`original_query` / `subtasks` / `count`), not a flat
+/// `HashMap<String, String>`. Forcing it through the string-map helper would be
+/// a contrived abstraction; the two string-map call sites (pii, codeword) are
+/// the shared skeleton.
 pub struct DecomposeToSubtasks {
     decomposer: Box<dyn Decomposer>,
 }

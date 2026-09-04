@@ -9,3 +9,6 @@
 
 #[path = "live/smoke_live.rs"]
 mod smoke_live;
+
+#[path = "live/entity_link_live.rs"]
+mod entity_link_live;

@@ -6,6 +6,9 @@ pub const NS_XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 pub const NS_SCHEMA: &str = "http://schema.org/";
 pub const NS_SKOS: &str = "http://www.w3.org/2004/02/skos/core#";
 
+use fluent_types::{local_id_of, property_id_for_iri, InterlinguaId};
+use guidance_rdf::normalize::hash_iri;
+
 pub const YAGO_VERSION: &str = "4.5";
 
 #[derive(Debug, Clone, Copy)]
@@ -164,12 +167,40 @@ pub fn is_whitelisted(iri: &str) -> bool {
     WHITELIST_IRIS.contains(&iri)
 }
 
+/// Whether an [`InterlinguaId`] names a whitelisted YaGO class (ROADMAP
+/// §13.6 — namespace-aware, truncation-correct). Compares the **48-bit local**
+/// against the truncated whitelist hashes.
+pub fn is_whitelisted_id(id: InterlinguaId) -> bool {
+    id.is_yago()
+        && WHITELIST_IRIS
+            .iter()
+            .any(|iri| id.local_id() == local_id_of(hash_iri(iri)))
+}
+
+/// Truncation-aware hash whitelist check. Legacy callers pass a full-width
+/// `hash_iri` value; comparing full hashes silently misses a *truncated*
+/// interlingua id, so both sides are reduced to the 48-bit local (DRY — the
+/// same truncation `is_whitelisted_id` uses).
 pub fn is_whitelisted_hash(hash: i64) -> bool {
-    let whitelist_hashes: std::collections::HashSet<i64> = WHITELIST_IRIS
-        .iter()
-        .map(|iri| guidance_rdf::normalize::hash_iri(iri))
-        .collect();
-    whitelist_hashes.contains(&hash)
+    let local = local_id_of(hash);
+    WHITELIST_IRIS.iter().any(|iri| local == local_id_of(hash_iri(iri)))
+}
+
+/// The deterministic `RDF_PROPERTY` interlingua id for an ontology property
+/// (ROADMAP §13.4). Lets the ledger reference typed relations by id.
+pub fn property_interlingua_id(prop: &OntologyProperty) -> InterlinguaId {
+    property_id_for_iri(prop.iri)
+}
+
+/// The `RDF_PROPERTY` id for a property IRI, when it is one of the known
+/// [`OntologyProperty`] constants.
+pub fn property_interlingua_id_by_iri(iri: &str) -> Option<InterlinguaId> {
+    lookup_property(iri).map(property_interlingua_id)
+}
+
+/// The `RDF_PROPERTY` id for the `rdfs:subClassOf` relation.
+pub fn subclass_property_id() -> InterlinguaId {
+    property_interlingua_id(&PROP_SUBCLASS)
 }
 
 pub const PROP_LABEL: OntologyProperty = OntologyProperty {
@@ -301,102 +332,5 @@ pub fn lookup_property(iri: &str) -> Option<&'static OntologyProperty> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_class_lookup() {
-        let cls = lookup_class("http://schema.org/Person");
-        assert!(cls.is_some());
-        assert_eq!(cls.unwrap().label, "Person");
-    }
-
-    #[test]
-    fn test_class_lookup_unknown() {
-        assert!(lookup_class("http://unknown.example/").is_none());
-    }
-
-    #[test]
-    fn test_property_lookup() {
-        let prop = lookup_property("http://www.w3.org/2000/01/rdf-schema#label");
-        assert!(prop.is_some());
-        assert_eq!(prop.unwrap().lod_target, Some(4));
-    }
-
-    #[test]
-    fn test_property_lookup_type() {
-        let prop = lookup_property("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
-        assert!(prop.is_some());
-        assert_eq!(prop.unwrap().lod_target, None);
-    }
-
-    #[test]
-    fn test_superclass_chain_person() {
-        let chain = superclass_chain("http://schema.org/Person");
-        assert!(chain.len() >= 2, "chain length: {}", chain.len());
-        assert_eq!(chain[0], "http://schema.org/Person");
-        assert_eq!(chain[1], "http://yago-knowledge.org/resource/Entity");
-    }
-
-    #[test]
-    fn test_domain_validation() {
-        let prop = lookup_property("http://yago-knowledge.org/resource/hasGender");
-        assert!(prop.is_some());
-        assert_eq!(prop.unwrap().domain, Some("http://schema.org/Person"));
-    }
-
-    #[test]
-    fn test_transitive_property() {
-        let prop = lookup_property("http://www.w3.org/2000/01/rdf-schema#subClassOf");
-        assert!(prop.unwrap().transitive);
-    }
-
-    #[test]
-    fn test_is_subclass_of_identity() {
-        assert!(is_subclass_of(
-            "http://schema.org/Person",
-            "http://schema.org/Person"
-        ));
-    }
-
-    #[test]
-    fn test_is_subclass_of_direct() {
-        assert!(is_subclass_of(
-            "http://schema.org/Person",
-            "http://yago-knowledge.org/resource/Entity"
-        ));
-    }
-
-    #[test]
-    fn test_is_subclass_of_unrelated() {
-        assert!(!is_subclass_of(
-            "http://schema.org/Person",
-            "http://schema.org/Product"
-        ));
-    }
-
-    #[test]
-    fn test_is_subclass_of_unknown_child() {
-        assert!(!is_subclass_of(
-            "http://unknown/Foo",
-            "http://yago-knowledge.org/resource/Entity"
-        ));
-    }
-
-    #[test]
-    fn test_whitelist() {
-        assert!(is_whitelisted("http://schema.org/Person"));
-        assert!(is_whitelisted("http://yago-knowledge.org/resource/Entity"));
-        assert!(!is_whitelisted("http://unknown/Foo"));
-    }
-
-    #[test]
-    fn test_all_classes_count() {
-        assert_eq!(ALL_CLASSES.len(), 7);
-    }
-
-    #[test]
-    fn test_all_properties_count() {
-        assert_eq!(ALL_PROPERTIES.len(), 11);
-    }
-}
+#[path = "../tests/yago.rs"]
+mod tests;

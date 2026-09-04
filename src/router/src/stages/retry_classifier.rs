@@ -5,6 +5,16 @@
 //! signal emitted by `ClassifierStage` on parse/LLM error), the decorator
 //! re-executes the inner stage with an escalating system prompt override.
 //! After `max_retries` attempts it returns the final fallback output.
+//!
+//! NOTE (P6, evaluated-and-declined): this loop deliberately does NOT compose
+//! `common_core::retry::retry_async` (or `SupervisedBatch`). Those retry on a
+//! typed `Err`; this retries on an *output marker* (`metadata.fallback`) while
+//! threading a *different* `WorkContext` per attempt (escalating prompt,
+//! attempt number, parse error) and re-executing on the *original* context
+//! when exhausted. Adapting marker→`Err`→marker plus per-attempt context
+//! plumbing outweighs the ~15-line loop — structure-destroying, not
+//! structure-sharing. Future *error-typed* retries should use
+//! `common_core::retry`; see `stages_retry_classifier.rs` loop tests.
 
 use std::sync::Arc;
 
@@ -118,6 +128,80 @@ impl RetryClassifier {
             .unwrap_or("unknown parse error")
             .to_string()
     }
+
+    /// Whether a classifier decision is a parse-failure fallback (same marker
+    /// `is_fallback` reads off the `WorkOutput` boundary, without the
+    /// serialize round-trip).
+    fn is_fallback_decision(decision: &crate::pipeline_types::StageDecision) -> bool {
+        crate::pipeline_types::StageMetadata::from(decision.metadata.clone())
+            .fallback()
+            .unwrap_or(false)
+    }
+}
+
+impl RetryClassifier {
+    /// Typed evaluation: mirrors the `execute` retry loop but threads the
+    /// inner classifier's dispatch target by value. The orchestrator's
+    /// producer path calls this so a retry-wrapped classifier still publishes
+    /// to the typed store.
+    pub(crate) fn evaluate_with_target(
+        &self,
+        ctx: &WorkContext,
+        prior: &[crate::pipeline_types::StageDecision],
+    ) -> Result<
+        (
+            crate::pipeline_types::StageDecision,
+            Option<crate::pipeline::RoutingTarget>,
+        ),
+        WorkError,
+    > {
+        let Some(classifier) = self.inner.as_any().downcast_ref::<crate::stages::classifier::ClassifierStage>()
+        else {
+            // Unknown inner: the serialization boundary carries no target.
+            let decision: crate::pipeline_types::StageDecision =
+                self.inner.execute(ctx).and_then(|output| {
+                    output
+                        .data_take()
+                        .map_err(|e| WorkError::Execution(e.to_string()))
+                })?;
+            return Ok((decision, None));
+        };
+
+        // Attempt 0 (initial, no retry prompt).
+        let (decision, target) = classifier.evaluate_with_target(ctx, prior)?;
+        if !Self::is_fallback_decision(&decision) {
+            return Ok((decision, target));
+        }
+        let mut last_error = decision.reason.clone();
+
+        for retry_index in 0..self.max_retries {
+            tracing::info!(
+                target: "router.pipeline.retry",
+                retry = retry_index + 1,
+                max_retries = self.max_retries,
+                parse_error = %last_error,
+                "classifier fallback detected, retrying",
+            );
+            let retry_ctx = self.build_retry_context(ctx, retry_index, &last_error);
+            let (retry_decision, retry_target) =
+                classifier.evaluate_with_target(&retry_ctx, prior)?;
+            if !Self::is_fallback_decision(&retry_decision) {
+                return Ok((retry_decision, retry_target));
+            }
+            last_error.clone_from(&retry_decision.reason);
+        }
+
+        tracing::warn!(
+            target: "router.pipeline.retry",
+            max_retries = self.max_retries,
+            parse_error = %last_error,
+            "exhausted retries, returning final fallback",
+        );
+
+        // Re-evaluate on the original context for the final attempt so the
+        // classifier's own fallback logic handles the response.
+        classifier.evaluate_with_target(ctx, prior)
+    }
 }
 
 impl WorkUnit for RetryClassifier {
@@ -191,124 +275,6 @@ impl Describable for RetryClassifier {
 }
 
 impl_component!(RetryClassifier);
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::pipeline_types::StageDecision;
-    use crate::test_stubs;
-
-    fn make_fallback_output() -> WorkOutput {
-        let decision = StageDecision {
-            stage: crate::pipeline_types::PipelineStage::Classifier,
-            verdict: crate::pipeline_types::StageVerdict::Passed,
-            score: Some(1.0),
-            reason: "parse error: trailing characters".into(),
-            latency_ms: 0,
-            metadata: serde_json::json!({"fallback": true}),
-        };
-        WorkOutput::typed_infallible("classified", &decision)
-    }
-
-    fn make_success_output() -> WorkOutput {
-        let decision = StageDecision {
-            stage: crate::pipeline_types::PipelineStage::Classifier,
-            verdict: crate::pipeline_types::StageVerdict::Passed,
-            score: Some(0.95),
-            reason: "intent=code, action=route".into(),
-            latency_ms: 0,
-            metadata: serde_json::json!({"intent": "code", "action": "route", "fallback": false}),
-        };
-        WorkOutput::typed_infallible("classified", &decision)
-    }
-
-    #[test]
-    fn is_fallback_detects_fallback_flag() {
-        assert!(RetryClassifier::is_fallback(&make_fallback_output()));
-        assert!(!RetryClassifier::is_fallback(&make_success_output()));
-    }
-
-    #[test]
-    fn parse_error_extraction() {
-        let err = RetryClassifier::parse_error_from(&make_fallback_output());
-        assert!(err.contains("parse error"));
-    }
-
-    #[test]
-    fn retry_injects_prompt_into_context() {
-        let inner = Arc::new(test_stubs::FailingStage::new(
-            "failing_classifier",
-            2, // fail twice, then succeed
-        ));
-        let retry = RetryClassifier::new(
-            inner,
-            2,
-            vec!["retry prompt 1".into(), "retry prompt 2".into()],
-        );
-
-        let ctx = WorkContext::default();
-        let _ = retry.execute(&ctx);
-        // The test asserts that retry_context was built correctly — the inner
-        // test_stubs::FailingStage handles the actual failure verification.
-    }
-
-    #[test]
-    fn retry_builds_context_with_correct_metadata() {
-        let retry = RetryClassifier::new(
-            Arc::new(test_stubs::SimplePassStage::new("inner", "ok")),
-            3,
-            vec!["prompt1".into(), "prompt2".into(), "prompt3".into()],
-        );
-
-        let base = WorkContext::default();
-        let ctx = retry.build_retry_context(&base, 1, "test error");
-
-        assert_eq!(ctx.get::<i64>(METADATA_RETRY_ATTEMPT), Some(&1));
-        assert_eq!(
-            ctx.metadata.get(METADATA_PARSE_ERROR),
-            Some(&MetadataValue::String("test error".into()))
-        );
-        assert_eq!(
-            ctx.metadata.get(METADATA_SYSTEM_PROMPT),
-            Some(&MetadataValue::String("prompt2".into()))
-        );
-    }
-
-    #[test]
-    fn retry_reuses_last_prompt_when_out_of_prompts() {
-        let retry = RetryClassifier::new(
-            Arc::new(test_stubs::SimplePassStage::new("inner", "ok")),
-            2,
-            vec!["only_prompt".into()],
-        );
-
-        let base = WorkContext::default();
-
-        // retry_index=0 uses "only_prompt"
-        let ctx0 = retry.build_retry_context(&base, 0, "err0");
-        assert_eq!(
-            ctx0.metadata.get(METADATA_SYSTEM_PROMPT),
-            Some(&MetadataValue::String("only_prompt".into()))
-        );
-
-        // retry_index=1 also gets "only_prompt" (last prompt reused)
-        let ctx1 = retry.build_retry_context(&base, 1, "err1");
-        assert_eq!(
-            ctx1.metadata.get(METADATA_SYSTEM_PROMPT),
-            Some(&MetadataValue::String("only_prompt".into()))
-        );
-    }
-
-    #[test]
-    fn retry_with_empty_prompts_omits_prompt_override() {
-        let retry = RetryClassifier::new(
-            Arc::new(test_stubs::SimplePassStage::new("inner", "ok")),
-            1,
-            vec![],
-        );
-
-        let base = WorkContext::default();
-        let ctx = retry.build_retry_context(&base, 0, "err");
-        assert!(!ctx.metadata.contains_key(METADATA_SYSTEM_PROMPT));
-    }
-}
+#[path = "../../tests/stages_retry_classifier.rs"]
+mod tests;

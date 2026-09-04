@@ -10,11 +10,14 @@
 //! between the pipeline and dispatch. It is designed to be owned by the
 //! orchestrator and called directly in the async dispatch path.
 
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use lru::LruCache;
+
 use crate::pool::{PriorityResultPool, ResultPoolError};
+use common_core::sync as sync_lock;
 
 /// Configuration for aging behaviour.
 #[derive(Debug, Clone)]
@@ -60,9 +63,12 @@ pub struct AffinityScheduler<T: Send + 'static, R: Send + 'static, E: Send + 'st
     pool: Arc<PriorityResultPool<T, R, E>>,
     current_affinity: Mutex<Option<String>>,
     aging: AgingConfig,
-    base_priorities: Mutex<HashMap<String, i32>>,
+    base_priorities: Mutex<LruCache<String, i32>>,
     last_aging: Mutex<Instant>,
+    runtime: Arc<dyn fluent_wvr::Runtime>,
 }
+
+const DEFAULT_MAX_IDENTITIES: usize = 1024;
 
 impl<T, R, E> AffinityScheduler<T, R, E>
 where
@@ -72,12 +78,37 @@ where
 {
     /// Create a new affinity scheduler wrapping the given pool.
     pub fn new(pool: Arc<PriorityResultPool<T, R, E>>) -> Self {
+        Self::new_with_runtime(pool, crate::tokio_runtime())
+    }
+
+    /// Create a new affinity scheduler with an explicit runtime (for virtual-time tests).
+    pub fn new_with_runtime(pool: Arc<PriorityResultPool<T, R, E>>, runtime: Arc<dyn fluent_wvr::Runtime>) -> Self {
+        let cap = NonZeroUsize::new(DEFAULT_MAX_IDENTITIES).unwrap();
         Self {
             pool,
             current_affinity: Mutex::new(None),
             aging: AgingConfig::default(),
-            base_priorities: Mutex::new(HashMap::new()),
-            last_aging: Mutex::new(Instant::now()),
+            base_priorities: Mutex::new(LruCache::new(cap)),
+            last_aging: Mutex::new(runtime.now()),
+            runtime,
+        }
+    }
+
+    /// Create with explicit LRU cap (for testing eviction).
+    pub fn new_with_cap(
+        pool: Arc<PriorityResultPool<T, R, E>>,
+        runtime: Arc<dyn fluent_wvr::Runtime>,
+        cap: usize,
+        aging: AgingConfig,
+    ) -> Self {
+        let cap = NonZeroUsize::new(cap.max(1)).unwrap();
+        Self {
+            pool,
+            current_affinity: Mutex::new(None),
+            aging,
+            base_priorities: Mutex::new(LruCache::new(cap)),
+            last_aging: Mutex::new(runtime.now()),
+            runtime,
         }
     }
 
@@ -98,56 +129,93 @@ where
         base_priority: i32,
     ) -> Result<R, ResultPoolError<E>> {
         self.maybe_age();
-
-        let priority = self.compute_priority(&task.identity, base_priority);
-
+        let priority = self.compute_priority_with_base(&task, base_priority);
         self.pool.submit(task.task, priority).await
+    }
+
+    fn compute_priority_with_base(&self, task: &ScheduledTask<T>, base_priority: i32) -> i32 {
+        // Canonical lock order via helper
+        let (affinity_guard, mut prio_guard, _last_guard) = self.lock_in_order_for_compute();
+        let affinity = affinity_guard.clone();
+        // drop last_guard early? Keep order but we hold it.
+        let effective_base = prio_guard.get(&task.identity).copied().unwrap_or(base_priority);
+        // Blend enqueued_at age: per-task starvation, capped at aging_rate
+        let now = self.runtime.now();
+        let age_secs = now
+            .checked_duration_since(task.enqueued_at)
+            .unwrap_or(Duration::ZERO)
+            .as_secs() as i32;
+        let age_bonus = age_secs.min(self.aging.aging_rate).max(0);
+        let with_age = effective_base.saturating_add(age_bonus);
+        // Insert/update LRU
+        prio_guard.put(task.identity.clone(), with_age);
+        if affinity.as_deref() == Some(task.identity.as_str()) {
+            with_age.saturating_add(self.aging.affinity_bonus)
+        } else {
+            with_age
+        }
+    }
+
+    /// Public helper for tests: compute effective priority without submitting.
+    pub fn effective_priority(&self, task: &ScheduledTask<T>, base_priority: i32) -> i32 {
+        self.compute_priority_with_base(task, base_priority)
+    }
+
+    /// Helper enforcing canonical lock order: current_affinity -> base_priorities -> last_aging
+    #[allow(clippy::type_complexity)]
+    fn lock_in_order_for_compute(
+        &self,
+    ) -> (
+        std::sync::MutexGuard<'_, Option<String>>,
+        std::sync::MutexGuard<'_, LruCache<String, i32>>,
+        std::sync::MutexGuard<'_, Instant>,
+    ) {
+        let a = sync_lock::lock(&self.current_affinity);
+        let b = sync_lock::lock(&self.base_priorities);
+        let c = sync_lock::lock(&self.last_aging);
+        (a, b, c)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn lock_all_for_age(
+        &self,
+    ) -> (
+        std::sync::MutexGuard<'_, Option<String>>,
+        std::sync::MutexGuard<'_, LruCache<String, i32>>,
+        std::sync::MutexGuard<'_, Instant>,
+    ) {
+        let a = sync_lock::lock(&self.current_affinity);
+        let b = sync_lock::lock(&self.base_priorities);
+        let c = sync_lock::lock(&self.last_aging);
+        (a, b, c)
     }
 
     /// Set the current affinity session.
     pub fn set_affinity(&self, identity: Option<String>) {
-        let mut aff = self
-            .current_affinity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut aff = sync_lock::lock(&self.current_affinity);
         *aff = identity;
     }
 
     /// Get the current affinity session.
     pub fn current_affinity(&self) -> Option<String> {
-        self.current_affinity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        sync_lock::lock(&self.current_affinity).clone()
     }
 
-    fn compute_priority(&self, identity: &str, base_priority: i32) -> i32 {
-        let affinity = self
-            .current_affinity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut priorities = self
-            .base_priorities
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    /// Remove an identity from the bounded map (session close).
+    pub fn remove_identity(&self, identity: &str) {
+        let mut prios = sync_lock::lock(&self.base_priorities);
+        prios.pop(identity);
+    }
 
-        let effective_base = priorities.get(identity).copied().unwrap_or(base_priority);
-        priorities.insert(identity.to_string(), effective_base);
-
-        if affinity.as_deref() == Some(identity) {
-            effective_base + self.aging.affinity_bonus
-        } else {
-            effective_base
-        }
+    /// For testing: current map length.
+    pub fn base_priorities_len(&self) -> usize {
+        sync_lock::lock(&self.base_priorities).len()
     }
 
     fn maybe_age(&self) {
         let should_age = {
-            let last = self
-                .last_aging
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            last.elapsed() >= self.aging.aging_interval
+            let last = sync_lock::lock(&self.last_aging);
+            self.runtime.now().duration_since(*last) >= self.aging.aging_interval
         };
 
         if should_age {
@@ -156,27 +224,15 @@ where
     }
 
     fn age_priorities(&self) {
-        let mut priorities = self
-            .base_priorities
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut last = self
-            .last_aging
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let affinity = self
-            .current_affinity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        // Canonical order: current_affinity -> base_priorities -> last_aging
+        let (affinity, mut priorities, mut last) = self.lock_all_for_age();
+        let affinity = affinity.clone();
         for (identity, prio) in priorities.iter_mut() {
             if Some(identity.as_str()) != affinity.as_deref() {
                 *prio = (*prio + self.aging.aging_rate).min(self.aging.max_priority);
             }
         }
-
-        *last = Instant::now();
+        *last = self.runtime.now();
     }
 
     /// Run aging immediately (useful for testing).
@@ -191,124 +247,5 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tokio_runtime;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    #[tokio::test]
-    async fn test_affinity_bonus_applied() {
-        let runtime = tokio_runtime();
-        let processed = Arc::new(AtomicUsize::new(0));
-        let p_clone = Arc::clone(&processed);
-        let p = Arc::new(PriorityResultPool::new(
-            Arc::clone(&runtime),
-            1,
-            move |identity: String| {
-                let c = Arc::clone(&p_clone);
-                async move {
-                    c.fetch_add(1, Ordering::SeqCst);
-                    Ok::<String, String>(identity)
-                }
-            },
-        ));
-
-        let scheduler = AffinityScheduler::new(Arc::clone(&p));
-        scheduler.set_affinity(Some("session-a".into()));
-
-        let task = ScheduledTask {
-            identity: "session-a".into(),
-            task: "task-a".into(),
-            enqueued_at: Instant::now(),
-        };
-
-        let result = scheduler.submit(task, 0).await.unwrap();
-        assert_eq!(result, "task-a");
-        assert_eq!(processed.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn test_no_affinity_bonus_for_different_session() {
-        let runtime = tokio_runtime();
-        let processed = Arc::new(AtomicUsize::new(0));
-        let p_clone = Arc::clone(&processed);
-        let p = Arc::new(PriorityResultPool::new(
-            Arc::clone(&runtime),
-            1,
-            move |identity: String| {
-                let c = Arc::clone(&p_clone);
-                async move {
-                    c.fetch_add(1, Ordering::SeqCst);
-                    Ok::<String, String>(identity)
-                }
-            },
-        ));
-
-        let scheduler = AffinityScheduler::new(Arc::clone(&p));
-        scheduler.set_affinity(Some("session-a".into()));
-
-        let task = ScheduledTask {
-            identity: "session-b".into(),
-            task: "task-b".into(),
-            enqueued_at: Instant::now(),
-        };
-
-        scheduler.submit(task, 0).await.unwrap();
-        assert_eq!(processed.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn test_aging_increases_priority_for_starved_tasks() {
-        let runtime = tokio_runtime();
-        let p = Arc::new(PriorityResultPool::new(
-            Arc::clone(&runtime),
-            1,
-            move |_identity: String| async move { Ok::<String, String>("done".into()) },
-        ));
-
-        let scheduler = AffinityScheduler::new(Arc::clone(&p)).with_aging(AgingConfig {
-            affinity_bonus: 10,
-            aging_interval: Duration::ZERO,
-            aging_rate: 5,
-            max_priority: 100,
-        });
-
-        scheduler.set_affinity(Some("session-a".into()));
-
-        let task = ScheduledTask {
-            identity: "session-b".into(),
-            task: "task-b".into(),
-            enqueued_at: Instant::now(),
-        };
-        scheduler.submit(task, 0).await.unwrap();
-
-        scheduler.age_now();
-
-        let prios = scheduler
-            .base_priorities
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(prios.get("session-b"), Some(&5));
-    }
-
-    #[tokio::test]
-    async fn test_set_and_get_affinity() {
-        let runtime = tokio_runtime();
-        let p = Arc::new(PriorityResultPool::new(
-            Arc::clone(&runtime),
-            1,
-            move |_: String| async move { Ok::<String, String>("ok".into()) },
-        ));
-
-        let scheduler: AffinityScheduler<String, String, String> =
-            AffinityScheduler::new(Arc::clone(&p));
-
-        assert_eq!(scheduler.current_affinity(), None);
-
-        scheduler.set_affinity(Some("my-session".into()));
-        assert_eq!(scheduler.current_affinity(), Some("my-session".into()));
-
-        scheduler.set_affinity(None);
-        assert_eq!(scheduler.current_affinity(), None);
-    }
-}
+#[path = "../tests/affinity.rs"]
+mod tests;

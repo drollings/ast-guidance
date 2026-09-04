@@ -17,11 +17,11 @@ intelligence.
 
 ## **Attention**: Skills needed to understand files
 
-Skills are referenced per-file in comments below.  The lookup path for the skills is: 
+Skills are referenced per-file in comments below.  The lookup path for the skills is:
 `{guidance_dir}/skills/{skill}/SKILL.md`
 
 So if you find a file you're looking for named file.rs:
-`file.rs      # [zig-current, gof-patterns] Summary of files' contents` , 
+`file.rs      # [zig-current, gof-patterns] Summary of files' contents` ,
 Then you you must read
 
 ```
@@ -35,92 +35,105 @@ Then you you must read
 
 ```
 .
-├── AGENTS.md  # # Coral Router — Development Guide
+├── AGENTS.md
 ├── Cargo.toml
 ├── LICENSE
 ├── LICENSE-Commercial-Requirement
 ├── LICENSE-Contributor-Agreement
 ├── Makefile
-├── README.md  # # Fluent Monorepo - a high-speed agentic
-├── STRUCTURE.md  # # AST-Guidance Project Structure
+├── README.md
+├── STRUCTURE.md
 ├── bin/
-│   ├── coral-router-test.py  # #!/usr/bin/env python3
-│   ├── gen_simhash_projections.py  # #!/usr/bin/env python3
-│   └── router-wait-health.sh
+│   ├── coral-router-test.py
+│   ├── gen_simhash_projections.py
+│   ├── router-wait-health.sh
+│   └── spacy/
+│       └── benchmark/
+│           ├── Cargo.lock
+│           ├── Cargo.toml
+│           ├── bench_py.py
+│           ├── run.sh
+│           ├── src/
+│           │   └── main.rs
+│           └── summarize.py
 ├── data/
 │   └── yamake.json
 ├── doc/
-│   ├── AMBIGUOUS_DAG.md  # # Unified Dependency Resolver — Fro...
-│   ├── MEMORY_PLUGIN.md  # # Memory Plugin Architecture — Clea...
-│   ├── SUBAGENT.md  # # REVIEW_20260418_LOCAL_SUBAGENT.
+│   ├── AMBIGUOUS_DAG.md
+│   ├── MEMORY_PLUGIN.md
 │   ├── capabilities/
 │   │   ├── ast-indexing/
-│   │   │   └── CAPABILITY.md  # ---
+│   │   │   └── CAPABILITY.md
 │   │   ├── config-system/
-│   │   │   └── CAPABILITY.md  # ---
+│   │   │   └── CAPABILITY.md
 │   │   ├── coral-cache/
-│   │   │   └── CAPABILITY.md  # ---
+│   │   │   └── CAPABILITY.md
 │   │   ├── coral-database/
-│   │   │   └── CAPABILITY.md  # ---
+│   │   │   └── CAPABILITY.md
 │   │   ├── coral-ingestion/
-│   │   │   └── CAPABILITY.md  # ---
+│   │   │   └── CAPABILITY.md
 │   │   ├── coral-mcp/
-│   │   │   └── CAPABILITY.md  # ---
+│   │   │   └── CAPABILITY.md
 │   │   ├── embedding-providers/
-│   │   │   └── CAPABILITY.md  # ---
+│   │   │   └── CAPABILITY.md
 │   │   ├── explain-query/
-│   │   │   └── CAPABILITY.md  # ---
+│   │   │   └── CAPABILITY.md
 │   │   ├── fluent-concurrency/
-│   │   │   └── CAPABILITY.md  # ---
+│   │   │   └── CAPABILITY.md
 │   │   ├── llm-client/
-│   │   │   └── CAPABILITY.md  # ---
+│   │   │   └── CAPABILITY.md
 │   │   ├── local-model-decomposition/
-│   │   │   └── CAPABILITY.md  # ---
+│   │   │   └── CAPABILITY.md
 │   │   ├── ontology/
-│   │   │   └── CAPABILITY.md  # ---
+│   │   │   └── CAPABILITY.md
 │   │   ├── plugin-system/
-│   │   │   └── CAPABILITY.md  # ---
+│   │   │   └── CAPABILITY.md
 │   │   ├── rdf-parsing/
-│   │   │   └── CAPABILITY.md  # ---
+│   │   │   └── CAPABILITY.md
 │   │   ├── reflection/
-│   │   │   └── CAPABILITY.md  # ---
+│   │   │   └── CAPABILITY.md
 │   │   ├── sync-pipeline/
-│   │   │   └── CAPABILITY.md  # ---
+│   │   │   └── CAPABILITY.md
 │   │   ├── target-registry/
-│   │   │   └── CAPABILITY.md  # ---
+│   │   │   └── CAPABILITY.md
 │   │   ├── vector-search/
-│   │   │   └── CAPABILITY.md  # ---
+│   │   │   └── CAPABILITY.md
 │   │   └── wasm-tools/
-│   │       └── CAPABILITY.md  # ---
+│   │       └── CAPABILITY.md
 │   ├── coral/
-│   │   ├── CHANGELOG.md  # # Changelog
-│   │   ├── DETAILS.md  # # Coral Context: Detailed Engineering Sp
-│   │   ├── OVERVIEW.md  # # Coral Context: Architectural Design Do
-│   │   └── VISION.md  # # Coral Context: Architectural Vision
+│   │   ├── CHANGELOG.md
+│   │   ├── DETAILS.md
+│   │   ├── OVERVIEW.md
+│   │   └── VISION.md
 │   ├── guidance/
-│   │   ├── ARCHITECTURE.md  # # Architecture Overview
-│   │   ├── DESIGN.md  # Comprehensive Analysis: Agentic Document
-│   │   ├── MCP.md  # # guidance MCP Server
-│   │   ├── VISION.md  # # guidance: Vision Document
+│   │   ├── ARCHITECTURE.md
+│   │   ├── DESIGN.md
+│   │   ├── MCP.md
+│   │   ├── VISION.md
 │   │   └── schemas/
 │   │       └── guidance.schema.json
 │   ├── router/
-│   │   ├── ARCHITECTURE.md  # # Coral Router — Architecture
-│   │   ├── TESTING.md  # # Coral Router — Testing Guide
-│   │   └── VISION.md  # # Coral Router — Vision
-│   └── skills/
-│       ├── common-core/
-│       │   └── SKILL.md  # # common-core — Zero-Domain Utility...
-│       ├── dag/
-│       │   └── SKILL.md  # # fluent-dag — Dependency Graph & D...
-│       ├── fluent-concurrency/
-│       │   └── SKILL.md  # # `fluent-concurrency` — Lightweigh...
-│       ├── fluent-db/
-│       │   └── SKILL.md  # # fluent-db — Canonical Database-Ac...
-│       ├── fluent-wvr/
-│       │   └── SKILL.md  # # Fluent WVR in Rust — The Synthesi...
-│       └── subagent/
-│           └── SKILL.md  # ---
+│   │   ├── ARCHITECTURE.md
+│   │   ├── TESTING.md
+│   │   └── VISION.md
+│   ├── skills/
+│   │   ├── common-core/
+│   │   │   └── SKILL.md
+│   │   ├── dag/
+│   │   │   └── SKILL.md
+│   │   ├── fluent-concurrency/
+│   │   │   └── SKILL.md
+│   │   ├── fluent-db/
+│   │   │   └── SKILL.md
+│   │   ├── fluent-wvr/
+│   │   │   └── SKILL.md
+│   │   ├── interlingua/
+│   │   │   └── SKILLS.md
+│   │   └── subagent/
+│   │       └── SKILL.md
+│   └── spacy-rs/
+│       ├── ARCHITECTURE.md
+│       └── VISION.md
 ├── env/
 │   ├── categories.json
 │   ├── coral-router.json.example
@@ -140,401 +153,538 @@ Then you you must read
 │       └── charts/
 │           ├── bug_triage.md.json
 │           └── draft_doc.md.json
-└── src/
-    ├── Cargo.lock
-    ├── bin/
-    │   ├── coral/
-    │   │   ├── Cargo.toml
-    │   │   └── src/
-    │   │       └── main.rs  # use clap::{Parser, Subcommand};
-    │   ├── coral-router/
-    │   │   ├── Cargo.toml
-    │   │   └── src/
-    │   │       └── main.rs  # //! coral-router — LLM Router & Age...
-    │   ├── guidance/
-    │   │   ├── Cargo.toml
-    │   │   └── src/
-    │   │       ├── benchmark.rs  # //! `guidance benchmark` — query ac...
-    │   │       ├── commit.rs  # //! Commit message generation — LLM...
-    │   │       ├── editor.rs  # //! Editor interaction utilities for hum
-    │   │       ├── main.rs  # use std::path::{Path, PathBuf};
-    │   │       ├── mcp.rs  # //! MCP (Model Context Protocol) server 
-    │   │       └── structure.rs  # use std::collections::BTreeMap;
-    │   └── yamake-coral/
-    │       ├── Cargo.toml
-    │       └── src/
-    │           └── main.rs  # use std::process;
-    ├── common-core/
-    │   ├── Cargo.toml
-    │   └── src/
-    │       ├── cache.rs  # //! A read-through cache abstraction: ch
-    │       ├── config.rs  # //! JSON config loaders: `load_json_or_d
-    │       ├── constants.rs  # //! Cross-crate magic numbers (size caps
-    │       ├── drift.rs  # //! Bit-set drift analysis: compute "mis
-    │       ├── error.rs  # //! Shared leaf error types: `IoError`, 
-    │       ├── error_context.rs  # //! Contextual error wrappers: `ErrorCon
-    │       ├── format.rs  # //! Human-readable output: `format_json`
-    │       ├── git.rs  # //! Git operations — thin wrappers ...
-    │       ├── hash.rs  # //! Hashing utilities: `blake3_*`, `sha2
-    │       ├── http.rs  # //! Process-wide shared HTTP client (and
-    │       ├── interner.rs  # //! Capability registry: thread-safe str
-    │       ├── io.rs  # use std::fs;
-    │       ├── jsonrpc.rs  # //! Shared JSON-RPC 2.
-    │       ├── lib.rs  # #![forbid(unsafe_code)]
-    │       ├── metrics.rs  # //! Lock-free latency histogram with 12 
-    │       ├── prelude.rs  # //! The common-core prelude — impor...
-    │       ├── registry.rs  # //! Generic keyed registry — the ca...
-    │       ├── retry.rs  # //! Retry and backoff primitives — ...
-    │       ├── runtime.rs  # //! Sync→async runtime bridge: run ...
-    │       ├── shell.rs  # //! Subprocess helpers: `run_capture`, `
-    │       ├── shell_parser.rs  # //! Safe shell parser: whitespace+quote 
-    │       ├── sqlite.rs  # //! Shared SQLite helpers — connect...
-    │       ├── string.rs  # //! 20+ string utilities: case-insensiti
-    │       ├── sync.rs  # //! Poison-safe locking helpers for `std
-    │       ├── time.rs  # //! Time utilities: epoch-second helpers
-    │       ├── tokens.rs  # //! Token budget helpers: `estimate_toke
-    │       ├── walk.rs  # //! Directory walker: `walk_files` (call
-    │       └── watchdog.rs  # use std::collections::VecDeque;
-    ├── content-node/
-    │   ├── Cargo.toml
-    │   └── src/
-    │       ├── doc_node.rs  # use crate::file_node::FileContentNode;
-    │       ├── file_node.rs  # use std::fmt::Debug;
-    │       ├── lib.rs  # //! content-node: Level-of-detail text s
-    │       ├── lod.rs  # pub fn generate_lod_slices(full_text: &s
-    │       ├── node.rs  # use fluent_types::LOD_COUNT;
-    │       └── source_node.rs  # use crate::file_node::FileContentNode;
-    ├── coral/
-    │   ├── Cargo.toml
-    │   └── src/
-    │       ├── cache/
-    │       │   ├── mod.rs  # pub mod reactor;
-    │       │   ├── reactor.rs  # use std::sync::Arc;
-    │       │   └── stats.rs  # #[derive(Debug, Clone, serde::Serialize,
-    │       ├── cache_l1.rs  # use serde::{Deserialize, Serialize};
-    │       ├── cache_router.rs  # use std::sync::Arc;
-    │       ├── db/
-    │       │   ├── edges.rs  # use fluent_types::{GraphNode, NodeId};
-    │       │   ├── embeddings.rs  # use fluent_db::vector::{try_bytes_to_vec
-    │       │   ├── hnsw.rs  # use std::collections::HashMap;
-    │       │   ├── mod.rs  # pub mod edges;
-    │       │   ├── nodes.rs  # use std::collections::HashMap;
-    │       │   └── schema.rs  # use fluent_db::error::DbError;
-    │       ├── error.rs  # use thiserror::Error;
-    │       ├── ingest.rs  # use std::sync::Arc;
-    │       ├── knowledge.rs  # //! `KnowledgeCapability` implementation
-    │       ├── lib.rs  # //! Coral: Context-graph library for gui
-    │       ├── mcp.rs  # use std::path::Path;
-    │       ├── packer.rs  # use fluent_types::{ContentNode, NodeId};
-    │       ├── test_stubs.rs  # //! Test stubs for coral cache reactor t
-    │       ├── tier_units.rs  # use std::sync::Arc;
-    │       ├── wasm_runtime.rs  # use std::path::Path;
-    │       └── wvr.rs  # //! Fluent WVR integration for Coral cra
-    ├── dag/
-    │   ├── Cargo.toml
-    │   └── src/
-    │       ├── adapter.rs  # //! Re-export of `ComponentAdapter` and 
-    │       ├── closure.rs  # use std::collections::HashSet;
-    │       ├── dep_graph.rs  # //! Pure dependency-graph algorithms sha
-    │       ├── error.rs  # use thiserror::Error;
-    │       ├── lib.rs  # //! fluent-dag: DAG executor with resolv
-    │       ├── middleware.rs  # use std::sync::Arc;
-    │       ├── narrowing.rs  # use std::collections::HashSet;
-    │       ├── resolver.rs  # //! Capability-aware dependency resolver
-    │       ├── target.rs  # use bitvec::vec::BitVec;
-    │       ├── target_work_unit.rs  # //! `Target → WorkUnit` bridge.
-    │       ├── type_inference.rs  # //! Ontology type-hierarchy inference vi
-    │       ├── work_unit.rs  # use bon::Builder;
-    │       ├── wvr.rs  # //! Fluent WVR integration for DAG crate
-    │       └── yamake_loader.rs  # use bitvec::vec::BitVec;
-    ├── db/
-    │   ├── Cargo.toml
-    │   └── src/
-    │       ├── cache.rs  # //! Generic TTL/LRU key-value cache stor
-    │       ├── capability.rs  # //! The capability-gated async database 
-    │       ├── error.rs  # //! The single database error taxonomy f
-    │       ├── hnsw.rs  # //! The canonical HNSW-backed vector ind
-    │       ├── lib.rs  # //! # fluent-db — the canonical dat...
-    │       ├── migrate.rs  # //! Idempotent schema migrations.
-    │       ├── pool.rs  # //! The canonical pooled SQLite store (D
-    │       ├── query.rs  # //! Typed statement helpers shared by `S
-    │       ├── store.rs  # //! The canonical single-connection SQLi
-    │       ├── vector.rs  # //! Embedding vector math (D8).
-    │       └── wvr.rs  # //! Database `Component`/`WorkUnit` adap
-    ├── fluent-concurrency/
-    │   ├── Cargo.toml
-    │   └── src/
-    │       ├── affinity.rs  # //! Affinity-aware priority scheduler.
-    │       ├── capability.rs  # //! Concrete capability tokens for files
-    │       ├── flow.rs  # //! Credit-based backpressure flow contr
-    │       ├── io/
-    │       │   ├── db.rs  # //! SQLite-backed database capability (p
-    │       │   ├── fs.rs  # //! Capability-gated filesystem I/O (rea
-    │       │   ├── mod.rs  # //! Capability-gated I/O primitive engin
-    │       │   └── net.rs  # //! Capability-gated network I/O (TCP co
-    │       ├── lib.rs  # #![forbid(unsafe_code)]
-    │       ├── llm_queue.rs  # //! LLM request queue — async, queu...
-    │       ├── pool.rs  # //! Bounded async queue, worker pool, an
-    │       ├── queue.rs  # //! A priority queue with a fast path fo
-    │       ├── reserve.rs  # //! Available primitive: RAII permit on 
-    │       ├── router.rs  # //! A partitioned router that distribute
-    │       ├── runtime/
-    │       │   ├── mod.rs  # //! Pluggable `Runtime` backends (produc
-    │       │   ├── test.rs  # //! Test `Runtime` implementation with p
-    │       │   └── tokio.rs  # //! Production `Runtime` implementation 
-    │       ├── scope.rs  # //! Structured concurrency via `Scope...
-    │       ├── tests/
-    │       │   ├── e2e.rs  # use crate::pool::WorkerPool;
-    │       │   ├── m1.rs  # use super::*;
-    │       │   ├── m2.rs  # use super::*;
-    │       │   ├── m3.rs  # use super::*;
-    │       │   ├── m4.rs  # use super::*;
-    │       │   ├── m5.rs  # // Exercises the capability-gated I/O en
-    │       │   └── mod.rs  # use std::sync::atomic::{AtomicUsize, Ord
-    │       ├── thread_resource.rs  # //! Per-thread lazy-initialized resource
-    │       └── zone.rs  # //! Supervision zone with async retry, d
-    ├── fluent-wvr/
-    │   ├── Cargo.toml
-    │   └── src/
-    │       ├── capability.rs  # use std::any::{Any, TypeId};
-    │       ├── lib.rs  # #![forbid(unsafe_code)]
-    │       ├── macros.rs  # /// Eliminates the 7-line `as_any`/`as_a
-    │       ├── metadata.rs  # use serde::{Deserialize, Serialize};
-    │       ├── prelude.rs  # //! The fluent-wvr prelude — import...
-    │       ├── runtime.rs  # use std::future::Future;
-    │       ├── store.rs  # //! Typed in-process handoff accumulator
-    │       ├── tests.rs  # use crate::*;
-    │       ├── traits.rs  # use std::any::Any;
-    │       ├── work.rs  # use std::collections::HashMap;
-    │       └── wrapper.rs  # use std::collections::HashMap;
-    ├── fluent-wvr-macros/
-    │   ├── Cargo.toml
-    │   └── src/
-    │       └── lib.rs  # #![forbid(unsafe_code)]
-    ├── fluent-wvr-testutil/
-    │   ├── Cargo.toml
-    │   └── src/
-    │       └── lib.rs  # //! Test utilities for Fluent WVR crates
-    ├── guidance/
-    │   ├── Cargo.toml
-    │   ├── src/
-    │   │   ├── ast_parser.rs  # use std::path::Path;
-    │   │   ├── config.rs  # use std::collections::HashMap;
-    │   │   ├── enhancer.rs  # use fluent_llm::client::LlmClient;
-    │   │   ├── grounding.rs  # //! Grounding enforcement — ensures...
-    │   │   ├── lib.rs  # //! Guidance: AST-guided vector search &
-    │   │   ├── memory.rs  # //! Memory integration for the guidance 
-    │   │   ├── plugin.rs  # use std::path::{Path, PathBuf};
-    │   │   ├── query/
-    │   │   │   ├── formatter.rs  # use std::fmt::Write;
-    │   │   │   ├── identifier.rs  # use common_core::string::{contains_ignor
-    │   │   │   ├── llm_filter.rs  # use common_core::string::contains_ignore
-    │   │   │   ├── llm_filter_batch.rs  # use super::llm_filter::{LlmFilterBackend
-    │   │   │   ├── mod.rs  # pub mod formatter;
-    │   │   │   ├── search_backend.rs  # use common_core::string::contains_ignore
-    │   │   │   ├── snapshot.rs  # use std::path::Path;
-    │   │   │   ├── strategy.rs  # use fluent_types::GuidanceDoc;
-    │   │   │   └── synthesize.rs  # use fluent_types::{GuidanceDoc, Member, 
-    │   │   ├── query_engine.rs  # use std::path::Path;
-    │   │   ├── runtime.rs  # use std::path::{Path, PathBuf};
-    │   │   ├── scanner.rs  # use common_core::string::{contains_any, 
-    │   │   ├── sync/
-    │   │   │   ├── comments.rs  # use std::path::Path;
-    │   │   │   ├── json_store.rs  # use std::path::{Path, PathBuf};
-    │   │   │   ├── json_writer.rs  # use fluent_types::{GuidanceDoc, Member};
-    │   │   │   ├── mod.rs  # pub mod comments;
-    │   │   │   └── staleness.rs  # use std::path::Path;
-    │   │   └── sync_engine.rs  # use std::path::{Path, PathBuf};
-    │   └── tests/
-    │       └── e2e_gen_roundtrip.rs  # use fluent_types::MemberType;
-    ├── knowledge/
-    │   ├── Cargo.toml
-    │   └── src/
-    │       ├── csr_graph.rs  # pub const CSR_MAGIC: u32 = 0x4752_5343;
-    │       ├── freq_table.rs  # use std::fs;
-    │       ├── index_header.rs  # pub const INDEX_HEADER_SIZE: usize = 10;
-    │       ├── lib.rs  # //! fluent-knowledge: Word/trigram index
-    │       ├── query_cache.rs  # //! TTL/LRU query cache delegating to `f
-    │       ├── tokenizer.rs  # pub struct WordTokenizer<'a> {
-    │       ├── trigram_index.rs  # use crate::index_header::Header;
-    │       └── word_index.rs  # use std::collections::HashMap;
-    ├── llm/
-    │   ├── Cargo.toml
-    │   └── src/
-    │       ├── anonymize.rs  # pub fn anonymize(text: &str) -> String {
-    │       ├── client.rs  # use std::sync::Arc;
-    │       ├── constants.rs  # //! Cross-crate limit moved to `common-c
-    │       ├── context_packer.rs  # use crate::ChatMessage;
-    │       ├── decomposer.rs  # use bon::Builder;
-    │       ├── embeddings.rs  # use std::num::NonZeroUsize;
-    │       ├── error.rs  # use crate::embeddings::EmbeddingError;
-    │       ├── http_class.rs  # use serde::{Deserialize, Serialize};
-    │       ├── lib.rs  # //! fluent-llm: LLM HTTP client provider
-    │       ├── llm_queue.rs  # //! Default LLM request handler — w...
-    │       ├── openai.rs  # //! OpenAI-compatible chat-completion wi
-    │       ├── parse.rs  # //! Tolerant JSON parsing for LLM output
-    │       ├── pii_patterns.rs  # use std::sync::LazyLock;
-    │       └── url.rs  # use thiserror::Error;
-    ├── memory-plugin/
-    │   ├── Cargo.toml
-    │   └── src/
-    │       ├── capability.rs  # //! Capability token for explicit memory
-    │       ├── lib.rs  # #![forbid(unsafe_code)]
-    │       ├── plugins/
-    │       │   ├── hindsight/
-    │       │   │   └── mod.rs  # //! Hindsight memory plugin — struc...
-    │       │   ├── holographic/
-    │       │   │   ├── hrr.rs  # //! Holographic Reduced Representations 
-    │       │   │   ├── mod.rs  # //! Holographic memory plugin — loc...
-    │       │   │   └── store.rs  # //! SQLite-backed fact store with entity
-    │       │   ├── honcho/
-    │       │   │   └── mod.rs  # //! Honcho memory plugin — cross-se...
-    │       │   └── mod.rs  # //! Memory plugin implementations.
-    │       ├── registry.rs  # //! Central memory plugin registry.
-    │       ├── traits.rs  # //! Core trait definitions for the memor
-    │       ├── types.rs  # //! Shared types for the memory plugin s
-    │       └── zone.rs  # //! Memory ingestion zone.
-    ├── ontology/
-    │   ├── Cargo.toml
-    │   └── src/
-    │       ├── entity.rs  # use std::collections::HashMap;
-    │       ├── inference.rs  # use std::collections::{HashMap, HashSet}
-    │       ├── lib.rs  # //! guidance-ontology: Entity extraction
-    │       ├── mapper.rs  # use std::collections::HashMap;
-    │       ├── migration.rs  # #[derive(Debug, Clone)]
-    │       └── yago.rs  # pub const NS_YAGO: &str = "http://yago-k
-    ├── rdf/
-    │   ├── Cargo.toml
-    │   └── src/
-    │       ├── lexer.rs  # use crate::RdfError;
-    │       ├── lib.rs  # //! guidance-rdf: RDF/Turtle/N-Quads par
-    │       ├── normalize.rs  # pub struct BlankNodeScope;
-    │       ├── nquads.rs  # use crate::lexer::{Lexer, TokenKind};
-    │       └── parser.rs  # use std::collections::{HashMap, VecDeque
-    ├── requirements.txt
-    ├── router/
-    │   ├── Cargo.toml
-    │   └── src/
-    │       ├── audit.rs  # //! Canonical durable-audit surface for 
-    │       ├── charts/
-    │       │   ├── binding.rs  # //! Entity binding layer — the dete...
-    │       │   ├── compile.rs  # //! Chart compiler — turns a valida...
-    │       │   ├── execute.rs  # //! Zone-supervised execution of a compi
-    │       │   ├── extract.rs  # //! Chart auto-extraction from dispatch 
-    │       │   ├── mod.rs  # //! Chart content model — a library...
-    │       │   ├── render.rs  # //! Chart template rendering — mini...
-    │       │   ├── rubric.rs  # //! Rubric acceptance gate for chart tar
-    │       │   ├── select.rs  # //! Chart selection — deterministic...
-    │       │   ├── stage.rs  # //! ChartPromptStage — a `Classifie...
-    │       │   └── store.rs  # //! ChartStore — loads and holds a ...
-    │       ├── cli/
-    │       │   ├── commands.rs  # //! Implementation of the `coral-router`
-    │       │   ├── gguf.rs  # //! GGUF directory scanning, caching, mo
-    │       │   ├── mod.rs  # //! Admin CLI support for Coral Router.
-    │       │   └── preset.rs  # //! Rendering of downstream serving conf
-    │       ├── config/
-    │       │   ├── addr.rs  # //! Address parsing, host equivalence, a
-    │       │   ├── builder.rs  # //! Pipeline builder - constructs pipeli
-    │       │   ├── classification.rs  # //! Classification-tree configuration
-    │       │   ├── escalation.rs  # //! Escalation-ladder configuration
-    │       │   ├── filters.rs  # //! Filter types and reject patterns for
-    │       │   └── routing.rs  # //! Route resolution and routing configu
-    │       ├── config.rs  # //! Router configuration types - deseria
-    │       ├── dag_session.rs  # //! Dependency-aware session with DAG st
-    │       ├── dispatch/
-    │       │   ├── backend.rs  # use std::future::Future;
-    │       │   ├── escalation.rs  # //! Escalation-ladder dispatch loop
-    │       │   ├── frontier.rs  # use serde_json::Value;
-    │       │   └── mod.rs  # pub mod backend;
-    │       ├── error.rs  # //! Server-level error type — the s...
-    │       ├── filters/
-    │       │   ├── injection_detect.rs  # use std::collections::HashSet;
-    │       │   ├── luhn.rs  # pub fn luhn_valid(input: &str) -> bool {
-    │       │   ├── mod.rs  # pub mod injection_detect;
-    │       │   └── regex_filter.rs  # use std::collections::HashMap;
-    │       ├── frontier/
-    │       │   ├── mod.rs  # pub mod modes;
-    │       │   └── modes.rs  # //! Frontier escalation ladder — VI...
-    │       ├── hnsw.rs  # /// A single HNSW index handle — th...
-    │       ├── instances.rs  # //! Instance-pool grammar generation, ma
-    │       ├── knowledge.rs  # //! `KnowledgeCapability` implementation
-    │       ├── kv_cache.rs  # //! KV cache snapshot management - two-t
-    │       ├── ledger.rs  # //! Full-detail content ledger with LOD 
-    │       ├── ledger_guard.rs  # //! Irreversible write-path scrubber for
-    │       ├── lib.rs  # //! LLM Router & Agent Orchestration Fra
-    │       ├── logging.rs  # //! Structured logging infrastructure fo
-    │       ├── metrics.rs  # //! Failure classification for the route
-    │       ├── node_store.rs  # //! ContentNodeStore — the shared, referen...
-    │       ├── normalize.rs  # //! Request and response normalizatio...
-    │       ├── pipeline.rs  # //! Pipeline orchestrator — sequenc...
-    │       ├── pipeline_types.rs  # //! Pipeline decision types — struc...
-    │       ├── routes/
-    │       │   ├── mod.rs  # pub mod plan;
-    │       │   ├── plan.rs  # use std::sync::Arc;
-    │       │   └── rigor.rs  # //! Rigor route - the fixed-pass blue/re
-    │       ├── scheduler.rs  # //! Affinity-aware priority scheduler.
-    │       ├── score_matrix.rs  # use std::collections::HashMap;
-    │       ├── server/
-    │       │   ├── admin.rs  # //! Admin endpoints for the CLI (`coral-
-    │       │   ├── dispatch.rs  # use std::collections::HashMap;
-    │       │   ├── handler.rs  # use std::collections::HashMap;
-    │       │   ├── instances_api.rs  # //! Public `/instances` management API f
-    │       │   └── responses.rs  # use std::sync::atomic::AtomicU64;
-    │       ├── server.rs  # //! HTTP server exposing the router pipe
-    │       ├── server_http_tests.rs  # //! HTTP-level integration tests for the
-    │       ├── server_tests.rs  # #[cfg(test)]
-    │       ├── session.rs  # //! Session context node schema — b...
-    │       ├── stage_tests.rs  # #[cfg(test)]
-    │       ├── stages/
-    │       │   ├── classifier.rs  # //! Stage 2: ClassifierStage — sing...
-    │       │   ├── common.rs  # //! Shared helpers for pipeline stages.
-    │       │   ├── deterministic.rs  # use std::collections::HashMap;
-    │       │   ├── mod.rs  # pub mod classifier;
-    │       │   ├── pipeline_ref.rs  # //! PipelineRefStage — a `WorkUnit`...
-    │       │   ├── retry_classifier.rs  # //! RetryClassifier — a `WorkUnit` ...
-    │       │   └── tree.rs  # //! Classification-tree engine
-    │       ├── streaming.rs  # //! SSE streaming handler — transla...
-    │       ├── summarization.rs  # //! Summarization and result acceptance.
-    │       ├── supervisor.rs  # //! Managed `llama-server` process super
-    │       ├── target_match.rs  # //! Classifier-driven target matching...
-    │       ├── telemetry.rs  # //! Structured telemetry events with con
-    │       ├── test_stubs.rs  # use std::collections::VecDeque;
-    │       ├── test_support.rs  # //! Shared test logging capture.
-    │       ├── testing/
-    │       │   ├── mock.rs  # use std::collections::HashMap;
-    │       │   └── mod.rs  # pub mod mock;
-    │       ├── tests/
-    │       │   ├── e2e_tests.rs  # //! End-to-end tests for the router pipe
-    │       │   ├── golden.rs  # //! Golden test set for the router pipel
-    │       │   ├── mod.rs  # //! Router test modules.
-    │       │   └── rubric_fixtures.rs  # //! Rubric-based test fixtures for `Resu
-    │       ├── transforms/
-    │       │   ├── codeword_anonymize.rs  # use std::collections::HashMap;
-    │       │   ├── decompose_hypothetical.rs  # use fluent_llm::anonymize;
-    │       │   ├── decompose_subtasks.rs  # use fluent_llm::Decomposer;
-    │       │   ├── mod.rs  # pub mod codeword_anonymize;
-    │       │   ├── none.rs  # use crate::transforms::{TransformError, 
-    │       │   ├── pii_anonymize.rs  # use std::collections::HashMap;
-    │       │   ├── sanitize.rs  # use common_core::string::{filter_unsafe_
-    │       │   ├── secret_mask.rs  # use std::sync::LazyLock;
-    │       │   └── tests.rs  # #[cfg(test)]
-    │       ├── types.rs  # //! Unified request/response types ...
-    │       └── views.rs  # //! Reference-only view layer over the s
-    ├── search-vector/
-    │   ├── Cargo.toml
-    │   └── src/
-    │       ├── aliases.rs  # use std::collections::HashMap;
-    │       ├── db.rs  # use std::path::Path;
-    │       ├── error.rs  # //! Database error taxonomy — re-ex...
-    │       ├── lib.rs  # //! search-vector: SQLite hybrid search 
-    │       └── math.rs  # //! Embedding vector math — re-expo...
-    ├── types/
-    │   ├── Cargo.toml
-    │   └── src/
-    │       ├── knowledge.rs  # //! KnowledgeCapability — the cross...
-    │       └── lib.rs  # //! fluent-types: Shared data types (Gui
-    └── wasm_ipc/
-        ├── Cargo.toml
-        └── src/
-            └── lib.rs  # //! WASM IPC — Binary schemas for E...
+├── src/
+│   ├── Cargo.lock
+│   ├── bin/
+│   │   ├── coral/
+│   │   │   ├── Cargo.toml
+│   │   │   └── src/
+│   │   │       └── main.rs
+│   │   ├── coral-router/
+│   │   │   ├── Cargo.toml
+│   │   │   └── src/
+│   │   │       ├── boot.rs
+│   │   │       └── main.rs
+│   │   ├── guidance/
+│   │   │   ├── Cargo.toml
+│   │   │   └── src/
+│   │   │       ├── benchmark.rs
+│   │   │       ├── commit.rs
+│   │   │       ├── editor.rs
+│   │   │       ├── main.rs
+│   │   │       ├── mcp.rs
+│   │   │       └── structure.rs
+│   │   └── yamake-coral/
+│   │       ├── Cargo.toml
+│   │       └── src/
+│   │           └── main.rs
+│   ├── common-core/
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── cache.rs
+│   │       ├── config.rs
+│   │       ├── constants.rs
+│   │       ├── drift.rs
+│   │       ├── error.rs
+│   │       ├── error_context.rs
+│   │       ├── format.rs
+│   │       ├── git.rs
+│   │       ├── hash.rs
+│   │       ├── http.rs
+│   │       ├── interner.rs
+│   │       ├── io.rs
+│   │       ├── jsonrpc.rs
+│   │       ├── lib.rs
+│   │       ├── metrics.rs
+│   │       ├── prelude.rs
+│   │       ├── registry.rs
+│   │       ├── retry.rs
+│   │       ├── runtime.rs
+│   │       ├── shell.rs
+│   │       ├── shell_parser.rs
+│   │       ├── sqlite.rs
+│   │       ├── string.rs
+│   │       ├── sync.rs
+│   │       ├── time.rs
+│   │       ├── tokens.rs
+│   │       ├── walk.rs
+│   │       └── watchdog.rs
+│   ├── content-node/
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── doc_node.rs
+│   │       ├── file_node.rs
+│   │       ├── lib.rs
+│   │       ├── lod.rs
+│   │       ├── node.rs
+│   │       └── source_node.rs
+│   ├── coral/
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── cache/
+│   │       │   ├── mod.rs
+│   │       │   ├── reactor.rs
+│   │       │   └── stats.rs
+│   │       ├── cache_l1.rs
+│   │       ├── cache_router.rs
+│   │       ├── db/
+│   │       │   ├── edges.rs
+│   │       │   ├── embeddings.rs
+│   │       │   ├── hnsw.rs
+│   │       │   ├── mod.rs
+│   │       │   ├── nodes.rs
+│   │       │   └── schema.rs
+│   │       ├── error.rs
+│   │       ├── ingest.rs
+│   │       ├── knowledge.rs
+│   │       ├── lib.rs
+│   │       ├── mcp.rs
+│   │       ├── packer.rs
+│   │       ├── test_stubs.rs
+│   │       ├── tests/
+│   │       │   ├── common.rs
+│   │       │   └── mod.rs
+│   │       ├── tier_units.rs
+│   │       ├── wasm_runtime.rs
+│   │       └── wvr.rs
+│   ├── dag/
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── adapter.rs
+│   │       ├── checkpointed.rs
+│   │       ├── closure.rs
+│   │       ├── dep_graph.rs
+│   │       ├── error.rs
+│   │       ├── lib.rs
+│   │       ├── middleware.rs
+│   │       ├── narrowing.rs
+│   │       ├── resolver.rs
+│   │       ├── target.rs
+│   │       ├── target_work_unit.rs
+│   │       ├── tests/
+│   │       │   ├── common.rs
+│   │       │   └── mod.rs
+│   │       ├── type_inference.rs
+│   │       ├── work_unit.rs
+│   │       ├── wvr.rs
+│   │       └── yamake_loader.rs
+│   ├── db/
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── cache.rs
+│   │       ├── capability.rs
+│   │       ├── error.rs
+│   │       ├── hnsw.rs
+│   │       ├── lib.rs
+│   │       ├── migrate.rs
+│   │       ├── pool.rs
+│   │       ├── query.rs
+│   │       ├── store.rs
+│   │       ├── tests/
+│   │       │   ├── common.rs
+│   │       │   └── mod.rs
+│   │       ├── vector.rs
+│   │       └── wvr.rs
+│   ├── fluent-concurrency/
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── affinity.rs
+│   │       ├── batch.rs
+│   │       ├── capability.rs
+│   │       ├── flow.rs
+│   │       ├── io/
+│   │       │   ├── db.rs
+│   │       │   ├── fs.rs
+│   │       │   ├── mod.rs
+│   │       │   └── net.rs
+│   │       ├── ladder.rs
+│   │       ├── lib.rs
+│   │       ├── llm_queue.rs
+│   │       ├── pool.rs
+│   │       ├── queue.rs
+│   │       ├── reserve.rs
+│   │       ├── router.rs
+│   │       ├── runtime/
+│   │       │   ├── mod.rs
+│   │       │   ├── test.rs
+│   │       │   └── tokio.rs
+│   │       ├── scope.rs
+│   │       ├── stream.rs
+│   │       ├── tests/
+│   │       │   ├── e2e.rs
+│   │       │   ├── m1.rs
+│   │       │   ├── m2.rs
+│   │       │   ├── m3.rs
+│   │       │   ├── m4.rs
+│   │       │   ├── m5.rs
+│   │       │   └── mod.rs
+│   │       └── thread_resource.rs
+│   ├── fluent-wvr/
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── boundary.rs
+│   │       ├── capability.rs
+│   │       ├── coerce.rs
+│   │       ├── dynamic.rs
+│   │       ├── lib.rs
+│   │       ├── macros.rs
+│   │       ├── metadata.rs
+│   │       ├── prelude.rs
+│   │       ├── runtime.rs
+│   │       ├── store.rs
+│   │       ├── test_support.rs
+│   │       ├── tests.rs
+│   │       ├── traits.rs
+│   │       ├── work.rs
+│   │       └── wrapper.rs
+│   ├── fluent-wvr-macros/
+│   │   ├── Cargo.toml
+│   │   ├── src/
+│   │   │   └── lib.rs
+│   │   └── tests/
+│   │       └── derive_expansion.rs
+│   ├── fluent-wvr-testutil/
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       └── lib.rs
+│   ├── guidance/
+│   │   ├── Cargo.toml
+│   │   ├── src/
+│   │   │   ├── ast_parser.rs
+│   │   │   ├── config.rs
+│   │   │   ├── enhancer.rs
+│   │   │   ├── grounding.rs
+│   │   │   ├── lib.rs
+│   │   │   ├── memory.rs
+│   │   │   ├── plugin.rs
+│   │   │   ├── query/
+│   │   │   │   ├── formatter.rs
+│   │   │   │   ├── identifier.rs
+│   │   │   │   ├── llm_filter.rs
+│   │   │   │   ├── llm_filter_batch.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── search_backend.rs
+│   │   │   │   ├── snapshot.rs
+│   │   │   │   ├── strategy.rs
+│   │   │   │   └── synthesize.rs
+│   │   │   ├── query_engine.rs
+│   │   │   ├── runtime.rs
+│   │   │   ├── scanner.rs
+│   │   │   ├── sync/
+│   │   │   │   ├── comments.rs
+│   │   │   │   ├── json_store.rs
+│   │   │   │   ├── json_writer.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   └── staleness.rs
+│   │   │   ├── sync_engine.rs
+│   │   │   └── tests/
+│   │   │       ├── common.rs
+│   │   │       └── mod.rs
+│   │   └── tests/
+│   │       ├── common/
+│   │       │   └── mod.rs
+│   │       ├── e2e_gen_roundtrip.rs
+│   │       ├── live/
+│   │       │   ├── README.md
+│   │       │   └── smoke_live.rs
+│   │       └── live.rs
+│   ├── knowledge/
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── csr_graph.rs
+│   │       ├── freq_table.rs
+│   │       ├── index_header.rs
+│   │       ├── lib.rs
+│   │       ├── query_cache.rs
+│   │       ├── tokenizer.rs
+│   │       ├── trigram_index.rs
+│   │       └── word_index.rs
+│   ├── llm/
+│   │   ├── Cargo.toml
+│   │   ├── src/
+│   │   │   ├── anonymize.rs
+│   │   │   ├── client.rs
+│   │   │   ├── constants.rs
+│   │   │   ├── context_packer.rs
+│   │   │   ├── decomposer.rs
+│   │   │   ├── embeddings.rs
+│   │   │   ├── error.rs
+│   │   │   ├── http_class.rs
+│   │   │   ├── lib.rs
+│   │   │   ├── llm_queue.rs
+│   │   │   ├── openai.rs
+│   │   │   ├── parse.rs
+│   │   │   ├── pii_patterns.rs
+│   │   │   └── url.rs
+│   │   └── tests/
+│   │       ├── live/
+│   │       │   ├── README.md
+│   │       │   └── smoke_live.rs
+│   │       └── live.rs
+│   ├── memory-plugin/
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── capability.rs
+│   │       ├── lib.rs
+│   │       ├── plugins/
+│   │       │   ├── hindsight/
+│   │       │   │   └── mod.rs
+│   │       │   ├── holographic/
+│   │       │   │   ├── hrr.rs
+│   │       │   │   ├── mod.rs
+│   │       │   │   └── store.rs
+│   │       │   ├── honcho/
+│   │       │   │   └── mod.rs
+│   │       │   └── mod.rs
+│   │       ├── registry.rs
+│   │       ├── traits.rs
+│   │       └── types.rs
+│   ├── ontology/
+│   │   ├── Cargo.toml
+│   │   ├── build.rs
+│   │   ├── data/
+│   │   │   └── yago_classes.json
+│   │   ├── src/
+│   │   │   ├── entity.rs
+│   │   │   ├── inference.rs
+│   │   │   ├── lib.rs
+│   │   │   ├── mapper.rs
+│   │   │   ├── migration.rs
+│   │   │   ├── yago.rs
+│   │   │   └── yago_loader.rs
+│   │   └── tests/
+│   │       └── yago_interlingua.rs
+│   ├── rdf/
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lexer.rs
+│   │       ├── lib.rs
+│   │       ├── normalize.rs
+│   │       ├── nquads.rs
+│   │       └── parser.rs
+│   ├── requirements.txt
+│   ├── router/
+│   │   ├── Cargo.toml
+│   │   ├── src/
+│   │   │   ├── audit.rs
+│   │   │   ├── charts/
+│   │   │   │   ├── binding.rs
+│   │   │   │   ├── compile.rs
+│   │   │   │   ├── execute.rs
+│   │   │   │   ├── extract.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── render.rs
+│   │   │   │   ├── rubric.rs
+│   │   │   │   ├── select.rs
+│   │   │   │   ├── stage.rs
+│   │   │   │   └── store.rs
+│   │   │   ├── cli/
+│   │   │   │   ├── commands/
+│   │   │   │   │   ├── filesystem.rs
+│   │   │   │   │   ├── mod.rs
+│   │   │   │   │   └── server.rs
+│   │   │   │   ├── gguf.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   └── preset.rs
+│   │   │   ├── concept_store_sqlite.rs
+│   │   │   ├── config/
+│   │   │   │   ├── addr.rs
+│   │   │   │   ├── builder.rs
+│   │   │   │   ├── classification.rs
+│   │   │   │   ├── escalation.rs
+│   │   │   │   ├── filters.rs
+│   │   │   │   └── routing.rs
+│   │   │   ├── config.rs
+│   │   │   ├── config_route_tests.rs
+│   │   │   ├── dag_session.rs
+│   │   │   ├── dispatch/
+│   │   │   │   ├── backend.rs
+│   │   │   │   ├── escalation/
+│   │   │   │   │   ├── assemble.rs
+│   │   │   │   │   ├── audit.rs
+│   │   │   │   │   ├── mod.rs
+│   │   │   │   │   └── modes.rs
+│   │   │   │   ├── frontier.rs
+│   │   │   │   └── mod.rs
+│   │   │   ├── error.rs
+│   │   │   ├── filters/
+│   │   │   │   ├── injection_detect.rs
+│   │   │   │   ├── luhn.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   └── regex_filter.rs
+│   │   │   ├── frontier/
+│   │   │   │   ├── mod.rs
+│   │   │   │   └── modes.rs
+│   │   │   ├── hnsw.rs
+│   │   │   ├── instances/
+│   │   │   │   ├── api.rs
+│   │   │   │   ├── client.rs
+│   │   │   │   ├── manager.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   └── pool.rs
+│   │   │   ├── knowledge.rs
+│   │   │   ├── kv_cache.rs
+│   │   │   ├── ledger/
+│   │   │   │   ├── correction_index.rs
+│   │   │   │   ├── nlp.rs
+│   │   │   │   ├── orchestrator.rs
+│   │   │   │   ├── prompt.rs
+│   │   │   │   └── tiering.rs
+│   │   │   ├── ledger.rs
+│   │   │   ├── ledger_guard.rs
+│   │   │   ├── lib.rs
+│   │   │   ├── logging.rs
+│   │   │   ├── metrics.rs
+│   │   │   ├── node_store.rs
+│   │   │   ├── normalize.rs
+│   │   │   ├── pipeline.rs
+│   │   │   ├── pipeline_types.rs
+│   │   │   ├── routes/
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── plan.rs
+│   │   │   │   └── rigor/
+│   │   │   │       ├── mod.rs
+│   │   │   │       └── prompts.rs
+│   │   │   ├── scheduler.rs
+│   │   │   ├── score_matrix.rs
+│   │   │   ├── server/
+│   │   │   │   ├── admin.rs
+│   │   │   │   ├── dispatch.rs
+│   │   │   │   ├── handler.rs
+│   │   │   │   ├── instances_api.rs
+│   │   │   │   ├── responses.rs
+│   │   │   │   └── review.rs
+│   │   │   ├── server.rs
+│   │   │   ├── server_http_tests.rs
+│   │   │   ├── server_tests.rs
+│   │   │   ├── session.rs
+│   │   │   ├── stage_tests.rs
+│   │   │   ├── stages/
+│   │   │   │   ├── classifier.rs
+│   │   │   │   ├── common.rs
+│   │   │   │   ├── deterministic.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── nlp.rs
+│   │   │   │   ├── pipeline_ref.rs
+│   │   │   │   ├── prompt_parse.rs
+│   │   │   │   ├── retry_classifier.rs
+│   │   │   │   └── tree/
+│   │   │   │       ├── decisions.rs
+│   │   │   │       ├── engine.rs
+│   │   │   │       ├── mod.rs
+│   │   │   │       └── verdict.rs
+│   │   │   ├── streaming.rs
+│   │   │   ├── summarization.rs
+│   │   │   ├── supervisor.rs
+│   │   │   ├── supervisor_integration_tests.rs
+│   │   │   ├── target_match.rs
+│   │   │   ├── telemetry.rs
+│   │   │   ├── test_stubs.rs
+│   │   │   ├── test_support.rs
+│   │   │   ├── testing/
+│   │   │   │   ├── mock.rs
+│   │   │   │   └── mod.rs
+│   │   │   ├── tests/
+│   │   │   │   ├── common.rs
+│   │   │   │   ├── e2e_tests.rs
+│   │   │   │   ├── golden.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   └── rubric_fixtures.rs
+│   │   │   ├── transforms/
+│   │   │   │   ├── codeword_anonymize.rs
+│   │   │   │   ├── decompose_hypothetical.rs
+│   │   │   │   ├── decompose_subtasks.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── none.rs
+│   │   │   │   ├── pii_anonymize.rs
+│   │   │   │   ├── sanitize.rs
+│   │   │   │   ├── secret_mask.rs
+│   │   │   │   └── tests.rs
+│   │   │   ├── types.rs
+│   │   │   └── views.rs
+│   │   └── tests/
+│   │       ├── live/
+│   │       │   ├── README.md
+│   │       │   └── smoke_live.rs
+│   │       └── live.rs
+│   ├── search-vector/
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── aliases.rs
+│   │       ├── db.rs
+│   │       ├── error.rs
+│   │       ├── lib.rs
+│   │       └── math.rs
+│   ├── spacy-rs/
+│   │   ├── Cargo.toml
+│   │   ├── build.rs
+│   │   ├── data/
+│   │   │   └── en_lemmatizer.json
+│   │   ├── src/
+│   │   │   ├── arc_eager.rs
+│   │   │   ├── attrs.rs
+│   │   │   ├── concept_store.rs
+│   │   │   ├── concept_store_mem.rs
+│   │   │   ├── doc.rs
+│   │   │   ├── error.rs
+│   │   │   ├── hash.rs
+│   │   │   ├── interlingua.rs
+│   │   │   ├── labels.rs
+│   │   │   ├── lang/
+│   │   │   │   ├── en/
+│   │   │   │   │   ├── exceptions.rs
+│   │   │   │   │   ├── num_words.rs
+│   │   │   │   │   ├── patterns.rs
+│   │   │   │   │   ├── stop_words.rs
+│   │   │   │   │   └── tag_map.rs
+│   │   │   │   ├── en.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── norm_exceptions.rs
+│   │   │   │   └── url.rs
+│   │   │   ├── lemma_blob.rs
+│   │   │   ├── lemmatizer.rs
+│   │   │   ├── lex_attrs.rs
+│   │   │   ├── lexeme.rs
+│   │   │   ├── lib.rs
+│   │   │   ├── llm.rs
+│   │   │   ├── morph.rs
+│   │   │   ├── pipeline/
+│   │   │   │   └── tests.rs
+│   │   │   ├── pipeline.rs
+│   │   │   ├── review.rs
+│   │   │   ├── routing.rs
+│   │   │   ├── sentencizer.rs
+│   │   │   ├── strings.rs
+│   │   │   ├── tag_map.rs
+│   │   │   ├── tokenizer.rs
+│   │   │   ├── validate.rs
+│   │   │   └── vocab.rs
+│   │   ├── tests/
+│   │   │   ├── arceager_golden.rs
+│   │   │   ├── data/
+│   │   │   │   └── en_tokenization.json
+│   │   │   ├── en_tokenization.rs
+│   │   │   ├── live/
+│   │   │   │   ├── README.md
+│   │   │   │   └── smoke_live.rs
+│   │   │   └── live.rs
+│   │   └── tools/
+│   │       ├── gen_en_exceptions.py
+│   │       ├── gen_en_lemma_data.py
+│   │       ├── gen_en_regexes.py
+│   │       ├── gen_en_tag_map.py
+│   │       └── gen_golden_corpus.py
+│   ├── types/
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── interlingua.rs
+│   │       ├── knowledge.rs
+│   │       └── lib.rs
+│   └── wasm_ipc/
+│       ├── Cargo.toml
+│       └── src/
+│           └── lib.rs
+└── tools/
+    ├── download_yago_taxonomy.sh
+    └── gen_yago_classes.py
 ```

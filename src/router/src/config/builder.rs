@@ -24,15 +24,17 @@
 //! on the pipeline/engine constructors is a builder-shape, not a call-shape.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use common_core::config::load_json_or_default;
 use fluent_llm::client::ChatBackend;
 use fluent_llm::{LlmClient, LlmConfig};
-use fluent_wvr::prelude::Component;
 
-use super::{default_true, strip_declaration_params, RejectPatterns, RouterConfig};
+use super::{
+    default_true, refine_policy::RouterRefinePolicy, strip_declaration_params, RejectPatterns,
+    RouterConfig,
+};
 use crate::pipeline::PipelineOrchestrator;
 use crate::score_matrix::ScoreMatrix;
 use crate::target_match::{TargetBackends, TargetMatcher};
@@ -55,12 +57,49 @@ pub enum TargetMatchMode {
     Static,
 }
 
+/// NLP annotation ordering (ROADMAP_20260827_ORT §2.7). `LlmFirst` (the
+/// default) preserves today's behavior: the LLM annotation rung runs first
+/// when a fetch is wired, with ArcEager/rule beneath. `DeterministicFirst`
+/// skips the up-front annotation LLM call and lets the `overlay` stage consult
+/// models on residuals — it is only reachable together with non-empty
+/// `overlay_models` (the two changes are inseparable in config).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum NlpOrdering {
+    /// LLM annotation rung first when a fetch is wired (today's ladder).
+    #[default]
+    #[serde(rename = "llm_first")]
+    LlmFirst,
+    /// ArcEager baseline; models consulted on residuals via overlays.
+    #[serde(rename = "deterministic_first")]
+    DeterministicFirst,
+}
+
+/// A1a: cohesive NLP view derived from the flat `PipelineParams` fields.
+/// The three seams (`nlp` stage, `overlay` stage, encoder) are now accessed
+/// through this single view — the flat fields remain for serde backward
+/// compat but all pipeline logic goes through `nlp_config()` / `overlay_enabled()`.
+#[derive(Debug, Clone)]
+pub struct NlpConfig {
+    pub enabled: bool,
+    pub ordering: NlpOrdering,
+    pub refine_policy: Option<RouterRefinePolicy>,
+    pub encoder_model: Option<String>,
+}
+
 /// Named pipeline parameters. Pipelines are stored as a map keyed by name.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct PipelineParams {
     #[serde(default = "default_true")]
     pub deterministic_prefilter: bool,
+    /// Milestone 6: run the deterministic NLP parse stage (`spacy-rs`) on the
+    /// request text and publish the per-sentence routing signals under the
+    /// `"nlp_parse"` handoff key. When the resolved classifier backend is
+    /// available, the stage also attempts the LLM annotation rung (full UD
+    /// deps) before falling back to the deterministic star parse. Default
+    /// `false` — strictly additive.
+    #[serde(default)]
+    pub nlp: bool,
     #[serde(default = "default_true")]
     pub classifier: bool,
     #[serde(default = "default_true")]
@@ -106,11 +145,70 @@ pub struct PipelineParams {
     /// Defaults to `DEFAULT_TOTAL_TIMEOUT_MS` (the shared timeout constant).
     #[serde(default = "default_target_match_timeout_ms")]
     pub target_match_timeout_ms: u64,
+    /// Model keys whose onnx `ZeroShotRouting` sessions back the overlay
+    /// stage's disambiguation scoring. Non-empty enables the overlay stage.
+    /// A legacy `"overlay": true` key in JSON is ignored by serde (unknown
+    /// field); the migration path is to set `overlay_models`.
+    #[serde(default)]
+    pub overlay_models: Vec<String>,
+    /// Bounds concurrent overlay `run` calls (default 2).
+    #[serde(default)]
+    pub overlay_max_concurrency: Option<usize>,
+    /// The parse-confidence floor below which a sentence (or the doc) yields a
+    /// disambiguation residual. Defaults to the shared disambiguation floor.
+    #[serde(default = "default_overlay_disambiguation_floor")]
+    pub overlay_disambiguation_floor: f64,
+    /// NLP annotation ordering (default `llm_first` — today's behavior,
+    /// unchanged for existing `nlp: true` deployments). `deterministic_first`
+    /// is only reachable together with overlay models.
+    #[serde(default)]
+    pub nlp_ordering: NlpOrdering,
+    /// Optional redirect gate (OFF by default): when set AND the zero-shot
+    /// eval corpus gate passes, a top overlay hint at/above the threshold can
+    /// turn into a `Rerouted` classifier verdict. Inert until the ≥100-case
+    /// golden corpus lands (see ROADMAP_20260827_ORT §2.6a).
+    #[serde(default)]
+    pub overlay_redirect_threshold: Option<f64>,
+    /// The ort encoder model key for the trained-encoder annotation rung
+    /// (ROADMAP_20260827_ORT §4.4). When set and the model is registered in
+    /// the ort registry, the NlpStage runs the encoder between the LLM and
+    /// ArcEager rungs. `None` (default) disables the encoder rung — the
+    /// ladder is unchanged from today's behavior.
+    #[serde(default)]
+    pub encoder_model: Option<String>,
+    /// Refinement policy for the deterministic-first annotation ladder
+    /// (ROADMAP_20260831_ARCEAGER M4.1). When `Some`, this DTO is converted
+    /// `Into<spacy_rs::RefinePolicy>` verbatim; when `None` (default), the
+    /// effective policy follows `nlp_ordering` — `LlmFirst` ⇒ `Always`,
+    /// `DeterministicFirst` ⇒ `OnUncertain` with default thresholds — so
+    /// existing configs are byte-identical. Every `refine_on_*` flag is
+    /// independently tunable without a code change.
+    #[serde(default)]
+    pub refine_policy: Option<RouterRefinePolicy>,
 }
 
 fn default_target_match_timeout_ms() -> u64 {
-    common_core::constants::DEFAULT_TOTAL_TIMEOUT_MS
+    fluent_llm::constants::DEFAULT_TOTAL_TIMEOUT_MS
 }
+
+/// Default parse-confidence floor for the overlay disambiguation residual
+/// ([A] producer self-doubt axis). Locked by the calibration corpus in
+/// `tests/overlay_calibration.rs`: 50 known-quality sentences + 20
+/// confident-but-wrong controls (which must NOT yield residuals, proving
+/// [A] is not correctness). Residual yield 30/50, 0 false positives on
+/// the 40 confident controls at this value.
+pub const OVERLAY_DISAMBIGUATION_FLOOR_DEFAULT: f64 = 0.5;
+
+fn default_overlay_disambiguation_floor() -> f64 {
+    OVERLAY_DISAMBIGUATION_FLOOR_DEFAULT
+}
+
+/// Default redirect gate ([B] task-value axis). Locked to OFF (`None`) by
+/// the calibration corpus in `tests/overlay_calibration.rs`: 100
+/// route-labeled prompts + 20 adversarial-nearby pairs (which must NOT
+/// redirect). Precision on controls is 100% only because nothing redirects
+/// while OFF; any arming requires re-calibration to 100% first.
+pub const OVERLAY_REDIRECT_THRESHOLD_DEFAULT: Option<f64> = None;
 
 fn default_classifier_retry_prompts() -> Vec<String> {
     vec![
@@ -127,6 +225,7 @@ impl Default for PipelineParams {
     fn default() -> Self {
         Self {
             deterministic_prefilter: true,
+            nlp: false,
             classifier: true,
             router: true,
             coherence_threshold: default_coherence_threshold(),
@@ -139,7 +238,34 @@ impl Default for PipelineParams {
             classifier_retry_prompts: default_classifier_retry_prompts(),
             target_match: TargetMatchMode::SelfAssess,
             target_match_timeout_ms: default_target_match_timeout_ms(),
+            overlay_models: Vec::new(),
+            overlay_max_concurrency: None,
+            overlay_disambiguation_floor: default_overlay_disambiguation_floor(),
+            nlp_ordering: NlpOrdering::LlmFirst,
+            overlay_redirect_threshold: OVERLAY_REDIRECT_THRESHOLD_DEFAULT,
+            encoder_model: None,
+            refine_policy: None,
         }
+    }
+}
+
+impl PipelineParams {
+    /// Cohesive NLP view (A1a): single struct for the `nlp` stage's seams.
+    #[must_use]
+    pub fn nlp_config(&self) -> NlpConfig {
+        NlpConfig {
+            enabled: self.nlp,
+            ordering: self.nlp_ordering,
+            refine_policy: self.refine_policy,
+            encoder_model: self.encoder_model.clone(),
+        }
+    }
+
+    /// Overlay is enabled when `overlay_models` is non-empty: the single
+    /// named predicate for the derived flag.
+    #[must_use]
+    pub fn overlay_enabled(&self) -> bool {
+        !self.overlay_models.is_empty()
     }
 }
 
@@ -153,23 +279,104 @@ fn default_classifier_concurrency() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get().max(1))
 }
 
+/// NLP dependencies threaded into the pipeline builder from the composition
+/// root (ROADMAP_20260828_ORT M1.1/M1.2). The concept store (built over the
+/// shared ledger connection **before** pipeline build) backs the interlingua
+/// resolver; the optional strings path wires the durable `StringStore` (G9).
+/// `Default` is fully fail-open: no resolver, in-memory strings — byte-identical
+/// to today's `NlpPipeline::en_default()`.
+#[derive(Clone, Default)]
+pub struct NlpDeps {
+    /// The shared concept registry over the ledger connection. `Some` wires
+    /// `InterlinguaResolver` into the NLP pipeline so `NlpStage` stamps
+    /// interlingua ids; `None` disables interlingua stamping (with a `warn!`).
+    pub concept_store: Option<Arc<dyn spacy_rs::concept_store::ConceptStore>>,
+    /// Optional durable StringStore path: the pipeline's vocab is loaded from
+    /// (`en_default_with_strings`) and persisted (`persist_strings`) to this
+    /// path. `None` keeps the in-memory vocab.
+    pub strings_path: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for NlpDeps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NlpDeps")
+            .field("concept_store", &self.concept_store.is_some())
+            .field("strings_path", &self.strings_path)
+            .finish()
+    }
+}
+
+/// Canonical build deps for a named pipeline (Plan B F4): one struct carries
+/// the three optional seams that previously required three overloads
+/// (`classifier_backend`, `onnx`, `nlp_deps`). Old overloads now delegate
+/// here (DRY — ordering + fallback logic lives in exactly one place).
+#[derive(Default)]
+pub struct PipelineBuildDeps<'a> {
+    pub classifier_backend: Option<Arc<dyn ChatBackend>>,
+    pub onnx: Option<&'a crate::ort::OrtRegistry>,
+    pub nlp_deps: NlpDeps,
+}
+
+/// Build the `spacy-rs` NLP pipeline for a named pipeline from `deps`: a
+/// vocab (loaded from `deps.strings_path` when configured, else fresh), a
+/// tokenizer, and — when a concept store is present — an
+/// [`InterlinguaResolver`] over it so the pipeline stamps interlingua ids.
+/// Fail-open: `None` deps produce the deterministic baseline with no resolver.
+fn build_nlp_pipeline(
+    deps: &NlpDeps,
+) -> Result<Arc<spacy_rs::NlpPipeline>, spacy_rs::PipelineError> {
+    let vocab = match deps.strings_path.as_deref() {
+        Some(path) => Arc::new(spacy_rs::vocab::Vocab::load_or_empty(
+            path,
+            spacy_rs::lang::en::lexicon_config(),
+        )),
+        None => Arc::new(spacy_rs::vocab::Vocab::new(spacy_rs::lang::en::lexicon_config())),
+    };
+    let tokenizer = spacy_rs::lang::en::tokenizer(Arc::clone(&vocab))?;
+    let resolver = deps.concept_store.clone().map(|concepts| {
+        Arc::new(spacy_rs::InterlinguaResolver::new(
+            concepts,
+            Arc::clone(vocab.strings()),
+        ))
+    });
+    match resolver {
+        Some(resolver) => spacy_rs::NlpPipeline::new_with_resolver(
+            vocab,
+            tokenizer,
+            spacy_rs::AnnotationValidator::new(),
+            Some(resolver),
+        )
+        .map(Arc::new),
+        None => spacy_rs::NlpPipeline::new(
+            vocab,
+            tokenizer,
+            spacy_rs::AnnotationValidator::new(),
+        )
+        .map(Arc::new),
+    }
+}
+
 impl RouterConfig {
     pub fn load_reject_patterns(path: &str) -> RejectPatterns {
         load_json_or_default::<RejectPatterns>(Path::new(path))
     }
 
+    /// Build a standalone `NlpPipeline` for the `arc_ready` spacy overlay,
+    /// threading the same `InterlinguaResolver` (via `nlp_deps.concept_store`)
+    /// as the request-time pipelines. `None` on build error (fail-open — the
+    /// spacy overlay just isn't wired).
+    pub fn overlay_nlp_pipeline(&self, nlp_deps: &NlpDeps) -> Option<Arc<spacy_rs::NlpPipeline>> {
+        build_nlp_pipeline(nlp_deps).ok()
+    }
+
     pub fn routing_config(&self) -> super::RoutingConfig {
-        // When a classification tree is configured and no explicit
-        // `system_prompt` is set, derive one from the root classifier node's
-        // children so flat consumers still observe the auto-generated prompt.
-        let system_prompt = if self.system_prompt.is_empty() {
-            self.classification
-                .as_ref()
-                .and_then(super::ClassificationTree::derive_system_prompt)
-                .unwrap_or_default()
-        } else {
-            self.system_prompt.clone()
-        };
+        // The system prompt is always derived from the root classifier
+        // node's children (M3c: the flat `system_prompt` field is gone).
+        let system_prompt = self
+            .classification
+            .as_ref()
+            .and_then(super::ClassificationTree::derive_system_prompt)
+            .unwrap_or_default();
         super::RoutingConfig {
             routes: self.routes_view(),
             models: self.models.clone(),
@@ -177,8 +384,25 @@ impl RouterConfig {
             system_prompt,
             safety_threshold: self.safety_threshold,
             default_route: self.default_route.clone(),
-            score_matrix: self.score_matrix.clone(),
+            score_matrix: None,
+            onnx_keys: self.onnx_role_keys(),
         }
+    }
+
+    /// The registry keys of the configured in-process onnx roles (e.g.
+    /// `onnx/llm`). A `model_groups` member that names one is a valid dispatch
+    /// target served by the onnx `ChatBackend`. Empty when no onnx fleet (or
+    /// this build's `onnx` feature) is configured.
+    pub fn onnx_role_keys(&self) -> std::collections::BTreeSet<String> {
+        self.onnx
+            .as_ref()
+            .map(|fleet| {
+                fleet
+                    .iter()
+                    .map(|(role, _)| role.registry_key().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn build_named_pipeline(&self, name: &str) -> Option<PipelineOrchestrator> {
@@ -190,21 +414,268 @@ impl RouterConfig {
         name: &str,
         classifier_backend: Option<Arc<dyn ChatBackend>>,
     ) -> Option<PipelineOrchestrator> {
+        self.build_named_pipeline_with_backend_and_onnx(name, classifier_backend, None)
+    }
+
+    /// Build a named pipeline with an injected classifier backend and the boot
+    /// ort registry (ROADMAP_20260827_ORT §2.5). The registry supplies the
+    /// overlay `Arc`s for `PipelineParams.overlay_models`; `None` (or absent
+    /// onnx config) is fully fail-open — the overlay stage is skipped.
+    ///
+    /// No `NlpDeps` are supplied, so the NLP pipeline is built fail-open (no
+    /// interlingua resolver, in-memory strings) — equivalent to
+    /// `NlpPipeline::en_default()`. Composition roots that have built a concept
+    /// store should call [`Self::build_named_pipeline_with_backend_onnx_and_nlp`].
+    pub fn build_named_pipeline_with_backend_and_onnx(
+        &self,
+        name: &str,
+        classifier_backend: Option<Arc<dyn ChatBackend>>,
+        onnx: Option<&crate::ort::OrtRegistry>,
+    ) -> Option<PipelineOrchestrator> {
+        self.build_named_pipeline_with_backend_onnx_and_nlp(
+            name,
+            classifier_backend,
+            onnx,
+            &NlpDeps::default(),
+        )
+    }
+
+    /// Canonical single-point pipeline build (Plan B F4): the three overloads
+    /// above delegate here. `deps` bundles the three optional seams.
+    pub fn build_named_pipeline_with_deps(
+        &self,
+        name: &str,
+        deps: PipelineBuildDeps<'_>,
+    ) -> Option<PipelineOrchestrator> {
+        self.build_named_pipeline_with_backend_onnx_and_nlp(
+            name,
+            deps.classifier_backend,
+            deps.onnx,
+            &deps.nlp_deps,
+        )
+    }
+
+    /// [`Self::build_named_pipeline_with_backend_and_onnx`] plus the NLP
+    /// dependencies (concept store + optional durable strings path,
+    /// ROADMAP_20260828_ORT M1.2). When `nlp: true` and a concept store is
+    /// present, the NLP pipeline is built with an `InterlinguaResolver` so the
+    /// `NlpStage` stamps interlingua ids; otherwise it fails open with a
+    /// `warn!`.
+    ///
+    /// This is the sole implementation; the other `build_named_pipeline_*`
+    /// overloads delegate through [`Self::build_named_pipeline_with_deps`] (DRY).
+    pub fn build_named_pipeline_with_backend_onnx_and_nlp(
+        &self,
+        name: &str,
+        classifier_backend: Option<Arc<dyn ChatBackend>>,
+        onnx: Option<&crate::ort::OrtRegistry>,
+        nlp_deps: &NlpDeps,
+    ) -> Option<PipelineOrchestrator> {
         let params = self.pipelines.get(name)?;
-        let mut stages: Vec<Arc<dyn Component>> = Vec::new();
+        let mut orchestrator = PipelineOrchestrator::builder();
+
+        // Overlay is enabled exactly when `overlay_models` is non-empty.
+        // `DeterministicFirst` requires overlay models.
+        let nlp_cfg = params.nlp_config();
+        // `DeterministicFirst` and overlay are inseparable: the new ordering
+        // never ships without the residual-consultation machinery that
+        // justifies it. A config that sets `deterministic_first` without
+        // overlay models is a loud warning and falls back to today's `LlmFirst`.
+        let nlp_ordering = if nlp_cfg.ordering == NlpOrdering::DeterministicFirst
+            && !params.overlay_enabled()
+        {
+            tracing::warn!(
+                target: "router.config",
+                pipeline = %name,
+                "nlp_ordering=deterministic_first requires overlay_models to be non-empty; \
+                 falling back to llm_first (today's behavior)",
+            );
+            NlpOrdering::LlmFirst
+        } else {
+            nlp_cfg.ordering
+        };
 
         if params.deterministic_prefilter {
             if let Some(ref blacklist_path) = params.blacklist {
                 let reject_patterns = Self::load_reject_patterns(blacklist_path);
-                stages.push(Arc::new(
+                orchestrator = orchestrator.push(Arc::new(
                     crate::stages::deterministic::DeterministicPreFilter::from_config(
                         &reject_patterns,
                     ),
                 ));
             } else {
-                stages.push(Arc::new(
+                orchestrator = orchestrator.push(Arc::new(
                     crate::stages::deterministic::DeterministicPreFilter::new(),
                 ));
+            }
+        }
+
+        if nlp_cfg.enabled {
+            // The NLP parse stage (ROADMAP_20260831_ARCEAGER M4): the pipeline
+            // is built with an `InterlinguaResolver` when the boot supplied a
+            // concept store (M1.2); with `None` it fails open to `en_default()`.
+            // The annotation LLM call is now a **refiner** gated by a
+            // `RefinePolicy` rather than an up-front rung. `LlmFirst` maps to
+            // `Always` (today's behavior); `DeterministicFirst` maps to
+            // `OnUncertain` — deterministic base + confidence-and-task-value-gated
+            // refinement — instead of `None`.
+            if nlp_deps.concept_store.is_none() {
+                tracing::warn!(
+                    target: "router.config",
+                    pipeline = %name,
+                    "nlp enabled without a concept store — interlingua ids disabled",
+                );
+            }
+            match build_nlp_pipeline(nlp_deps) {
+                Ok(pipeline) => {
+                    // Effective refine policy: explicit DTO wins (converted); otherwise
+                    // it follows `nlp_ordering` (M4.1). `LlmFirst` preserves
+                    // today's always-consult behavior; `DeterministicFirst`
+                    // consults only on uncertainty or routing incompleteness.
+                    let refine_policy: spacy_rs::RefinePolicy = nlp_cfg
+                        .refine_policy
+                        .map_or_else(
+                            || match nlp_ordering {
+                                NlpOrdering::LlmFirst => spacy_rs::RefinePolicy {
+                                    mode: spacy_rs::RefineMode::Always,
+                                    ..spacy_rs::RefinePolicy::default()
+                                },
+                                NlpOrdering::DeterministicFirst => spacy_rs::RefinePolicy {
+                                    mode: spacy_rs::RefineMode::OnUncertain,
+                                    ..spacy_rs::RefinePolicy::default()
+                                },
+                            },
+                            Into::into,
+                        );
+                    // The annotation backend (refiner): the injected classifier
+                    // backend, else the resolved classifier client, else the
+                    // onnx LLM backend (M2.6). Present for both orderings — the
+                    // policy decides when it is consulted.
+                    let fetch = classifier_backend
+                        .clone()
+                        .or_else(|| build_classifier_client(self, name, params))
+                        .or_else(|| self.onnx_llm_backend())
+                        .map(crate::stages::nlp::annotation_fetch);
+                    let llm_rung = fetch.is_some();
+                    // Build the trained-encoder annotation seam: when the
+                    // `encoder_model` knob is set and the `encoder` role is
+                    // registered, the ladder attempts it between LLM and
+                    // ArcEager.
+                    let encoder = nlp_cfg
+                        .encoder_model
+                        .as_deref()
+                        .map(|_| fluent_onnx::OnnxRole::Encoder.registry_key())
+                        .and_then(|role_key| {
+                            onnx.and_then(|reg| {
+                                match crate::ort::nlp_encoder_fetch(reg, role_key) {
+                                    Ok(enc) => enc,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            target: "router.config",
+                                            pipeline = %name,
+                                            model = %role_key,
+                                            error = %e,
+                                            "encoder role build failed — encoder rung \
+                                             unavailable (fail-open)",
+                                        );
+                                        None
+                                    }
+                                }
+                            })
+                        });
+                    let encoder_rung = encoder.is_some();
+                    orchestrator = orchestrator.push(Arc::new(
+                        crate::stages::nlp::NlpStage::with_strings(
+                            pipeline,
+                            fetch,
+                            encoder,
+                            nlp_deps.strings_path.clone(),
+                        )
+                        .with_refine_policy(refine_policy),
+                    ));
+                    tracing::info!(
+                        target: "router.config",
+                        pipeline = %name,
+                        llm_rung = llm_rung,
+                        encoder_rung = encoder_rung,
+                        interlingua = nlp_deps.concept_store.is_some(),
+                        nlp_ordering = ?nlp_ordering,
+                        refine_policy = ?refine_policy.mode,
+                        "NLP parse stage enabled"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "router.config",
+                        pipeline = %name,
+                        error = %e,
+                        "NLP pipeline build failed; pipeline dropped"
+                    );
+                    return None;
+                }
+            }
+        }
+
+        // The overlay stage sits between nlp and classifier: it consumes the
+        // parse residuals and publishes route hints the classifier merges.
+        // Absent onnx config (or an unresolvable overlay model) skips the
+        // stage with a warning — fail-open. The overlay disambiguation is
+        // served by the `router` role (a zero-shot two-tower model); the
+        // per-pipeline `overlay_models` knob (when non-empty) enables it (A1a).
+        if params.overlay_enabled() {
+            let router_keys = [fluent_onnx::OnnxRole::Router.registry_key().to_string()];
+            let overlays = if let Some(registry) = onnx {
+                let routing = self.routing_config();
+                match crate::ort::disambiguation_overlays(
+                    registry,
+                    &router_keys,
+                    &routing.routes,
+                ) {
+                    Ok(overlays) => overlays,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "router.config",
+                            pipeline = %name,
+                            error = %e,
+                            "overlay role build failed — overlay stage skipped (fail-open)",
+                        );
+                        Vec::new()
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    target: "router.config",
+                    pipeline = %name,
+                    overlay_models = ?params.overlay_models,
+                    "overlay enabled but no onnx registry is available — overlay stage \
+                     skipped (fail-open)",
+                );
+                Vec::new()
+            };
+            if overlays.is_empty() {
+                tracing::warn!(
+                    target: "router.config",
+                    pipeline = %name,
+                    overlay_models = ?params.overlay_models,
+                    "overlay enabled but no overlay model resolved — overlay stage skipped \
+                     (fail-open)",
+                );
+            } else {
+                let selector = crate::stages::overlay::ResidualSelector::new(
+                    params.overlay_disambiguation_floor,
+                );
+                orchestrator = orchestrator.push(Arc::new(crate::stages::overlay::OverlayStage::new(
+                    selector,
+                    overlays,
+                    params.overlay_max_concurrency,
+                )));
+                tracing::info!(
+                    target: "router.config",
+                    pipeline = %name,
+                    overlay_models = ?params.overlay_models,
+                    overlay_disambiguation_floor = params.overlay_disambiguation_floor,
+                    "overlay stage inserted between nlp and classifier",
+                );
             }
         }
 
@@ -217,10 +688,21 @@ impl RouterConfig {
             let client: Arc<dyn ChatBackend> = if let Some(backend) = classifier_backend {
                 tracing::info!(target: "router.config", pipeline = %name, backend = "mock/transcript", "classifier using injected backend");
                 backend
-            } else {
-                let client = build_classifier_client(self, name, params)?;
+            } else if let Some(client) = build_classifier_client(self, name, params) {
                 tracing::info!(target: "router.config", pipeline = %name, "classifier using real LLM client");
                 client
+            } else {
+                tracing::warn!(
+                    target: "router.config",
+                    pipeline = %name,
+                    classifier_model = resolve_classifier_model_key(self, params)
+                        .unwrap_or("(none)"),
+                    "classifier enabled but no model resolved — classifier stage \
+                     skipped (fail-open); pipeline runs without classification",
+                );
+                // Build the pipeline stages accumulated so far (deterministic
+                // prefilter, NLP, overlay) without the classifier and return.
+                return Some(orchestrator.build());
             };
             let max_concurrency = params
                 .classifier_max_concurrency
@@ -326,11 +808,9 @@ impl RouterConfig {
             };
             // When configured, wrap the classifier in the retry decorator
             // so parse/LLM failures re-run with escalating corrective prompts.
-            // `RetryClassifier` is a `Component`, so it pushes as
-            // `Arc<dyn Component>`; it is deliberately NOT a
-            // `StageDecisionProducer`, so the orchestrator consumes it through
-            // the `WorkOutput` serialization boundary (one serialize/deserialize
-            // per request) rather than the by-reference typed path.
+            // Both push through the orchestrator's typed producer path so the
+            // dispatch target reaches the typed store without a JSON round-trip.
+            let classifier: Arc<crate::stages::classifier::ClassifierStage> = Arc::new(stage);
             if params.classifier_retry_max > 0 {
                 let retry_max = params.classifier_retry_max as usize;
                 let retry_prompts = params.classifier_retry_prompts.clone();
@@ -341,15 +821,23 @@ impl RouterConfig {
                     retry_prompt_count = retry_prompts.len(),
                     "classifier wrapped in RetryClassifier",
                 );
-                stages.push(Arc::new(
-                    crate::stages::retry_classifier::RetryClassifier::new(
-                        Arc::new(stage),
+                let retry: Arc<crate::stages::retry_classifier::RetryClassifier> =
+                    Arc::new(crate::stages::retry_classifier::RetryClassifier::new(
+                        classifier,
                         retry_max,
                         retry_prompts,
-                    ),
-                ));
+                    ));
+                let producer_stage = Arc::clone(&retry);
+                let producer: crate::pipeline::StageProducer = Arc::new(move |ctx, prior| {
+                    producer_stage.evaluate_with_target(ctx, prior)
+                });
+                orchestrator = orchestrator.push_with_producer(retry, producer);
             } else {
-                stages.push(Arc::new(stage));
+                let producer_stage = Arc::clone(&classifier);
+                let producer: crate::pipeline::StageProducer = Arc::new(move |ctx, prior| {
+                    producer_stage.evaluate_with_target(ctx, prior)
+                });
+                orchestrator = orchestrator.push_with_producer(classifier, producer);
             }
         } else if classifier_backend.is_some() {
             tracing::warn!(
@@ -359,7 +847,7 @@ impl RouterConfig {
             );
         }
 
-        Some(PipelineOrchestrator::new(stages))
+        Some(orchestrator.build())
     }
 
     pub fn build_all_pipelines(&self) -> HashMap<String, Arc<PipelineOrchestrator>> {
@@ -370,6 +858,43 @@ impl RouterConfig {
         &self,
         classifier_backend: Option<&Arc<dyn ChatBackend>>,
     ) -> HashMap<String, Arc<PipelineOrchestrator>> {
+        self.build_all_pipelines_with_backend_and_onnx(classifier_backend, None)
+    }
+
+    /// Build every pipeline, supplying the boot ort registry to the overlay
+    /// wiring (ROADMAP_20260827_ORT §2.5).
+    pub fn build_all_pipelines_with_backend_and_onnx(
+        &self,
+        classifier_backend: Option<&Arc<dyn ChatBackend>>,
+        onnx: Option<&crate::ort::OrtRegistry>,
+    ) -> HashMap<String, Arc<PipelineOrchestrator>> {
+        self.build_all_pipelines_with_backend_onnx_and_nlp(classifier_backend, onnx, &NlpDeps::default())
+    }
+
+    /// Canonical single-point build-all (Plan B F4) — delegates to the
+    /// named-pipeline canonical above.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn build_all_pipelines_with_deps(
+        &self,
+        deps: PipelineBuildDeps<'_>,
+    ) -> HashMap<String, Arc<PipelineOrchestrator>> {
+        self.build_all_pipelines_with_backend_onnx_and_nlp(
+            deps.classifier_backend.as_ref(),
+            deps.onnx,
+            &deps.nlp_deps,
+        )
+    }
+
+    /// [`Self::build_all_pipelines_with_backend_and_onnx`] plus the NLP
+    /// dependencies (ROADMAP_20260828_ORT M1.2). Composition roots that built a
+    /// concept store before pipeline build thread it here so `nlp: true`
+    /// pipelines resolve interlingua ids end-to-end.
+    pub fn build_all_pipelines_with_backend_onnx_and_nlp(
+        &self,
+        classifier_backend: Option<&Arc<dyn ChatBackend>>,
+        onnx: Option<&crate::ort::OrtRegistry>,
+        nlp_deps: &NlpDeps,
+    ) -> HashMap<String, Arc<PipelineOrchestrator>> {
         let mut map = HashMap::new();
         let mut dropped = Vec::new();
         let pipeline_count = self.pipelines.len();
@@ -377,9 +902,14 @@ impl RouterConfig {
         tracing::info!(target: "router.config", pipeline_count = pipeline_count, mock_backend = has_mock, classifier_model = ?self.classifier_model, default_route = %self.default_route, "building pipelines");
         for name in self.pipelines.keys() {
             let backend_for_pipeline = classifier_backend.cloned();
-            if let Some(pipeline) =
-                self.build_named_pipeline_with_backend(name, backend_for_pipeline)
-            {
+            if let Some(pipeline) = self.build_named_pipeline_with_deps(
+                name,
+                PipelineBuildDeps {
+                    classifier_backend: backend_for_pipeline,
+                    onnx,
+                    nlp_deps: nlp_deps.clone(),
+                },
+            ) {
                 map.insert(name.clone(), Arc::new(pipeline));
             } else {
                 dropped.push(name.clone());
@@ -407,7 +937,7 @@ impl RouterConfig {
     }
 
     pub fn route_pipeline_names(&self, model_name: &str) -> Vec<String> {
-        self.routes
+        self.routes_view()
             .get(model_name)
             .map_or_else(|| vec!["default".into()], |r| r.pipelines.clone())
     }
@@ -445,7 +975,10 @@ fn resolve_classifier_model_key<'a>(
 /// Return the classifier model's intelligence rating, or 0 if not found.
 fn classifier_intelligence(config: &RouterConfig, params: &PipelineParams) -> u8 {
     resolve_classifier_model_key(config, params)
-        .and_then(|k| config.models.get(k))
+        .and_then(|k| {
+            let (base, _) = crate::config::split_model_key(k);
+            config.models.get(base)
+        })
         .map_or(0, |m| m.intelligence)
 }
 
@@ -581,13 +1114,29 @@ impl RouterConfig {
     /// keeps `default_dispatch_qualifier` via `from_model_entry`. When
     /// `pool_qualifier()` is `None` the id is bare `<base>` (upstream models,
     /// byte-identical to today). Declaration-only params are stripped.
+    ///
+    /// **ONNX branch (ROADMAP M2.3):** a key that resolves to the onnx registry
+    /// (the generative `OnnxRole::Llm` key, via the boot-injected
+    /// `onnx_resolver`) yields the onnx `ChatBackend`. Absent registry /
+    /// unregistered / non-`CausalLm` → `None` (fail-open). HTTP `models` keys
+    /// are unchanged.
     pub fn local_backend(&self, key: &str) -> Option<Arc<dyn ChatBackend>> {
-        let entry = self.models.get(key)?;
-        let base = entry.name.as_deref().unwrap_or(key);
-        let qualifier = entry.pool_qualifier();
+        if let Some(backend) = self.onnx_resolver.resolve(key) {
+            return Some(backend);
+        }
+        let (base, explicit) = crate::config::split_model_key(key);
+        let entry = self.models.get(base)?;
+        let base_name = entry.name.as_deref().unwrap_or(base);
+        // A qualified key (`base:qualifier`) pins the named instance/group
+        // explicitly; a bare key uses the entry's internal pool qualifier
+        // (`latest` normalizes to the pool, i.e. the bare-key behavior).
+        let qualifier = explicit
+            .filter(|q| *q != "latest")
+            .map(String::from)
+            .or_else(|| entry.pool_qualifier());
         let model = match &qualifier {
-            Some(qualifier) => format!("{base}:{qualifier}"),
-            None => base.to_string(),
+            Some(qualifier) => format!("{base_name}:{qualifier}"),
+            None => base_name.to_string(),
         };
         // The pool is an instance/group of the model, so its sampling
         // params (e.g. the swarm work pool's temperature) reach the body.
@@ -602,6 +1151,36 @@ impl RouterConfig {
             .maybe_extra_body_params(params)
             .build();
         Some(Arc::new(LlmClient::with_config(llm_config)))
+    }
+
+    /// The onnx LLM role's registry key when the generative role is configured
+    /// (`config.onnx.llm`). This is the **default wiring point** (ROADMAP M2.3):
+    /// the fallback backend for the LLM annotation rung, the review worker,
+    /// the ledger summarizer/tier worker, and the chart selector model when
+    /// their respective explicit keys are absent. `None` when no generative
+    /// onnx model is declared.
+    pub fn onnx_llm_key(&self) -> Option<String> {
+        self.onnx.as_ref()?.llm.as_ref()?;
+        Some(fluent_onnx::OnnxRole::Llm.registry_key().to_string())
+    }
+
+    /// The onnx generative `ChatBackend` (the `OnnxRole::Llm` session) via the
+    /// single factory, for the default-wiring call sites. `None` when no onnx
+    /// LLM is configured / not registered as a `CausalLm` (fail-open).
+    pub fn onnx_llm_backend(&self) -> Option<Arc<dyn ChatBackend>> {
+        let key = fluent_onnx::OnnxRole::Llm.registry_key();
+        self.onnx_resolver.resolve(key)
+    }
+
+    /// Install the onnx `ChatBackend` resolver (ROADMAP M2.3). The composition
+    /// root calls this once at boot, after building the onnx registry, so
+    /// `local_backend` resolves the generative `onnx/llm` key to the onnx
+    /// backend. `f` resolves a key to an onnx backend (or `None` for HTTP keys).
+    pub fn install_onnx_resolver<F>(&mut self, f: F)
+    where
+        F: Fn(&str, Option<&str>) -> Option<Arc<dyn ChatBackend>> + Send + Sync + 'static,
+    {
+        self.onnx_resolver.install(f);
     }
 
     /// Build a `ChatBackend` for a specific named inference point
@@ -621,14 +1200,23 @@ impl RouterConfig {
         key: &str,
         instance_or_group: &str,
     ) -> Option<Arc<dyn ChatBackend>> {
-        let entry = self.models.get(key)?;
+        // ROADMAP M6 onnx branch: a key that resolves to an onnx role (via the
+        // boot-injected resolver) builds a context-bound backend for the named
+        // context — the onnx analogue of `<base>:<instance>` dispatch. The
+        // context is created on demand and reused (idempotent, like
+        // `ensure_instance`). `None` for an HTTP/unknown key.
+        if let Some(backend) = self.onnx_resolver.resolve_instance(key, instance_or_group) {
+            return Some(backend);
+        }
+        let (base, _) = crate::config::split_model_key(key);
+        let entry = self.models.get(base)?;
         // Resolve the named profile; an unknown instance name -> None.
         entry
             .instance_profiles()
             .into_iter()
             .find(|p| p.name.as_deref() == Some(instance_or_group))?;
-        let base = entry.name.as_deref().unwrap_or(key);
-        let model = format!("{base}:{instance_or_group}");
+        let base_name = entry.name.as_deref().unwrap_or(base);
+        let model = format!("{base_name}:{instance_or_group}");
         let params = entry
             .instance_params_for(instance_or_group)
             .unwrap_or_else(|| strip_declaration_params(serde_json::Value::Null));
@@ -645,15 +1233,14 @@ impl RouterConfig {
     /// Summarizer's only construction site. Resolves the ledger model key
     /// (the `ledger` section's `model`, else the classifier model key), then
     /// targets the named `ledger` instance via `local_backend_for_instance`.
-    /// Returns `None` when no ledger section is configured, no model key
-    /// resolves, or the `ledger` instance is unknown.
+    /// When no llama `ledger` instance resolves (or no explicit key is set),
+    /// it falls back to the onnx LLM backend (ROADMAP M2.6) — the generative
+    /// onnx model is the default enrichment backend, config-driven via
+    /// `config.onnx.llm`. Returns `None` when no backend resolves.
     pub fn summarizer_for_ledger(&self) -> Option<crate::summarization::Summarizer> {
         let ledger = self.ledger.as_ref()?;
-        let key = ledger
-            .model
-            .as_deref()
-            .or(self.classifier_model.as_deref())?;
-        let backend = self.local_backend_for_instance(key, "ledger")?;
+        let backend = self
+            .ledger_enrichment_backend(ledger.model.as_deref().or(self.classifier_model.as_deref()))?;
         Some(crate::summarization::Summarizer::new(
             backend,
             ledger.max_summary_tokens,
@@ -664,9 +1251,9 @@ impl RouterConfig {
     /// construction site. Reuses the same `LlmClient` factory and the same
     /// `<base>:ledger` named-instance target as `summarizer_for_ledger` (no
     /// second HTTP client). `tier_model` (if given) wins over the ledger
-    /// section's `model`, then the classifier model key. Returns `None` when no
-    /// ledger section is configured, no model key resolves, or the `ledger`
-    /// instance is unknown.
+    /// section's `model`, then the classifier model key. Falls back to the onnx
+    /// LLM backend (ROADMAP M2.6) when no llama `ledger` instance resolves.
+    /// Returns `None` when no backend resolves.
     pub fn ledger_tier_backend(
         &self,
         tier_model: Option<&str>,
@@ -674,8 +1261,24 @@ impl RouterConfig {
         let ledger = self.ledger.as_ref()?;
         let key = tier_model
             .or(ledger.model.as_deref())
-            .or(self.classifier_model.as_deref())?;
-        self.local_backend_for_instance(key, "ledger")
+            .or(self.classifier_model.as_deref());
+        self.ledger_enrichment_backend(key)
+    }
+
+    /// Resolve a ledger enrichment backend (ROADMAP M2.6): the explicit key's
+    /// `<base>:ledger` named instance when one exists, else the onnx LLM
+    /// backend (the default enrichment model, config-driven). `None` when
+    /// neither resolves.
+    fn ledger_enrichment_backend(
+        &self,
+        explicit: Option<&str>,
+    ) -> Option<Arc<dyn ChatBackend>> {
+        if let Some(key) = explicit {
+            if let Some(backend) = self.local_backend_for_instance(key, "ledger") {
+                return Some(backend);
+            }
+        }
+        self.onnx_llm_backend()
     }
 
     /// Build the tier worker's `TierConfig` from the `ledger` section.
@@ -796,598 +1399,6 @@ fn frontier_api_client(shared: &reqwest::Client, api_key_env: Option<&str>) -> r
         .build()
         .unwrap_or_else(|_| shared.clone())
 }
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Mutex;
-
-    use common_core::sync::lock;
-
-    use crate::charts::binding::Entity;
-    use crate::charts::{ChartDef, ChartError};
-    use crate::test_stubs::StubChatBackend;
-    use crate::test_support::capture_logs;
-    use fluent_concurrency::pool::Limiter;
-
-    fn config_with_unresolvable_classifier() -> RouterConfig {
-        // `classifier` is enabled but no `classifier_model`, no root
-        // `classifier_model`, and no `fast` model group resolves a key.
-        serde_json::from_str(
-            r#"{
-                "pipelines": {
-                    "default": {"deterministic_prefilter": true, "classifier": true}
-                },
-                "models": {},
-                "model_groups": {},
-                "routes": {}
-            }"#,
-        )
-        .expect("valid config")
-    }
-
-    #[test]
-    fn unresolvable_classifier_drops_pipeline_with_warning() {
-        let config = config_with_unresolvable_classifier();
-        let (map, logs) = capture_logs(|| config.build_all_pipelines());
-        let joined = logs.join("\n");
-
-        assert!(map.is_empty(), "no pipeline should build");
-        assert!(
-            joined.contains("pipeline not built"),
-            "missing per-pipeline warning, logs:\n{joined}"
-        );
-        assert!(
-            joined.contains("\"default\""),
-            "warning must name the dropped pipeline, logs:\n{joined}"
-        );
-        assert!(
-            joined.contains("configured_classifier") && joined.contains("resolved_classifier"),
-            "warning must log resolved-vs-configured classifier keys, logs:\n{joined}"
-        );
-        assert!(
-            joined.contains("some configured pipelines were not built"),
-            "missing aggregate error, logs:\n{joined}"
-        );
-    }
-
-    #[test]
-    fn resolvable_classifier_builds_pipeline_without_warnings() {
-        let config: RouterConfig = serde_json::from_str(
-            r#"{
-                "pipelines": {"default": {"classifier": true}},
-                "models": {"fast": {"endpoint": "http://upstream.test:8080/v1/chat/completions", "name": "fast", "intelligence": 1, "cost_input": 0.0, "cost_output": 0.0, "cost_cached_read": 0.0, "speed": 10}},
-                "model_groups": {"fast": ["fast"]}
-            }"#,
-        )
-        .expect("valid config");
-        let (map, logs) = capture_logs(|| config.build_all_pipelines());
-        let joined = logs.join("\n");
-
-        assert_eq!(map.len(), 1, "pipeline should build");
-        assert!(
-            !joined.contains("pipeline not built"),
-            "no drop warning expected, logs:\n{joined}"
-        );
-        assert!(
-            !joined.contains("some configured pipelines were not built"),
-            "no aggregate error expected, logs:\n{joined}"
-        );
-    }
-
-    #[test]
-    fn local_backend_uses_pool_qualifier_while_from_model_entry_keeps_default() {
-        // router-internal work (local_backend) targets the pool group
-        // (swarm), while the client-facing canonical target builder
-        // (from_model_entry) still resolves the fork's default instance
-        // (ledger). Two intents, two answers on the same entry.
-        let config: RouterConfig = serde_json::from_value(serde_json::json!({
-            "models": {
-                "swarm": {
-                    "endpoint": "http://x/v1/chat/completions",
-                    "name": "abiray/lfm2.5-2.6b-heretic-abliterated",
-                    "intelligence": 2,
-                    "cost_input": 1.0, "cost_output": 6.0, "cost_cached_read": 0.4,
-                    "speed": 8,
-                    "instances": {
-                        "swarm": { "count": 3, "group": "swarm", "num_ctx": 16384 },
-                        "ledger": { "num_ctx": 131072, "pinned": true, "default": true },
-                        "scratch": { "num_ctx": 131072, "sleep_idle_seconds": 30 }
-                    }
-                }
-            }
-        })).expect("valid config");
-
-        // local_backend builds (is_some) and routes to the pool group.
-        assert!(config.local_backend("swarm").is_some());
-        let entry = config.models.get("swarm").expect("swarm");
-        assert_eq!(entry.pool_qualifier().as_deref(), Some("swarm"));
-        assert_eq!(entry.default_dispatch_qualifier().as_deref(), Some("ledger"));
-
-        // The canonical target builder keeps bare-base default dispatch: :ledger.
-        let rt = crate::pipeline::RoutingTarget::from_model_entry("swarm", entry);
-        assert_eq!(
-            rt.model,
-            "abiray/lfm2.5-2.6b-heretic-abliterated:ledger",
-            "client-facing default dispatch is unchanged (goldens preserved)"
-        );
-    }
-
-    #[test]
-    fn summarizer_for_ledger_builds_when_ledger_section_present() {
-        // The ledger Summarizer's DIP construction site. With a `ledger`
-        // section and a swarm entry declaring a `ledger` instance, the backend
-        // builds; without a ledger section it is `None`.
-        let config: RouterConfig = serde_json::from_value(serde_json::json!({
-            "classifier_model": "swarm",
-            "ledger": { "model": "swarm", "max_summary_tokens": 300 },
-            "models": {
-                "swarm": {
-                    "endpoint": "http://x/v1/chat/completions",
-                    "name": "abiray/lfm2.5-2.6b-heretic-abliterated",
-                    "intelligence": 2,
-                    "cost_input": 1.0, "cost_output": 6.0, "cost_cached_read": 0.4,
-                    "speed": 8,
-                    "instances": {
-                        "ledger": { "num_ctx": 131072, "pinned": true, "default": true },
-                        "swarm": { "count": 3, "group": "swarm", "num_ctx": 16384 }
-                    }
-                }
-            }
-        })).expect("valid config");
-
-        let summarizer = config.summarizer_for_ledger();
-        assert!(summarizer.is_some(), "ledger section + ledger instance -> Some");
-    }
-
-    #[test]
-    fn ledger_tier_backend_builds_when_ledger_section_present() {
-        // The tier worker's DIP backend targets `<base>:ledger` via the
-        // single LlmClient factory; tier_model wins over ledger.model.
-        let config: RouterConfig = serde_json::from_value(serde_json::json!({
-            "classifier_model": "swarm",
-            "ledger": {
-                "model": "swarm",
-                "tier_model": "qwen3.5-4b",
-                "background_tiering": true
-            },
-            "models": {
-                "swarm": {
-                    "endpoint": "http://x/v1/chat/completions",
-                    "name": "swarm", "intelligence": 2,
-                    "cost_input": 1.0, "cost_output": 6.0, "cost_cached_read": 0.4, "speed": 8,
-                    "instances": {
-                        "ledger": { "num_ctx": 131072, "pinned": true, "default": true },
-                        "swarm": { "count": 3, "group": "swarm", "num_ctx": 16384 }
-                    }
-                },
-                "qwen3.5-4b": {
-                    "endpoint": "http://y/v1/chat/completions",
-                    "name": "qwen3.5-4b", "intelligence": 5,
-                    "cost_input": 2.0, "cost_output": 2.0, "cost_cached_read": 0.8, "speed": 4,
-                    "instances": {
-                        "ledger": { "num_ctx": 131072, "pinned": true, "default": true }
-                    }
-                }
-            }
-        })).expect("valid config");
-
-        // tier_model wins over ledger.model.
-        assert!(config.ledger_tier_backend(Some("qwen3.5-4b")).is_some());
-        // Falls back to ledger.model when tier_model is absent.
-        assert!(config.ledger_tier_backend(None).is_some());
-    }
-
-    #[test]
-    fn ledger_tier_backend_none_without_ledger_section() {
-        let config: RouterConfig = serde_json::from_value(serde_json::json!({
-            "classifier_model": "swarm",
-            "models": {
-                "swarm": {
-                    "endpoint": "http://x/v1/chat/completions",
-                    "name": "swarm", "intelligence": 2,
-                    "cost_input": 1.0, "cost_output": 6.0, "cost_cached_read": 0.4, "speed": 8
-                }
-            }
-        })).expect("valid config");
-        assert!(
-            config.ledger_tier_backend(None).is_none(),
-            "no ledger section -> no tier backend"
-        );
-    }
-
-    #[test]
-    fn summarizer_for_ledger_none_without_ledger_section() {
-        let config: RouterConfig = serde_json::from_value(serde_json::json!({
-            "classifier_model": "swarm",
-            "models": {
-                "swarm": {
-                    "endpoint": "http://x/v1/chat/completions",
-                    "name": "swarm",
-                    "intelligence": 2,
-                    "cost_input": 1.0, "cost_output": 6.0, "cost_cached_read": 0.4,
-                    "speed": 8
-                }
-            }
-        })).expect("valid config");
-        assert!(
-            config.summarizer_for_ledger().is_none(),
-            "no ledger section -> no summarizer"
-        );
-    }
-
-    #[test]
-    fn local_backend_for_instance_builds_ledger_and_scratch_backends() {
-        // The ledger summarizer and on-demand scratch route must dispatch
-        // to their named instances. `local_backend_for_instance` builds an
-        // `LlmClient` for the `models` key qualified to `<base>:<instance>`,
-        // and `RoutingTarget::from_model_entry_instance` mirrors the model id.
-        let config: RouterConfig = serde_json::from_value(serde_json::json!({
-            "models": {
-                "swarm": {
-                    "endpoint": "http://x/v1/chat/completions",
-                    "name": "abiray/lfm2.5-2.6b-heretic-abliterated",
-                    "intelligence": 2,
-                    "cost_input": 1.0, "cost_output": 6.0, "cost_cached_read": 0.4,
-                    "speed": 8,
-                    "instances": {
-                        "ledger": { "num_ctx": 131072, "pinned": true, "default": true },
-                        "scratch": { "num_ctx": 131072, "sleep_idle_seconds": 30 }
-                    }
-                }
-            }
-        })).expect("valid config");
-
-        // The named-instance backends build (single LlmClient factory).
-        assert!(config.local_backend_for_instance("swarm", "ledger").is_some());
-        assert!(config.local_backend_for_instance("swarm", "scratch").is_some());
-
-        // The canonical target builder confirms the exact model id each point
-        // resolves to on the wire.
-        let entry = config.models.get("swarm").expect("swarm");
-        let ledger_rt =
-            crate::pipeline::RoutingTarget::from_model_entry_instance("swarm", entry, "ledger");
-        assert_eq!(
-            ledger_rt.model,
-            "abiray/lfm2.5-2.6b-heretic-abliterated:ledger"
-        );
-        assert_eq!(ledger_rt.instance.as_deref(), Some("ledger"));
-        let scratch_rt =
-            crate::pipeline::RoutingTarget::from_model_entry_instance("swarm", entry, "scratch");
-        assert_eq!(
-            scratch_rt.model,
-            "abiray/lfm2.5-2.6b-heretic-abliterated:scratch"
-        );
-        assert_eq!(scratch_rt.instance.as_deref(), Some("scratch"));
-    }
-
-    #[test]
-    fn local_backend_for_instance_merges_profile_params_over_entry_params() {
-        // Scratch's profile `params` (temperature 0.4) overlay the entry
-        // `params` (repeat_penalty 1.05); declaration-only keys are stripped so
-        // the merged body carries both sampling params and nothing else.
-        let config: RouterConfig = serde_json::from_value(serde_json::json!({
-            "models": {
-                "swarm": {
-                    "endpoint": "http://x/v1/chat/completions",
-                    "name": "abiray/lfm2.5-2.6b-heretic-abliterated",
-                    "intelligence": 2,
-                    "cost_input": 1.0, "cost_output": 6.0, "cost_cached_read": 0.4,
-                    "speed": 8,
-                    "params": { "repeat_penalty": 1.05, "num_ctx": 0 },
-                    "instances": {
-                        "scratch": {
-                            "num_ctx": 131072,
-                            "sleep_idle_seconds": 30,
-                            "params": { "temperature": 0.4, "num_ctx": 99999 }
-                        }
-                    }
-                }
-            }
-        })).expect("valid config");
-
-        let merged = config
-            .models
-            .get("swarm")
-            .unwrap()
-            .instance_params_for("scratch")
-            .expect("scratch profile resolves");
-        let stripped = strip_declaration_params(merged);
-        let obj = stripped.as_object().expect("merged params object");
-        // Profile wins for temperature; entry key preserved.
-        assert_eq!(obj["temperature"].as_f64(), Some(0.4));
-        assert_eq!(obj["repeat_penalty"].as_f64(), Some(1.05));
-        // Declaration-only keys are stripped from the merged object.
-        assert!(obj.get("num_ctx").is_none(), "declaration key stripped");
-        assert!(obj.get("sleep_idle_seconds").is_none(), "declaration key stripped");
-    }
-
-    #[test]
-    fn local_backend_for_instance_none_for_unknown_instance() {
-        let config: RouterConfig = serde_json::from_value(serde_json::json!({
-            "models": {
-                "swarm": {
-                    "endpoint": "http://x/v1/chat/completions",
-                    "name": "swarm",
-                    "intelligence": 2,
-                    "cost_input": 1.0, "cost_output": 6.0, "cost_cached_read": 0.4,
-                    "speed": 8,
-                    "instances": { "scratch": { "num_ctx": 131072 } }
-                }
-            }
-        })).expect("valid config");
-        // A named instance that does not exist -> None (no fabricated lookup).
-        assert!(config.local_backend_for_instance("swarm", "ghost").is_none());
-        // An unknown model key -> None.
-        assert!(config.local_backend_for_instance("missing", "scratch").is_none());
-    }
-
-    #[test]
-    fn local_backend_for_instance_entry_params_unchanged_without_profile_params() {
-        // No profile `params` -> the merged body is exactly the entry params
-        // (sampling params preserved, declaration keys stripped).
-        let config: RouterConfig = serde_json::from_value(serde_json::json!({
-            "models": {
-                "swarm": {
-                    "endpoint": "http://x/v1/chat/completions",
-                    "name": "swarm",
-                    "intelligence": 2,
-                    "cost_input": 1.0, "cost_output": 6.0, "cost_cached_read": 0.4,
-                    "speed": 8,
-                    "params": { "repeat_penalty": 1.05, "num_ctx": 0 },
-                    "instances": { "scratch": { "num_ctx": 131072 } }
-                }
-            }
-        })).expect("valid config");
-        let merged = config
-            .models
-            .get("swarm")
-            .unwrap()
-            .instance_params_for("scratch")
-            .expect("scratch profile resolves");
-        let stripped = strip_declaration_params(merged);
-        let obj = stripped.as_object().expect("merged params object");
-        assert_eq!(obj["repeat_penalty"].as_f64(), Some(1.05));
-        assert!(obj.get("num_ctx").is_none(), "declaration key stripped");
-        assert_eq!(obj.len(), 1, "no profile params to add");
-        // The backend itself still builds for the valid named instance.
-        assert!(config.local_backend_for_instance("swarm", "scratch").is_some());
-    }
-
-    #[test]
-    fn target_backends_builds_every_group_member_key() {
-        let config: RouterConfig = serde_json::from_str(
-            r#"{
-                "models": {
-                    "swarm": {"endpoint": "http://a/v1/chat/completions", "name": "swarm", "intelligence": 2, "cost_input": 1.0, "cost_output": 1.0, "cost_cached_read": 0.4, "speed": 8},
-                    "qwen3.6-27b": {"endpoint": "http://b/v1/chat/completions", "name": "qwen3.6-27b", "intelligence": 6, "cost_input": 3.0, "cost_output": 3.0, "cost_cached_read": 1.0, "speed": 4},
-                    "unused": {"endpoint": "http://c/v1/chat/completions", "name": "unused", "intelligence": 9, "cost_input": 9.0, "cost_output": 9.0, "cost_cached_read": 3.0, "speed": 2}
-                },
-                "model_groups": {
-                    "default": ["swarm", "qwen3.6-27b"],
-                    "translation": {"models": ["qwen3.6-27b"]}
-                }
-            }"#,
-        )
-        .expect("valid config");
-
-        let backends = config.target_backends();
-        // Exactly the model keys referenced by any model_groups member are
-        // built (deduplicated across groups) - `unused` is not a group member.
-        let mut keys: Vec<&str> = backends.keys().map(String::as_str).collect();
-        keys.sort_unstable();
-        assert_eq!(keys, vec!["qwen3.6-27b", "swarm"]);
-    }
-
-    #[test]
-    fn builder_threads_target_match_timeout_ms_into_matcher() {
-        // `target_match_timeout_ms` must flow from PipelineParams into the
-        // TargetMatcher's per-assessment budget. The builder logs the
-        // value it passes on the self-assess path; assert it is the configured
-        // knob, not the hardcoded constant.
-        let config: RouterConfig = serde_json::from_str(
-            r#"{
-                "pipelines": {
-                    "default": {
-                        "classifier": true,
-                        "classifier_model": "fast",
-                        "target_match": "self_assess",
-                        "target_match_timeout_ms": 4321
-                    }
-                },
-                "models": {
-                    "fast": {"endpoint": "http://a/v1/chat/completions", "name": "fast", "intelligence": 1, "cost_input": 1.0, "cost_output": 1.0, "cost_cached_read": 0.4, "speed": 10},
-                    "swarm": {"endpoint": "http://b/v1/chat/completions", "name": "swarm", "intelligence": 2, "cost_input": 1.0, "cost_output": 1.0, "cost_cached_read": 0.4, "speed": 9},
-                    "qwen3.6-27b": {"endpoint": "http://c/v1/chat/completions", "name": "qwen3.6-27b", "intelligence": 6, "cost_input": 5.0, "cost_output": 5.0, "cost_cached_read": 2.0, "speed": 4}
-                },
-                "model_groups": {
-                    "default": ["swarm", "qwen3.6-27b"]
-                },
-                "routes": {
-                    "code": {"group": "default", "pipelines": ["default"]}
-                },
-                "default_route": "fast"
-            }"#,
-        )
-        .expect("valid config");
-        let backend: Arc<dyn ChatBackend> = Arc::new(StubChatBackend::always("{}"));
-
-        let (pipeline, logs) = capture_logs(|| {
-            config
-                .build_named_pipeline_with_backend("default", Some(Arc::clone(&backend)))
-                .expect("pipeline builds")
-        });
-        let _ = pipeline;
-        let joined = logs.join("\n");
-        assert!(
-            joined.contains("target_match_timeout_ms=4321"),
-            "builder must thread the configured per-assessment timeout, got:\n{joined}"
-        );
-    }
-
-    /// Records every system prompt it receives, and returns a canned response.
-    struct RecordingBackend {
-        prompts: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl ChatBackend for RecordingBackend {
-        fn chat_complete(
-            &self,
-            messages: &[fluent_llm::ChatMessage],
-        ) -> Result<String, fluent_llm::LlmError> {
-            lock(&self.prompts).extend(
-                messages
-                    .iter()
-                    .filter(|m| m.role == "system")
-                    .map(|m| m.content.clone()),
-            );
-            Ok(r#"{"ok": true}"#.to_string())
-        }
-    }
-
-    fn triage_chart() -> ChartDef {
-        serde_json::from_str(
-            r#"{
-                "name": "bug_triage",
-                "description": "triage",
-                "schema_version": 1,
-                "author_model": "human",
-                "targets": [
-                    {
-                        "name": "reproduce",
-                        "provides": ["repro_plan"],
-                        "depends": [],
-                        "template": "Plan repro for: {{ request }}",
-                        "essential": true
-                    },
-                    {
-                        "name": "root_cause",
-                        "provides": ["root_cause"],
-                        "depends": [
-                            { "kind": "capability", "name": "repro_plan" },
-                            { "kind": "entity_match", "name": "report",
-                              "description": "the report",
-                              "predicate": {
-                                "fields": [
-                                    { "path": "title", "ty": "string", "required": true }
-                                ]
-                              },
-                              "required": true }
-                        ],
-                        "template": "Prior plan: {{ upstream.reproduce.output }}\nReport: {% for e in deps.report %}{{ e.value.title }}{% endfor %}\nCause of: {{ request }}",
-                        "essential": true
-                    },
-                    {
-                        "name": "fix_plan",
-                        "provides": ["fix_plan"],
-                        "depends": [
-                            { "kind": "capability", "name": "root_cause" }
-                        ],
-                        "template": "Fix for: {{ request }}",
-                        "essential": true
-                    }
-                ]
-            }"#,
-        )
-        .expect("triage chart JSON")
-    }
-
-    fn request_ctx(text: &str, entities: &[Entity]) -> fluent_wvr::WorkContext {
-        let ctx_json = serde_json::json!({
-            "model": "test",
-            "messages": [{"role": "user", "content": text}]
-        });
-        let mut ctx = fluent_wvr::WorkContext::default();
-        ctx.set_structured("request", &ctx_json);
-        if !entities.is_empty() {
-            ctx.set_structured(crate::charts::binding::ENTITIES_META_KEY, &entities);
-        }
-        ctx
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn chart_executes_in_topo_order_with_preamble_and_prior_output() {
-        let entity = Entity {
-            id: "issue-42".into(),
-            kind: "report".into(),
-            value: serde_json::json!({"title": "Segfault on startup"}),
-        };
-
-        let prompts = Arc::new(Mutex::new(Vec::<String>::new()));
-        let backend: Arc<dyn ChatBackend> = Arc::new(RecordingBackend {
-            prompts: prompts.clone(),
-        });
-        let limiter = Arc::new(Limiter::new(4));
-        let plan = crate::charts::execute::ChartExecutionPlan::compile(
-            &triage_chart(),
-            std::slice::from_ref(&entity),
-            &backend,
-            &limiter,
-        )
-        .expect("chart compiles into an executable plan");
-
-        let ctx = request_ctx("app crashes on startup", std::slice::from_ref(&entity));
-        let opts = crate::charts::execute::ChartExecOptions {
-            runtime: fluent_concurrency::tokio_runtime(),
-            ..Default::default()
-        };
-        let summary = plan
-            .execute(&ctx, &opts)
-            .await
-            .expect("chart executes under SupervisedBatch supervision");
-
-        // Topo order: reproduce - root_cause - fix_plan (3 completed targets).
-        assert_eq!(summary.completed.len(), 3);
-        assert!(summary.failed.is_empty());
-        assert!(summary.accepted);
-        let reasons: Vec<&str> = summary
-            .completed
-            .iter()
-            .map(|d| d.reason.as_str())
-            .collect();
-        assert_eq!(
-            reasons,
-            vec![
-                "chart target 'reproduce' completed",
-                "chart target 'root_cause' completed",
-                "chart target 'fix_plan' completed",
-            ]
-        );
-
-        // Every stage made one LLM call (3 system prompts recorded).
-        let recorded = prompts.lock().unwrap().clone();
-        assert_eq!(recorded.len(), 3, "one LLM call per chart target");
-
-        // reproduce's prompt carries the request.
-        assert!(recorded[0].contains("app crashes on startup"));
-        // root_cause's prompt carries the entity preamble AND the prior output.
-        assert!(
-            recorded[1].contains("Segfault on startup"),
-            "root_cause prompt must include the bound entity preamble: {}",
-            recorded[1]
-        );
-        assert!(
-            recorded[1].contains(r#"{"ok": true}"#),
-            "root_cause prompt must include the prior target output: {}",
-            recorded[1]
-        );
-        // fix_plan's prompt carries the request.
-        assert!(recorded[2].contains("app crashes on startup"));
-    }
-
-    #[test]
-    fn chart_compile_rejects_unbound_chart_at_build_time() {
-        let backend: Arc<dyn ChatBackend> = Arc::new(StubChatBackend::always("{}"));
-        let limiter = Arc::new(Limiter::new(4));
-        // No entities - root_cause's required `report` dep is unmatched.
-        let Err(err) =
-            crate::charts::compile::compile_chart_stages(&triage_chart(), &[], &backend, &limiter)
-        else {
-            panic!("expected compile error for unbound chart")
-        };
-        assert!(
-            matches!(&err, ChartError::Compile { reason } if reason.contains("not fully bound")),
-            "expected compile error, got: {err}"
-        );
-    }
-}
+#[path = "../../tests/config_builder.rs"]
+mod tests;

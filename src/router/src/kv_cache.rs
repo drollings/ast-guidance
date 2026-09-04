@@ -91,6 +91,8 @@ pub struct KvSnapshot {
     pub model_quant: Option<String>,
     /// Base-model hash, when recorded. `None` where unknowable.
     pub base_model_hash: Option<String>,
+    /// Monotonic per-session turn sequence (M3). `None` for legacy rows.
+    pub turn_seq: Option<u64>,
 }
 
 /// Hot tier: in-process, RAM-resident LRU cache of recently-used snapshot
@@ -185,6 +187,29 @@ impl HotSnapshotIndex {
 /// `<slot_save_path>/<model_key>/` layout. The fork owns the bytes; this tier
 /// only records which snapshot a session's KV was saved under so a rewind can
 /// switch it back into a slot.
+///
+/// # Eviction story (M10)
+///
+/// The workspace has one documented eviction story with three distinct,
+/// deliberately-ununified pieces:
+///
+/// - **Hot tier** (`HotSnapshotIndex`): shared `common_core::cache::LoadCache`
+///   (in-process LRU, capacity-bounded).
+/// - **Cold tier** (this type): a named, in-memory TTL predicate sweep
+///   (`evict` retains entries with `age < ttl_secs`). It is *not* delegated
+///   to `db::cache::TtlCache`: that type is SQLite-backed with string
+///   key→payload rows and `max_entries` LRU, while this tier holds structured
+///   `KvSnapshot` values keyed by `(model, adapter, session)` with no entry
+///   cap and fork-layout path derivation. Delegating would change durability,
+///   key/value shapes, and capacity behavior. The one-second boundary
+///   difference (`age == ttl` evicts here; `TtlCache::get` keeps while
+///   `now <= ts + ttl`) is preserved verbatim — unifying it would be a
+///   behavior change.
+/// - **Residency ordering** (`instances::pool`): shared
+///   `common_core::cache::{eviction_order, evict_until_fit}` (footprint ×
+///   coldness, largest-coldest first). The cold-tier TTL sweep is a
+///   *predicate* filter, not a byte-budget eviction, so it intentionally does
+///   not use that engine (see `common_core::cache` docs).
 pub struct ColdSnapshotIndex {
     /// The fork's `--slot-save-path`. When `None`, snapshots are recorded as
     /// metadata only (no server-owned store) - never a crash.
@@ -198,11 +223,16 @@ impl ColdSnapshotIndex {
     /// Creates a metadata index rooted at `slot_save_path` (the fork's
     /// `--slot-save-path`). `max_mb` is informational; the fork owns the bytes.
     /// `ttl_secs` governs metadata eviction.
+    ///
+    /// M10.2: the former `_eviction: EvictionPolicy` parameter was removed —
+    /// it was accepted and dropped at every call site (always `Lru`), so the
+    /// cold tier never honored it. Eviction here is always the TTL predicate
+    /// sweep in [`ColdSnapshotIndex::evict`]; byte-budget ordering lives in
+    /// `common_core::cache` and is composed by `instances::pool`, not here.
     pub fn new(
         slot_save_path: impl Into<PathBuf>,
         _max_mb: usize,
         ttl_secs: u64,
-        _eviction: crate::config::EvictionPolicy,
     ) -> Self {
         Self {
             slot_save_path: Some(slot_save_path.into()),
@@ -284,6 +314,23 @@ impl ColdSnapshotIndex {
     pub fn remove(&self, model: &str, adapter: Option<&str>, session_id: &str) {
         let key = (model.to_string(), adapter.map(String::from), session_id.to_string());
         lock(&self.entries).remove(&key);
+    }
+
+    /// Max `turn_seq` for `session_id` across all entries (M3).
+    pub fn seed_seq_for(&self, session_id: &str) -> u64 {
+        lock(&self.entries)
+            .values()
+            .filter(|s| s.session_id == session_id)
+            .filter_map(|s| s.turn_seq)
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+impl SnapshotStore {
+    /// Max `turn_seq` for `session_id` (M3).
+    pub fn seed_seq_for(&self, session_id: &str) -> u64 {
+        self.cold.seed_seq_for(session_id)
     }
 }
 
@@ -381,6 +428,18 @@ impl SnapshotStore {
         name: &str,
         instance: &str,
     ) -> Result<(), KvCacheError> {
+        self.save_snapshot_with_seq(model, adapter, session_id, name, instance, None)
+    }
+
+    pub fn save_snapshot_with_seq(
+        &self,
+        model: &str,
+        adapter: Option<&str>,
+        session_id: &str,
+        name: &str,
+        instance: &str,
+        turn_seq: Option<u64>,
+    ) -> Result<(), KvCacheError> {
         let Some(fork) = &self.fork else {
             return Ok(()); // no fork handle: metadata-only no-op (today's behavior)
         };
@@ -418,6 +477,7 @@ impl SnapshotStore {
             llama_cpp_version: None,
             model_quant: None,
             base_model_hash: None,
+            turn_seq,
         };
         self.store(snapshot)
     }
@@ -456,6 +516,7 @@ impl SnapshotStore {
                     llama_cpp_version: None,
                     model_quant: None,
                     base_model_hash: None,
+                    turn_seq: None,
                 })
                 .collect(),
             Err(e) => {
@@ -507,312 +568,5 @@ impl SnapshotStore {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_snapshot(session_id: &str) -> KvSnapshot {
-        KvSnapshot {
-            model: "test-model".into(),
-            adapter: None,
-            session_id: session_id.into(),
-            snapshot_name: "default".into(),
-            instance: None,
-            file_path: PathBuf::new(),
-            token_count: Some(100),
-            created_at: now_secs(),
-            last_used_at: now_secs(),
-            llama_cpp_version: Some("0.1.0".into()),
-            model_quant: None,
-            base_model_hash: Some("abc123".into()),
-        }
-    }
-
-    #[test]
-    fn test_hot_cache_put_get() {
-        let cache = HotSnapshotIndex::new(10, 1024);
-        let snap = test_snapshot("sess-1");
-        cache.put(snap.clone());
-
-        let retrieved = cache.get("test-model", None, "sess-1").unwrap();
-        assert_eq!(retrieved.session_id, "sess-1");
-        assert_eq!(retrieved.token_count, Some(100));
-    }
-
-    #[test]
-    fn test_hot_cache_miss() {
-        let cache = HotSnapshotIndex::new(10, 1024);
-        assert!(cache.get("nonexistent", None, "sess-x").is_none());
-    }
-
-    #[test]
-    fn test_hot_cache_remove() {
-        let cache = HotSnapshotIndex::new(10, 1024);
-        cache.put(test_snapshot("sess-1"));
-        assert_eq!(cache.len(), 1);
-
-        cache.remove("test-model", None, "sess-1");
-        assert_eq!(cache.len(), 0);
-    }
-
-    #[test]
-    fn test_hot_cache_lru_eviction() {
-        let cache = HotSnapshotIndex::new(3, 1024);
-
-        for i in 0..5 {
-            cache.put(KvSnapshot {
-                model: "m".into(),
-                adapter: None,
-                session_id: format!("sess-{i}"),
-                snapshot_name: "default".into(),
-                instance: None,
-                file_path: PathBuf::new(),
-                token_count: Some(1),
-                created_at: now_secs(),
-                last_used_at: now_secs(),
-                llama_cpp_version: Some("0.1".into()),
-                model_quant: None,
-                base_model_hash: Some("hash".into()),
-            });
-        }
-
-        assert_eq!(cache.len(), 3);
-        assert!(cache.get("m", None, "sess-0").is_none());
-        assert!(cache.get("m", None, "sess-1").is_none());
-        assert!(cache.get("m", None, "sess-2").is_some());
-    }
-
-    #[test]
-    fn model_key_sanitizes_slashes_and_colons() {
-        assert_eq!(model_key("abiray/lfm2.5"), "abiray_lfm2.5");
-        assert_eq!(model_key("org/model:q4"), "org_model_q4");
-    }
-
-    #[test]
-    fn kv_snapshot_path_matches_fork_layout() {
-        let p = kv_snapshot_path(Path::new("/srv/slots"), "abiray/lfm2.5", "readfiles");
-        assert_eq!(p, PathBuf::from("/srv/slots/abiray_lfm2.5/readfiles.bin"));
-    }
-
-    #[tokio::test]
-    async fn test_cold_cache_save_load() {
-        let dir = tempfile::tempdir().unwrap();
-        let cold = ColdSnapshotIndex::new(dir.path(), 1024, 86400, crate::config::EvictionPolicy::Lru);
-
-        let mut snap = test_snapshot("sess-cold");
-        snap.snapshot_name = "readfiles".into();
-        snap.instance = Some("scratch".into());
-        cold.save(&snap).unwrap();
-
-        let loaded = cold.load("test-model", None, "sess-cold").unwrap();
-        assert_eq!(loaded.model, "test-model");
-        assert_eq!(loaded.session_id, "sess-cold");
-        assert_eq!(loaded.snapshot_name, "readfiles");
-        assert_eq!(loaded.instance.as_deref(), Some("scratch"));
-        // The derived path matches the fork layout: <slot_save_path>/<model_key>/<name>.bin
-        assert_eq!(
-            loaded.file_path,
-            dir.path().join("test-model").join("readfiles.bin")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_cold_cache_load_nonexistent() {
-        let dir = tempfile::tempdir().unwrap();
-        let cold = ColdSnapshotIndex::new(dir.path(), 1024, 86400, crate::config::EvictionPolicy::Lru);
-
-        let result = cold.load("test-model", None, "no-such-session");
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_kv_cache_manager_two_tier() {
-        let dir = tempfile::tempdir().unwrap();
-        let hot = Arc::new(HotSnapshotIndex::new(10, 1024));
-        let cold = Arc::new(ColdSnapshotIndex::new(
-            dir.path(),
-            1024,
-            86400,
-            crate::config::EvictionPolicy::Lru,
-        ));
-        let mgr = SnapshotStore::new(Arc::clone(&hot), Arc::clone(&cold));
-
-        mgr.store(test_snapshot("sess-tier")).unwrap();
-
-        // Should be in hot tier
-        let retrieved = mgr.retrieve("test-model", None, "sess-tier").unwrap();
-        assert_eq!(retrieved.session_id, "sess-tier");
-
-        // Remove from hot, should fall back to cold
-        hot.remove("test-model", None, "sess-tier");
-        let retrieved2 = mgr.retrieve("test-model", None, "sess-tier").unwrap();
-        assert_eq!(retrieved2.session_id, "sess-tier");
-    }
-
-    #[tokio::test]
-    async fn test_cold_cache_evict_by_ttl() {
-        let dir = tempfile::tempdir().unwrap();
-        let cold = ColdSnapshotIndex::new(
-            dir.path(),
-            1024,
-            0, // immediate TTL
-            crate::config::EvictionPolicy::Lru,
-        );
-
-        cold.save(&test_snapshot("sess-evict")).unwrap();
-
-        let evicted = cold.evict().unwrap();
-        assert_eq!(evicted, 1);
-    }
-
-    #[tokio::test]
-    async fn test_list_snapshots() {
-        let dir = tempfile::tempdir().unwrap();
-        let cold = ColdSnapshotIndex::new(dir.path(), 1024, 86400, crate::config::EvictionPolicy::Lru);
-
-        cold.save(&test_snapshot("sess-list")).unwrap();
-
-        let snapshots = cold.list_snapshots("sess-list");
-        assert_eq!(snapshots.len(), 1);
-        assert_eq!(snapshots[0].session_id, "sess-list");
-    }
-
-    #[tokio::test]
-    async fn metadata_only_cold_tier_degrades_gracefully() {
-        let cold = ColdSnapshotIndex::metadata_only(86400);
-        let mut snap = test_snapshot("sess-meta");
-        snap.snapshot_name = "x".into();
-        cold.save(&snap).unwrap();
-
-        let loaded = cold.load("test-model", None, "sess-meta").unwrap();
-        // No server-owned store: the derived path is empty, never a crash.
-        assert!(loaded.file_path.as_os_str().is_empty());
-    }
-
-    // -- Fork round-trip via the optional InstanceClient handle --------
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn save_snapshot_with_fork_records_metadata_and_posts() {
-        use crate::instances::stub::StubServer;
-        use crate::instances::InstanceClient;
-
-        let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
-            |method, path, _body| {
-                if method == "POST" && path == "/instances/scratch/snapshot" {
-                    (200, "{}".into())
-                } else {
-                    (200, "[]".into())
-                }
-            },
-        );
-        let stub = StubServer::start(handler);
-        let fork = Arc::new(InstanceClient::new(
-            reqwest::Client::new(),
-            stub.base_url(),
-            None,
-        ));
-
-        let dir = tempfile::tempdir().unwrap();
-        let hot = Arc::new(HotSnapshotIndex::new(10, 1024));
-        let kv = SnapshotStore::new(
-            Arc::clone(&hot),
-            Arc::new(ColdSnapshotIndex::new(
-                dir.path(),
-                1024,
-                86400,
-                crate::config::EvictionPolicy::Lru,
-            )),
-        )
-        .with_fork_io(fork);
-
-        kv.save_snapshot("model-x", None, "sess-1", "readfiles", "scratch")
-            .expect("save succeeds");
-
-        // The fork received the snapshot POST.
-        assert!(
-            stub.recorded()
-                .iter()
-                .any(|(m, p, _)| m == "POST" && p == "/instances/scratch/snapshot"),
-            "stub fork must receive the snapshot save"
-        );
-
-        // Metadata was recorded under the session key: a rewind can find it.
-        let retrieved = kv.retrieve("model-x", None, "sess-1").expect("retrieve");
-        assert_eq!(retrieved.snapshot_name, "readfiles");
-        assert_eq!(retrieved.instance.as_deref(), Some("scratch"));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn save_snapshot_without_fork_is_noop() {
-        let dir = tempfile::tempdir().unwrap();
-        let hot = Arc::new(HotSnapshotIndex::new(10, 1024));
-        let kv = SnapshotStore::new(
-            Arc::clone(&hot),
-            Arc::new(ColdSnapshotIndex::new(
-                dir.path(),
-                1024,
-                86400,
-                crate::config::EvictionPolicy::Lru,
-            )),
-        );
-
-        // No fork handle -> metadata-only no-op returning Ok, nothing recorded.
-        kv.save_snapshot("model-x", None, "sess-1", "readfiles", "scratch")
-            .expect("no-op save returns Ok");
-        assert!(
-            kv.retrieve("model-x", None, "sess-1").is_err(),
-            "no metadata recorded without a fork handle"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn list_and_delete_delegate_to_fork_when_present() {
-        use crate::instances::stub::StubServer;
-        use crate::instances::InstanceClient;
-
-        let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
-            |method, path, _body| {
-                if method == "GET" && path == "/instances/scratch/snapshots" {
-                    (
-                        200,
-                        serde_json::json!([
-                            { "name": "readfiles", "size": 512, "mtime": "x" }
-                        ])
-                        .to_string(),
-                    )
-                } else {
-                    (200, "{}".into())
-                }
-            },
-        );
-        let stub = StubServer::start(handler);
-        let fork = Arc::new(InstanceClient::new(
-            reqwest::Client::new(),
-            stub.base_url(),
-            None,
-        ));
-        let dir = tempfile::tempdir().unwrap();
-        let hot = Arc::new(HotSnapshotIndex::new(10, 1024));
-        let kv = SnapshotStore::new(
-            Arc::clone(&hot),
-            Arc::new(ColdSnapshotIndex::new(
-                dir.path(),
-                1024,
-                86400,
-                crate::config::EvictionPolicy::Lru,
-            )),
-        )
-        .with_fork_io(fork);
-
-        let listed = kv.list_snapshots("scratch");
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].snapshot_name, "readfiles");
-
-        kv.delete_snapshot("scratch", "readfiles").expect("delete");
-        assert!(
-            stub.recorded()
-                .iter()
-                .any(|(m, p, _)| m == "DELETE" && p == "/instances/scratch/snapshot/readfiles"),
-            "fork must receive the snapshot delete"
-        );
-    }
-}
+#[path = "../tests/kv_cache.rs"]
+mod tests;

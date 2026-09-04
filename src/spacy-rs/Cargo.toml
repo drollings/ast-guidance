@@ -1,0 +1,67 @@
+[package]
+name = "spacy-rs"
+version.workspace = true
+edition.workspace = true
+description = "Native Rust reimplementation of core spaCy: lexicon, tokenizer, doc model, annotation validator, and LLM-JSON bridge, composed from fluent-monorepo idioms."
+autotests = false
+autobenches = false
+
+[[test]]
+name = "arceager_golden"
+path = "tests/arceager_golden.rs"
+
+[[test]]
+name = "en_tokenization"
+path = "tests/en_tokenization.rs"
+
+[[test]]
+name = "refine_calibration"
+path = "tests/refine_calibration.rs"
+
+[[test]]
+name = "live"
+path = "tests/live.rs"
+required-features = ["live-ai"]
+
+[dependencies]
+fancy-regex = { workspace = true }
+fluent-types = { path = "../types" }
+internment = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Unicode General_Category properties matching CPython's `str.is*` semantics
+# (used for lexeme flags: is_punct / is_alpha / is_currency / ...).
+unicode-properties = "0.1"
+# Pipeline composition (Milestone 4): Component/WorkUnit stages, the
+# first_accept_in_order fallback ladder, SupervisedBatch execution, and the
+# ResultPool batch fan-out. fluent-dag supplies the stage DependencyGraph.
+fluent-wvr = { path = "../fluent-wvr" }
+fluent-concurrency = { path = "../fluent-concurrency" }
+fluent-dag = { path = "../dag" }
+bon = { workspace = true }
+common-core = { path = "../common-core" }
+blake3 = { workspace = true }
+tracing = { workspace = true }
+
+[build-dependencies]
+# Compiles ../../env/en_lemmatizer.json into the versioned binary lemma blob.
+serde_json = { workspace = true }
+crc32fast = "1"
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+# Live-AI tests build the LLM queue via the M9 canonical owner
+# (`fluent_llm::protocol`). Acyclic: `fluent-llm` never depends on `spacy-rs`.
+fluent-llm = { path = "../llm" }
+
+[features]
+# Live-AI integration tests (real inference). Compiled ONLY when enabled via
+# `make test-live` / `make spacy-test-live`; hermetic builds never include them.
+live-ai = []
+
+[lints]
+workspace = true

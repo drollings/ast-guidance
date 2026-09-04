@@ -1,7 +1,0 @@
-{
-  "meta": {
-    "module": "src.ontology.root",
-    "source": "src/ontology/root.zig",
-    "language": "zig"
-  }
-}

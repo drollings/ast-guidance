@@ -6,6 +6,7 @@ pub mod inference;
 pub mod mapper;
 pub mod migration;
 pub mod yago;
+pub mod yago_loader;
 
 use thiserror::Error;
 
@@ -16,3 +17,5 @@ pub enum OntologyError {
     #[error("inference error: {0}")]
     Inference(String),
 }
+
+pub use yago_loader::{canonical_class_name, yago_class_id, LoadStats, YaGoLoader};

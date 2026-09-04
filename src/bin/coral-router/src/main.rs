@@ -19,22 +19,31 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod boot;
+
 use clap::{Args, Parser, Subcommand};
 use common_core::config::load_json_or_default;
 use fluent_llm::client::ChatBackend;
+use fluent_llm::protocol::ChatMessage;
 use fluent_llm::{create_embedding_provider, EmbeddingProvider};
 use fluent_router::charts::store::ChartStore;
 use fluent_router::cli::{commands, CliContext};
+use fluent_router::config::builder::NlpDeps;
 use fluent_router::config::{validate_no_self_routing, RouterConfig};
-use fluent_router::hnsw::HnswIndexHandle;
+use fluent_router::concept_store_sqlite::SqliteConceptStore;
+use fluent_db::hnsw::HnswIndexHandle;
+use fluent_router::ledger::correction_index::SqliteCorrectionIndex;
 use fluent_router::ledger::ContentNodeLedger;
 use fluent_router::logging::init_router_logging;
 use fluent_router::routes::plan::PlanRoute;
 use fluent_router::routes::rigor::RigorRoute;
 use fluent_router::server::RouterServer;
+use fluent_router::server::review::{ReviewFetch, ReviewWorker};
+use fluent_router::server::entity_link::{EntityLinkWorker, EntityLinkScorer};
 use fluent_router::testing::{
     load_transcript_file, transcript_provider_from_entries, MockDispatchContext,
 };
+use spacy_rs::concept_store::ConceptStore;
 
 #[derive(Parser)]
 #[command(
@@ -117,6 +126,11 @@ struct StartArgs {
     /// LLM calls instead of returning canned dispatch responses.
     #[arg(long, value_delimiter = ',')]
     mock_except: Vec<String>,
+
+    /// Synthesize a default ledger config when none is configured (M4).
+    /// Opt-in via env `CORAL_LEDGER_DEFAULT=1` or this flag; keeps wire default `None`.
+    #[arg(long)]
+    ledger_default: bool,
 }
 
 /// Shared server-address args for the router-API commands.
@@ -313,7 +327,7 @@ fn resolve_classifier_model_name(config: &RouterConfig) -> String {
             return m.clone();
         }
     }
-    if let Some(route) = config.routes.get(&config.default_route) {
+    if let Some(route) = config.routes_view().get(&config.default_route) {
         if let Some(group) = config.model_groups.get(&route.group) {
             if let Some(first) = group.models().first() {
                 return first.clone();
@@ -330,6 +344,25 @@ fn resolve_classifier_model_name(config: &RouterConfig) -> String {
 async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut config: RouterConfig = load_json_or_default(config_path.as_ref());
     config.apply_defaults();
+    // M7: flat vs tree coherence — fail fast on drift
+    if let Err(e) = config.validate_flat_tree_coherence() {
+        eprintln!("FATAL: {e}");
+        std::process::exit(1);
+    }
+
+    // M4: wire default stays None, but CI/operator opt-in via flag/env synthesizes a ledger at the composition root.
+    let ledger_default_env = std::env::var("CORAL_LEDGER_DEFAULT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let is_mock = args.mock.is_some() || config.mock.is_some();
+    if config.ledger.is_none() && !is_mock && (ledger_default_env || args.ledger_default) {
+        tracing::info!(target: "coral-router", path = "/tmp/coral-ledger.db", "CORAL_LEDGER_DEFAULT/--ledger-default synthesized ledger config");
+        config.ledger = Some(fluent_router::config::LedgerConfig {
+            path: Some("/tmp/coral-ledger.db".into()),
+            background_tiering: false,
+            ..Default::default()
+        });
+    }
 
     // CLI overrides take priority over config file
     let bind_addr = match (args.host.as_deref(), args.port) {
@@ -454,6 +487,156 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
         tracing::info!(target: "coral-router", except_models = ?args.mock_except, "mock-except models configured");
     }
 
+    // ONNX registry (ROADMAP_20260827_ORT §0.5): one session per onnx-declared
+    // model. `Always`-resident models load here (a missing model file is a
+    // loud, actionable boot error); `Unloadable` models load on first use.
+    // Absent onnx config yields `None` (fully fail-open). The llama.cpp
+    // supervisor, sidecar, and `/instances` never touch onnx models.
+    let onnx_registry = match fluent_router::ort::build_onnx_registry(&config) {
+        Ok(registry) => registry,
+        Err(e) => {
+            tracing::error!(target: "coral-router", error = %e, "fatal: onnx registry build failed");
+            eprintln!("FATAL: onnx registry build failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Some(registry) = onnx_registry.as_ref() {
+        tracing::info!(
+            target: "coral-router",
+            onnx_models = ?registry.model_keys(),
+            "onnx registry built",
+        );
+    }
+    // Install the onnx `ChatBackend` resolver (ROADMAP M2.3/M6): the generative
+    // LLM role's backend, served behind the single `RouterConfig::local_backend`
+    // factory. The `(key, instance)` shape lets the resolver build a
+    // **context-bound** backend for a named context (created on demand — the
+    // onnx lazy-residency load point) on first use. Absent / unregistered /
+    // non-CausalLm → `None` (fail-open to the HTTP/deterministic path). The
+    // role's default (`instance = None`) is the single-shot backend unless it
+    // declares an `instances` block, in which case it binds to the pool context
+    // (the `pool_qualifier` rule) — byte-identical to M0 for the shipped config.
+    let onnx_llm_backend = {
+        let onnx_llm_key = fluent_onnx::OnnxRole::Llm.registry_key();
+        let role = config.onnx.as_ref().and_then(|f| f.llm.as_ref());
+        let onnx_llm_backend = onnx_registry
+            .as_ref()
+            .and_then(|reg| {
+                fluent_router::ort::onnx_chat_backend(reg, onnx_llm_key).ok().flatten()
+            });
+        let llm_weights = match (onnx_registry.as_ref(), role) {
+            (Some(reg), Some(role)) => Some(Arc::new(
+                fluent_router::ort::OnnxWeights::new(
+                    onnx_llm_key.to_string(),
+                    reg.clone(),
+                    role.clone(),
+                ),
+            )),
+            _ => None,
+        };
+        let has_instances = role
+            .is_some_and(|r| r.instances.as_ref().is_some_and(|m| !m.is_empty()));
+        let pool_context = role.and_then(fluent_router::ort::onnx_pool_context);
+        if onnx_llm_backend.is_some() {
+            tracing::info!(
+                target: "coral-router",
+                model = onnx_llm_key,
+                has_instances = has_instances,
+                "onnx generative backend wired as the default local backend",
+            );
+        }
+        let resolver_backend = onnx_llm_backend.clone();
+        config.install_onnx_resolver(move |key, instance| {
+            if key != onnx_llm_key {
+                return None;
+            }
+            match instance {
+                Some(name) => llm_weights.as_ref().and_then(|w| {
+                    fluent_router::ort::onnx_context_backend(w, name).ok().flatten()
+                }),
+                None if has_instances => {
+                    let ctx = pool_context.clone()?;
+                    llm_weights.as_ref().and_then(|w| {
+                        fluent_router::ort::onnx_context_backend(w, &ctx).ok().flatten()
+                    })
+                }
+                None => resolver_backend.clone(),
+            }
+        });
+        onnx_llm_backend
+    };
+    // The shared residency engine (M5): ONE loop over the fleet's weights
+    // (llama adapters + onnx implementors), replacing both the llama sidecar
+    // task and the onnx residency sibling. Built here so the `sidecar` knobs
+    // are read before `config` is partially moved into the server. The VRAM
+    // budget is detected inside an `FsCapability` scope (ROCm sysfs), exactly
+    // as the llama loop's boot did.
+    let residency_engine = fluent_concurrency::scope::CURRENT_CAPS.sync_scope(
+            fluent_concurrency::capability::default_capability_set(),
+            || {
+                fluent_llm::runtime::LlmResidencyEngine::new(
+                    std::time::Duration::from_secs(config.sidecar.poll_interval_s.max(1)),
+                    config.sidecar.allocation_limit(),
+                    config.sidecar.onnx_working_set_budget_bytes,
+                    fluent_onnx::residency::DEFAULT_SLEEP_IDLE_SECONDS,
+                    config.sidecar.evict_batch,
+                )
+            },
+    );
+
+    // ROADMAP_20260828_ORT M1.1: when any pipeline needs interlingua ids
+    // (`nlp: true`) or a durable concept store (`review` configured,
+    // `overlay.entity_link_enabled`), open the ledger and build the shared
+    // `SqliteConceptStore` + `SqliteCorrectionIndex` + YaGO reconcile BEFORE
+    // the pipeline build, so a resolver can be threaded into the NLP pipeline
+    // (G3 — pipelines were previously built before the store existed). When
+    // nothing needs the store the boot order is byte-identical to today
+    // (fail-open; `NlpDeps` stays default).
+    let nlp_enabled = config.pipelines.values().any(|p| p.nlp);
+    let needs_concept_store = nlp_enabled
+        || config.review.is_some()
+        || config.overlay.as_ref().is_some_and(|o| o.entity_link_enabled)
+        || config
+            .overlay
+            .as_ref()
+            .is_some_and(|o| o.arc_ready.as_ref().is_some_and(|a| a.enabled && a.nlp));
+    let mut ledger: Option<Arc<ContentNodeLedger>> = None;
+    let mut concept_store: Option<Arc<SqliteConceptStore>> = None;
+    let mut correction_index: Option<Arc<SqliteCorrectionIndex>> = None;
+    let mut nlp_deps = NlpDeps::default();
+    if needs_concept_store {
+        let opened = match boot::open_ledger(&config) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(target: "coral-router", error = %e, "fatal: ledger open failed");
+                eprintln!("FATAL: {e}");
+                std::process::exit(1);
+            }
+        };
+        let store_boot = match boot::build_concept_store_boot(&opened) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(target: "coral-router", error = %e, "fatal: boot reconciliation failed");
+                eprintln!("FATAL: boot reconciliation failed: {e}");
+                std::process::exit(1);
+            }
+        };
+        ledger = Some(Arc::clone(&opened));
+        concept_store = Some(Arc::clone(&store_boot.concept_store));
+        correction_index = Some(Arc::clone(&store_boot.correction_index));
+        nlp_deps = NlpDeps {
+            concept_store: Some(Arc::clone(&store_boot.concept_store) as Arc<dyn ConceptStore>),
+            strings_path: None,
+        };
+        tracing::info!(
+            target: "coral-router",
+            classes = store_boot.stats.classes,
+            coral_nodes = store_boot.stats.coral_nodes,
+            router_concepts = store_boot.stats.router_concepts,
+            "boot concept store + reconcile complete (before pipeline build)",
+        );
+    }
+
     let (pipelines, mock_dispatch) = if let Some(ref path) = transcript_path {
         tracing::info!(target: "coral-router", transcript = %path, mock_except = ?args.mock_except, "mock mode enabled");
 
@@ -466,11 +649,19 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
 
         let pipelines = if classifier_is_excepted {
             tracing::info!(target: "coral-router", "classifier model is excepted — building with real LLM backend");
-            config.build_all_pipelines_with_backend(None::<&Arc<dyn ChatBackend>>)
+            config.build_all_pipelines_with_backend_onnx_and_nlp(
+                None::<&Arc<dyn ChatBackend>>,
+                onnx_registry.as_ref(),
+                &nlp_deps,
+            )
         } else {
             let provider = transcript_provider_from_entries(dispatch_ctx.transcripts());
             let provider: Arc<dyn ChatBackend> = Arc::new(provider);
-            config.build_all_pipelines_with_backend(Some(&provider))
+            config.build_all_pipelines_with_backend_onnx_and_nlp(
+                Some(&provider),
+                onnx_registry.as_ref(),
+                &nlp_deps,
+            )
         };
 
         (pipelines, Some(dispatch_ctx))
@@ -478,7 +669,11 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
         if !args.mock_except.is_empty() {
             tracing::warn!(target: "coral-router", "--mock-except has no effect without --mock");
         }
-        let pipelines = config.build_all_pipelines();
+        let pipelines = config.build_all_pipelines_with_backend_onnx_and_nlp(
+            None::<&Arc<dyn ChatBackend>>,
+            onnx_registry.as_ref(),
+            &nlp_deps,
+        );
         (pipelines, None)
     };
 
@@ -505,54 +700,20 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
     // `<base>:ledger`) and/or a `SessionRegistry`, and attach both to the
     // server so rigor rewind and ledger LOD derivation exist at runtime. 
     // Both are default-absent, so existing deployments are untouched.
-    let ledger = if let Some(ledger_cfg) = &config.ledger {
-        let opened = match &ledger_cfg.path {
-            Some(path) => ContentNodeLedger::open(path),
-            None => {
-                tracing::warn!(
-                    target: "coral-router",
-                    "ledger section has no path - using an in-memory ledger (ephemeral)",
-                );
-                ContentNodeLedger::open_in_memory()
-            }
-        };
-        let ledger = match opened {
-            Ok(l) => l,
+    //
+    // The ledger may already have been opened by the M1.1 early step (when
+    // nlp/review/overlay need a concept store); reuse it rather than open a
+    // second connection (DRY — one shared ledger/store per boot).
+    if ledger.is_none() && config.ledger.is_some() {
+        match boot::open_ledger(&config) {
+            Ok(l) => ledger = Some(l),
             Err(e) => {
-                tracing::error!(
-                    target: "coral-router",
-                    error = %e,
-                    "fatal: ledger open failed",
-                );
-                eprintln!("FATAL: ledger open failed: {e}");
+                tracing::error!(target: "coral-router", error = %e, "fatal: ledger open failed");
+                eprintln!("FATAL: {e}");
                 std::process::exit(1);
             }
-        };
-        match config.summarizer_for_ledger() {
-            Some(summarizer) => {
-                let model_key = ledger_cfg
-                    .model
-                    .clone()
-                    .or_else(|| config.classifier_model.clone());
-                tracing::info!(
-                    target: "coral-router",
-                    ledger_model = ?model_key,
-                    summarizer = true,
-                    "ledger summarizer attached",
-                );
-                Some(Arc::new(ledger.with_summarizer(summarizer)))
-            }
-            None => {
-                tracing::warn!(
-                    target: "coral-router",
-                    "ledger section present but no summarizer derivable - ledger attached without LOD derivation",
-                );
-                Some(Arc::new(ledger))
-            }
         }
-    } else {
-        None
-    };
+    }
 
     let sessions = if let Some(session_cfg) = &config.session {
         let kv_root = session_cfg.root.as_ref().map(std::path::PathBuf::from);
@@ -575,7 +736,11 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
     // Chart store boot: load `config.charts.dir` (fail fast on a corrupt
     // file — a half-loaded library must not serve), attach the shared store
     // to the plan route. A missing directory is tolerated (empty store).
-    let plan_route = Arc::new(build_plan_route(&config, ledger_store.as_ref()));
+    let plan_route = Arc::new(build_plan_route(
+        &config,
+        ledger_store.as_ref(),
+        onnx_registry.as_ref(),
+    ));
     let rigor_route = Arc::new(build_rigor_route(&config, ledger_store.as_ref()));
 
     // Escalation ladders: one per `model_groups[g].escalation` config.
@@ -604,6 +769,19 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
             std::process::exit(1);
         }
     };
+
+    // The unified weights facade (ROADMAP M4): llama adapters + onnx
+    // implementors behind the shared `LlmWeights` surface. Backs the
+    // `/instances` + `/v1/models` aggregation (onnx rows), `ps`, and the
+    // onnx branch of `POST /models/unload`. The llama rows stay byte-identical
+    // (delegated to the llama-only `InstancePool`); onnx rows appear only
+    // when the onnx fleet is configured.
+    let fleet = Arc::new(fluent_router::instances::traits::LlmFleet::build(
+        instance_pool.clone(),
+        _supervisor.as_deref(),
+        onnx_registry.clone(),
+        &config,
+    ));
 
     // Background tiering: when the operator opts in via
     // `ledger.background_tiering`, attach a `LedgerTierWorker` to the shared
@@ -688,6 +866,321 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
         }
     }
 
+    // Boot reconciliation: load YaGO taxonomy into both coral's content-addressed
+    // graph and the router's SqliteConceptStore, then assert they match (ROADMAP
+    // §11.10/§13.10 — C3). Requires both a ledger (for the shared SQLite
+    // connection) and a review config (which implies the concept store is needed).
+    let mut review_worker: Option<Arc<ReviewWorker>> = None;
+    let mut review_fetch: Option<ReviewFetch> = None;
+    if let (Some(ledger_arc), Some(review_cfg)) = (&ledger, &config.review) {
+        // Build the review model backend (ChatBackend) from the review_model
+        // key, else the classifier key, else the onnx LLM key (ROADMAP M2.6 —
+        // the generative onnx model is the default review backend).
+        let review_model_key = review_cfg
+            .review_model
+            .clone()
+            .or_else(|| config.classifier_model.clone())
+            .or_else(|| config.onnx_llm_key());
+        let review_backend: Option<Arc<dyn ChatBackend>> = review_model_key
+            .as_deref()
+            .and_then(|key| config.local_backend(key));
+
+        // Reuse the M1.1 early-built shared store (ROADMAP_20260828_ORT M1.1):
+        // review configured ⇒ `needs_concept_store` ⇒ the `SqliteConceptStore`
+        // + `SqliteCorrectionIndex` were built and YaGO reconciled **before**
+        // the pipeline build. One shared store, not one per consumer (DRY).
+        let sqlite_store = concept_store
+            .clone()
+            .expect("review configured => concept store built before pipeline build");
+        let correction_index = correction_index
+            .clone()
+            .expect("review configured => correction index built before pipeline build");
+        let concept_store_arc = sqlite_store;
+        let fetch: ReviewFetch = if let Some(backend) = review_backend {
+            Arc::new(move |prompt: String| {
+                let messages = vec![ChatMessage {
+                    role: "user".into(),
+                    content: prompt,
+                }];
+                // ChatBackend::chat_complete_with_extras is synchronous. The
+                // ParseReview schema travels as `response_format.schema`
+                // (ROADMAP M2.5) so a grammar-constrained backend (the onnx
+                // LLM) prevents structurally-invalid review output; a backend
+                // without the extras seam ignores it (post-hoc serde parsing
+                // of `ParseReview` remains the backstop).
+                let extras = serde_json::json!({
+                    "response_format": {
+                        "type": "json_object",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "corrections": {"type": "array", "items": {"type": "object"}},
+                                "linked_entities": {"type": "array", "items": {"type": "object"}},
+                                "note": {"type": "string"}
+                            },
+                            "required": ["corrections"]
+                        }
+                    }
+                });
+                backend
+                    .chat_complete_with_extras(&messages, &extras)
+                    .map_err(|e| format!("review model call failed: {e}"))
+            })
+        } else {
+            // No review backend derivable — return an error closure so the
+            // worker logs and continues without the LLM call.
+            Arc::new(|_prompt| Err("no review backend configured".into()))
+        };
+        review_fetch = Some(fetch.clone());
+
+        // Build the PII pre-filter seam: the ort PII-Detector when the `pii`
+        // role is configured and registered, else the deterministic regex
+        // baseline when `auto_enqueue` is on. Fail-open — never a boot error.
+        let pii_model = if onnx_registry.as_ref().is_some_and(|r| {
+            r.config(fluent_onnx::OnnxRole::Pii.registry_key())
+                .is_some()
+        }) {
+            Some(fluent_onnx::OnnxRole::Pii.registry_key())
+        } else {
+            None
+        };
+        let pii_prefilter: Option<Arc<dyn fluent_onnx::PiiSpanDetector>> =
+            match fluent_router::ort::pii_prefilter(
+                onnx_registry.as_ref(),
+                pii_model,
+                review_cfg.auto_enqueue,
+            ) {
+            Ok(prefilter) => prefilter,
+            Err(e) => {
+                tracing::warn!(
+                    target: "coral-router",
+                    error = %e,
+                    "PII pre-filter build failed — falling back to the regex baseline",
+                );
+                review_cfg.auto_enqueue.then(|| {
+                    Arc::new(fluent_onnx::RegexPiiDetector) as Arc<dyn fluent_onnx::PiiSpanDetector>
+                })
+            }
+        };
+
+        let worker = Arc::new(ReviewWorker::new(
+            ledger_arc,
+            &(correction_index as Arc<dyn spacy_rs::CorrectionIndex>),
+            &(concept_store_arc as Arc<dyn ConceptStore>),
+            &fetch,
+            pii_prefilter.clone(),
+            review_cfg.auto_enqueue,
+            review_cfg.review_model.clone().unwrap_or_else(|| "review-model".into()),
+            review_cfg.queue_capacity,
+            review_cfg.credit_limit,
+            fluent_concurrency::tokio_runtime(),
+        ));
+        review_worker = Some(worker);
+        tracing::info!(
+            target: "coral-router",
+            review_model = %review_cfg.review_model.as_deref().unwrap_or("default"),
+            queue_capacity = review_cfg.queue_capacity,
+            credit_limit = review_cfg.credit_limit,
+            auto_enqueue = review_cfg.auto_enqueue,
+            prefilter = pii_prefilter.is_some(),
+            "review worker enabled"
+        );
+    }
+
+    // Async entity-link overlay worker (ROADMAP_20260827_ORT §6.2): opt-in
+    // (`overlay.entity_link_enabled`), fail-open. It scores unresolved PROPN
+    // spans against boot-cached concept-label embeddings and writes `EntityLink`
+    // candidates to `overlay_candidates` — never a doc-id write. Requires a
+    // ledger (the candidate plane) and the YaGO concept store.
+    let mut entity_link_worker: Option<Arc<EntityLinkWorker>> = None;
+    if let Some(overlay_cfg) = &config.overlay {
+        if overlay_cfg.entity_link_enabled {
+            let Some(ledger_arc) = ledger.as_ref() else {
+                tracing::warn!(
+                    target: "coral-router",
+                    "entity-link overlay enabled but no ledger — skipping",
+                );
+                return Err("overlay.entity_link_enabled requires a ledger".into());
+            };
+            // Reuse the M1.1 early-built shared store (overlay enabled ⇒
+            // `needs_concept_store` ⇒ built before the pipeline build); fall
+            // back to a lazy build only if absent (defensive).
+            let concepts: Arc<dyn ConceptStore> = match concept_store.clone() {
+                Some(cs) => cs as Arc<dyn ConceptStore>,
+                None => Arc::new(SqliteConceptStore::new(
+                    ledger_arc
+                        .node_store()
+                        .shared_sqlite()
+                        .expect("ledger must have shared sqlite for overlay"),
+                )),
+            };
+            // The YaGO `Entity` reference class gates which candidates are
+            // genuine entities (`is_subclass_of`), resolved through the store.
+            let entity_root = concepts
+                .resolve_yago_iri(fluent_router::overlay::canonical::ENTITY_ROOT_IRI)
+                .unwrap_or_else(|_| {
+                    fluent_types::InterlinguaId::from_u64(0x0100_0000_0000_0000)
+                });
+            // ColBERT entity-link scorer (the `colbert` role): baked over the
+            // concept store's labels at boot. Fail-open — the colbert role
+            // unconfigured/unregistered → empty scorer, and the worker yields
+            // no candidates (identical to a pre-colbert stub).
+            let colbert_key = fluent_onnx::OnnxRole::Colbert.registry_key();
+            let scorer_model = onnx_registry
+                .as_ref()
+                .and_then(|r| r.config(colbert_key).map(|_| colbert_key));
+            let scorer_wired = scorer_model.is_some();
+            let scorer: EntityLinkScorer = match (onnx_registry.as_ref(), scorer_model) {
+                (Some(registry), Some(model_key)) => {
+                    match fluent_router::ort::colbert_entity_scorer(
+                        registry,
+                        model_key,
+                        &concepts,
+                        overlay_cfg.entity_link_threshold,
+                    ) {
+                        Ok(scorer) => {
+                            tracing::info!(
+                                target: "coral-router",
+                                model = %model_key,
+                                "entity-link scorer backed by ColBERT",
+                            );
+                            scorer
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "coral-router",
+                                model = %model_key,
+                                error = %e,
+                                "entity-link ColBERT scorer failed to bake — empty scorer \
+                                 (fail-open)",
+                            );
+                            Arc::new(|_text| Vec::new())
+                        }
+                    }
+                }
+                (_, _) => {
+                    tracing::warn!(
+                        target: "coral-router",
+                        "entity-link overlay enabled but no registered ColBERT (LateInteraction) \
+                         model — empty scorer (fail-open)",
+                    );
+                    Arc::new(|_text| Vec::new())
+                }
+            };
+            let candidates = fluent_router::ledger::overlay::OverlayCandidateStore::new(
+                ledger_arc.node_store().shared_sqlite().expect("shared sqlite"),
+            );
+            let worker = Arc::new(EntityLinkWorker::new(
+                &candidates,
+                &concepts,
+                &scorer,
+                overlay_cfg.entity_link_threshold,
+                entity_root,
+                overlay_cfg.queue_capacity,
+                overlay_cfg.credit_limit,
+                fluent_concurrency::tokio_runtime(),
+            ));
+            entity_link_worker = Some(worker);
+            tracing::info!(
+                target: "coral-router",
+                threshold = overlay_cfg.entity_link_threshold,
+                queue_capacity = overlay_cfg.queue_capacity,
+                credit_limit = overlay_cfg.credit_limit,
+                scorer_wired = scorer_wired,
+                "entity-link overlay worker enabled",
+            );
+        }
+    }
+
+    // ArcReady annotation-overlay worker (OVERLAYS §8): opt-in
+    // (`overlay.arc_ready.enabled`), fail-open. It derives three lazy,
+    // at-most-once overlays per recorded node (spacy parse, LLM enrichment,
+    // embedding) in parallel from LOD0. Requires a ledger (the shared
+    // `ContentNodeStore`); each seam is attached only when its model/pipeline
+    // resolves — a missing seam leaves that overlay off (fail-open) without
+    // affecting the others. Attached to the server and drained on shutdown so
+    // in-flight derivations complete before the router exits.
+    let mut overlay_worker: Option<
+        Arc<fluent_router::ledger::overlay_worker::OverlayWorker>,
+    > = None;
+    if let Some(overlay_cfg) = &config.overlay {
+        if let Some(arc_cfg) = overlay_cfg.arc_ready.as_ref() {
+            if arc_cfg.enabled {
+                let Some(ledger_arc) = ledger.as_ref() else {
+                    tracing::warn!(
+                        target: "coral-router",
+                        "overlay.arc_ready.enabled but no ledger — skipping",
+                    );
+                    return Err("overlay.arc_ready.enabled requires a ledger".into());
+                };
+                let store = Arc::clone(ledger_arc.node_store());
+
+                // Spacy overlay seam: the standalone NLP pipeline (threads the
+                // same resolver as the request-time pipelines). `nlp: false` →
+                // not wired (fail-open).
+                if arc_cfg.nlp {
+                    match config.overlay_nlp_pipeline(&nlp_deps) {
+                        Some(pipeline) => store.set_overlay_pipeline(pipeline),
+                        None => tracing::warn!(
+                            target: "coral-router",
+                            "overlay.arc_ready.nlp set but the spacy pipeline failed to build \
+                             — spacy overlay skipped (fail-open)",
+                        ),
+                    }
+                }
+
+                // LLM enrichment overlay seam: the named model's `ChatBackend`.
+                if let Some(model_key) = arc_cfg.llm_model.as_deref() {
+                    match config.local_backend(model_key) {
+                        Some(backend) => store.set_overlay_llm(backend),
+                        None => tracing::warn!(
+                            target: "coral-router",
+                            llm_model = %model_key,
+                            "overlay.arc_ready.llm_model unresolved — LLM overlay skipped \
+                             (fail-open)",
+                        ),
+                    }
+                }
+
+                // Embedding overlay seam: the named model's `EmbeddingProvider`.
+                if let Some(model_key) = arc_cfg.embedding_model.as_deref() {
+                    match overlay_embedding_provider(&config, model_key) {
+                        Some(embedder) => store.set_overlay_embedder(embedder),
+                        None => tracing::warn!(
+                            target: "coral-router",
+                            embedding_model = %model_key,
+                            "overlay.arc_ready.embedding_model unresolved — embedding overlay \
+                             skipped (fail-open)",
+                        ),
+                    }
+                }
+
+                let worker_cfg =
+                    fluent_router::ledger::overlay_worker::OverlayWorkerConfig::from_arc_ready(
+                        arc_cfg,
+                    );
+                let worker = fluent_router::ledger::overlay_worker::OverlayWorker::new(
+                    Arc::clone(&store),
+                    worker_cfg,
+                    fluent_concurrency::tokio_runtime(),
+                );
+                store.set_overlay_events(worker.sender());
+                worker.start();
+                tracing::info!(
+                    target: "coral-router",
+                    nlp = arc_cfg.nlp,
+                    llm_model = ?arc_cfg.llm_model,
+                    embedding_model = ?arc_cfg.embedding_model,
+                    queue_capacity = arc_cfg.queue_capacity,
+                    max_concurrent = arc_cfg.max_concurrent,
+                    backfill = arc_cfg.backfill,
+                    "arc_ready overlay worker enabled",
+                );
+                overlay_worker = Some(worker);
+            }
+        }
+    }
+
     let mut server =
         RouterServer::new(pipelines, routes, config.models, &config.server, classifier)
             .with_plan_route(plan_route)
@@ -706,12 +1199,33 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
     if let Some(coordinator) = coordinator {
         server = server.with_coordinator(coordinator);
     }
+    if let Some(worker) = review_worker {
+        server = server.with_review_worker(worker);
+    }
+    if let Some(fetch) = review_fetch {
+        server = server.with_review_fetch(fetch);
+    }
+    if let Some(worker) = entity_link_worker {
+        server = server.with_entity_link_worker(worker);
+    }
+    if let Some(worker) = overlay_worker {
+        server = server.with_overlay_worker(worker);
+    }
 
     if !instance_pool.is_empty() {
         server = server.with_instance_pool(instance_pool);
     }
     server = server.with_management_api_key(config.sidecar.api_key_env.clone());
     server = server.with_supervisor(_supervisor.clone());
+    server = server.with_onnx_registry(onnx_registry);
+    server = server.with_onnx_llm_backend(onnx_llm_backend);
+    server = server.with_residency_engine(Some(residency_engine));
+    // Only attach the unified facade when either fleet exists — an empty fleet
+    // would otherwise turn `/instances` into a 200 empty envelope where the
+    // pre-M4 path returned 404 "no managed instances".
+    if !fleet.is_empty() {
+        server = server.with_fleet(fleet);
+    }
 
     if let Some(ctx) = mock_dispatch {
         server = server.with_mock(ctx);
@@ -778,6 +1292,7 @@ async fn shutdown_signal() {
 fn build_plan_route(
     config: &RouterConfig,
     ledger_store: Option<&Arc<fluent_router::node_store::ContentNodeStore>>,
+    onnx: Option<&fluent_router::ort::OrtRegistry>,
 ) -> PlanRoute {
     let index_handle = config
         .charts
@@ -819,7 +1334,7 @@ fn build_plan_route(
     // when index_path is configured. Failure-tolerant: a missing/unreachable
     // embedding endpoint skips the build with a warning, never aborts boot.
     if config.charts.index_path.is_some() {
-        match default_chart_embedder(config) {
+        match default_chart_embedder(config, onnx) {
             Some(embedder) => match store.build_index(embedder) {
                 Ok(()) => tracing::info!(
                     target: "coral-router",
@@ -848,6 +1363,49 @@ fn build_plan_route(
     }
     if let Some(backend) = default_reranker_backend(config) {
         route = route.with_reranker_backend(backend);
+    }
+    // ColBERT two-stage retrieval: when the `colbert` role is configured and
+    // resolves to a LateInteraction session, build the MaxSim reranker.
+    #[cfg(feature = "onnx")]
+    {
+        let colbert_key = fluent_onnx::OnnxRole::Colbert.registry_key();
+        if let Some(registry) = &onnx {
+            if config
+                .onnx
+                .as_ref()
+                .is_some_and(|f| f.has(fluent_onnx::OnnxRole::Colbert))
+            {
+                match fluent_router::ort::onnx_colbert_reranker(registry, colbert_key) {
+                    Ok(Some(retriever)) => {
+                        let reranker = Arc::new(
+                            fluent_router::ort::ColbertChartReranker::new(retriever),
+                        );
+                        route = route.with_colbert_reranker(reranker);
+                        tracing::info!(
+                            target: "router.main",
+                            role = %colbert_key,
+                            "ColBERT MaxSim reranker built",
+                        );
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            target: "router.main",
+                            role = %colbert_key,
+                            "colbert role configured but not a registered LateInteraction \
+                             session — ColBERT reranking disabled",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "router.main",
+                            role = %colbert_key,
+                            error = %e,
+                            "ColBERT reranker build failed — falling back to HNSW-only retrieval",
+                        );
+                    }
+                }
+            }
+        }
     }
     // Server-side execution: the same charts model runs a selected chart's
     // targets (and doubles as the rubric judge). A shared limiter bounds
@@ -897,9 +1455,11 @@ fn build_plan_route(
     route
 }
 
-/// Number of embedding dimensions to declare for the chart embedder. The
-/// actual vector length is whatever the endpoint returns (the embeddings HTTP
-/// client parses the response); this only sets the declared capacity.
+/// Number of embedding dimensions to declare for the OpenAI chart embedder.
+/// The actual vector length is whatever the endpoint returns (the embeddings
+/// HTTP client parses the response); this only sets the declared capacity.
+/// Onnx-declared embedding models derive their dims from config/metadata
+/// instead (ROADMAP_20260827_ORT §0.6).
 const CHART_EMBEDDING_DIMS: u32 = 768;
 
 /// Max concurrent chart-target LLM calls during server-side execution.
@@ -915,17 +1475,81 @@ fn embeddings_base_url(endpoint: &str) -> String {
 /// Build the default chart embedder from the model config, if derivable.
 ///
 /// Uses the root-level `embedding_model` (falling back to the selector model,
-/// then the classifier model's) to reach an OpenAI-compatible `/v1/embeddings`.
-/// An empty API key is sent — local llama.cpp servers ignore the header.
-/// Returns `None` when no model is configured or the URL is not embeddable,
+/// then the classifier model's). Two branches:
+///
+/// - **Onnx** (ROADMAP_20260827_ORT §0.6): when the resolved model declares an
+///   `onnx` block with `task: FillMask`, build the ort encoder from the boot
+///   registry's session (dims model-derived), wrapped in
+///   `CachedEmbeddingProvider`. A declared-but-broken onnx encoder returns
+///   `None` (HNSW disabled, degraded) — it never silently falls back to the
+///   OpenAI path for a model the operator declared as onnx.
+/// - **OpenAI**: unchanged — an empty API key is sent (local llama.cpp servers
+///   ignore the header).
+///
+/// Returns `None` when no model is configured or no embedder is derivable,
 /// leaving HNSW retrieval disabled.
-fn default_chart_embedder(config: &RouterConfig) -> Option<Arc<dyn EmbeddingProvider>> {
+fn default_chart_embedder(
+    config: &RouterConfig,
+    onnx: Option<&fluent_router::ort::OrtRegistry>,
+) -> Option<Arc<dyn EmbeddingProvider>> {
+    // In-process ONNX encoder role: when configured, it is the preferred chart
+    // embedder (dims model-derived), independent of any HTTP model key.
+    #[cfg(feature = "onnx")]
+    {
+        if let Some(registry) = onnx {
+            if config
+                .onnx
+                .as_ref()
+                .is_some_and(|f| f.has(fluent_onnx::OnnxRole::Encoder))
+            {
+                let key = fluent_onnx::OnnxRole::Encoder.registry_key();
+                return match fluent_router::ort::onnx_chart_embedder(registry, key) {
+                    Ok(Some(provider)) => Some(provider),
+                    Ok(None) => {
+                        tracing::warn!(
+                            target: "coral-router",
+                            "onnx encoder role present but not a FillMask session — HNSW retrieval disabled (degraded)",
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "coral-router",
+                            error = %e,
+                            "onnx encoder chart embedder failed to build — HNSW retrieval disabled (degraded)",
+                        );
+                        None
+                    }
+                };
+            }
+        }
+    }
+    #[cfg(not(feature = "onnx"))]
+    {
+        let _ = onnx;
+        if config
+            .onnx
+            .as_ref()
+            .is_some_and(|f| f.has(fluent_onnx::OnnxRole::Encoder))
+        {
+            tracing::warn!(
+                target: "coral-router",
+                "onnx encoder role declared but this build has the `onnx` feature off — HNSW retrieval disabled (degraded)",
+            );
+            return None;
+        }
+    }
+
+    // OpenAI-compatible path: an HTTP embedding model key (no onnx encoder
+    // role configured). An empty API key is sent (local llama.cpp servers
+    // ignore the header).
     let key = config
         .embedding_model
         .as_deref()
         .or(config.charts.selector_model.as_deref())
         .or(config.classifier_model.as_deref())?;
     let entry = config.models.get(key)?;
+
     let base = embeddings_base_url(&entry.endpoint);
     let boxed = create_embedding_provider(
         "openai",
@@ -943,6 +1567,29 @@ fn default_chart_embedder(config: &RouterConfig) -> Option<Arc<dyn EmbeddingProv
 /// Build the chart-selection adjudicator backend from the selector model, if
 /// configured. Mirrors `build_classifier_client` (the DIP factory: exactly one
 /// place constructs a concrete `LlmClient` for the selector).
+/// Build an `EmbeddingProvider` from a named `models` key (the arc_ready
+/// embedding overlay seam). Mirrors `default_chart_embedder`'s OpenAI-compatible
+/// path: one factory, no new transport. `None` when the key is absent → the
+/// embedding overlay is off (fail-open).
+fn overlay_embedding_provider(
+    config: &RouterConfig,
+    key: &str,
+) -> Option<Arc<dyn EmbeddingProvider>> {
+    let entry = config.models.get(key)?;
+    let base = embeddings_base_url(&entry.endpoint);
+    let boxed = create_embedding_provider(
+        "openai",
+        entry.name.as_deref(),
+        Some(&base),
+        Some(""),
+        CHART_EMBEDDING_DIMS,
+        None,
+        entry.params.as_ref(),
+    )
+    .ok()?;
+    Some(Arc::from(boxed))
+}
+
 fn default_adjudicator_backend(config: &RouterConfig) -> Option<Arc<dyn ChatBackend>> {
     let key = config.charts.selector_model.as_deref()?;
     config.local_backend(key)
@@ -1009,7 +1656,7 @@ fn build_rigor_route(
         red_model = ?cfg.red_model,
         judge_model = ?cfg.judge_model,
         kv_cache_enabled = cfg.kv_cache_enabled,
-        max_passes = cfg.max_passes,
+        max_passes = cfg.max_passes.rounds(),
         "rigor route configured",
     );
     route
@@ -1036,37 +1683,6 @@ fn load_router_config() -> RouterConfig {
 
 #[cfg(test)]
 mod config_tests {
-    use serde::Deserialize;
-    use std::collections::HashMap;
-
-    #[derive(Debug, Deserialize)]
-    struct TestModelEntry {
-        pub endpoint: String,
-        #[serde(default)]
-        pub name: Option<String>,
-        pub intelligence: u8,
-        pub cost_input: f64,
-        pub cost_output: f64,
-        pub cost_cached_read: f64,
-        pub speed: u8,
-        #[serde(default)]
-        pub total_timeout_ms: u64,
-        #[serde(default)]
-        pub idle_timeout_ms: u64,
-        #[serde(default)]
-        pub stream: bool,
-        #[serde(default)]
-        pub filter_thinking: bool,
-        #[serde(default)]
-        pub retry_count: u32,
-        #[serde(default)]
-        pub retry_base_interval_s: u64,
-        #[serde(default)]
-        pub params: Option<serde_json::Value>,
-        #[serde(default)]
-        pub sessions: Option<HashMap<String, serde_json::Value>>,
-    }
-
     #[test]
     fn test_parse_config() {
         let config_path = concat!(
@@ -1084,7 +1700,7 @@ mod config_tests {
         // The env config points `embedding_model` at the `embed` model; the
         // embedder must derive from that key (and build against its endpoint).
         let config = super::load_router_config();
-        let embedder = super::default_chart_embedder(&config);
+        let embedder = super::default_chart_embedder(&config, None);
         assert!(
             embedder.is_some(),
             "embedding_model: \"embed\" must yield a working chart embedder"
@@ -1099,5 +1715,99 @@ mod config_tests {
             super::default_reranker_backend(&config).is_none(),
             "no reranker_model configured → rerank stage disabled"
         );
+    }
+
+    /// A config with a valid OpenAI embedding model AND a declared `encoder`
+    /// role. The endpoint is left VALID so the OpenAI path WOULD succeed — the
+    /// encoder role must be preferred and, when its encoder cannot be built
+    /// (stub registry), return `None` rather than silently switching models.
+    fn onnx_embedder_config() -> super::RouterConfig {
+        let mut config = super::load_router_config();
+        let model: serde_json::Value =
+            serde_json::from_str(r#"{
+                "endpoint": "http://127.0.0.1:9999/v1/chat/completions",
+                "name": "embed",
+                "intelligence": 2,
+                "cost_input": 0.0,
+                "cost_output": 0.0,
+                "cost_cached_read": 0.0,
+                "speed": 10
+            }"#)
+            .unwrap();
+        config
+            .models
+            .insert("embed".into(), serde_json::from_value(model).unwrap());
+        config.embedding_model = Some("embed".into());
+        config.onnx = Some(fluent_onnx::OnnxFleetConfig {
+            encoder: Some(fluent_onnx::OnnxRoleConfig {
+                pinned: false,
+                no_sleep: false,
+                sleep_idle_seconds: None,
+                total_timeout_ms: 0,
+                idle_timeout_ms: 0,
+                params: None,
+                instances: None,
+                model: fluent_onnx::OnnxConfig::new()
+                    .model_path("/models/encoder/onnx/model_q8.onnx")
+                    .tokenizer_path("/models/encoder/tokenizer.json")
+                    .build(),
+            }),
+            ..Default::default()
+        });
+        config
+    }
+
+    #[test]
+    #[cfg(feature = "onnx")]
+    fn onnx_embedder_is_preferred_over_openai() {
+        use std::sync::Arc;
+
+        let config = onnx_embedder_config();
+        // A stub registry: the encoder role registered as an Always FillMask
+        // encoder, but its stub handle holds no real session — the encoder
+        // build must fail.
+        let registry = fluent_onnx::OrtSessionRegistry::new(Arc::new(StubLoader));
+        let encoder_cfg = config
+            .onnx
+            .as_ref()
+            .and_then(|f| f.encoder.as_ref())
+            .map(|rc| rc.clone().to_onnx_config(fluent_onnx::OnnxRole::Encoder))
+            .unwrap();
+        registry
+            .register(fluent_onnx::OnnxRole::Encoder.registry_key().to_string(), encoder_cfg)
+            .expect("register");
+
+        // The onnx encoder role is preferred: even though the endpoint is valid
+        // enough for OpenAI, a broken onnx encoder yields None — never a
+        // wrong-model OpenAI fallback.
+        let embedder = super::default_chart_embedder(&config, Some(&Arc::new(registry)));
+        assert!(
+            embedder.is_none(),
+            "onnx-declared encoder role must not fall back to the OpenAI path"
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "onnx"))]
+    fn onnx_embedder_without_feature_is_fail_open() {
+        let config = onnx_embedder_config();
+        let embedder = super::default_chart_embedder(&config, None);
+        assert!(
+            embedder.is_none(),
+            "no-ort build with an onnx encoder role: fail-open (degraded, no wrong-model fallback)"
+        );
+    }
+
+    #[derive(Default)]
+    struct StubLoader;
+
+    impl fluent_onnx::SessionLoader for StubLoader {
+        fn load(
+            &self,
+            _config: &fluent_onnx::OnnxConfig,
+            _model_key: &str,
+        ) -> Result<fluent_onnx::SessionHandle, fluent_onnx::OrtError> {
+            Ok(fluent_onnx::SessionHandle::new("stub"))
+        }
     }
 }

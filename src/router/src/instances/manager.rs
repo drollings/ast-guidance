@@ -5,6 +5,7 @@
 //! tokio runtime (owned by the server).
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,11 +14,45 @@ use serde_json::Value;
 
 use common_core::hash::uuid_v4;
 use common_core::retry::PollWithBackoff;
+use crate::cli::gguf::{compute_short_id, quant_name, read_gguf_metadata};
 use crate::config::InstanceProfile;
 
 use super::client::{InstanceClient, InstanceError, InstanceInfo, InstanceList, InstanceTotals};
 use super::{instance_grammar_string, management_base_url, validate_instances};
 use super::pool::InstancePool;
+
+/// The weights-file identity of one managed model, surfaced on the aggregate
+/// `/instances` envelope so `coral-router ps` can display it without needing
+/// the weights file on the CLI's host. The router computes it from the file it
+/// actually loaded (authoritative); empty when the model has no weights path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WeightsIdentity {
+    pub short_id: String,
+    pub arch: String,
+    pub quant: String,
+}
+
+/// Derive a model's weights identity from its GGUF file on disk. Best-effort:
+/// a missing/unreadable file yields empty strings (callers fall back).
+pub fn weights_identity(weights_path: &Path) -> WeightsIdentity {
+    let short_id = compute_short_id(weights_path);
+    let meta = read_gguf_metadata(weights_path);
+    let arch = meta
+        .get("general.architecture")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let quant = meta
+        .get("general.file_type")
+        .and_then(Value::as_u64)
+        .map(|ft| quant_name(ft as u32))
+        .unwrap_or_default();
+    WeightsIdentity {
+        short_id,
+        arch,
+        quant,
+    }
+}
 
 /// The sidecar owner of instance lifecycle for ONE spawned `llama-server`.
 /// Holds the model key (public id), the management client talking directly to
@@ -41,6 +76,9 @@ pub struct InstanceManager {
     /// from the configured profiles, updated by [`Self::set_resume`]. The fork
     /// knows nothing of it; the aggregate overlays it on the envelope.
     resume: Mutex<HashMap<String, bool>>,
+    /// The weights-file identity (`short_id`/`arch`/`quant`) of this model,
+    /// surfaced on the aggregate envelope for `coral-router ps`.
+    identity: WeightsIdentity,
 }
 
 impl InstanceManager {
@@ -62,6 +100,7 @@ impl InstanceManager {
             weights_bytes: 0,
             last_used: AtomicI64::new(-1),
             resume: Mutex::new(resume),
+            identity: WeightsIdentity::default(),
         }
     }
 
@@ -71,6 +110,20 @@ impl InstanceManager {
     pub fn with_weights_bytes(mut self, bytes: u64) -> Self {
         self.weights_bytes = bytes;
         self
+    }
+
+    /// Builder-style: set the weights-file identity (`short_id`/`arch`/`quant`)
+    /// so the aggregate `/instances` envelope can surface it.
+    #[must_use]
+    pub fn with_weights_identity(mut self, identity: WeightsIdentity) -> Self {
+        self.identity = identity;
+        self
+    }
+
+    /// The weights-file identity of this model (empty fields when the model has
+    /// no weights path).
+    pub fn weights_identity(&self) -> &WeightsIdentity {
+        &self.identity
     }
 
     /// Whether this manager's model declares an instance pool. Only instance
@@ -128,6 +181,13 @@ impl InstanceManager {
             i64::try_from(common_core::now_secs()).unwrap_or(i64::MAX),
             Ordering::Relaxed,
         );
+    }
+
+    /// The router-tracked last use (seconds; `-1` = never used). This is the
+    /// model-level recency the shared `LlmWeights` surface reports for a llama
+    /// weights instance (instance-level recency comes from the fork envelope).
+    pub fn last_used(&self) -> i64 {
+        self.last_used.load(Ordering::Relaxed)
     }
 
     /// Ask this model's server to stop the generation running in a slot.
@@ -592,6 +652,8 @@ pub fn build_instance_managers(
     // that server (no `model` routing).
     let mut managers = HashMap::new();
     for (key, entry) in &config.models {
+        // Onnx models are served by the ort registry, never by a llama-server
+        // instance pool (ROADMAP_20260827_ORT §0.5).
         if !entry.is_managed() {
             continue;
         }
@@ -625,9 +687,15 @@ pub fn build_instance_managers(
             .as_ref()
             .and_then(|p| fluent_wvr::capability::capability_aware_fs::metadata(p).ok())
             .map_or(0, |m| m.len());
+        let identity = entry
+            .weights
+            .as_deref()
+            .map(|p| weights_identity(Path::new(p)))
+            .unwrap_or_default();
         let manager = Arc::new(
             InstanceManager::new(key, client, profiles, config.sidecar.clone())
-                .with_weights_bytes(weights_bytes),
+                .with_weights_bytes(weights_bytes)
+                .with_weights_identity(identity),
         );
         managers.insert(key.clone(), manager);
     }
@@ -651,3 +719,6 @@ pub(super) fn instance_name_from_server_id(id: &str) -> &str {
 pub fn resume_snapshot_name(instance: &str) -> String {
     format!("{instance}-resume")
 }
+#[cfg(test)]
+#[path = "../../tests/instances_manager.rs"]
+mod tests;

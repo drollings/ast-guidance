@@ -1,0 +1,49 @@
+[package]
+autotests = false
+autobenches = false
+name = "fluent-onnx"
+version.workspace = true
+edition.workspace = true
+description = "ONNX / ort workers for Coral Router + spacy-rs: encoder, two-tower, PII, ColBERT"
+
+[features]
+# Default-on (precedent: fluent-db's `sqlite`). The `ort` code paths (session
+# loading, encoder/two-tower/… workers) are gated behind this feature so a
+# no-ort build still compiles: the config/lifecycle types and the registry
+# (with its injected `SessionLoader` seam) are ort-free.
+default = ["onnx"]
+onnx = ["dep:ort", "dep:tokenizers"]
+# Real-inference tests (tests/live/, `#[ignore]` + gated), run only via
+# `make ort-test-live` / `make test-live`.
+live-ai = []
+
+[dependencies]
+fluent-llm = { path = "../llm" }
+common-core = { path = "../common-core" }
+# `Runtime` (the injected async-runtime seam) for the onnx residency loop —
+# the loop is a sibling of the llama sidecar and must compose the shared
+# primitive, never ambient `tokio::spawn`.
+fluent-wvr = { path = "../fluent-wvr" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bon = { workspace = true }
+# `#[async_trait]` — the shared `LlmContext`/`LlmKVCache` contracts in
+# `fluent-llm::runtime` are async-trait traits; M2's `OnnxContext`/`OnnxKVCache`
+# implement them.
+async-trait = { workspace = true }
+# `JoinHandle` for the residency loop's `start()` (the `Runtime::spawn` return
+# type — the loop returns the injected runtime's handle to its caller).
+tokio = { workspace = true }
+ort = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# `tokio_runtime()` for the residency-loop `start()` test — the real tokio
+# backend of the shared `Runtime` trait (a test-local fake would duplicate it).
+fluent-concurrency = { path = "../fluent-concurrency" }
+
+[lints]
+workspace = true

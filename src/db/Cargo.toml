@@ -1,5 +1,7 @@
 [package]
 name = "fluent-db"
+autotests = false
+autobenches = false
 version.workspace = true
 edition.workspace = true
 
@@ -8,6 +10,7 @@ default = ["sqlite"]
 sqlite = ["dep:rusqlite", "dep:hnsw_rs", "dep:anndists", "common-core/sqlite"]
 
 [dependencies]
+fluent-types = { path = "../types" }
 fluent-wvr = { path = "../fluent-wvr" }
 common-core = { path = "../common-core" }
 tokio = { workspace = true }

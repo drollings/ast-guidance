@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use common_core::hash::uuid_v4;
-use common_core::ResponseCache;
+use fluent_llm::cache::ResponseCache;
 use http_body_util::BodyExt;
 
 use crate::config::{ModelEntry, RouteRef};
@@ -22,6 +22,7 @@ use crate::server::responses::make_error_completion;
 use crate::server::responses::make_text_completion;
 use crate::server::responses::HyperResponse;
 use crate::server::responses::ServerStats;
+use crate::server::review::{ReviewFetch, ReviewWorker};
 use crate::testing::mock::MockDispatchContext;
 use crate::types::RouterRequest;
 
@@ -57,10 +58,34 @@ pub struct ServerDeps {
     /// Managed llama-server supervisor (the process owner). `None` in mock
     /// mode. Backs `POST /models/unload` and the `/metrics` aggregation.
     pub supervisor: Option<Arc<crate::supervisor::LlamaServerSupervisor>>,
+    /// The ort ONNX session registry. Onnx-declared models are listed by
+    /// `/v1/models`; `Always`-resident ones are refused by `/models/unload`.
+    pub onnx: Option<Arc<fluent_onnx::OrtSessionRegistry>>,
+    /// The unified weights facade (ROADMAP M4): llama adapters + onnx
+    /// implementors behind the shared `LlmWeights` surface. When present, the
+    /// `/instances` + `/v1/models` handlers aggregate through it (onnx rows
+    /// appear); `POST /models/unload` routes onnx roles through it.
+    pub fleet: Option<Arc<crate::instances::traits::LlmFleet>>,
+    /// The in-process onnx generative `ChatBackend` (the `onnx/llm` routing
+    /// model). Routes whose `model_groups` resolve to an onnx role dispatch
+    /// through it. `None` when no onnx LLM is wired (mock mode / no fleet).
+    pub onnx_llm_backend: Option<Arc<dyn fluent_llm::client::ChatBackend>>,
     /// The `LedgerAgentCoordinator`, when the operator opts in. `None`
     /// (the default) leaves dispatch unchanged — requests fall through to the
     /// existing pipeline.
     pub coordinator: Option<Arc<crate::ledger::orchestrator::LedgerAgentCoordinator>>,
+    /// The async review worker (ROADMAP §12.6). `None` (the default) leaves
+    /// review disabled — requests to `/v1/sessions/{id}/review-parse` return
+    /// 501 Not Implemented.
+    pub review_worker: Option<Arc<ReviewWorker>>,
+    /// The review-model fetch seam: given a prompt, return the model's
+    /// corrections JSON. Injected so the review worker is hermetic and
+    /// unit-testable without a real endpoint.
+    pub review_fetch: Option<ReviewFetch>,
+    /// The async entity-link overlay worker (ROADMAP_20260827_ORT §6.2). `None`
+    /// (the default) leaves the overlay plane idle — no entity-link candidates
+    /// are produced.
+    pub entity_link_worker: Option<Arc<crate::server::entity_link::EntityLinkWorker>>,
 }
 
 impl ServerDeps {
@@ -75,6 +100,11 @@ impl ServerDeps {
 
 /// Best-effort ledger insert, moved off the async handler via
 /// `spawn_blocking` so sync rusqlite never runs on a tokio worker thread.
+/// (M9: this wrapper IS the pooled-path equivalent for the sync ledger API —
+/// `SqlitePool::with_conn` would do the same offload, but would require an
+/// async ledger API plus a `DbCapability` token; the parse lookup previously
+/// inline here now lives on the store as
+/// `ContentNodeStore::latest_parse_node_id`.)
 ///
 /// Both failure modes are swallowed by design: a panicked blocking task
 /// (`.ok()`) and a ledger error (`.flatten()`) degrade to "no ledger row",
@@ -110,6 +140,81 @@ pub(crate) async fn record_ledger_result(
     })
     .await
     .ok();
+}
+
+/// Best-effort write of the NLP parse node when the pipeline ran an `Nlp`
+/// stage (the request's per-sentence routing signals → a `ContentNode`, with
+/// the confidence summary + review status in the metadata, §14.1). Off the
+/// async handler, swallowing errors like `record_ledger_request`. Returns the
+/// allocated node id when the write landed — the PII auto-enqueue path
+/// (ROADMAP_20260827_ORT §3.4) needs it to reference the parse it flags.
+pub(crate) async fn record_parse_ledger(
+    ledger: Option<&Arc<ContentNodeLedger>>,
+    session_id: String,
+    request_id: String,
+    request_text: String,
+    signals: Vec<spacy_rs::routing::RoutingSignal>,
+    confidence: Option<&crate::pipeline_types::NlpConfidenceSummary>,
+    token_confidence: Option<&[f64]>,
+) -> Option<fluent_types::NodeId> {
+    let l = ledger?;
+    let l = Arc::clone(l);
+    let confidence = confidence.cloned();
+    let token_confidence = token_confidence.map(<[f64]>::to_vec);
+    tokio::task::spawn_blocking(move || {
+        // The single consolidated parse write (ROADMAP_20260828_ORT M1.3): the
+        // node AND its `interlingua_index` rows land in one ledger call, so the
+        // durable index is populated by the live request path (G2).
+        crate::ledger::nlp::record_parse_node_with_confidence(
+            &l,
+            &session_id,
+            &request_id,
+            &request_text,
+            &signals,
+            confidence.as_ref(),
+            token_confidence.as_deref(),
+        )
+        .ok()
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Pull the `Nlp` stage's routing signals from a finished pipeline result.
+fn nlp_signals_from(
+    decisions: &[crate::pipeline_types::StageDecision],
+) -> Option<Vec<spacy_rs::routing::RoutingSignal>> {
+    decisions
+        .iter()
+        .find(|d| d.stage == crate::pipeline_types::PipelineStage::Nlp)
+        .and_then(|d| crate::pipeline_types::StageMetadata::from(d.metadata.clone()).nlp_parse())
+}
+
+/// Pull the `Nlp` stage's confidence summary from a finished pipeline result
+/// (ROADMAP §14.5, C1 — the escalation ladder's "needs disambiguation" signal).
+fn nlp_confidence_from(
+    decisions: &[crate::pipeline_types::StageDecision],
+) -> Option<crate::pipeline_types::NlpConfidenceSummary> {
+    decisions
+        .iter()
+        .find(|d| d.stage == crate::pipeline_types::PipelineStage::Nlp)
+        .and_then(|d| {
+            crate::pipeline_types::StageMetadata::from(d.metadata.clone()).nlp_confidence()
+        })
+}
+
+/// Pull the `Nlp` stage's per-token confidence vector from a finished pipeline
+/// result (L3 — persisted on the parse node for the review endpoint).
+fn nlp_token_confidence_from(
+    decisions: &[crate::pipeline_types::StageDecision],
+) -> Option<Vec<f64>> {
+    decisions
+        .iter()
+        .find(|d| d.stage == crate::pipeline_types::PipelineStage::Nlp)
+        .and_then(|d| {
+            crate::pipeline_types::StageMetadata::from(d.metadata.clone()).nlp_token_confidence()
+        })
 }
 
 /// Opt-in: run a request through the `LedgerAgentCoordinator`'s
@@ -299,6 +404,9 @@ async fn ensure_classifier_ready(
     let (Some((key, entry)), Some(pool)) = (classifier, instance_pool) else {
         return;
     };
+    // Managed llama.cpp classifiers are served by a supervisor + instance pool;
+    // unmanaged (plain upstream HTTP) models never take this on-demand
+    // residency path.
     if !entry.is_managed() {
         return;
     }
@@ -344,6 +452,12 @@ async fn handle_chat_completion(
         api_key_env_name: _,
         supervisor: _,
         coordinator,
+        review_worker: _,
+        review_fetch: _,
+        entity_link_worker: _,
+        onnx: _,
+        fleet: _,
+        onnx_llm_backend,
     } = deps;
     // The dispatch post-processing hook (workflow extraction), if the
     // operator configured it. Passed through to successful dispatches only.
@@ -519,6 +633,91 @@ async fn handle_chat_completion(
     let pipeline_result =
         resolve_pipeline(&model_name, &routes, &models, &pipelines, &router_request);
 
+    // Milestone 6: when the pipeline ran the NLP parse stage, persist the
+    // per-sentence routing signals as a ledger parse node (best-effort).
+    let nlp_confidence = nlp_confidence_from(&pipeline_result.decisions);
+    let nlp_token_confidence = nlp_token_confidence_from(&pipeline_result.decisions);
+    if let Some(signals) = nlp_signals_from(&pipeline_result.decisions) {
+        let parse_node_id = record_parse_ledger(
+            ledger.as_ref(),
+            session_id.clone(),
+            request_id.clone(),
+            request_text.clone(),
+            signals.clone(),
+            nlp_confidence.as_ref(),
+            nlp_token_confidence.as_deref(),
+        )
+        .await;
+
+        // M3.4 PII auto-enqueue: after a parse is recorded, PII-shaped spans
+        // detected on the request text enqueue a review candidate through the
+        // existing credit gate. Opt-in (`review.auto_enqueue`), fail-open, and
+        // the `POST /v1/sessions/{id}/review-parse` endpoint is unchanged.
+        if let Some(worker) = deps.review_worker.as_ref() {
+            if worker.auto_enqueue_enabled() {
+                if let Some(node_id) = parse_node_id {
+                    let job = crate::server::review::build_review_job(
+                        worker.review_model(),
+                        node_id,
+                        &session_id,
+                        &request_id,
+                        &request_text,
+                        &signals,
+                        nlp_confidence.as_ref(),
+                        nlp_token_confidence.as_deref(),
+                    );
+                    worker.maybe_auto_enqueue(job).await;
+                }
+            }
+        }
+
+        // M6.2 entity-link auto-submit: when the overlay worker is enabled,
+        // every unresolved PROPN span in the parse becomes an `EntityLink`
+        // residual submitted to the credit-gated worker, which scores it and
+        // writes candidates to `overlay_candidates` (never a doc-id write).
+        // Opt-in (`overlay.entity_link_enabled`), fail-open — a submission
+        // failure logs and never takes the request path down.
+        if let Some(worker) = deps.entity_link_worker.as_ref() {
+            if let Some(node_id) = parse_node_id {
+                let jobs = crate::server::entity_link::entity_link_jobs_from_signals(
+                    &request_text,
+                    node_id,
+                    &signals,
+                );
+                for job in jobs {
+                    if let Err(e) = worker.submit(job).await {
+                        tracing::warn!(
+                            target: "router.overlay",
+                            error = %e,
+                            "entity-link submission failed (fail-open)",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // ROADMAP §14.5 (C1): a low-confidence / colliding ArcEager parse marks
+    // the request "needs disambiguation". Deterministic routing policy —
+    // additive audit signal, never a rejection (§9.4). The ladder's
+    // escalate-don't-loop consumes it to prefer a more capable model.
+    const DISAMBIGUATION_CONFIDENCE: f64 = 0.5;
+    if let Some(conf) = nlp_confidence.as_ref() {
+        if conf.needs_disambiguation(DISAMBIGUATION_CONFIDENCE) {
+            crate::audit::emit(
+                "nlp_disambiguation",
+                serde_json::json!({
+                    "source": conf.source,
+                    "overall": conf.overall,
+                    "role_coverage": conf.role_coverage,
+                    "oracle_tie_count": conf.oracle_tie_count,
+                    "collision_count": conf.collision_count,
+                    "request_id": request_id,
+                }),
+            );
+        }
+    }
+
     let user_text = router_request
         .messages
         .iter()
@@ -603,6 +802,7 @@ async fn handle_chat_completion(
         context_cache,
         session: session_step.as_ref().map(|s| s.session.clone()),
         instance_pool: instance_pool.map(|p| p.as_ref().clone()),
+        onnx_llm_backend: onnx_llm_backend.clone(),
     };
 
     if let Some(ref rt) = pipeline_result.routing_target {
@@ -776,6 +976,15 @@ async fn handle_request_inner(
             stats.requests.fetch_add(1, Ordering::Relaxed);
             crate::routes::rigor::handle_rigor_request(req, deps).await
         }
+        // -- Async parse review (ROADMAP §12.8) -------------------------------
+        ("POST", path) if path.starts_with("/v1/sessions/") && path.ends_with("/review-parse") => {
+            stats.requests.fetch_add(1, Ordering::Relaxed);
+            handle_review_parse_post(req, deps, path).await
+        }
+        ("GET", path) if path.starts_with("/v1/sessions/") && path.ends_with("/review-parse") => {
+            stats.requests.fetch_add(1, Ordering::Relaxed);
+            Ok(handle_review_parse_get(req, deps, path))
+        }
         // -- Shared-weight instance management API (mirrors the llama-server
         //    contract; aggregated across every managed model) --------------
         ("GET", "/instances" | "/v1/instances") => {
@@ -913,6 +1122,189 @@ fn route_instance_resource(method: &str, path: &str) -> Option<(&'static str, St
     }
 }
 
+/// Extract the session_id from a `/v1/sessions/{id}/review-parse` path.
+fn extract_session_id_from_review_path(path: &str) -> Option<String> {
+    let prefix = "/v1/sessions/";
+    let suffix = "/review-parse";
+    if path.starts_with(prefix) && path.ends_with(suffix) {
+        let id = &path[prefix.len()..path.len() - suffix.len()];
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
+    }
+    None
+}
+
+/// POST /v1/sessions/{id}/review-parse — enqueue a review job for the parse
+/// node associated with the session's latest request. Returns 202 with a job
+/// id on success; 404 if no review worker is configured or no parse node
+/// exists for the session.
+async fn handle_review_parse_post(
+    _req: hyper::Request<hyper::body::Incoming>,
+    deps: ServerDeps,
+    path: &str,
+) -> Result<HyperResponse, std::convert::Infallible> {
+    let Some(session_id) = extract_session_id_from_review_path(path) else {
+        return Ok(error_response(
+            hyper::StatusCode::BAD_REQUEST,
+            "invalid session id in path",
+        ));
+    };
+
+    let Some(ledger) = deps.ledger else {
+        return Ok(error_response(
+            hyper::StatusCode::NOT_FOUND,
+            "review not available: no ledger configured",
+        ));
+    };
+
+    let Some(worker) = deps.review_worker else {
+        return Ok(error_response(
+            hyper::StatusCode::NOT_IMPLEMENTED,
+            "review not enabled: no review worker configured",
+        ));
+    };
+
+    // Find the latest parse node for this session
+    let Some(node_id) = ledger.node_store().latest_parse_node_id(&session_id) else {
+        return Ok(error_response(
+            hyper::StatusCode::NOT_FOUND,
+            "no parse node found for session",
+        ));
+    };
+
+    // Get the parse data from the ledger
+    let Some(node) = ledger.get_node(node_id) else {
+        return Ok(error_response(
+            hyper::StatusCode::NOT_FOUND,
+            "parse node not found",
+        ));
+    };
+
+    // Extract the signals and confidence from the node metadata
+    let signals = extract_signals_from_node(&node);
+    let confidence = extract_confidence_from_node(&node);
+    let token_confidence = node
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("token_confidence"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(serde_json::Value::as_f64).collect::<Vec<f64>>());
+
+    // Build the ReviewJob via the shared helper: the correction-cache patterns
+    // are the aligned (lemma_id, entity_id) pairs from the sentinel-filtered
+    // token ids; `entity_id` is `None` until entity linking lands. The job
+    // carries the parse node's real origin (L4 — `parse_review` nodes are
+    // indexed under the session/request they belong to).
+    let job = crate::server::review::build_review_job(
+        worker.review_model(),
+        node_id,
+        node.session_id.as_deref().unwrap_or(&session_id),
+        node.request_id.as_deref().unwrap_or("review"),
+        &node.lod[0],
+        &signals,
+        confidence.as_ref(),
+        token_confidence.as_deref(),
+    );
+
+    // Enqueue the job
+    match worker.enqueue(job).await {
+        Ok(()) => Ok(crate::server::responses::json_response(
+            hyper::StatusCode::ACCEPTED,
+            &serde_json::json!({
+                "session_id": session_id,
+                "node_id": node_id.as_int(),
+                "status": "review_queued"
+            }),
+        )),
+        Err(e) => Ok(error_response(
+            hyper::StatusCode::SERVICE_UNAVAILABLE,
+            &format!("review queue error: {e}"),
+        )),
+    }
+}
+
+/// GET /v1/sessions/{id}/review-parse — return the review status for the
+/// session's latest parse node (if any). Returns the `review_status` metadata
+/// from the parse node. Synchronous (pure ledger reads; no await).
+fn handle_review_parse_get(
+    _req: hyper::Request<hyper::body::Incoming>,
+    deps: ServerDeps,
+    path: &str,
+) -> HyperResponse {
+    let Some(session_id) = extract_session_id_from_review_path(path) else {
+        return error_response(
+            hyper::StatusCode::BAD_REQUEST,
+            "invalid session id in path",
+        );
+    };
+
+    let Some(ledger) = deps.ledger else {
+        return error_response(
+            hyper::StatusCode::NOT_FOUND,
+            "review not available: no ledger configured",
+        );
+    };
+
+    let Some(node_id) = ledger.node_store().latest_parse_node_id(&session_id) else {
+        return error_response(
+            hyper::StatusCode::NOT_FOUND,
+            "no parse node found for session",
+        );
+    };
+
+    let Some(node) = ledger.get_node(node_id) else {
+        return error_response(
+            hyper::StatusCode::NOT_FOUND,
+            "parse node not found",
+        );
+    };
+
+    let review_status = node.metadata
+        .as_ref()
+        .and_then(|m| m.get("review_status"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({"Unreviewed": {"auto_confidence": 1.0}}));
+
+    // M6.5: surface the overlay/candidate plane for this node (entity links,
+    // PII, parse candidates) alongside the review status. The candidate table
+    // is the durable overlay surface — candidates are listed, never a doc-id
+    // write.
+    let candidates = crate::ledger::overlay::candidate_store(&ledger)
+        .and_then(|store| store.for_node(node_id).ok())
+        .unwrap_or_default();
+
+    crate::server::responses::json_response(
+        hyper::StatusCode::OK,
+        &serde_json::json!({
+            "session_id": session_id,
+            "node_id": node_id.as_int(),
+            "review_status": review_status,
+            "candidates": candidates,
+        }),
+    )
+}
+/// Extract routing signals from a parse node's metadata.
+fn extract_signals_from_node(
+    node: &fluent_types::ContentNode,
+) -> Vec<spacy_rs::routing::RoutingSignal> {
+    node.metadata
+        .as_ref()
+        .and_then(|m| m.get("signals"))
+        .and_then(|s| serde_json::from_value(s.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// Extract confidence summary from a parse node's metadata.
+fn extract_confidence_from_node(
+    node: &fluent_types::ContentNode,
+) -> Option<crate::pipeline_types::NlpConfidenceSummary> {
+    node.metadata
+        .as_ref()
+        .and_then(|m| m.get("confidence"))
+        .and_then(|c| serde_json::from_value(c.clone()).ok())
+}
+
 pub(crate) fn is_local_request(req: &hyper::Request<hyper::body::Incoming>) -> bool {
     req.headers()
         .get(hyper::header::HOST)
@@ -939,7 +1331,9 @@ fn resolve_pipeline(
     // The model id grammar `<model_id>[:<instance|group|latest>]`: a qualified
     // id resolves directly to the owning model's server, bypassing the route
     // table. `<id>:latest` means the pool's default instance.
-    if let Some((base_model, qualifier)) = model_name.split_once(':') {
+    // Canonical model-id split — zero-alloc callers use split_model_key (see pipeline.rs).
+    let (base_model, qual_opt) = crate::config::split_model_key(model_name);
+    if let Some(qualifier) = qual_opt {
         if let Some(entry) = models.get(base_model) {
             let rt = if qualifier == "latest" {
                 RoutingTarget::from_model_entry(base_model, entry)

@@ -11,8 +11,11 @@ impl super::Library {
         edge_type: &str,
         weight: f64,
     ) -> Result<(), LibraryError> {
+        // INSERT OR IGNORE on the (source, target, edge_type) uniqueness
+        // constraint (idx_edges_unique) makes re-ingesting the same RDF file
+        // idempotent — a repeated edge is a no-op, not a duplicate row.
         self.store.execute(
-            "INSERT INTO edges (source_node_id, target_node_id, edge_type, weight) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR IGNORE INTO edges (source_node_id, target_node_id, edge_type, weight) VALUES (?1, ?2, ?3, ?4)",
             params![source.as_int(), target.as_int(), edge_type, weight],
         )?;
         Ok(())
@@ -146,6 +149,20 @@ mod tests {
         let b = insert(&lib, "b");
         lib.insert_edge(a, b, "depends", 1.0).expect("insert edge");
         assert_eq!(lib.edge_count().expect("count"), 1);
+    }
+
+    #[test]
+    fn reinsert_same_edge_is_idempotent() {
+        let lib = lib();
+        let a = insert(&lib, "a");
+        let b = insert(&lib, "b");
+        lib.insert_edge(a, b, "depends", 1.0).expect("first");
+        lib.insert_edge(a, b, "depends", 1.0).expect("second");
+        assert_eq!(lib.edge_count().expect("count"), 1, "no duplicate edge rows");
+
+        // A different edge type between the same nodes IS a distinct row.
+        lib.insert_edge(a, b, "related", 0.5).expect("other type");
+        assert_eq!(lib.edge_count().expect("count"), 2);
     }
 
     #[test]

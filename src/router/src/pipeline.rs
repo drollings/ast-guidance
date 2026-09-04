@@ -4,13 +4,84 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use fluent_wvr::component_downcast_ref;
 use fluent_wvr::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use common_core::constants::default_true;
 
 use crate::config::{strip_declaration_params, ModelEntry};
+
+/// Router-local newtype for the `<base>` / `<base>:<qualifier>` model-id grammar
+/// (`pipeline.rs:87`, `config.rs:47` `split_model_key`). The wire form is still a
+/// single `model` string (OpenAI compat), but in-memory code uses the typed form
+/// so bare vs qualified dispatch is checked at the call site rather than by
+/// stringly-typed `format!("{base}:{q}")` / `split_once(':')` (Pattern 7,
+/// `fluent-wvr/SKILL.md:1107`). Kept router-local per the import-boundary rule:
+/// only the router speaks this grammar.
+///
+/// Ownership: `split_model_key` (`config/root.rs:33`) is the single `split_once(':')`
+/// site; `QualifiedModelId::parse` delegates to it. Zero-alloc callers use
+/// `split_model_key`; typed callers use `QualifiedModelId::parse`/`as_wire`.
+/// Never duplicate the `split_once` literal elsewhere. Model-id parsing is
+/// neither confidence nor task-value — no threshold.
+///
+/// `as_wire` is the single `format!("{base}:{q}")` site.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct QualifiedModelId {
+    pub base: String,
+    pub qualifier: Option<String>,
+}
+
+impl QualifiedModelId {
+    pub fn new(base: impl Into<String>, qualifier: Option<impl Into<String>>) -> Self {
+        Self {
+            base: base.into(),
+            qualifier: qualifier.map(Into::into),
+        }
+    }
+    pub fn bare(base: impl Into<String>) -> Self {
+        Self {
+            base: base.into(),
+            qualifier: None,
+        }
+    }
+    pub fn qualified(base: impl Into<String>, qualifier: impl Into<String>) -> Self {
+        Self {
+            base: base.into(),
+            qualifier: Some(qualifier.into()),
+        }
+    }
+    /// Parse the wire form (`base` or `base:qualifier`) into the typed form.
+    /// Mirrors `crate::config::split_model_key` but returns the owned newtype.
+    pub fn parse(wire: &str) -> Self {
+        match crate::config::split_model_key(wire) {
+            (base, Some(q)) => Self {
+                base: base.to_string(),
+                qualifier: Some(q.to_string()),
+            },
+            (base, None) => Self {
+                base: base.to_string(),
+                qualifier: None,
+            },
+        }
+    }
+    /// Render the wire form (`base` or `base:qualifier`) — the single format site.
+    pub fn as_wire(&self) -> String {
+        match &self.qualifier {
+            Some(q) => format!("{}:{}", self.base, q),
+            None => self.base.clone(),
+        }
+    }
+    pub fn is_qualified(&self) -> bool {
+        self.qualifier.is_some()
+    }
+}
+
+impl std::fmt::Display for QualifiedModelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.as_wire())
+    }
+}
 use crate::pipeline_types::{
     PipelineStage, StageDecision, StageDecisionProducer, StageMetadata, StageVerdict,
 };
@@ -53,16 +124,37 @@ pub struct RoutingTarget {
     /// Maximum total time for the entire request in milliseconds.
     #[serde(default = "default_total_timeout_ms")]
     pub total_timeout_ms: u64,
+    /// Name of an environment variable holding the `Authorization: Bearer`
+    /// token for an external OpenAI endpoint. Resolved to the actual token at
+    /// dispatch time by the backend; `None` sends no auth header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
     /// Ordered fallback targets to try when the primary fails.
     /// Populated at route-resolution time from all available models,
     /// ordered by intelligence proximity to the request complexity.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallbacks: Vec<RoutingTarget>,
+    /// Whether this target is served by the in-process onnx backend (a role
+    /// key like `onnx/llm`) rather than an HTTP model entry. The dispatch layer
+    /// routes onnx targets to the onnx `ChatBackend`; `url` is empty for them.
+    #[serde(default)]
+    pub is_onnx: bool,
 }
 
 /// The model id grammar on the wire: `<base>` qualified with a group or exact
 /// instance as `<base>:<qualifier>`. The fork resolves the default instance of
 /// a `default: true` profile, else a group's first available member.
+fn base_target(entry: &ModelEntry, model_key: &str) -> (String, Option<serde_json::Value>, String) {
+    let base = entry.name.clone().unwrap_or_else(|| model_key.to_string());
+    let qualifier = entry.default_dispatch_qualifier();
+    let model = QualifiedModelId::new(base.clone(), qualifier.clone()).as_wire();
+    let params = qualifier
+        .as_deref()
+        .and_then(|q| entry.instance_params_for(q))
+        .or_else(|| entry.params.clone().map(strip_declaration_params));
+    (model, params, base)
+}
+
 impl RoutingTarget {
     /// Build a routing target from a configured model entry — the canonical
     /// mapping used by every dispatch path (direct-model requests and the
@@ -72,18 +164,7 @@ impl RoutingTarget {
     /// `rope_freq_base`) are stripped from the body (the fork owns them via the
     /// instance grammar).
     pub fn from_model_entry(model_key: &str, entry: &ModelEntry) -> Self {
-        let base = entry.name.clone().unwrap_or_else(|| model_key.to_string());
-        let qualifier = entry.default_dispatch_qualifier();
-        let model = match &qualifier {
-            Some(q) => format!("{base}:{q}"),
-            None => base,
-        };
-        // When dispatch is qualified to an instance/group, overlay that
-        // profile's sampling params (profile wins); otherwise use entry params.
-        let params = qualifier
-            .as_deref()
-            .and_then(|q| entry.instance_params_for(q))
-            .or_else(|| entry.params.clone().map(strip_declaration_params));
+        let (model, params, _base) = base_target(entry, model_key);
         Self {
             url: entry.endpoint.clone(),
             model,
@@ -99,7 +180,9 @@ impl RoutingTarget {
             stream: entry.stream,
             idle_timeout_ms: entry.idle_timeout_ms,
             total_timeout_ms: entry.total_timeout_ms,
+            api_key: entry.api_key.clone(),
             fallbacks: vec![],
+            is_onnx: false,
         }
     }
 
@@ -113,7 +196,7 @@ impl RoutingTarget {
         instance_or_group: &str,
     ) -> Self {
         let base = entry.name.clone().unwrap_or_else(|| model_key.to_string());
-        let model = format!("{base}:{instance_or_group}");
+        let model = QualifiedModelId::qualified(base, instance_or_group).as_wire();
         Self {
             url: entry.endpoint.clone(),
             model,
@@ -131,22 +214,54 @@ impl RoutingTarget {
             stream: entry.stream,
             idle_timeout_ms: entry.idle_timeout_ms,
             total_timeout_ms: entry.total_timeout_ms,
+            api_key: entry.api_key.clone(),
             fallbacks: vec![],
+            is_onnx: false,
+        }
+    }
+
+    /// Build a routing target for an in-process onnx role (e.g. the generative
+    /// `onnx/llm` routing model). The target has no HTTP `url` — `is_onnx` is
+    /// set so the dispatch layer serves it through the onnx `ChatBackend` — and
+    /// uses the canonical default timeouts (the role's own knobs are applied at
+    /// the onnx-backend call site).
+    pub fn from_onnx_role(model_key: &str) -> Self {
+        use fluent_llm::constants::{
+            DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_RETRY_INTERVAL_S, DEFAULT_TOTAL_TIMEOUT_MS,
+        };
+        Self {
+            url: String::new(),
+            model: model_key.to_string(),
+            group: None,
+            target_name: Some(model_key.to_string()),
+            params: None,
+            instance: None,
+            snapshot: None,
+            id_slot: None,
+            filter_thinking: false,
+            retry_count: 0,
+            retry_base_interval_s: DEFAULT_RETRY_INTERVAL_S,
+            stream: false,
+            idle_timeout_ms: DEFAULT_IDLE_TIMEOUT_MS,
+            total_timeout_ms: DEFAULT_TOTAL_TIMEOUT_MS,
+            api_key: None,
+            fallbacks: vec![],
+            is_onnx: true,
         }
     }
 }
 
-/// Canonical timeout/retry defaults, centralized in `common_core::constants`.
+/// Canonical timeout/retry defaults, centralized in `fluent_llm::constants`.
 fn default_retry_interval() -> u64 {
-    common_core::constants::DEFAULT_RETRY_INTERVAL_S
+    fluent_llm::constants::DEFAULT_RETRY_INTERVAL_S
 }
 
 fn default_idle_timeout_ms() -> u64 {
-    common_core::constants::DEFAULT_IDLE_TIMEOUT_MS
+    fluent_llm::constants::DEFAULT_IDLE_TIMEOUT_MS
 }
 
 fn default_total_timeout_ms() -> u64 {
-    common_core::constants::DEFAULT_TOTAL_TIMEOUT_MS
+    fluent_llm::constants::DEFAULT_TOTAL_TIMEOUT_MS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,10 +278,24 @@ pub struct PipelineResult {
     pub classifier_response: Option<String>,
 }
 
+pub type StageProducer = Arc<
+    dyn Fn(&WorkContext, &[StageDecision]) -> Result<(StageDecision, Option<RoutingTarget>), WorkError>
+        + Send
+        + Sync,
+>;
+
+pub fn producer_for<T>(arc: Arc<T>) -> StageProducer
+where
+    T: StageDecisionProducer + 'static,
+{
+    Arc::new(move |ctx, prior| arc.evaluate(ctx, prior).map(|d| (d, None)))
+}
+
 /// Holds pipeline stages as `Arc<dyn Component>` and executes them sequentially.
 pub struct PipelineOrchestrator {
     name: ArcIntern<str>,
     stages: Vec<Arc<dyn Component>>,
+    producers: Vec<Option<StageProducer>>,
     depends: Vec<ArcIntern<str>>,
     provides: Vec<ArcIntern<str>>,
 }
@@ -185,6 +314,17 @@ impl PipelineOrchestrator {
         Self {
             name: ArcIntern::from("pipeline.orchestrator"),
             stages,
+            producers: vec![],
+            depends: vec![],
+            provides: vec![ArcIntern::from("pipeline.result")],
+        }
+    }
+
+    pub fn with_producers(stages: Vec<Arc<dyn Component>>, producers: Vec<Option<StageProducer>>) -> Self {
+        Self {
+            name: ArcIntern::from("pipeline.orchestrator"),
+            stages,
+            producers,
             depends: vec![],
             provides: vec![ArcIntern::from("pipeline.result")],
         }
@@ -225,33 +365,35 @@ impl PipelineOrchestrator {
                             response_len = resp.len(),
                             "classifier direct response"
                         );
-                        crate::audit::emit(
-                            "route",
-                            serde_json::json!({
-                                "stage": "classifier",
-                                "verdict": "direct_response",
-                                "response_len": resp.len(),
-                            }),
-                        );
+                        crate::audit::AuditRecord::route(
+                            PipelineStage::Classifier,
+                            StageVerdict::Passed,
+                            None,
+                            Some(resp.len()),
+                            Some("direct_response"),
+                        )
+                        .emit();
                         *classifier_response = Some(resp.to_string());
                     }
-                    if let Some(rt) = metadata.routing_target() {
+                    // The typed channel is the only routing-target handoff.
+                    if let Some(rt) = ctx
+                        .get::<RoutingTarget>(crate::stages::common::ROUTING_TARGET_TYPED_KEY)
+                        .cloned()
+                    {
                         tracing::info!(target: "router.pipeline",
                             target_route = %rt.target_name.as_deref().unwrap_or("?"),
                             target_model = %rt.model,
                             target_url = %rt.url,
                             "classifier set routing target"
                         );
-                        crate::audit::emit(
-                            "route",
-                            serde_json::json!({
-                                "stage": "classifier",
-                                "verdict": "passed",
-                                "target_route": rt.target_name,
-                                "target_model": rt.model,
-                                "target_url": rt.url,
-                            }),
-                        );
+                        crate::audit::AuditRecord::route(
+                            PipelineStage::Classifier,
+                            StageVerdict::Passed,
+                            Some(&rt),
+                            None,
+                            Some("passed"),
+                        )
+                        .emit();
                         *routing_target = Some(rt);
                     }
                 }
@@ -327,35 +469,34 @@ impl PipelineOrchestrator {
     }
 }
 
-/// Router-internal downcast to the typed decision producers. The
-/// pipelines built by `config::RouterConfigBuilder` contain exactly
-/// `DeterministicPreFilter` and `ClassifierStage`; the `None` fallback keeps
-/// the orchestrator usable with arbitrary components (test stubs, pipeline
-/// refs), which then go through the `WorkOutput` channel unchanged.
-fn as_producer(stage: &dyn Component) -> Option<&dyn StageDecisionProducer> {
-    component_downcast_ref::<crate::stages::deterministic::DeterministicPreFilter>(stage)
-        .map(|s| s as &dyn StageDecisionProducer)
-        .or_else(|| {
-            component_downcast_ref::<crate::stages::classifier::ClassifierStage>(stage)
-                .map(|s| s as &dyn StageDecisionProducer)
-        })
-}
-
 #[derive(Default)]
 pub struct PipelineOrchestratorBuilder {
     stages: Vec<Arc<dyn Component>>,
+    producers: Vec<Option<StageProducer>>,
 }
 
 impl PipelineOrchestratorBuilder {
     #[must_use]
     pub fn push(mut self, stage: Arc<dyn Component>) -> Self {
         self.stages.push(stage);
+        self.producers.push(None);
+        self
+    }
+
+    #[must_use]
+    pub fn push_with_producer(
+        mut self,
+        stage: Arc<dyn Component>,
+        producer: StageProducer,
+    ) -> Self {
+        self.stages.push(stage);
+        self.producers.push(Some(producer));
         self
     }
 
     #[must_use]
     pub fn build(self) -> PipelineOrchestrator {
-        PipelineOrchestrator::new(self.stages)
+        PipelineOrchestrator::with_producers(self.stages, self.producers)
     }
 }
 
@@ -388,33 +529,34 @@ impl WorkUnit for PipelineOrchestrator {
         // store, not `WorkOutput.data`, is the in-process handoff channel.
         let mut running = ctx.clone();
 
-        for stage in &self.stages {
+        for (idx, stage) in self.stages.iter().enumerate() {
             let stage_ctx = Self::build_stage_context(&running, &current_request);
             let start = Instant::now();
 
             let stage_name_human = stage.name().to_string();
             tracing::debug!(target: "router.pipeline", stage = %stage_name_human, "stage entering");
 
-            // Typed handoff. The known stages implement
-            // `StageDecisionProducer`, so their `StageDecision` is produced by
-            // a direct method call with the running decision accumulator
-            // passed by reference — no per-stage serialize→deserialize through
-            // `WorkOutput.data`. Arbitrary components (test stubs, pipeline
-            // refs) fall back to the `WorkOutput` channel, which is a genuine
-            // serialization boundary: their serialized decision is
-            // deserialized exactly once here and published to the typed store.
-            let decision = if let Some(producer) = as_producer(stage.as_ref()) {
-                producer.evaluate(&stage_ctx, &decisions)
-            } else {
-                stage.execute(&stage_ctx).and_then(|output| {
-                    output
-                        .data_take()
-                        .map_err(|e| WorkError::Execution(e.to_string()))
-                })
-            };
+            // Typed handoff via builder registry. If a producer is registered
+            // for this index, use it — it returns the target by value alongside
+            // the decision; otherwise fall back to the `WorkOutput`
+            // serialization boundary (test stubs, unknown components), which
+            // carries no target.
+            let outcome: Result<(StageDecision, Option<RoutingTarget>), WorkError> =
+                if let Some(prod) = self.producers.get(idx).and_then(|p| p.as_ref()) {
+                    prod(&stage_ctx, &decisions)
+                } else {
+                    stage
+                        .execute(&stage_ctx)
+                        .and_then(|output| {
+                            output
+                                .data_take()
+                                .map_err(|e| WorkError::Execution(e.to_string()))
+                        })
+                        .map(|decision| (decision, None))
+                };
 
-            match decision {
-                Ok(mut decision) => {
+            match outcome {
+                Ok((mut decision, target)) => {
                     let latency_ms = start.elapsed().as_millis() as u64;
                     decision.latency_ms = latency_ms;
                     let verdict = decision.verdict.clone();
@@ -440,7 +582,17 @@ impl WorkUnit for PipelineOrchestrator {
                     // in-process handoff. `handle_stage_verdict` reads it back
                     // by reference instead of `data_take()`, and any downstream
                     // stage can do the same via `STAGE_DECISION_KEY`.
-                    running.set(STAGE_DECISION_KEY, decision);
+                    running.set(STAGE_DECISION_KEY, decision.clone());
+                    // Publish a producer-returned target once through the
+                    // single canonical typed write. No JSON bridge: the
+                    // decision carries no routing-target shim.
+                    if let Some(rt) = target {
+                        crate::stages::common::publish_routing_target(
+                            &mut running,
+                            &mut decision,
+                            rt,
+                        );
+                    }
 
                     if let Some(early_return) = Self::handle_stage_verdict(
                         &running,
@@ -459,14 +611,9 @@ impl WorkUnit for PipelineOrchestrator {
                         latency_ms = %start.elapsed().as_millis(),
                         "stage execution error"
                     );
-                    decisions.push(StageDecision {
-                        stage: PipelineStage::Router,
-                        verdict: StageVerdict::Error,
-                        score: None,
-                        reason: e.to_string(),
-                        latency_ms: start.elapsed().as_millis() as u64,
-                        metadata: serde_json::json!({}),
-                    });
+                    // No synthetic decision is recorded: the `WorkUnit`
+                    // contract propagates the error, and the caller surfaces
+                    // the failing stage via `PipelineError::Stage`.
                     return Err(e);
                 }
             }
@@ -512,189 +659,8 @@ impl Describable for PipelineOrchestrator {
 impl_component!(PipelineOrchestrator);
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_entry() -> ModelEntry {
-        serde_json::from_value(serde_json::json!({
-            "endpoint": "http://localhost:8080/v1/chat/completions",
-            "name": "unsloth/lfm2.5-1.2b-instruct",
-            "intelligence": 2,
-            "cost_input": 1e-6,
-            "cost_output": 6e-6,
-            "cost_cached_read": 4e-7,
-            "speed": 8,
-            "total_timeout_ms": 40000,
-            "idle_timeout_ms": 8000,
-            "stream": true,
-            "filter_thinking": true,
-            "retry_count": 2,
-            "retry_base_interval_s": 1,
-            "params": {
-                "num_ctx": 98304,
-                "parallel": 3,
-                "sleep_idle_seconds": 7200
-            }
-        }))
-        .expect("valid ModelEntry")
-    }
-
-    #[test]
-    fn from_model_entry_strips_declaration_only_params() {
-        let rt = RoutingTarget::from_model_entry("lfm", &test_entry());
-
-        assert_eq!(rt.url, "http://localhost:8080/v1/chat/completions");
-        assert_eq!(rt.model, "unsloth/lfm2.5-1.2b-instruct");
-        assert_eq!(rt.target_name.as_deref(), Some("lfm"));
-        // The declaration-only llama.cpp keys are stripped — they are owned by
-        // the instance grammar, not the request body.
-        let params = rt.params.expect("params present");
-        assert!(params.get("num_ctx").is_none());
-        assert!(params.get("parallel").is_none());
-        assert!(params.get("sleep_idle_seconds").is_none());
-        assert!(rt.filter_thinking);
-        assert_eq!(rt.retry_count, 2);
-        assert_eq!(rt.retry_base_interval_s, 1);
-        assert!(rt.stream);
-        assert_eq!(rt.idle_timeout_ms, 8000);
-        assert_eq!(rt.total_timeout_ms, 40000);
-    }
-
-    #[test]
-    fn from_model_entry_keeps_sampling_params() {
-        let mut entry = test_entry();
-        entry.params = Some(serde_json::json!({
-            "num_ctx": 98304,
-            "temperature": 0.1,
-            "repeat_penalty": 1.1,
-            "chat_template_kwargs": {"enable_thinking": false},
-        }));
-        let rt = RoutingTarget::from_model_entry("lfm", &entry);
-        let params = rt.params.expect("params present");
-        assert!(params.get("num_ctx").is_none());
-        assert_eq!(params.get("temperature"), Some(&serde_json::json!(0.1)));
-        assert_eq!(params.get("repeat_penalty"), Some(&serde_json::json!(1.1)));
-        assert!(params.get("chat_template_kwargs").is_some());
-    }
-
-    fn entry_with_instances(instances: serde_json::Value) -> ModelEntry {
-        serde_json::from_value(serde_json::json!({
-            "endpoint": "http://localhost:8080/v1/chat/completions",
-            "name": "abiray/lfm2.5-2.6b-heretic-abliterated",
-            "intelligence": 2,
-            "cost_input": 1e-6, "cost_output": 6e-6, "cost_cached_read": 4e-7,
-            "speed": 8,
-            "instances": instances,
-        }))
-        .expect("valid ModelEntry")
-    }
-
-    #[test]
-    fn from_model_entry_qualifies_single_shared_group() {
-        // swarm: count 3, all in group "swarm", no explicit default -> group.
-        let entry = entry_with_instances(serde_json::json!({
-            "swarm": { "count": 3, "group": "swarm", "num_ctx": 16384, "warm": true }
-        }));
-        let rt = RoutingTarget::from_model_entry("swarm", &entry);
-        assert_eq!(
-            rt.model,
-            "abiray/lfm2.5-2.6b-heretic-abliterated:swarm"
-        );
-    }
-
-    #[test]
-    fn from_model_entry_qualifies_default_profile() {
-        // ledger: pinned + default -> its group ("ledger").
-        let entry = entry_with_instances(serde_json::json!({
-            "ledger": { "num_ctx": 131072, "pinned": true, "default": true }
-        }));
-        let rt = RoutingTarget::from_model_entry("ledger", &entry);
-        assert_eq!(
-            rt.model,
-            "abiray/lfm2.5-2.6b-heretic-abliterated:ledger"
-        );
-    }
-
-    #[test]
-    fn from_model_entry_no_instances_leaves_bare_base() {
-        let rt = RoutingTarget::from_model_entry("lfm", &test_entry());
-        assert_eq!(rt.model, "unsloth/lfm2.5-1.2b-instruct");
-    }
-
-    #[test]
-    fn from_model_entry_instance_targets_named_point() {
-        let entry = entry_with_instances(serde_json::json!({
-            "ledger": { "num_ctx": 131072, "pinned": true, "default": true },
-            "scratch": { "num_ctx": 131072, "sleep_idle_seconds": 30 }
-        }));
-        let rt = RoutingTarget::from_model_entry_instance("swarm", &entry, "scratch");
-        assert_eq!(
-            rt.model,
-            "abiray/lfm2.5-2.6b-heretic-abliterated:scratch"
-        );
-        assert_eq!(rt.instance.as_deref(), Some("scratch"));
-        assert_eq!(rt.snapshot, None);
-        assert_eq!(rt.id_slot, None);
-    }
-
-    #[test]
-    fn from_model_entry_merges_instance_profile_params() {
-        // The reference swarm config: the default profile (ledger) carries
-        // temperature 0.1, scratch carries 0.4. Those must reach the body for
-        // the qualifier each builder resolves.
-        let entry = entry_with_instances(serde_json::json!({
-            "swarm": { "count": 3, "group": "swarm", "num_ctx": 16384, "warm": true,
-                       "params": { "temperature": 0.1 } },
-            "ledger": { "num_ctx": 131072, "pinned": true, "default": true,
-                        "params": { "temperature": 0.1 } },
-            "scratch": { "num_ctx": 131072, "sleep_idle_seconds": 30,
-                         "params": { "temperature": 0.4 } }
-        }));
-
-        // from_model_entry resolves the default profile (ledger, temp 0.1).
-        let rt = RoutingTarget::from_model_entry("swarm", &entry);
-        assert_eq!(rt.model, "abiray/lfm2.5-2.6b-heretic-abliterated:ledger");
-        assert_eq!(
-            rt.params.as_ref().and_then(|p| p.get("temperature")),
-            Some(&serde_json::json!(0.1)),
-            "default profile sampling params reach the dispatch body"
-        );
-
-        // from_model_entry_instance targets scratch (temp 0.4).
-        let rt = RoutingTarget::from_model_entry_instance("swarm", &entry, "scratch");
-        assert_eq!(rt.model, "abiray/lfm2.5-2.6b-heretic-abliterated:scratch");
-        assert_eq!(
-            rt.params.as_ref().and_then(|p| p.get("temperature")),
-            Some(&serde_json::json!(0.4)),
-            "named-instance sampling params reach the dispatch body"
-        );
-    }
-
-    #[test]
-    fn from_model_entry_falls_back_to_key_when_name_missing() {
-        let mut entry = test_entry();
-        entry.name = None;
-        let rt = RoutingTarget::from_model_entry("lfm", &entry);
-        assert_eq!(rt.model, "lfm");
-    }
-
-    #[test]
-    fn routing_target_serde_defaults_read_canonical_constants() {
-        // Round-trips through the serde path (no explicit timeout/retry fields)
-        // so the defaults actually exercised are the serde defaults — guards
-        // against the 120s/10s-vs-300s/30s divergence recurring (D7).
-        let rt: RoutingTarget = serde_json::from_str(r#"{"url":"u","model":"m"}"#).unwrap();
-        assert_eq!(
-            rt.total_timeout_ms,
-            common_core::constants::DEFAULT_TOTAL_TIMEOUT_MS
-        );
-        assert_eq!(
-            rt.idle_timeout_ms,
-            common_core::constants::DEFAULT_IDLE_TIMEOUT_MS
-        );
-        assert_eq!(
-            rt.retry_base_interval_s,
-            common_core::constants::DEFAULT_RETRY_INTERVAL_S
-        );
-    }
-}
+#[path = "../tests/pipeline.rs"]
+mod tests;
+#[cfg(test)]
+#[path = "../tests/qualified_model_id_roundtrip.rs"]
+mod qualified_model_id_roundtrip;

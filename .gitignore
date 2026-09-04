@@ -27,9 +27,18 @@ doc/Legacy
 .guidance/capabilities
 .guidance/skills
 bin/guidance-cpp
-data/
 
 env/coral-router.json
+
+# Runtime data at the repo root (sqlite DBs, model slots, opt caches). The
+# root-anchor keeps per-crate source-of-truth data tracked (e.g.
+# src/spacy-rs/data/en_lemmatizer.json).
+/data/
+
+# Python
+**/*.pyc
+**/*.pyx
+**/__pycache__
 
 # Zig
 zig/zig-*

@@ -74,29 +74,3 @@ pub fn rev_parse_head(workspace: &Path) -> Result<String, GitError> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_diff_staged_no_repo() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let result = diff_staged(dir.path());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_commit_no_repo() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let result = commit(dir.path(), "test");
-        assert!(result.is_ok());
-        assert!(!result.unwrap());
-    }
-
-    #[test]
-    fn test_rev_parse_head_no_repo() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let result = rev_parse_head(dir.path());
-        assert!(result.is_err());
-    }
-}

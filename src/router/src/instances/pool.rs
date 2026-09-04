@@ -208,6 +208,62 @@ impl InstancePool {
         }
     }
 
+    /// ROADMAP M7 resize-to-demand: when the dispatch path targets a named
+    /// context and the caller's declared context need (`num_ctx`) exceeds the
+    /// profile's allocated `n_ctx` but stays under its `max_ctx`, resize the
+    /// instance via the fork's `client.resize` before dispatching. A need
+    /// beyond `max_ctx` is a loud error (no new fail-open) — the same shape a
+    /// too-large llama request gets today. No-op for unmanaged / unnamed
+    /// targets (best-effort, like `ensure_target_ready`).
+    pub async fn resize_to_demand(
+        &self,
+        endpoint_url: &str,
+        instance: Option<&str>,
+        num_ctx: Option<u64>,
+    ) -> Result<(), InstanceError> {
+        let Some(need) = num_ctx else {
+            return Ok(());
+        };
+        let Some(instance) = instance else {
+            return Ok(());
+        };
+        let Some(manager) = self.manager_for_url(endpoint_url) else {
+            return Ok(());
+        };
+        // The targeted context's profile: the allocated `n_ctx` and the cap.
+        let Some(profile) = manager
+            .profiles()
+            .iter()
+            .find(|p| p.name.as_deref() == Some(instance))
+        else {
+            // No configured profile for the instance — nothing to size.
+            return Ok(());
+        };
+        if need <= profile.num_ctx {
+            return Ok(());
+        }
+        if let Some(cap) = profile.max_ctx {
+            if need > cap {
+                return Err(InstanceError::Rejected {
+                    status: 400,
+                    body: format!(
+                        "instance '{instance}' resize to {need} exceeds max_ctx {cap}"
+                    ),
+                });
+            }
+        }
+        tracing::info!(
+            target: "router.instances",
+            model = %manager.model_key(),
+            instance = %instance,
+            allocated = profile.num_ctx,
+            requested = need,
+            max_ctx = ?profile.max_ctx,
+            "resizing instance to demand",
+        );
+        manager.client().resize(instance, need).await
+    }
+
     /// One device-wide residency pass. The pool owns VRAM residency for the
     /// whole device (all managed servers share it), so this aggregates every
     /// manager's `/instances` into a device `used` total and compares it to

@@ -10,6 +10,7 @@ http = ["dep:reqwest"]
 sqlite = ["dep:rusqlite", "dep:hnsw_rs", "dep:anndists"]
 
 [dependencies]
+http = { workspace = true }
 bitvec = { workspace = true }
 blake3 = { workspace = true }
 fastrand = { workspace = true }
@@ -22,6 +23,8 @@ rusqlite = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+crc32fast = "1"
+regex = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

@@ -20,11 +20,74 @@
 use std::sync::{Mutex, RwLock};
 
 use anndists::dist::DistCosine;
-use common_core::constants::HnswParams;
+use common_core::constants::{HnswParams, DEFAULT_HNSW_THRESHOLD};
 use common_core::sync::{lock, lock_read, lock_write};
 use hnsw_rs::hnsw::Hnsw;
 
 use crate::error::DbError;
+
+/// Single adaptive-dispatch policy for HNSW-vs-brute-force routing (M6).
+///
+/// This is a policy, not an index: it owns the threshold and answers whether
+/// a store of `len` vectors should consult a built HNSW graph. The one
+/// threshold source is [`DEFAULT_HNSW_THRESHOLD`]; there is no second
+/// threshold type — call sites reuse `HnswParams`/`DEFAULT_HNSW_THRESHOLD`
+/// through this struct.
+///
+/// Axis: **[B] cost/recall only.** This gate measures corpus scale (where the
+/// HNSW approximation pays off — recall≥0.95 at N≥512 per M5a). It is NOT a
+/// confidence signal and must never gate verification, persistence, or
+/// frontier escalation (those are [A]/[B]-outcome decisions owned by the
+/// workflow/rubric gates calibrated in M5c–M5d).
+///
+/// [`DEFAULT_HNSW_THRESHOLD`]: common_core::constants::DEFAULT_HNSW_THRESHOLD
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdaptiveHnsw {
+    /// Corpus size above which a built HNSW graph is consulted. Strict `>`:
+    /// `len == threshold` stays brute-force.
+    pub threshold: usize,
+}
+
+impl AdaptiveHnsw {
+    /// Policy with an explicit threshold (tests, unusual corpora).
+    pub fn new(threshold: usize) -> Self {
+        Self { threshold }
+    }
+
+    /// Whether a store holding `len` vectors should use its built HNSW graph
+    /// (`len > threshold`).
+    pub fn should_use_built(&self, len: usize) -> bool {
+        len > self.threshold
+    }
+
+    /// Query-time dispatch: probe HNSW iff the index is built *and* the corpus
+    /// is above threshold. `false` means "take the call-site brute-force
+    /// fallback" — the fallback bodies stay call-site code (M2), this only
+    /// answers which path to take.
+    pub fn dispatch(&self, hnsw_built: bool, len: usize) -> bool {
+        hnsw_built && self.should_use_built(len)
+    }
+}
+
+impl Default for AdaptiveHnsw {
+    fn default() -> Self {
+        Self {
+            threshold: DEFAULT_HNSW_THRESHOLD,
+        }
+    }
+}
+
+/// A single HNSW index handle — the named index path owned by a store (e.g.
+/// the router's `ChartStore` workflow_library index). Moved here from
+/// `fluent_router::hnsw` (D7, router shim deleted in M3): the `db` crate is
+/// the canonical home for the HNSW surface (`HnswIndex`, `hnsw_lookup`), and
+/// this handle is plain data (no router dependency) so it belongs with that
+/// surface. Consume it as `fluent_db::hnsw::HnswIndexHandle` directly.
+#[derive(Debug, Clone)]
+pub struct HnswIndexHandle {
+    pub name: String,
+    pub path: String,
+}
 
 /// A generic HNSW-backed vector index with external-id mapping.
 ///
@@ -122,7 +185,8 @@ impl HnswIndex {
         // resolution. Lock order: hnsw (read) → id_map.
         let _id_map = lock(&self.id_map);
 
-        hnsw.search(query, k, k)
+        let ef = (k * 4).max(64);
+        hnsw.search(query, k, ef)
             .into_iter()
             .map(|n| (n.d_id, n.distance))
             .collect()
@@ -149,104 +213,43 @@ impl HnswIndex {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::vector::vec_to_bytes;
-
-    #[test]
-    fn empty_index_is_not_built() {
-        let idx = HnswIndex::new();
-        assert!(!idx.is_built());
-        assert_eq!(idx.len(), 0);
-        assert!(idx.search(&[1.0, 0.0], 5).is_empty());
+/// Probe a possibly-unbuilt [`HnswIndex`], resolving external ids to the
+/// caller keys the index was built with.
+///
+/// M5: the one shared HNSW-then-brute-force stanza. Returns `Some((key,
+/// distance))` pairs in HNSW order (cosine distance, NOT similarity — each
+/// site applies its own `1 - dist` mapping), or `None` when the caller must
+/// use its exact brute-force fallback: the index is unbuilt, the probe is
+/// empty (`k == 0`, malformed query), or no hit resolves through the id map.
+///
+/// Deliberately lookup-only: the fallback bodies stay call-site code because
+/// sort/truncate/re-score/filter semantics differ per store (unifying them
+/// would be a behavior change). Compose as
+/// `hnsw_lookup(...).map_or_else(fallback, scored)` — see
+/// `node_store::knn_search`, `charts::store::search`,
+/// `ledger::workflow_store::nearest` for the three production shapes.
+pub fn hnsw_lookup(hnsw: &HnswIndex, query: &[f32], k: usize) -> Option<Vec<(i64, f32)>> {
+    if !hnsw.is_built() {
+        return None;
     }
-
-    #[test]
-    fn insert_then_search_returns_nearest() {
-        let idx = HnswIndex::new();
-        let id_a = idx.insert(101, &[1.0, 0.0, 0.0]);
-        let id_b = idx.insert(202, &[0.0, 1.0, 0.0]);
-        assert_eq!(id_a, 0);
-        assert_eq!(id_b, 1);
-        assert!(idx.is_built());
-        assert_eq!(idx.len(), 2);
-        assert_eq!(idx.id_map_snapshot(), vec![101, 202]);
-
-        let nearest = idx.search(&[1.0, 0.1, 0.0], 1);
-        assert_eq!(nearest.len(), 1);
-        let (external, _dist) = nearest[0];
-        let node_id = idx.id_map_snapshot()[external];
-        assert_eq!(node_id, 101);
+    if query.is_empty() || k == 0 {
+        // Malformed probe: an empty query panics inside the distance kernel
+        // (dim assertion), so short-circuit to the brute-force fallback
+        // signal instead of touching the index.
+        return None;
     }
-
-    #[test]
-    fn rebuild_from_round_trips() {
-        let idx = HnswIndex::new();
-        let rows = vec![
-            (7, vec_to_bytes(&[1.0, 0.0])),
-            (8, vec_to_bytes(&[0.0, 1.0])),
-            (9, vec_to_bytes(&[0.8, 0.2])),
-        ];
-        let count = idx
-            .rebuild_from(rows.into_iter(), |b| Some(crate::vector::bytes_to_vec(b)))
-            .unwrap();
-        assert_eq!(count, 3);
-        assert_eq!(idx.len(), 3);
-        assert_eq!(idx.id_map_snapshot(), vec![7, 8, 9]);
-
-        let nearest = idx.search(&[1.0, 0.05], 1);
-        let external = nearest[0].0;
-        assert_eq!(idx.id_map_snapshot()[external], 7);
+    let hits = hnsw.search(query, k);
+    if hits.is_empty() {
+        return None;
     }
-
-    #[test]
-    fn rebuild_from_skips_bad_blobs() {
-        let idx = HnswIndex::new();
-        let rows = vec![
-            (1, vec_to_bytes(&[1.0, 0.0])),
-            (2, vec![0u8; 3]), // not a multiple of 4 -> decode None
-            (3, Vec::new()),   // empty -> skipped
-        ];
-        let count = idx
-            .rebuild_from(rows.into_iter(), crate::vector::try_bytes_to_vec)
-            .unwrap();
-        assert_eq!(count, 3, "total rows examined");
-        assert_eq!(idx.len(), 1, "only the valid blob is indexed");
-        assert_eq!(idx.id_map_snapshot(), vec![1]);
-    }
-
-    #[test]
-    fn insert_after_rebuild_extends_id_map() {
-        let idx = HnswIndex::new();
-        idx.insert(1, &[1.0, 0.0]);
-        idx.rebuild_from(std::iter::once((5, vec_to_bytes(&[0.0, 1.0]))), |b| {
-            Some(crate::vector::bytes_to_vec(b))
-        })
-        .unwrap();
-        assert_eq!(idx.id_map_snapshot(), vec![5]);
-        idx.insert(9, &[1.0, 0.0]);
-        assert_eq!(idx.id_map_snapshot(), vec![5, 9]);
-        assert_eq!(idx.len(), 2);
-    }
-
-    #[test]
-    fn poisoned_hnsw_rwlock_still_serves_insert_and_search() {
-        // The hnsw `RwLock` must recover from poison via
-        // `common_core::sync::lock_write` / `lock_read`. A panic while holding
-        // a write guard obtained via `.write().unwrap()` poisons the lock; a
-        // subsequent `insert`/`search` must still work.
-        let idx = HnswIndex::new();
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = idx.hnsw.write().unwrap();
-            panic!("boom");
-        }));
-        assert!(panic.is_err(), "expected the closure to panic");
-        idx.insert(101, &[1.0, 0.0, 0.0]);
-        let nearest = idx.search(&[1.0, 0.1, 0.0], 1);
-        assert_eq!(nearest.len(), 1);
-        assert_eq!(idx.id_map_snapshot()[nearest[0].0], 101);
-        assert!(idx.is_built());
-        assert_eq!(idx.len(), 1);
-    }
+    let id_map = hnsw.id_map_snapshot();
+    let resolved: Vec<(i64, f32)> = hits
+        .into_iter()
+        .filter_map(|(d_id, distance)| id_map.get(d_id).map(|key| (*key, distance)))
+        .collect();
+    if resolved.is_empty() { None } else { Some(resolved) }
 }
+
+#[cfg(all(test, feature = "sqlite"))]
+#[path = "../tests/hnsw.rs"]
+mod tests;

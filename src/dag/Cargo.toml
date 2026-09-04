@@ -2,6 +2,7 @@
 name = "fluent-dag"
 version.workspace = true
 edition.workspace = true
+autotests = false
 
 [dependencies]
 common-core = { path = "../common-core", features = ["sqlite"] }

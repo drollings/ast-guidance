@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![allow(clippy::pedantic, clippy::all)]
 
 //! common-core: Zero-domain generic utility crate (hashing, formatting, I/O,
 //! shell, metrics, string utilities, watchdogs, time helpers, sync→async
@@ -13,9 +14,14 @@
 //! not here. The sole exceptions are generic storage backends (`rusqlite`
 //! behind the `sqlite` feature) and generic data utilities (hashing, I/O,
 //! strings, formatting, metrics, drift, interner, watchdogs).
+pub mod blob_spec;
 pub mod cache;
+pub mod calibration;
+pub mod cite;
+pub mod score;
+pub mod telemetry;
 
-pub use cache::{CachedResponse, LoadCache, ResponseCache};
+pub use cache::LoadCache;
 
 pub mod config;
 pub mod constants;
@@ -42,14 +48,15 @@ pub mod sqlite;
 pub mod string;
 pub mod sync;
 pub mod time;
-pub mod tokens;
+pub mod vector_math;
 pub mod walk;
 pub mod watchdog;
+pub mod yago_normalize;
+pub mod yago_taxonomy;
 
 pub use config::{load_json, load_json_or_default};
 pub use constants::{
-    default_true, HnswParams, MAX_EMBEDDING_DIMENSIONS, MAX_FILE_SIZE, MAX_JSON_DEPTH,
-    MAX_VALUE_LEN,
+    default_true, HnswParams, MAX_FILE_SIZE, MAX_JSON_DEPTH, MAX_VALUE_LEN,
 };
 pub use drift::BitSetDrift;
 #[cfg(feature = "sqlite")]
@@ -77,58 +84,20 @@ pub use runtime::block_on;
 pub use shell::{run_capture, run_command, run_shell_capture, shell_cmd, CommandOutput};
 #[cfg(feature = "sqlite")]
 pub use sqlite::{
-    init_embedding_cache, make_hnsw, open_in_memory, open_shared_in_memory, open_wal, run_batch,
-    EMBEDDING_CACHE_SCHEMA,
+    make_hnsw, open_in_memory, open_shared_in_memory, open_wal, run_batch,
 };
 pub use string::{
     contains_any, contains_any_word, contains_ident_word, contains_ignore_case, contains_word,
-    detect_identifier_kind, drain_sse_lines, filter_unsafe_chars, find_subseq, first_comment_line,
+    detect_identifier_kind, filter_unsafe_chars, find_subseq, first_comment_line,
     first_sentence, has_extension, is_noisy_comment, is_path_token, is_test_path,
     looks_like_identifier, lower_into, skill_name_from_ref, slugify, strip_boilerplate,
     strip_nl_prefix, trim_doc_prefix, trim_left, trim_right, truncate_at_sentence, AnsiStripper,
-    IdentifierKind, StreamingThinkFilter, STOP_WORDS,
+    IdentifierKind, STOP_WORDS,
 };
 pub use time::now_secs;
-#[allow(deprecated)]
-pub use tokens::DEFAULT_CHARS_PER_TOKEN;
-pub use tokens::{
-    chunk_document, estimate_tokens, estimate_tokens_floor, estimate_tokens_with,
-    AtomicTokenBudget, ChunkConfig, TokenBudget,
-};
 pub use walk::{collect_extensions, should_skip_dir, walk_files, SOURCE_EXTENSIONS};
 pub use watchdog::{
     BudgetWatchdog, RepetitionWatchdog, WallClockWatchdog, WatchdogEvent, WatchdogEventType,
     WatchdogSet,
 };
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn prelude_smoke() {
-        use crate::prelude::*;
-        let _ = blake3_hex(b"test");
-        let _ = fnv1a64(b"test");
-        let _ = sha256_hex(b"test");
-        let _ = hex_encode(&[1u8, 2, 3]);
-        let _ = LatencyHistogram::new();
-        let _ = estimate_tokens("test");
-        let _ = ensure_dir(std::path::Path::new("/tmp/common-core-prelude-smoke"));
-        let _ = TokenBudget(100);
-    }
-
-    #[test]
-    fn uuid_v4_format() {
-        let id = crate::uuid_v4();
-        assert_eq!(id.len(), 36);
-        assert_eq!(id.chars().filter(|&c| c == '-').count(), 4);
-    }
-
-    #[test]
-    fn now_secs_returns_nonzero_after_2020() {
-        let s = crate::now_secs();
-        assert!(
-            s > 1_577_836_800,
-            "now_secs returned {s}, expected > 2020-01-01"
-        );
-    }
-}

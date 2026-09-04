@@ -1,7 +1,0 @@
-{
-  "meta": {
-    "module": "src.common.vaxis_stub.root",
-    "source": "src/common/vaxis_stub/root.zig",
-    "language": "zig"
-  }
-}

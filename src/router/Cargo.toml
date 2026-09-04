@@ -1,5 +1,7 @@
 [package]
 name = "fluent-router"
+autotests = false
+autobenches = false
 version.workspace = true
 edition.workspace = true
 
@@ -11,6 +13,14 @@ fluent-types = { path = "../types" }
 fluent-llm = { path = "../llm" }
 fluent-dag = { path = "../dag" }
 fluent-db = { path = "../db" }
+# The shared `LlmWeights`/`LlmContext`/`LlmKVCache` contracts in
+# `fluent-llm::runtime` are `#[async_trait]` traits; the fleet adapters
+# (`instances/traits.rs`, `ort.rs`) implement them.
+async-trait = { workspace = true }
+# Milestone 6: DEP-as-routing-signal extraction + the NlpStage that runs the
+# deterministic NLP pipeline on inbound natural-language requests.
+spacy-rs = { path = "../spacy-rs" }
+fluent-onnx = { path = "../fluent-onnx" }
 fluent-wvr-testutil = { path = "../fluent-wvr-testutil" }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -33,12 +43,33 @@ bytes = { workspace = true }
 rusqlite = { workspace = true }
 minijinja = { workspace = true }
 search-vector = { path = "../search-vector" }
+bitvec = { workspace = true }
+internment = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 
 [features]
+# The onnx wiring (registry build at boot, encoder/overlay workers) is gated on
+# the same feature as fluent-onnx's, so a no-ort build still compiles and runs
+# deterministically: onnx-declared models degrade to plain HTTP entries with a
+# loud warning (fail-open).
+default = ["onnx"]
+onnx = ["fluent-onnx/onnx"]
 live-ai = []
+
+[[test]]
+name = "liveness_calibration"
+path = "tests/liveness_calibration.rs"
+
+[[test]]
+name = "threshold_calibration"
+path = "tests/threshold_calibration.rs"
+
+[[test]]
+name = "live"
+path = "tests/live.rs"
+required-features = ["live-ai"]
 
 [lints]
 workspace = true

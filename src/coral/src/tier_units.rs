@@ -519,7 +519,7 @@ mod tests {
         // the queue, proving the wiring exists end-to-end.
         let queue = fluent_llm::llm_queue::build_default_queue(
             fluent_concurrency::tokio_runtime(),
-            &fluent_concurrency::llm_queue::LlmQueueConfig {
+            &fluent_llm::protocol::LlmQueueConfig {
                 worker_count: 2,
                 queue_capacity: 20,
             },

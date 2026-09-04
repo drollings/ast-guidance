@@ -24,10 +24,16 @@ fn make_request(text: &str) -> RouterRequest {
 }
 
 fn classify_output(action: &str, coherence: f64, safety: f64, reason: &str) -> String {
+    // Dual-shape: the flat engine reads `action`/scores, the tree engine
+    // reads `route`/three-axis keys. Reject verdicts pick no child.
     serde_json::to_string(&serde_json::json!({
         "action": action,
+        "route": null,
         "coherence_score": coherence,
+        "coherence": coherence,
         "safety_score": safety,
+        "safety": safety,
+        "complexity": 5,
         "reason": reason,
         "intent": if action == "reject" { serde_json::Value::Null } else { serde_json::Value::String("question".into()) },
     }))
@@ -37,8 +43,12 @@ fn classify_output(action: &str, coherence: f64, safety: f64, reason: &str) -> S
 fn classify_with_target(target: &str) -> String {
     serde_json::to_string(&serde_json::json!({
         "action": "route",
+        "route": target,
         "coherence_score": 0.95,
+        "coherence": 0.95,
         "safety_score": 0.9,
+        "safety": 0.9,
+        "complexity": 5,
         "intent": "question",
         "reason": "well-formed factual query",
         "target": target,
@@ -56,7 +66,14 @@ fn make_test_config() -> RouterConfig {
         "pipelines": {"default": {"deterministic_prefilter": true, "classifier": true, "blacklist": "env/pii-patterns.json"}},
         "models": {"fast": {"endpoint": "http://upstream.test:8080/v1/chat/completions", "name": "fast", "intelligence": 1, "cost_input": 0.000001, "cost_output": 0.000006, "cost_cached_read": 0.0000004, "speed": 10, "total_timeout_ms": 5000, "idle_timeout_ms": 2000, "stream": false, "filter_thinking": false, "retry_count": 0, "retry_base_interval_s": 1}},
         "model_groups": {"fast": ["fast"]},
-        "routes": {"fast": {"group": "fast", "pipelines": ["default"]}},
+        "classification": {"root": {
+            "type": "classifier",
+            "description": "test router",
+            "model": "fast",
+            "children": [
+                {"key": "fast", "description": "test route", "node": {"type": "terminal", "route": "fast", "group": "fast"}}
+            ]
+        }},
         "default_route": "fast"
     }"#,
     ) {
@@ -191,12 +208,12 @@ fn test_e2e_routing_decision_included() {
     assert_eq!(classifier_decision.stage, PipelineStage::Classifier);
     assert_eq!(classifier_decision.verdict, StageVerdict::Passed);
 
-    let routing_target = classifier_decision
-        .metadata
-        .get("routing_target")
-        .expect("classifier decision should have routing_target metadata");
+    let routing_target = result
+        .routing_target
+        .as_ref()
+        .expect("pipeline result should carry the typed routing target");
     assert!(
-        routing_target.get("url").is_some(),
+        !routing_target.url.is_empty(),
         "routing target should have a url"
     );
 }

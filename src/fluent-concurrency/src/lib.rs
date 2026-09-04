@@ -6,11 +6,17 @@ pub mod affinity;
 // feature so a non-DB consumer pays nothing for the database layer.
 #[cfg(feature = "db")]
 pub mod capability;
+pub mod credit_pool;
+pub mod feed_worker;
 pub mod flow;
 #[cfg(feature = "db")]
 pub mod io;
 pub mod ladder;
-pub mod llm_queue;
+// NOTE (ROADMAP_20260903_LLM M11): `llm_queue` (LLM protocol types +
+// `LlmRequestQueue`, owned by `fluent_llm::protocol` since M9) lived here
+// through M10 as deprecated byte-identical shims; M11 deleted the module.
+// The generic executor (`pool::ResultPool`, `stream::StreamAbort`,
+// `runtime::TestRuntime`) stays and is composed by the protocol owner.
 pub mod pool;
 pub mod queue;
 pub mod reserve;
@@ -28,6 +34,11 @@ use std::sync::Arc;
 pub fn tokio_runtime() -> Arc<dyn fluent_wvr::Runtime> {
     Arc::new(runtime::tokio::TokioRuntime)
 }
+#[cfg(test)]
+#[path = "../tests/mod.rs"]
+mod e2e_tests;
 
 #[cfg(test)]
-mod tests;
+#[path = "../tests/affinity_calibration.rs"]
+mod affinity_calibration_tests;
+

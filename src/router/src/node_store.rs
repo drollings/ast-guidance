@@ -17,26 +17,31 @@
 //! The LOD lifecycle (LOD0/LOD5 eager, LOD1–LOD4 lazy from LOD0 only via the
 //! `Summarizer`, recency compaction) is ported here unchanged from the ledger.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use common_core::sync::{lock, lock_read, lock_write};
+use fluent_db::error::DbError;
+use fluent_db::hnsw::AdaptiveHnsw;
 use fluent_db::migrate::migrate;
 use fluent_db::store::SqliteStore;
 use fluent_db::vector::knn_brute_force;
-use fluent_types::{ContentNode, KnnHit, NodeId};
+use fluent_llm::client::ChatBackend;
+use fluent_llm::EmbeddingProvider;
+use fluent_types::{AnnotationClaim, ClaimStatus, ContentNode, KnnHit, NodeId, OriginRole, OverlayKind, OverlayStatus};
 use fluent_wvr::ArcIntern;
+use rusqlite::Connection;
 
+use crate::ledger::correction_index::{upsert_correction_row, CorrectionRow};
+use crate::ledger::annotations::AnnotationStore;
 use crate::ledger::{
     CompactionStrategy, LedgerEntry, LedgerError, RecencyCompaction, LAZY_LOD_RANGE,
     LOD0_FULL_TEXT, LOD5_LABEL,
 };
+use crate::ledger_guard::scrub_for_ledger;
 use crate::summarization::Summarizer;
-
-#[cfg(test)]
-use fluent_db::error::DbError;
 
 /// The shared ContentNode store: refcounted nodes + interned indices + durable
 /// backing.
@@ -54,7 +59,16 @@ pub struct ContentNodeStore {
     next_id: AtomicI64,
     /// The existing `ledger` table. `None` for a pure in-memory store that
     /// skips durability.
-    durable: Option<SqliteStore>,
+    ///
+    /// NOTE (M9 decision): this stays a single-connection `SqliteStore`,
+    /// not a `SqlitePool`. The ledger sub-stores (annotations, correction
+    /// index, concept store) share this one `Arc<SqliteStore>` for
+    /// single-writer semantics and atomic cross-view updates; the store API
+    /// is sync (served off async paths via `spawn_blocking`); and pool
+    /// checkout would require a `DbCapability` token the serving path does
+    /// not install. Statements compose the canonical `SqliteStore`
+    /// typed helpers (`query_row`/`query_rows`/`with_conn`).
+    durable: Option<Arc<SqliteStore>>,
     /// Lazy LOD derivation. `Mutex` for interior mutability so the summarizer
     /// can be attached after the store is `Arc`-shared
     /// (`ContentNodeLedger::with_summarizer`).
@@ -66,21 +80,56 @@ pub struct ContentNodeStore {
     /// store is `Arc`-shared. The bounded channel (not an unbounded one) is the
     /// memory bound for a burst of writes faster than the worker can derive.
     tier_events: Mutex<Option<tokio::sync::mpsc::Sender<NodeId>>>,
+    /// Optional spacy pipeline for the spacy overlay (`annotation`). `None`
+    /// (the default) is fail-open: `annotation_for` returns `Ok(None)`.
+    overlay_pipeline: Mutex<Option<Arc<spacy_rs::NlpPipeline>>>,
+    /// Optional embedder for the embedding overlay (`embedding`). `None`
+    /// (the default) is fail-open: `embedding_for` returns `Ok(None)`.
+    overlay_embedder: Mutex<Option<Arc<dyn EmbeddingProvider>>>,
+    /// Optional LLM backend for the LLM overlay (`metadata["llm_overlay"]`).
+    /// `None` (the default) is fail-open: `llm_overlay_for` returns `Ok(None)`.
+    overlay_llm: Mutex<Option<Arc<dyn ChatBackend>>>,
+    /// Optional overlay-event feed: a sender the background
+    /// `OverlayWorker` drains to derive the three overlays in parallel. `None`
+    /// (the default) leaves today's behavior.
+    overlay_events: Mutex<Option<tokio::sync::mpsc::Sender<NodeId>>>,
+    /// Nodes still missing at least one overlay — maintained incrementally
+    /// (insert on write, remove on successful derive) so boot backfill and
+    /// enqueue checks are O(pending) not O(N) (Plan B F1).
+    overlay_pending: RwLock<HashSet<NodeId>>,
+    /// Optional HNSW index for adaptive dispatch (M5). `None` until
+    /// `|store| > hnsw_threshold` (default 512, `DEFAULT_HNSW_THRESHOLD`).
+    /// When `Some`, `knn_search` routes through HNSW (approximate,
+    /// recall≥0.95); otherwise it uses brute-force (`knn_brute_force`).
+    hnsw: RwLock<Option<Arc<fluent_db::hnsw::HnswIndex>>>,
+    /// Adaptive HNSW-vs-brute-force dispatch policy (M6) — the single
+    /// threshold source (`DEFAULT_HNSW_THRESHOLD`). [B] cost/recall only.
+    hnsw_policy: AdaptiveHnsw,
 }
+
+/// The `metadata` key under which the LLM enrichment overlay lives.
+pub const LLM_OVERLAY_META_KEY: &str = "llm_overlay";
+
+/// The system prompt for the one-call LLM enrichment overlay.
+const LLM_OVERLAY_SYSTEM_PROMPT: &str =
+    "Write one concise sentence summarizing the user's message for later retrieval. \
+     Reply with only the summary text, no labels.";
 
 impl ContentNodeStore {
     /// Open (or create) the durable store at `path`, run the ledger schema
     /// migrations, and hydrate the in-memory maps from every row.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, LedgerError> {
         let db_path = path.into();
-        let store = SqliteStore::open(&db_path).map_err(|e| LedgerError::Db(e.to_string()))?;
+        let store = Arc::new(SqliteStore::open(&db_path).map_err(|e| LedgerError::Db(e.to_string()))?);
         Self::open_with_store(Some(store))
     }
 
     /// Open an in-memory (non-durable-across-processes) store. Used by tests
     /// and ephemeral ledgers.
     pub fn open_in_memory() -> Result<Self, LedgerError> {
-        let store = SqliteStore::open_in_memory().map_err(|e| LedgerError::Db(e.to_string()))?;
+        let store = Arc::new(
+            SqliteStore::open_in_memory().map_err(|e| LedgerError::Db(e.to_string()))?,
+        );
         Self::open_with_store(Some(store))
     }
 
@@ -95,10 +144,17 @@ impl ContentNodeStore {
             durable: None,
             summarizer: Mutex::new(None),
             tier_events: Mutex::new(None),
+            overlay_pipeline: Mutex::new(None),
+            overlay_embedder: Mutex::new(None),
+            overlay_llm: Mutex::new(None),
+            overlay_events: Mutex::new(None),
+            overlay_pending: RwLock::new(HashSet::new()),
+            hnsw: RwLock::new(None),
+            hnsw_policy: AdaptiveHnsw::default(),
         }
     }
 
-    fn open_with_store(durable: Option<SqliteStore>) -> Result<Self, LedgerError> {
+    fn open_with_store(durable: Option<Arc<SqliteStore>>) -> Result<Self, LedgerError> {
         if let Some(ref store) = durable {
             let migrations = crate::ledger::ledger_migrations();
             store
@@ -113,6 +169,13 @@ impl ContentNodeStore {
             durable,
             summarizer: Mutex::new(None),
             tier_events: Mutex::new(None),
+            overlay_pipeline: Mutex::new(None),
+            overlay_embedder: Mutex::new(None),
+            overlay_llm: Mutex::new(None),
+            overlay_events: Mutex::new(None),
+            overlay_pending: RwLock::new(HashSet::new()),
+            hnsw: RwLock::new(None),
+            hnsw_policy: AdaptiveHnsw::default(),
         };
         store_obj.hydrate()?;
         Ok(store_obj)
@@ -139,6 +202,317 @@ impl ContentNodeStore {
     /// no sender keeps today's behavior (opt-in).
     pub fn set_tier_events(&self, sender: tokio::sync::mpsc::Sender<NodeId>) {
         *lock(&self.tier_events) = Some(sender);
+    }
+
+    /// Attach the spacy pipeline seam for the spacy overlay. `None` (the
+    /// default) is fail-open: `annotation_for` returns `Ok(None)`.
+    pub fn set_overlay_pipeline(&self, pipeline: Arc<spacy_rs::NlpPipeline>) {
+        *lock(&self.overlay_pipeline) = Some(pipeline);
+    }
+
+    /// Attach the embedder seam for the embedding overlay. `None` (the
+    /// default) is fail-open: `embedding_for` returns `Ok(None)`.
+    pub fn set_overlay_embedder(&self, embedder: Arc<dyn EmbeddingProvider>) {
+        *lock(&self.overlay_embedder) = Some(embedder);
+    }
+
+    /// Attach the LLM backend seam for the LLM enrichment overlay. `None` (the
+    /// default) is fail-open: `llm_overlay_for` returns `Ok(None)`.
+    pub fn set_overlay_llm(&self, backend: Arc<dyn ChatBackend>) {
+        *lock(&self.overlay_llm) = Some(backend);
+    }
+
+    /// Attach an overlay-event sender. When set, the canonical write paths
+    /// enqueue any node missing an overlay so the background `OverlayWorker`
+    /// can derive the three overlays in parallel. A store with no sender keeps
+    /// today's behavior (opt-in).
+    pub fn set_overlay_events(&self, sender: tokio::sync::mpsc::Sender<NodeId>) {
+        *lock(&self.overlay_events) = Some(sender);
+    }
+
+    /// Whether a node still needs any overlay derived (no annotation, no
+    /// embedding, and no `llm_overlay`).
+    pub fn needs_overlay(&self, node_id: NodeId) -> bool {
+        self.get_node(node_id).is_some_and(|arc| {
+            let guard = lock_read(&arc);
+            guard.annotation.is_none()
+                || guard.embedding.is_none()
+                || guard
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get(LLM_OVERLAY_META_KEY))
+                    .is_none()
+        })
+    }
+
+    /// Enqueue `node_id` on the overlay-event feed if it is missing any overlay
+    /// and a sender is attached. No-op when no sender is attached; a full feed
+    /// skips the enqueue (the boot backfill catches stragglers). Maintains
+    /// `overlay_pending` so the backfill stays O(pending) (Plan B F1).
+    fn enqueue_if_needs_overlay(&self, node_id: NodeId) {
+        let sender = lock(&self.overlay_events).clone();
+        if let Some(sender) = sender {
+            if self.needs_overlay(node_id) {
+                // Track pending before the try_send so a full channel still
+                // leaves the node in the pending set for the next backfill.
+                lock_write(&self.overlay_pending).insert(node_id);
+                match sender.try_send(node_id) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        tracing::debug!(
+                            target: "router.ledger.overlay",
+                            node_id = node_id.as_int(),
+                            "overlay feed full - skipping sync enqueue",
+                        );
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::warn!(
+                            target: "router.ledger.overlay",
+                            node_id = node_id.as_int(),
+                            "overlay feed closed - skipping sync enqueue",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// All node ids missing at least one overlay (boot backfill). Returns the
+    /// incrementally-maintained `overlay_pending` snapshot — O(pending), not
+    /// O(N) (Plan B F1). Falls back to a scan only when the pending set is
+    /// empty but nodes exist (e.g. ephemeral store without hydrate).
+    pub fn node_ids_needing_overlays(&self) -> Vec<NodeId> {
+        let pending: Vec<NodeId> = lock_read(&self.overlay_pending).iter().copied().collect();
+        if !pending.is_empty() {
+            // Filter stale entries (nodes whose overlays have since become ready/failed)
+            // and prune the set so a second backfill is idempotent.
+            let original_len = pending.len();
+            let filtered: Vec<NodeId> = pending.into_iter().filter(|id| self.needs_overlay(*id)).collect();
+            // Prune stale entries from the live set when any were filtered
+            if filtered.len() != original_len {
+                let mut guard = lock_write(&self.overlay_pending);
+                guard.retain(|id| self.needs_overlay(*id));
+            }
+            if !filtered.is_empty() {
+                return filtered;
+            }
+            // All pending entries are now satisfied — fall through to empty (idempotent)
+            return Vec::new();
+        }
+        // Fallback for stores that never hydrated (e.g. ephemeral in tests):
+        // scan once and populate pending.
+        let ids: Vec<NodeId> = lock_read(&self.by_session)
+            .values()
+            .flatten()
+            .copied()
+            .collect();
+        let mut out: Vec<NodeId> = Vec::new();
+        for id in ids {
+            if self.needs_overlay(id) {
+                out.push(id);
+            }
+        }
+        if !out.is_empty() {
+            lock_write(&self.overlay_pending).extend(out.iter().copied());
+        }
+        out
+    }
+
+    /// The shared at-most-once overlay derivation (OVERLAYS §6), used by
+    /// [`Self::annotation_for`] / [`Self::embedding_for`] / [`Self::llm_overlay_for`]:
+    ///
+    /// 1. Read-guard fast path: a cached value (or a **permanent** `failed`
+    ///    status — never retried) returns immediately.
+    /// 2. Snapshot LOD0 (the sole derivation source — never another overlay)
+    ///    and mark `pending` (advisory).
+    /// 3. Derive **off-node** — no guard is held across the model call / parse.
+    /// 4. On a permanent derivation error: mark `status: failed` and return
+    ///    `Ok(None)` (fail-open, no retry loop).
+    /// 5. Re-acquire the write lock, **re-check** (a concurrent worker may have
+    ///    won), install the winner and mark `ready` — the re-check is what
+    ///    makes installation at-most-once under concurrency.
+    ///
+    /// `cached` reads the overlay's value slot, `derive` produces it from the
+    /// node's LOD0 text, `install` writes it back.
+    fn derive_overlay<T>(
+        &self,
+        node_id: NodeId,
+        kind: OverlayKind,
+        source: &str,
+        cached: impl Fn(&ContentNode) -> Option<T>,
+        derive: impl FnOnce(&str) -> Result<T, String>,
+        install: impl FnOnce(&mut ContentNode, T),
+    ) -> Result<Option<T>, LedgerError> {
+        let arc = self.get_node(node_id).ok_or(LedgerError::NotFound(node_id))?;
+
+        // 1. Read-guard fast path.
+        {
+            let guard = lock_read(&arc);
+            if let Some(v) = cached(&guard) {
+                return Ok(Some(v));
+            }
+            if guard.overlay(kind).status == OverlayStatus::Failed {
+                return Ok(None);
+            }
+        }
+
+        // 2. Snapshot LOD0 and mark `pending` (advisory, best-effort).
+        let text = {
+            let guard = lock_read(&arc);
+            guard.lod.first().cloned().unwrap_or_default()
+        };
+        if let Some(arc) = self.get_node(node_id) {
+            let mut guard = lock_write(&arc);
+            let _ = guard.transition_overlay(kind, OverlayStatus::Pending, source, None);
+        }
+
+        // 3. Derive off-node — no guard held across the model call / parse.
+        let derived = match derive(&text) {
+            Ok(v) => v,
+            Err(error) => {
+                // 4. Permanent failure: mark `failed`, fail-open, no retry.
+                tracing::warn!(
+                    target: "router.ledger.overlay",
+                    node_id = node_id.as_int(),
+                    kind = ?kind,
+                    %error,
+                    "overlay derivation failed - marking failed (fail-open)"
+                );
+                let _ = self.with_node_mut(node_id, |node| {
+                    let _ = node.transition_overlay(
+                        kind,
+                        OverlayStatus::Failed,
+                        source,
+                        Some(common_core::now_secs()),
+                    );
+                });
+                if !self.needs_overlay(node_id) {
+                    lock_write(&self.overlay_pending).remove(&node_id);
+                }
+                return Ok(None);
+            }
+        };
+
+        // 5. At-most-once install: re-check under the write lock, then install.
+        let mut installed: Option<T> = None;
+        self.with_node_mut(node_id, |node| {
+            if let Some(v) = cached(node) {
+                installed = Some(v);
+                return;
+            }
+            install(node, derived);
+            let _ = node.transition_overlay(
+                kind,
+                OverlayStatus::Ready,
+                source,
+                Some(common_core::now_secs()),
+            );
+            installed = cached(node);
+        })?;
+        if !self.needs_overlay(node_id) {
+            lock_write(&self.overlay_pending).remove(&node_id);
+        }
+        Ok(installed)
+    }
+
+    /// Get the shared `ArcReadyAnnotation`, computing it lazily (**at most
+    /// once**) if absent and a pipeline is wired. `Ok(None)` when no pipeline is
+    /// attached (fail-open), the node's overlay is permanently `failed` (no
+    /// retry), or derivation failed. Locking: off-node derivation, then an
+    /// at-most-once write-lock install (OVERLAYS §6).
+    pub fn annotation_for(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<Arc<spacy_rs::ArcReadyAnnotation>>, LedgerError> {
+        let Some(pipeline) = lock(&self.overlay_pipeline).clone() else {
+            return Ok(None); // fail-open: no pipeline wired
+        };
+        self.derive_overlay(
+            node_id,
+            OverlayKind::Spacy,
+            "spacy",
+            |node| {
+                node.annotation.clone().and_then(
+                    <dyn fluent_types::NodeOverlay>::downcast_arc::<spacy_rs::ArcReadyAnnotation>,
+                )
+            },
+            move |text| {
+                let (doc, result) = pipeline
+                    .process_sync_with_confidence(text, None, None, spacy_rs::RefinePolicy::default())
+                    .map_err(|e| e.to_string())?;
+                Ok(Arc::new(spacy_rs::pipeline::arc_ready(&doc, &result)))
+            },
+            |node, ann| {
+                node.annotation = Some(ann);
+            },
+        )
+    }
+
+    /// Get the node's dense embedding, computing it lazily (**at most once**)
+    /// if absent and an embedder is wired. `Ok(None)` when no embedder is
+    /// attached (fail-open), the overlay is permanently `failed` (no retry), or
+    /// derivation failed.
+    pub fn embedding_for(&self, node_id: NodeId) -> Result<Option<Vec<f32>>, LedgerError> {
+        let Some(embedder) = lock(&self.overlay_embedder).clone() else {
+            return Ok(None); // fail-open: no embedder wired
+        };
+        let name = embedder.name().to_string();
+        let result = self.derive_overlay(
+            node_id,
+            OverlayKind::Embedding,
+            &name,
+            |node| node.embedding.clone(),
+            move |text| embedder.embed(text).map_err(|e| e.to_string()),
+            |node, emb| {
+                node.embedding = Some(emb);
+            },
+        )?;
+        if let Some(ref emb) = result {
+            self.sync_hnsw_insert(node_id, emb);
+        }
+        Ok(result)
+    }
+
+    /// Get the node's LLM enrichment overlay (`metadata["llm_overlay"]`),
+    /// computing it lazily (**at most once**) if absent and a backend is wired.
+    /// `Ok(None)` when no backend is attached (fail-open), the overlay is
+    /// permanently `failed` (no retry), or derivation failed. The one-call
+    /// summary is scrubbed through the same `scrub_for_ledger` gate as every
+    /// other ledger write before install (OVERLAYS §9).
+    pub fn llm_overlay_for(&self, node_id: NodeId) -> Result<Option<serde_json::Value>, LedgerError> {
+        let Some(backend) = lock(&self.overlay_llm).clone() else {
+            return Ok(None); // fail-open: no backend wired
+        };
+        self.derive_overlay(
+            node_id,
+            OverlayKind::Llm,
+            "llm",
+            |node| {
+                node.metadata
+                    .as_ref()
+                    .and_then(|m| m.get(LLM_OVERLAY_META_KEY).cloned())
+            },
+            move |text| {
+                let reply = backend
+                    .chat_complete(&[
+                        fluent_llm::ChatMessage {
+                            role: "system".into(),
+                            content: LLM_OVERLAY_SYSTEM_PROMPT.into(),
+                        },
+                        fluent_llm::ChatMessage {
+                            role: "user".into(),
+                            content: text.to_string(),
+                        },
+                    ])
+                    .map_err(|e| e.to_string())?;
+                let scrubbed = scrub_for_ledger(&reply).text;
+                Ok(serde_json::json!(scrubbed))
+            },
+            |node, value| {
+                let meta = node.metadata.get_or_insert_with(|| serde_json::json!({}));
+                meta[LLM_OVERLAY_META_KEY] = value;
+            },
+        )
     }
 
     /// Enqueue `node_id` on the tier-event feed if its LOD4 or LOD5 is empty
@@ -207,12 +581,37 @@ impl ContentNodeStore {
         out
     }
 
-    /// Access the durable backing (for the facade's flat view and the poison
-    /// test helper). `None` for an ephemeral store.
-    #[cfg(test)]
-    pub(crate) fn durable(&self) -> Option<&SqliteStore> {
-        self.durable.as_ref()
-    }
+/// Access the durable backing (for the facade's flat view, the poison test
+/// helper, and the shared `SqliteConceptStore`/`SqliteCorrectionIndex` — all
+/// three share one connection). `None` for an ephemeral store.
+pub(crate) fn durable(&self) -> Option<&Arc<SqliteStore>> {
+    self.durable.as_ref()
+}
+
+/// A clone of the shared durable connection, so the `SqliteConceptStore` and
+/// `SqliteCorrectionIndex` operate over the *same* connection as the ledger
+/// (one connection, many typed views — atomic corrections, §12.6). The binary
+/// boot composes these at startup.
+pub fn shared_sqlite(&self) -> Option<Arc<SqliteStore>> {
+    self.durable().cloned()
+}
+
+/// Latest `nlp_parse` node id for a session (M9: the single store-owned
+/// spelling of the parse-lookup query; the HTTP handler calls this instead
+/// of inline SQL).
+pub fn latest_parse_node_id(&self, session_id: &str) -> Option<NodeId> {
+    let store = self.shared_sqlite()?;
+    let row = store
+        .query_row(
+            "SELECT node_id FROM ledger \
+             WHERE session_id = ?1 AND json_extract(metadata, '$.kind') = 'nlp_parse' \
+             ORDER BY node_id DESC LIMIT 1",
+            rusqlite::params![session_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok()??;
+    Some(NodeId::from_int(row))
+}
 
     /// Load every persisted row into the maps, seeding `next_id` from
     /// `MAX(node_id) + 1` (pre-existing restart-collision bug fix).
@@ -236,8 +635,13 @@ impl ContentNodeStore {
                     continue;
                 };
                 let node_id = NodeId::from_int(id);
+                let mut node = node;
+                // Rows written before the `content_hash` field default to 0;
+                // stamp the hash from LOD0 so the annotation keying domain is
+                // correct even for pre-M4 rows (ROADMAP M4).
+                node.content_hash = content_hash_of(node.lod.get(LOD0_FULL_TEXT as usize).map(String::as_str).unwrap_or_default());
                 let session_key = node.session_id.as_deref().map(ArcIntern::from);
-                let role_key = node.role.as_deref().map(ArcIntern::from);
+                let role_key = node.role.as_ref().map(|r| ArcIntern::from(r.as_str()));
                 max_id = max_id.max(id);
                 nodes.insert(node_id, Arc::new(RwLock::new(node)));
                 if let Some(key) = session_key {
@@ -249,6 +653,38 @@ impl ContentNodeStore {
             }
         }
         self.next_id.store(max_id + 1, Ordering::SeqCst);
+        // Populate overlay_pending incrementally — O(N) once at boot, then
+        // O(pending) for backfill and O(1) for enqueue checks (Plan B F1).
+        let pending: HashSet<NodeId> = {
+            let nodes = lock_read(&self.nodes);
+            nodes
+                .iter()
+                .filter_map(|(&id, arc)| {
+                    let guard = lock_read(arc);
+                    let needs = guard.annotation.is_none()
+                        || guard.embedding.is_none()
+                        || guard
+                            .metadata
+                            .as_ref()
+                            .and_then(|m| m.get(LLM_OVERLAY_META_KEY))
+                            .is_none();
+                    // Nodes already marked failed are not pending — derive_overlay
+                    // short-circuits them and they should not be backfilled.
+                    let failed = [
+                        OverlayKind::Spacy,
+                        OverlayKind::Embedding,
+                        OverlayKind::Llm,
+                    ]
+                    .iter()
+                    .all(|k| guard.overlay(*k).status == OverlayStatus::Failed);
+                    if needs && !failed { Some(id) } else { None }
+                })
+                .collect()
+        };
+        *lock_write(&self.overlay_pending) = pending;
+        // M5: lazily build HNSW if the hydrated store already exceeds the
+        // threshold (so a restart with a large ledger does not stay brute-force).
+        self.maybe_init_hnsw();
         Ok(())
     }
 
@@ -265,15 +701,18 @@ impl ContentNodeStore {
     }
 
     /// Record a user request as a new node. LOD0 and LOD5 are written eagerly;
-    /// LOD1–LOD4 stay empty until derived lazily.
+    /// LOD1–LOD4 stay empty until derived lazily. Scrub is non-bypassable — every
+    /// write path payload is scrubbed through `scrub_for_ledger` + `emit_write_audit` (D1).
     pub fn record_request(
         &self,
         session_id: &str,
         request_id: &str,
         content: &str,
     ) -> Result<NodeId, LedgerError> {
+        let scrubbed = crate::ledger_guard::scrub_for_ledger(content);
+        crate::ledger_guard::emit_write_audit(&scrubbed);
         let id = NodeId::from_int(self.next_id.fetch_add(1, Ordering::SeqCst));
-        let node = new_node(id, session_id, request_id, "user", content, None);
+        let node = new_node(id, session_id, request_id, "user", &scrubbed.text, None);
         self.insert_node(&node)?;
         Ok(id)
     }
@@ -288,17 +727,21 @@ impl ContentNodeStore {
         score: Option<f64>,
         content: &str,
     ) -> Result<(), LedgerError> {
+        let scrubbed = crate::ledger_guard::scrub_for_ledger(content);
+        crate::ledger_guard::emit_write_audit(&scrubbed);
+        let scrubbed_text = scrubbed.text.clone();
         self.with_node_mut(node_id, |node| {
             node.accepted = Some(accepted);
             node.acceptance_score = score;
-            if !content.is_empty() {
-                node.lod[LOD0_FULL_TEXT as usize] = content.to_string();
+            if !scrubbed_text.is_empty() {
+                node.lod[LOD0_FULL_TEXT as usize].clone_from(&scrubbed_text);
                 node.lod[LOD5_LABEL as usize] =
-                    derive_label(&node.role.clone().unwrap_or_default(), content);
+                    derive_label(node.role.as_ref().map(OriginRole::as_str).unwrap_or_default(), &scrubbed_text);
                 node.active_lod = Some(LOD0_FULL_TEXT);
             }
         })?;
         self.enqueue_if_needs_tier(node_id);
+        self.enqueue_if_needs_overlay(node_id);
         Ok(())
     }
 
@@ -307,6 +750,12 @@ impl ContentNodeStore {
     /// is allocated when `node.id` is `None`.
     pub fn record_content_node(&self, node: &ContentNode) -> Result<NodeId, LedgerError> {
         let mut node = node.clone();
+        // Scrub LOD0 before persistence — irreversible, always on.
+        if !node.lod.is_empty() {
+            let scrubbed = crate::ledger_guard::scrub_for_ledger(&node.lod[0]);
+            crate::ledger_guard::emit_write_audit(&scrubbed);
+            node.lod[0].clone_from(&scrubbed.text);
+        }
         let id = if let Some(id) = node.id {
             id
         } else {
@@ -319,10 +768,37 @@ impl ContentNodeStore {
         Ok(id)
     }
 
-    /// Insert a node into the shared maps (and the durable `content_json`
-    /// column). The canonical write path: every mutation funnels through here.
+    /// Write a tiered annotation claim against a node's **current content
+    /// hash** (ROADMAP M4). This is the single wiring point for annotation
+    /// writers: it resolves the node's `content_hash` and routes the claim to
+    /// the `AnnotationStore` over the shared ledger connection. A mutation of
+    /// LOD0 (a new hash) makes old claims unreachable — invalidation is a
+    /// consequence of keying, never a scheduler.
+    ///
+    /// `Ok(None)` when the store has no durable backing (pure in-memory) —
+    /// fail-open, mirroring the store's other best-effort persistence.
+    pub fn write_annotation(
+        &self,
+        node_id: NodeId,
+        claim: &AnnotationClaim,
+    ) -> Result<Option<ClaimStatus>, LedgerError> {
+        let Some(store) = self.shared_sqlite() else {
+            return Ok(None);
+        };
+        let node = self.snapshot(node_id).ok_or(LedgerError::NotFound(node_id))?;
+        let status = AnnotationStore::new(store)
+            .write(node.content_hash, claim)
+            .map_err(|e| LedgerError::Db(e.to_string()))?;
+        Ok(Some(status))
+    }
     pub fn insert_node(&self, node: &ContentNode) -> Result<NodeId, LedgerError> {
         let mut node = node.clone();
+        // Scrub LOD0 — non-bypassable write-path guard (D1).
+        if !node.lod.is_empty() && !node.lod[0].is_empty() {
+            let scrubbed = crate::ledger_guard::scrub_for_ledger(&node.lod[0]);
+            crate::ledger_guard::emit_write_audit(&scrubbed);
+            node.lod[0].clone_from(&scrubbed.text);
+        }
         let node_id = if let Some(id) = node.id {
             id
         } else {
@@ -331,12 +807,197 @@ impl ContentNodeStore {
             id
         };
         ensure_lod_eager(&mut node);
+        let embedding_for_hnsw = node.embedding.clone();
         let arc = Arc::new(RwLock::new(node));
         lock_write(&self.nodes).insert(node_id, Arc::clone(&arc));
         self.index_node(node_id);
         self.persist_insert(&arc)?;
         self.enqueue_if_needs_tier(node_id);
+        self.enqueue_if_needs_overlay(node_id);
+        if let Some(emb) = embedding_for_hnsw {
+            self.sync_hnsw_insert(node_id, &emb);
+        } else {
+            self.maybe_init_hnsw();
+        }
         Ok(node_id)
+    }
+
+    /// Node count threshold for HNSW activation (single source: the policy's
+    /// `DEFAULT_HNSW_THRESHOLD`-derived threshold — see `AdaptiveHnsw`).
+    pub fn hnsw_threshold(&self) -> usize {
+        self.hnsw_policy.threshold
+    }
+
+    /// Whether the HNSW index has been built (adaptive dispatch is active).
+    pub fn is_hnsw_built(&self) -> bool {
+        lock_read(&self.hnsw)
+            .as_ref()
+            .is_some_and(|h| h.is_built())
+    }
+
+    /// Ensure the HNSW index exists when `|store| > threshold` by bulk-building
+    /// from all current embeddings. No-op when already built or below threshold.
+    fn maybe_init_hnsw(&self) {
+        let len = lock_read(&self.nodes).len();
+        if !self.hnsw_policy.should_use_built(len) {
+            return;
+        }
+        if self.is_hnsw_built() {
+            return;
+        }
+        // Collect all embeddings under a short read lock, then build.
+        let candidates: Vec<(NodeId, Vec<f32>)> = {
+            let nodes = lock_read(&self.nodes);
+            nodes
+                .iter()
+                .filter_map(|(&id, arc)| {
+                    let g = lock_read(arc);
+                    g.embedding.clone().map(|e| (id, e))
+                })
+                .collect()
+        };
+        if candidates.is_empty() {
+            return;
+        }
+        let hnsw = Arc::new(fluent_db::hnsw::HnswIndex::new());
+        for (id, emb) in &candidates {
+            hnsw.insert(id.as_int(), emb);
+        }
+        *lock_write(&self.hnsw) = Some(hnsw);
+    }
+
+    /// Insert a single node's embedding into the HNSW index, lazily
+    /// initializing the index if the threshold has been crossed.
+    fn sync_hnsw_insert(&self, node_id: NodeId, embedding: &[f32]) {
+        // If already built, just insert.
+        if let Some(hnsw) = lock_read(&self.hnsw).clone() {
+            if hnsw.is_built() {
+                hnsw.insert(node_id.as_int(), embedding);
+                return;
+            }
+        }
+        // Not built — check if we should build now.
+        let len = lock_read(&self.nodes).len();
+        if self.hnsw_policy.should_use_built(len) {
+            // Build from all embeddings (including this one) for consistency.
+            self.maybe_init_hnsw();
+            // Ensure this node's embedding is present even if maybe_init found
+            // it already (idempotent double-insert is okay for correctness
+            // because hnsw.insert tolerates duplicates, but we skip to avoid
+            // duplicate entries).
+            if !self.is_hnsw_built() {
+                // Fallback single insert if bulk had no embeddings (race).
+                let hnsw = Arc::new(fluent_db::hnsw::HnswIndex::new());
+                hnsw.insert(node_id.as_int(), embedding);
+                *lock_write(&self.hnsw) = Some(hnsw);
+            }
+        }
+    }
+
+    /// Update an existing node's `metadata` (the review worker's
+    /// `review_status` write, §12.6). The shared `Arc<RwLock<ContentNode>>`
+    /// is mutated in place (so every ledger view sees it) and the durable
+    /// `content_json` column is rewritten. `Err` when the node is absent.
+    pub fn update_node_metadata(
+        &self,
+        node_id: NodeId,
+        metadata: serde_json::Value,
+    ) -> Result<(), LedgerError> {
+        self.with_node_mut(node_id, |node| {
+            node.metadata = Some(metadata);
+        })
+        .map(|_| ())
+    }
+
+    /// Atomic review write (ROADMAP §12.6/§12.7, C4): the parse node's
+    /// `review_status` metadata update, the `parse_review` node (on a miss),
+    /// and the `interlingua_index` correction rows all commit in **one SQLite
+    /// transaction** (the ledger's existing connection), so a crash mid-review
+    /// never half-applies. The in-memory maps are updated **only on commit**
+    /// (durable-first — a durable failure leaves zero in-memory divergence).
+    ///
+    /// - `parse_node_id` — the parse node whose metadata is overlaid with
+    ///   `parse_metadata` (the `review_status` write).
+    /// - `review_node` — the `parse_review` `ContentNode` to persist (only on
+    ///   a review **miss**). Its id is allocated here; `None` skips the node.
+    /// - `correction_rows` — the correction-pattern cache rows to upsert.
+    ///
+    /// Returns the allocated `parse_review` node id when one was written.
+    pub(crate) fn apply_review(
+        &self,
+        parse_node_id: NodeId,
+        parse_metadata: serde_json::Value,
+        review_node: Option<&ContentNode>,
+        correction_rows: &[CorrectionRow],
+    ) -> Result<Option<NodeId>, LedgerError> {
+        // 1. Prepare — no shared-state mutation. Snapshot the parse node and
+        //    overlay the new metadata; allocate the review node's id and
+        //    ensure its eager LODs. Nothing touches the maps yet, so a failure
+        //    below cannot leave in-memory/durable divergence (M1).
+        let parse_arc = self
+            .get_node(parse_node_id)
+            .ok_or(LedgerError::NotFound(parse_node_id))?;
+        let mut parse_node = lock_read(&parse_arc).clone();
+        drop(parse_arc);
+        parse_node.metadata = Some(parse_metadata);
+
+        let review = match review_node {
+            Some(rn) => {
+                let mut node = rn.clone();
+                let id = NodeId::from_int(self.next_id.fetch_add(1, Ordering::SeqCst));
+                node.id = Some(id);
+                ensure_lod_eager(&mut node);
+                Some((id, node))
+            }
+            None => None,
+        };
+
+        // 2. Durable transaction FIRST. On `Err` we return with zero in-memory
+        //    mutation (an id consumed here is a harmless monotonic gap —
+        //    hydration seeds `next_id` from durable `MAX`).
+        let Some(store) = self.durable.clone() else {
+            // No durable backing: commit the prepared state in memory only.
+            return Ok(self.commit_review_in_memory(parse_node_id, parse_node, review));
+        };
+        store
+            .transaction(|tx| {
+                update_node_row(tx, &parse_node)?;
+                if let Some((_, node)) = &review {
+                    insert_node_row(tx, node)?;
+                }
+                for row in correction_rows {
+                    upsert_correction_row(tx, row)?;
+                }
+                Ok(())
+            })
+            .map_err(|e| LedgerError::Db(e.to_string()))?;
+
+        // 3. In-memory only on success: overwrite the parse node's shared
+        //    metadata and insert + index the review node.
+        Ok(self.commit_review_in_memory(parse_node_id, parse_node, review))
+    }
+
+    /// The in-memory half of [`Self::apply_review`]: overwrite the parse node's
+    /// shared metadata and (when present) insert + index the review node. Only
+    /// ever called after the durable side committed (or for a store with no
+    /// durable backing). Infallible — the shared parse node is guaranteed to
+    /// still exist.
+    fn commit_review_in_memory(
+        &self,
+        parse_node_id: NodeId,
+        parse_node: ContentNode,
+        review: Option<(NodeId, ContentNode)>,
+    ) -> Option<NodeId> {
+        if let Some(parse_arc) = self.get_node(parse_node_id) {
+            lock_write(&parse_arc).metadata = parse_node.metadata;
+        }
+        if let Some((id, node)) = &review {
+            let arc = Arc::new(RwLock::new(node.clone()));
+            lock_write(&self.nodes).insert(*id, Arc::clone(&arc));
+            self.index_node(*id);
+            self.enqueue_if_needs_tier(*id);
+        }
+        review.map(|(id, _)| id)
     }
 
     /// Maintain the interned session/role indices for a node.
@@ -369,51 +1030,10 @@ impl ContentNodeStore {
         let Some(ref store) = self.durable else {
             return Ok(());
         };
-        let node = lock_read(node);
-        let metadata = node
-            .metadata
-            .as_ref()
-            .unwrap_or(&serde_json::json!({}))
-            .to_string();
-        let lod_json =
-            serde_json::to_string(&node.lod).map_err(|e| LedgerError::Db(e.to_string()))?;
-        let content_json =
-            serde_json::to_string(&*node).map_err(|e| LedgerError::Db(e.to_string()))?;
-        let content = node.lod.first().map_or("", String::as_str);
-        let label = node
-            .lod
-            .get(LOD5_LABEL as usize)
-            .cloned()
-            .filter(|l| !l.is_empty())
-            .unwrap_or_else(|| derive_label(&node.role.clone().unwrap_or_default(), content));
-
+        let node = lock_read(node).clone();
         store
-            .execute(
-                "INSERT INTO ledger (node_id, session_id, request_id, role, content, turn_index,
-                                     accepted, acceptance_score, active_lod, parent_id, step_id,
-                                     metadata, created_at, label, lod, content_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-                rusqlite::params![
-                    node.id.map(NodeId::as_int),
-                    node.session_id.clone().unwrap_or_default(),
-                    node.request_id.clone().unwrap_or_default(),
-                    node.role.clone().unwrap_or_default(),
-                    content,
-                    node.turn_index.unwrap_or(0) as i64,
-                    node.accepted.unwrap_or(true),
-                    node.acceptance_score,
-                    i64::from(node.active_lod.unwrap_or(LOD0_FULL_TEXT)),
-                    node.parent_id.map(NodeId::as_int),
-                    node.step_id.as_deref(),
-                    metadata,
-                    node.created_at.unwrap_or_else(common_core::now_secs) as i64,
-                    label,
-                    lod_json,
-                    content_json,
-                ],
-            )
-            .map_err(|e| LedgerError::Db(e.to_string()))?;
-        Ok(())
+            .with_conn(|conn| insert_node_row(conn, &node))
+            .map_err(|e| LedgerError::Db(e.to_string()))
     }
 
     /// Persist an updated node (flat projection + `content_json`).
@@ -421,51 +1041,9 @@ impl ContentNodeStore {
         let Some(ref store) = self.durable else {
             return Ok(());
         };
-        let metadata = node
-            .metadata
-            .as_ref()
-            .unwrap_or(&serde_json::json!({}))
-            .to_string();
-        let lod_json =
-            serde_json::to_string(&node.lod).map_err(|e| LedgerError::Db(e.to_string()))?;
-        let content_json =
-            serde_json::to_string(node).map_err(|e| LedgerError::Db(e.to_string()))?;
-        let content = node.lod.first().map_or("", String::as_str);
-        let label = node
-            .lod
-            .get(LOD5_LABEL as usize)
-            .cloned()
-            .filter(|l| !l.is_empty())
-            .unwrap_or_else(|| derive_label(&node.role.clone().unwrap_or_default(), content));
-
         store
-            .execute(
-                "UPDATE ledger SET session_id = ?1, request_id = ?2, role = ?3, content = ?4,
-                                   turn_index = ?5, accepted = ?6, acceptance_score = ?7,
-                                   active_lod = ?8, parent_id = ?9, step_id = ?10, metadata = ?11,
-                                   created_at = ?12, label = ?13, lod = ?14, content_json = ?15
-                 WHERE node_id = ?16",
-                rusqlite::params![
-                    node.session_id.clone().unwrap_or_default(),
-                    node.request_id.clone().unwrap_or_default(),
-                    node.role.clone().unwrap_or_default(),
-                    content,
-                    node.turn_index.unwrap_or(0) as i64,
-                    node.accepted.unwrap_or(true),
-                    node.acceptance_score,
-                    i64::from(node.active_lod.unwrap_or(LOD0_FULL_TEXT)),
-                    node.parent_id.map(NodeId::as_int),
-                    node.step_id.as_deref(),
-                    metadata,
-                    node.created_at.unwrap_or_else(common_core::now_secs) as i64,
-                    label,
-                    lod_json,
-                    content_json,
-                    node.id.map(NodeId::as_int),
-                ],
-            )
-            .map_err(|e| LedgerError::Db(e.to_string()))?;
-        Ok(())
+            .with_conn(|conn| update_node_row(conn, node))
+            .map_err(|e| LedgerError::Db(e.to_string()))
     }
 
     /// Apply a mutation to the shared node and persist both the shared node and
@@ -499,7 +1077,7 @@ impl ContentNodeStore {
         self.with_node_mut(node_id, |node| {
             node.lod[LOD0_FULL_TEXT as usize] = summary.to_string();
             node.lod[LOD5_LABEL as usize] =
-                derive_label(&node.role.clone().unwrap_or_default(), summary);
+                derive_label(node.role.as_ref().map(OriginRole::as_str).unwrap_or_default(), summary);
             node.active_lod = Some(lod);
         })?;
         Ok(())
@@ -728,12 +1306,45 @@ impl ContentNodeStore {
             .unwrap_or_default()
     }
 
-    /// Cosine KNN search over node embeddings (brute force over the shared
-    /// nodes) — the single similarity path, `fluent_db::vector`'s
-    /// `knn_brute_force`.
+    /// Cosine KNN search over node embeddings.
+    ///
+    /// For `|store| <= hnsw_threshold` (default 512, `DEFAULT_HNSW_THRESHOLD`)
+    /// this is exact brute-force (`knn_brute_force`). For `|store| > threshold`
+    /// it routes through the HNSW index (approximate, recall≥0.95 vs brute-force
+    /// at N=512..2048). When the HNSW index is not yet built or the query
+    /// embedding is malformed, it falls back to brute-force.
     pub fn knn_search(&self, embedding: &[f32], k: usize) -> Vec<KnnHit> {
-        // Snapshot embeddings under the map read lock (cloning the vecs out)
-        // so no borrow escapes a node's guard.
+        // M6: single adaptive-dispatch policy ([B] cost/recall only — never a
+        // confidence/verification gate). Probe HNSW iff built and above
+        // threshold; the built-implies-above-threshold invariant (nodes never
+        // shrink; build decisions go through the same policy) makes this
+        // exactly the previous probe-if-built behavior.
+        // M5: the HNSW probe + id resolution is the shared
+        // `fluent_db::hnsw::hnsw_lookup` (`None` = fall back). Name lookup
+        // and the raw-distance `KnnHit` shape stay call-site code.
+        let dispatch_hnsw = {
+            let len = lock_read(&self.nodes).len();
+            self.hnsw_policy.dispatch(self.is_hnsw_built(), len)
+        };
+        if dispatch_hnsw {
+            let hnsw = lock_read(&self.hnsw).clone().expect("dispatched ⇒ built");
+            if let Some(neighbours) = fluent_db::hnsw::hnsw_lookup(&hnsw, embedding, k) {
+                let mut results = Vec::with_capacity(neighbours.len());
+                for (raw, distance) in neighbours {
+                    let node_id = NodeId::from_int(raw);
+                    let name = self.snapshot(node_id).map(|n| n.name).unwrap_or_default();
+                    results.push(KnnHit {
+                        node_id,
+                        distance,
+                        name,
+                    });
+                }
+                if !results.is_empty() {
+                    return results;
+                }
+            }
+        }
+        // Fallback: exact brute-force.
         let candidates: Vec<(NodeId, Vec<f32>)> = {
             let nodes = lock_read(&self.nodes);
             nodes
@@ -764,6 +1375,7 @@ impl ContentNodeStore {
     /// Panic while holding the durable connection mutex (test-only): exercises
     /// the poison-recovery path in `SqliteStore`'s `common_core::sync::lock`.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn poison_conn(&self) {
         if let Some(ref store) = self.durable {
             let _ = store.with_conn(|_| -> Result<(), DbError> {
@@ -771,6 +1383,101 @@ impl ContentNodeStore {
             });
         }
     }
+}
+
+/// The `ledger` table INSERT — the canonical row shape shared by
+/// [`ContentNodeStore::persist_insert`] and the atomic review transaction
+/// ([`ContentNodeStore::apply_review`]). `DbError` so the caller owns the
+/// wrapper error type.
+fn insert_node_row(conn: &Connection, node: &ContentNode) -> Result<(), DbError> {
+    let metadata = node
+        .metadata
+        .as_ref()
+        .unwrap_or(&serde_json::json!({}))
+        .to_string();
+    let lod_json = serde_json::to_string(&node.lod).map_err(|e| DbError::Other(e.to_string()))?;
+    let content_json = serde_json::to_string(node).map_err(|e| DbError::Other(e.to_string()))?;
+    let content = node.lod.first().map_or("", String::as_str);
+    let label = node
+        .lod
+        .get(LOD5_LABEL as usize)
+        .cloned()
+        .filter(|l| !l.is_empty())
+        .unwrap_or_else(|| derive_label(node.role.as_ref().map(OriginRole::as_str).unwrap_or_default(), content));
+
+    fluent_db::query::execute(
+        conn,
+        "INSERT INTO ledger (node_id, session_id, request_id, role, content, turn_index,
+                             accepted, acceptance_score, active_lod, parent_id, step_id,
+                             metadata, created_at, label, lod, content_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        rusqlite::params![
+            node.id.map(NodeId::as_int),
+            node.session_id.clone().unwrap_or_default(),
+            node.request_id.clone().unwrap_or_default(),
+            node.role.as_ref().map(|r| r.as_str().to_string()).unwrap_or_default(),
+            content,
+            node.turn_index.unwrap_or(0) as i64,
+            node.accepted.unwrap_or(true),
+            node.acceptance_score,
+            i64::from(node.active_lod.unwrap_or(LOD0_FULL_TEXT)),
+            node.parent_id.map(NodeId::as_int),
+            node.step_id.as_deref(),
+            metadata,
+            node.created_at.unwrap_or_else(common_core::now_secs) as i64,
+            label,
+            lod_json,
+            content_json,
+        ],
+    )?;
+    Ok(())
+}
+
+/// The `ledger` table UPDATE — shared by [`ContentNodeStore::persist_update`]
+/// and the atomic review transaction.
+fn update_node_row(conn: &Connection, node: &ContentNode) -> Result<(), DbError> {
+    let metadata = node
+        .metadata
+        .as_ref()
+        .unwrap_or(&serde_json::json!({}))
+        .to_string();
+    let lod_json = serde_json::to_string(&node.lod).map_err(|e| DbError::Other(e.to_string()))?;
+    let content_json = serde_json::to_string(node).map_err(|e| DbError::Other(e.to_string()))?;
+    let content = node.lod.first().map_or("", String::as_str);
+    let label = node
+        .lod
+        .get(LOD5_LABEL as usize)
+        .cloned()
+        .filter(|l| !l.is_empty())
+        .unwrap_or_else(|| derive_label(node.role.as_ref().map(OriginRole::as_str).unwrap_or_default(), content));
+
+    fluent_db::query::execute(
+        conn,
+        "UPDATE ledger SET session_id = ?1, request_id = ?2, role = ?3, content = ?4,
+                           turn_index = ?5, accepted = ?6, acceptance_score = ?7,
+                           active_lod = ?8, parent_id = ?9, step_id = ?10, metadata = ?11,
+                           created_at = ?12, label = ?13, lod = ?14, content_json = ?15
+         WHERE node_id = ?16",
+        rusqlite::params![
+            node.session_id.clone().unwrap_or_default(),
+            node.request_id.clone().unwrap_or_default(),
+            node.role.as_ref().map(|r| r.as_str().to_string()).unwrap_or_default(),
+            content,
+            node.turn_index.unwrap_or(0) as i64,
+            node.accepted.unwrap_or(true),
+            node.acceptance_score,
+            i64::from(node.active_lod.unwrap_or(LOD0_FULL_TEXT)),
+            node.parent_id.map(NodeId::as_int),
+            node.step_id.as_deref(),
+            metadata,
+            node.created_at.unwrap_or_else(common_core::now_secs) as i64,
+            label,
+            lod_json,
+            content_json,
+            node.id.map(NodeId::as_int),
+        ],
+    )?;
+    Ok(())
 }
 
 /// Build a fresh `ContentNode` with LOD0 (full text) and LOD5 (label) eager.
@@ -788,6 +1495,7 @@ pub(crate) fn new_node(
         id: Some(id),
         name: format!("{role}-msg-{}", id.as_int()).into(),
         source: "session".into(),
+        content_hash: 0,
         lod: vec![
             content.to_string(),
             String::new(),
@@ -800,7 +1508,15 @@ pub(crate) fn new_node(
         capabilities: None,
         session_id: Some(session_id.to_string()),
         request_id: Some(request_id.to_string()),
-        role: Some(role.to_string()),
+        role: Some(match role.to_ascii_lowercase().as_str() {
+            "user" => fluent_types::OriginRole::User,
+            "system" => fluent_types::OriginRole::System,
+            "assistant" => fluent_types::OriginRole::Assistant,
+            "tool" => fluent_types::OriginRole::Tool,
+            "subagent" => fluent_types::OriginRole::Subagent,
+            "self" => fluent_types::OriginRole::SelfOrigin,
+            _ => fluent_types::OriginRole::Other(role.to_string()),
+        }),
         // Monotonic per allocation → stable `ORDER BY turn_index DESC` within
         // a session even before a real turn counter exists.
         turn_index: Some(id.as_int() as u64),
@@ -812,6 +1528,7 @@ pub(crate) fn new_node(
         step_status: None,
         metadata: None,
         created_at: Some(common_core::now_secs()),
+        annotation: None,
     };
     ensure_lod_eager(&mut node);
     node
@@ -836,17 +1553,31 @@ pub(crate) fn derive_label(role: &str, content: &str) -> String {
 }
 
 /// Guarantee LOD0 (full text) and LOD5 (label) are present on a node.
+/// The stable content hash for a node's LOD0 — `0` for empty content.
+fn content_hash_of(content: &str) -> u64 {
+    if content.is_empty() {
+        0
+    } else {
+        common_core::hash::fnv1a64(content.as_bytes())
+    }
+}
+
 fn ensure_lod_eager(node: &mut ContentNode) {
     while node.lod.len() < LOD5_LABEL as usize + 1 {
         node.lod.push(String::new());
     }
     let content = node.lod[LOD0_FULL_TEXT as usize].clone();
+    // The content hash is the annotation keying domain (ROADMAP M4): it tracks
+    // LOD0 exactly, recomputed in this single write funnel so a mutation that
+    // changes LOD0 changes the hash and thereby invalidates cached annotations
+    // — no staleness scheduler. Empty content maps to the stable `0` sentinel.
+    node.content_hash = content_hash_of(&content);
     if content.is_empty() {
         // Nothing to derive LOD0 from — nothing to do.
         return;
     }
     if node.lod[LOD5_LABEL as usize].is_empty() {
-        let role = node.role.clone().unwrap_or_default();
+        let role = node.role.as_ref().map(OriginRole::as_str).unwrap_or_default().to_string();
         node.lod[LOD5_LABEL as usize] = derive_label(&role, &content);
     }
     if node.active_lod.is_none() {
@@ -855,188 +1586,5 @@ fn ensure_lod_eager(node: &mut ContentNode) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_stubs::{CountingBackend, StubChatBackend};
-
-    fn temp_store() -> ContentNodeStore {
-        let dir = std::env::temp_dir().join(format!(
-            "coral-router-nodestore-{}",
-            common_core::hash::uuid_v4()
-        ));
-        let store = ContentNodeStore::open(&dir).unwrap();
-        let _ = std::fs::remove_file(&dir);
-        store
-    }
-
-    #[test]
-    fn same_id_returns_same_arc_identity() {
-        let store = temp_store();
-        let id = store.record_request("s", "r1", "hello").unwrap();
-        let a = store.get_node(id).unwrap();
-        let b = store.get_node(id).unwrap();
-        assert!(Arc::ptr_eq(&a, &b), "two lookups must share one Arc");
-    }
-
-    #[test]
-    fn ensure_lod_computed_once_across_views() {
-        let client: Arc<dyn fluent_llm::client::ChatBackend> =
-            Arc::new(StubChatBackend::always("lazy LOD summary"));
-        let summarizer = Summarizer::new(client, 20);
-        let store = temp_store().with_summarizer(summarizer);
-        let id = store
-            .record_request("s", "r1", "The full text that must be summarized once.")
-            .unwrap();
-
-        // "Two concurrent views" hold the same Arc — derive once, then both see
-        // the cached tier without a second LLM call.
-        let v1 = store.get_node(id).unwrap();
-        let v2 = store.get_node(id).unwrap();
-        let node = store.ensure_lod(id, 2).unwrap();
-        assert_eq!(node.lod[2], "lazy LOD summary");
-        assert_eq!(lock_read(&v1).lod[2], "lazy LOD summary");
-        assert_eq!(lock_read(&v2).lod[2], "lazy LOD summary");
-    }
-
-    #[test]
-    fn interned_session_and_role_indices_return_correct_sets() {
-        let store = temp_store();
-        store.record_request("sess-a", "r1", "one").unwrap();
-        store.record_request("sess-a", "r2", "two").unwrap();
-        store.record_request("sess-b", "r3", "three").unwrap();
-
-        let sess_a = store.get_session_nodes("sess-a", 10).unwrap();
-        assert_eq!(sess_a.len(), 2);
-        assert_eq!(sess_a[0].request_id.as_deref(), Some("r2"));
-        assert_eq!(sess_a[1].request_id.as_deref(), Some("r1"));
-        assert!(store.get_session_nodes("sess-b", 10).unwrap().len() == 1);
-        assert!(store.get_session_nodes("absent", 10).unwrap().is_empty());
-
-        // role index (interned): all recorded requests carry role "user".
-        let user_ids = store.nodes_for_role("user");
-        assert_eq!(user_ids.len(), 3);
-        assert!(store.nodes_for_role("assistant").is_empty());
-    }
-
-    #[test]
-    fn hydration_round_trip_preserves_data_and_continues_next_id() {
-        let dir = std::env::temp_dir().join(format!(
-            "coral-router-nodestore-rt-{}",
-            common_core::hash::uuid_v4()
-        ));
-        let path = dir.clone();
-        {
-            let store = ContentNodeStore::open(&path).unwrap();
-            store.record_request("s", "r1", "first").unwrap();
-            store.record_request("s", "r2", "second").unwrap();
-        } // drop
-        {
-            let store = ContentNodeStore::open(&path).unwrap();
-            let nodes = store.get_session_nodes("s", 10).unwrap();
-            assert_eq!(nodes.len(), 2, "data must survive reopen");
-            assert_eq!(nodes[0].request_id.as_deref(), Some("r2"));
-
-            // next_id continues past the hydrated max: the next allocation
-            // must not collide with the persisted ids.
-            let id = store.record_request("s", "r3", "third").unwrap();
-            assert!(id.as_int() > 2, "next id must be past the hydrated max");
-            assert!(store.get_node(id).is_some());
-            assert_eq!(store.get_session_nodes("s", 10).unwrap().len(), 3);
-        }
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn knn_search_delegates_to_brute_force_over_embeddings() {
-        let store = temp_store();
-        let mut node = new_node(
-            NodeId::from_int(0),
-            "s",
-            "r1",
-            "assistant",
-            "embedding target",
-            Some(true),
-        );
-        node.embedding = Some(vec![1.0, 0.0, 0.0, 0.0]);
-        let id = store.record_content_node(&node).unwrap();
-
-        let hits = store.knn_search(&[1.0, 0.0, 0.0, 0.0], 1);
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].node_id, id);
-
-        let no_hits = store.knn_search(&[0.0, 1.0, 0.0, 0.0], 1);
-        assert_eq!(no_hits.len(), 1, "orthogonal but still nearest");
-        assert_eq!(no_hits[0].node_id, id);
-    }
-
-    #[test]
-    fn ephemeral_store_needs_no_durable() {
-        let store = ContentNodeStore::ephemeral();
-        let id = store.record_request("s", "r1", "x").unwrap();
-        assert!(store.get_node(id).is_some());
-        assert!(store.get_session_entries("s", 10).unwrap().is_empty());
-    }
-
-    #[test]
-    fn lod_text_returns_eager_tiers_directly() {
-        let store = temp_store();
-        let id = store
-            .record_request("s", "r1", "Full text for eager tiers.")
-            .unwrap();
-        assert_eq!(store.lod_text(id, 0).unwrap(), "Full text for eager tiers.");
-        assert_eq!(store.lod_text(id, 5).unwrap(), "Full text for eager tiers.");
-    }
-
-    #[test]
-    fn lod_text_derives_lazy_tier_exactly_once() {
-        let backend = Arc::new(CountingBackend::new("lazy tier text"));
-        let summarizer = Summarizer::new(backend.clone(), 20);
-        let store = temp_store().with_summarizer(summarizer);
-        let id = store
-            .record_request("s", "r1", "The full text that must be summarized once.")
-            .unwrap();
-
-        let first = store.lod_text(id, 2).unwrap();
-        assert_eq!(first, "lazy tier text");
-        assert_eq!(backend.calls(), 1, "exactly one derivation");
-
-        let second = store.lod_text(id, 2).unwrap();
-        assert_eq!(second, "lazy tier text");
-        assert_eq!(backend.calls(), 1, "second read hits the cache");
-    }
-
-    #[test]
-    fn lod_text_without_summarizer_returns_no_summarizer() {
-        let store = temp_store();
-        let id = store.record_request("s", "r1", "text").unwrap();
-        assert!(matches!(
-            store.lod_text(id, 2),
-            Err(LedgerError::NoSummarizer)
-        ));
-        assert!(matches!(
-            store.lod_text(id, 9),
-            Err(LedgerError::InvalidLod(9))
-        ));
-    }
-
-    #[test]
-    fn session_node_ids_returns_ids_without_node_clones() {
-        let store = temp_store();
-        let id1 = store.record_request("sess", "r1", "one").unwrap();
-        let id2 = store.record_request("sess", "r2", "two").unwrap();
-        store.record_request("other", "r3", "three").unwrap();
-
-        let ids = store.session_node_ids("sess");
-        assert_eq!(ids, vec![id1, id2], "insertion order, ids only");
-        assert!(store.session_node_ids("absent").is_empty());
-    }
-
-    #[test]
-    fn lod_text_not_found_returns_not_found() {
-        let store = temp_store();
-        assert!(matches!(
-            store.lod_text(NodeId::from_int(9999), 0),
-            Err(LedgerError::NotFound(_))
-        ));
-    }
-}
+#[path = "../tests/node_store.rs"]
+mod tests;

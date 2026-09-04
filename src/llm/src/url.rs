@@ -11,8 +11,56 @@ pub enum UrlError {
 }
 
 pub fn is_local_host(host: &str) -> bool {
-    let h = host.trim().to_lowercase();
-    h == "localhost" || h == "127.0.0.1" || h == "::1" || h.starts_with("127.")
+    hosts_equivalent_with(host, "127.0.0.1", HostEquivalence::LOCAL_SSRF)
+}
+
+/// Options for the parameterized host-equivalence primitive (P5).
+///
+/// The two call sites keep DIFFERENT equivalence classes (different threat
+/// models — SSRF vs self-routing-loop — so the classes are never unified):
+/// - `LOCAL_SSRF` (`fold_case`, full `127/8`): the LLM-transport class that
+///   [`is_local_host`] preserves.
+/// - `EXACT_LOOPBACK` (trim only, three exact forms): the router's
+///   `hosts_equivalent` class (see `router/src/config/addr.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostEquivalence {
+    /// Lowercase before comparing (`"LocalHost" == "localhost"`).
+    pub fold_case: bool,
+    /// Treat the whole `127.*` range as loopback (else only `127.0.0.1`).
+    pub loopback_range_127: bool,
+}
+
+impl HostEquivalence {
+    /// The LLM-transport (SSRF) class: case-folded, full `127/8` loopback.
+    pub const LOCAL_SSRF: Self = Self { fold_case: true, loopback_range_127: true };
+    /// The router self-routing class: trim-only, three exact loopback forms.
+    pub const EXACT_LOOPBACK: Self = Self { fold_case: false, loopback_range_127: false };
+}
+
+fn canonical_host(host: &str, opts: HostEquivalence) -> String {
+    let trimmed = host.trim();
+    if opts.fold_case {
+        let lower = trimmed.to_lowercase();
+        if lower == "localhost"
+            || lower == "::1"
+            || lower == "127.0.0.1"
+            || (opts.loopback_range_127 && lower.starts_with("127."))
+        {
+            return "127.0.0.1".to_string();
+        }
+        return lower;
+    }
+    match trimmed {
+        "localhost" | "127.0.0.1" | "::1" => "127.0.0.1".to_string(),
+        _ => trimmed.to_string(),
+    }
+}
+
+/// Parameterized host equivalence: compare canonical forms under `opts`.
+/// Each side's current equivalence class is preserved by its own options
+/// (see [`HostEquivalence`]) — the classes are never merged.
+pub fn hosts_equivalent_with(a: &str, b: &str, opts: HostEquivalence) -> bool {
+    canonical_host(a, opts) == canonical_host(b, opts)
 }
 
 pub fn is_private_ip(host: &str) -> bool {
@@ -44,7 +92,12 @@ pub fn is_private_ip(host: &str) -> bool {
     false
 }
 
-fn extract_host(url: &str) -> &str {
+/// Extract the host from a URL (`scheme://host[:port][/path]` → `host`).
+/// Scheme-less inputs pass through unchanged. Shared primitive (P5) — note
+/// it is IPv6-bracket naive (cuts at the first `':'`), so host:port parsers
+/// that must handle `[::1]` (e.g. the router's `parse_bind_addr` flow) keep
+/// their own bracket-aware shape instead of composing this.
+pub fn extract_host(url: &str) -> &str {
     if let Some(rest) = url.split("://").nth(1) {
         let end = rest.find([':', '/']).unwrap_or(rest.len());
         &rest[..end]
@@ -99,126 +152,7 @@ pub fn derive_embeddings_url(endpoint: &str) -> String {
         trimmed.to_string()
     }
 }
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn is_local_host_variants() {
-        assert!(is_local_host("localhost"));
-        assert!(is_local_host("127.0.0.1"));
-        assert!(is_local_host("::1"));
-        assert!(!is_local_host("example.com"));
-    }
-
-    #[test]
-    fn is_private_ip_ranges() {
-        assert!(is_private_ip("10.0.0.1"));
-        assert!(is_private_ip("192.168.1.1"));
-        assert!(is_private_ip("172.16.0.1"));
-        assert!(!is_private_ip("8.8.8.8"));
-    }
-
-    #[test]
-    fn validate_https_accepts() {
-        assert!(validate_https_or_local_http("https://api.openai.com/v1").is_ok());
-    }
-
-    #[test]
-    fn validate_local_http_accepts() {
-        assert!(validate_https_or_local_http("http://localhost:11434").is_ok());
-    }
-
-    #[test]
-    fn validate_rejects_remote_http() {
-        assert!(validate_https_or_local_http("http://evil.com").is_err());
-    }
-
-    #[test]
-    fn validate_rejects_bare_hostname() {
-        assert!(validate_https_or_local_http("localhost").is_err());
-    }
-
-    #[test]
-    fn validate_rejects_empty() {
-        assert!(validate_https_or_local_http("").is_err());
-    }
-
-    #[test]
-    fn allows_localhost_http() {
-        assert!(validate_https_or_local_http("http://localhost:11434/api/embed").is_ok());
-    }
-
-    #[test]
-    fn allows_public_https() {
-        assert!(validate_https_or_local_http("https://api.openai.com/v1/embeddings").is_ok());
-    }
-
-    #[test]
-    fn blocks_aws_metadata_http() {
-        assert!(validate_https_or_local_http("http://169.254.169.254/latest/meta-data").is_err());
-    }
-
-    #[test]
-    fn blocks_aws_metadata_https() {
-        assert!(validate_https_or_local_http("https://169.254.169.254/latest/meta-data").is_err());
-    }
-
-    #[test]
-    fn blocks_private_class_a_https() {
-        assert!(validate_https_or_local_http("https://10.0.0.1/api").is_err());
-    }
-
-    #[test]
-    fn blocks_private_class_c_https() {
-        assert!(validate_https_or_local_http("https://192.168.1.1/api").is_err());
-    }
-
-    #[test]
-    fn chat_completions_url_already_suffixed() {
-        assert_eq!(
-            chat_completions_url("http://localhost:11434/v1/chat/completions"),
-            "http://localhost:11434/v1/chat/completions"
-        );
-    }
-
-    #[test]
-    fn chat_completions_url_appends() {
-        assert_eq!(
-            chat_completions_url("http://localhost:11434/v1"),
-            "http://localhost:11434/v1/chat/completions"
-        );
-    }
-
-    #[test]
-    fn chat_completions_url_trims_trailing_slash() {
-        assert_eq!(
-            chat_completions_url("http://localhost:11434/v1/"),
-            "http://localhost:11434/v1/chat/completions"
-        );
-    }
-
-    #[test]
-    fn derive_embeddings_url_v1_chat() {
-        assert_eq!(
-            derive_embeddings_url("http://host:port/v1/chat/completions"),
-            "http://host:port/v1"
-        );
-    }
-
-    #[test]
-    fn derive_embeddings_url_plain_chat() {
-        assert_eq!(
-            derive_embeddings_url("http://host:port/chat/completions"),
-            "http://host:port/v1"
-        );
-    }
-
-    #[test]
-    fn derive_embeddings_url_passthrough() {
-        assert_eq!(
-            derive_embeddings_url("http://host:port/v1"),
-            "http://host:port/v1"
-        );
-    }
-}
+#[path = "../tests/url.rs"]
+mod tests;

@@ -32,14 +32,14 @@ pub fn test_http_client() -> &'static reqwest::Client {
     TEST.get_or_init(reqwest::Client::new)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// NOTE (ROADMAP_20260903_LLM M11): the CORS contract (`CORS_*`,
+// `add_cors_headers`, now owned by `fluent_router::server::cors`) and the
+// error envelope (`error_value`, now `fluent_llm::openai::error_response`)
+// lived here through M10 as deprecated byte-identical shims; M11 deleted
+// them. The generic client + body helpers below stay.
 
-    #[test]
-    fn shared_http_client_returns_same_instance() {
-        let a = shared_http_client();
-        let b = shared_http_client();
-        assert!(std::ptr::eq(a, b));
-    }
+/// JSON body string for `value`.
+pub fn json_body(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).unwrap_or_default()
 }
+

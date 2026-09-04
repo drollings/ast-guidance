@@ -23,6 +23,9 @@ use tokio::process::{Child, Command};
 use crate::config::{InstanceProfile, RouterConfig};
 use crate::instances::instance_grammar_string;
 
+pub mod health;
+use health::HealthProbe;
+
 /// The `llama-server` binary name resolved from `$PATH`.
 pub const LLAMA_SERVER_BIN: &str = "llama-server";
 
@@ -181,8 +184,13 @@ pub fn build_server_args(spec: &LlamaServerSpec) -> Vec<String> {
     }
     // Only pinned instances are declared at spawn; unpinned instances are
     // created on demand by the sidecar (see InstanceManager::ensure_instance).
+    // Exception: a pool with NO pinned instance (an all-lazy model) declares
+    // its full grammar so the server registers `/instances` and the model is
+    // trackable the moment it is loaded on demand — there is no resident anchor
+    // whose VRAM a declaration would waste.
+    let any_pinned = spec.instances.iter().any(|p| p.pinned);
     for profile in &spec.instances {
-        if !profile.pinned {
+        if any_pinned && !profile.pinned {
             continue;
         }
         args.push("--instance".into());
@@ -213,8 +221,17 @@ pub fn build_server_args(spec: &LlamaServerSpec) -> Vec<String> {
 }
 
 /// Backoff between restart attempts: 1s, 2s, 4s, ... capped at 64s.
+///
+/// M3: delegates to the shared no-jitter capped-exponential schedule
+/// (`common_core::retry::capped_exp_backoff_ms` with base 1s, max shift 6).
+/// The schedule is deliberately jitter-free — jitter would change restart
+/// timing. Locked element-wise by the M3.1 golden test below.
 fn restart_backoff(consecutive_failures: u32) -> Duration {
-    Duration::from_secs(1u64 << consecutive_failures.min(6))
+    Duration::from_millis(common_core::retry::capped_exp_backoff_ms(
+        1000,
+        consecutive_failures,
+        6,
+    ))
 }
 
 /// One supervised server: the spawn spec, its localhost address, and the shared
@@ -322,6 +339,14 @@ impl ManagedServer {
     /// spawn lock prevents a lazy model from being double-spawned. Called by
     /// the router when a dispatch targets a managed model that is not loaded.
     pub async fn ensure_running(self: &Arc<Self>, bin: &Path) -> Result<(), String> {
+        self.ensure_running_with_client(bin, &build_shared_client()).await
+    }
+
+    pub async fn ensure_running_with_client(
+        self: &Arc<Self>,
+        bin: &Path,
+        client: &reqwest::Client,
+    ) -> Result<(), String> {
         if self.contained() {
             return Err(self.terminal_failure());
         }
@@ -353,11 +378,12 @@ impl ManagedServer {
             if guard.is_none() {
                 let me = Arc::clone(self);
                 let bin = bin.to_path_buf();
-                let handle = tokio::spawn(async move { me.supervise(bin).await; });
+                let client = Arc::new(client.clone());
+                let handle = tokio::spawn(async move { me.supervise(bin, client).await; });
                 *guard = Some(handle.abort_handle());
             }
         }
-        self.wait_healthy().await
+        self.wait_healthy_with_client(client).await
     }
 
     /// Unload the server (on-demand teardown): kill the child and stop the
@@ -394,15 +420,15 @@ impl ManagedServer {
 
     /// Wait for `/health` to answer 2xx, up to `HEALTH_TIMEOUT`.
     pub async fn wait_healthy(&self) -> Result<(), String> {
-        // `cap=1` keeps the poll interval constant at HEALTH_POLL (the poll
-        // deadline is a fixed wall-clock, not a growing backoff), and
-        // `max_failures = HEALTH_TIMEOUT/HEALTH_POLL` bounds the loop to the
-        // deadline, preserving the original hard-stop behavior.
-        let poll = PollWithBackoff::new(HEALTH_POLL, 1)
-            .with_max_failures(HEALTH_TIMEOUT.as_secs() as u32);
-        match poll
+        self.wait_healthy_with_client(&build_shared_client()).await
+    }
+
+    pub async fn wait_healthy_with_client(&self, client: &reqwest::Client) -> Result<(), String> {
+        let probe = HealthProbe::for_wait(client.clone(), self.base_url.clone());
+        // Use HealthProbe's poll but log on success
+        let result = probe.poll
             .run(|| async {
-                let healthy = self.probe_health().await;
+                let healthy = probe.probe_once().await;
                 if healthy {
                     tracing::info!(
                         target: "router.supervisor",
@@ -413,14 +439,9 @@ impl ManagedServer {
                 }
                 healthy
             })
-            .await
-        {
+            .await;
+        match result {
             PollResult::Ready => {
-                // A server that answered `/health` has earned a fresh restart
-                // budget: reset the consecutive-failure count (which drives
-                // backoff and the restart limit) and clear any containment
-                // flag. The reset lives here — on health, never on spawn — so
-                // a process that dies before becoming healthy keeps counting.
                 self.inner.spawn_failures.store(0, Ordering::Relaxed);
                 self.inner.failed.store(false, Ordering::Relaxed);
                 Ok(())
@@ -461,16 +482,21 @@ impl ManagedServer {
         )
     }
 
-    /// Probe the server's `/health` endpoint once; `true` iff it answers 2xx.
-    /// The single health-probe primitive shared by boot-wait (`wait_healthy`)
-    /// and the post-boot liveness poll — never duplicated.
+    #[allow(dead_code)]
     async fn probe_health(&self) -> bool {
-        let client = reqwest::Client::new();
-        client
-            .get(format!("{}/health", self.base_url))
-            .send()
-            .await
-            .is_ok_and(|resp| resp.status().is_success())
+        self.probe_health_with_client(&build_shared_client()).await
+    }
+
+    async fn probe_health_with_client(&self, client: &reqwest::Client) -> bool {
+        HealthProbe::new(
+            client.clone(),
+            self.base_url.clone(),
+            PollWithBackoff::new(HEALTH_POLL, 1),
+            self.inner.liveness_failures_before_restart,
+            HEALTH_POLL,
+        )
+        .probe_once()
+        .await
     }
 
     /// Spawn the child process (no health wait). Failure is logged and counted
@@ -569,7 +595,7 @@ impl ManagedServer {
     /// killed so the exit-restart path (with backoff) takes over. Runs as a
     /// spawned task for the life of the server. Guarded by `stopping` so a
     /// shutdown never triggers a restart.
-    async fn supervise(self: Arc<Self>, bin: PathBuf) {
+    async fn supervise(self: Arc<Self>, bin: PathBuf, client: Arc<reqwest::Client>) {
         let liveness_poll = self.inner.liveness_poll;
         let liveness_threshold = self.inner.liveness_failures_before_restart;
         loop {
@@ -622,7 +648,7 @@ impl ManagedServer {
                 if self.inner.stopping.load(Ordering::Relaxed) {
                     break;
                 }
-                if self.probe_health().await {
+                if self.probe_health_with_client(&client).await {
                     liveness_failures = 0;
                     // The server answered `/health`: it earned a fresh crash
                     // budget. The reset must only happen here (and in
@@ -730,10 +756,21 @@ impl ManagedServer {
     }
 }
 
+fn build_shared_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .pool_idle_timeout(Duration::from_secs(30))
+        .tcp_keepalive(Duration::from_secs(30))
+        .user_agent("coral-router")
+        .build()
+        .expect("reqwest client build")
+}
+
 /// The supervisor: one [`ManagedServer`] per managed model.
 pub struct LlamaServerSupervisor {
     bin: PathBuf,
     servers: ConcurrentRegistry<String, ManagedServer>,
+    http_client: Arc<reqwest::Client>,
 }
 
 impl LlamaServerSupervisor {
@@ -781,6 +818,9 @@ impl LlamaServerSupervisor {
         let liveness_failures = config.sidecar.liveness_failures_before_restart;
         for key in keys {
             let entry = &config.models[key];
+            // Onnx models are router-managed but NOT llama-managed: the ort
+            // registry serves them (ROADMAP_20260827_ORT §0.5), so the
+            // supervisor must never spawn a llama-server for one.
             if !entry.is_managed() {
                 continue;
             }
@@ -809,7 +849,20 @@ impl LlamaServerSupervisor {
             server_count = servers.len(),
             "llama-server supervisor built",
         );
-        Ok(Self { bin, servers })
+        Ok(Self {
+            bin,
+            servers,
+            http_client: Arc::new(build_shared_client()),
+        })
+    }
+
+    #[cfg(test)]
+    pub fn with_client_for_test(bin: PathBuf, client: reqwest::Client) -> Self {
+        Self {
+            bin,
+            servers: ConcurrentRegistry::new(),
+            http_client: Arc::new(client),
+        }
     }
 
     /// The resolved binary path.
@@ -858,10 +911,11 @@ impl LlamaServerSupervisor {
             boot_keys.push(key.clone());
             server.spawn_child(&bin);
             server.inner.running.store(true, Ordering::Relaxed);
+            let client = Arc::clone(&self.http_client);
             let handle = {
                 let me = Arc::clone(&server);
                 let bin = bin.clone();
-                tokio::spawn(async move { me.supervise(bin).await; })
+                tokio::spawn(async move { me.supervise(bin, client).await; })
             };
             let supervisor_guard = server.inner.supervisor.lock();
             if let Ok(mut guard) = supervisor_guard {
@@ -870,10 +924,12 @@ impl LlamaServerSupervisor {
         }
         // Await every boot server's /health concurrently; the first failure
         // aborts (lazy models are not health-checked at boot).
+        let client = Arc::clone(&self.http_client);
         let mut health = Vec::new();
         for key in &boot_keys {
             let server = self.servers.get(key).expect("managed key from registry");
-            health.push(async move { (key.clone(), server.wait_healthy().await) });
+            let client = Arc::clone(&client);
+            health.push(async move { (key.clone(), server.wait_healthy_with_client(&client).await) });
         }
         for fut in health {
             let (key, result) = fut.await;
@@ -891,7 +947,9 @@ impl LlamaServerSupervisor {
         let server = self.servers.get(&model_key.to_string()).ok_or_else(|| {
             format!("model '{model_key}' is not managed by the supervisor")
         })?;
-        server.ensure_running(&self.bin).await
+        server
+            .ensure_running_with_client(&self.bin, &self.http_client)
+            .await
     }
 
     /// Whether a managed model's server is currently running. `None` when the
@@ -941,367 +999,6 @@ impl Drop for LlamaServerSupervisor {
         }
     }
 }
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::ModelEntry;
-
-    use bytes::Bytes;
-    use http_body_util::BodyExt;
-    use http_body_util::Full;
-    use hyper::body::Incoming;
-    use hyper_util::rt::TokioIo;
-    use tokio::net::TcpListener;
-
-    fn managed_entry() -> ModelEntry {
-        serde_json::from_value(serde_json::json!({
-            "endpoint": "http://127.0.0.1:0/v1/chat/completions",
-            "name": "abiray/lfm2.5-2.6b-heretic-abliterated",
-            "intelligence": 2,
-            "cost_input": 1e-06, "cost_output": 6e-06, "cost_cached_read": 4e-07,
-            "speed": 8,
-            "weights": "/models/lfm2.6b.gguf",
-            "instances": {
-                "swarm": { "count": 2, "group": "swarm", "num_ctx": 8192, "pinned": true },
-                "ledger": { "num_ctx": 65536, "default": true }
-            }
-        }))
-        .expect("entry parses")
-    }
-
-    fn defaults() -> crate::config::DefaultModelParams {
-        crate::config::DefaultModelParams::default()
-    }
-
-    #[test]
-    fn resolve_llama_server_prefers_env_override() {
-        let old = std::env::var_os(LLAMA_SERVER_ENV);
-        std::env::set_var(LLAMA_SERVER_ENV, "/custom/llama-server");
-        let resolved = resolve_llama_server();
-        assert_eq!(resolved.as_deref(), Some(std::path::Path::new("/custom/llama-server")));
-        match old {
-            Some(v) => std::env::set_var(LLAMA_SERVER_ENV, v),
-            None => std::env::remove_var(LLAMA_SERVER_ENV),
-        }
-    }
-
-    #[test]
-    fn server_args_declare_host_port_alias_and_model() {
-        let spec = LlamaServerSpec::from_entry(
-            "swarm",
-            &managed_entry(),
-            18080,
-            Some("/srv/slots".into()),
-            Some("sekrit".into()),
-            defaults(),
-        );
-        let args = build_server_args(&spec);
-        let joined = args.join(" ");
-        assert!(joined.contains("--host 127.0.0.1"));
-        assert!(joined.contains("--port 18080"));
-        assert!(joined.contains("--alias abiray/lfm2.5-2.6b-heretic-abliterated"));
-        assert!(joined.contains("-m /models/lfm2.6b.gguf"));
-        assert!(joined.contains("--slot-save-path /srv/slots"));
-        assert!(joined.contains("--api-key sekrit"));
-    }
-
-    #[test]
-    fn server_args_declare_default_params_run_defaults() {
-        let spec = LlamaServerSpec::from_entry(
-            "swarm",
-            &managed_entry(),
-            18080,
-            None,
-            None,
-            defaults(),
-        );
-        let args = build_server_args(&spec);
-        let joined = args.join(" ");
-        assert!(joined.contains("--batch-size 4096"));
-        assert!(joined.contains("--ubatch-size 1024"));
-        assert!(joined.contains("--cache-type-k q8_0"));
-        assert!(joined.contains("--cache-type-v q8_0"));
-        assert!(joined.contains("--n-gpu-layers 999"));
-    }
-
-    #[test]
-    fn server_args_declare_only_pinned_instance_profiles() {
-        let spec = LlamaServerSpec::from_entry(
-            "swarm",
-            &managed_entry(),
-            18080,
-            None,
-            None,
-            defaults(),
-        );
-        assert!(spec.boot, "pinned swarm profile -> boot model");
-        let args = build_server_args(&spec);
-        let instances: Vec<&String> = args
-            .iter()
-            .enumerate()
-            .filter_map(|(i, a)| if a == "--instance" { args.get(i + 1) } else { None })
-            .collect();
-        // `ledger` is unpinned (no `pinned: true`) in the fixture, so only the
-        // pinned count:2 swarm siblings are declared at spawn.
-        assert_eq!(instances.len(), 2, "only pinned instances declared at boot");
-        assert!(instances.contains(&&"swarm-0:group=swarm:ctx=8192:pinned".to_string()));
-        assert!(instances.contains(&&"swarm-1:group=swarm:ctx=8192:pinned".to_string()));
-        assert!(
-            !instances.iter().any(|s| s.contains("ledger")),
-            "unpinned ledger deferred to on-demand creation"
-        );
-    }
-
-    #[test]
-    fn plain_model_gets_default_ctx_and_idle_sleep() {
-        let mut entry = managed_entry();
-        entry.instances = None;
-        let spec = LlamaServerSpec::from_entry("swarm", &entry, 18080, None, None, defaults());
-        assert!(!spec.boot, "no pinned instance -> lazy model");
-        let args = build_server_args(&spec);
-        let joined = args.join(" ");
-        assert!(joined.contains("--ctx-size 16384"));
-        assert!(joined.contains("--sleep-idle-seconds 15"));
-        assert!(!joined.contains("--instance"), "no instance grammar for plain models");
-    }
-
-    #[test]
-    fn server_args_use_hf_repo_when_no_weights() {
-        let mut entry = managed_entry();
-        entry.weights = None;
-        entry.hf_repo = Some("abiray/lfm2.5-2.6b-gguf".into());
-        entry.hf_file = Some("Q4_K_M.gguf".into());
-        let spec = LlamaServerSpec::from_entry("swarm", &entry, 18080, None, None, defaults());
-        let args = build_server_args(&spec);
-        let joined = args.join(" ");
-        assert!(joined.contains("-hf abiray/lfm2.5-2.6b-gguf"));
-        assert!(joined.contains("-hff Q4_K_M.gguf"));
-        assert!(!joined.contains("-m /models"));
-    }
-
-    #[test]
-    fn model_entry_managed_detection() {
-        let mut entry = managed_entry();
-        assert!(entry.is_managed(), "weights -> managed");
-        entry.weights = None;
-        entry.hf_repo = None;
-        assert!(entry.is_managed(), "instances -> managed");
-        entry.instances = None;
-        assert!(!entry.is_managed(), "nothing to load -> not managed");
-    }
-
-    // ── Post-boot liveness supervision ─────────────────────────────────
-
-    /// Spawn a tiny in-process `/health` server whose availability is toggled
-    /// by an `AtomicBool`: `true` -> 200, `false` -> 503. Returns its port.
-    async fn spawn_health_server(up: Arc<AtomicBool>) -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind health stub");
-        let addr = listener.local_addr().expect("addr");
-        tokio::spawn(async move {
-            loop {
-                let Ok((stream, _peer)) = listener.accept().await else {
-                    break;
-                };
-                let up = up.clone();
-                let io = TokioIo::new(stream);
-                let service =
-                    hyper::service::service_fn(move |_req: hyper::Request<Incoming>| {
-                        let up = up.clone();
-                        async move {
-                            let status = if up.load(Ordering::SeqCst) { 200u16 } else { 503u16 };
-                            Ok::<_, std::convert::Infallible>(
-                                hyper::Response::builder()
-                                    .status(status)
-                                    .body(Full::new(Bytes::new()).boxed_unsync())
-                                    .expect("build response"),
-                            )
-                        }
-                    });
-                tokio::spawn(async move {
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, service)
-                        .await;
-                });
-            }
-        });
-        addr.port()
-    }
-
-    /// Write a fake `llama-server` script that logs each spawn to `counter` and
-    /// then stays alive until killed (`exec` keeps the PID stable so the
-    /// supervisor's kill reaches the long-lived process).
-    fn write_fake_llama(counter: &Path) -> PathBuf {
-        let script = counter.parent().expect("counter parent").join("fake-llama");
-        let content = format!(
-            "#!/bin/sh\necho spawned >> \"{}\"\nexec sleep 600\n",
-            counter.display()
-        );
-        std::fs::write(&script, content).expect("write fake llama");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod fake llama");
-        }
-        script
-    }
-
-    /// Write a fake `llama-server` script that logs each spawn to `counter` and
-    /// then exits immediately (a crash loop — e.g. a missing weights file).
-    fn write_crashing_llama(counter: &Path) -> PathBuf {
-        let script = counter
-            .parent()
-            .expect("counter parent")
-            .join("fake-llama-crash");
-        let content = format!(
-            "#!/bin/sh\necho spawned >> \"{}\"\nexit 1\n",
-            counter.display()
-        );
-        std::fs::write(&script, content).expect("write crashing fake llama");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod fake llama");
-        }
-        script
-    }
-
-    fn spawn_count(counter: &Path) -> usize {
-        std::fs::read_to_string(counter)
-            .map(|s| s.lines().count())
-            .unwrap_or(0)
-    }
-
-    async fn wait_for_spawn_count(counter: &Path, expected: usize, timeout: Duration) {
-        let deadline = std::time::Instant::now() + timeout;
-        while std::time::Instant::now() < deadline {
-            if spawn_count(counter) >= expected {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        panic!(
-            "spawn counter did not reach {expected} within {timeout:?}; count={}",
-            spawn_count(counter)
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn liveness_restarts_hung_server_but_leaves_healthy_one() {
-        let up = Arc::new(AtomicBool::new(true));
-        let port = spawn_health_server(up.clone()).await;
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let counter = tmp.path().join("spawns");
-        let bin = write_fake_llama(&counter);
-
-        let server = Arc::new(ManagedServer::with_liveness(
-            LlamaServerSpec::from_entry("swarm", &managed_entry(), port, None, None, defaults()),
-            Duration::from_millis(100),
-            3,
-            0,
-        ));
-        server.spawn_child(&bin);
-        let supervise = tokio::spawn(server.clone().supervise(bin));
-
-        // While the server answers 200, several liveness polls must NOT touch
-        // the child.
-        tokio::time::sleep(Duration::from_millis(450)).await;
-        assert_eq!(
-            spawn_count(&counter),
-            1,
-            "healthy server must not be restarted by the liveness poll"
-        );
-
-        // Hang the server; stay below the (3) failure threshold -> still no
-        // restart.
-        up.store(false, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(
-            spawn_count(&counter),
-            1,
-            "below the failure threshold must not restart"
-        );
-
-        // Cross the threshold: the hung child is killed and respawned.
-        wait_for_spawn_count(&counter, 2, Duration::from_secs(8)).await;
-        supervise.abort();
-        let _ = server.stop().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn liveness_never_restarts_during_shutdown() {
-        let up = Arc::new(AtomicBool::new(true));
-        let port = spawn_health_server(up.clone()).await;
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let counter = tmp.path().join("spawns");
-        let bin = write_fake_llama(&counter);
-
-        let server = Arc::new(ManagedServer::with_liveness(
-            LlamaServerSpec::from_entry("swarm", &managed_entry(), port, None, None, defaults()),
-            Duration::from_millis(50),
-            1,
-            0,
-        ));
-        server.spawn_child(&bin);
-        let supervise = tokio::spawn(server.clone().supervise(bin.clone()));
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(spawn_count(&counter), 1, "server running");
-
-        // Stop the server: the supervise task must exit without restarting
-        // even though the health probe now fails (stopping guard).
-        server.stop().await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(
-            spawn_count(&counter),
-            1,
-            "shutdown must never restart the server"
-        );
-        supervise.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn crash_loop_is_contained_after_max_restarts() {
-        // A llama-server that dies immediately (e.g. a missing weights file)
-        // must NOT restart forever: the failure count rises, the backoff
-        // escalates, and after `max_restarts` crashes the supervision task
-        // gives up and marks the server failed (containment).
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let counter = tmp.path().join("spawns");
-        let bin = write_crashing_llama(&counter);
-
-        let server = Arc::new(ManagedServer::with_liveness(
-            LlamaServerSpec::from_entry("swarm", &managed_entry(), 1, None, None, defaults()),
-            Duration::from_millis(50),
-            3,
-            3,
-        ));
-        server.spawn_child(&bin);
-        let supervise = tokio::spawn(server.clone().supervise(bin.clone()));
-
-        // Three spawns (initial + two restarts) exhaust the budget; then the
-        // loop stops. Give the third child time to exit and be contained.
-        wait_for_spawn_count(&counter, 3, Duration::from_secs(30)).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(
-            spawn_count(&counter),
-            3,
-            "containment stops the restart loop at max_restarts"
-        );
-        assert!(
-            server.inner.failed.load(Ordering::Relaxed),
-            "server marked failed (contained)"
-        );
-        assert!(!server.is_running(), "contained server is not running");
-        supervise.abort();
-
-        // A load attempt after containment fails fast with the terminal error
-        // instead of spawning again.
-        let err = server.ensure_running(&bin).await.unwrap_err();
-        assert!(err.contains("containment"), "terminal error names containment: {err}");
-        assert_eq!(spawn_count(&counter), 3, "contained server is never re-spawned");
-    }
-}
+#[path = "../tests/supervisor.rs"]
+mod tests;
