@@ -295,7 +295,7 @@ pub enum StepStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OverlayKind {
-    /// The `ArcReadyAnnotation` (deterministic spacy parse, cheap).
+    /// The `NodeAnnotation` (deterministic spacy parse, cheap).
     Spacy,
     /// LLM enrichment (summary/description).
     Llm,
@@ -567,7 +567,7 @@ pub struct ContentNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<u64>,
     // ── Overlay slot (in-memory only) ──
-    /// The node's derived overlay (e.g. the spacy-rs `ArcReadyAnnotation`),
+    /// The node's derived overlay (e.g. the router ledger's `NodeAnnotation`),
     /// shared behind an `Arc` so every holder of the node reads the same
     /// immutable document without a copy or a lock. **Never serialized**
     /// (`#[serde(skip)]`): the node is durable without it and the overlay is
@@ -583,7 +583,7 @@ impl ContentNode {
         self.lod.first().map(String::as_str)
     }
 
-    /// The typed overlay (e.g. `ArcReadyAnnotation`), downcast from the
+    /// The typed overlay (e.g. `NodeAnnotation`), downcast from the
     /// opaque slot. `None` when the node carries no overlay of type `T`.
     #[must_use]
     pub fn annotation_as<T: NodeOverlay>(&self) -> Option<&T> {

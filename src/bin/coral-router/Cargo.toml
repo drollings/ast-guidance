@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 fluent-db = { path = "../../db" }
 fluent-router = { path = "../../router" }
+fluent-concept = { path = "../../concept" }
 fluent-onnx = { path = "../../fluent-onnx" }
 fluent-types = { path = "../../types" }
 fluent-concurrency = { path = "../../fluent-concurrency" }

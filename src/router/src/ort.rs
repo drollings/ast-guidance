@@ -854,7 +854,7 @@ pub fn pii_prefilter(
 pub fn colbert_entity_scorer(
     registry: &OrtRegistry,
     model_key: &str,
-    concept_store: &Arc<dyn spacy_rs::ConceptStore>,
+    concept_store: &Arc<dyn fluent_concept::ConceptStore>,
     threshold: f64,
 ) -> Result<crate::server::entity_link::EntityLinkScorer, OrtError> {
     use fluent_onnx::colbert::{bake_entity_index, EntitySimilarityIndex};
@@ -918,7 +918,7 @@ pub fn colbert_entity_scorer(
 fn score_span(
     query_tokens: &[Vec<f32>],
     index: &fluent_onnx::EntitySimilarityIndex,
-    store: &dyn spacy_rs::ConceptStore,
+    store: &dyn fluent_concept::ConceptStore,
 ) -> Vec<(fluent_types::InterlinguaId, f64)> {
     if query_tokens.is_empty() {
         return Vec::new();
@@ -941,7 +941,7 @@ fn score_span(
 pub fn colbert_entity_scorer(
     _registry: &OrtRegistry,
     model_key: &str,
-    _concept_store: &Arc<dyn spacy_rs::ConceptStore>,
+    _concept_store: &Arc<dyn fluent_concept::ConceptStore>,
     _threshold: f64,
 ) -> Result<crate::server::entity_link::EntityLinkScorer, OrtError> {
     if !model_key.is_empty() {

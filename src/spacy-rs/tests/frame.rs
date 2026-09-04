@@ -1,5 +1,5 @@
 use super::*;
-use crate::concept_store_mem::InMemoryConceptStore;
+use fluent_concept::InMemoryConceptStore;
 use crate::llm::{attach, AnnotationSet};
 use crate::sentencizer::Sentencizer;
 use crate::vocab::Vocab;
@@ -222,13 +222,13 @@ fn empty_doc_yields_no_frames() {
 
 #[test]
 fn loading_gate_stamps_provisional_even_when_unambiguous() {
-    use crate::concept_store::ConceptStoreState;
+    use fluent_concept::ConceptStoreState;
     struct LoadingStore(InMemoryConceptStore);
-    impl crate::concept_store::ConceptStore for LoadingStore {
-        fn get(&self, id: fluent_types::InterlinguaId) -> Result<fluent_types::ConceptMetadata, crate::concept_store::ConceptStoreError> { self.0.get(id) }
-        fn resolve_name(&self, n: &str) -> Result<fluent_types::InterlinguaId, crate::concept_store::ConceptStoreError> { self.0.resolve_name(n) }
-        fn resolve_yago_iri(&self, i: &str) -> Result<fluent_types::InterlinguaId, crate::concept_store::ConceptStoreError> { self.0.resolve_yago_iri(i) }
-        fn insert(&self, m: fluent_types::ConceptMetadata) -> Result<(), crate::concept_store::ConceptStoreError> { self.0.insert(m) }
+    impl fluent_concept::ConceptStore for LoadingStore {
+        fn get(&self, id: fluent_types::InterlinguaId) -> Result<fluent_types::ConceptMetadata, fluent_concept::ConceptStoreError> { self.0.get(id) }
+        fn resolve_name(&self, n: &str) -> Result<fluent_types::InterlinguaId, fluent_concept::ConceptStoreError> { self.0.resolve_name(n) }
+        fn resolve_yago_iri(&self, i: &str) -> Result<fluent_types::InterlinguaId, fluent_concept::ConceptStoreError> { self.0.resolve_yago_iri(i) }
+        fn insert(&self, m: fluent_types::ConceptMetadata) -> Result<(), fluent_concept::ConceptStoreError> { self.0.insert(m) }
         fn contains(&self, id: fluent_types::InterlinguaId) -> bool { self.0.contains(id) }
         fn iter_ids(&self) -> Box<dyn Iterator<Item=fluent_types::InterlinguaId> + '_> { self.0.iter_ids() }
         fn ancestors_of(&self, id: fluent_types::InterlinguaId) -> Vec<fluent_types::InterlinguaId> { self.0.ancestors_of(id) }
@@ -238,8 +238,8 @@ fn loading_gate_stamps_provisional_even_when_unambiguous() {
     let store = Arc::new(LoadingStore(InMemoryConceptStore::new()));
     let doc = attached(FULL_PARSE, &["Show", "me", "the", "sales", "report", "for", "yesterday", "please"]);
     let ex = crate::frame::FrameExtractor::new(
-        Arc::new(crate::interlingua::InterlinguaResolver::new(Arc::clone(&store) as Arc<dyn crate::concept_store::ConceptStore>, Arc::clone(vocab().strings()))),
-        Arc::clone(&store) as Arc<dyn crate::concept_store::ConceptStore>,
+        Arc::new(crate::interlingua::InterlinguaResolver::new(Arc::clone(&store) as Arc<dyn fluent_concept::ConceptStore>, Arc::clone(vocab().strings()))),
+        Arc::clone(&store) as Arc<dyn fluent_concept::ConceptStore>,
     );
     let analysis = ex.extract(&doc, None);
     assert!(analysis.ambiguities.is_empty(), "grammatically unambiguous");

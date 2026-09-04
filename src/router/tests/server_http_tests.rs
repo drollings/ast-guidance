@@ -1951,7 +1951,7 @@ fn review_deps(
     use crate::ledger::ContentNodeLedger;
     use crate::server::review::{ReviewFetch, ReviewWorker};
     use fluent_concurrency::tokio_runtime;
-    use spacy_rs::concept_store_mem::InMemoryConceptStore;
+    use fluent_concept::InMemoryConceptStore;
     use spacy_rs::CorrectionIndex;
 
     let ledger = Arc::new(ContentNodeLedger::open_in_memory().expect("ledger"));
@@ -1971,7 +1971,7 @@ fn review_deps(
     let worker = Arc::new(ReviewWorker::new(
         &ledger,
         &(Arc::clone(&index) as Arc<dyn CorrectionIndex>),
-        &(Arc::clone(&concepts) as Arc<dyn spacy_rs::ConceptStore>),
+        &(Arc::clone(&concepts) as Arc<dyn fluent_concept::ConceptStore>),
         &fetch,
         None,
         false,

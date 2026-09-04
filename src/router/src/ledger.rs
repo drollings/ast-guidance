@@ -43,6 +43,7 @@ pub mod span_cache;
 pub mod annotations;
 pub mod frame_index;
 pub mod nlp;
+pub mod node_annotation;
 pub mod orchestrator;
 pub mod overlay;
 pub mod overlay_worker;

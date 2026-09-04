@@ -12,3 +12,6 @@ mod smoke_live;
 
 #[path = "live/refine_live.rs"]
 mod refine_live;
+
+#[path = "live/parse_bench_live.rs"]
+mod parse_bench_live;

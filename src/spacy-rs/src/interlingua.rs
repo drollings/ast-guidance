@@ -3,7 +3,7 @@
 //! [`InterlinguaResolver`] is **stateless in the common path**: every ID is a
 //! pure function of content, so there is no `Mutex`, no mutable probe state,
 //! and no registry to serialize parallel workers. It consumes an
-//! [`Arc<dyn ConceptStore>`](crate::concept_store::ConceptStore) (the only
+//! [`Arc<dyn ConceptStore>`](fluent_concept::ConceptStore) (the only
 //! concept state — F9) and the vocabulary's [`StringStore`] for hash→canonical
 //! lookups.
 //!
@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use crate::concept_store::ConceptStore;
+use fluent_concept::ConceptStore;
 use crate::doc::Doc;
 use crate::hash::hash_utf8;
 use crate::strings::StringStore;

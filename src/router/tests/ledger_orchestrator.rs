@@ -292,7 +292,7 @@ fn lod_spec_and_role_defaults() {
 /// embeddings: paraphrase equivalents share a dimension).
 struct TestEmbedder;
 
-impl spacy_rs::retrieval::EmbeddingProvider for TestEmbedder {
+impl crate::retrieval::EmbeddingProvider for TestEmbedder {
     fn embed(&self, text: &str) -> Option<Vec<f32>> {
         let mut v = vec![0.0f32; 8];
         for tok in text.split_whitespace() {
@@ -345,7 +345,7 @@ async fn retrieve_nodes_composes_the_live_retrieval_seam() {
         reports[0]
             .hits
             .iter()
-            .any(|h| h.source == spacy_rs::retrieval::RetrievalSource::LemmaGrep
+            .any(|h| h.source == crate::retrieval::RetrievalSource::LemmaGrep
                 && h.parse_confidence.is_some()),
         "lemma-grep hits carry their parse confidence"
     );

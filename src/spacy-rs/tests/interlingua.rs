@@ -1,6 +1,6 @@
 use super::*;
-use crate::concept_store::ConceptStore;
-use crate::concept_store_mem::InMemoryConceptStore;
+use fluent_concept::ConceptStore;
+use fluent_concept::InMemoryConceptStore;
 use crate::vocab::Vocab;
 use fluent_types::{local_id_of, NodeId};
 

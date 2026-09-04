@@ -23,10 +23,14 @@
 #![allow(clippy::pedantic, clippy::all)]
 
 pub mod arc_eager;
-pub mod arcready;
 pub mod attrs;
-pub mod concept_store;
-pub mod concept_store_mem;
+/// Neutral-home re-export (ROADMAP_20260903_SPACY_RS_SPLIT M3): the
+/// `ConceptStore` trait, `TaxonomyHierarchy`, and the hermetic
+/// `InMemoryConceptStore` live in `fluent-concept`. spacy-rs keeps only a
+/// read-only view import — resolver/frame/triple/yago-stage read through it;
+/// boot-only registration is owned elsewhere. The re-export below is a
+/// backward-compat alias; new code should import from `fluent_concept`.
+pub use fluent_concept::{ConceptStore, ConceptStoreError, InMemoryConceptStore, PlausibilityTriple, ScoredLemma, TaxonomyHierarchy};
 pub mod doc;
 pub mod error;
 pub mod frame;
@@ -39,14 +43,13 @@ mod lemma_blob;
 pub mod lex_attrs;
 pub mod taxonomy_blob;
 pub mod triple;
+pub use triple::{build_plausibility_inputs, extract_triples, semantic_plausibility_via_fetch, PlausibilityFetch, Triple};
 pub mod yago_resolve;
-pub mod yago_view;
 pub mod lexeme;
 pub mod llm;
 pub mod morph;
 pub mod pipeline;
 pub mod cache;
-pub mod genesis;
 pub mod routing;
 pub mod review;
 pub mod retrieval;
@@ -61,17 +64,14 @@ pub use arc_eager::{
     infer_pos, ArcEagerAction, ArcEagerAnnotator, ArcEagerMove, ArcEagerRung, ArcEagerState,
     DepLabels, DeterministicOracle, ParseConfidence,
 };
-pub use arcready::ArcReadyAnnotation;
 pub use attrs::Attribute;
-pub use concept_store::{ConceptStore, ConceptStoreError, TaxonomyHierarchy};
-pub use concept_store_mem::InMemoryConceptStore;
 pub use doc::{
     get_token_attr, set_children_from_heads, set_token_attr, Doc, SentStart, TokenRecord,
 };
 pub use error::SpacyError;
 pub use frame::{
     extract_frames, mint_frame_key, AmbiguityEntry, AmbiguityKind, Frame, FrameAnalysis,
-    FrameExtractor, FrameKey, Modality, Polarity, PreferredSenseIndex, Resolution, RoleType,
+    FrameExtractor, FrameKey, Modality, Polarity, Resolution, RoleType,
     TIE_MARGIN_EPSILON,
 };
 pub use hash::{hash_utf8, murmur64a, HASH_SEED};
@@ -92,18 +92,17 @@ pub use pipeline::{
     SentencizeStage, StagePipeline, TaskValueReason, frame_coverage, frame_coverage_signal,
     refine_focus, refine_reason, should_refine,
 };
-pub use cache::{span_key, InMemorySpanCache, SpanCache};
-pub use genesis::{GenesisEntry, GenesisIndex, InMemoryGenesisIndex};
+pub use cache::{span_key, SpanCacheGet, SpanCacheInvalidate, SpanCachePut, SpanCacheSeam};
+pub use lang::genesis::{GenesisEntry, GenesisIndex, InMemoryGenesisIndex};
 pub use routing::{extract_routing_signals, InterlinguaSignal, RoutingSignal};
 pub use review::{
     apply_corrections, apply_edits, review_prompt, Correction, CorrectionField, CorrectionIndex,
     LinkedEntity, ParseReview, ReviewStatus,
 };
-pub use retrieval::{
-    cosine, cross_check, lemma_grep, CrossCheckReport, EmbeddingProvider, FuzzyHit,
-    FuzzyRetrieval, InMemoryFuzzyIndex, LemmaGrepHit, RegionVerdict, RetrievalHit,
-    RetrievalSource, Span,
-};
+/// Pure lemma-grep helpers only (M4): the fuzzy axis, hit tagging, and the
+/// cross-check combiner live with the router retrieval owner beside
+/// `NodeRetrievalService`.
+pub use retrieval::{lemma_grep, LemmaGrepHit, Span};
 pub use sentencizer::Sentencizer;
 pub use strings::StringStore;
 pub use tag_map::TagMap;

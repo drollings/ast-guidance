@@ -1,7 +1,7 @@
 use super::*;
 use fluent_concurrency::tokio_runtime;
 use fluent_db::migrate::migrate;
-use spacy_rs::concept_store_mem::InMemoryConceptStore;
+use fluent_concept::InMemoryConceptStore;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn open_index() -> (Arc<SqliteStore>, SqlitePreferredSenseIndex) {
@@ -210,7 +210,8 @@ fn parse_naive_handles_single_object_and_garbage() {
 
 #[test]
 fn trait_is_implementable_over_hermetic_store() {
-    // Compile-check: the router impl satisfies the spacy-rs trait.
+    // Compile-check: the router impl satisfies the ledger-owner trait
+    // (M2a: moved from spacy-rs to `ledger::frame_index`).
     let (_store, idx) = open_index();
     let _: &dyn PreferredSenseIndex = &idx;
     // And a hermetic ConceptStore still works (the trait's error type).

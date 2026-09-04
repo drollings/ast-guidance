@@ -24,6 +24,7 @@ members = [
     "src/router",
     "src/bin/coral-router",
     "src/bin/yamake-coral",
+    "src/concept",
     "src/db",
     "src/spacy-rs",
     "src/fluent-onnx",

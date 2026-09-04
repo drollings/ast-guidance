@@ -7,6 +7,8 @@ edition.workspace = true
 
 [dependencies]
 fluent-types = { path = "../types" }
+# M3 (spacy-rs split): the neutral ConceptStore/TaxonomyHierarchy home.
+fluent-concept = { path = "../concept" }
 guidance-rdf = { path = "../rdf" }
 blake3 = { workspace = true }
 thiserror = { workspace = true }

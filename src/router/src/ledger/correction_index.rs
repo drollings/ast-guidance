@@ -102,10 +102,10 @@ impl CorrectionIndex for SqliteCorrectionIndex {
         lemma_id: InterlinguaId,
         entity_id: Option<InterlinguaId>,
         corrections: &[Correction],
-    ) -> Result<(), spacy_rs::ConceptStoreError> {
+    ) -> Result<(), fluent_concept::ConceptStoreError> {
         let entity = entity_id.unwrap_or(InterlinguaId::from_u64(0));
         let json = serde_json::to_string(corrections)
-            .map_err(|e| spacy_rs::ConceptStoreError::Storage(e.to_string()))?;
+            .map_err(|e| fluent_concept::ConceptStoreError::Storage(e.to_string()))?;
         let row = CorrectionRow {
             lemma_id: lemma_id.as_i64(),
             entity_id: entity.as_i64(),
@@ -113,7 +113,7 @@ impl CorrectionIndex for SqliteCorrectionIndex {
         };
         self.store
             .with_conn(|conn| upsert_correction_row(conn, &row))
-            .map_err(|e| spacy_rs::ConceptStoreError::Storage(e.to_string()))?;
+            .map_err(|e| fluent_concept::ConceptStoreError::Storage(e.to_string()))?;
         Ok(())
     }
 }

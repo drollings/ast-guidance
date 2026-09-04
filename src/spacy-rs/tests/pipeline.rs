@@ -1,6 +1,6 @@
 use super::*;
-use crate::concept_store::ConceptStore;
-use crate::concept_store_mem::InMemoryConceptStore;
+use fluent_concept::ConceptStore;
+use fluent_concept::InMemoryConceptStore;
 use crate::interlingua::InterlinguaResolver;
 use crate::labels::Upos;
 use fluent_wvr::{CapabilitySet, Runtime};
@@ -426,82 +426,6 @@ fn process_sync_llm_rung_wins_with_full_deps() {
 
 fn signals_of(doc: &Doc) -> Vec<crate::routing::RoutingSignal> {
     crate::routing::extract_routing_signals(doc)
-}
-
-// ── ArcReady annotation hook (OVERLAYS M3) ──
-
-#[test]
-fn arc_ready_materializes_from_sync_ladder_run() {
-    let pipeline = en_pipeline();
-    let (doc, result) = pipeline
-        .process_sync_with_confidence("Show me the sales report", None, None, RefinePolicy::default())
-        .expect("sync");
-    let ann = arc_ready(&doc, &result);
-
-    // The annotation is the validated ladder output, not the working doc.
-    assert_eq!(ann.records, result.records().clone());
-    assert_eq!(ann.source, result.source());
-    assert_eq!(ann.collision_count, 0);
-    // Signals derive from the sentencized doc (the hook wires extraction).
-    assert_eq!(ann.signals.len(), 1);
-    // The predicate is the root verb's lemma as surfaced by the ArcEager rung
-    // (the deterministic lemmatizer does not lowercase a capitalized verb).
-    assert_eq!(ann.signals[0].predicate, "Show");
-    // The primary signal is the whole (single-sentence) text.
-    let primary = ann.primary_signal().expect("one signal");
-    assert_eq!(primary.predicate, "Show");
-    assert_eq!(primary.sentence, "Show me the sales report");
-    // The token baseline is the tokenizer's exact array (detail baseline).
-    assert_eq!(ann.tokens.len(), doc.len());
-    assert_eq!(ann.tokens[1].idx, 5, "Show (4) + spacy (1)");
-}
-
-#[test]
-fn arc_ready_materializes_from_llm_rung_with_real_deps() {
-    let pipeline = en_pipeline();
-    let full = r#"[
-        {"text":"Show","pos":"verb","dep":"root","head":0,"lemma":"show"},
-        {"text":"me","pos":"pron","dep":"iobj","head":-1,"lemma":"me"},
-        {"text":"the","pos":"det","dep":"det","head":2,"lemma":"the"},
-        {"text":"sales","pos":"noun","dep":"compound","head":1,"lemma":"sales"},
-        {"text":"report","pos":"noun","dep":"dobj","head":-4,"lemma":"report"}
-    ]"#;
-    let (doc, result) = pipeline
-        .process_sync_with_confidence(
-            "Show me the sales report",
-            Some(&stub_fetch_sync(full.into())),
-            None,
-            llm_first_policy(),
-        )
-        .expect("sync");
-    let ann = arc_ready(&doc, &result);
-    assert_eq!(ann.source, AnnotationSource::Llm);
-    assert_eq!(ann.records.records()[4].dep, "dobj");
-    assert_eq!(ann.records.records()[4].lemma, "report");
-    assert_eq!(ann.signals[0].direct_object.as_deref(), Some("report"));
-    // The immutable document shares cleanly behind an `Arc`.
-    let shared: std::sync::Arc<crate::ArcReadyAnnotation> = std::sync::Arc::new(ann);
-    assert_eq!(shared.primary_signal().unwrap().predicate, "show");
-}
-
-#[test]
-fn arc_ready_hook_is_inert_for_existing_callers() {
-    // The hook is a pure addition: the existing entry points keep their exact
-    // return shapes (Doc / (Doc, AnnotationResult)) and the annotation is only
-    // materialized on the explicit `arc_ready` call.
-    let pipeline = en_pipeline();
-    let doc = pipeline.process_sync("Show me the sales report", None).expect("sync");
-    assert_eq!(doc.len(), 5, "process_sync still returns just the Doc");
-
-    let (doc, result) = pipeline
-        .process_sync_with_confidence("Show me the sales report", None, None, RefinePolicy::default())
-        .expect("sync");
-    assert_eq!(result.records().len(), 5, "ladder handoff unchanged");
-
-    // Nothing materialized the annotation until the hook is asked.
-    let ann = arc_ready(&doc, &result);
-    assert_eq!(ann.tokens.len(), 5);
-    assert_eq!(ann.signals.len(), 1);
 }
 
 // ── Trained-encoder rung (ROADMAP_20260827_ORT §4.2) ──
@@ -2450,20 +2374,41 @@ fn always_policy_ignores_focused_seams_and_uses_full_reannotation() {
     assert_eq!(result.records().records()[1].dep, "dobj", "full reply adopted");
 }
 
-// ── M6.1: span-level cache (amortized detail cache) ──
-use crate::cache::SpanCache as _;
-use crate::genesis::GenesisIndex as _;
+// ── M6.1: span-level cache (amortized detail cache, M2b seam) ──
+use crate::lang::genesis::GenesisIndex as _;
+
+/// A hermetic [`SpanCacheSeam`](crate::cache::SpanCacheSeam) over a shared
+/// map — the ladder's whole cache contract without any ledger type.
+fn test_span_seam() -> crate::cache::SpanCacheSeam {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    let map: Arc<Mutex<HashMap<u64, Vec<crate::review::Correction>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let get_h = Arc::clone(&map);
+    let put_h = Arc::clone(&map);
+    let inv_h = Arc::clone(&map);
+    crate::cache::SpanCacheSeam::new(
+        Arc::new(move |key| get_h.lock().expect("lock").get(&key).cloned()),
+        Arc::new(move |key, corrections| {
+            if key != 0 {
+                put_h.lock().expect("lock").insert(key, corrections);
+            }
+        }),
+        Arc::new(move |key| {
+            inv_h.lock().expect("lock").remove(&key);
+        }),
+    )
+}
 
 #[test]
 fn span_cache_hit_avoids_llm_call() {
     let pipeline = en_pipeline();
-    let cache: std::sync::Arc<dyn crate::cache::SpanCache> =
-        std::sync::Arc::new(crate::cache::InMemorySpanCache::new());
+    let seam = test_span_seam();
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let reply = r#"{"corrections":[{"token_index":1,"field":"pos","new_value":"verb"}]}"#;
     let seams = RefineSeams {
         llm_focused: Some(focused_fetch(reply, calls.clone())),
-        span_cache: Some(std::sync::Arc::clone(&cache)),
+        span_cache: Some(seam.clone()),
         ..RefineSeams::default()
     };
     let policy = RefinePolicy {
@@ -2496,7 +2441,7 @@ fn span_cache_hit_avoids_llm_call() {
         policy,
     );
     // Direct invalidation (simulates CorrectionIndex write).
-    cache.invalidate(crate::cache::span_key(&doc, &focus));
+    seam.invalidate(crate::cache::span_key(&doc, &focus));
     let (_, _r3) = pipeline
         .process_sync_with_refine("show me the report", None, None, &seams, None, policy)
         .expect("sync");
@@ -2505,7 +2450,7 @@ fn span_cache_hit_avoids_llm_call() {
 
 #[test]
 fn span_cache_write_through_on_hit_and_gate() {
-    let cache = crate::cache::InMemorySpanCache::new();
+    let seam = test_span_seam();
     let corr = vec![crate::review::Correction {
         token_index: 0,
         field: crate::review::CorrectionField::Pos,
@@ -2513,19 +2458,19 @@ fn span_cache_write_through_on_hit_and_gate() {
         new_value: "verb".into(),
     }];
     let key = 99u64;
-    cache.put(key, corr.clone());
-    assert_eq!(cache.get(key).unwrap(), corr);
-    assert_eq!(cache.len(), 1);
-    cache.invalidate(key);
-    assert!(cache.get(key).is_none());
+    assert!(seam.get(key).is_none());
+    seam.put(key, corr.clone());
+    assert_eq!(seam.get(key).unwrap(), corr);
+    seam.invalidate(key);
+    assert!(seam.get(key).is_none());
 }
 
 // ── M6.2: rule genesis (POS/NER) ──
 
 #[test]
 fn genesis_promotes_after_threshold_and_overrides_rule() {
-    let genesis: std::sync::Arc<dyn crate::genesis::GenesisIndex> =
-        std::sync::Arc::new(crate::genesis::InMemoryGenesisIndex::with_threshold(2));
+    let genesis: std::sync::Arc<dyn crate::lang::genesis::GenesisIndex> =
+        std::sync::Arc::new(crate::lang::genesis::InMemoryGenesisIndex::with_threshold(2));
     // A pipeline with genesis wired: the rule annotator consults it.
     let mut pipe = en_pipeline();
     // Manually wire genesis (with_genesis rebuilds the rule).
@@ -2554,7 +2499,7 @@ fn genesis_promotes_after_threshold_and_overrides_rule() {
 fn genesis_save_and_load_roundtrip() {
     let dir = tempfile::tempdir().expect("tmpdir");
     let path = dir.path().join("genesis.json");
-    let g = crate::genesis::InMemoryGenesisIndex::with_threshold(1);
+    let g = crate::lang::genesis::InMemoryGenesisIndex::with_threshold(1);
     let c = crate::review::Correction {
         token_index: 0,
         field: crate::review::CorrectionField::Pos,
@@ -2563,7 +2508,7 @@ fn genesis_save_and_load_roundtrip() {
     };
     g.record(&c, "run");
     g.save(&path).expect("save");
-    let h = crate::genesis::InMemoryGenesisIndex::load_or_empty(&path);
+    let h = crate::lang::genesis::InMemoryGenesisIndex::load_or_empty(&path);
     assert_eq!(h.get_pos("run"), Some(crate::labels::Upos::Verb));
 }
 
@@ -2951,9 +2896,9 @@ fn async_sync_refine_agree() {
     {
         let vocab = std::sync::Arc::new(crate::vocab::Vocab::new(crate::lexeme::LexiconConfig::default()));
         let tokenizer = crate::lang::en::tokenizer(std::sync::Arc::clone(&vocab)).expect("tokenizer");
-        let store = std::sync::Arc::new(crate::concept_store_mem::InMemoryConceptStore::new());
+        let store = std::sync::Arc::new(fluent_concept::InMemoryConceptStore::new());
         let resolver = std::sync::Arc::new(crate::interlingua::InterlinguaResolver::new(
-            std::sync::Arc::clone(&store) as std::sync::Arc<dyn crate::concept_store::ConceptStore>,
+            std::sync::Arc::clone(&store) as std::sync::Arc<dyn fluent_concept::ConceptStore>,
             std::sync::Arc::clone(vocab.strings()),
         ));
         let pipe = crate::pipeline::NlpPipeline::new_with_resolver(

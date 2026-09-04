@@ -1,6 +1,5 @@
 use super::*;
 use crate::ranking::{SalienceSignal, SalienceSource};
-use spacy_rs::retrieval::RetrievalSource;
 use std::collections::HashMap;
 
 /// A deterministic synonym-aware embedder (the M5 paraphrase axis): function
@@ -188,4 +187,114 @@ fn sentence_regions_split_on_sentence_boundaries() {
     assert!(regions[0].0.start < regions[1].0.start);
     assert!(regions[0].1.contains("Show the report"));
     assert!(regions[1].1.contains("Get the sales"));
+}
+
+// ── Moved tool surface (M4): spacy-rs produces the inputs, this module ──
+// ── consumes them. spacy-rs keeps only `lemma_grep`; the fuzzy axis,   ──
+// ── hit tagging, and the combiner live here.                           ──
+
+/// Fixed-embedding provider: query embeds to `q`, regions to listed vectors.
+struct FixedProvider {
+    q: Option<Vec<f32>>,
+    region_embs: Vec<Vec<f32>>,
+}
+impl EmbeddingProvider for FixedProvider {
+    fn embed(&self, text: &str) -> Option<Vec<f32>> {
+        if text == "QUERY" {
+            return self.q.clone();
+        }
+        text.strip_prefix("REGION")
+            .and_then(|n| n.parse::<usize>().ok())
+            .and_then(|i| self.region_embs.get(i).cloned())
+    }
+}
+
+#[test]
+fn moved_fuzzy_index_covers_the_paraphrase_gap() {
+    // Index-level paraphrase: "display the report" finds the "show me the
+    // report" region first with high similarity (the gap lemma-grep cannot).
+    let mut idx = InMemoryFuzzyIndex::new(Arc::new(SynonymProvider));
+    idx.insert(Span { start: 0, end: 18 }, "show me the report");
+    idx.insert(Span { start: 20, end: 40 }, "delete the old file");
+    let hits = idx.search("display the report", 2);
+    assert!(!hits.is_empty(), "paraphrase-matched region found");
+    assert_eq!(hits[0].span, Span { start: 0, end: 18 }, "paraphrase region ranks first");
+    assert!(hits[0].score > 0.8, "high paraphrase similarity");
+    let scores: Vec<f32> = hits.iter().map(|h| h.score).collect();
+    assert!(scores.windows(2).all(|w| w[0] >= w[1]), "sorted desc");
+}
+
+#[test]
+fn moved_fuzzy_search_filters_nonpositive() {
+    // Strict-positive filter + take(k) order.
+    // q=(1,0); regions: r0=(1,0) sim 1.0, r1=(-1,0) sim -1.0, r2=(0,0) sim 0.0.
+    let provider = Arc::new(FixedProvider {
+        q: Some(vec![1.0, 0.0]),
+        region_embs: vec![vec![1.0, 0.0], vec![-1.0, 0.0], vec![0.0, 0.0]],
+    });
+    let mut idx = InMemoryFuzzyIndex::new(provider);
+    for (i, start) in [0usize, 10, 20].iter().enumerate() {
+        idx.insert(
+            Span { start: *start, end: *start + 5 },
+            &format!("REGION{i}"),
+        );
+    }
+    // Negative and zero sims excluded; only the positive region survives.
+    let hits = idx.search("QUERY", 10);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].span, Span { start: 0, end: 5 });
+    // k == 0 → empty.
+    assert!(idx.search("QUERY", 0).is_empty());
+    // k larger than region count → capped at the positive survivors.
+    assert_eq!(idx.search("QUERY", 100).len(), 1);
+    // Unembeddable query → empty.
+    let dead = InMemoryFuzzyIndex::new(Arc::new(FixedProvider {
+        q: None,
+        region_embs: vec![],
+    }));
+    assert!(dead.search("QUERY", 5).is_empty());
+}
+
+#[test]
+fn moved_combiner_consumes_spacy_lemma_hits() {
+    // Seam round-trip (M4): spacy-rs produces the lemma hits via its kept
+    // `lemma_grep` helper; the moved combiner consumes them alongside the
+    // moved fuzzy axis. Low parse confidence + high paraphrase similarity on
+    // the same region → material disagreement surfaced, never collapsed.
+    let svc = service();
+    let doc = svc
+        .pipeline
+        .process_sync("Show me the report", None)
+        .expect("parse");
+    let lemma_hits = spacy_rs::retrieval::lemma_grep(&doc, "show");
+    assert_eq!(lemma_hits.len(), 1, "spacy produces one lemma hit");
+    let mut index = InMemoryFuzzyIndex::new(Arc::new(SynonymProvider));
+    for (span, text) in sentence_regions(&doc) {
+        index.insert(span, &text);
+    }
+    let fuzzy_hits = index.search("display the report", 2);
+    assert!(!fuzzy_hits.is_empty(), "fuzzy axis finds the paraphrase");
+    let report = cross_check(&lemma_hits, &fuzzy_hits, DEFAULT_AGREE_TOLERANCE);
+    let sources: Vec<RetrievalSource> = report.hits.iter().map(|h| h.source).collect();
+    assert!(sources.contains(&RetrievalSource::LemmaGrep));
+    assert!(sources.contains(&RetrievalSource::Fuzzy));
+    assert!(
+        report.regions.iter().any(|r| r.disagreed),
+        "material confidence difference is surfaced, not collapsed"
+    );
+}
+
+#[test]
+fn moved_cross_check_lemma_only_regions_have_no_conflict() {
+    let svc = service();
+    let doc = svc
+        .pipeline
+        .process_sync("Show me the report", None)
+        .expect("parse");
+    let lemma_hits = spacy_rs::retrieval::lemma_grep(&doc, "show");
+    let report = cross_check(&lemma_hits, &[], DEFAULT_AGREE_TOLERANCE);
+    assert_eq!(report.hits.len(), 1);
+    let v = &report.regions[0];
+    assert_eq!(v.fuzzy_score, None);
+    assert!(!v.disagreed);
 }

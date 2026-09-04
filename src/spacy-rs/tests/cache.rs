@@ -9,6 +9,30 @@ fn doc_from(text: &str) -> Doc {
     tok.tokenize(text).expect("tokenize")
 }
 
+/// A hermetic [`SpanCacheSeam`] over a shared map (test-only double).
+/// The ledger owns the production `SpanCache` trait + `InMemorySpanCache`;
+/// the ladder only needs these three legs, so tests build the seam directly.
+fn test_seam() -> (SpanCacheSeam, std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, Vec<Correction>>>>) {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    let map: Arc<Mutex<HashMap<u64, Vec<Correction>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let get_h = Arc::clone(&map);
+    let put_h = Arc::clone(&map);
+    let inv_h = Arc::clone(&map);
+    let seam = SpanCacheSeam::new(
+        Arc::new(move |key| get_h.lock().expect("lock").get(&key).cloned()),
+        Arc::new(move |key, corrections| {
+            if key != 0 {
+                put_h.lock().expect("lock").insert(key, corrections);
+            }
+        }),
+        Arc::new(move |key| {
+            inv_h.lock().expect("lock").remove(&key);
+        }),
+    );
+    (seam, map)
+}
+
 #[test]
 fn cache_is_content_addressed() {
     let a = doc_from("hello world");
@@ -27,14 +51,14 @@ fn cache_is_content_addressed() {
 fn cache_empty_focus_never_cached() {
     let doc = doc_from("hello");
     assert_eq!(span_key(&doc, &[]), 0);
-    let cache = InMemorySpanCache::new();
-    cache.put(0, vec![]);
-    assert_eq!(cache.len(), 0);
+    let (seam, map) = test_seam();
+    seam.put(0, vec![]);
+    assert!(map.lock().expect("lock").is_empty());
 }
 
 #[test]
 fn put_get_invalidate() {
-    let cache = InMemorySpanCache::new();
+    let (seam, _) = test_seam();
     let key = 42u64;
     let corr = vec![Correction {
         token_index: 0,
@@ -42,12 +66,11 @@ fn put_get_invalidate() {
         old_value: String::new(),
         new_value: "verb".into(),
     }];
-    cache.put(key, corr.clone());
-    assert_eq!(cache.len(), 1);
-    assert_eq!(cache.get(key).unwrap(), corr);
-    cache.invalidate(key);
-    assert!(cache.get(key).is_none());
-    assert_eq!(cache.len(), 0);
+    assert!(seam.get(key).is_none());
+    seam.put(key, corr.clone());
+    assert_eq!(seam.get(key).unwrap(), corr);
+    seam.invalidate(key);
+    assert!(seam.get(key).is_none());
 }
 
 #[test]

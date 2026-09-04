@@ -25,7 +25,7 @@ use fluent_db::store::SqliteStore;
 use fluent_types::InterlinguaId;
 use fluent_wvr::Runtime;
 use rusqlite::params;
-use spacy_rs::{AmbiguityKind, PreferredSenseIndex, Resolution};
+use spacy_rs::{AmbiguityKind, Resolution};
 use thiserror::Error;
 
 use crate::ledger::correction_index::PATTERN_NODE;
@@ -67,6 +67,35 @@ pub enum FrameResolutionError {
     Closed(String),
     #[error("frame resolution queue full: {0}")]
     Full(String),
+}
+
+/// The promotion seam for resolved ambiguity patterns (mirrors
+/// `spacy_rs::review::CorrectionIndex`): a `(predicate_lemma_id,
+/// ambiguity_kind)` pattern that has been resolved is recorded and replayed
+/// deterministically — golden-corpus-style rule genesis applied to senses.
+///
+/// Owner: the ledger pattern-cache (this module), beside
+/// [`SqlitePreferredSenseIndex`]. spacy-rs keeps only the pure derivation
+/// (`Frame`, `extract_frames`, ambiguity detection, key minting, `Resolution`
+/// value type); it never imports this trait, so no router edge enters
+/// spacy-rs. Replay lives behind [`FrameResolutionWorker`].
+///
+/// The router implements this over the existing `interlingua_index`
+/// correction-cache rows (the entity-scope column = the ambiguity kind).
+pub trait PreferredSenseIndex: Send + Sync {
+    /// The previously-recorded resolution for this pattern, when known.
+    fn preferred_sense(
+        &self,
+        predicate_lemma_id: InterlinguaId,
+        ambiguity_kind: AmbiguityKind,
+    ) -> Option<Resolution>;
+    /// Persist a resolution for this pattern.
+    fn record_preferred_sense(
+        &self,
+        predicate_lemma_id: InterlinguaId,
+        ambiguity_kind: AmbiguityKind,
+        resolution: Resolution,
+    ) -> Result<(), fluent_concept::ConceptStoreError>;
 }
 
 /// `PreferredSenseIndex` over `interlingua_index` — the pattern-cache rows for
@@ -139,9 +168,9 @@ impl PreferredSenseIndex for SqlitePreferredSenseIndex {
         predicate_lemma_id: InterlinguaId,
         ambiguity_kind: AmbiguityKind,
         resolution: Resolution,
-    ) -> Result<(), spacy_rs::ConceptStoreError> {
+    ) -> Result<(), fluent_concept::ConceptStoreError> {
         let json = serde_json::to_string(&resolution)
-            .map_err(|e| spacy_rs::ConceptStoreError::Storage(e.to_string()))?;
+            .map_err(|e| fluent_concept::ConceptStoreError::Storage(e.to_string()))?;
         self.store
             .with_conn(|conn| {
                 upsert_sense_row(
@@ -151,7 +180,7 @@ impl PreferredSenseIndex for SqlitePreferredSenseIndex {
                     &json,
                 )
             })
-            .map_err(|e| spacy_rs::ConceptStoreError::Storage(e.to_string()))?;
+            .map_err(|e| fluent_concept::ConceptStoreError::Storage(e.to_string()))?;
         Ok(())
     }
 }

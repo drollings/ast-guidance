@@ -1,14 +1,21 @@
 //! Live subagent retrieval service — the M5/M6 live-dispatch seam (ROADMAP
 //! "Subagent tool surface" + "Ranking pipeline" follow-up).
 //!
-//! The M5 spacy-rs retrieval tools (`spacy-rs::retrieval`) operate on a parsed
-//! [`Doc`]: lemma-grep is fast + exact (every hit carries its `ParseConfidence`),
+//! This module is the agent/subagent **tool owner** (ROADMAP_20260903_SPACY_RS_SPLIT
+//! M4 — moved here from `spacy-rs`): the hit tagging ([`RetrievalSource`] /
+//! [`RetrievalHit`]), the embedding-driven fuzzy axis ([`EmbeddingProvider`] /
+//! [`FuzzyRetrieval`] / [`InMemoryFuzzyIndex`]), and the [`cross_check`]
+//! combiner live beside the [`NodeRetrievalService`] that wires them.
+//! spacy-rs keeps only the pure `lemma_grep`-grade helpers (`Span`,
+//! `LemmaGrepHit`, `lemma_grep`), which the service composes.
+//!
+//! Lemma-grep is fast + exact (every hit carries its `ParseConfidence`),
 //! fuzzy retrieval covers the paraphrase gap (different lemmas, same intent),
 //! and `cross_check` surfaces **both** axes on a region when they materially
-//! disagree. This service is the router-side live wiring: it parses a candidate
-//! node's LOD0 into a `Doc`, runs the two axes + the combiner, and pre-filters
-//! the candidate pool through the M6 [`SalienceRanker`] — the model ranks only
-//! the deterministic shortlist, never the full pool.
+//! disagree. The service parses a candidate node's LOD0 into a `Doc`, runs the
+//! two axes + the combiner, and pre-filters the candidate pool through the M6
+//! [`SalienceRanker`] — the model ranks only the deterministic shortlist,
+//! never the full pool.
 //!
 //! Hermetic by default: the embedder and ranker are injected (a real encoder +
 //! a `LedgerSalienceProvider`-backed ranker in production; stubs in tests), and
@@ -19,16 +26,232 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use common_core::score::top_k_by_score;
+use common_core::vector_math::cosine_similarity_f32;
 use fluent_types::{ContentNode, NodeId};
 use spacy_rs::doc::SentStart;
 use spacy_rs::pipeline::NlpPipeline;
-use spacy_rs::retrieval::{
-    self, EmbeddingProvider, FuzzyRetrieval, InMemoryFuzzyIndex, RegionVerdict, RetrievalHit, Span,
-};
+use spacy_rs::retrieval::{LemmaGrepHit, Span};
 
 use crate::ranking::SalienceRanker;
 
-/// The cross-check agreement tolerance passed to `retrieval::cross_check`
+/// The provenance of a retrieval hit. `TreeSitter` / `StringSearch` are
+/// produced by sibling tool backends (the compiled-tool world); this owner's
+/// tools produce [`RetrievalSource::LemmaGrep`] and [`RetrievalSource::Fuzzy`].
+/// Pure data so the combiner can tag every hit without depending on those
+/// backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetrievalSource {
+    LemmaGrep,
+    Fuzzy,
+    TreeSitter,
+    StringSearch,
+}
+
+/// A fuzzy-retrieval hit: an embedding-similar span (paraphrase coverage).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FuzzyHit {
+    pub span: Span,
+    pub score: f32,
+    pub embedding_id: u64,
+}
+
+/// One surfaced hit, discriminated by [`RetrievalSource`]. A subagent never
+/// sees a bare span — it sees the producing axis, the span, and the
+/// confidence/score that axis warrants.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetrievalHit {
+    pub source: RetrievalSource,
+    pub span: Span,
+    /// Lemma-grep: the matched lemma. Fuzzy: `None`.
+    pub lemma: Option<String>,
+    /// Lemma-grep: the lemma's interlingua id, when stamped.
+    pub lemma_id: Option<fluent_types::InterlinguaId>,
+    /// Lemma-grep: the per-token parse confidence. Always `Some` for lemma hits.
+    pub parse_confidence: Option<f64>,
+    /// Fuzzy: the similarity score in `0..=1`. `None` otherwise.
+    pub fuzzy_score: Option<f32>,
+    /// Fuzzy: the matched region's embedding id.
+    pub embedding_id: Option<u64>,
+}
+
+impl RetrievalHit {
+    /// A lemma-grep hit surfaced for a subagent.
+    #[must_use]
+    pub fn from_lemma(hit: &LemmaGrepHit) -> Self {
+        Self {
+            source: RetrievalSource::LemmaGrep,
+            span: hit.span,
+            lemma: Some(hit.lemma.clone()),
+            lemma_id: hit.lemma_id,
+            parse_confidence: Some(hit.parse_confidence),
+            fuzzy_score: None,
+            embedding_id: None,
+        }
+    }
+
+    /// A fuzzy hit surfaced for a subagent.
+    #[must_use]
+    pub fn from_fuzzy(hit: &FuzzyHit) -> Self {
+        Self {
+            source: RetrievalSource::Fuzzy,
+            span: hit.span,
+            lemma: None,
+            lemma_id: None,
+            parse_confidence: None,
+            fuzzy_score: Some(hit.score),
+            embedding_id: Some(hit.embedding_id),
+        }
+    }
+}
+
+/// An embedding provider — the substitution point for a real encoder backend.
+pub trait EmbeddingProvider: Send + Sync {
+    /// Embed `text` into a fixed-dimension vector, or `None` when the provider
+    /// is unavailable (fail-open for a missing encoder).
+    fn embed(&self, text: &str) -> Option<Vec<f32>>;
+}
+
+/// A fuzzy retrieval index over document regions (paraphrase axis).
+pub trait FuzzyRetrieval: Send + Sync {
+    /// The top-`k` spans closest to `query`.
+    fn search(&self, query: &str, k: usize) -> Vec<FuzzyHit>;
+}
+
+/// A hermetic in-memory fuzzy index over `(span, text, embedding)` regions
+/// ranked by cosine similarity. Deterministic and model-free — the test double
+/// a caller replaces with a real HNSW-backed [`FuzzyRetrieval`] implementation.
+#[derive(Clone)]
+pub struct InMemoryFuzzyIndex {
+    provider: Arc<dyn EmbeddingProvider>,
+    regions: Vec<(Span, Vec<f32>)>,
+}
+
+impl InMemoryFuzzyIndex {
+    /// An empty index over `provider`.
+    #[must_use]
+    pub fn new(provider: Arc<dyn EmbeddingProvider>) -> Self {
+        Self {
+            provider,
+            regions: Vec::new(),
+        }
+    }
+
+    /// Index a region's text under `span`. Returns `false` (no insert) when the
+    /// provider cannot embed it.
+    pub fn insert(&mut self, span: Span, text: &str) -> bool {
+        match self.provider.embed(text) {
+            Some(emb) => {
+                self.regions.push((span, emb));
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+impl FuzzyRetrieval for InMemoryFuzzyIndex {
+    fn search(&self, query: &str, k: usize) -> Vec<FuzzyHit> {
+        let Some(qe) = self.provider.embed(query) else {
+            return Vec::new();
+        };
+        let scored: Vec<(f32, usize)> = self
+            .regions
+            .iter()
+            .enumerate()
+            .map(|(i, (_, emb))| (cosine_similarity_f32(&qe, emb), i))
+            .collect();
+        // Shared top-K tail (P2): descending score, take(k). The strict-
+        // positive filter stays call-site (fail-open semantics never move).
+        top_k_by_score(scored, k, |t| t.0, true)
+            .into_iter()
+            .filter(|(s, _)| *s > 0.0)
+            .map(|(s, i)| FuzzyHit {
+                span: self.regions[i].0,
+                score: s,
+                embedding_id: i as u64,
+            })
+            .collect()
+    }
+}
+
+/// A per-region cross-check verdict: whether the lemma and fuzzy axes agreed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegionVerdict {
+    pub span: Span,
+    pub lemma_confidence: Option<f64>,
+    pub fuzzy_score: Option<f32>,
+    /// Material disagreement: `|lemma_confidence - fuzzy_score|` exceeded the
+    /// tolerance. The subagent should weigh the two axes independently.
+    pub disagreed: bool,
+}
+
+/// All surfaced hits plus per-region cross-check verdicts. Both axes' hits for
+/// a region are **always surfaced when they materially disagree** — the
+/// subagent sees the conflict rather than a silent single preference.
+#[derive(Debug, Clone)]
+pub struct CrossCheckReport {
+    pub hits: Vec<RetrievalHit>,
+    pub regions: Vec<RegionVerdict>,
+}
+
+/// Combine the lemma-grep and fuzzy axes for a query. Every hit from either
+/// axis is surfaced; regions covered by both are annotated with a
+/// [`RegionVerdict`] so a material disagreement is visible, never collapsed.
+pub fn cross_check(
+    lemma_hits: &[LemmaGrepHit],
+    fuzzy_hits: &[FuzzyHit],
+    agree_tolerance: f64,
+) -> CrossCheckReport {
+    let mut hits: Vec<RetrievalHit> = Vec::new();
+    hits.extend(lemma_hits.iter().map(RetrievalHit::from_lemma));
+    hits.extend(fuzzy_hits.iter().map(RetrievalHit::from_fuzzy));
+
+    let mut regions: Vec<RegionVerdict> = Vec::new();
+
+    // Regions covered by a fuzzy hit: verdict against every overlapping lemma hit.
+    for fh in fuzzy_hits {
+        let overlapping: Vec<&LemmaGrepHit> = lemma_hits
+            .iter()
+            .filter(|lh| lh.span.overlaps(&fh.span))
+            .collect();
+        if overlapping.is_empty() {
+            regions.push(RegionVerdict {
+                span: fh.span,
+                lemma_confidence: None,
+                fuzzy_score: Some(fh.score),
+                disagreed: false,
+            });
+            continue;
+        }
+        for lh in overlapping {
+            let conf = lh.parse_confidence;
+            let score = f64::from(fh.score);
+            regions.push(RegionVerdict {
+                span: fh.span,
+                lemma_confidence: Some(conf),
+                fuzzy_score: Some(fh.score),
+                disagreed: (conf - score).abs() > agree_tolerance,
+            });
+        }
+    }
+
+    // Lemma-only regions (no fuzzy overlap) — surfaced alone, no conflict.
+    for lh in lemma_hits {
+        if !fuzzy_hits.iter().any(|fh| fh.span.overlaps(&lh.span)) {
+            regions.push(RegionVerdict {
+                span: lh.span,
+                lemma_confidence: Some(lh.parse_confidence),
+                fuzzy_score: None,
+                disagreed: false,
+            });
+        }
+    }
+
+    CrossCheckReport { hits, regions }
+}
+
+/// The cross-check agreement tolerance passed to [`cross_check`]
 /// (see the M5 acceptance criterion: material disagreement surfaces both hits).
 pub const DEFAULT_AGREE_TOLERANCE: f64 = 0.1;
 
@@ -68,7 +291,7 @@ pub struct NodeRetrievalService {
     ranker: Option<Arc<SalienceRanker>>,
     agree_tolerance: f64,
     fuzzy_top_k: usize,
-    concept_store: Option<Arc<dyn spacy_rs::concept_store::ConceptStore>>,
+    concept_store: Option<Arc<dyn fluent_concept::ConceptStore>>,
 }
 
 impl NodeRetrievalService {
@@ -116,7 +339,7 @@ impl NodeRetrievalService {
     /// reports whose predicate lemma id does not match the query predicate or its
     /// ancestors are filtered out before ranking.
     #[must_use]
-    pub fn with_concept_store(mut self, store: Arc<dyn spacy_rs::concept_store::ConceptStore>) -> Self {
+    pub fn with_concept_store(mut self, store: Arc<dyn fluent_concept::ConceptStore>) -> Self {
         self.concept_store = Some(store);
         self
     }
@@ -179,9 +402,9 @@ impl NodeRetrievalService {
                 );
                 continue;
             };
-            let lemma_hits = retrieval::lemma_grep(&doc, query);
+            let lemma_hits = spacy_rs::retrieval::lemma_grep(&doc, query);
             let fuzzy_hits = self.fuzzy_hits(&doc, query);
-            let report = retrieval::cross_check(&lemma_hits, &fuzzy_hits, self.agree_tolerance);
+            let report = cross_check(&lemma_hits, &fuzzy_hits, self.agree_tolerance);
             reports.push(NodeRetrievalReport {
                 node_id,
                 hits: report.hits,
@@ -194,7 +417,7 @@ impl NodeRetrievalService {
 
     /// The fuzzy axis over one parsed node: index each sentence as a region
     /// (via the injected embedder), then top-k paraphrase search.
-    fn fuzzy_hits(&self, doc: &spacy_rs::doc::Doc, query: &str) -> Vec<retrieval::FuzzyHit> {
+    fn fuzzy_hits(&self, doc: &spacy_rs::doc::Doc, query: &str) -> Vec<FuzzyHit> {
         let mut index = InMemoryFuzzyIndex::new(Arc::clone(&self.embedder));
         for (span, sentence) in sentence_regions(doc) {
             index.insert(span, &sentence);

@@ -4,7 +4,7 @@ use std::time::Duration;
 use crate::ledger::correction_index::SqliteCorrectionIndex;
 use fluent_concurrency::tokio_runtime;
 use fluent_types::InterlinguaNamespace;
-use spacy_rs::concept_store_mem::InMemoryConceptStore;
+use fluent_concept::InMemoryConceptStore;
 use spacy_rs::{AnnotationRecord, AnnotationSet, AnnotationSource};
 
 fn parse() -> AnnotationResult {

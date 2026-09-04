@@ -12,8 +12,9 @@ stable, model-free id. `#![forbid(unsafe_code)]`.
 
 The crate deliberately has **no** dependency on `guidance`, `coral`, or
 `wasm_ipc`; it depends on `fluent-types`, `fluent-wvr`, `fluent-concurrency`,
-`fluent-dag`, and (for the routing signal model) nothing router-owned. The
-router implements `ConceptStore`/`CorrectionIndex` over spacy-rs' traits.
+`fluent-dag`, `fluent-concept`, and (for the routing signal model) nothing router-owned. The
+router implements `SqliteConceptStore`/`CorrectionIndex` over the shared
+`fluent-concept::ConceptStore` trait (M3) and spacy-rs' `CorrectionIndex` seam.
 
 ## Module map
 
@@ -26,29 +27,26 @@ router implements `ConceptStore`/`CorrectionIndex` over spacy-rs' traits.
 | `doc.rs` | `Doc` + `TokenRecord`: orth/lemma/dep heads (relative offsets), tree rebuild, `to_array`/`from_array`, attribute dispatch |
 | `attrs.rs` | `Attribute` ids incl. 89–91 (`InterlinguaLemmaId`/`InterlinguaEntityId`/`AnnotationConfidence`) |
 | `labels.rs` | Closed `Upos`/`DepRel`/`NerType`/`EntIoB` + `DepLabelSet` |
-| `lang/` | English defaults (`lang::en::tokenizer`, `lexicon_config`) |
+| `lang/` | English defaults (`lang::en::tokenizer`, `lexicon_config`) + the version-pinned rule-data audit surface (M2c): tokenizer exceptions, lemma-blob pipeline, and `lang::genesis` promotions |
 | `tokenizer.rs` | Deterministic tokenizer over the lexicon |
 | `sentencizer.rs` | Deterministic sentence-boundary prediction (`predict`/`process`) |
 | `lemmatizer.rs` + `lemma_blob.rs` | Rule lemmatizer over a versioned blob built by `build.rs` from `data/en_lemmatizer.json` |
 | `morph.rs`, `tag_map.rs` | Morphology + tag→UPOS map |
 | `validate.rs` | The 7-check annotation gate; checks 5+6 compose `DependencyGraph` (never hand-rolled DFS) |
-| `llm.rs` | `AnnotationRecord`/`AnnotationSet` (wire JSON), `AnnotationResult` + `AnnotationSource` (provenance + confidence), `LlmRefinePrompt` (span-scoped corrections contract), `attach`/`apply_with` |
+| `llm.rs` | `AnnotationRecord`/`AnnotationSet` (wire JSON), `AnnotationResult` + `AnnotationSource` (provenance + confidence), `LlmRefinePrompt` (span-scoped corrections contract), `attach`/`apply_with` — the annotation *inputs* the ledger's `NodeAnnotation` consumes |
 | `arc_eager.rs` | The deterministic transition parser (heuristic ArcEager) + `ParseConfidence` |
-| `arcready.rs` | `ArcReadyAnnotation` — a fully-materialized, immutable annotation document (`from_doc` over a `Doc` + `AnnotationResult` + routing signals), exposed as a `fluent_types::NodeOverlay` so a node can carry it in its `annotation` slot |
-| `concept_store.rs` | `ConceptStore` trait + `TaxonomyHierarchy` (DAG-backed ancestors/is-subclass), `ConceptStoreState::Loading/Ready` gate |
-| `concept_store_mem.rs` | `InMemoryConceptStore` — the **hermetic test double**, never production |
+| `fluent-concept` (neutral shared crate, M3) | `ConceptStore` trait + `TaxonomyHierarchy` (DAG-backed ancestors/is-subclass), `ConceptStoreState::Loading/Ready` gate + the hermetic `InMemoryConceptStore` test double (never production); spacy-rs keeps a read-only view import only (`InterlinguaResolver`, `FrameExtractor`, `triple::extract_triples` + `build_plausibility_inputs`, `YagoResolveStage` read through it; boot-only registration invariant unchanged) + the `PlausibilityTriple`/`ScoredLemma` text↔knowledge bridge inputs (M5) |
 | `interlingua.rs` | `InterlinguaResolver` (pure), `CollisionNote`, `resolve_doc` stamping |
 | `routing.rs` | `extract_routing_signals` → `RoutingSignal` (+ `InterlinguaSignal`) |
-| `frame.rs` | `RoleType`/`Frame`/`AmbiguityKind`/`FrameAnalysis`, `FrameKey::permanent/provisional`, `extract_frames`, `PreferredSenseIndex` trait — the deterministic structural index (M3) |
+| `frame.rs` | `RoleType`/`Frame`/`AmbiguityKind`/`FrameAnalysis`, `FrameKey::permanent/provisional`, `extract_frames`, `Resolution` value type — the deterministic structural index (M3); the `PreferredSenseIndex` promotion seam lives in the router (`ledger::frame_index`, M2a) |
 | `taxonomy_blob.rs` | `LemmaView::from_bytes` (`SLM2` compile-time `include_bytes!`), `LazyLock<Arc<LemmaView>>` safe embed |
-| `yago_view.rs` | `YagoView::load` via `std::fs::read` safe (no `mmap`), CSR parents + a `RwLock<HashMap>` ancestors memo; class lookup is a `HashMap` for now (an `fst`/`OnceLock` codegen lands later); YSM1 binary decode is not yet wired — load parses TTL directly |
-| `triple.rs` | Deterministic `(subject, predicate, object)` extraction + YaGO taxonomy plausibility (`extract_triples`, `semantic_plausibility`; hermetic `Dog→Animal` tests; never touches `oracle_margins`) |
-| `yago_resolve.rs` | `YagoResolveStage` between `attach` and `frame`, `semantic_plausibility` separate field (M3 guarded spike: `enabled` default off, triple-vs-taxonomy when on) |
-| `cache.rs` | Span-level detail cache (`SpanCache` trait, `InMemorySpanCache` hermetic, content-addressed `span_key`; M6.1 amortized cache, read-through view over the ledger sqlite in the router — key stored as fixed-width hex `span_key TEXT` (`{:016x}`), not `i64` cast, F7) |
-| `genesis.rs` | Rule genesis for POS/NER (`GenesisIndex` trait, `InMemoryGenesisIndex` hermetic, threshold-promoted version-pinned data; M6.2 pos/ner genesis — `CorrectionField::Ner` promotes `ner` on same `count >= threshold` path, `RuleAnnotator::annotate` consults `genesis.get_ner` for `ent_type`, F4) |
+| `triple.rs` | Deterministic `(subject, predicate, object)` extraction (`extract_triples`, pure over the attached tree) + the text-half adapter (`build_plausibility_inputs`) and the dependency-free `PlausibilityFetch` seam the knowledge owner wires (M5 — scoring itself lives in `guidance-ontology` `plausibility::score_plausibility`; hermetic `Dog→Animal` suite moved with it; E7 `oracle_margins` separation test stays here) |
+| `yago_resolve.rs` | `YagoResolveStage` shell between `attach` and `frame` (M5: default-off, knowledge-half scoring injected via `PlausibilityFetch` — same pattern as the router injecting `LlmFetch`; unwired stays fail-closed `None`); `StagePipeline::new_with_resolver_and_plausibility` / `NlpPipeline::new_with_resolver_and_plausibility` thread the fetch |
+| `cache.rs` | Span-level detail cache: content-addressed `span_key` (pure hash discipline, stays) + dependency-free `SpanCacheSeam` callback bundle (`get`/`put`/`invalidate` closures, M2b) the ladder consults; the `SpanCache` trait + `InMemorySpanCache` hermetic double live with the ledger view owner (router `ledger/span_cache.rs` beside `SqliteSpanCache` — key stored as fixed-width hex `span_key TEXT` (`{:016x}`), not `i64` cast, F7) |
+| `lang/genesis.rs` | Rule genesis for POS/NER (`GenesisIndex` trait, `InMemoryGenesisIndex` hermetic, threshold-promoted version-pinned data; M6.2 pos/ner genesis — `CorrectionField::Ner` promotes `ner` on same `count >= threshold` path, `RuleAnnotator::annotate` consults `genesis.get_ner` for `ent_type`, F4; M2c rule-data home beside tokenizer exceptions + lemma-blob pipeline, thresholds POS 3 / NER 5 preserved) |
 | `review.rs` | `ParseReview`/`Correction` (`CorrectionField::Ner` for entity type)/`ReviewStatus`, `CorrectionIndex` trait, `review_prompt`, shared `apply_edits` amendment helper (guards `old_value`: empty = don't-care, non-empty mismatch = `warn!` + skip, F6) — `ParseReview::parse_json` preserves `serde_json::Error` source (line/column) via `AnnotationError::Json { source }` (F6) |
-| `retrieval.rs` | The subagent tool surface: `RetrievalSource`, `LemmaGrepHit` (confidence mandatory), `FuzzyHit`, `EmbeddingProvider`/`FuzzyRetrieval` substitution points + hermetic `InMemoryFuzzyIndex`, `cross_check` combiner (M5) |
-| `pipeline.rs` + `pipeline/` | `NlpPipeline`, `StagePipeline` (DAG), `AnnotationRung` ladder + gated `AnnotationRefiner` refine phase (`LlmRefineRung`, `EncoderResidualRung`, `RefineSeams` + `span_cache`, `RuleAnnotator` + `genesis`), `RefinePolicy`/`should_refine`/`refine_focus`/`frame_coverage`, `PipelineState` |
+| `retrieval.rs` | Pure lemma-grep helpers only: `Span`, `LemmaGrepHit` (confidence mandatory), `lemma_grep` (M4 — the fuzzy axis, hit tagging, and `cross_check` combiner live with the router retrieval owner beside `NodeRetrievalService`) |
+| `pipeline.rs` + `pipeline/` | `NlpPipeline`, `StagePipeline` (DAG), `AnnotationRung` ladder + gated `AnnotationRefiner` refine phase (`LlmRefineRung`, `EncoderResidualRung`, `RefineSeams` + `SpanCacheSeam`, `RuleAnnotator` + `genesis`), `RefinePolicy`/`should_refine`/`refine_focus`/`frame_coverage`, `PipelineState` |
 
 ## Core data model
 
@@ -83,8 +81,8 @@ anaphora and coordination/ellipsis are documented future work). Key minting is
 the contract: an **ambiguity-free frame mints a permanent `FrameKey`** (the only
 kind persisted to the ledger/graph); a frame with any open ambiguity mints a
 **provisional** key and stays unresolved until a resolution is applied. Resolved
-`(predicate_lemma_id, ambiguity_kind)` patterns promote into the
-`PreferredSenseIndex` trait (the router's `SqlitePreferredSenseIndex` over the
+`(predicate_lemma_id, ambiguity_kind)` patterns promote into the ledger-owned
+`PreferredSenseIndex` trait (`ledger::frame_index::PreferredSenseIndex`, M2a; the router's `SqlitePreferredSenseIndex` over the
 `interlingua_index` pattern-cache rows, `role='sense'`), so a repeating pattern
 replays deterministically — the tokenizer golden-corpus rule-genesis flow
 applied to senses, zero LLM cost on the next occurrence.
@@ -251,7 +249,9 @@ Consequences:
 wired via `StagePipeline::new_with_resolver`, the DAG is
 `annotate → validate → attach → yago_resolve → frame → resolve → sentencize`:
 the **`yago_resolve` stage** (`YagoResolveStage`) runs right after attach
-(scoring `semantic_plausibility`); the **`frame` stage** (a `FrameStage`
+(scoring `semantic_plausibility` through the owner-injected `PlausibilityFetch`;
+M5 — the shell is constructed in-crate but the knowledge-half scoring arrives
+from `guidance-ontology`, unwired it stamps `None`); the **`frame` stage** (a `FrameStage`
 WorkUnit) depends on `yago_resolved` and derives per-predicate `Frame`s + a
 typed `AmbiguityEntry` list, minting provisional-vs-permanent `FrameKey`s; the
 **read-only `resolve` stage** then stamps `interlingua_lemma_id` +
@@ -303,8 +303,8 @@ with metadata from the YaGO 4.5 taxonomy for nouns and direct objects.
 | `arc_eager.rs` | `annotate_with_confidence` → `ParseConfidence{role_coverage}` | `{nsubj,dobj}` slots filled (shallow verb-centric structure) |
 | `routing.rs` | `extract_routing_signals` | per-sentence `predicate/subject/direct_object` lemmas + `InterlinguaSignal` role ids |
 | `interlingua.rs` | `InterlinguaResolver::resolve_doc` | lemma → `InterlinguaId` (pure, read-only) |
-| `concept_store.rs` | `ConceptStore` / `TaxonomyHierarchy` (DAG-backed) | `ancestors_of` / `is_subclass_of` over `rdfs:subClassOf` edges |
-| `yago_view.rs` | `YagoView` (CSR + memo) | runtime YaGO class hierarchy (`Loading→Ready` fail-open, `ancestors_of`) |
+| `fluent-concept` | `ConceptStore` / `TaxonomyHierarchy` (DAG-backed) | `ancestors_of` / `is_subclass_of` over `rdfs:subClassOf` edges |
+| `guidance-ontology` | `YagoView` (CSR + memo, moved from spacy-rs in M5) + `plausibility::score_plausibility` | runtime YaGO class hierarchy (`Loading→Ready` fail-open, `ancestors_of`) + triple-vs-taxonomy scoring over the shared `PlausibilityTriple` input |
 | `frame.rs` | `FrameExtractor` | per-predicate `Frame` + `AmbiguityKind` + provisional vs permanent `FrameKey` |
 | ontology | `YaGoLoader` + router `SqliteConceptStore` | the two durable homes, reconciled at boot (id-membership) |
 
@@ -329,13 +329,16 @@ with metadata from the YaGO 4.5 taxonomy for nouns and direct objects.
    `oracle_margins` (roadmap E7). `Loading` state yields `None` (provisional,
    mirroring `FrameKey` gating).
 
-**Guarded spike (M3.3):** `yago_resolve::YagoResolveStage` now carries an
-`enabled: bool` (default **off**). When disabled it leaves
+**Guarded spike (M3.3, M5 tenancy):** `yago_resolve::YagoResolveStage` carries
+an `enabled: bool` (default **off**) plus an optional owner-injected
+`PlausibilityFetch`. When disabled, or when no fetch is wired, it leaves
 `semantic_plausibility` as `None` (pre-M3 behavior, ladder unchanged). When
-enabled it runs `triple::extract_triples` → `triple::semantic_plausibility`
-(the triple-vs-taxonomy mean in `[0,1]`). Hermetic tests use
-`InMemoryConceptStore` with `Dog → Animal` edges. The ladder behavior is
-unchanged either way — this stage only stamps confidence, never a rung decision.
+enabled with a fetch it runs `triple::extract_triples` →
+`triple::build_plausibility_inputs` → owner fetch (the triple-vs-taxonomy mean
+in `[0,1]`, scored by `guidance-ontology`). Hermetic tests use
+`InMemoryConceptStore` with `Dog → Animal` edges (suite moved to the ontology
+in M5). The ladder behavior is unchanged either way — this stage only stamps
+confidence, never a rung decision.
 
 **Decision (M3.4):** keep default-off and document; the enrich signal is real
 (`dog`/`cat` known vs unknown) but is not wired as a ladder gate today.
@@ -344,21 +347,30 @@ unchanged either way — this stage only stamps confidence, never a rung decisio
 
 **M6.1 Span-level cache.** The refine phase's focused corrections are
 content-addressed (`span_key(doc, focus)` → `hash_utf8` of lowercased focused
-orths, 0x1F-separated) and cached as `Vec<Correction>` behind the `SpanCache`
-trait (`Send + Sync`, object-safe). `InMemorySpanCache` (`Mutex<HashMap>`) is
-the hermetic test double; the router's `SqliteSpanCache` (`ledger/span_cache.rs`)
-is the production **read-through view over the shared ledger sqlite** — same
-`interlingua_index` table, `role='span_cache'`, `interlingua_id = span_key`
-— so no parallel store exists. The ladder checks the cache before the model
+orths, 0x1F-separated) and cached as `Vec<Correction>` behind the
+dependency-free `SpanCacheSeam` bundle (`get`/`put`/`invalidate` closures in
+the fetch-seam idiom — M2b, no router edge into this crate). The `SpanCache`
+trait (`Send + Sync`, object-safe) + `InMemorySpanCache` (`Mutex<HashMap>`)
+hermetic double live with the ledger view owner (router
+`ledger/span_cache.rs`); the router's `SqliteSpanCache` is the production
+**read-through view over the shared ledger sqlite** — same
+`interlingua_index` table, `role='span_cache'`, hex `span_key TEXT` — so no
+parallel store exists, and `span_cache_seam` adapts an `Arc<dyn SpanCache>`
+into the seam at the wiring site. The ladder checks the cache before the model
 (`LlmRefineRung`/`EncoderResidualRung` with `with_cache`, both async and sync
 paths) and write-throughs on a gated adoption. Invalidation is explicit
-`SpanCache::invalidate(key)` when a `CorrectionIndex::record_correction` for the
-same span lands (the "invalidated through the correction index" contract); a
-content mutation is a different key by construction.
+(seam `invalidate`, i.e. `SqliteSpanCache::invalidate_for_corrections`) when a
+`CorrectionIndex::record_correction` for the same span lands (the "invalidated
+through the correction index" contract); a content mutation is a different key
+by construction.
 
 **M6.2 Rule genesis for POS/NER.** The tokenizer's "LLM proposes → golden
 corpus accepts → data absorbs" pattern is extended from lexical boundaries to
-POS/NER. `GenesisIndex` (`Send + Sync`) counts corrections per normalized
+POS/NER. Tenancy (M2c): the promotion store (`GenesisIndex`,
+`InMemoryGenesisIndex`, JSON-blob persistence) lives in `lang/genesis.rs`
+beside the tokenizer exceptions and the lemma-blob pipeline — one audit
+surface (`lang/` docs) for all deterministic data that grows by promotion;
+the parser keeps only consultation. `GenesisIndex` (`Send + Sync`) counts corrections per normalized
 orth (`to_ascii_lowercase`) with **separate thresholds and counters**: POS
 promotes at `threshold` (default 3), NER at `ner_threshold` (default 5) — entity
 type is context-variant (Washington/Jordan/Paris) so the NER bar is
@@ -429,7 +441,7 @@ lexeme-flag + closed function-word/verb maps; PROPN fires on `is_upper()` only
 - **Provisional keys are never persisted as resolved structure.** A frame with
   an open ambiguity mints only a provisional `FrameKey`; only ambiguity-free
   (permanent) keys reach the ledger/graph. Resolved patterns promote into the
-  `PreferredSenseIndex`, never back into the deterministic extractor's output.
+  ledger-owned `PreferredSenseIndex`, never back into the deterministic extractor's output.
 - **`Arc<dyn Runtime>`** everywhere async (WVR); no ambient `tokio::spawn`.
 - **No `guidance`/`coral`/`wasm_ipc` imports** in this crate.
 

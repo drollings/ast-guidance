@@ -195,8 +195,9 @@ knowledge: YaGO classes/entities (interlingua_concepts) ⇄ coral graph (node_id
   `local_id_of`, `ConceptMetadata`.
 - `src/spacy-rs/src/interlingua.rs` — `InterlinguaResolver`, `CollisionNote`,
   `resolve_doc`.
-- `src/spacy-rs/src/concept_store.rs` + `concept_store_mem.rs` —
-  `ConceptStore`, `TaxonomyHierarchy`, `InMemoryConceptStore`.
+- `src/concept/src/concept_store.rs` + `concept_store_mem.rs` —
+  `ConceptStore`, `TaxonomyHierarchy`, `InMemoryConceptStore` (neutral
+  `fluent-concept` home, M3 — spacy-rs keeps a read-only view import only).
 - `src/spacy-rs/src/pipeline.rs` — the annotation ladder
   (`LlmRung`/`EncoderRung`/`ArcEagerRung`/`RuleRung`) that produces the lemmas
   `resolve_doc` stamps.
@@ -213,4 +214,9 @@ knowledge: YaGO classes/entities (interlingua_concepts) ⇄ coral graph (node_id
   entity-link overlay and parse-review workers.
 - `src/ontology/src/yago_loader.rs`, `yago.rs` — the YaGO 4.5 loader + schema
   ids + whitelist.
+- `src/ontology/src/yago_view.rs`, `plausibility.rs` — the runtime YaGO
+  class-hierarchy view (CSR/memo, moved from spacy-rs in M5) + the
+  triple-vs-taxonomy `score_plausibility` kernel over the shared
+  `fluent-concept::PlausibilityTriple` input (spacy-rs keeps only
+  `extract_triples` + the `PlausibilityFetch` seam).
 - `src/coral/src/db/nodes.rs`, `ingest.rs` — the content-addressed graph.

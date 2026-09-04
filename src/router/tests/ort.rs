@@ -288,8 +288,8 @@ async fn entity_link_full_loop_scorer_to_overlay_candidates() {
     use crate::server::entity_link::{EntityLinkJob, EntityLinkWorker, EntityLinkScorer};
     use fluent_concurrency::tokio_runtime;
     use fluent_types::{ConceptMetadata, InterlinguaId, InterlinguaNamespace, NodeId};
-    use spacy_rs::concept_store_mem::InMemoryConceptStore;
-    use spacy_rs::ConceptStore;
+    use fluent_concept::InMemoryConceptStore;
+    use fluent_concept::ConceptStore;
 
     // YaGO `Entity` reference class + a child entity the scorer resolves to.
     let concepts = InMemoryConceptStore::new();
@@ -379,8 +379,8 @@ async fn entity_link_full_loop_scorer_to_overlay_candidates() {
 #[test]
 fn score_span_resolves_canonical_and_respects_threshold() {
     use fluent_types::{InterlinguaId, InterlinguaNamespace};
-    use spacy_rs::concept_store_mem::InMemoryConceptStore;
-    use spacy_rs::ConceptStore;
+    use fluent_concept::InMemoryConceptStore;
+    use fluent_concept::ConceptStore;
 
     let concepts = InMemoryConceptStore::new();
     let known = InterlinguaId::new(InterlinguaNamespace::YagoEntity, 0x002);

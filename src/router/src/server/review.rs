@@ -28,7 +28,8 @@ use fluent_onnx::pii::{PiiSpan, PiiSpanDetector};
 use fluent_wvr::Runtime;
 use fluent_types::{AnnotationClaim, InterlinguaId, NodeId, ProvenanceTier};
 use spacy_rs::review::{apply_corrections, review_prompt, ParseReview};
-use spacy_rs::{AnnotationResult, ConceptStore, CorrectionIndex};
+use fluent_concept::ConceptStore;
+use spacy_rs::{AnnotationResult, CorrectionIndex};
 use thiserror::Error;
 
 use crate::ledger::correction_index::CorrectionRow;

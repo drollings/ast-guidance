@@ -11,7 +11,7 @@
 //!   unrecoverable).
 //!
 //! The loader also exposes the `rdfs:subClassOf` edges so the boot sequence
-//! can build the [`TaxonomyHierarchy`](spacy_rs::TaxonomyHierarchy) (C5).
+//! can build the [`TaxonomyHierarchy`](fluent_concept::TaxonomyHierarchy) (C5).
 //!
 //! **One loader, two consumers (C3):** the same `Vec<ConceptMetadata>` feeds
 //! both coral's durable content-addressed graph and the router's
@@ -167,7 +167,7 @@ impl YaGoLoader {
     }
 
     /// The `(child ← parent)` `rdfs:subClassOf` edges for building the
-    /// [`TaxonomyHierarchy`](spacy_rs::TaxonomyHierarchy) at boot.
+    /// [`TaxonomyHierarchy`](fluent_concept::TaxonomyHierarchy) at boot.
     #[must_use]
     pub fn subclass_edges(&self) -> &[(InterlinguaId, InterlinguaId)] {
         &self.edges

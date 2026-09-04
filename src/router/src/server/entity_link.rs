@@ -25,7 +25,7 @@ use fluent_wvr::Runtime;
 use thiserror::Error;
 
 use crate::ledger::overlay::OverlayCandidateStore;
-use spacy_rs::ConceptStore;
+use fluent_concept::ConceptStore;
 
 /// One entity-link job: a PROPN span (with no resolved entity) to link.
 #[derive(Debug, Clone)]

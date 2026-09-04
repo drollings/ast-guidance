@@ -1,15 +1,21 @@
 //! The **hermetic in-memory** [`ConceptStore`] — the test double of ROADMAP
-//! §6.4 (C3). Never the production store: the router's `SqliteConceptStore`
-//! and coral's durable graph are the real homes, and boot reconciliation locks
-//! them equal. This store exists so resolver/pipeline unit tests run with no
-//! SQLite and no disk.
+//! §6.4 (C3; neutral home `fluent-concept` per ROADMAP_20260903_SPACY_RS_SPLIT
+//! M3 — moved here from `spacy-rs`). Never the production store: the router's
+//! `SqliteConceptStore` and coral's durable graph are the real homes, and boot
+//! reconciliation locks them equal. This store exists so resolver/pipeline
+//! unit tests run with no SQLite and no disk.
+//!
+//! NOTE (M3): `InMemoryConceptStore::from_n2_fixture` was deliberately **not**
+//! moved with the double — it composes `spacy-rs`' `YagoView`, and this crate
+//! must not depend on `spacy-rs` (neutral-home acyclicity). It had no callers;
+//! tests that need YaGO-backed seeding build the store via `insert` directly.
 
 use std::collections::HashMap;
 use std::sync::RwLock;
 
 use fluent_types::{ConceptMetadata, InterlinguaId};
 
-use crate::concept_store::{ConceptStore, ConceptStoreError, TaxonomyHierarchy};
+use crate::concept_store::{ConceptStore, ConceptStoreError, ConceptStoreState, TaxonomyHierarchy};
 
 /// An in-memory concept registry: id → metadata, plus name/IRI indexes and a
 /// [`TaxonomyHierarchy`] backing the subclass queries. The hierarchy is built
@@ -27,7 +33,7 @@ pub struct InMemoryConceptStore {
     hierarchy: RwLock<TaxonomyHierarchy>,
     /// Accumulated `(child ← parent)` edges collected from `insert` metadata.
     edges: RwLock<Vec<(InterlinguaId, InterlinguaId)>>,
-    state: RwLock<crate::concept_store::ConceptStoreState>,
+    state: RwLock<ConceptStoreState>,
 }
 
 impl std::fmt::Debug for InMemoryConceptStore {
@@ -48,7 +54,7 @@ impl Default for InMemoryConceptStore {
             yago_iris: RwLock::new(HashMap::new()),
             hierarchy: RwLock::new(TaxonomyHierarchy::default()),
             edges: RwLock::new(Vec::new()),
-            state: RwLock::new(crate::concept_store::ConceptStoreState::Ready),
+            state: RwLock::new(ConceptStoreState::Ready),
         }
     }
 }
@@ -69,29 +75,10 @@ impl InMemoryConceptStore {
         *self.hierarchy.write().expect("concept store write lock poisoned") = hierarchy;
     }
 
-    pub fn set_state(&self, state: crate::concept_store::ConceptStoreState) {
+    /// Override the store readiness (tests only — production readiness is
+    /// `Ready` except while the SQLite store batches).
+    pub fn set_state(&self, state: ConceptStoreState) {
         *self.state.write().expect("concept store write lock poisoned") = state;
-    }
-
-    pub fn from_n2_fixture(path: &std::path::Path) -> Result<Self, crate::error::SpacyError> {
-        let view = crate::yago_view::YagoView::load(path)?;
-        let store = Self::new();
-        // Seed fallback concepts from n2 — classes become minimal ConceptMetadata
-        for (curie, id) in view.classes_iter() {
-            let meta = fluent_types::ConceptMetadata {
-                id,
-                canonical_name: curie.clone(),
-                namespace: id.namespace(),
-                yago_iri: Some(format!("http://yago-knowledge.org/resource/{}", curie.trim_start_matches("yago:").trim_start_matches("schema:"))),
-                yago_class_iri: None,
-                label: Some(curie.clone()),
-                node_id: None,
-                parent_class_id: None,
-            };
-            let _ = store.insert(meta);
-        }
-        // Rebuild hierarchy from view edges via is_subclass checks not needed for stub
-        Ok(store)
     }
 }
 
@@ -214,7 +201,7 @@ impl ConceptStore for InMemoryConceptStore {
             .is_subclass(child, parent)
     }
 
-    fn state(&self) -> crate::concept_store::ConceptStoreState {
+    fn state(&self) -> ConceptStoreState {
         *self.state.read().expect("concept store read lock poisoned")
     }
 }

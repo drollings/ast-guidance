@@ -1,8 +1,10 @@
+//! Moved with the view (M5.5): the `YagoView` TTL/load suite now lives
+//! beside its owner.
 use super::*;
 #[test]
 fn ttl_parses_n2() {
     let ttl = std::fs::read_to_string("env/yago-taxonomy-n2.ttl").or_else(|_| std::fs::read_to_string("../../env/yago-taxonomy-n2.ttl")).expect("n2 ttl");
-    let view = YagoView::from_ttl_str(&ttl).expect("parse");
+    let view = YagoView::from_ttl_str(&ttl);
     assert!(view.class_count() > 0);
     let thing = view.resolve_curie("schema:Thing").expect("Thing");
     let person = view.resolve_curie("schema:Person").expect("Person");

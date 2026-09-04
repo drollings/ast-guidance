@@ -23,8 +23,7 @@ use fluent_router::ledger::ContentNodeLedger;
 use fluent_types::{ContentNode, NodeId};
 use guidance_ontology::yago::WHITELIST_IRIS;
 use guidance_ontology::yago_loader::YaGoLoader;
-use spacy_rs::concept_store::ConceptStore;
-use spacy_rs::TaxonomyHierarchy;
+use fluent_concept::{ConceptStore, TaxonomyHierarchy};
 
 /// Open the ledger the way the boot wants it (ROADMAP_20260828_ORT M1.1): a
 /// configured `ledger` section opens its durable path (with a `warn!` for the
@@ -432,7 +431,7 @@ mod tests {
         let store_boot = build_concept_store_boot(&ledger).expect("store + reconcile built before pipeline");
         assert!(store_boot.stats.classes >= 7, "YaGO reconcile populated the store");
         let nlp_deps = NlpDeps {
-            concept_store: Some(store_boot.concept_store as std::sync::Arc<dyn spacy_rs::ConceptStore>),
+            concept_store: Some(store_boot.concept_store as std::sync::Arc<dyn fluent_concept::ConceptStore>),
             strings_path: None,
         };
         let map = config.build_all_pipelines_with_backend_onnx_and_nlp(None, None, &nlp_deps);

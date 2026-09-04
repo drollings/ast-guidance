@@ -287,7 +287,9 @@ async fn budget_eviction_footprint_coldness_matches_eviction_order() {
     ];
 
     // Crank the budget so the pass evicts (mirror the llama over-budget);
-    // used = 5000 + 3*0 (rows carry total_bytes 0) = 5000 > 500.
+    // used = max(model_bytes) 0 + vram 2000+1000+1000 = 4000 > 500 (VRAM
+    // accounting: fork weights + VRAM context bytes, never file size or
+    // all-memory totals).
     let engine = LlmResidencyEngine::new_with_clock(
         Duration::from_secs(1),
         Some(500),
@@ -483,6 +485,65 @@ async fn start_loops_on_injected_runtime() {
     handle.abort();
     let _ = handle.await;
     assert_eq!(w.unload_count(), 1, "loop released the idle entry");
+}
+
+#[tokio::test]
+async fn vram_budget_ignores_cpu_offloaded_bytes() {
+    // Partial GPU offload (production 28.4G-counted-vs-14.2G-resident WARN):
+    // the weights file is 14000B, the fork reports 13900B shared weights
+    // resident, and one context whose 14550B all-memory footprint holds only
+    // 350B in VRAM. `ps` renders 13900 + 350 = 14250 resident; the engine
+    // must agree — file size + all-memory total (28550) against a 19400
+    // budget spuriously evicted.
+    let mut ctx = row("base", "default", false, 100);
+    ctx.model_bytes = 13900;
+    ctx.context_bytes = 14000;
+    ctx.compute_bytes = 550;
+    ctx.total_bytes = 14550;
+    ctx.vram_bytes = 350;
+    let w = Arc::new(StubWeights::llama("base", 14000, true, vec![ctx]));
+    let destroyed = Arc::new(Mutex::new(0usize));
+    *w.contexts.lock().unwrap() =
+        vec![StubContext { name: "default", destroyed: Arc::clone(&destroyed) }];
+    let engine = LlmResidencyEngine::new_with_clock(
+        Duration::from_secs(1),
+        Some(19400),
+        None,
+        30,
+        1,
+        Arc::new(|| 9_000_000_000i64),
+    );
+    engine.residency_cycle(&[w.clone() as Arc<dyn LlmWeights>]).await.expect("cycle");
+    assert_eq!(w.unload_count(), 0, "VRAM-accurate usage (14250) fits the 19400 budget");
+    assert_eq!(*destroyed.lock().unwrap(), 0, "no context destroyed");
+}
+
+#[tokio::test]
+async fn vram_budget_still_evicts_when_truly_over() {
+    // Guard against overcorrection: the same offloaded shape against a
+    // 14000 budget (14250 resident) must evict exactly one unit (batch=1).
+    let mut ctx = row("base", "default", false, 100);
+    ctx.model_bytes = 13900;
+    ctx.total_bytes = 14550;
+    ctx.vram_bytes = 350;
+    let w = Arc::new(StubWeights::llama("base", 14000, true, vec![ctx]));
+    let destroyed = Arc::new(Mutex::new(0usize));
+    *w.contexts.lock().unwrap() =
+        vec![StubContext { name: "default", destroyed: Arc::clone(&destroyed) }];
+    let engine = LlmResidencyEngine::new_with_clock(
+        Duration::from_secs(1),
+        Some(14000),
+        None,
+        30,
+        1,
+        Arc::new(|| 9_000_000_000i64),
+    );
+    engine.residency_cycle(&[w.clone() as Arc<dyn LlmWeights>]).await.expect("cycle");
+    assert_eq!(
+        w.unload_count() + *destroyed.lock().unwrap(),
+        1,
+        "genuinely over budget evicts exactly one unit"
+    );
 }
 
 #[test]

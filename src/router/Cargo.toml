@@ -20,6 +20,8 @@ async-trait = { workspace = true }
 # Milestone 6: DEP-as-routing-signal extraction + the NlpStage that runs the
 # deterministic NLP pipeline on inbound natural-language requests.
 spacy-rs = { path = "../spacy-rs" }
+# M3 (spacy-rs split): the neutral ConceptStore/TaxonomyHierarchy home.
+fluent-concept = { path = "../concept" }
 fluent-onnx = { path = "../fluent-onnx" }
 fluent-wvr-testutil = { path = "../fluent-wvr-testutil" }
 serde = { workspace = true }

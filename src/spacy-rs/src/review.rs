@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::concept_store::ConceptStoreError;
+use fluent_concept::ConceptStoreError;
 use crate::llm::{AnnotationRecord, AnnotationResult, AnnotationSource};
 use fluent_types::{ConceptMetadata, InterlinguaId};
 

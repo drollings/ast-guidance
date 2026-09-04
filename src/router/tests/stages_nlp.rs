@@ -3,8 +3,8 @@ use crate::config::builder::NlpDeps;
 use crate::config::RouterConfig;
 use crate::pipeline::PipelineResult;
 use crate::types::RouterRequest;
-use spacy_rs::concept_store_mem::InMemoryConceptStore;
-use spacy_rs::concept_store::ConceptStore;
+use fluent_concept::InMemoryConceptStore;
+use fluent_concept::ConceptStore;
 
 /// A context carrying a user message (the `structured["request"]` handoff
 /// the stage reads).
@@ -67,9 +67,10 @@ fn publishes_interlingua_and_confidence_accessors() {
         spacy_rs::lang::en::lexicon_config(),
     ));
     let tokenizer = spacy_rs::lang::en::tokenizer(vocab.clone()).expect("tokenizer");
-    let store = std::sync::Arc::new(spacy_rs::concept_store_mem::InMemoryConceptStore::new());
-    let resolver = std::sync::Arc::new(spacy_rs::InterlinguaResolver::new(
-        std::sync::Arc::clone(&store) as std::sync::Arc<dyn spacy_rs::ConceptStore>,
+    let store = std::sync::Arc::new(fluent_concept::InMemoryConceptStore::new());
+
+    let resolver = std::sync::Arc::new(spacy_rs::interlingua::InterlinguaResolver::new(
+        std::sync::Arc::clone(&store) as std::sync::Arc<dyn fluent_concept::ConceptStore>,
         std::sync::Arc::clone(vocab.strings()),
     ));
     let pipeline = std::sync::Arc::new(

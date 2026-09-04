@@ -415,7 +415,7 @@ impl ContentNodeStore {
         Ok(installed)
     }
 
-    /// Get the shared `ArcReadyAnnotation`, computing it lazily (**at most
+    /// Get the shared `NodeAnnotation`, computing it lazily (**at most
     /// once**) if absent and a pipeline is wired. `Ok(None)` when no pipeline is
     /// attached (fail-open), the node's overlay is permanently `failed` (no
     /// retry), or derivation failed. Locking: off-node derivation, then an
@@ -423,7 +423,7 @@ impl ContentNodeStore {
     pub fn annotation_for(
         &self,
         node_id: NodeId,
-    ) -> Result<Option<Arc<spacy_rs::ArcReadyAnnotation>>, LedgerError> {
+    ) -> Result<Option<Arc<crate::ledger::node_annotation::NodeAnnotation>>, LedgerError> {
         let Some(pipeline) = lock(&self.overlay_pipeline).clone() else {
             return Ok(None); // fail-open: no pipeline wired
         };
@@ -433,14 +433,16 @@ impl ContentNodeStore {
             "spacy",
             |node| {
                 node.annotation.clone().and_then(
-                    <dyn fluent_types::NodeOverlay>::downcast_arc::<spacy_rs::ArcReadyAnnotation>,
+                    <dyn fluent_types::NodeOverlay>::downcast_arc::<
+                        crate::ledger::node_annotation::NodeAnnotation,
+                    >,
                 )
             },
             move |text| {
                 let (doc, result) = pipeline
                     .process_sync_with_confidence(text, None, None, spacy_rs::RefinePolicy::default())
                     .map_err(|e| e.to_string())?;
-                Ok(Arc::new(spacy_rs::pipeline::arc_ready(&doc, &result)))
+                Ok(Arc::new(crate::ledger::node_annotation::node_annotation(&doc, &result)))
             },
             |node, ann| {
                 node.annotation = Some(ann);

@@ -189,10 +189,11 @@ LLM's job is the residue, not the whole.
   only). The surface that produces the sparse tokens for routing use is
   future work.
 
-- **ArcReady annotation document (`ArcReadyAnnotation`):** *Implemented.* A
+- **Node annotation document (`NodeAnnotation`):** *Implemented.* A
   fully-materialized, immutable annotation document
-  (`spacy-rs::arcready::ArcReadyAnnotation`, built by `from_doc` / `arc_ready`)
-  exposed as a `fluent_types::NodeOverlay` so a shared node can carry it in its
+  (router `ledger/node_annotation.rs::NodeAnnotation`, built by `from_doc` /
+  `node_annotation` over spacy-rs inputs) exposed as a
+  `fluent_types::NodeOverlay` so a shared node can carry it in its
   `annotation` slot. The router's background overlay worker
   (`ledger/overlay_worker.rs`, opt-in via `overlay.arc_ready`) derives it —
   alongside the LLM enrichment and embedding overlays — lazily, at-most-once,

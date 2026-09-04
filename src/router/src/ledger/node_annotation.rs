@@ -1,27 +1,29 @@
-//! `ArcReadyAnnotation` — a fully-materialized, immutable annotation document.
+//! `NodeAnnotation` — the fully-materialized, immutable ledger annotation document.
 //!
-//! The shareable product of the annotation ladder (Llm → Encoder → ArcEager →
-//! Rule), validated by the 7-check gate, plus the routing signals and the
-//! detail-baseline tokens. "ArcReady" means it is completely materialized and
-//! safe to share behind an `Arc` with **no locks at read time**: every field is
-//! owned immutable data and nothing in the struct is mutable after
+//! Moved from `spacy-rs` (`arcready.rs::ArcReadyAnnotation`, renamed) per
+//! `REVIEW-20260903-SPACY-TO-RUST-COMPARISON.md` §7: a ledger cache entry
+//! implementing the ledger's `NodeOverlay` trait must live with the ledger,
+//! not in the NLP crate. The rename kills the ArcEager/ArcReady confusion at
+//! the source — this type is not a parser stage, it is the shareable product
+//! of the annotation ladder.
+//!
+//! spacy-rs exports only the *inputs* (`AnnotationSet`/`AnnotationResult` via
+//! `spacy_rs::llm`, `RoutingSignal` via `spacy_rs::routing`, `TokenRecord` via
+//! `spacy_rs::doc`); this module owns the document, the `NodeOverlay` impl,
+//! and the `node_annotation` constructor composing
+//! `spacy_rs::extract_routing_signals` with `from_doc` (replacing
+//! `spacy_rs::pipeline::arc_ready`).
+//!
+//! Safe to share behind an `Arc` with **no locks at read time**: every field
+//! is owned immutable data and nothing in the struct is mutable after
 //! construction (`#![forbid(unsafe_code)]`; no `Mutex`/`RefCell`/atomics).
-//!
-//! This is the `spacy-rs`-owned overlay document the router's ledger caches
-//! lazily on a `ContentNode` (the `arc_ready` overlays design). It deliberately
-//! stores the **validated output** — the wire [`AnnotationSet`], the producing
-//! rung + confidence, the surfaced interlingua collisions, the per-sentence
-//! routing signals, and the [`TokenRecord`] detail baseline (orth + byte
-//! offsets, aligned to the raw request text) — not the mutable working
-//! [`crate::doc::Doc`], so consumers read the annotation without re-running the
-//! tokenizer or holding the node write lock.
 
-use crate::arc_eager::ParseConfidence;
-use crate::doc::{Doc, TokenRecord};
-use crate::llm::{AnnotationResult, AnnotationSet, AnnotationSource};
-use crate::routing::RoutingSignal;
+use spacy_rs::{
+    AnnotationResult, AnnotationSet, AnnotationSource, Doc, ParseConfidence, RoutingSignal,
+    TokenRecord,
+};
 
-impl fluent_types::NodeOverlay for ArcReadyAnnotation {
+impl fluent_types::NodeOverlay for NodeAnnotation {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -34,7 +36,7 @@ impl fluent_types::NodeOverlay for ArcReadyAnnotation {
 /// carries the token orths and byte offsets aligned to the raw request text,
 /// so consumers get exact alignment without re-running the tokenizer.
 #[derive(Debug, Clone)]
-pub struct ArcReadyAnnotation {
+pub struct NodeAnnotation {
     /// The validated per-token annotation records (text/pos/tag/dep/head/lemma).
     pub records: AnnotationSet,
     /// Which rung produced the parse, plus confidence / provenance.
@@ -53,7 +55,7 @@ pub struct ArcReadyAnnotation {
     pub tokens: Vec<TokenRecord>,
 }
 
-impl ArcReadyAnnotation {
+impl NodeAnnotation {
     /// Run the pipeline once and materialize the immutable document from an
     /// attached `doc`, its ladder [`AnnotationResult`], and the extracted
     /// routing `signals`. The caller treats a genuinely empty doc (no tokens,
@@ -63,8 +65,8 @@ impl ArcReadyAnnotation {
         doc: &Doc,
         result: &AnnotationResult,
         signals: Vec<RoutingSignal>,
-    ) -> ArcReadyAnnotation {
-        ArcReadyAnnotation {
+    ) -> NodeAnnotation {
+        NodeAnnotation {
             records: result.records.clone(),
             source: result.source,
             token_confidence: result.token_confidence.clone(),
@@ -100,6 +102,21 @@ impl ArcReadyAnnotation {
     }
 }
 
+/// Materialize the immutable, shareable [`NodeAnnotation`] from a successful
+/// ladder run: an already-attached, sentencized, and — when a resolver is
+/// wired — resolved `doc` plus its ladder [`AnnotationResult`] handoff.
+/// Composes [`spacy_rs::extract_routing_signals`] over the run's doc and hands
+/// the validated output to [`NodeAnnotation::from_doc`].
+///
+/// Pure and additive: the annotation is the validated output — the wire
+/// records + signals + token baseline — not the working [`Doc`], so consumers
+/// share it behind an `Arc` with no locks at read time.
+#[must_use]
+pub fn node_annotation(doc: &Doc, result: &AnnotationResult) -> NodeAnnotation {
+    let signals = spacy_rs::extract_routing_signals(doc);
+    NodeAnnotation::from_doc(doc, result, signals)
+}
+
 #[cfg(test)]
-#[path = "../tests/arcready.rs"]
+#[path = "../../tests/ledger_node_annotation.rs"]
 mod tests;

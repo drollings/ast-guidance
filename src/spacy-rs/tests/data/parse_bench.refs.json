@@ -1,0 +1,2840 @@
+{
+  "refs": {
+    "command-01": [
+      {
+        "dep": "root",
+        "head": 0,
+        "pos": "verb",
+        "text": "Summarize"
+      },
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "this",
+        "pos": "det",
+        "text": "this"
+      },
+      {
+        "dep": "dobj",
+        "head": -2,
+        "lemma": "article",
+        "pos": "noun",
+        "text": "article"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "command-02": [
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "translate",
+        "pos": "verb",
+        "text": "Translate"
+      },
+      {
+        "dep": "dobj",
+        "head": -1,
+        "lemma": "hello",
+        "pos": "noun",
+        "text": "hello"
+      },
+      {
+        "dep": "case",
+        "head": 1,
+        "lemma": "to",
+        "pos": "adp",
+        "text": "to"
+      },
+      {
+        "dep": "pobj",
+        "head": -1,
+        "lemma": "French",
+        "pos": "propn",
+        "text": "French"
+      },
+      {
+        "dep": "punct",
+        "head": -4,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "command-03": [
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "find",
+        "pos": "verb",
+        "text": "Find"
+      },
+      {
+        "dep": "det",
+        "head": 2,
+        "lemma": "the",
+        "pos": "det",
+        "text": "the"
+      },
+      {
+        "dep": "amod",
+        "head": 1,
+        "lemma": "cheap",
+        "pos": "adj",
+        "text": "cheapest"
+      },
+      {
+        "dep": "dobj",
+        "head": -3,
+        "lemma": "flight",
+        "pos": "noun",
+        "text": "flight"
+      },
+      {
+        "dep": "punct",
+        "head": -4,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "command-04": [
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "remind",
+        "pos": "verb",
+        "text": "Remind"
+      },
+      {
+        "dep": "iobj",
+        "head": -1,
+        "lemma": "me",
+        "pos": "pron",
+        "text": "me"
+      },
+      {
+        "dep": "prep",
+        "head": -2,
+        "lemma": "at",
+        "pos": "adp",
+        "text": "at"
+      },
+      {
+        "dep": "pobj",
+        "head": -1,
+        "lemma": "noon",
+        "pos": "noun",
+        "text": "noon"
+      },
+      {
+        "dep": "punct",
+        "head": -4,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "command-05": [
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "search",
+        "pos": "verb",
+        "text": "Search"
+      },
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "the"
+      },
+      {
+        "dep": "dobj",
+        "head": -2,
+        "lemma": "web",
+        "pos": "noun",
+        "text": "web"
+      },
+      {
+        "dep": "case",
+        "head": 1,
+        "lemma": "for",
+        "pos": "adp",
+        "text": "for"
+      },
+      {
+        "dep": "pobj",
+        "head": -1,
+        "lemma": "pension",
+        "pos": "noun",
+        "text": "pensions"
+      },
+      {
+        "dep": "punct",
+        "head": -5,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "command-06": [
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "explain",
+        "pos": "verb",
+        "text": "Explain"
+      },
+      {
+        "dep": "det",
+        "head": 2,
+        "lemma": "bell",
+        "pos": "propn",
+        "text": "Bell"
+      },
+      {
+        "dep": "case",
+        "head": 1,
+        "lemma": "'s",
+        "pos": "part",
+        "text": "'s"
+      },
+      {
+        "dep": "dobj",
+        "head": -3,
+        "lemma": "theorem",
+        "pos": "noun",
+        "text": "theorem"
+      },
+      {
+        "dep": "punct",
+        "head": -4,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "contraction-01": [
+      {
+        "dep": "aux",
+        "head": 2,
+        "lemma": "do",
+        "pos": "aux",
+        "text": "Do"
+      },
+      {
+        "dep": "neg",
+        "head": 1,
+        "pos": "part",
+        "text": "n't"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "pos": "verb",
+        "text": "help"
+      },
+      {
+        "dep": "dobj",
+        "head": -1,
+        "lemma": "them",
+        "pos": "pron",
+        "text": "them"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "contraction-02": [
+      {
+        "dep": "nsubj",
+        "head": 3,
+        "lemma": "i",
+        "pos": "pron",
+        "text": "I"
+      },
+      {
+        "dep": "aux",
+        "head": 2,
+        "lemma": "can",
+        "pos": "aux",
+        "text": "ca"
+      },
+      {
+        "dep": "neg",
+        "head": 1,
+        "lemma": "not",
+        "pos": "part",
+        "text": "n't"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "go",
+        "pos": "verb",
+        "text": "go"
+      },
+      {
+        "dep": "advmod",
+        "head": -1,
+        "lemma": "today",
+        "pos": "adv",
+        "text": "today"
+      },
+      {
+        "dep": "punct",
+        "head": -2,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "contraction-03": [
+      {
+        "dep": "nsubj",
+        "head": 3,
+        "lemma": "she",
+        "pos": "pron",
+        "text": "She"
+      },
+      {
+        "dep": "aux",
+        "head": 2,
+        "lemma": "do",
+        "pos": "aux",
+        "text": "wo"
+      },
+      {
+        "dep": "neg",
+        "head": 1,
+        "lemma": "not",
+        "pos": "part",
+        "text": "n't"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "answer",
+        "pos": "verb",
+        "text": "answer"
+      },
+      {
+        "dep": "dobj",
+        "head": -1,
+        "lemma": "call",
+        "pos": "noun",
+        "text": "calls"
+      },
+      {
+        "dep": "punct",
+        "head": -2,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "contraction-04": [
+      {
+        "dep": "nsubj",
+        "head": 3,
+        "lemma": "we",
+        "pos": "pron",
+        "text": "We"
+      },
+      {
+        "dep": "aux",
+        "head": 2,
+        "lemma": "do",
+        "pos": "aux",
+        "text": "did"
+      },
+      {
+        "dep": "neg",
+        "head": 1,
+        "lemma": "n't",
+        "pos": "part",
+        "text": "n't"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "see",
+        "pos": "verb",
+        "text": "see"
+      },
+      {
+        "dep": "dobj",
+        "head": -1,
+        "lemma": "it",
+        "pos": "pron",
+        "text": "it"
+      },
+      {
+        "dep": "punct",
+        "head": -2,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "contraction-05": [
+      {
+        "dep": "nsubj",
+        "head": 2,
+        "lemma": "it",
+        "pos": "pron",
+        "text": "It"
+      },
+      {
+        "dep": "aux",
+        "head": 1,
+        "lemma": "be",
+        "pos": "aux",
+        "text": "'s"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "rain",
+        "pos": "verb",
+        "text": "raining"
+      },
+      {
+        "dep": "advmod",
+        "head": -1,
+        "lemma": "hard",
+        "pos": "adv",
+        "text": "hard"
+      },
+      {
+        "dep": "punct",
+        "head": -2,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "contraction-06": [
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "you",
+        "pos": "pron",
+        "text": "You"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "be",
+        "pos": "aux",
+        "text": "'re"
+      },
+      {
+        "dep": "amod",
+        "head": -1,
+        "lemma": "late",
+        "pos": "adj",
+        "text": "late"
+      },
+      {
+        "dep": "advmod",
+        "head": -2,
+        "lemma": "again",
+        "pos": "adv",
+        "text": "again"
+      },
+      {
+        "dep": "punct",
+        "head": -3,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "coordination-01": [
+      {
+        "dep": "nsubj",
+        "head": 3,
+        "pos": "noun",
+        "text": "Cats"
+      },
+      {
+        "dep": "cc",
+        "head": 1,
+        "lemma": "and",
+        "pos": "cconj",
+        "text": "and"
+      },
+      {
+        "dep": "conj",
+        "head": -1,
+        "pos": "noun",
+        "text": "dogs"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "pos": "verb",
+        "text": "play"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "coordination-02": [
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "she",
+        "pos": "pron",
+        "text": "She"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "run",
+        "pos": "verb",
+        "text": "ran"
+      },
+      {
+        "dep": "mark",
+        "head": 1,
+        "lemma": "but",
+        "pos": "sconj",
+        "text": "but"
+      },
+      {
+        "dep": "conj",
+        "head": -2,
+        "lemma": "fall",
+        "pos": "verb",
+        "text": "fell"
+      },
+      {
+        "dep": "punct",
+        "head": -3,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "coordination-03": [
+      {
+        "text": "Buy",
+        "pos": "verb",
+        "dep": "root",
+        "head": 0
+      },
+      {
+        "text": "milk",
+        "pos": "noun",
+        "dep": "dobj",
+        "head": -1,
+        "lemma": "milk"
+      },
+      {
+        "text": "and",
+        "pos": "cconj",
+        "dep": "cc",
+        "head": 1,
+        "lemma": "and"
+      },
+      {
+        "text": "eggs",
+        "pos": "noun",
+        "dep": "conj",
+        "head": -2,
+        "lemma": "egg"
+      },
+      {
+        "text": ".",
+        "pos": "punct",
+        "dep": "punct",
+        "head": -4,
+        "lemma": "."
+      }
+    ],
+    "coordination-04": [
+      {
+        "text": "He",
+        "pos": "pron",
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "he"
+      },
+      {
+        "text": "laughed",
+        "pos": "verb",
+        "dep": "root",
+        "head": 0
+      },
+      {
+        "text": "and",
+        "pos": "cconj",
+        "dep": "cc",
+        "head": 1,
+        "lemma": "and"
+      },
+      {
+        "text": "cried",
+        "pos": "verb",
+        "dep": "conj",
+        "head": -2
+      },
+      {
+        "text": ".",
+        "pos": "punct",
+        "dep": "punct",
+        "head": -3,
+        "lemma": "."
+      }
+    ],
+    "coordination-05": [
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "run",
+        "pos": "verb",
+        "text": "Run"
+      },
+      {
+        "dep": "advmod",
+        "head": -1,
+        "lemma": "fast",
+        "pos": "adv",
+        "text": "fast"
+      },
+      {
+        "dep": "conj",
+        "head": 1,
+        "lemma": "or",
+        "pos": "sconj",
+        "text": "or"
+      },
+      {
+        "dep": "conj",
+        "head": -3,
+        "lemma": "lose",
+        "pos": "verb",
+        "text": "lose"
+      },
+      {
+        "dep": "punct",
+        "head": -4,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "coordination-06": [
+      {
+        "text": "Tea",
+        "pos": "noun",
+        "dep": "nsubj",
+        "head": 3
+      },
+      {
+        "text": "or",
+        "pos": "cconj",
+        "dep": "cc",
+        "head": 1,
+        "lemma": "or"
+      },
+      {
+        "text": "coffee",
+        "pos": "noun",
+        "dep": "conj",
+        "head": -2
+      },
+      {
+        "text": "helps",
+        "pos": "verb",
+        "dep": "root",
+        "head": 0
+      },
+      {
+        "text": "mornings",
+        "pos": "noun",
+        "dep": "dobj",
+        "head": -1
+      },
+      {
+        "text": ".",
+        "pos": "punct",
+        "dep": "punct",
+        "head": -2,
+        "lemma": "."
+      }
+    ],
+    "copular-01": [
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "your",
+        "pos": "det",
+        "text": "Your"
+      },
+      {
+        "dep": "nsubj",
+        "head": 2,
+        "lemma": "fee",
+        "pos": "noun",
+        "text": "fee"
+      },
+      {
+        "dep": "cop",
+        "head": 1,
+        "pos": "aux",
+        "text": "is"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "pos": "adj",
+        "text": "low"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "copular-02": [
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "The"
+      },
+      {
+        "dep": "nsubj",
+        "head": 2,
+        "lemma": "sky",
+        "pos": "noun",
+        "text": "sky"
+      },
+      {
+        "dep": "cop",
+        "head": 1,
+        "pos": "aux",
+        "text": "is"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "pos": "adj",
+        "text": "blue"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "copular-03": [
+      {
+        "dep": "nsubj",
+        "head": 3,
+        "lemma": "she",
+        "pos": "pron",
+        "text": "She"
+      },
+      {
+        "dep": "cop",
+        "head": 2,
+        "lemma": "be",
+        "pos": "verb",
+        "text": "is"
+      },
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "a",
+        "pos": "det",
+        "text": "a"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "doctor",
+        "pos": "noun",
+        "text": "doctor"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "copular-04": [
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "The"
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "soup",
+        "pos": "noun",
+        "text": "soup"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "taste",
+        "pos": "verb",
+        "text": "tastes"
+      },
+      {
+        "dep": "acomp",
+        "head": -1,
+        "lemma": "salty",
+        "pos": "adj",
+        "text": "salty"
+      },
+      {
+        "dep": "punct",
+        "head": -2,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "copular-05": [
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "he",
+        "pos": "pron",
+        "text": "He"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "become",
+        "pos": "verb",
+        "text": "became"
+      },
+      {
+        "dep": "oprd",
+        "head": -1,
+        "lemma": "president",
+        "pos": "noun",
+        "text": "president"
+      },
+      {
+        "dep": "punct",
+        "head": -2,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "copular-06": [
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "The"
+      },
+      {
+        "dep": "nsubj",
+        "head": 2,
+        "lemma": "result",
+        "pos": "noun",
+        "text": "results"
+      },
+      {
+        "dep": "cop",
+        "head": 1,
+        "lemma": "be",
+        "pos": "aux",
+        "text": "were"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "surprise",
+        "pos": "adj",
+        "text": "surprising"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "imperative-01": [
+      {
+        "dep": "root",
+        "head": 0,
+        "pos": "verb",
+        "text": "Show"
+      },
+      {
+        "dep": "dobj",
+        "head": -1,
+        "lemma": "me",
+        "pos": "pron",
+        "text": "me"
+      },
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "the"
+      },
+      {
+        "dep": "dobj",
+        "head": -3,
+        "lemma": "report",
+        "pos": "noun",
+        "text": "report"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "imperative-02": [
+      {
+        "dep": "root",
+        "head": 0,
+        "pos": "verb",
+        "text": "Open"
+      },
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "the"
+      },
+      {
+        "dep": "dobj",
+        "head": -2,
+        "lemma": "door",
+        "pos": "noun",
+        "text": "door"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "imperative-03": [
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "let",
+        "pos": "verb",
+        "text": "Let"
+      },
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "the"
+      },
+      {
+        "dep": "nsubj",
+        "head": -2,
+        "lemma": "dead",
+        "pos": "adj",
+        "text": "dead"
+      },
+      {
+        "dep": "ccomp",
+        "head": -3,
+        "lemma": "go",
+        "pos": "verb",
+        "text": "go"
+      },
+      {
+        "dep": "xcomp",
+        "head": -1,
+        "lemma": "bury",
+        "pos": "verb",
+        "text": "bury"
+      },
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "their",
+        "pos": "det",
+        "text": "their"
+      },
+      {
+        "dep": "dobj",
+        "head": -2,
+        "lemma": "dead",
+        "pos": "adj",
+        "text": "dead"
+      },
+      {
+        "dep": "punct",
+        "head": -7,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "imperative-04": [
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "close",
+        "pos": "verb",
+        "text": "Close"
+      },
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "the"
+      },
+      {
+        "dep": "dobj",
+        "head": -2,
+        "lemma": "window",
+        "pos": "noun",
+        "text": "window"
+      },
+      {
+        "dep": "advmod",
+        "head": -3,
+        "lemma": "now",
+        "pos": "adv",
+        "text": "now"
+      },
+      {
+        "dep": "punct",
+        "head": -4,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "imperative-05": [
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "send",
+        "pos": "verb",
+        "text": "Send"
+      },
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "the"
+      },
+      {
+        "dep": "dobj",
+        "head": -2,
+        "lemma": "invoice",
+        "pos": "noun",
+        "text": "invoice"
+      },
+      {
+        "dep": "advmod",
+        "head": -3,
+        "lemma": "today",
+        "pos": "noun",
+        "text": "today"
+      },
+      {
+        "dep": "punct",
+        "head": -4,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "imperative-06": [
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "help",
+        "pos": "verb",
+        "text": "Help"
+      },
+      {
+        "dep": "dobj",
+        "head": -1,
+        "lemma": "them",
+        "pos": "pron",
+        "text": "them"
+      },
+      {
+        "dep": "xcomp",
+        "head": -2,
+        "lemma": "win",
+        "pos": "verb",
+        "text": "win"
+      },
+      {
+        "dep": "punct",
+        "head": -3,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "multiclause-01": [
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "let",
+        "pos": "verb",
+        "text": "Let"
+      },
+      {
+        "dep": "det",
+        "head": 5,
+        "lemma": "the",
+        "pos": "det",
+        "text": "the"
+      },
+      {
+        "dep": "amod",
+        "head": 4,
+        "lemma": "dead",
+        "pos": "adj",
+        "text": "dead"
+      },
+      {
+        "dep": "xcomp",
+        "head": -3,
+        "lemma": "go",
+        "pos": "verb",
+        "text": "go"
+      },
+      {
+        "dep": "ccomp",
+        "head": -1,
+        "lemma": "bury",
+        "pos": "verb",
+        "text": "bury"
+      },
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "their",
+        "pos": "det",
+        "text": "their"
+      },
+      {
+        "dep": "dobj",
+        "head": -2,
+        "lemma": "dead",
+        "pos": "noun",
+        "text": "dead"
+      },
+      {
+        "dep": "parataxis",
+        "head": -7,
+        "lemma": ";",
+        "pos": "punct",
+        "text": ";"
+      },
+      {
+        "dep": "aux",
+        "head": 2,
+        "lemma": "do",
+        "pos": "aux",
+        "text": "do"
+      },
+      {
+        "dep": "neg",
+        "head": 1,
+        "lemma": "n't",
+        "pos": "part",
+        "text": "n't"
+      },
+      {
+        "dep": "conj",
+        "head": -7,
+        "lemma": "help",
+        "pos": "verb",
+        "text": "help"
+      },
+      {
+        "dep": "dobj",
+        "head": -1,
+        "lemma": "them",
+        "pos": "pron",
+        "text": "them"
+      },
+      {
+        "dep": "punct",
+        "head": -12,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "multiclause-02": [
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "she",
+        "pos": "pron",
+        "text": "She"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "come",
+        "pos": "verb",
+        "text": "came"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ";",
+        "pos": "punct",
+        "text": ";"
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "she",
+        "pos": "pron",
+        "text": "she"
+      },
+      {
+        "dep": "parataxis",
+        "head": -3,
+        "lemma": "see",
+        "pos": "verb",
+        "text": "saw"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ";",
+        "pos": "punct",
+        "text": ";"
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "she",
+        "pos": "pron",
+        "text": "she"
+      },
+      {
+        "dep": "parataxis",
+        "head": -6,
+        "lemma": "leave",
+        "pos": "verb",
+        "text": "left"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "multiclause-03": [
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "The"
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "storm",
+        "pos": "noun",
+        "text": "storm"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "pass",
+        "pos": "verb",
+        "text": "passed"
+      },
+      {
+        "dep": "cc",
+        "head": 2,
+        "lemma": "but",
+        "pos": "cconj",
+        "text": "but"
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "flood",
+        "pos": "noun",
+        "text": "floods"
+      },
+      {
+        "dep": "conj",
+        "head": -3,
+        "lemma": "stay",
+        "pos": "verb",
+        "text": "stayed"
+      },
+      {
+        "dep": "punct",
+        "head": -4,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "multiclause-04": [
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "work",
+        "pos": "verb",
+        "text": "Work"
+      },
+      {
+        "dep": "advmod",
+        "head": -1,
+        "lemma": "hard",
+        "pos": "adv",
+        "text": "hard"
+      },
+      {
+        "dep": "punct",
+        "head": -2,
+        "lemma": ",",
+        "pos": "punct",
+        "text": ","
+      },
+      {
+        "dep": "conj",
+        "head": -3,
+        "lemma": "play",
+        "pos": "verb",
+        "text": "play"
+      },
+      {
+        "dep": "advmod",
+        "head": -1,
+        "lemma": "fair",
+        "pos": "adv",
+        "text": "fair"
+      },
+      {
+        "dep": "punct",
+        "head": -5,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "multiclause-05": [
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "he",
+        "pos": "pron",
+        "text": "He"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "cook",
+        "pos": "verb",
+        "text": "cooks"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ",",
+        "pos": "punct",
+        "text": ","
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "she",
+        "pos": "pron",
+        "text": "she"
+      },
+      {
+        "dep": "parataxis",
+        "head": -3,
+        "lemma": "clean",
+        "pos": "verb",
+        "text": "cleans"
+      },
+      {
+        "dep": "punct",
+        "head": -4,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "multiclause-06": [
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "price",
+        "pos": "noun",
+        "text": "Prices"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "rise",
+        "pos": "verb",
+        "text": "rose"
+      },
+      {
+        "dep": "mark",
+        "head": 2,
+        "lemma": "yet",
+        "pos": "sconj",
+        "text": "yet"
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "wage",
+        "pos": "noun",
+        "text": "wages"
+      },
+      {
+        "dep": "conj",
+        "head": -3,
+        "lemma": "stall",
+        "pos": "verb",
+        "text": "stalled"
+      },
+      {
+        "dep": "punct",
+        "head": -4,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "parenthetical-01": [
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "my",
+        "pos": "det",
+        "text": "My"
+      },
+      {
+        "dep": "nsubj",
+        "head": 5,
+        "lemma": "brother",
+        "pos": "noun",
+        "text": "brother"
+      },
+      {
+        "dep": "punct",
+        "head": 2,
+        "lemma": ",",
+        "pos": "punct",
+        "text": ","
+      },
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "a",
+        "pos": "det",
+        "text": "a"
+      },
+      {
+        "dep": "appos",
+        "head": -3,
+        "lemma": "doctor",
+        "pos": "noun",
+        "text": "doctor"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ",",
+        "pos": "punct",
+        "text": ","
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "live",
+        "pos": "verb",
+        "text": "lives"
+      },
+      {
+        "dep": "advmod",
+        "head": -1,
+        "lemma": "here",
+        "pos": "adv",
+        "text": "here"
+      },
+      {
+        "dep": "punct",
+        "head": -2,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "parenthetical-02": [
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "The"
+      },
+      {
+        "dep": "nsubj",
+        "head": 4,
+        "lemma": "report",
+        "pos": "noun",
+        "text": "report"
+      },
+      {
+        "dep": "punct",
+        "head": 1,
+        "lemma": ",",
+        "pos": "punct",
+        "text": ","
+      },
+      {
+        "dep": "advmod",
+        "head": 2,
+        "lemma": "frankly",
+        "pos": "adv",
+        "text": "frankly"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ",",
+        "pos": "punct",
+        "text": ","
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "be",
+        "pos": "verb",
+        "text": "was"
+      },
+      {
+        "dep": "acomp",
+        "head": -1,
+        "lemma": "late",
+        "pos": "adj",
+        "text": "late"
+      },
+      {
+        "dep": "punct",
+        "head": -2,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "parenthetical-03": [
+      {
+        "dep": "nsubj",
+        "head": 5,
+        "lemma": "paris",
+        "pos": "propn",
+        "text": "Paris"
+      },
+      {
+        "dep": "punct",
+        "head": 4,
+        "lemma": ",",
+        "pos": "punct",
+        "text": ","
+      },
+      {
+        "dep": "mark",
+        "head": 1,
+        "lemma": "as",
+        "pos": "sconj",
+        "text": "as"
+      },
+      {
+        "dep": "advmod",
+        "head": 2,
+        "lemma": "always",
+        "pos": "adv",
+        "text": "always"
+      },
+      {
+        "dep": "punct",
+        "head": 1,
+        "lemma": ",",
+        "pos": "punct",
+        "text": ","
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "charm",
+        "pos": "verb",
+        "text": "charmed"
+      },
+      {
+        "dep": "dobj",
+        "head": -1,
+        "lemma": "us",
+        "pos": "pron",
+        "text": "us"
+      },
+      {
+        "dep": "punct",
+        "head": -2,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "parenthetical-04": [
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "her",
+        "pos": "det",
+        "text": "Her"
+      },
+      {
+        "dep": "nsubj",
+        "head": 6,
+        "lemma": "car",
+        "pos": "noun",
+        "text": "car"
+      },
+      {
+        "dep": "punct",
+        "head": 1,
+        "lemma": ",",
+        "pos": "punct",
+        "text": ","
+      },
+      {
+        "dep": "amod",
+        "head": -2,
+        "lemma": "red",
+        "pos": "adj",
+        "text": "red"
+      },
+      {
+        "dep": "cc",
+        "head": 1,
+        "lemma": "and",
+        "pos": "cconj",
+        "text": "and"
+      },
+      {
+        "dep": "amod",
+        "head": -4,
+        "lemma": "fast",
+        "pos": "adj",
+        "text": "fast"
+      },
+      {
+        "dep": "punct",
+        "head": -3,
+        "lemma": ",",
+        "pos": "punct",
+        "text": ","
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "win",
+        "pos": "verb",
+        "text": "won"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "parenthetical-05": [
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "The"
+      },
+      {
+        "dep": "nsubj",
+        "head": 4,
+        "lemma": "ceo",
+        "pos": "noun",
+        "text": "CEO"
+      },
+      {
+        "dep": "punct",
+        "head": 1,
+        "lemma": ",",
+        "pos": "punct",
+        "text": ","
+      },
+      {
+        "dep": "amod",
+        "head": -2,
+        "lemma": "smile",
+        "pos": "verb",
+        "text": "smiling"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ",",
+        "pos": "punct",
+        "text": ","
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "take",
+        "pos": "verb",
+        "text": "took"
+      },
+      {
+        "dep": "dobj",
+        "head": -1,
+        "lemma": "question",
+        "pos": "noun",
+        "text": "questions"
+      },
+      {
+        "dep": "punct",
+        "head": -2,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "parenthetical-06": [
+      {
+        "dep": "advmod",
+        "head": 4,
+        "lemma": "truthfully",
+        "pos": "adv",
+        "text": "Truthfully"
+      },
+      {
+        "dep": "punct",
+        "head": 3,
+        "lemma": ",",
+        "pos": "punct",
+        "text": ","
+      },
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "the"
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "plan",
+        "pos": "noun",
+        "text": "plan"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "fail",
+        "pos": "verb",
+        "text": "failed"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "question-01": [
+      {
+        "dep": "obj",
+        "head": 1,
+        "lemma": "what",
+        "pos": "pron",
+        "text": "What"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "be",
+        "pos": "verb",
+        "text": "is"
+      },
+      {
+        "dep": "nsubj",
+        "head": -1,
+        "lemma": "2",
+        "pos": "num",
+        "text": "2"
+      },
+      {
+        "dep": "conj",
+        "head": -1,
+        "lemma": "+",
+        "pos": "sym",
+        "text": "+"
+      },
+      {
+        "dep": "conj",
+        "head": -2,
+        "lemma": "2",
+        "pos": "num",
+        "text": "2"
+      },
+      {
+        "dep": "punct",
+        "head": -4,
+        "lemma": "?",
+        "pos": "punct",
+        "text": "?"
+      }
+    ],
+    "question-02": [
+      {
+        "dep": "advmod",
+        "head": 1,
+        "lemma": "where",
+        "pos": "adv",
+        "text": "Where"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "be",
+        "pos": "verb",
+        "text": "is"
+      },
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "the"
+      },
+      {
+        "dep": "dobj",
+        "head": -2,
+        "lemma": "station",
+        "pos": "noun",
+        "text": "station"
+      },
+      {
+        "dep": "punct",
+        "head": -3,
+        "lemma": "?",
+        "pos": "punct",
+        "text": "?"
+      }
+    ],
+    "question-03": [
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "who",
+        "pos": "pron",
+        "text": "Who"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "pos": "verb",
+        "text": "called"
+      },
+      {
+        "dep": "advmod",
+        "head": -1,
+        "pos": "adv",
+        "text": "earlier"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": "?",
+        "pos": "punct",
+        "text": "?"
+      }
+    ],
+    "question-04": [
+      {
+        "dep": "aux",
+        "head": 2,
+        "lemma": "can",
+        "pos": "aux",
+        "text": "Can"
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "you",
+        "pos": "pron",
+        "text": "you"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "help",
+        "pos": "verb",
+        "text": "help"
+      },
+      {
+        "dep": "dobj",
+        "head": -1,
+        "lemma": "me",
+        "pos": "pron",
+        "text": "me"
+      },
+      {
+        "dep": "punct",
+        "head": -2,
+        "lemma": "?",
+        "pos": "punct",
+        "text": "?"
+      }
+    ],
+    "question-05": [
+      {
+        "dep": "advmod",
+        "head": 4,
+        "lemma": "why",
+        "pos": "adv",
+        "text": "Why"
+      },
+      {
+        "dep": "cop",
+        "head": 3,
+        "lemma": "be",
+        "pos": "verb",
+        "text": "is"
+      },
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "the"
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "sky",
+        "pos": "noun",
+        "text": "sky"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "blue",
+        "pos": "adj",
+        "text": "blue"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "?"
+      }
+    ],
+    "question-06": [
+      {
+        "dep": "aux",
+        "head": 3,
+        "lemma": "do",
+        "pos": "aux",
+        "text": "Did"
+      },
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "the"
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "report",
+        "pos": "noun",
+        "text": "report"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "arrive",
+        "pos": "verb",
+        "text": "arrive"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "?"
+      }
+    ],
+    "relative-01": [
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "The"
+      },
+      {
+        "dep": "nsubj",
+        "head": 3,
+        "lemma": "man",
+        "pos": "noun",
+        "text": "man"
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "who",
+        "pos": "pron",
+        "text": "who"
+      },
+      {
+        "dep": "relcl",
+        "head": -2,
+        "pos": "verb",
+        "text": "called"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "pos": "verb",
+        "text": "left"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "relative-02": [
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "The"
+      },
+      {
+        "dep": "nsubj",
+        "head": 4,
+        "lemma": "book",
+        "pos": "noun",
+        "text": "book"
+      },
+      {
+        "dep": "obj",
+        "head": 2,
+        "lemma": "that",
+        "pos": "pron",
+        "text": "that"
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "i",
+        "pos": "pron",
+        "text": "I"
+      },
+      {
+        "dep": "relcl",
+        "head": -3,
+        "lemma": "buy",
+        "pos": "verb",
+        "text": "bought"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "vanish",
+        "pos": "verb",
+        "text": "vanished"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "relative-03": [
+      {
+        "text": "People",
+        "pos": "noun",
+        "dep": "nsubj",
+        "head": 3
+      },
+      {
+        "text": "who",
+        "pos": "pron",
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "who"
+      },
+      {
+        "text": "wait",
+        "pos": "verb",
+        "dep": "relcl",
+        "head": -2
+      },
+      {
+        "text": "succeed",
+        "pos": "verb",
+        "dep": "root",
+        "head": 0
+      },
+      {
+        "text": ".",
+        "pos": "punct",
+        "dep": "punct",
+        "head": -1,
+        "lemma": "."
+      }
+    ],
+    "relative-04": [
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "The"
+      },
+      {
+        "dep": "nsubj",
+        "head": 4,
+        "lemma": "house",
+        "pos": "noun",
+        "text": "house"
+      },
+      {
+        "dep": "mark",
+        "head": 2,
+        "lemma": "where",
+        "pos": "adp",
+        "text": "where"
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "i",
+        "pos": "pron",
+        "text": "I"
+      },
+      {
+        "dep": "relcl",
+        "head": -3,
+        "lemma": "grow",
+        "pos": "verb",
+        "text": "grew"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "stand",
+        "pos": "verb",
+        "text": "stands"
+      },
+      {
+        "dep": "acomp",
+        "head": -1,
+        "lemma": "empty",
+        "pos": "adj",
+        "text": "empty"
+      },
+      {
+        "dep": "punct",
+        "head": -2,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "relative-05": [
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "The"
+      },
+      {
+        "dep": "nsubj",
+        "head": 3,
+        "lemma": "dog",
+        "pos": "noun",
+        "text": "dog"
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "that",
+        "pos": "pron",
+        "text": "that"
+      },
+      {
+        "dep": "relcl",
+        "head": -2,
+        "lemma": "bark",
+        "pos": "verb",
+        "text": "barked"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "run",
+        "pos": "verb",
+        "text": "ran"
+      },
+      {
+        "dep": "advmod",
+        "head": -1,
+        "lemma": "off",
+        "pos": "adv",
+        "text": "off"
+      },
+      {
+        "dep": "punct",
+        "head": -2,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "subordinate-01": [
+      {
+        "dep": "mark",
+        "head": 2,
+        "lemma": "as",
+        "pos": "sconj",
+        "text": "As"
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "you",
+        "pos": "pron",
+        "text": "you"
+      },
+      {
+        "dep": "parataxis",
+        "head": 5,
+        "lemma": "know",
+        "pos": "verb",
+        "text": "know"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ",",
+        "pos": "punct",
+        "text": ","
+      },
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "your",
+        "pos": "det",
+        "text": "your"
+      },
+      {
+        "dep": "nsubj",
+        "head": 2,
+        "lemma": "fee",
+        "pos": "noun",
+        "text": "fee"
+      },
+      {
+        "dep": "cop",
+        "head": 1,
+        "pos": "aux",
+        "text": "is"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "pos": "adj",
+        "text": "low"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "subordinate-02": [
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "i",
+        "pos": "pron",
+        "text": "I"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "leave",
+        "pos": "verb",
+        "text": "left"
+      },
+      {
+        "dep": "mark",
+        "head": 2,
+        "lemma": "because",
+        "pos": "sconj",
+        "text": "because"
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "it",
+        "pos": "pron",
+        "text": "it"
+      },
+      {
+        "dep": "ccomp",
+        "head": -3,
+        "lemma": "rain",
+        "pos": "verb",
+        "text": "rained"
+      },
+      {
+        "dep": "punct",
+        "head": -4,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "subordinate-03": [
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "she",
+        "pos": "pron",
+        "text": "She"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "sing",
+        "pos": "verb",
+        "text": "sings"
+      },
+      {
+        "dep": "mark",
+        "head": 2,
+        "lemma": "when",
+        "pos": "sconj",
+        "text": "when"
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "she",
+        "pos": "pron",
+        "text": "she"
+      },
+      {
+        "dep": "advcl",
+        "head": -3,
+        "lemma": "work",
+        "pos": "verb",
+        "text": "works"
+      },
+      {
+        "dep": "punct",
+        "head": -4,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "subordinate-04": [
+      {
+        "dep": "mark",
+        "head": 4,
+        "lemma": "if",
+        "pos": "sconj",
+        "text": "If"
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "it",
+        "pos": "pron",
+        "text": "it"
+      },
+      {
+        "dep": "advcl",
+        "head": 2,
+        "lemma": "rain",
+        "pos": "verb",
+        "text": "rains"
+      },
+      {
+        "dep": "punct",
+        "head": 1,
+        "lemma": ",",
+        "pos": "punct",
+        "text": ","
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "stay",
+        "pos": "verb",
+        "text": "stay"
+      },
+      {
+        "dep": "obl",
+        "head": -1,
+        "lemma": "home",
+        "pos": "nsubj",
+        "text": "home"
+      },
+      {
+        "dep": "punct",
+        "head": -2,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "subordinate-05": [
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "The"
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "meeting",
+        "pos": "noun",
+        "text": "meeting"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "end",
+        "pos": "verb",
+        "text": "ended"
+      },
+      {
+        "dep": "mark",
+        "head": 2,
+        "lemma": "after",
+        "pos": "sconj",
+        "text": "after"
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "he",
+        "pos": "pron",
+        "text": "he"
+      },
+      {
+        "dep": "advcl",
+        "head": -3,
+        "lemma": "speak",
+        "pos": "verb",
+        "text": "spoke"
+      },
+      {
+        "dep": "punct",
+        "head": -4,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "subordinate-06": [
+      {
+        "dep": "mark",
+        "head": 1,
+        "lemma": "although",
+        "pos": "sconj",
+        "text": "Although"
+      },
+      {
+        "dep": "advcl",
+        "head": 3,
+        "lemma": "tired",
+        "pos": "adj",
+        "text": "tired"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ",",
+        "pos": "punct",
+        "text": ","
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "she",
+        "pos": "pron",
+        "text": "she"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "keep",
+        "pos": "verb",
+        "text": "kept"
+      },
+      {
+        "dep": "dobj",
+        "head": -1,
+        "lemma": "pace",
+        "pos": "noun",
+        "text": "pace"
+      },
+      {
+        "dep": "punct",
+        "head": -2,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "svo-01": [
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "The"
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "cat",
+        "pos": "noun",
+        "text": "cat"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "pos": "verb",
+        "text": "sat"
+      },
+      {
+        "dep": "prep",
+        "head": -1,
+        "lemma": "on",
+        "pos": "adp",
+        "text": "on"
+      },
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "the"
+      },
+      {
+        "dep": "pobj",
+        "head": -2,
+        "lemma": "mat",
+        "pos": "noun",
+        "text": "mat"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "svo-02": [
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "The"
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "dog",
+        "pos": "noun",
+        "text": "dog"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "bark",
+        "pos": "verb",
+        "text": "barks"
+      },
+      {
+        "dep": "advmod",
+        "head": -2,
+        "pos": "adv",
+        "text": "loudly"
+      },
+      {
+        "dep": "punct",
+        "head": -1,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "svo-03": [
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "she",
+        "pos": "pron",
+        "text": "She"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "read",
+        "pos": "verb",
+        "text": "reads"
+      },
+      {
+        "dep": "dobj",
+        "head": -1,
+        "lemma": "book",
+        "pos": "noun",
+        "text": "books"
+      },
+      {
+        "dep": "advmod",
+        "head": -2,
+        "lemma": "daily",
+        "pos": "adv",
+        "text": "daily"
+      },
+      {
+        "dep": "punct",
+        "head": -3,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "svo-04": [
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "The"
+      },
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "chef",
+        "pos": "noun",
+        "text": "chef"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "cook",
+        "pos": "verb",
+        "text": "cooked"
+      },
+      {
+        "dep": "dobj",
+        "head": -1,
+        "lemma": "dinner",
+        "pos": "noun",
+        "text": "dinner"
+      },
+      {
+        "dep": "punct",
+        "head": -2,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "svo-05": [
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "bird",
+        "pos": "noun",
+        "text": "Birds"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "sing",
+        "pos": "verb",
+        "text": "sing"
+      },
+      {
+        "dep": "advmod",
+        "head": -1,
+        "lemma": "softly",
+        "pos": "adv",
+        "text": "softly"
+      },
+      {
+        "dep": "punct",
+        "head": -2,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "svo-06": [
+      {
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "John",
+        "pos": "propn",
+        "text": "John"
+      },
+      {
+        "dep": "root",
+        "head": 0,
+        "lemma": "open",
+        "pos": "verb",
+        "text": "opened"
+      },
+      {
+        "dep": "det",
+        "head": 1,
+        "lemma": "the",
+        "pos": "det",
+        "text": "the"
+      },
+      {
+        "dep": "dobj",
+        "head": -2,
+        "lemma": "door",
+        "pos": "noun",
+        "text": "door"
+      },
+      {
+        "dep": "punct",
+        "head": -3,
+        "lemma": ".",
+        "pos": "punct",
+        "text": "."
+      }
+    ],
+    "relative-06": [
+      {
+        "text": "Students",
+        "pos": "noun",
+        "dep": "nsubj",
+        "head": 3
+      },
+      {
+        "text": "who",
+        "pos": "pron",
+        "dep": "nsubj",
+        "head": 1,
+        "lemma": "who"
+      },
+      {
+        "text": "study",
+        "pos": "verb",
+        "dep": "relcl",
+        "head": -2
+      },
+      {
+        "text": "pass",
+        "pos": "verb",
+        "dep": "root",
+        "head": 0
+      },
+      {
+        "text": ".",
+        "pos": "punct",
+        "dep": "punct",
+        "head": -1,
+        "lemma": "."
+      }
+    ]
+  }
+}

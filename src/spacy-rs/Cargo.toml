@@ -19,6 +19,10 @@ name = "refine_calibration"
 path = "tests/refine_calibration.rs"
 
 [[test]]
+name = "parse_bench"
+path = "tests/parse_bench.rs"
+
+[[test]]
 name = "live"
 path = "tests/live.rs"
 required-features = ["live-ai"]
@@ -36,9 +40,12 @@ unicode-properties = "0.1"
 # Pipeline composition (Milestone 4): Component/WorkUnit stages, the
 # first_accept_in_order fallback ladder, SupervisedBatch execution, and the
 # ResultPool batch fan-out. fluent-dag supplies the stage DependencyGraph.
+# fluent-concept supplies the neutral ConceptStore/TaxonomyHierarchy home (M3):
+# spacy-rs keeps a read-only view import only, never the trait definition.
 fluent-wvr = { path = "../fluent-wvr" }
 fluent-concurrency = { path = "../fluent-concurrency" }
 fluent-dag = { path = "../dag" }
+fluent-concept = { path = "../concept" }
 bon = { workspace = true }
 common-core = { path = "../common-core" }
 blake3 = { workspace = true }

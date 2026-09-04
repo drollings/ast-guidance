@@ -24,8 +24,8 @@ use fluent_router::server::entity_link::{
     EntityLinkJob, EntityLinkWorker,
 };
 use fluent_types::{InterlinguaId, InterlinguaNamespace, NodeId};
-use spacy_rs::concept_store_mem::InMemoryConceptStore;
-use spacy_rs::ConceptStore;
+use fluent_concept::InMemoryConceptStore;
+use fluent_concept::ConceptStore;
 
 /// The YaGO `Entity` root (as `YagoClass`).
 fn entity_root() -> InterlinguaId {

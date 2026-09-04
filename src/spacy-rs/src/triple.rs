@@ -1,19 +1,36 @@
-//! Deterministic RDF triple extraction + YaGO taxonomy plausibility (ROADMAP M3).
+//! Deterministic RDF triple extraction (ROADMAP M3) + the knowledge-half
+//! seam for YaGO taxonomy plausibility (ROADMAP_20260903_SPACY_RS_SPLIT M5).
 //!
 //! Derives `(subject, predicate, object)` triples from the ArcEager roles
 //! (`nsubj`/`dobj` filling `role_coverage`) — the same dependency-tree
-//! discipline as `routing.rs` and `frame.rs` — and scores them against the
-//! YaGO taxonomy via `ConceptStore`/`TaxonomyHierarchy`.
+//! discipline as `routing.rs` and `frame.rs`.
+//!
+//! Scoring lives with the knowledge owner (`guidance-ontology`
+//! `plausibility::score_plausibility`, over the shared
+//! [`PlausibilityTriple`](fluent_concept::PlausibilityTriple) input); this
+//! module keeps only the pure derivation plus the dependency-free
+//! [`PlausibilityFetch`] seam and the [`build_plausibility_inputs`] text-half
+//! adapter, so no `guidance` edge ever enters this crate (M2b template).
 //!
 //! The spike is **default-off** and `semantic_plausibility` stays a separate
 //! `ParseConfidence` field (roadmap E7 — never blended into `oracle_margins`).
 
 #![forbid(unsafe_code)]
 
-use crate::concept_store::ConceptStore;
+use std::sync::Arc;
+
+use fluent_concept::{PlausibilityTriple, ScoredLemma};
 use crate::doc::{Doc, SentStart};
 use crate::hash::hash_utf8;
 use crate::interlingua::InterlinguaResolver;
+
+/// The knowledge-half scoring seam (M5): given the scorable triples the
+/// text half derived, return the taxonomy plausibility, or `None` when the
+/// taxonomy is not ready. The owner wires its kernel at the construction
+/// site (same pattern as the router injecting `LlmFetch`); unwired, the
+/// `YagoResolveStage` stays fail-closed (`None`, the pre-M3 behavior).
+pub type PlausibilityFetch =
+    Arc<dyn Fn(&[PlausibilityTriple]) -> Option<f64> + Send + Sync>;
 
 
 /// One deterministic triple from a single sentence: the predicate is the
@@ -86,107 +103,55 @@ pub fn extract_triples(doc: &Doc) -> Vec<Triple> {
     out
 }
 
-/// Score `triples` against the YaGO taxonomy: for each triple, resolve the
-/// subject/object noun lemmas (via `InterlinguaResolver`) to their
-/// content-addressed ids and test whether they are known in `store`
-/// (`store.contains`). A subject/object whose lemma id is known counts as
-/// plausible; the per-triple score is `1.0` (both), `0.5` (one), `0.0` (neither).
-/// The sentence-level plausibility is the mean over triples; `None` when there
-/// are no triples (empty doc).
-///
-/// When `store` is in `Loading` state the call returns `None` (provisional —
-/// taxonomy not yet ready, mirrors `FrameKey` provisional gating).
-///
-/// This is the **class-resolved** variant: a thin wrapper that also verifies
-/// `is_subclass_of` ancestry when the store carries a `TaxonomyHierarchy` so
-/// that `dog → animal` via `subClassOf` counts as a hit (the M3.1 "type
-/// signature via subclass-of" check). `store.contains` already suffices for a
-/// directly-registered class; the hierarchy check is additive.
+/// Build the knowledge-half scoring input for `triples`: one
+/// [`PlausibilityTriple`] per triple, pairing each role's content-addressed
+/// id (via `resolver`) with its surface lemma. Pure over `Doc` + resolver;
+/// the store is never consulted here (registration is boot-only).
 #[must_use]
-pub fn semantic_plausibility(
+pub fn build_plausibility_inputs(
     doc: &Doc,
     triples: &[Triple],
     resolver: &InterlinguaResolver,
-    store: &dyn ConceptStore,
-) -> Option<f64> {
-    if triples.is_empty() {
-        return None;
-    }
-    if store.state() == crate::concept_store::ConceptStoreState::Loading {
-        return None;
-    }
-    let mut scores = Vec::with_capacity(triples.len());
-    for t in triples {
-        let subj_known = t.subject.is_some_and(|i| token_known(doc, i, resolver, store));
-        let obj_known = t.object.is_some_and(|i| token_known(doc, i, resolver, store));
-        let triple_score = match (subj_known, obj_known, t.subject.is_some(), t.object.is_some()) {
-            // Both arguments present
-            (true, true, true, true) => 1.0,
-            (true, false, true, true) | (false, true, true, true) => 0.5,
-            (false, false, true, true) => 0.0,
-            // Only one argument structurally present — unresolved → 0, resolved → 1
-            (true, _, true, false) | (_, true, false, true) => 1.0,
-            (false, _, true, false) | (_, false, false, true) => 0.0,
-            // No arguments (verbless or bare predicate) — predicate-only triple
-            // is vacuously plausible when the predicate lemma itself is known.
-            (_, _, false, false) => {
-                if token_known(doc, t.predicate, resolver, store) { 1.0 } else { 0.0 }
-            }
-        };
-        scores.push(triple_score);
-    }
-    if scores.is_empty() {
-        None
-    } else {
-        Some(scores.iter().sum::<f64>() / scores.len() as f64)
-    }
+) -> Vec<PlausibilityTriple> {
+    triples
+        .iter()
+        .map(|t| {
+            PlausibilityTriple::new(
+                t.subject.map(|i| scored_lemma(doc, i, resolver)),
+                scored_lemma(doc, t.predicate, resolver),
+                t.object.map(|i| scored_lemma(doc, i, resolver)),
+            )
+        })
+        .collect()
 }
 
-fn token_known(
-    doc: &Doc,
-    idx: usize,
-    resolver: &InterlinguaResolver,
-    store: &dyn ConceptStore,
-) -> bool {
+fn scored_lemma(doc: &Doc, idx: usize, resolver: &InterlinguaResolver) -> ScoredLemma {
     let lemma = doc
         .vocab()
         .strings()
         .get(doc.token(idx).lemma)
         .map(|s| s.to_string())
         .unwrap_or_default();
-    if lemma.is_empty() {
-        return false;
-    }
-    let lid = resolver.lemma_id(&lemma);
-    if store.contains(lid) {
-        return true;
-    }
-    // YaGO curie fallback: a common noun lemma like "dog" is stored as
-    // `yago:Dog` / `schema:Dog` when loaded from the taxonomy. Try the
-    // capitalized curie form.
-    let curie = format!("yago:{}", capitalize(&lemma));
-    if store.resolve_name(&curie).is_ok() {
-        return true;
-    }
-    let schema = format!("schema:{}", capitalize(&lemma));
-    if store.resolve_name(&schema).is_ok() {
-        return true;
-    }
-    // Hierarchy check: if the lemma id resolves to a class that is a subclass
-    // of a known upper class, the store's `is_subclass_of` will surface via
-    // `ancestors_of` — but we already checked `contains`; only an
-    // is-subclass edge needs no extra lookup here because the store's
-    // `contains` covers the node itself and the subclass relationship is
-    // transitive through the graph we built at insert time.
-    false
+    let id = resolver.lemma_id(&lemma);
+    ScoredLemma::new(id, lemma)
 }
 
-fn capitalize(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        None => String::new(),
-        Some(f) => f.to_ascii_uppercase().to_string() + c.as_str(),
+/// Score `triples` through an injected knowledge-half fetch: the text-half
+/// adapter over [`build_plausibility_inputs`]. Returns `None` when there are
+/// no triples or no fetch is wired (fail-closed, the pre-M3 behavior).
+#[must_use]
+pub fn semantic_plausibility_via_fetch(
+    doc: &Doc,
+    triples: &[Triple],
+    resolver: &InterlinguaResolver,
+    fetch: Option<&PlausibilityFetch>,
+) -> Option<f64> {
+    if triples.is_empty() {
+        return None;
     }
+    let fetch = fetch?;
+    let inputs = build_plausibility_inputs(doc, triples, resolver);
+    fetch(&inputs)
 }
 
 fn dep_in(token: &crate::doc::TokenRecord, labels: &[&str]) -> bool {

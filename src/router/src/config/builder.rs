@@ -290,7 +290,7 @@ pub struct NlpDeps {
     /// The shared concept registry over the ledger connection. `Some` wires
     /// `InterlinguaResolver` into the NLP pipeline so `NlpStage` stamps
     /// interlingua ids; `None` disables interlingua stamping (with a `warn!`).
-    pub concept_store: Option<Arc<dyn spacy_rs::concept_store::ConceptStore>>,
+    pub concept_store: Option<Arc<dyn fluent_concept::ConceptStore>>,
     /// Optional durable StringStore path: the pipeline's vocab is loaded from
     /// (`en_default_with_strings`) and persisted (`persist_strings`) to this
     /// path. `None` keeps the in-memory vocab.

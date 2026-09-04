@@ -487,7 +487,7 @@ fn annotation_for_derives_once_and_caches_same_arc() {
     assert_eq!(node.overlay(OverlayKind::Spacy).status, OverlayStatus::Ready);
     assert_eq!(node.overlay(OverlayKind::Spacy).source, "spacy");
     assert_eq!(
-        node.annotation_as::<spacy_rs::ArcReadyAnnotation>().unwrap().tokens.len(),
+        node.annotation_as::<crate::ledger::node_annotation::NodeAnnotation>().unwrap().tokens.len(),
         5
     );
 }
@@ -566,7 +566,7 @@ fn concurrent_annotation_for_installs_at_most_once() {
             })
         })
         .collect();
-    let mut results: Vec<Arc<spacy_rs::ArcReadyAnnotation>> =
+    let mut results: Vec<Arc<crate::ledger::node_annotation::NodeAnnotation>> =
         handles.into_iter().map(|h| h.join().expect("thread")).collect();
     let canonical = results.pop().expect("at least one");
     assert!(

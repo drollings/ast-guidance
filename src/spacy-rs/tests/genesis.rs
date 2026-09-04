@@ -93,7 +93,7 @@ fn genesis_ner_promotes_after_threshold_and_overrides_rule() {
     assert_eq!(g.get_ner("london"), Some(NerType::Person));
     // RuleAnnotator consults genesis.get_ner for ent_type
     let annotator = crate::pipeline::RuleAnnotator::en_default()
-        .with_genesis(g.clone() as std::sync::Arc<dyn crate::genesis::GenesisIndex>);
+        .with_genesis(g.clone() as std::sync::Arc<dyn crate::lang::genesis::GenesisIndex>);
     let vocab = std::sync::Arc::new(crate::vocab::Vocab::new(crate::lexeme::LexiconConfig::default()));
     let mut doc = crate::doc::Doc::new(vocab);
     doc.push_back("london", true).expect("push");
@@ -180,4 +180,26 @@ fn old_file_migration_preserves_ner_promotion() {
     let g = InMemoryGenesisIndex::load_or_empty(&path);
     assert_eq!(g.get_ner("washington"), Some(NerType::Person));
     assert!(g.is_promoted("washington"));
+}
+
+#[test]
+fn default_thresholds_preserved_at_new_home() {
+    // M2c: the rule-data home constructs with POS 3 / NER 5; recording N
+    // corrections promotes and `RuleAnnotator`-visible getters replay.
+    assert_eq!(crate::lang::genesis::DEFAULT_POS_THRESHOLD, 3);
+    assert_eq!(crate::lang::genesis::DEFAULT_NER_THRESHOLD, 5);
+    let g = InMemoryGenesisIndex::new();
+    for _ in 0..2 {
+        g.record(&corr("verb"), "xyzzy");
+    }
+    assert!(!g.is_promoted("xyzzy"), "POS needs 3 evidence writes");
+    g.record(&corr("verb"), "xyzzy");
+    assert!(g.is_promoted("xyzzy"));
+    assert_eq!(g.get_pos("xyzzy"), Some(Upos::Verb));
+    for _ in 0..4 {
+        g.record(&ner_corr("Person"), "washington");
+    }
+    assert!(g.get_ner("washington").is_none(), "NER needs 5 evidence writes");
+    g.record(&ner_corr("Person"), "washington");
+    assert_eq!(g.get_ner("washington"), Some(NerType::Person));
 }

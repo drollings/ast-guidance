@@ -22,15 +22,17 @@
 //! - **Negation/modal scope** — a sentence with both a `neg` and a modal `aux`
 //!   governing the same predicate.
 //!
-//! The [`PreferredSenseIndex`] trait is the promotion seam (mirroring
+//! The promotion seam lives in the ledger owner
+//! (`fluent-router` `ledger::frame_index::PreferredSenseIndex`, mirroring
 //! `CorrectionIndex`): a resolved `(predicate_lemma_id, ambiguity_kind)` pattern
 //! is recorded and reused deterministically, so a repeating ambiguity never
 //! re-triggers an LLM call (golden-corpus-style rule genesis applied to senses).
+//! This module keeps only the pure derivation; it never imports the router.
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::concept_store::{ConceptStore, ConceptStoreError};
+use fluent_concept::ConceptStore;
 use crate::doc::{Doc, SentStart};
 use crate::hash::hash_utf8;
 use crate::interlingua::InterlinguaResolver;
@@ -203,37 +205,18 @@ impl FrameKey {
 }
 
 /// The disambiguation product of a resolved `(predicate, ambiguity_kind)`
-/// pattern. Recorded in a [`PreferredSenseIndex`] and replayed deterministically
+/// pattern. Recorded in the ledger-owner `PreferredSenseIndex`
+/// (see `fluent-router` `ledger::frame_index`) and replayed deterministically
 /// so the next occurrence never re-triggers an LLM call.
+///
+/// This value type stays in spacy-rs (pure, no store); only the trait tenancy
+/// moved to the router.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Resolution {
     /// The chosen sense / attachment / scope id.
     pub chosen_candidate_id: InterlinguaId,
     /// A legible reason (audit-trail friendly).
     pub detail: String,
-}
-
-/// The promotion seam for resolved ambiguity patterns (mirrors
-/// [`crate::review::CorrectionIndex`]): a `(predicate_lemma_id,
-/// ambiguity_kind)` pattern that has been resolved is recorded and replayed
-/// deterministically — golden-corpus-style rule genesis applied to senses.
-///
-/// The router implements this over the existing `interlingua_index`
-/// correction-cache rows (the entity-scope column = the ambiguity kind).
-pub trait PreferredSenseIndex: Send + Sync {
-    /// The previously-recorded resolution for this pattern, when known.
-    fn preferred_sense(
-        &self,
-        predicate_lemma_id: InterlinguaId,
-        ambiguity_kind: AmbiguityKind,
-    ) -> Option<Resolution>;
-    /// Persist a resolution for this pattern.
-    fn record_preferred_sense(
-        &self,
-        predicate_lemma_id: InterlinguaId,
-        ambiguity_kind: AmbiguityKind,
-        resolution: Resolution,
-    ) -> Result<(), ConceptStoreError>;
 }
 
 /// The deterministic frame extractor: a resolver + concept store wired into
@@ -276,7 +259,7 @@ impl FrameExtractor {
     /// Permanence also gates on `ConceptStore::state()==Ready` — while `Loading`, every key is provisional.
     #[must_use]
     pub fn keys(&self, doc: &Doc, analysis: &FrameAnalysis) -> Vec<FrameKey> {
-        let loading = self.concept_store.state() == crate::concept_store::ConceptStoreState::Loading;
+        let loading = self.concept_store.state() == fluent_concept::ConceptStoreState::Loading;
         analysis
             .frames
             .iter()

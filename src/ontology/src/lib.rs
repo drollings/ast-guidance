@@ -5,8 +5,10 @@ pub mod entity;
 pub mod inference;
 pub mod mapper;
 pub mod migration;
+pub mod plausibility;
 pub mod yago;
 pub mod yago_loader;
+pub mod yago_view;
 
 use thiserror::Error;
 
@@ -16,6 +18,10 @@ pub enum OntologyError {
     Mapping(String),
     #[error("inference error: {0}")]
     Inference(String),
+    #[error("yago view error: {0}")]
+    YagoView(String),
 }
 
 pub use yago_loader::{canonical_class_name, yago_class_id, LoadStats, YaGoLoader};
+pub use plausibility::{score_plausibility, PlausibilityInput};
+pub use yago_view::YagoView;

@@ -200,6 +200,10 @@ SPACY_BENCH_DIR := bin/spacy/benchmark
 spacy-benchmark: ## Re-run the spaCy vs spacy-rs parity benchmark (speed + memory over the shared golden corpus); env: SPACY_PYTHON=<python-with-spacy>, SPACY_BENCH_PASSES=<n>, SPACY_BENCH_REPS=<n>
 	$(Q)bash $(SPACY_BENCH_DIR)/run.sh
 
+.PHONY: spacy-parse-benchmark
+spacy-parse-benchmark: ## Score the deterministic ArcEager ladder (UPOS/UAS/LAS per category) against pinned refs; fully hermetic, no LLM (refs: tests/data/parse_bench.refs.json; new refs via `make spacy-test-live`)
+	$(Q)cargo test -p spacy-rs --test parse_bench -- --nocapture
+
 .PHONY: doc-check
 doc-check: ## Doc consistency lint — types named in skill/router docs must exist in source
 	$(Q)bin/doc-check.sh --types

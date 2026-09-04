@@ -2,9 +2,7 @@
 //!
 //! A repeated span need not re-consult a model: the corrections produced for
 //! a focus span are cached content-addressably and replayed on the next
-//! occurrence. The cache is `Arc<dyn SpanCache>` so both the async and sync
-//! ladders share one instance and the router can back it with its ledger
-//! sqlite (a **read-through view**, not a parallel store).
+//! occurrence.
 //!
 //! # Content addressing
 //!
@@ -14,49 +12,90 @@
 //! universe-independent. 64 bits is sufficient for the expected span
 //! population (`n=1M` → `≈2e-7` collision).
 //!
+//! # Tenancy (M2b)
+//!
+//! This module keeps only the pure hash discipline ([`span_key`]) and the
+//! dependency-free [`SpanCacheSeam`] callback bundle the ladder consults.
+//! The `SpanCache` trait + `InMemorySpanCache` hermetic double live with the
+//! ledger view owner (`fluent-router` `ledger::span_cache`, beside
+//! `SqliteSpanCache` — the read-through view over the shared
+//! `interlingua_index` table, same sqlite file, `role='span_cache'`
+//! sentinel; no parallel store). The router adapts its
+//! `Arc<dyn SpanCache>` into a [`SpanCacheSeam`] at the wiring site, so no
+//! router edge ever enters this crate.
+//!
 //! # Invalidation
 //!
 //! Cached entries are keyed by content. A human review that writes a new
 //! [`Correction`](crate::review::Correction) for the same span through the
 //! [`CorrectionIndex`](crate::review::CorrectionIndex) must invalidate the
-//! cached entry for that span key. The spacy-rs crate does not know the
-//! ledger's sqlite schema; it exposes `invalidate(key)` and the router calls
-//! it when it records a correction (the "invalidated through the correction
-//! index" contract). The cache never goes stale silently — the key is the
-//! content hash, so a content mutation is a different key by construction.
-//!
-//! # Storage
-//!
-//! `spacy-rs` ships only the trait and the hermetic `InMemorySpanCache`.
-//! The production `LedgerSpanCache` (router) is a view over the shared
-//! `interlingua_index` table (same sqlite file, `role='span_cache'`
-//! sentinel) — no parallel store. The trait is object-safe so the pipeline
-//! can hold `Option<Arc<dyn SpanCache>>` without knowing the backend.
+//! cached entry for that span key: the router calls the seam's `invalidate`
+//! when it records a correction (the "invalidated through the correction
+//! index" contract; see `SqliteSpanCache::invalidate_for_corrections`). The
+//! cache never goes stale silently — the key is the content hash, so a
+//! content mutation is a different key by construction.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::Arc;
 
 use crate::doc::Doc;
 use crate::hash::hash_utf8;
 use crate::review::Correction;
 
-/// Content-addressed span cache for refiner corrections.
+/// Read leg of the span-cache seam: cached corrections for `key`, if present.
+pub type SpanCacheGet = Arc<dyn Fn(u64) -> Option<Vec<Correction>> + Send + Sync>;
+/// Write leg of the span-cache seam: store `corrections` under `key`
+/// (overwrite; key `0` is a no-op — never cached).
+pub type SpanCachePut = Arc<dyn Fn(u64, Vec<Correction>) + Send + Sync>;
+/// Invalidation leg of the span-cache seam: drop the entry for `key`
+/// (called when a `CorrectionIndex` write for the same span lands).
+pub type SpanCacheInvalidate = Arc<dyn Fn(u64) + Send + Sync>;
+
+/// The dependency-free span-cache seam the ladder consults (M2b).
 ///
-/// `Send + Sync` so the async ladder (shared `Arc` across `ResultPool`
-/// workers) and the sync ladder (single-threaded) can share one instance.
-pub trait SpanCache: Send + Sync {
+/// A bundle of closures in the same idiom as the fetch seams
+/// ([`LlmRefineFetchSync`](crate::pipeline::LlmRefineFetchSync),
+/// [`EncoderResidualFetch`](crate::pipeline::EncoderResidualFetch)):
+/// the ladder needs `get`/`put` per refine plus `invalidate` for the
+/// correction-index contract, and knows nothing about the backend
+/// (in-memory map, ledger sqlite, or test stub). `Clone` is an `Arc` bump
+/// per leg, so sharing one seam across async workers and sync calls is
+/// cheap.
+#[derive(Clone)]
+pub struct SpanCacheSeam {
     /// Return the cached corrections for `key`, if present.
-    fn get(&self, key: u64) -> Option<Vec<Correction>>;
+    pub get: SpanCacheGet,
     /// Store `corrections` under `key` (overwrite).
-    fn put(&self, key: u64, corrections: Vec<Correction>);
-    /// Invalidate the entry for `key` (called when a `CorrectionIndex` write
-    /// for the same span lands).
-    fn invalidate(&self, key: u64);
-    /// Number of entries (for tests/metrics).
-    fn len(&self) -> usize;
-    /// Whether the cache is empty.
-    fn is_empty(&self) -> bool {
-        self.len() == 0
+    pub put: SpanCachePut,
+    /// Invalidate the entry for `key`.
+    pub invalidate: SpanCacheInvalidate,
+}
+
+impl SpanCacheSeam {
+    /// A seam over explicit closure legs.
+    pub fn new(get: SpanCacheGet, put: SpanCachePut, invalidate: SpanCacheInvalidate) -> Self {
+        Self { get, put, invalidate }
+    }
+
+    /// Return the cached corrections for `key`, if present.
+    #[must_use]
+    pub fn get(&self, key: u64) -> Option<Vec<Correction>> {
+        (self.get)(key)
+    }
+
+    /// Store `corrections` under `key` (overwrite).
+    pub fn put(&self, key: u64, corrections: Vec<Correction>) {
+        (self.put)(key, corrections);
+    }
+
+    /// Invalidate the entry for `key`.
+    pub fn invalidate(&self, key: u64) {
+        (self.invalidate)(key);
+    }
+}
+
+impl std::fmt::Debug for SpanCacheSeam {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpanCacheSeam").finish_non_exhaustive()
     }
 }
 
@@ -79,49 +118,6 @@ pub fn span_key(doc: &Doc, focus: &[usize]) -> u64 {
         buf.push_str(&doc.token_text(idx).to_ascii_lowercase());
     }
     hash_utf8(&buf)
-}
-
-/// Hermetic in-memory span cache (tests + non-ledger callers).
-///
-/// `Mutex<HashMap>` — the cache is not a hot loop; a single lock per
-/// get/put is negligible compared to a model call.
-#[derive(Debug, Default)]
-pub struct InMemorySpanCache {
-    map: Mutex<HashMap<u64, Vec<Correction>>>,
-}
-
-impl InMemorySpanCache {
-    /// An empty cache.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            map: Mutex::new(HashMap::new()),
-        }
-    }
-}
-
-impl SpanCache for InMemorySpanCache {
-    fn get(&self, key: u64) -> Option<Vec<Correction>> {
-        self.map.lock().expect("cache lock").get(&key).cloned()
-    }
-
-    fn put(&self, key: u64, corrections: Vec<Correction>) {
-        if key == 0 {
-            return;
-        }
-        self.map
-            .lock()
-            .expect("cache lock")
-            .insert(key, corrections);
-    }
-
-    fn invalidate(&self, key: u64) {
-        self.map.lock().expect("cache lock").remove(&key);
-    }
-
-    fn len(&self) -> usize {
-        self.map.lock().expect("cache lock").len()
-    }
 }
 
 #[cfg(test)]

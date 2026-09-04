@@ -8,16 +8,16 @@
 //! (11.10/13.10) locks the two homes equal.
 //!
 //! Ancestor/subclass queries delegate to a boot-built
-//! [`TaxonomyHierarchy`](spacy_rs::TaxonomyHierarchy) over the
+//! [`TaxonomyHierarchy`](fluent_concept::TaxonomyHierarchy) over the
 //! `parent_class_id` edges (C5 — the DAG primitive, not a hand-rolled walk).
 
 use std::sync::Arc;
 use std::sync::RwLock;
 
+use fluent_concept::{ConceptStore, ConceptStoreError, TaxonomyHierarchy};
 use fluent_db::store::SqliteStore;
 use fluent_types::{ConceptMetadata, InterlinguaId, InterlinguaNamespace, NodeId, local_id_of};
 use rusqlite::params;
-use spacy_rs::concept_store::{ConceptStore, ConceptStoreError, TaxonomyHierarchy};
 
 /// `ConceptStore` over the `interlingua_concepts` table, sharing the ledger's
 /// SQLite connection.

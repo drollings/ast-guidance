@@ -6,6 +6,17 @@
 //! pattern becomes permanent, version-pinned deterministic data — a standing
 //! model cost becomes a committed rule.
 //!
+//! # Tenancy (M2c)
+//!
+//! This module is the version-pinned rule-data home for promoted POS/NER,
+//! alongside the tokenizer exceptions (`en::exceptions`, `norm_exceptions`)
+//! and the lemma-blob pipeline (`crate::lemma_blob` + `build.rs`) — one
+//! audit surface for all "deterministic data that grows by promotion"
+//! (see [`crate::lang`] docs). The promotion store (trait + persistence)
+//! lives here; the parser keeps only consultation
+//! (`RuleAnnotator::annotate` reads promoted entries through the
+//! [`GenesisIndex`] seam).
+//!
 //! # Design
 //!
 //! * Evidence is a [`Correction`](crate::review::Correction) whose `field` is
@@ -293,5 +304,5 @@ impl InMemoryGenesisIndex {
 }
 
 #[cfg(test)]
-#[path = "../tests/genesis.rs"]
+#[path = "../../tests/genesis.rs"]
 mod tests;

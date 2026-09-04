@@ -476,13 +476,44 @@ impl LlmResidencyEngine {
             }
             let rows = w.residency_rows().await;
             let has_pinned = rows.iter().any(|r| r.pinned);
-            let resident = if w.is_loaded() { w.weights_bytes() } else { 0 };
+            // Pool-accurate weights footprint. The VRAM pool mirrors
+            // `coral-router ps` (ps parity): the fork-reported shared weights
+            // (`max(model_bytes)` — first loaded instance only), never the
+            // all-memory totals. With partial GPU offload most of
+            // `total_bytes` lives in CPU RAM; counting it against the VRAM
+            // budget spuriously evicts (28.4G counted vs 14.2G resident).
+            // Empty rows on a resident server fall back to the file size,
+            // same as `ps`. The RAM pool keeps the all-memory accounting
+            // (onnx `weights_bytes` is RAM-resident and carries no VRAM split).
+            let resident: u64 = match pool {
+                MemoryPool::Vram => rows
+                    .iter()
+                    .map(|r| r.model_bytes)
+                    .max()
+                    .unwrap_or_else(|| {
+                        if w.is_loaded() {
+                            w.weights_bytes()
+                        } else {
+                            0
+                        }
+                    }),
+                MemoryPool::Ram => {
+                    if w.is_loaded() {
+                        w.weights_bytes()
+                    } else {
+                        0
+                    }
+                }
+            };
             used = used.saturating_add(resident);
             let mut unpinned_vram: u64 = 0;
             let mut unpinned_min_last_used: i64 = i64::MAX;
             let mut unpinned: Vec<&LlmResidencyRow> = Vec::new();
             for row in &rows {
-                used = used.saturating_add(row.total_bytes);
+                match pool {
+                    MemoryPool::Vram => used = used.saturating_add(row.vram_bytes),
+                    MemoryPool::Ram => used = used.saturating_add(row.total_bytes),
+                }
                 if row.pinned {
                     continue;
                 }

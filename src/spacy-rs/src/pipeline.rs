@@ -383,7 +383,7 @@ impl_component!(FrameStage);
 
 /// Stage 4 — resolve each token's lemma hash into an [`InterlinguaId`] and
 /// stamp per-token confidence (ROADMAP §11.2). **PURE and read-only** over
-/// the [`ConceptStore`](crate::concept_store::ConceptStore) (C2): all
+/// the [`ConceptStore`](fluent_concept::ConceptStore) (C2): all
 /// registration happens at boot; corrections happen in the review worker. The
 /// only shared-state writes are the `TokenRecord` fields this stage owns.
 /// Depends on `"annotated_doc"`, provides `"interlingua_resolved"`.
@@ -541,6 +541,19 @@ impl StagePipeline {
         sentencizer: Sentencizer,
         resolver: Option<Arc<InterlinguaResolver>>,
     ) -> Result<Self, PipelineError> {
+        Self::new_with_resolver_and_plausibility(validator, sentencizer, resolver, None)
+    }
+
+    /// The stage graph with the knowledge-half plausibility fetch injected
+    /// from the knowledge owner (M5 — same pattern as the router injecting
+    /// `LlmFetch`, not constructed in-crate). `None` keeps the default-off
+    /// shell: `yago_resolve` provides its asset but stamps `None`.
+    pub fn new_with_resolver_and_plausibility(
+        validator: AnnotationValidator,
+        sentencizer: Sentencizer,
+        resolver: Option<Arc<InterlinguaResolver>>,
+        plausibility: Option<crate::triple::PlausibilityFetch>,
+    ) -> Result<Self, PipelineError> {
         let mut graph = DependencyGraph::new();
         let annotate = ArcIntern::from("annotate");
         let validate = ArcIntern::from("validate");
@@ -564,14 +577,25 @@ impl StagePipeline {
             (attach, Arc::new(AttachStage) as Arc<dyn Component>),
         ]);
         if let Some(resolver) = resolver {
-            // YagoResolveStage: attach → yago_resolve → frame → resolve (Alt C)
+            // YagoResolveStage: attach → yago_resolve → frame → resolve (Alt C).
+            // M5: the shell is constructed in-crate but the knowledge-half
+            // scoring arrives via the injected `plausibility` fetch — the
+            // owner adapts its kernel at the wiring site.
             let yago = ArcIntern::from("yago_resolve");
             graph
                 .register(&yago, &*YAGO_RESOLVE_DEPS, &*YAGO_RESOLVE_PROVIDES)
                 .map_err(|e| PipelineError::StageGraph(e.to_string()))?;
+            let yago_stage = match plausibility {
+                Some(fetch) => crate::yago_resolve::YagoResolveStage::with_fetch(
+                    Arc::clone(resolver.concepts()),
+                    false,
+                    fetch,
+                ),
+                None => crate::yago_resolve::YagoResolveStage::new(Arc::clone(resolver.concepts())),
+            };
             stages.insert(
                 yago,
-                Arc::new(crate::yago_resolve::YagoResolveStage::new(Arc::clone(resolver.concepts()))) as Arc<dyn Component>,
+                Arc::new(yago_stage) as Arc<dyn Component>,
             );
             let frame = ArcIntern::from("frame");
             // Frame now depends on yago_resolved, not directly on annotated_doc
@@ -1448,13 +1472,16 @@ pub struct RefineSeams {
     pub llm_focused: Option<LlmRefineFetchSync>,
     /// Span-scoped encoder residual (M2.3) — opt-in only.
     pub encoder_residual: Option<EncoderResidualFetch>,
-    /// Span-level detail cache (M6.1) — content-addressed `Vec<Correction>`
-    /// keyed by `span_key(doc, focus)`. Shared across async workers and sync
-    /// calls (read-through before the model, write-through after). `None` by
-    /// default (no caching). When present, a cache hit skips the model call
-    /// entirely and replays the cached corrections through the same
-    /// `adopt_corrections` gate.
-    pub span_cache: Option<std::sync::Arc<dyn crate::cache::SpanCache>>,
+    /// Span-level detail cache (M6.1) — a dependency-free
+    /// [`SpanCacheSeam`](crate::cache::SpanCacheSeam) over content-addressed
+    /// `Vec<Correction>` keyed by `span_key(doc, focus)`. Shared across async
+    /// workers and sync calls (read-through before the model, write-through
+    /// after). `None` by default (no caching). When present, a cache hit
+    /// skips the model call entirely and replays the cached corrections
+    /// through the same `adopt_corrections` gate. The ledger adapts its
+    /// `Arc<dyn SpanCache>` into this seam at the wiring site (M2b), so the
+    /// ladder never names a router-owned type.
+    pub span_cache: Option<crate::cache::SpanCacheSeam>,
 }
 
 /// Amend `base` with review-shaped `corrections`, restricted to `focus`
@@ -1518,7 +1545,7 @@ fn adopt_corrections(
 pub struct LlmRefineRung {
     fetch: LlmRefineFetchSync,
     validator: Arc<AnnotationValidator>,
-    span_cache: Option<std::sync::Arc<dyn crate::cache::SpanCache>>,
+    span_cache: Option<crate::cache::SpanCacheSeam>,
 }
 
 impl LlmRefineRung {
@@ -1535,10 +1562,7 @@ impl LlmRefineRung {
     /// Attach a span cache (M6.1). When present the rung checks the cache
     /// before the model and write-throughs on a successful refine.
     #[must_use]
-    pub fn with_cache(
-        mut self,
-        cache: std::sync::Arc<dyn crate::cache::SpanCache>,
-    ) -> Self {
+    pub fn with_cache(mut self, cache: crate::cache::SpanCacheSeam) -> Self {
         self.span_cache = Some(cache);
         self
     }
@@ -1557,7 +1581,7 @@ impl AnnotationRefiner for LlmRefineRung {
     > {
         Box::pin(async move {
             Ok(refine_llm_scoped_with_cache(
-                doc, base, focus, &self.fetch, &self.validator, self.span_cache.as_deref(),
+                doc, base, focus, &self.fetch, &self.validator, self.span_cache.as_ref(),
             ))
         })
     }
@@ -1584,7 +1608,7 @@ fn refine_llm_scoped_with_cache(
     focus: &[usize],
     fetch: &LlmRefineFetchSync,
     validator: &AnnotationValidator,
-    span_cache: Option<&dyn crate::cache::SpanCache>,
+    span_cache: Option<&crate::cache::SpanCacheSeam>,
 ) -> Option<AnnotationResult> {
     if focus.is_empty() {
         return None; // nothing flagged — the base stands (Ok(None) keeps it)
@@ -1632,7 +1656,7 @@ fn refine_llm_scoped_with_cache(
 pub struct EncoderResidualRung {
     fetch: EncoderResidualFetch,
     validator: Arc<AnnotationValidator>,
-    span_cache: Option<std::sync::Arc<dyn crate::cache::SpanCache>>,
+    span_cache: Option<crate::cache::SpanCacheSeam>,
 }
 
 impl EncoderResidualRung {
@@ -1648,10 +1672,7 @@ impl EncoderResidualRung {
 
     /// Attach a span cache (M6.1).
     #[must_use]
-    pub fn with_cache(
-        mut self,
-        cache: std::sync::Arc<dyn crate::cache::SpanCache>,
-    ) -> Self {
+    pub fn with_cache(mut self, cache: crate::cache::SpanCacheSeam) -> Self {
         self.span_cache = Some(cache);
         self
     }
@@ -1886,7 +1907,7 @@ impl AnnotationRung for RuleRung {
 /// picks one ROOT — the last alphabetic non-stop token, else the first token
 /// of the sentence (the minimal star fallback for degenerate sentences) — and
 /// attaches every other token to it. POS comes from the lexeme flags
-/// (`PUNCT`/`NUM`/`PROPN`/`X`) unless a [`GenesisIndex`](crate::genesis::GenesisIndex)
+/// (`PUNCT`/`NUM`/`PROPN`/`X`) unless a [`GenesisIndex`](crate::lang::genesis::GenesisIndex)
 /// has promoted a correction for that orth (M6.2 rule genesis), lemma from the
 /// rule [`Lemmatizer`]. This is what the ladder runs when the LLM rung fails
 /// or is absent; every field it writes is the same shape the LLM writes, so
@@ -1894,7 +1915,7 @@ impl AnnotationRung for RuleRung {
 pub struct RuleAnnotator {
     sentencizer: Sentencizer,
     lemmatizer: Lemmatizer,
-    genesis: Option<std::sync::Arc<dyn crate::genesis::GenesisIndex>>,
+    genesis: Option<std::sync::Arc<dyn crate::lang::genesis::GenesisIndex>>,
 }
 
 impl std::fmt::Debug for RuleAnnotator {
@@ -1933,14 +1954,14 @@ impl RuleAnnotator {
     /// before the heuristic `pos_of` — a promoted correction becomes
     /// deterministic data.
     #[must_use]
-    pub fn with_genesis(mut self, genesis: std::sync::Arc<dyn crate::genesis::GenesisIndex>) -> Self {
+    pub fn with_genesis(mut self, genesis: std::sync::Arc<dyn crate::lang::genesis::GenesisIndex>) -> Self {
         self.genesis = Some(genesis);
         self
     }
 
     /// The attached genesis index, if any.
     #[must_use]
-    pub fn genesis(&self) -> Option<&std::sync::Arc<dyn crate::genesis::GenesisIndex>> {
+    pub fn genesis(&self) -> Option<&std::sync::Arc<dyn crate::lang::genesis::GenesisIndex>> {
         self.genesis.as_ref()
     }
 
@@ -2116,9 +2137,9 @@ pub struct NlpPipeline {
     resolver: Option<Arc<InterlinguaResolver>>,
     /// M6.1 span cache (shared across ladders, read-through view over the
     /// ledger sqlite when wired by the router; `None` by default).
-    span_cache: Option<std::sync::Arc<dyn crate::cache::SpanCache>>,
+    span_cache: Option<crate::cache::SpanCacheSeam>,
     /// M6.2 genesis index (POS/NER rule genesis; `None` by default).
-    genesis: Option<std::sync::Arc<dyn crate::genesis::GenesisIndex>>,
+    genesis: Option<std::sync::Arc<dyn crate::lang::genesis::GenesisIndex>>,
 }
 
 impl NlpPipeline {
@@ -2141,8 +2162,25 @@ impl NlpPipeline {
         validator: AnnotationValidator,
         resolver: Option<Arc<InterlinguaResolver>>,
     ) -> Result<Self, PipelineError> {
-        let stages =
-            StagePipeline::new_with_resolver(validator.clone(), Sentencizer::new(), resolver.clone())?;
+        Self::new_with_resolver_and_plausibility(vocab, tokenizer, validator, resolver, None)
+    }
+
+    /// Build a pipeline with the knowledge-half plausibility fetch injected
+    /// from the knowledge owner (M5). Threaded into the stage DAG's
+    /// `yago_resolve` shell; `None` keeps the default-off behavior.
+    pub fn new_with_resolver_and_plausibility(
+        vocab: Arc<Vocab>,
+        tokenizer: Tokenizer,
+        validator: AnnotationValidator,
+        resolver: Option<Arc<InterlinguaResolver>>,
+        plausibility: Option<crate::triple::PlausibilityFetch>,
+    ) -> Result<Self, PipelineError> {
+        let stages = StagePipeline::new_with_resolver_and_plausibility(
+            validator.clone(),
+            Sentencizer::new(),
+            resolver.clone(),
+            plausibility,
+        )?;
         Ok(Self {
             vocab,
             tokenizer,
@@ -2156,11 +2194,12 @@ impl NlpPipeline {
     }
 
     /// Attach a span cache (M6.1). The cache is shared across the sync/async
-    /// ladders; the router wires it as a read-through view over the ledger
-    /// sqlite. `SpanCache::invalidate` is called when a `CorrectionIndex`
-    /// write for the same span lands.
+    /// ladders; the router wires its ledger view by adapting its
+    /// `Arc<dyn SpanCache>` into a [`SpanCacheSeam`](crate::cache::SpanCacheSeam).
+    /// Invalidation runs through the seam's `invalidate` when a
+    /// `CorrectionIndex` write for the same span lands.
     #[must_use]
-    pub fn with_span_cache(mut self, cache: std::sync::Arc<dyn crate::cache::SpanCache>) -> Self {
+    pub fn with_span_cache(mut self, cache: crate::cache::SpanCacheSeam) -> Self {
         self.span_cache = Some(cache);
         self
     }
@@ -2168,7 +2207,7 @@ impl NlpPipeline {
     /// Attach a genesis index (M6.2). A promoted POS/NER correction becomes
     /// deterministic data consulted by the rule annotator on the next run.
     #[must_use]
-    pub fn with_genesis(mut self, genesis: std::sync::Arc<dyn crate::genesis::GenesisIndex>) -> Self {
+    pub fn with_genesis(mut self, genesis: std::sync::Arc<dyn crate::lang::genesis::GenesisIndex>) -> Self {
         // Rebuild the rule annotator with the new genesis handle (first-wins).
         self.rule = std::sync::Arc::new(
             RuleAnnotator::en_default().with_genesis(std::sync::Arc::clone(&genesis)),
@@ -2179,13 +2218,13 @@ impl NlpPipeline {
 
     /// The span cache, if wired.
     #[must_use]
-    pub fn span_cache(&self) -> Option<&std::sync::Arc<dyn crate::cache::SpanCache>> {
+    pub fn span_cache(&self) -> Option<&crate::cache::SpanCacheSeam> {
         self.span_cache.as_ref()
     }
 
     /// The genesis index, if wired.
     #[must_use]
-    pub fn genesis(&self) -> Option<&std::sync::Arc<dyn crate::genesis::GenesisIndex>> {
+    pub fn genesis(&self) -> Option<&std::sync::Arc<dyn crate::lang::genesis::GenesisIndex>> {
         self.genesis.as_ref()
     }
 
@@ -2664,7 +2703,7 @@ fn refiner_order(
                 Arc::clone(validator),
             );
             if let Some(cache) = &seams.span_cache {
-                rung = rung.with_cache(std::sync::Arc::clone(cache));
+                rung = rung.with_cache(cache.clone());
             }
             refiners.push(Box::new(rung));
         }
@@ -2683,7 +2722,7 @@ fn refiner_order(
                 Arc::clone(validator),
             );
             if let Some(cache) = &seams.span_cache {
-                rung = rung.with_cache(std::sync::Arc::clone(cache));
+                rung = rung.with_cache(cache.clone());
             }
             refiners.push(Box::new(rung));
         }
@@ -2936,7 +2975,7 @@ fn run_ladder_sync(
                 &focus,
                 &fetch,
                 validator,
-                span_cache.as_deref(),
+                span_cache.as_ref(),
             ),
             SyncRung::Encoder(encoder) => {
                 let accepted = encoder(doc)
@@ -3012,24 +3051,6 @@ fn pool_error(e: fluent_concurrency::pool::ResultPoolError<PipelineError>) -> St
         fluent_concurrency::pool::ResultPoolError::Canceled => "worker cancelled".into(),
         fluent_concurrency::pool::ResultPoolError::Pool(p) => p.to_string(),
     }
-}
-
-/// Materialize the immutable, shareable [`crate::ArcReadyAnnotation`] from a
-/// successful ladder run (OVERLAYS §4.1, M3): an already-attached,
-/// sentencized, and — when a resolver is wired — resolved `doc` plus its
-/// ladder [`AnnotationResult`] handoff. This is the pipeline hook: it composes
-/// [`crate::routing::extract_routing_signals`] over the run's doc and hands
-/// the validated output to [`crate::ArcReadyAnnotation::from_doc`].
-///
-/// Pure and additive: it changes no ladder control flow (`run_ladder_for` /
-/// `run_ladder_sync`) and no existing caller's return value, and it is inert
-/// for any caller that does not ask for it. The annotation is the validated
-/// output — the wire records + signals + token baseline — not the working
-/// [`Doc`], so consumers share it behind an `Arc` with no locks at read time.
-#[must_use]
-pub fn arc_ready(doc: &Doc, result: &AnnotationResult) -> crate::ArcReadyAnnotation {
-    let signals = crate::routing::extract_routing_signals(doc);
-    crate::ArcReadyAnnotation::from_doc(doc, result, signals)
 }
 
 // ─────────────────────────────────────────────────────────────────────────

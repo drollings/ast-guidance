@@ -1,4 +1,5 @@
-//! ROADMAP M11.8 — the YaGO taxonomy through spacy-rs' ConceptStore + resolver.
+//! ROADMAP M11.8 — the YaGO taxonomy through fluent-concept's ConceptStore +
+//! the spacy-rs resolver.
 //!
 //! Verifies the interlingua bridge end to end: `YaGoLoader` produces
 //! `ConceptMetadata` with deterministic ids, registration through
@@ -8,10 +9,9 @@
 
 use std::sync::Arc;
 
+use fluent_concept::{ConceptStore, InMemoryConceptStore, TaxonomyHierarchy};
 use fluent_types::{property_id_for_iri, yago_class_id_for_iri, InterlinguaNamespace};
 use guidance_ontology::yago_loader::YaGoLoader;
-use spacy_rs::concept_store::ConceptStore;
-use spacy_rs::concept_store_mem::InMemoryConceptStore;
 use spacy_rs::interlingua::InterlinguaResolver;
 
 #[test]
@@ -27,8 +27,7 @@ fn schema_person_resolves_through_the_store_and_resolver() {
         store.insert(meta.clone()).expect("insert");
     }
     // The subclass hierarchy mirrors the loader edges (C5).
-    let hierarchy =
-        spacy_rs::TaxonomyHierarchy::from_edges(&edges).expect("hierarchy");
+    let hierarchy = TaxonomyHierarchy::from_edges(&edges).expect("hierarchy");
     store.set_hierarchy(hierarchy);
 
     // The resolver (pure, no state) sits over the same store.

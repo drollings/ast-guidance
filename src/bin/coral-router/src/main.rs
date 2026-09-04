@@ -43,7 +43,7 @@ use fluent_router::server::entity_link::{EntityLinkWorker, EntityLinkScorer};
 use fluent_router::testing::{
     load_transcript_file, transcript_provider_from_entries, MockDispatchContext,
 };
-use spacy_rs::concept_store::ConceptStore;
+use fluent_concept::ConceptStore;
 
 #[derive(Parser)]
 #[command(

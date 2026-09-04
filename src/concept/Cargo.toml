@@ -1,0 +1,15 @@
+[package]
+name = "fluent-concept"
+version.workspace = true
+edition.workspace = true
+description = "Neutral shared home for the ConceptStore trait, TaxonomyHierarchy, and the hermetic InMemoryConceptStore test double (ROADMAP_20260903_SPACY_RS_SPLIT M3)."
+autotests = false
+autobenches = false
+
+[dependencies]
+fluent-types = { path = "../types" }
+fluent-dag = { path = "../dag" }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,7 +1,10 @@
 //! The single source of truth for concept lookup (ROADMAP §6 — pulled forward
-//! by F9). [`InterlinguaResolver`](crate::interlingua::InterlinguaResolver)
-//! consumes it; `YaGoLoader` feeds it; the router implements the SQLite
-//! backend; [`InMemoryConceptStore`](crate::concept_store_mem::InMemoryConceptStore)
+//! by F9; neutral home `fluent-concept` per ROADMAP_20260903_SPACY_RS_SPLIT
+//! M3 — moved here from `spacy-rs`).
+//!
+//! [`InterlinguaResolver`](https://docs.rs/spacy-rs) (in `spacy-rs`) consumes
+//! it; `YaGoLoader` (in `guidance-ontology`) feeds it; the router implements
+//! the SQLite backend; [`InMemoryConceptStore`](crate::concept_store_mem::InMemoryConceptStore)
 //! is the hermetic test double. **No second registry anywhere.**
 //!
 //! All IDs are content-addressed (`trunc48(hash(content))`); a store only
@@ -32,7 +35,7 @@ pub enum ConceptStoreError {
 
 /// A registry of concepts keyed by content-addressed [`InterlinguaId`]s. The
 /// trait is the seam between the pure resolver and whatever backend serves it
-/// (in-memory test double today; SQLite in the router; CozoDB deferred).
+/// (in-memory test double here; SQLite in the router; coral's durable graph).
 pub trait ConceptStore: Send + Sync {
     /// The metadata for `id`, or `NotFound`.
     fn get(&self, id: InterlinguaId) -> Result<ConceptMetadata, ConceptStoreError>;

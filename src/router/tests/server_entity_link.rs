@@ -4,7 +4,7 @@ use std::time::Duration;
 use crate::ledger::ContentNodeLedger;
 use crate::ledger::overlay::CandidateStatus;
 use fluent_concurrency::tokio_runtime;
-use spacy_rs::concept_store_mem::InMemoryConceptStore;
+use fluent_concept::InMemoryConceptStore;
 use fluent_types::{InterlinguaId, InterlinguaNamespace};
 
 fn entity_root() -> InterlinguaId {

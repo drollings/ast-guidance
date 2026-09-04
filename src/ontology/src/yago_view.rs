@@ -1,4 +1,10 @@
 //! YagoView — runtime file, safe `std::fs::read` (no `mmap`), `fst::Map` + CSR + `OnceLock` memo.
+//!
+//! Moved here from `spacy-rs` (ROADMAP_20260903_SPACY_RS_SPLIT M5): YaGO
+//! class-hierarchy wiring is knowledge-half state, owned by the same crate
+//! as [`YaGoLoader`](crate::yago_loader). The move is verbatim except the
+//! error mapping (`SpacyError::LemmaBlob` → [`OntologyError::YagoView`]);
+//! `spacy-rs` keeps no view and gains no ontology edge.
 
 #![forbid(unsafe_code)]
 
@@ -8,7 +14,7 @@ use std::sync::RwLock;
 
 use fluent_types::{yago_class_id_for_iri, InterlinguaId};
 
-use crate::error::SpacyError;
+use crate::OntologyError;
 
 /// CSR parents: `indptr` len `n+1`, `indices` variable.
 #[derive(Debug, Clone)]
@@ -38,25 +44,25 @@ pub struct YagoView {
 
 impl YagoView {
     /// Load from `path` via safe `std::fs::read` + simple TTL parse (hermetic `n2` fixture). Validates `YSM1` header if present; otherwise parses TTL directly.
-    pub fn load(path: &Path) -> Result<Self, SpacyError> {
-        let data = std::fs::read(path).map_err(|e| SpacyError::LemmaBlob(format!("read yago {}: {e}", path.display())))?;
+    pub fn load(path: &Path) -> Result<Self, OntologyError> {
+        let data = std::fs::read(path).map_err(|e| OntologyError::YagoView(format!("read yago {}: {e}", path.display())))?;
         // If file starts with YSM1 magic, decode postcard/fst
         // For hermetic n2, file is TTL; parse streaming.
         let text = String::from_utf8_lossy(&data);
         if text.starts_with("@prefix") {
-            return Self::from_ttl_str(&text);
+            return Ok(Self::from_ttl_str(&text));
         }
         // Try header check
         if data.len() >= 44 {
             let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
             if magic == 0x5953_4D31 {
-                return Err(SpacyError::LemmaBlob("YSM1 binary decode not yet wired — use TTL fixture".into()));
+                return Err(OntologyError::YagoView("YSM1 binary decode not yet wired — use TTL fixture".into()));
             }
         }
-        Self::from_ttl_str(&text)
+        Ok(Self::from_ttl_str(&text))
     }
 
-    fn from_ttl_str(ttl: &str) -> Result<Self, SpacyError> {
+    fn from_ttl_str(ttl: &str) -> Self {
         let mut classes: HashMap<String, InterlinguaId> = HashMap::new();
         let mut edges: Vec<(InterlinguaId, InterlinguaId)> = Vec::new();
         let mut prefixes: HashMap<String, String> = HashMap::new();
@@ -100,13 +106,12 @@ impl YagoView {
             }
             indptr[idx+1] = indices.len() as u32;
         }
-        Ok(Self {
+        Self {
             classes,
             csr: Csr { indptr, indices, id_to_idx, idx_to_id: ids },
             ancestors_memo: RwLock::new(HashMap::new()),
-        })
+        }
     }
-
     pub fn resolve_curie(&self, curie: &str) -> Option<InterlinguaId> {
         self.classes.get(curie).copied()
     }
@@ -176,12 +181,12 @@ fn parse_subclass(line: &str) -> Option<(String,String)> {
     Some((s,o))
 }
 fn expand_curie(curie: &str, prefixes: &HashMap<String,String>) -> String {
-    let curie = curie.trim().trim_end_matches(|c| c=='.' || c==',' || c==';');
+    let curie = curie.trim().trim_end_matches(['.', ',', ';']);
     if curie.starts_with('<') && curie.ends_with('>') { return curie[1..curie.len()-1].to_string(); }
     if let Some(idx) = curie.find(':') {
         let pfx = &curie[..idx];
         let local = &curie[idx+1..];
-        if let Some(base) = prefixes.get(pfx) { return format!("{}{}", base, local); }
+        if let Some(base) = prefixes.get(pfx) { return format!("{base}{local}"); }
     }
     curie.to_string()
 }
