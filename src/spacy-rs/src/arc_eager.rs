@@ -78,6 +78,7 @@ fn closed_funcword_pos(text: &str) -> Option<Upos> {
     let pron = [
         "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "them", "us", "my",
         "mine", "your", "yours", "his", "hers", "ours", "theirs", "who", "whom", "what", "which",
+        "everybody",
     ];
     if det.contains(&w.as_str()) {
         Some(Upos::Det)
@@ -226,6 +227,22 @@ fn refine_pos_pronoun_subject_verb(texts: &[String], pos: &mut [Upos]) {
     }
 }
 
+/// Sentence-initial comment `As` (`As you know, …`, `As everybody knows,
+/// …`). The closed map lexes every `as` as ADP, so comment clauses read as
+/// prepositional phrases: the Sconj-keyed mark arm never fires and the
+/// subject misattaches as `pobj`. Upgrades a sentence-initial `as` to
+/// SCONJ only with a nominal next (the comment subject). Guards: medial
+/// `as` (`Paris, as always, …`) never matches — comment position is
+/// initial by construction. Same O(n) frame-scan shape.
+fn refine_pos_comment_as(texts: &[String], pos: &mut [Upos]) {
+    if texts.len() < 2 || pos[0] != Upos::Adp || !texts[0].eq_ignore_ascii_case("as") {
+        return;
+    }
+    if matches!(pos[1], Upos::Noun | Upos::Propn | Upos::Pron) {
+        pos[0] = Upos::Sconj;
+    }
+}
+
 /// Whether `text` is a nominal relativizer with corpus evidence (`who`,
 /// `that`, `where`). Only forms attested in the bench; `which`/`whom` have
 /// no instance and stay out until one appears.
@@ -233,6 +250,39 @@ fn is_relative_marker(text: &str) -> bool {
     text.eq_ignore_ascii_case("who")
         || text.eq_ignore_ascii_case("that")
         || text.eq_ignore_ascii_case("where")
+}
+
+/// Shifted DET+NOUN predicate after a clause boundary (`Truthfully, the
+/// plan failed`, `Sadly, the trip ended early`). The initial-noun frame
+/// only sees positions 0-2, shielded here by leading adverbial material —
+/// but the same DET+NOUN+predicate shape recurs past the boundary comma.
+/// Upgrades the third NOUN to VERB only for a clause-final predicate
+/// (only ADV/PUNCT may follow: `failed.` / `ended early.`), which excludes
+/// appositive nominals with more clause to come (`an old brick, still…`).
+/// Guards (mirroring the initial-noun rule): lowercase target, and the
+/// comma must sit directly before the determiner (comma-free triples like
+/// `the sales report` never match). Same O(n) frame-scan shape.
+fn refine_pos_shifted_det_noun_verb(texts: &[String], pos: &mut [Upos]) {
+    for i in 3..texts.len() {
+        if pos[i] != Upos::Noun {
+            continue;
+        }
+        if texts[i - 3] != "," || pos[i - 2] != Upos::Det {
+            continue;
+        }
+        if !matches!(pos[i - 1], Upos::Noun | Upos::Propn) {
+            continue;
+        }
+        if !texts[i].chars().next().is_some_and(|c| c.is_lowercase()) {
+            continue;
+        }
+        if pos[i + 1..]
+            .iter()
+            .all(|p| matches!(p, Upos::Punct | Upos::Adv))
+        {
+            pos[i] = Upos::Verb;
+        }
+    }
 }
 
 /// Matrix finite verb after a relative clause (`The man who called left`,
@@ -468,7 +518,54 @@ fn refine_pos_linking_predicate(texts: &[String], pos: &mut [Upos]) {
     }
 }
 
-/// Whether `text` is a WH-relativizer that can never host a matrix verb in
+/// Clause-initial verb after a comma boundary (`The test, honestly,
+/// scared us`, `Her car, red and fast, won`). Matrix verbs opening after a
+/// parenthetical-closing comma fall through to NOUN — no subject rule sees
+/// a comma-adjacent predicate — and strand their objects into repair-dep.
+/// Upgrades a NOUN directly after a comma to VERB only when an earlier
+/// comma directly follows a nominal (the parenthetical opener) — i.e. the
+/// target opens a new clause after parenthetical material, not a
+/// subordinate clause after its predicate (`If it snows, schools…`, whose
+/// comma follows a verb) and not an imperative conjunct (`Study hard,
+/// rest…`, no nominal opener). Guards: `-ing` participles (their own
+/// clause-role gap — upgrading one would crown it root), CCONJ-next
+/// (coordinated predicate adjectives: `red and fast`), and VERB-next
+/// (infinitival/complement adjacency: `still works`). Same O(n)
+/// frame-scan shape as the other refines.
+fn refine_pos_post_comma_verb(texts: &[String], pos: &mut [Upos]) {
+    for i in 1..texts.len() {
+        if pos[i] != Upos::Noun || texts[i - 1] != "," {
+            continue;
+        }
+        let word = texts[i].as_str();
+        if word.len() > 4
+            && word
+                .get(word.len() - 3..)
+                .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ing"))
+        {
+            continue;
+        }
+        // Coordinated predicate adjectives (`red and fast`) and
+        // infinitival/complement adjacency (`still works`) are not clause
+        // openings.
+        if let Some(next_pos) = pos.get(i + 1) {
+            if matches!(next_pos, Upos::Cconj | Upos::Verb) {
+                continue;
+            }
+        }
+        // The comma must close parenthetical material opened right after a
+        // nominal — otherwise the target is a subordinate subject
+        // (`schools`, `lunch`), an imperative conjunct (`rest`), or a
+        // complement (`stay`).
+        let opened = (1..i - 1).any(|k| {
+            texts[k] == "," && matches!(pos[k - 1], Upos::Noun | Upos::Propn | Upos::Pron)
+        });
+        if !opened {
+            continue;
+        }
+        pos[i] = Upos::Verb;
+    }
+}
 /// subject position (`The store where …`). Only forms with corpus evidence;
 /// `when`/`that`/`who` lex out of NOUN already and need no guard.
 fn is_noun_subject_verb_blocker(text: &str) -> bool {
@@ -531,6 +628,44 @@ fn is_be_form(text: &str) -> bool {
         "is", "are", "was", "were", "be", "been", "being", "am", "'s", "'re", "'m",
     ];
     BE.iter().any(|h| text.eq_ignore_ascii_case(h))
+}
+
+/// Inverted copular predicate (`Is lunch ready?`, `is the sky blue`). The
+/// be-predicate rule only sees AUX-adjacent complements, and its guard
+/// rightly protects a directly-following nominal subject (`Is lunch…`
+/// keeps `lunch`) — but when an overt subject stands between be and the
+/// complement, the predicate strands as a nominal object. Upgrades an
+/// alpha-fallback NOUN to ADJ only after the nearest preceding AUX-tagged
+/// be-form with ≥1 nominal strictly between (the overt subject). Guards
+/// (mirroring be-predicate/initial-noun): `-ing` participles, capitalized
+/// targets, and subject-less complements (`is a doctor`, `is the station`
+/// — bare determiners never match). Sequenced just before be-predicate;
+/// disjoint from it by construction (its direct/bridged shapes have no
+/// nominal between be and target).
+fn refine_pos_inverted_copular(texts: &[String], pos: &mut [Upos]) {
+    for i in 1..texts.len() {
+        if pos[i] != Upos::Noun {
+            continue;
+        }
+        let word = texts[i].as_str();
+        if word.len() > 4
+            && word
+                .get(word.len() - 3..)
+                .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ing"))
+        {
+            continue;
+        }
+        if !word.chars().next().is_some_and(|c| c.is_lowercase()) {
+            continue;
+        }
+        let Some(j) = (0..i).rfind(|&j| pos[j] == Upos::Aux && is_be_form(texts[j].as_str()))
+        else {
+            continue;
+        };
+        if ((j + 1)..i).any(|k| matches!(pos[k], Upos::Noun | Upos::Propn | Upos::Pron)) {
+            pos[i] = Upos::Adj;
+        }
+    }
 }
 
 /// Copular predicate adjective (`fee is low`, `isn't ready`). There is no
@@ -807,6 +942,16 @@ impl ArcEagerState {
             match (ps, pb) {
                 (Upos::Noun | Upos::Propn | Upos::Pron, Upos::Verb) => {
                     out.push(Self::act(ArcEagerMove::Left, labels.nsubj));
+                    // An object relativizer with an overt subject (the book
+                    // that I bought): a nominative pronoun visibly between
+                    // marker and verb proves s is the object, not the
+                    // subject. Subject frames (no intervening pronoun) never
+                    // offer it, so true subjects never compete.
+                    if ps == Upos::Pron
+                        && ((s + 1)..b).any(|m| is_nominative_subject(texts[m].as_str()))
+                    {
+                        out.push(Self::act(ArcEagerMove::Left, labels.obj));
+                    }
                 }
                 // The subject of a predicate adjective (fee is low: fee →
                 // nsubj → low). The only ADJ the tagger emits are be-rule
@@ -976,6 +1121,11 @@ impl ArcEagerState {
         // would have attached it had the pair met. Scoped to nominal-ish
         // buffers (subject/determiner arriving); verbs, adjectives, and
         // auxiliaries keep the old dynamics (cop/neg/progressive paths).
+        // And an object relativizer waits for the embedded subject (that
+        // [I]): popping on the subject strands the marker before the clause
+        // verb arrives, and the obj arm above never meets its pair. Scoped
+        // to pronouns directly after a nominal-headed marker — subject
+        // markers attach immediately, complement frames never match.
         if self.right_children[s].is_empty()
             && ps != Upos::Adp
             && !matches!(pb, Upos::Aux | Upos::Part)
@@ -996,6 +1146,11 @@ impl ArcEagerState {
                 && matches!(pos[b - 2], Upos::Noun | Upos::Propn))
             && !(ps == Upos::Aux
                 && matches!(pb, Upos::Pron | Upos::Noun | Upos::Propn | Upos::Det))
+            && !(ps == Upos::Pron
+                && pb == Upos::Pron
+                && b >= 2
+                && is_relative_marker(texts[b - 1].as_str())
+                && matches!(pos[b - 2], Upos::Noun | Upos::Propn))
         {
             out.push(ArcEagerAction {
                 move_type: ArcEagerMove::Reduce,
@@ -1108,6 +1263,20 @@ impl DeterministicOracle {
                     l if l == labels.nsubj && pos[b] == Upos::Adj => {
                         if matches!(pos[s], Upos::Noun | Upos::Propn | Upos::Pron) {
                             100.0
+                        } else {
+                            10.0
+                        }
+                    }
+                    // The object relativizer outbids the subject-Left (100):
+                    // inside a gated frame the overt subject between marker
+                    // and verb proves s is the object, and attaching s as
+                    // subject would both mishead it and pop it before the
+                    // anchor meets the verb. Ungated here by design — the
+                    // candidate arm above is the gate, so this weight only
+                    // ever ranks intervening-subject pairs.
+                    l if l == labels.obj && pos[b] == Upos::Verb => {
+                        if pos[s] == Upos::Pron {
+                            105.0
                         } else {
                             10.0
                         }
@@ -1334,6 +1503,7 @@ pub struct DepLabels {
     pub acomp: u64,
     pub xcomp: u64,
     pub relcl: u64,
+    pub obj: u64,
 }
 
 impl DepLabels {
@@ -1364,6 +1534,7 @@ impl DepLabels {
             acomp: intern("acomp"),
             xcomp: intern("xcomp"),
             relcl: intern("relcl"),
+            obj: intern("obj"),
         }
     }
 
@@ -1558,6 +1729,23 @@ impl ArcEagerAnnotator {
         // from every relativizer/adverbial trigger, and ADJ outputs feed
         // nothing upstream of the be-predicate pass.
         refine_pos_linking_predicate(&texts, &mut pos);
+        // Post-comma pass: clause-initial NOUN after a parenthetical
+        // boundary → VERB. Sequenced after the linking pass (sensory verbs
+        // read first where both could apply — disjoint in practice: no
+        // bench sensory verb sits post-comma) and before the
+        // relative-matrix pass (disjoint: matrix needs a marker frame).
+        refine_pos_post_comma_verb(&texts, &mut pos);
+        // Shifted-initial pass: comma + DET + NOUN + clause-final NOUN →
+        // VERB. Sequenced after the post-comma pass (disjoint: that pass
+        // needs comma-adjacent targets, this one comma-distant) and before
+        // the relative-matrix pass (disjoint: matrix needs a marker
+        // frame). The ADV trailer reads final-adverbial outputs.
+        refine_pos_shifted_det_noun_verb(&texts, &mut pos);
+        // Comment-As pass: sentence-initial as + nominal → SCONJ so the
+        // existing mark arm fires. First-token only, disjoint from every
+        // medial frame; SCONJ outputs feed no refine (waits and arms read
+        // them at transition time).
+        refine_pos_comment_as(&texts, &mut pos);
         // Relative-matrix pass: sentence-final NOUN after a relcl VERB with
         // a nominal-headed who/that/where earlier. Sequenced after the
         // pronoun pass so relcl verbs upgraded there (wait, study, sang)
@@ -1575,6 +1763,11 @@ impl ArcEagerAnnotator {
         // Conjoined-clause pass: CC + NOUN + NOUN → VERB. Disjoint (CC prev
         // matches none of the above triggers).
         refine_pos_conjoined_clause_verb(&texts, &mut pos);
+        // Inverted-copular pass: be-AUX + subject + predicate-NOUN → ADJ.
+        // Sequenced just before be-predicate; disjoint from it (its
+        // direct/bridged shapes have no nominal between be and target) and
+        // from every verb trigger above (ADJ targets).
+        refine_pos_inverted_copular(&texts, &mut pos);
         // Copular-predicate pass: be + NOUN → ADJ. Disjoint (AUX prev with
         // NOUN target matches none of the verb triggers above).
         refine_pos_be_predicate(&texts, &mut pos);

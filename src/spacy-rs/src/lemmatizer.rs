@@ -154,7 +154,15 @@ impl Lemmatizer {
                 vec![orth.to_lowercase()]
             }
         } else {
-            self.apply_rules(orth, &univ_pos)
+            // No rule fired: fall back to the surface — lowercased for
+            // verbs (never proper nouns: sentence case on a verb is
+            // orthographic, never lexical) and for all-caps tokens
+            // (acronyms, never title-case names). Title-case nominals keep
+            // surface per the proper-noun convention (`French`, `John`;
+            // unit-pinned alongside `proper_nouns_keep_case`).
+            let shouty = orth.chars().any(|c| c.is_alphabetic())
+                && orth.chars().all(|c| !c.is_lowercase());
+            self.apply_rules(orth, &univ_pos, pos == Upos::Verb || shouty)
         };
 
         self.cache
@@ -173,7 +181,10 @@ impl Lemmatizer {
 
     /// The core rule application (`lemmatizer.py:207-240`): endswith rules,
     /// index-validated forms first, oov forms on fallback, exceptions up front.
-    fn apply_rules(&self, orth: &str, univ_pos: &str) -> Vec<String> {
+    /// `lowercase_fallback` selects the lowercased surface when no rule
+    /// fires (verbs / acronyms); otherwise the surface is kept for
+    /// title-case nominals (proper-noun convention).
+    fn apply_rules(&self, orth: &str, univ_pos: &str, lowercase_fallback: bool) -> Vec<String> {
         let orig = orth.to_string();
         let string = orth.to_lowercase();
 
@@ -222,7 +233,11 @@ impl Lemmatizer {
             forms.extend(oov_forms);
         }
         if forms.is_empty() {
-            forms.push(orig);
+            if lowercase_fallback {
+                forms.push(string.clone());
+            } else {
+                forms.push(orig);
+            }
         }
         forms
     }
@@ -271,8 +286,11 @@ impl Lemmatizer {
 /// Closed contraction-splinter lemma map (UD + spaCy lookup parity).
 /// `ca` is the bound allomorph of `can`, `wo` of `will` (both occur only
 /// pre-`n't`); `n't` is the negator `not`; clitic `be`/`have`/`will` forms
-/// resolve to their host. Gated on the parser's POS so possessive `'s`
-/// (PART/case, `Bell's theorem`) and nominal uses keep surface lemmas.
+/// resolve to their host. Full auxiliary `be`-forms resolve to `be` — the
+/// blob carries no `aux` tables, so without this map they fall through to
+/// lowercased surface (`is` ≠ `be`). Gated on the parser's POS so
+/// possessive `'s` (PART/case, `Bell's theorem`) and nominal uses keep
+/// surface lemmas.
 /// Returns the canonical lemma, or `None` when the tables should decide.
 fn contraction_lemma(orth: &str, pos: Upos) -> Option<&'static str> {
     if matches!(pos, Upos::Part) && orth.eq_ignore_ascii_case("n't") {
@@ -284,6 +302,17 @@ fn contraction_lemma(orth: &str, pos: Upos) -> Option<&'static str> {
         }
         if orth.eq_ignore_ascii_case("wo") {
             return Some("will");
+        }
+        if orth.eq_ignore_ascii_case("is")
+            || orth.eq_ignore_ascii_case("are")
+            || orth.eq_ignore_ascii_case("was")
+            || orth.eq_ignore_ascii_case("were")
+            || orth.eq_ignore_ascii_case("am")
+            || orth.eq_ignore_ascii_case("be")
+            || orth.eq_ignore_ascii_case("been")
+            || orth.eq_ignore_ascii_case("being")
+        {
+            return Some("be");
         }
         if orth.eq_ignore_ascii_case("'s")
             || orth.eq_ignore_ascii_case("'re")

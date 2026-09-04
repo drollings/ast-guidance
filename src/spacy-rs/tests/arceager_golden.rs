@@ -1044,6 +1044,179 @@ fn transitive_sensory_object_stays_noun() {
 }
 
 #[test]
+fn clause_initial_verb_after_comma_is_verbal() {
+    // Refs (UD parenthetical-08): scared → verb/root, us → dobj → scared.
+    // Matrix verbs opening after a parenthetical-closing comma fall through
+    // to NOUN (no subject rule sees them) and strand their objects.
+    let (_doc, set) = parse("The test, honestly, scared us.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (scared, us) = (at("scared"), at("us"));
+    assert_eq!(pos[scared], "verb", "pos: {pos:?}");
+    assert_eq!(deps[scared], "root", "deps: {deps:?}");
+    assert_eq!(deps[us], "dobj", "deps: {deps:?}");
+    assert_eq!(us as i32 + set.0[us].head, scared as i32);
+}
+
+#[test]
+fn post_comma_true_subject_stays_noun() {
+    // Must-NOT-fire: "schools" after a subordinate-clause comma is the next
+    // clause's subject, not a predicate — stays NOUN. The parenthetical
+    // opener (nominal + comma, no verb before the target) is absent here.
+    let (_doc, set) = parse("If it snows, schools close.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("schools")], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn coordinated_predicate_adjective_stays_nonverbal() {
+    // Must-NOT-fire: "red" in "red and fast" is a coordinated predicate
+    // adjective (ADJ gap, explicitly out of scope) — the CC-next guard
+    // keeps it off the verb path as well as the noun path is wrong.
+    let (_doc, set) = parse("Her car, red and fast, won.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_ne!(pos[at("red")], "verb", "pos: {pos:?}");
+}
+
+#[test]
+fn shifted_det_noun_verb_after_boundary_is_verbal() {
+    // Refs (UD parenthetical-06): failed → verb/root, plan → nsubj →
+    // failed. The DET+NOUN+initial frame shifted past a leading clause
+    // boundary (the initial-noun rule only sees positions 0-2, shielded
+    // here by the sentence-initial adverbial). Only the clause-final
+    // predicate qualifies — an appositive nominal (`an old brick,` with
+    // more clause to come) never matches.
+    let (_doc, set) = parse("Truthfully, the plan failed.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (plan, failed) = (at("plan"), at("failed"));
+    assert_eq!(pos[failed], "verb", "pos: {pos:?}");
+    assert_eq!(deps[failed], "root", "deps: {deps:?}");
+    assert_eq!(deps[plan], "nsubj", "deps: {deps:?}");
+    assert_eq!(plan as i32 + set.0[plan].head, failed as i32);
+}
+
+#[test]
+fn comma_free_det_noun_pair_stays_nominal() {
+    // Must-NOT-fire: without a clause boundary before the determiner
+    // ("Show me the sales report"), DET+NOUN+NOUN is a plain nominal —
+    // the shifted frame needs its comma. (Uses "sales": "report" itself
+    // is a closed-list verb over-fire, documented separately.)
+    let (_doc, set) = parse("Show me the sales report.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("sales")], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn comment_clause_as_is_sconj_mark() {
+    // Refs (UD subordinate-01): As → sconj/mark → know, you → nsubj →
+    // know. Sentence-initial comment clauses (`As you know`) read through
+    // the closed ADP map, so the marker arm never fires and the subject
+    // misattaches as a prepositional object.
+    let (_doc, set) = parse("As you know, your fee is low.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (as_, you, know) = (at("As"), at("you"), at("know"));
+    assert_eq!(pos[as_], "sconj", "pos: {pos:?}");
+    assert_eq!(deps[as_], "mark", "deps: {deps:?}");
+    assert_eq!(as_ as i32 + set.0[as_].head, know as i32);
+    assert_eq!(deps[you], "nsubj", "deps: {deps:?}");
+    assert_eq!(you as i32 + set.0[you].head, know as i32);
+}
+
+#[test]
+fn comment_clause_everybody_is_subject() {
+    // Refs (UD subordinate-12): As → sconj/mark → knows, everybody →
+    // pron/nsubj → knows. Same frame with an indefinite-pronoun subject
+    // (closed-map gap alongside the As gap); the matrix-clause
+    // parataxis/root half belongs to later work and is unasserted.
+    let (_doc, set) = parse("As everybody knows, lunch ends early.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (as_, everybody, knows) = (at("As"), at("everybody"), at("knows"));
+    assert_eq!(pos[as_], "sconj", "pos: {pos:?}");
+    assert_eq!(pos[everybody], "pron", "pos: {pos:?}");
+    assert_eq!(deps[as_], "mark", "deps: {deps:?}");
+    assert_eq!(deps[everybody], "nsubj", "deps: {deps:?}");
+    assert_eq!(everybody as i32 + set.0[everybody].head, knows as i32);
+}
+
+#[test]
+fn medial_as_frame_stays_prepositional() {
+    // Must-NOT-fire: medial "as" (`Paris, as always, …`) is not a comment
+    // clause — the As rule is sentence-initial only.
+    let (_doc, set) = parse("Paris, as always, charmed us.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("as")], "adp", "pos: {pos:?}");
+}
+
+#[test]
+fn inverted_copular_predicate_is_adjectival() {
+    // Refs (UD question-11): ready → adj/root, lunch → nsubj → ready,
+    // Is → cop → ready. The be-predicate rule only sees AUX-adjacent
+    // complements, so an inverted copular (overt subject between be and
+    // predicate) strands — while the predicate-nominal control below
+    // keeps subject-less complements (`a doctor`) shut.
+    let (_doc, set) = parse("Is lunch ready?");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (is, lunch, ready) = (at("Is"), at("lunch"), at("ready"));
+    assert_eq!(pos[ready], "adj", "pos: {pos:?}");
+    assert_eq!(deps[ready], "root", "deps: {deps:?}");
+    assert_eq!(deps[lunch], "nsubj", "deps: {deps:?}");
+    assert_eq!(lunch as i32 + set.0[lunch].head, ready as i32);
+    assert_eq!(deps[is], "cop", "deps: {deps:?}");
+    assert_eq!(is as i32 + set.0[is].head, ready as i32);
+}
+
+#[test]
+fn predicate_nominal_after_be_stays_noun() {
+    // Must-NOT-fire: "a doctor" is a predicate nominal, not a predicate
+    // adjective — with only a bare determiner between be and target there
+    // is no overt subject, so the inverted frame stays shut.
+    let (_doc, set) = parse("She is a doctor.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("doctor")], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn object_relative_pronoun_is_obj() {
+    // Refs (UD relative-02/08): that → obj → bought. The candidate set
+    // offers only subject-Left for (Pron, Verb), so an object relativizer
+    // with an overt subject strands into repair-dep — head and label both
+    // wrong. The obj arm fires only with a nominative pronoun visibly
+    // between marker and verb (the subject that makes s the object).
+    let (_doc, set) = parse("The book that I bought vanished.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (that, bought) = (at("that"), at("bought"));
+    assert_eq!(deps[that], "obj", "deps: {deps:?}");
+    assert_eq!(that as i32 + set.0[that].head, bought as i32);
+}
+
+#[test]
+fn subject_relative_pronoun_stays_nsubj() {
+    // Must-NOT-fire: "that" directly heading its clause verb ("The dog
+    // that barked") is the subject — no intervening pronoun, no obj arm.
+    let (_doc, set) = parse("The dog that barked ran off.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (that, barked) = (at("that"), at("barked"));
+    assert_eq!(deps[that], "nsubj", "deps: {deps:?}");
+    assert_eq!(that as i32 + set.0[that].head, barked as i32);
+}
+
+#[test]
 fn relative_matrix_verb_after_relcl_is_verb() {
     // Refs (UD relative-01): left → verb/root, man → nsubj → left. "left"
     // is outside the closed verb list, so the matrix verb falls through to

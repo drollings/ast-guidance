@@ -1993,7 +1993,7 @@
       {
         "dep": "punct",
         "head": -1,
-        "lemma": ".",
+        "lemma": "?",
         "pos": "punct",
         "text": "?"
       }
@@ -2030,7 +2030,7 @@
       {
         "dep": "punct",
         "head": -1,
-        "lemma": ".",
+        "lemma": "?",
         "pos": "punct",
         "text": "?"
       }
@@ -4219,7 +4219,7 @@
       {
         "dep": "nsubj",
         "head": 3,
-        "lemma": "players",
+        "lemma": "player",
         "pos": "noun",
         "text": "Players"
       },
@@ -4358,7 +4358,7 @@
       {
         "dep": "nsubj",
         "head": 3,
-        "lemma": "teachers",
+        "lemma": "teacher",
         "pos": "noun",
         "text": "Teachers"
       },
