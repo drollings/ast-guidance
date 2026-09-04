@@ -264,3 +264,438 @@ fn full_be_participial_adjective_stays_non_verb() {
     let surprising = texts.iter().position(|t| t == "surprising").expect("surprising");
     assert_ne!(pos[surprising], "verb", "pos: {pos:?}");
 }
+
+fn lemmas(set: &spacy_rs::AnnotationSet) -> Vec<String> {
+    set.0.iter().map(|r| r.lemma.clone()).collect()
+}
+
+#[test]
+fn cant_splinter_lemmas() {
+    // UD pins ca → can, n't → not (sibling refs -02/-03; spaCy parity).
+    let (_doc, set) = parse("I can't go today.");
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let lem = lemmas(&set);
+    assert_eq!(lem[at("ca")], "can", "lemmas: {lem:?}");
+    assert_eq!(lem[at("n't")], "not", "lemmas: {lem:?}");
+}
+
+#[test]
+fn wont_splinter_lemmas() {
+    // "wo" is the bound allomorph of modal "will" (never *"do"); n't → not.
+    let (_doc, set) = parse("She won't answer calls.");
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let lem = lemmas(&set);
+    assert_eq!(lem[at("wo")], "will", "lemmas: {lem:?}");
+    assert_eq!(lem[at("n't")], "not", "lemmas: {lem:?}");
+}
+
+#[test]
+fn contracted_be_splinter_lemma() {
+    // Aux-classified 's resolves to be (ref contraction-05).
+    let (_doc, set) = parse("It's raining hard.");
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let lem = lemmas(&set);
+    assert_eq!(lem[at("'s")], "be", "lemmas: {lem:?}");
+}
+
+#[test]
+fn did_lemma_is_do() {
+    // Refs (UD): did → do (contraction-04, question-06).
+    let (_doc, set) = parse("Did the report arrive?");
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let lem = lemmas(&set);
+    assert_eq!(lem[at("Did")], "do", "lemmas: {lem:?}");
+}
+
+#[test]
+fn possessive_s_lemma_untouched() {
+    // Must-NOT-fire: possessive 's (PART/case, ref command-06 pins "'s")
+    // keeps its surface lemma — the be-mapping is aux-gated.
+    let (_doc, set) = parse("Explain Bell's theorem.");
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let lem = lemmas(&set);
+    assert_eq!(lem[at("'s")], "'s", "lemmas: {lem:?}");
+}
+
+#[test]
+fn ambiguous_d_contraction_untouched() {
+    // Must-NOT-fire: 'd is would/had — lexically underdetermined, so the
+    // closed map leaves it alone rather than guessing.
+    let (_doc, set) = parse("I'd go today.");
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let lem = lemmas(&set);
+    assert_eq!(lem[at("'d")], "'d", "lemmas: {lem:?}");
+}
+
+#[test]
+fn directive_initial_verb_with_det_object() {
+    // Refs (UD): Close → verb/root, books → dobj. "Close" is outside the
+    // closed verb list; the sentence-initial DET+NOUN frame is the evidence.
+    let (_doc, set) = parse("Close your books.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (close, books) = (at("Close"), at("books"));
+    assert_eq!(pos[close], "verb", "pos: {pos:?}");
+    assert_eq!(deps[close], "root");
+    assert_eq!(deps[books], "dobj", "deps: {deps:?}");
+    assert_eq!(books as i32 + set.0[books].head, close as i32);
+}
+
+#[test]
+fn directive_initial_verb_command_frame() {
+    // Refs (UD): Solve → verb/root, equation → dobj.
+    let (_doc, set) = parse("Solve this equation.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (solve, equation) = (at("Solve"), at("equation"));
+    assert_eq!(pos[solve], "verb", "pos: {pos:?}");
+    assert_eq!(deps[solve], "root");
+    assert_eq!(deps[equation], "dobj", "deps: {deps:?}");
+    assert_eq!(equation as i32 + set.0[equation].head, solve as i32);
+}
+
+#[test]
+fn subject_noun_before_noun_is_not_directive() {
+    // Must-NOT-fire: "Anna" is a subject, not a directive verb — the
+    // lookahead demands DET+NOUN, and "finished"(NOUN) blocks it.
+    let (doc, set) = parse("Anna finished her lunch.");
+    let pos = pos_of(&set);
+    let texts = token_texts(&doc);
+    let anna = texts.iter().position(|t| t == "Anna").expect("Anna");
+    assert_eq!(pos[anna], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn conjunction_second_is_not_directive() {
+    // Must-NOT-fire: sentence-initial noun followed by a conjunction is a
+    // subject ("Dogs ... nap"), never a directive verb.
+    let (doc, set) = parse("Dogs and cats nap.");
+    let pos = pos_of(&set);
+    let texts = token_texts(&doc);
+    let dogs = texts.iter().position(|t| t == "Dogs").expect("Dogs");
+    assert_eq!(pos[dogs], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn pronoun_subject_governs_matrix_and_embedded_verb() {
+    // Refs (UD): stayed → verb/root, snowed → verb, We → nsubj,
+    // it → nsubj → snowed, snowed heads to stayed. The SCONJ "because" needs
+    // a mark arm (future work) and is deliberately unasserted.
+    let (_doc, set) = parse("We stayed because it snowed.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (we, stayed, it, snowed) = (at("We"), at("stayed"), at("it"), at("snowed"));
+    assert_eq!(pos[stayed], "verb", "pos: {pos:?}");
+    assert_eq!(pos[snowed], "verb", "pos: {pos:?}");
+    assert_eq!(deps[stayed], "root");
+    assert_eq!(deps[we], "nsubj", "deps: {deps:?}");
+    assert_eq!(deps[it], "nsubj", "deps: {deps:?}");
+    assert_eq!(it as i32 + set.0[it].head, snowed as i32);
+    assert_eq!(snowed as i32 + set.0[snowed].head, stayed as i32);
+}
+
+#[test]
+fn pronoun_subject_governs_sconj_clause_verb() {
+    // Refs (UD): snores → verb/root, sleeps → verb heading to snores, He →
+    // nsubj. The post-verbal "he" currently misattaches as dobj (the
+    // subordinate-subject attachment gap) and is deliberately unasserted.
+    let (_doc, set) = parse("He snores when he sleeps.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (he, snores, sleeps) = (at("He"), at("snores"), at("sleeps"));
+    assert_eq!(pos[snores], "verb", "pos: {pos:?}");
+    assert_eq!(pos[sleeps], "verb", "pos: {pos:?}");
+    assert_eq!(deps[snores], "root");
+    assert_eq!(deps[he], "nsubj", "deps: {deps:?}");
+    assert_eq!(sleeps as i32 + set.0[sleeps].head, snores as i32);
+}
+
+#[test]
+fn object_pronoun_does_not_govern_verb() {
+    // Must-NOT-fire: "me" is an object pronoun, not a nominative subject —
+    // "later" stays NOUN.
+    let (_doc, set) = parse("Call me later.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("later")], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn aux_prev_does_not_govern_participle() {
+    // Must-NOT-fire: "coming" follows an AUX ("are"), not a pronoun subject
+    // — the full-be progressive stays for copular handling.
+    let (_doc, set) = parse("They aren't coming today.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("coming")], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn initial_noun_subject_governs_verb() {
+    // Refs (UD): ended → verb/root, game → nsubj, scored → verb heading to
+    // ended. The "after she" PP-frame (ADP-lexed "after") is future work and
+    // deliberately unasserted.
+    let (_doc, set) = parse("The game ended after she scored.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (game, ended, scored) = (at("game"), at("ended"), at("scored"));
+    assert_eq!(pos[ended], "verb", "pos: {pos:?}");
+    assert_eq!(pos[scored], "verb", "pos: {pos:?}");
+    assert_eq!(deps[ended], "root");
+    assert_eq!(deps[game], "nsubj", "deps: {deps:?}");
+    assert_eq!(scored as i32 + set.0[scored].head, ended as i32);
+}
+
+#[test]
+fn bare_initial_noun_subject_governs_verb() {
+    // Refs (UD): passed → verb/root, storm → nsubj. The medial "floods
+    // stayed" (noun-subject, non-initial) belongs to later work.
+    let (_doc, set) = parse("The storm passed but floods stayed.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (storm, passed) = (at("storm"), at("passed"));
+    assert_eq!(pos[passed], "verb", "pos: {pos:?}");
+    assert_eq!(deps[passed], "root");
+    assert_eq!(deps[storm], "nsubj", "deps: {deps:?}");
+}
+
+#[test]
+fn bare_verb_object_initials_are_not_subject_verbs() {    // Must-NOT-fire: "Translate hello" / "Define photosynthesis" are
+    // verb–object initials, POS-identical to subject–verb ones — the
+    // initial-noun rule covers DET-led subjects only, so both stay NOUN.
+    let (_doc, set) = parse("Define photosynthesis.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("photosynthesis")], "noun", "pos: {pos:?}");
+    let (_doc, set) = parse("Translate hello to French.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("hello")], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn relativizer_where_is_not_a_verb() {
+    // Must-NOT-fire: "where" in DET+NOUN+where position is the relativizer
+    // (ref: adp/mark) — the initial-noun-subject rule excludes WH-forms.
+    let (_doc, set) = parse("The store where we met closed.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_ne!(pos[at("where")], "verb", "pos: {pos:?}");
+}
+
+#[test]
+fn medial_compound_noun_is_not_a_verb() {
+    // Must-NOT-fire: medial DET+NOUN+NOUN ("the sales report") is a compound
+    // nominal — the rule is sentence-initial only.
+    let (_doc, set) = parse("Show me the sales report.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("sales")], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn conjoined_clause_verb_after_cc_subject() {
+    // Refs (UD): rose → verb, spirits → nsubj → rose. The "yet" marker
+    // (sconj-mark) needs its own arm; rose steals root until the NOUN matrix
+    // verb upgrades (bare-initial work) — its own head is unasserted.
+    let (_doc, set) = parse("Grades dropped yet spirits rose.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (spirits, rose) = (at("spirits"), at("rose"));
+    assert_eq!(pos[rose], "verb", "pos: {pos:?}");
+    assert_eq!(deps[spirits], "nsubj", "deps: {deps:?}");
+    assert_eq!(spirits as i32 + set.0[spirits].head, rose as i32);
+}
+
+#[test]
+fn conjoined_np_subject_governs_final_verb() {
+    // Refs (UD): nap → verb/root, Dogs heads to nap (repair-head into the
+    // root). The "cats" conj label belongs to coordination-attachment work.
+    let (_doc, set) = parse("Dogs and cats nap.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (dogs, nap) = (at("Dogs"), at("nap"));
+    assert_eq!(pos[nap], "verb", "pos: {pos:?}");
+    assert_eq!(deps[nap], "root");
+    assert_eq!(dogs as i32 + set.0[dogs].head, nap as i32);
+}
+
+#[test]
+fn clause_final_conjoined_word_after_cc_stays_open() {
+    // Must-NOT-fire: CC + NOUN at the very end ("and eggs") is a conjoined
+    // object nominal — the rule needs a third token to govern.
+    let (_doc, set) = parse("Buy milk and eggs.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("eggs")], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn clause_final_conjoined_verb_needs_subject_tracking() {
+    // Must-NOT-fire (boundary): "failed" after "but" at the end is a
+    // conjoined verb, but so is "eggs" a conjoined object in the same shape
+    // — disambiguating them needs clause-subject tracking, not this rule.
+    let (_doc, set) = parse("She studied but failed.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("failed")], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn sconj_marker_attaches_to_clause_verb() {
+    // Refs (UD): because → mark → snowed. Before, the marker sat on the
+    // stack with no arm and Reduce popped it into repair-dep.
+    let (_doc, set) = parse("We stayed because it snowed.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (because, snowed) = (at("because"), at("snowed"));
+    assert_eq!(deps[because], "mark", "deps: {deps:?}");
+    assert_eq!(because as i32 + set.0[because].head, snowed as i32);
+}
+
+#[test]
+fn when_marker_attaches_to_clause_verb() {
+    // Refs (UD): when → mark → works.
+    let (_doc, set) = parse("She sings when she works.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (when, works) = (at("when"), at("works"));
+    assert_eq!(deps[when], "mark", "deps: {deps:?}");
+    assert_eq!(when as i32 + set.0[when].head, works as i32);
+}
+
+#[test]
+fn adjective_headed_sconj_does_not_mark() {
+    // Must-NOT-fire: "hungry" is a NOUN-tagged adjective (adjective gap) —
+    // with no verb on the buffer, the marker must not invent a mark arc.
+    let (_doc, set) = parse("Although hungry, he shared lunch.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_ne!(deps[at("Although")], "mark", "deps: {deps:?}");
+}
+
+#[test]
+fn dual_class_after_stays_prepositional() {
+    // Must-NOT-fire (boundary): "after" lexes ADP, so the SCONJ-keyed mark
+    // arm cannot fire — after-disambiguation is its own rule.
+    let (_doc, set) = parse("The game ended after she scored.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("after")], "adp", "pos: {pos:?}");
+}
+
+#[test]
+fn copular_be_predicate_frame() {
+    // Refs (UD): low → adj/root, is → cop → low, fee → nsubj → low.
+    let (_doc, set) = parse("Your fee is low.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (fee, is, low) = (at("fee"), at("is"), at("low"));
+    assert_eq!(pos[low], "adj", "pos: {pos:?}");
+    assert_eq!(deps[low], "root");
+    assert_eq!(deps[is], "cop", "deps: {deps:?}");
+    assert_eq!(is as i32 + set.0[is].head, low as i32);
+    assert_eq!(deps[fee], "nsubj", "deps: {deps:?}");
+    assert_eq!(fee as i32 + set.0[fee].head, low as i32);
+}
+
+#[test]
+fn negated_copular_predicate_frame() {
+    // Refs (UD): ready → adj/root, is → cop → ready, She → nsubj → ready.
+    // The n't-bridge and cop/nsubj arms compose; n't/yet are unasserted.
+    let (_doc, set) = parse("She isn't ready yet.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (she, is, ready) = (at("She"), at("is"), at("ready"));
+    assert_eq!(pos[ready], "adj", "pos: {pos:?}");
+    assert_eq!(deps[ready], "root");
+    assert_eq!(deps[is], "cop", "deps: {deps:?}");
+    assert_eq!(is as i32 + set.0[is].head, ready as i32);
+    assert_eq!(deps[she], "nsubj", "deps: {deps:?}");
+    assert_eq!(she as i32 + set.0[she].head, ready as i32);
+}
+
+#[test]
+fn np_predicate_noun_is_not_adjective() {
+    // Must-NOT-fire: "doctor" follows a DET, not be — the predicate-adjective
+    // rule needs a be-AUX (or n't-bridged be) immediately before.
+    let (_doc, set) = parse("She is a doctor.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("doctor")], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn initial_be_question_subject_is_not_adjective() {
+    // Must-NOT-fire (boundary): sentence-initial be is interrogative AUX, not
+    // a copula — its subject ("lunch") stays nominal.
+    let (_doc, set) = parse("Is lunch ready?");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("lunch")], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn comma_delimited_appos_attaches_to_anchor() {
+    // Refs (UD): doctor → appos → brother. The anchor must survive the
+    // determiner (noun-det wait) for the pair to meet.
+    let (_doc, set) = parse("My brother, a doctor, lives here.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (brother, doctor) = (at("brother"), at("doctor"));
+    assert_eq!(deps[doctor], "appos", "deps: {deps:?}");
+    assert_eq!(doctor as i32 + set.0[doctor].head, brother as i32);
+}
+
+#[test]
+fn punct_separated_verbs_attach_parataxis() {
+    // Refs (UD): called → parataxis → texted. The (Verb,Verb) pair needs a
+    // punctuation + nominal between them (see controls).
+    let (_doc, set) = parse("She texted; he called.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (texted, called) = (at("texted"), at("called"));
+    assert_eq!(deps[called], "parataxis", "deps: {deps:?}");
+    assert_eq!(called as i32 + set.0[called].head, texted as i32);
+}
+
+#[test]
+fn adjacent_clause_verbs_are_not_parataxis() {
+    // Must-NOT-fire: "called left" are adjacent (relative clause) — no
+    // punctuation/nominal between, so no parataxis arm may fire.
+    let (_doc, set) = parse("The man who called left.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_ne!(deps[at("left")], "parataxis", "deps: {deps:?}");
+    assert_ne!(deps[at("called")], "parataxis", "deps: {deps:?}");
+}
+
+#[test]
+fn participial_parenthetical_is_not_parataxis() {
+    // Must-NOT-fire: "smiling, took" has punctuation but no nominal between
+    // (participle + matrix verb, one clause) — parataxis must not fire.
+    let (_doc, set) = parse("The CEO, smiling, took questions.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_ne!(deps[at("took")], "parataxis", "deps: {deps:?}");
+}
+
+#[test]
+fn medial_compound_pair_is_not_appos() {
+    // Must-NOT-fire: "sales report" has no punctuation between — the pair
+    // stays on the compound path, never appos.
+    let (_doc, set) = parse("Show me the sales report.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_ne!(deps[at("report")], "appos", "deps: {deps:?}");
+}

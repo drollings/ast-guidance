@@ -105,7 +105,8 @@ fn candidate_actions_noun_before_verb() {
     st.stack.push(0); // noun
     st.buffer.extend(1..2); // verb
     let pos = vec![Upos::Noun, Upos::Verb];
-    let actions = st.candidate_actions(&pos, &labels);
+    let texts = vec!["dogs".to_string(), "bark".to_string()];
+    let actions = st.candidate_actions(&pos, &texts, &labels);
     assert!(actions.iter().any(|a| a.move_type == ArcEagerMove::Shift));
     assert!(
         actions
@@ -122,7 +123,8 @@ fn candidate_actions_verb_before_noun() {
     st.stack.push(0); // verb
     st.buffer.extend(1..2); // noun
     let pos = vec![Upos::Verb, Upos::Noun];
-    let actions = st.candidate_actions(&pos, &labels);
+    let texts = vec!["find".to_string(), "milk".to_string()];
+    let actions = st.candidate_actions(&pos, &texts, &labels);
     assert!(
         actions
             .iter()
@@ -136,7 +138,8 @@ fn candidate_actions_punct_with_empty_stack() {
     let mut st = ArcEagerState::new(1, 0);
     st.buffer.extend(0..1);
     let pos = vec![Upos::Punct];
-    let actions = st.candidate_actions(&pos, &labels);
+    let texts = vec![".".to_string()];
+    let actions = st.candidate_actions(&pos, &texts, &labels);
     assert!(
         !actions.iter().any(|a| a.move_type == ArcEagerMove::Right),
         "nothing to attach punctuation to"
@@ -152,7 +155,8 @@ fn candidate_actions_drain_on_empty_buffer() {
     st.stack.push(1);
     st.buffer.clear();
     let pos = vec![Upos::Noun, Upos::Noun];
-    let actions = st.candidate_actions(&pos, &labels);
+    let texts: Vec<String> = vec![];
+    let actions = st.candidate_actions(&pos, &texts, &labels);
     assert_eq!(
         actions,
         vec![ArcEagerAction {
@@ -289,7 +293,8 @@ fn oracle_best_with_margin_reports_ties() {
     st.stack.push(0);
     st.buffer.extend(1..2);
     let pos = vec![Upos::Noun, Upos::Verb];
-    let actions = st.candidate_actions(&pos, &labels);
+    let texts = vec!["dogs".to_string(), "bark".to_string()];
+    let actions = st.candidate_actions(&pos, &texts, &labels);
     assert!(actions.len() >= 2);
     let (best, margin) = oracle
         .best_with_margin(&st, &actions, &pos, &labels)

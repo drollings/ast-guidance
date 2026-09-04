@@ -170,6 +170,166 @@ fn refine_pos_bare_infinitive(texts: &[String], pos: &mut [Upos]) {
     }
 }
 
+/// Sentence-initial directive verb (`Close your books`, `Solve this
+/// equation`, `Search the web`). Directives outside the closed verb list
+/// fall through to NOUN and the clause loses its root. Upgrades an
+/// alpha-fallback NOUN to VERB only at a sentence start followed by a
+/// DET+NOUN object phrase. Strictly scoped: a NOUN second (`Anna finished`,
+/// `Translate hello`, `Explain Bell's`) or a conjunction (`Dogs and cats`),
+/// pronoun (`Help them`), or verb (`Dogs bark`) second never fires, so
+/// subjects and bare/proper objects are untouched.
+fn refine_pos_directive_initial(texts: &[String], pos: &mut [Upos]) {
+    for i in 0..texts.len() {
+        if pos[i] != Upos::Noun {
+            continue;
+        }
+        let at_start = i == 0
+            || matches!(
+                texts[i - 1].as_str(),
+                "." | "!" | "?" | ";" | ":" | "—" | "--"
+            );
+        if !at_start || i + 2 >= texts.len() {
+            continue;
+        }
+        if pos[i + 1] == Upos::Det && pos[i + 2] == Upos::Noun {
+            pos[i] = Upos::Verb;
+        }
+    }
+}
+
+/// Whether `text` is a nominative pronoun surface (finite-clause subject).
+/// Object/possessive forms (`me`, `them`, `mine`) are excluded even though
+/// the closed map tags them PRON.
+fn is_nominative_subject(text: &str) -> bool {
+    const NOMINATIVE: &[&str] = &["i", "you", "he", "she", "it", "we", "they", "who"];
+    NOMINATIVE.iter().any(|h| text.eq_ignore_ascii_case(h))
+}
+
+/// Finite verb after a nominative pronoun subject (`We stayed`, `it snowed`,
+/// `who called`, `you clean`). The closed verb list misses most of these, so
+/// matrix and SCONJ-embedded clauses alike lose their predicate — including
+/// after dual-class markers (`after she scored`) that lex as ADP, since the
+/// rule keys on the subject, never the marker. Upgrades an alpha-fallback
+/// NOUN to VERB only after a nominative pronoun. Guards: object pronouns
+/// (`Call me later`), determiners (`her keys`), AUX hosts (`are coming`), and
+/// noun subjects (`Anna finished`) never match. Known boundary: vocative
+/// collectives (`you guys`) would over-fire — no corpus instance; left for
+/// later work.
+fn refine_pos_pronoun_subject_verb(texts: &[String], pos: &mut [Upos]) {
+    for i in 1..texts.len() {
+        if pos[i] != Upos::Noun || pos[i - 1] != Upos::Pron {
+            continue;
+        }
+        if is_nominative_subject(texts[i - 1].as_str()) {
+            pos[i] = Upos::Verb;
+        }
+    }
+}
+
+/// Whether `text` is a WH-relativizer that can never host a matrix verb in
+/// subject position (`The store where …`). Only forms with corpus evidence;
+/// `when`/`that`/`who` lex out of NOUN already and need no guard.
+fn is_noun_subject_verb_blocker(text: &str) -> bool {
+    text.eq_ignore_ascii_case("where")
+}
+
+/// Finite verb after an initial determiner-led noun subject (`The game
+/// ended`, `The bus arrived`). The closed verb list misses these, so the
+/// sentence loses its root. Upgrades an alpha-fallback NOUN to VERB only in
+/// strict sentence-initial DET+NOUN+NOUN position (0–2). Guards:
+/// auxiliaries (`is/was`), punctuation (`,`, parentheticals), relativizers
+/// (`who/that/where` — PRON/DET/WH-blocked), and conjunctions never match;
+/// medial DET+NOUN+NOUN (`the sales report`) is out of scope by position.
+/// Deliberately NOT covered: bare NOUN+NOUN initials (`Rain fell`,
+/// `Translate hello`) — subject–verb and verb–object readings are
+/// POS-identical there (`Define photosynthesis.` proves it), so that frame
+/// needs verb-capability knowledge, not another positional guard.
+fn refine_pos_initial_noun_verb(texts: &[String], pos: &mut [Upos]) {
+    if texts.len() < 3 || pos[2] != Upos::Noun {
+        return;
+    }
+    if pos[0] != Upos::Det || pos[1] != Upos::Noun {
+        return;
+    }
+    if is_noun_subject_verb_blocker(texts[2].as_str()) {
+        return;
+    }
+    // A finite verb in third position is never capitalized.
+    if !texts[2].chars().next().is_some_and(|c| c.is_lowercase()) {
+        return;
+    }
+    pos[2] = Upos::Verb;
+}
+
+/// Finite verb of a conjoined clause (`floods stayed`, `spirits rose`,
+/// `cats nap`, `rice fill`, `coffee helps`). The closed verb list misses
+/// these, so the second clause loses its predicate. Upgrades an
+/// alpha-fallback NOUN to VERB only in CC + NOUN + NOUN position — the
+/// middle noun is the post-conjunction subject, the third its verb. Guards:
+/// the third token must be lowercase (title-case is the §8.2 proper-noun
+/// class); clause-final CC + NOUN (`and eggs`, conjoined objects) has no
+/// third token and never fires. Known boundary: clause-final conjoined
+/// verbs (`but failed`, `or quit`) share their shape with conjoined objects
+/// and need clause-subject tracking — left for later work.
+fn refine_pos_conjoined_clause_verb(texts: &[String], pos: &mut [Upos]) {
+    for i in 2..texts.len() {
+        if pos[i] != Upos::Noun || pos[i - 1] != Upos::Noun || pos[i - 2] != Upos::Cconj {
+            continue;
+        }
+        if texts[i].chars().next().is_some_and(|c| c.is_lowercase()) {
+            pos[i] = Upos::Verb;
+        }
+    }
+}
+
+/// Whether `text` is a finite `be` form (copula host). Sensory and
+/// resultative copulas (`taste`, `become`) are their own rules.
+fn is_be_form(text: &str) -> bool {
+    const BE: &[&str] = &[
+        "is", "are", "was", "were", "be", "been", "being", "am", "'s", "'re", "'m",
+    ];
+    BE.iter().any(|h| text.eq_ignore_ascii_case(h))
+}
+
+/// Copular predicate adjective (`fee is low`, `isn't ready`). There is no
+/// adjective detection elsewhere, so be-predicates fall through to NOUN and
+/// the copula has nothing to attach to. Upgrades an alpha-fallback NOUN to
+/// ADJ only directly after an AUX-tagged be-form, or after an n't/not
+/// negator hosted by one (`isn't ready`). Guards: the be must not be
+/// sentence-initial (interrogative AUX — `Is lunch ready` keeps its nominal
+/// subject); possessive `'s` is X-tagged, never AUX, so `Bell's theorem` is
+/// untouched; `-ing` forms are participles, not predicates (`are coming`,
+/// `were surprising` stay for participle handling); determiners and verbs
+/// never match. Sensory copulas (`tastes salty`) are a separate rule.
+fn refine_pos_be_predicate(texts: &[String], pos: &mut [Upos]) {
+    for i in 1..texts.len() {
+        if pos[i] != Upos::Noun {
+            continue;
+        }
+        // Participles end in -ing (allocation-free suffix check); they are
+        // verbs or participial adjectives, never copular predicates.
+        let word = texts[i].as_str();
+        let is_participle = word.len() > 4
+            && word
+                .get(word.len() - 3..)
+                .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ing"));
+        if is_participle {
+            continue;
+        }
+        let direct = pos[i - 1] == Upos::Aux
+            && is_be_form(texts[i - 1].as_str())
+            && i - 1 >= 1;
+        let bridged = i >= 2
+            && (texts[i - 1].eq_ignore_ascii_case("n't") || texts[i - 1].eq_ignore_ascii_case("not"))
+            && pos[i - 2] == Upos::Aux
+            && is_be_form(texts[i - 2].as_str())
+            && i - 2 >= 1;
+        if direct || bridged {
+            pos[i] = Upos::Adj;
+        }
+    }
+}
+
 /// Contracted-be disambiguation (`It's raining`, `You're late` vs. `Bell's
 /// theorem`). Runs after the lexeme-only tags so it can read neighbor POS.
 /// Two guarded upgrades, in one ascending pass so the participle rule sees
@@ -347,7 +507,12 @@ impl ArcEagerState {
     /// The set of candidate actions for the current state, given per-token
     /// POS. Only label variants plausible for the current `(stack_top, buffer
     /// head)` POS pair are offered, so the oracle rarely ties.
-    pub fn candidate_actions(&self, pos: &[Upos], labels: &DepLabels) -> Vec<ArcEagerAction> {
+    pub fn candidate_actions(
+        &self,
+        pos: &[Upos],
+        texts: &[String],
+        labels: &DepLabels,
+    ) -> Vec<ArcEagerAction> {
         let mut out = Vec::new();
         let Some(b) = self.buffer_head() else {
             // Drain: Reduce until the stack is empty.
@@ -401,6 +566,12 @@ impl ArcEagerState {
                 (Upos::Noun | Upos::Propn | Upos::Pron, Upos::Verb) => {
                     out.push(Self::act(ArcEagerMove::Left, labels.nsubj));
                 }
+                // The subject of a predicate adjective (fee is low: fee →
+                // nsubj → low). The only ADJ the tagger emits are be-rule
+                // predicates, so this fires exactly on copular subjects.
+                (Upos::Noun | Upos::Propn | Upos::Pron, Upos::Adj) => {
+                    out.push(Self::act(ArcEagerMove::Left, labels.nsubj));
+                }
                 (Upos::Det, Upos::Noun | Upos::Propn) => {
                     out.push(Self::act(ArcEagerMove::Left, labels.det));
                 }
@@ -408,10 +579,21 @@ impl ArcEagerState {
                     out.push(Self::act(ArcEagerMove::Left, labels.amod));
                 }
                 (Upos::Noun | Upos::Propn, Upos::Noun | Upos::Propn) => {
-                    out.push(Self::act(ArcEagerMove::Left, labels.compound));
+                    // Bare nominals compound (sales report). Comma-delimited
+                    // ones are apposition — handled by the Right arm below
+                    // (the appositive follows its anchor, so it attaches
+                    // rightward); offering compound here too would tie.
+                    if ((s + 1)..b).all(|k| pos[k] != Upos::Punct) {
+                        out.push(Self::act(ArcEagerMove::Left, labels.compound));
+                    }
                 }
                 (Upos::Aux, Upos::Verb) => {
                     out.push(Self::act(ArcEagerMove::Left, labels.aux));
+                }
+                // The copula depends on its predicate (fee is low: is → cop
+                // → low). Pairs with the be-predicate tagger rule above.
+                (Upos::Aux, Upos::Adj) => {
+                    out.push(Self::act(ArcEagerMove::Left, labels.cop));
                 }
                 (Upos::Adv, Upos::Verb) => {
                     out.push(Self::act(ArcEagerMove::Left, labels.advmod));
@@ -425,6 +607,17 @@ impl ArcEagerState {
                 (Upos::Part, Upos::Verb) => {
                     out.push(Self::act(ArcEagerMove::Left, labels.neg));
                 }
+                // The subordinator depends on its clause verb (because it
+                // snowed: because → mark → snowed). Needs the SCONJ Reduce
+                // wait below: the marker must survive its subject first.
+                // Never across a clause boundary (punctuation): in "Although
+                // hungry, he shared", the marker must not reach the matrix
+                // verb — it belongs to its own clause.
+                (Upos::Sconj, Upos::Verb) => {
+                    if ((s + 1)..b).all(|k| pos[k] != Upos::Punct) {
+                        out.push(Self::act(ArcEagerMove::Left, labels.mark));
+                    }
+                }
                 _ => {}
             }
         }
@@ -434,6 +627,31 @@ impl ArcEagerState {
                 (Upos::Verb, Upos::Noun | Upos::Propn | Upos::Pron) => {
                     out.push(Self::act(ArcEagerMove::Right, labels.dobj));
                     out.push(Self::act(ArcEagerMove::Right, labels.nsubj));
+                }
+                // A second finite verb across a punctuation + nominal boundary
+                // (She texted; he called) is parataxis, not a complement:
+                // both a clause boundary and an intervening subject must
+                // separate the pair. Adjacent verbs (called left, relative
+                // clause), bare participles (smiling, took), and complement
+                // clauses (said he left, no punctuation) never match.
+                (Upos::Verb, Upos::Verb) => {
+                    let boundary = ((s + 1)..b).any(|k| pos[k] == Upos::Punct);
+                    let subject = ((s + 1)..b).any(|k| {
+                        matches!(pos[k], Upos::Noun | Upos::Propn | Upos::Pron)
+                    });
+                    if boundary && subject {
+                        out.push(Self::act(ArcEagerMove::Right, labels.parataxis));
+                    }
+                }
+                // A comma-delimited nominal follows its anchor (My brother, a
+                // doctor): the appositive attaches rightward. The Left
+                // compound arm above stands down for punctuated pairs, so the
+                // two never compete. Needs the NOUN Reduce wait below so the
+                // anchor survives the appositive's determiner.
+                (Upos::Noun | Upos::Propn, Upos::Noun | Upos::Propn) => {
+                    if ((s + 1)..b).any(|k| pos[k] == Upos::Punct) {
+                        out.push(Self::act(ArcEagerMove::Right, labels.appos));
+                    }
                 }
                 (Upos::Verb, Upos::Adv) => {
                     out.push(Self::act(ArcEagerMove::Right, labels.advmod));
@@ -462,9 +680,29 @@ impl ArcEagerState {
         // Likewise never pop while an aux/PART is still on the buffer: the
         // stack top may be that aux's subject or host (We did n't see), and
         // Reduce outbids Shift (2.0 > 1.0), stranding them for repair-dep.
+        // Same for an unheaded verb with a determiner on the buffer (Close
+        // your books): its object phrase is arriving — popping strands the
+        // verb and the object falls to repair-dep instead of dobj. Scoped to
+        // non-closed verbs (the directive upgrades): closed verbs keep the
+        // old dynamics their fallback paths rely on (Find the cheapest
+        // flight, where cheapest must stay free to compound onto flight).
+        // And a subordinator waits for its clause (subject NP, then verb):
+        // popping on the subject ([because], it) strands the marker in
+        // repair-dep instead of mark. AUX/PART buffers keep the old
+        // exclusion above — copular fragments are out of scope.
+        // And a nominal anchor waits for its determiner (My brother, a
+        // doctor): popping on the DET ([brother], a) strands the anchor
+        // before the appositive arrives. Scoped to bare nouns — verbs keep
+        // their own waits, pronouns their greedy Right arms.
         if self.right_children[s].is_empty()
             && ps != Upos::Adp
             && !matches!(pb, Upos::Aux | Upos::Part)
+            && !(self.heads[s] == -1
+                && ps == Upos::Verb
+                && pb == Upos::Det
+                && !is_closed_verb(&texts[s]))
+            && !(ps == Upos::Sconj && matches!(pb, Upos::Pron | Upos::Noun | Upos::Propn | Upos::Det))
+            && !(ps == Upos::Noun && pb == Upos::Det)
         {
             out.push(ArcEagerAction {
                 move_type: ArcEagerMove::Reduce,
@@ -572,6 +810,15 @@ impl DeterministicOracle {
                             10.0
                         }
                     }
+                    // Predicate-adjective subject (fee is low): same label,
+                    // same confidence as verbal nsubj.
+                    l if l == labels.nsubj && pos[b] == Upos::Adj => {
+                        if matches!(pos[s], Upos::Noun | Upos::Propn | Upos::Pron) {
+                            100.0
+                        } else {
+                            10.0
+                        }
+                    }
                     l if l == labels.det && matches!(pos[b], Upos::Noun | Upos::Propn) => {
                         if pos[s] == Upos::Det {
                             90.0
@@ -618,6 +865,20 @@ impl DeterministicOracle {
                     }
                     l if l == labels.neg => {
                         if pos[s] == Upos::Part && pos[b] == Upos::Verb {
+                            95.0
+                        } else {
+                            5.0
+                        }
+                    }
+                    l if l == labels.mark => {
+                        if pos[s] == Upos::Sconj && pos[b] == Upos::Verb {
+                            95.0
+                        } else {
+                            5.0
+                        }
+                    }
+                    l if l == labels.cop => {
+                        if pos[s] == Upos::Aux && pos[b] == Upos::Adj {
                             95.0
                         } else {
                             5.0
@@ -674,6 +935,22 @@ impl DeterministicOracle {
                     l if l == labels.acomp => {
                         if pos[s] == Upos::Verb && pos[b] == Upos::Adj {
                             80.0
+                        } else {
+                            5.0
+                        }
+                    }
+                    l if l == labels.parataxis => {
+                        if pos[s] == Upos::Verb && pos[b] == Upos::Verb {
+                            90.0
+                        } else {
+                            5.0
+                        }
+                    }
+                    l if l == labels.appos => {
+                        if matches!(pos[s], Upos::Noun | Upos::Propn)
+                            && matches!(pos[b], Upos::Noun | Upos::Propn)
+                        {
+                            60.0
                         } else {
                             5.0
                         }
@@ -743,6 +1020,10 @@ pub struct DepLabels {
     pub cc: u64,
     pub dep: u64,
     pub neg: u64,
+    pub mark: u64,
+    pub cop: u64,
+    pub appos: u64,
+    pub parataxis: u64,
     pub acomp: u64,
     pub xcomp: u64,
 }
@@ -768,6 +1049,10 @@ impl DepLabels {
             cc: intern("cc"),
             dep: intern("dep"),
             neg: intern("neg"),
+            mark: intern("mark"),
+            cop: intern("cop"),
+            appos: intern("appos"),
+            parataxis: intern("parataxis"),
             acomp: intern("acomp"),
             xcomp: intern("xcomp"),
         }
@@ -934,6 +1219,22 @@ impl ArcEagerAnnotator {
         // -ing participle → VERB. Sequenced after the infinitive pass; the
         // two govern disjoint contexts (aux-host vs. clitic-host).
         refine_pos_contracted_be(&texts, &mut pos);
+        // Directive pass: sentence-initial NOUN + DET + NOUN → VERB.
+        // Sequenced last; disjoint from the aux/clitic triggers above.
+        refine_pos_directive_initial(&texts, &mut pos);
+        // Pronoun-subject pass: finite verb after a nominative pronoun.
+        // Disjoint from all above (PRON prev never matches aux/clitic/
+        // initial triggers).
+        refine_pos_pronoun_subject_verb(&texts, &mut pos);
+        // Initial noun-subject pass: DET+NOUN+NOUN / NOUN+NOUN at the start.
+        // Disjoint (targets positions the earlier passes leave as NOUN).
+        refine_pos_initial_noun_verb(&texts, &mut pos);
+        // Conjoined-clause pass: CC + NOUN + NOUN → VERB. Disjoint (CC prev
+        // matches none of the above triggers).
+        refine_pos_conjoined_clause_verb(&texts, &mut pos);
+        // Copular-predicate pass: be + NOUN → ADJ. Disjoint (AUX prev with
+        // NOUN target matches none of the verb triggers above).
+        refine_pos_be_predicate(&texts, &mut pos);
 
         // Sentence boundaries from the sentencizer.
         let starts = self.sentencizer.predict(doc);
@@ -949,7 +1250,7 @@ impl ArcEagerAnnotator {
             sentence_roots.push(root);
             state.reset_for_sentence(s, e, root, self.labels.root);
             while !state.is_final() {
-                let actions = state.candidate_actions(&pos, &self.labels);
+                let actions = state.candidate_actions(&pos, &texts, &self.labels);
                 let Some((best, margin)) = oracle.best_with_margin(&state, &actions, &pos, &self.labels)
                 else {
                     break;
@@ -1102,11 +1403,13 @@ fn partition_sentences(starts: &[bool], len: usize) -> Vec<(usize, usize)> {
     out
 }
 
-/// The sentence root: the leftmost verb; else the leftmost NOUN/PROPN/PRON;
+/// The sentence root: the leftmost verb; else the leftmost adjective
+/// (copular predicates head their clause); else the leftmost NOUN/PROPN/PRON;
 /// else the first token (the minimal star fallback for degenerate sentences).
 fn pick_root(pos: &[Upos], s: usize, e: usize) -> usize {
     (s..e)
         .find(|&i| pos[i] == Upos::Verb)
+        .or_else(|| (s..e).find(|&i| pos[i] == Upos::Adj))
         .or_else(|| (s..e).find(|&i| matches!(pos[i], Upos::Noun | Upos::Propn | Upos::Pron)))
         .unwrap_or(s)
 }

@@ -129,6 +129,14 @@ impl Lemmatizer {
     /// verbatim: base-form shortcut, per-POS suffix rules over the index, then
     /// exceptions, with the oov/exception ordering preserved.
     fn rule_lemmatize(&self, orth: &str, pos: Upos, morph_key: u64) -> Vec<String> {
+        // Closed contraction-splinter lemmas first (spaCy lookup parity): the
+        // tokenizer splits can't→ca/n't and won't→wo/n't, so the rule tables
+        // never see the base form. POS-conditioned — possessive 's
+        // (PART/case) keeps its surface lemma; only aux-classified clitics
+        // resolve. 'd is excluded (would/had is underdetermined).
+        if let Some(lemma) = contraction_lemma(orth, pos) {
+            return vec![lemma.to_string()];
+        }
         let cache_key = (hash_utf8(orth), pos.id() as u8, morph_key);
         if let Some(cached) = self.cache.read().expect("lemma cache lock poisoned").get(&cache_key) {
             return cached.clone();
@@ -260,11 +268,48 @@ impl Lemmatizer {
     }
 }
 
+/// Closed contraction-splinter lemma map (UD + spaCy lookup parity).
+/// `ca` is the bound allomorph of `can`, `wo` of `will` (both occur only
+/// pre-`n't`); `n't` is the negator `not`; clitic `be`/`have`/`will` forms
+/// resolve to their host. Gated on the parser's POS so possessive `'s`
+/// (PART/case, `Bell's theorem`) and nominal uses keep surface lemmas.
+/// Returns the canonical lemma, or `None` when the tables should decide.
+fn contraction_lemma(orth: &str, pos: Upos) -> Option<&'static str> {
+    if matches!(pos, Upos::Part) && orth.eq_ignore_ascii_case("n't") {
+        return Some("not");
+    }
+    if matches!(pos, Upos::Aux) {
+        if orth.eq_ignore_ascii_case("ca") {
+            return Some("can");
+        }
+        if orth.eq_ignore_ascii_case("wo") {
+            return Some("will");
+        }
+        if orth.eq_ignore_ascii_case("'s")
+            || orth.eq_ignore_ascii_case("'re")
+            || orth.eq_ignore_ascii_case("'m")
+        {
+            return Some("be");
+        }
+        if orth.eq_ignore_ascii_case("'ve") {
+            return Some("have");
+        }
+        if orth.eq_ignore_ascii_case("'ll") {
+            return Some("will");
+        }
+    }
+    if matches!(pos, Upos::Aux | Upos::Verb)
+        && (orth.eq_ignore_ascii_case("did") || orth.eq_ignore_ascii_case("does"))
+    {
+        return Some("do");
+    }
+    None
+}
+
 /// A lemmatizer whose morphology table resolves through a `StringStore`
 /// (helper for callers without a full vocab).
 #[must_use]
-pub fn rule_lemmatizer_with_strings(strings: std::sync::Arc<StringStore>) -> Lemmatizer {
-    let morphology = std::sync::Arc::new(Morphology::new(strings));
+pub fn rule_lemmatizer_with_strings(strings: std::sync::Arc<StringStore>) -> Lemmatizer {    let morphology = std::sync::Arc::new(Morphology::new(strings));
     Lemmatizer::english_rule().with_morphology(morphology)
 }
 
