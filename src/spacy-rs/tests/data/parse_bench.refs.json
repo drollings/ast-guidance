@@ -1432,10 +1432,10 @@
         "text": "rose"
       },
       {
-        "dep": "mark",
+        "dep": "cc",
         "head": 2,
         "lemma": "yet",
-        "pos": "sconj",
+        "pos": "cconj",
         "text": "yet"
       },
       {
@@ -1535,7 +1535,7 @@
       },
       {
         "dep": "nsubj",
-        "head": 4,
+        "head": 5,
         "lemma": "report",
         "pos": "noun",
         "text": "report"
@@ -1549,7 +1549,7 @@
       },
       {
         "dep": "advmod",
-        "head": 2,
+        "head": 3,
         "lemma": "frankly",
         "pos": "adv",
         "text": "frankly"
@@ -1562,22 +1562,22 @@
         "text": ","
       },
       {
-        "dep": "root",
-        "head": 0,
+        "dep": "cop",
+        "head": 1,
         "lemma": "be",
-        "pos": "verb",
+        "pos": "aux",
         "text": "was"
       },
       {
-        "dep": "acomp",
-        "head": -1,
+        "dep": "root",
+        "head": 0,
         "lemma": "late",
         "pos": "adj",
         "text": "late"
       },
       {
         "dep": "punct",
-        "head": -2,
+        "head": -1,
         "lemma": ".",
         "pos": "punct",
         "text": "."
@@ -1817,10 +1817,10 @@
         "text": "What"
       },
       {
-        "dep": "root",
-        "head": 0,
+        "dep": "cop",
+        "head": 1,
         "lemma": "be",
-        "pos": "verb",
+        "pos": "aux",
         "text": "is"
       },
       {
@@ -2425,7 +2425,7 @@
     "subordinate-04": [
       {
         "dep": "mark",
-        "head": 4,
+        "head": 2,
         "lemma": "if",
         "pos": "sconj",
         "text": "If"
@@ -2462,7 +2462,7 @@
         "dep": "obl",
         "head": -1,
         "lemma": "home",
-        "pos": "nsubj",
+        "pos": "noun",
         "text": "home"
       },
       {
@@ -3551,7 +3551,7 @@
     "subordinate-09": [
       {
         "dep": "mark",
-        "head": 5,
+        "head": 2,
         "lemma": "if",
         "pos": "sconj",
         "text": "If"
@@ -3718,7 +3718,7 @@
       },
       {
         "dep": "parataxis",
-        "head": 5,
+        "head": 3,
         "lemma": "know",
         "pos": "verb",
         "text": "knows"
@@ -5087,10 +5087,10 @@
         "text": "dropped"
       },
       {
-        "dep": "mark",
+        "dep": "cc",
         "head": 2,
         "lemma": "yet",
-        "pos": "sconj",
+        "pos": "cconj",
         "text": "yet"
       },
       {

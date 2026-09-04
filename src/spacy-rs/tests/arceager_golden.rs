@@ -502,7 +502,7 @@ fn medial_compound_noun_is_not_a_verb() {
 #[test]
 fn conjoined_clause_verb_after_cc_subject() {
     // Refs (UD): rose → verb, spirits → nsubj → rose. The "yet" marker
-    // (sconj-mark) needs its own arm; rose steals root until the NOUN matrix
+    // (cconj-cc, adversative coordination like "but") needs its own arm; rose steals root until the NOUN matrix
     // verb upgrades (bare-initial work) — its own head is unasserted.
     let (_doc, set) = parse("Grades dropped yet spirits rose.");
     let pos = pos_of(&set);
@@ -539,14 +539,35 @@ fn clause_final_conjoined_word_after_cc_stays_open() {
 }
 
 #[test]
-fn clause_final_conjoined_verb_needs_subject_tracking() {
-    // Must-NOT-fire (boundary): "failed" after "but" at the end is a
-    // conjoined verb, but so is "eggs" a conjoined object in the same shape
-    // — disambiguating them needs clause-subject tracking, not this rule.
+fn clause_final_conjoined_verb_resolves_by_first_conjunct() {
+    // Refs (UD coordination-08): failed → verb/conj → studied. The
+    // predecessor of this test documented the blocker — "failed" and
+    // "eggs" share the CC+NOUN-final shape, disambiguable only by
+    // clause-subject tracking. That tracker now exists: a VERB two back
+    // (studied) proves a verbal second conjunct, a nominal two back
+    // (milk) a nominal one. The (Verb, Verb) conj arm (overt-subject or
+    // shared-subject shape) does the rest.
     let (_doc, set) = parse("She studied but failed.");
     let pos = pos_of(&set);
+    let deps = deps(&set);
     let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
-    assert_eq!(pos[at("failed")], "noun", "pos: {pos:?}");
+    let (studied, failed) = (at("studied"), at("failed"));
+    assert_eq!(pos[failed], "verb", "pos: {pos:?}");
+    assert_eq!(deps[failed], "conj", "deps: {deps:?}");
+    assert_eq!(failed as i32 + set.0[failed].head, studied as i32);
+}
+
+#[test]
+fn adverbial_modified_coordination_stays_nominal() {
+    // Must-NOT-fire (boundary): "quit" follows a conjunction, but the
+    // first conjunct's head is shielded by the pinned-NOUN adverbial
+    // "daily" — the agreement tracker reads the adjacent token only, so
+    // adverbial-modified coordinations ("Run daily or quit", "Run fast or
+    // lose") stay nominal pending daily-disambiguation.
+    let (_doc, set) = parse("Run daily or quit.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("quit")], "noun", "pos: {pos:?}");
 }
 
 #[test]
@@ -1356,10 +1377,31 @@ fn determiner_before_closed_verb_is_nominal() {
     assert_eq!(pos[report], "noun", "pos: {pos:?}");
     assert_eq!(deps[at("the")], "det", "deps: {deps:?}");
     assert_eq!(at("the") as i32 + set.0[at("the")].head, report as i32);
-    // Attachment (report → nsubj → arrive, arrive → verb root) needs the
-    // question-inversion verb rule — its own iteration, deliberately
-    // unasserted here beyond the nominal half it stands on.
-    let _ = arrive;
+    // Question inversion (Did + subject NP + bare verb): the finite verb
+    // after a do-modal-hosted subject upgrades to VERB and takes root,
+    // the subject as nsubj, the host as aux.
+    assert_eq!(pos[arrive], "verb", "pos: {pos:?}");
+    assert_eq!(deps[arrive], "root");
+    assert_eq!(deps[report], "nsubj", "deps: {deps:?}");
+    assert_eq!(report as i32 + set.0[report].head, arrive as i32);
+    assert_eq!(deps[at("Did")], "aux", "deps: {deps:?}");
+    assert_eq!(at("Did") as i32 + set.0[at("Did")].head, arrive as i32);
+}
+
+#[test]
+fn copular_inversion_predicate_stays_adjective() {
+    // Must-NOT-fire: the inversion-verb upgrade is keyed on do-modal
+    // hosts — a be-hosted predicate ("Is the sky blue") keeps its
+    // copular reading (blue → adj/root, sky → nsubj → blue).
+    let (_doc, set) = parse("Is the sky blue?");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (sky, blue) = (at("sky"), at("blue"));
+    assert_eq!(pos[blue], "adj", "pos: {pos:?}");
+    assert_eq!(deps[blue], "root");
+    assert_eq!(deps[sky], "nsubj", "deps: {deps:?}");
+    assert_eq!(sky as i32 + set.0[sky].head, blue as i32);
 }
 
 #[test]
@@ -1377,6 +1419,465 @@ fn bare_closed_verb_without_determiner_stays_verb() {
     let pos = pos_of(&set);
     let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
     assert_eq!(pos[at("sales")], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn parenthetical_anchor_survives_apposition() {
+    // Refs (UD parenthetical-01/03/04/05/07/09/10/11): the anchor is the
+    // matrix subject (brother → nsubj → lives), the appositive depends on
+    // the anchor (doctor → appos → brother). The comma pops the anchor
+    // (Reduce outbids Shift) before the matrix verb arrives, so the anchor
+    // strands in repair-dep while the appositive — attaching earlier —
+    // lands correctly.
+    let (_doc, set) = parse("My brother, a doctor, lives here.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (brother, doctor, lives) = (at("brother"), at("doctor"), at("lives"));
+    assert_eq!(deps[brother], "nsubj", "deps: {deps:?}");
+    assert_eq!(brother as i32 + set.0[brother].head, lives as i32);
+    assert_eq!(deps[doctor], "appos", "deps: {deps:?}");
+    assert_eq!(doctor as i32 + set.0[doctor].head, brother as i32);
+}
+
+#[test]
+fn verbless_concessive_before_comma_keeps_tie_dynamics() {
+    // Must-NOT-fire: "tired" before a comma inside a subordinate-marker
+    // span is the Track B verbless case — the anchor wait must not reroute
+    // it. Both the near-tie emission and the (unchanged) heads are pinned.
+    let (conf, _analysis, _keys) = ambiguity_of("Although tired, she kept pace.");
+    assert!(
+        conf.oracle_tie_count >= 1,
+        "verbless concessive must still tie: {conf:?}"
+    );
+    let (_doc, set) = parse("Although tired, she kept pace.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(deps[at("Although")], "dep", "deps: {deps:?}");
+    assert_eq!(deps[at("tired")], "nsubj", "deps: {deps:?}");
+}
+
+#[test]
+fn clausal_coordination_first_predicate_is_verb() {
+    // Refs (UD multiclause-06/08/11): the first predicate of a clausal
+    // coordination is verbal (rose → verb/root, Prices → nsubj → rose).
+    // Coordination joins likes: a CCONJ-headed second clause with an overt
+    // VERB predicate proves the first predicate verbal too, so a NOUN with
+    // a nominal subject upgrades. The existing nsubj arm and root
+    // selection do the rest — no new arc.
+    let (_doc, set) = parse("Prices rose yet wages stalled.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (prices, rose) = (at("Prices"), at("rose"));
+    assert_eq!(pos[rose], "verb", "pos: {pos:?}");
+    assert_eq!(deps[rose], "root");
+    assert_eq!(deps[prices], "nsubj", "deps: {deps:?}");
+    assert_eq!(prices as i32 + set.0[prices].head, rose as i32);
+}
+
+#[test]
+fn nominal_pair_without_clausal_frame_stays_noun() {
+    // Must-NOT-fire: "chase" has a nominal subject but no CCONJ-headed
+    // second clause ahead (verb-capability needs lexicon knowledge —
+    // Track B territory, explicitly out of scope).
+    let (_doc, set) = parse("Dogs chase red cars.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("chase")], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn clausal_conjunction_second_verb_attaches_conj() {
+    // Refs (UD multiclause-03/06/08/11): the second clause predicate
+    // depends on the first (stayed → conj → passed), the marker on the
+    // second predicate (but → cc → stayed), the subject on its own
+    // predicate (floods → nsubj → stayed). The matrix verb reduces on the
+    // conjunction before the clause verb arrives, so the pair never meets
+    // and everything strands.
+    let (_doc, set) = parse("The storm passed but floods stayed.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (passed, but_, floods, stayed) = (at("passed"), at("but"), at("floods"), at("stayed"));
+    assert_eq!(deps[stayed], "conj", "deps: {deps:?}");
+    assert_eq!(stayed as i32 + set.0[stayed].head, passed as i32);
+    assert_eq!(deps[but_], "cc", "deps: {deps:?}");
+    assert_eq!(but_ as i32 + set.0[but_].head, stayed as i32);
+    assert_eq!(deps[floods], "nsubj", "deps: {deps:?}");
+    assert_eq!(floods as i32 + set.0[floods].head, stayed as i32);
+}
+
+#[test]
+fn elliptical_but_resolves_by_first_conjunct() {
+    // Refs (UD coordination-02, corrected): fell → verb/conj → ran. Same
+    // elliptical mechanism as the studied/failed pair on the but marker:
+    // clause-final with a VERB two back, and no finite verb ahead (an
+    // overt subject like floods always has its predicate after it).
+    let (_doc, set) = parse("She ran but fell.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (ran, but_, fell) = (at("ran"), at("but"), at("fell"));
+    assert_eq!(pos[fell], "verb", "pos: {pos:?}");
+    assert_eq!(deps[fell], "conj", "deps: {deps:?}");
+    assert_eq!(fell as i32 + set.0[fell].head, ran as i32);
+    assert_eq!(deps[but_], "cc", "deps: {deps:?}");
+    assert_eq!(but_ as i32 + set.0[but_].head, fell as i32);
+}
+
+#[test]
+fn verbless_fallback_root_emits_attachment_tie() {
+    // Track B (positive): "Define photosynthesis." has no verb or aux, so
+    // the nominal fallback root (Define) is genuinely ambiguous between an
+    // imperative verb–object reading and an NP-fragment reading — the two
+    // are POS-identical without lexicon knowledge (see
+    // refine_pos_directive_initial). The oracle must record a near-tie (→
+    // RefineReason::Confidence(Ties)) and the frame stage an
+    // AttachmentNearTie with a provisional key — never a confident silent
+    // misparse. Heads/labels are unchanged (Shift wins ties by stable
+    // order); only the margin drops.
+    let (conf, analysis, keys) = ambiguity_of("Define photosynthesis.");
+    assert!(
+        conf.oracle_tie_count >= 1,
+        "verbless fallback root must tie: {conf:?}"
+    );
+    assert!(
+        conf.oracle_margins
+            .iter()
+            .any(|m| m.abs() <= spacy_rs::TIE_MARGIN_EPSILON),
+        "near-zero margin expected: {conf:?}"
+    );
+    assert!(
+        analysis
+            .ambiguities
+            .iter()
+            .any(|a| a.kind == spacy_rs::AmbiguityKind::AttachmentNearTie),
+        "AttachmentNearTie expected: {analysis:?}"
+    );
+    assert!(
+        keys.iter().any(|k| k.provisional),
+        "ambiguous frame mints a provisional key"
+    );
+    // Parse-stability pin: the tie must not re-head anything.
+    let (_doc, set) = parse("Define photosynthesis.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("Define")], "noun", "pos: {pos:?}");
+    assert_eq!(deps[at("Define")], "root");
+}
+
+#[test]
+fn verb_anchored_sentence_emits_no_root_tie() {
+    // Track B (must-NOT-fire control): a sentence with a verbal anchor
+    // ("Dogs bark loudly.") is fully determined — no root tie, no
+    // ambiguity entry, permanent keys.
+    let (conf, analysis, keys) = ambiguity_of("Dogs bark loudly.");
+    assert_eq!(conf.oracle_tie_count, 0, "anchored clause must not tie: {conf:?}");
+    assert!(
+        analysis.ambiguities.is_empty(),
+        "no ambiguity on a clean clause: {analysis:?}"
+    );
+    assert!(
+        keys.iter().all(|k| !k.provisional),
+        "clean frames mint permanent keys"
+    );
+}
+
+#[test]
+fn asyndetic_second_predicate_attaches_conj() {
+    // Refs (UD multiclause-04/09): asyndetic coordination — two imperatives
+    // juxtaposed by comma with no overt subject (play → conj → Work). The
+    // comma+nominal branch owns subject-ful juxtaposition (parataxis: "He
+    // cooks, she cleans"); the subject-less comma shape is coordination.
+    let (_doc, set) = parse("Work hard, play fair.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (work, play) = (at("Work"), at("play"));
+    assert_eq!(deps[play], "conj", "deps: {deps:?}");
+    assert_eq!(play as i32 + set.0[play].head, work as i32);
+}
+
+#[test]
+fn comma_framed_participle_modifies_anchor() {
+    // Refs (UD parenthetical-05/11): comma-framed -ing forms are
+    // participial modifiers (smiling → verb/amod → CEO), not appositive
+    // nominals. The -ing morphology (same allocation-free suffix check as
+    // the copular-predicate rule) plus the comma frame identifies them; the
+    // existing Right arms plus a guarded Left-nsubj do the rest, and the
+    // matrix subject still meets its verb.
+    let (_doc, set) = parse("The CEO, smiling, took questions.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (ceo, smiling, took) = (at("CEO"), at("smiling"), at("took"));
+    assert_eq!(pos[smiling], "verb", "pos: {pos:?}");
+    assert_eq!(deps[smiling], "amod", "deps: {deps:?}");
+    assert_eq!(smiling as i32 + set.0[smiling].head, ceo as i32);
+    assert_eq!(deps[ceo], "nsubj", "deps: {deps:?}");
+    assert_eq!(ceo as i32 + set.0[ceo].head, took as i32);
+}
+
+#[test]
+fn unframed_participle_after_aux_stays_noun() {
+    // Must-NOT-fire: the participial upgrade needs the comma frame —
+    // "coming" after an AUX with no commas stays NOUN (its progressive
+    // reading belongs to copular handling, per the existing aux-prev
+    // pin).
+    let (_doc, set) = parse("They aren't coming today.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("coming")], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn temporal_yet_after_predicate_is_adv() {
+    // Refs (UD contraction-09): yet → adv/advmod → ready. The closed map
+    // lexes every "yet" as CCONJ, but sentence-final "yet" after a
+    // predicate adjective is the temporal adverb (still/yet aspectual
+    // family), not a coordinator — coordinators always have a second
+    // clause (finite verb) ahead.
+    let (_doc, set) = parse("She isn't ready yet.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (ready, yet) = (at("ready"), at("yet"));
+    assert_eq!(pos[yet], "adv", "pos: {pos:?}");
+    assert_eq!(deps[yet], "advmod", "deps: {deps:?}");
+    assert_eq!(yet as i32 + set.0[yet].head, ready as i32);
+}
+
+#[test]
+fn predicate_adjective_takes_trailing_advmod() {
+    // Refs (UD contraction-06): again → adv/advmod → late. Copular
+    // predicates take trailing adverbials rightward; no arm offers
+    // (Adj, Adv), so they strand in repair-dep with the right head.
+    let (_doc, set) = parse("You're late again.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (late, again) = (at("late"), at("again"));
+    assert_eq!(deps[again], "advmod", "deps: {deps:?}");
+    assert_eq!(again as i32 + set.0[again].head, late as i32);
+}
+
+#[test]
+fn clausal_yet_stays_conjunction() {
+    // Must-NOT-fire: "yet" with a second finite clause ahead ("Prices
+    // rose yet wages stalled") is the adversative coordinator — stays
+    // CCONJ even though no nominal follows it directly.
+    let (_doc, set) = parse("Prices rose yet wages stalled.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("yet")], "cconj", "pos: {pos:?}");
+    assert_eq!(deps[at("yet")], "cc", "deps: {deps:?}");
+}
+
+#[test]
+fn bare_object_noun_after_verb_is_nominal() {
+    // Refs (UD contraction-03): calls → noun/dobj → answer. A closed-verb
+    // s-form directly after a VERB at sentence end is a plural object
+    // noun, never a finite verb — English morphosyntax forbids a finite
+    // s-form after a bare verb (modals/causatives govern bare forms), so
+    // the s-form reads nominal. The existing dobj arm lands it.
+    let (_doc, set) = parse("She won't answer calls.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (answer, calls) = (at("answer"), at("calls"));
+    assert_eq!(pos[calls], "noun", "pos: {pos:?}");
+    assert_eq!(deps[calls], "dobj", "deps: {deps:?}");
+    assert_eq!(calls as i32 + set.0[calls].head, answer as i32);
+}
+
+#[test]
+fn verb_form_after_pronoun_stays_verbal() {
+    // Must-NOT-fire: the nominal reading needs a VERB host — "calls"
+    // after a pronoun ("she calls") keeps its finite reading, as does a
+    // non-s-form after a verb ("called left": ends in -t, matrix root).
+    let (_doc, set) = parse("She calls Kelly.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("calls")], "verb", "pos: {pos:?}");
+}
+
+#[test]
+fn negator_before_predicate_adjective_is_neg() {
+    // Refs (UD contraction-09): n't → part/neg → ready. The neg arm is
+    // verb-locked, but negators equally negate predicate adjectives;
+    // the head is already right via repair, only the label strands.
+    let (_doc, set) = parse("She isn't ready yet.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (nt, ready) = (at("n't"), at("ready"));
+    assert_eq!(deps[nt], "neg", "deps: {deps:?}");
+    assert_eq!(nt as i32 + set.0[nt].head, ready as i32);
+}
+
+#[test]
+fn possessive_object_reads_through_determiner() {
+    // Refs (UD question-09): snack → noun/dobj → ate. A verb reduces on a
+    // determiner buffer before its object arrives, stranding the object in
+    // repair-dep. Possessive determiners (my/your/her/…) obligatorily head
+    // a nominal on their right, so the matrix verb can wait out the
+    // determiner: it shifts, heads its noun, and vacates the stack for the
+    // dobj arm. Articles route through the existing det dynamics
+    // (unchanged); complementizer "that" is excluded by word, pronouns by
+    // POS.
+    let (_doc, set) = parse("Who ate my snack?");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (ate, snack) = (at("ate"), at("snack"));
+    assert_eq!(deps[snack], "dobj", "deps: {deps:?}");
+    assert_eq!(snack as i32 + set.0[snack].head, ate as i32);
+}
+
+#[test]
+fn complementizer_that_does_not_wait() {
+    // Must-NOT-fire: verb-headed "that" is a complementizer, not a
+    // determiner — the matrix verb reduces as before so the embedded
+    // subject meets its own verb ("they" stays nsubj → play, never
+    // dobj → know).
+    let (_doc, set) = parse("I know that they play soccer.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (they, play) = (at("they"), at("play"));
+    assert_eq!(deps[they], "nsubj", "deps: {deps:?}");
+    assert_eq!(they as i32 + set.0[they].head, play as i32);
+}
+
+#[test]
+fn bare_ed_predicate_with_transitive_frame_is_verb() {
+    // Refs (UD svo-06/12): bare -ed predicates with a nominal subject and
+    // a determiner-led object (John opened the door) are past-tense
+    // transitives, not noun compounds. Past morphology plus the
+    // transitive frame identifies them: -ed adjectives are attributive
+    // (DET-led: the tired man) or predicative after linking/be (AUX
+    // prev) — never bare-initial-subject position. The pre-existing
+    // Verb–Det wait (which only excludes closed-list verbs) holds the
+    // object slot, and the dobj arm lands it.
+    let (_doc, set) = parse("John opened the door.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (john, opened, door) = (at("John"), at("opened"), at("door"));
+    assert_eq!(pos[opened], "verb", "pos: {pos:?}");
+    assert_eq!(deps[opened], "root");
+    assert_eq!(deps[john], "nsubj", "deps: {deps:?}");
+    assert_eq!(john as i32 + set.0[john].head, opened as i32);
+    assert_eq!(deps[door], "dobj", "deps: {deps:?}");
+    assert_eq!(door as i32 + set.0[door].head, opened as i32);
+}
+
+#[test]
+fn nontransitive_ed_frames_keep_tags() {
+    // Must-NOT-fire (double guard): "dropped" has a conjunction (not a
+    // determiner-led object) after it, and "launched" a proper-noun
+    // object — neither is the transitive frame, so both keep their
+    // current tags (verb via agreement, verb via the closed list).
+    let (_doc, set) = parse("Grades dropped yet spirits rose.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("dropped")], "verb", "pos: {pos:?}");
+    let (_doc, set) = parse("NASA launched HTML5.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("launched")], "verb", "pos: {pos:?}");
+}
+
+#[test]
+fn as_comment_matrix_is_root() {
+    // Refs (UD subordinate-01): a comment clause depends on its matrix
+    // (know → parataxis → low), and the matrix predicate heads (low →
+    // adj/root). The leftmost verb is the subordinate predicate, so
+    // position alone crowns the wrong head — the SCONJ-marked frame plus
+    // a later matrix predicate proves it subordinate. The fee subject
+    // path (nsubj via the aux guard and the clause-boundary idiom) is
+    // pinned unchanged.
+    let (_doc, set) = parse("As you know, your fee is low.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (know, fee, low) = (at("know"), at("fee"), at("low"));
+    assert_eq!(deps[low], "root");
+    assert_eq!(deps[know], "parataxis", "deps: {deps:?}");
+    assert_eq!(know as i32 + set.0[know].head, low as i32);
+    assert_eq!(deps[fee], "nsubj", "deps: {deps:?}");
+    assert_eq!(fee as i32 + set.0[fee].head, low as i32);
+}
+
+#[test]
+fn matrixless_fronted_clause_keeps_subordinate_root() {
+    // Must-NOT-fire: with no well-formed matrix predicate ahead (stay
+    // tags NOUN — the verb-detection gap), skipping the subordinate verb
+    // would orphan the only predicate — rains stays root exactly as
+    // before.
+    let (_doc, set) = parse("If it rains, stay home.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(deps[at("rains")], "root");
+}
+
+#[test]
+fn verbless_matrix_fronted_clause_keeps_subordinate_root() {
+    // Must-NOT-fire: "ends" tags NOUN, so no matrix predicate exists
+    // ahead — knows stays root exactly as before.
+    let (_doc, set) = parse("As everybody knows, lunch ends early.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(deps[at("knows")], "root");
+}
+
+#[test]
+fn root_governed_bare_complement_attaches_ccomp() {
+    // Refs (UD imperative-03): permissive "let" governs its bare
+    // infinitive (go → ccomp → Let). Gated on the matrix verb holding
+    // the crown with a bare (marker/comma-free) verb after it — relcl
+    // matrices ("called left": called never roots) and marked clauses
+    // never match. The object nominals (dead/bury) keep their current
+    // tags — lexicon gaps, deliberately unasserted beyond stability.
+    let (_doc, set) = parse("Let the dead go bury their dead.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (let_, go, bury) = (at("Let"), at("go"), at("bury"));
+    assert_eq!(deps[go], "ccomp", "deps: {deps:?}");
+    assert_eq!(go as i32 + set.0[go].head, let_ as i32);
+    assert_eq!(deps[bury], "dobj", "deps: {deps:?}");
+}
+
+#[test]
+fn relcl_matrix_verb_keeps_crown() {
+    // Must-NOT-fire: "called" never holds the crown (relcl skip), so the
+    // bare-complement gate — which needs a root matrix — cannot fire;
+    // "left" stays root exactly as before.
+    let (_doc, set) = parse("The man who called left.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(deps[at("left")], "root");
+}
+
+#[test]
+fn temporal_today_after_verb_is_advmod() {
+    // Refs (UD imperative-05, contraction-02): temporal "today" (NOUN
+    // per the frozen pin) heads an adverbial modifier of its verb
+    // (today → advmod → Send/go), not a second direct object. Gated on
+    // the word itself — the dobj arm outbids everything below 100, so
+    // this ranks just above it.
+    let (_doc, set) = parse("Send the invoice today.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (send, today) = (at("Send"), at("today"));
+    assert_eq!(deps[today], "advmod", "deps: {deps:?}");
+    assert_eq!(today as i32 + set.0[today].head, send as i32);
+}
+
+#[test]
+fn temporal_today_after_modal_is_advmod() {
+    // Same adverbial reading under a modal host (contraction-02).
+    let (_doc, set) = parse("I can't go today.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (go, today) = (at("go"), at("today"));
+    assert_eq!(deps[today], "advmod", "deps: {deps:?}");
+    assert_eq!(today as i32 + set.0[today].head, go as i32);
 }
 
 #[test]
