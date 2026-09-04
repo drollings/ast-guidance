@@ -125,6 +125,86 @@ fn is_closed_verb(text: &str) -> bool {
     )
 }
 
+/// Hosts that govern a bare infinitive: do-support and the modals, plus the
+/// `n't`-split stubs the tokenizer emits (`wo`/`n't`, `ca`/`n't`). Checked
+/// case-insensitively without allocating (`eq_ignore_ascii_case`).
+fn is_bare_infinitive_host(text: &str) -> bool {
+    const HOSTS: &[&str] = &[
+        "do", "does", "did", "can", "could", "will", "would", "shall", "should", "may", "might",
+        "must", "ca", "wo",
+    ];
+    HOSTS.iter().any(|h| text.eq_ignore_ascii_case(h))
+}
+
+/// Whether `text` is a negator hosted by an auxiliary (`n't`, `not`).
+fn is_aux_negator(text: &str) -> bool {
+    text.eq_ignore_ascii_case("n't") || text.eq_ignore_ascii_case("not")
+}
+
+/// Contextual verb detection for the bare infinitive after a do-modal
+/// auxiliary (`Do help them`, `Don't help them`, `She won't answer calls`).
+/// The tokenizer splits `n't` off its host, so the infinitive — outside the
+/// closed verb list — falls through to NOUN and the clause loses its root.
+///
+/// Upgrades an alpha-fallback NOUN to VERB only when the previous token is a
+/// do-modal host, or a negator (`n't`/`not`) hosted by one. Clitic forms
+/// (`'s`, `'re`, `'ll`, …) are deliberately excluded: possessive `'s`
+/// (`Bell's theorem`) must not trigger. Lexical verbs (`need help`), nouns
+/// (`go today`), and determiners never match, so true nominals are untouched.
+fn refine_pos_bare_infinitive(texts: &[String], pos: &mut [Upos]) {
+    for i in 1..texts.len() {
+        if pos[i] != Upos::Noun {
+            continue;
+        }
+        let prev = texts[i - 1].as_str();
+        let governed = if is_bare_infinitive_host(prev) {
+            true
+        } else if is_aux_negator(prev) && i >= 2 && is_bare_infinitive_host(texts[i - 2].as_str()) {
+            true
+        } else {
+            false
+        };
+        if governed {
+            pos[i] = Upos::Verb;
+        }
+    }
+}
+
+/// Contracted-be disambiguation (`It's raining`, `You're late` vs. `Bell's
+/// theorem`). Runs after the lexeme-only tags so it can read neighbor POS.
+/// Two guarded upgrades, in one ascending pass so the participle rule sees
+/// the freshly classified `'s`:
+///
+/// - `'s` → AUX only when its host is a pronoun (`It`/`You`/…). After a noun
+///   it is the possessive case marker (UD: PART/case) and is left untouched.
+/// - an `-ing` word → VERB only when its host is an aux-classified be-clitic
+///   (`'s`/`'re`/`'m`) — the progressive participle. Full be-forms (`were
+///   surprising`) are excluded: participial adjectives after full be belong
+///   to copular handling, and firing there would mistag them.
+fn refine_pos_contracted_be(texts: &[String], pos: &mut [Upos]) {
+    for i in 0..texts.len() {
+        if pos[i] != Upos::X {
+            continue;
+        }
+        if texts[i].eq_ignore_ascii_case("'s") && i >= 1 && pos[i - 1] == Upos::Pron {
+            pos[i] = Upos::Aux;
+        }
+    }
+    for i in 1..texts.len() {
+        if pos[i] != Upos::Noun {
+            continue;
+        }
+        let prev = texts[i - 1].as_str();
+        let clitic_aux = pos[i - 1] == Upos::Aux
+            && (prev.eq_ignore_ascii_case("'s")
+                || prev.eq_ignore_ascii_case("'re")
+                || prev.eq_ignore_ascii_case("'m"));
+        if clitic_aux && texts[i].len() > 4 && texts[i].to_ascii_lowercase().ends_with("ing") {
+            pos[i] = Upos::Verb;
+        }
+    }
+}
+
 /// Derive UPOS from lexeme flags + the closed function-word map. PROPN fires
 /// on `is_upper()` **only** (never `is_title()`, which matches sentence-initial
 /// common nouns); Title-Case proper nouns (Google, Paris, Tuesday) fall
@@ -145,6 +225,20 @@ pub fn infer_pos(flags: LexemeFlags, text: &str) -> Upos {
     // start).
     if let Some(pos) = closed_funcword_pos(text) {
         return pos;
+    }
+    // Contraction splinters the tokenizer emits: `n't` is a particle (UD:
+    // PART), and the `n't`-split stubs `wo`/`ca` plus the unambiguous
+    // are-clitic `'re` are auxiliaries. Possessive/clitic `'s` is genuinely
+    // ambiguous (It's vs. Bell's) and is resolved contextually in
+    // `refine_pos_contracted_be`, never here.
+    if text.eq_ignore_ascii_case("n't") {
+        return Upos::Part;
+    }
+    if text.eq_ignore_ascii_case("wo")
+        || text.eq_ignore_ascii_case("ca")
+        || text.eq_ignore_ascii_case("'re")
+    {
+        return Upos::Aux;
     }
     // A closed set of common verbs gives the parser a predicate to govern
     // nsubj/dobj around. Verbs outside the list are an honest NOUN false
@@ -325,6 +419,12 @@ impl ArcEagerState {
                 (Upos::Cconj, _) => {
                     out.push(Self::act(ArcEagerMove::Left, labels.cc));
                 }
+                // The negator depends on the verb it negates (Don't help:
+                // n't → neg → help). Without this arm the PART splinter sits
+                // on the stack and every pre-verbal token falls to repair-dep.
+                (Upos::Part, Upos::Verb) => {
+                    out.push(Self::act(ArcEagerMove::Left, labels.neg));
+                }
                 _ => {}
             }
         }
@@ -359,7 +459,13 @@ impl ArcEagerState {
         // Reduce is viable when the stack top is right-complete — except an
         // Adp, which must stay to attract its object (Right(prep) leaves the
         // preposition on the stack so the following noun becomes its pobj).
-        if self.right_children[s].is_empty() && ps != Upos::Adp {
+        // Likewise never pop while an aux/PART is still on the buffer: the
+        // stack top may be that aux's subject or host (We did n't see), and
+        // Reduce outbids Shift (2.0 > 1.0), stranding them for repair-dep.
+        if self.right_children[s].is_empty()
+            && ps != Upos::Adp
+            && !matches!(pb, Upos::Aux | Upos::Part)
+        {
             out.push(ArcEagerAction {
                 move_type: ArcEagerMove::Reduce,
                 label: 0,
@@ -510,6 +616,13 @@ impl DeterministicOracle {
                             5.0
                         }
                     }
+                    l if l == labels.neg => {
+                        if pos[s] == Upos::Part && pos[b] == Upos::Verb {
+                            95.0
+                        } else {
+                            5.0
+                        }
+                    }
                     _ => 1.0,
                 }
             }
@@ -629,6 +742,7 @@ pub struct DepLabels {
     pub advmod: u64,
     pub cc: u64,
     pub dep: u64,
+    pub neg: u64,
     pub acomp: u64,
     pub xcomp: u64,
 }
@@ -653,6 +767,7 @@ impl DepLabels {
             advmod: intern("advmod"),
             cc: intern("cc"),
             dep: intern("dep"),
+            neg: intern("neg"),
             acomp: intern("acomp"),
             xcomp: intern("xcomp"),
         }
@@ -806,9 +921,19 @@ impl ArcEagerAnnotator {
             return Err(AnnotationError::EmptyDocument);
         }
 
-        let pos: Vec<Upos> = (0..doc.len())
-            .map(|i| infer_pos(doc.token(i).lexeme.flags, &doc.token_text(i)))
+        let texts: Vec<String> = (0..doc.len()).map(|i| doc.token_text(i)).collect();
+        let mut pos: Vec<Upos> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| infer_pos(doc.token(i).lexeme.flags, text))
             .collect();
+        // Contextual pass over the lexeme-only tags: bare infinitive after a
+        // do-modal host. Runs before root-picking so the oracle sees verbs.
+        refine_pos_bare_infinitive(&texts, &mut pos);
+        // Contracted-be pass: pronoun-hosted 's → AUX, then clitic-hosted
+        // -ing participle → VERB. Sequenced after the infinitive pass; the
+        // two govern disjoint contexts (aux-host vs. clitic-host).
+        refine_pos_contracted_be(&texts, &mut pos);
 
         // Sentence boundaries from the sentencizer.
         let starts = self.sentencizer.predict(doc);

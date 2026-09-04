@@ -126,8 +126,7 @@ fn one_root_per_sentence_multi_sentence_break() {
 }
 
 #[test]
-fn every_output_is_relatively_headed_and_valid() {
-    for text in [
+fn every_output_is_relatively_headed_and_valid() {    for text in [
         "The cat sat on the mat.",
         "NASA launched HTML5.",
         "Dogs bark loudly.",
@@ -148,4 +147,120 @@ fn every_output_is_relatively_headed_and_valid() {
             }
         }
     }
+}
+
+#[test]
+fn aux_neg_bare_infinitive_help_is_verb() {
+    // "help" is outside the closed verb list; the aux + n't context is the
+    // only evidence. Refs (UD): help → verb/root, them → dobj.
+    let (_doc, set) = parse("Don't help them.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let help = set.0.iter().position(|r| r.text == "help").expect("help");
+    let them = set.0.iter().position(|r| r.text == "them").expect("them");
+    assert_eq!(pos[help], "verb", "pos: {pos:?}");
+    assert_eq!(deps[help], "root");
+    assert_eq!(deps[them], "dobj");
+    assert_eq!(them as i32 + set.0[them].head, help as i32);
+}
+
+#[test]
+fn aux_neg_bare_infinitive_answer_is_verb() {
+    // Tokenizer splits "won't" into wo/n't; "answer" is outside the closed
+    // verb list. Refs (UD): answer → verb/root. "calls" stays over-lexed as
+    // VERB by the closed list (its dobj demotion is a separate error class,
+    // deliberately not asserted here) — but it must no longer steal root.
+    let (_doc, set) = parse("She won't answer calls.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let answer = set.0.iter().position(|r| r.text == "answer").expect("answer");
+    let calls = set.0.iter().position(|r| r.text == "calls").expect("calls");
+    assert_eq!(pos[answer], "verb", "pos: {pos:?}");
+    assert_eq!(deps[answer], "root");
+    assert_eq!(set.0[answer].head, 0);
+    assert_ne!(deps[calls], "root", "calls must not steal root: {deps:?}");
+}
+
+#[test]
+fn true_nominal_help_after_verb_stays_noun() {
+    // Must-NOT-fire: "help" after a lexical verb is a true nominal direct
+    // object and must stay NOUN.
+    let (_doc, set) = parse("I need help.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let help = set.0.iter().position(|r| r.text == "help").expect("help");
+    assert_eq!(pos[help], "noun", "pos: {pos:?}");
+    assert_eq!(deps[help], "dobj");
+}
+
+#[test]
+fn possessive_clitic_does_not_trigger_verb() {
+    // Must-NOT-fire: "'s" is a possessive clitic here, not an aux — the
+    // following noun must stay NOUN.
+    let (doc, set) = parse("Explain Bell's theorem.");
+    let pos = pos_of(&set);
+    let texts = token_texts(&doc);
+    let theorem = texts.iter().position(|t| t == "theorem").expect("theorem");
+    assert_eq!(pos[theorem], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn neg_attaches_to_governing_verb() {
+    // Refs (UD): did → aux, n't → part/neg → see, see → root, We → nsubj,
+    // it → dobj. Before the fix the X-tagged n't blocked the stack and every
+    // pre-verbal token fell to the repair-dep fallback.
+    let (_doc, set) = parse("We didn't see it.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (we, did, nt, see, it) = (at("We"), at("did"), at("n't"), at("see"), at("it"));
+    assert_eq!(pos[did], "aux", "pos: {pos:?}");
+    assert_eq!(pos[nt], "part", "pos: {pos:?}");
+    assert_eq!(deps[did], "aux", "deps: {deps:?}");
+    assert_eq!(deps[nt], "neg", "deps: {deps:?}");
+    assert_eq!(nt as i32 + set.0[nt].head, see as i32);
+    assert_eq!(deps[see], "root");
+    assert_eq!(deps[we], "nsubj");
+    assert_eq!(deps[it], "dobj");
+}
+
+#[test]
+fn contracted_be_progressive_frame() {
+    // Refs (UD): 's → aux, raining → verb/root, It → nsubj.
+    // "hard" (advmod) belongs to adverb detection — deliberately unasserted.
+    let (_doc, set) = parse("It's raining hard.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (it, s, raining) = (at("It"), at("'s"), at("raining"));
+    assert_eq!(pos[s], "aux", "pos: {pos:?}");
+    assert_eq!(pos[raining], "verb", "pos: {pos:?}");
+    assert_eq!(deps[s], "aux", "deps: {deps:?}");
+    assert_eq!(deps[raining], "root");
+    assert_eq!(deps[it], "nsubj");
+    assert_eq!(it as i32 + set.0[it].head, raining as i32);
+}
+
+#[test]
+fn possessive_s_is_not_aux() {
+    // Must-NOT-fire: possessive 's (host is a noun, not a pronoun) keeps its
+    // non-aux tag; the UD case-marker reading is future work, but aux is
+    // wrong and must not leak from the contracted-be rule.
+    let (doc, set) = parse("Explain Bell's theorem.");
+    let pos = pos_of(&set);
+    let texts = token_texts(&doc);
+    let s = texts.iter().position(|t| t == "'s").expect("'s");
+    assert_ne!(pos[s], "aux", "pos: {pos:?}");
+}
+
+#[test]
+fn full_be_participial_adjective_stays_non_verb() {
+    // Must-NOT-fire: "surprising" after full-form "were" is a participial
+    // adjective (ref: adj/root) — the clitic-hosted participle rule must not
+    // fire on full be-forms.
+    let (doc, set) = parse("The results were surprising.");
+    let pos = pos_of(&set);
+    let texts = token_texts(&doc);
+    let surprising = texts.iter().position(|t| t == "surprising").expect("surprising");
+    assert_ne!(pos[surprising], "verb", "pos: {pos:?}");
 }
