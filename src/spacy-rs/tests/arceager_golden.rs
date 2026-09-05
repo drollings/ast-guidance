@@ -165,6 +165,42 @@ fn aux_neg_bare_infinitive_help_is_verb() {
 }
 
 #[test]
+fn inversion_subject_withheld_from_infinitive_upgrade() {
+    // Refs (UD wh-aux-02): a finite verb later in the clause proves the
+    // post-host nominal is the inverted subject, not the infinitive —
+    // `photosynthesis` stays NOUN/nsubj→work, `does` aux→work, `work`
+    // crowns. (The WH-word itself stays NOUN/nsubj: the adverb-lexicon gap
+    // is explicitly out of scope; only its head is claimed.) Determined
+    // frame: no oracle tie.
+    let (_doc, set) = parse("How does photosynthesis work?");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (how, does, subj, verb) = (at("How"), at("does"), at("photosynthesis"), at("work"));
+    assert_eq!(pos[subj], "noun", "pos: {pos:?}");
+    assert_eq!(deps[subj], "nsubj", "deps: {deps:?}");
+    assert_eq!(subj as i32 + set.0[subj].head, verb as i32);
+    assert_eq!(deps[does], "aux", "deps: {deps:?}");
+    assert_eq!(does as i32 + set.0[does].head, verb as i32);
+    assert_eq!(deps[verb], "root", "deps: {deps:?}");
+    assert_eq!(how as i32 + set.0[how].head, verb as i32, "deps: {deps:?}");
+    let (conf, _, _) = ambiguity_of("How does photosynthesis work?");
+    assert_eq!(conf.oracle_tie_count, 0, "determined frame must not tie: {conf:?}");
+}
+
+#[test]
+fn later_sform_object_does_not_block_infinitive_upgrade() {
+    // Must-NOT-fire (boundary of the inversion gate): a clause-final s-form
+    // is a plural object noun, not the clause predicate — `calls` must not
+    // read as the later verb, so `answer` still upgrades (see
+    // `aux_neg_bare_infinitive_answer_is_verb` for the attachment pins).
+    let (_doc, set) = parse("She won't answer calls.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("answer")], "verb", "pos: {pos:?}");
+}
+
+#[test]
 fn aux_neg_bare_infinitive_answer_is_verb() {
     // Tokenizer splits "won't" into wo/n't; "answer" is outside the closed
     // verb list. Refs (UD): answer → verb/root. "calls" stays over-lexed as

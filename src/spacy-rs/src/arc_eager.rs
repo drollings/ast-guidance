@@ -119,6 +119,13 @@ fn is_aux_negator(flags: LexemeFlags) -> bool {
 /// (`'s`, `'re`, `'ll`, …) are deliberately excluded: possessive `'s`
 /// (`Bell's theorem`) must not trigger. Lexical verbs (`need help`), nouns
 /// (`go today`), and determiners never match, so true nominals are untouched.
+/// A finite verb later in the clause withholds the upgrade: the post-host
+/// nominal is then the inverted subject, not the infinitive (`Does
+/// photosynthesis work` — `work` crowns, `photosynthesis` subjects — while
+/// `Do help them`, with no verb ahead, keeps the infinitive reading).
+/// Clause-final s-forms don't count as the later verb: they are plural
+/// object nouns (`She won't answer calls`), owned by the bare-object rule
+/// below, so `answer` still upgrades.
 fn refine_pos_bare_infinitive(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
     for i in 1..texts.len() {
         if pos[i] != Upos::Noun {
@@ -131,10 +138,32 @@ fn refine_pos_bare_infinitive(texts: &[String], pos: &mut [Upos], flags: &[Lexem
         } else {
             false
         };
-        if governed {
+        if !governed {
+            continue;
+        }
+        let later_verb = (i + 1..texts.len())
+            .take_while(|&k| pos[k] != Upos::Punct)
+            .any(|k| pos[k] == Upos::Verb && !is_sform_final(texts, k));
+        if !later_verb {
             pos[i] = Upos::Verb;
         }
     }
+}
+
+/// A verb-form token reading as a plural object noun: an s-form with nothing
+/// but punctuation after it (`calls` in `She won't answer calls`). Shared by
+/// the bare-object rule below and the bare-infinitive gate above (which must
+/// not mistake such objects for the clause predicate).
+fn is_sform_final(texts: &[String], i: usize) -> bool {
+    let word = texts[i].as_str();
+    word.len() > 2
+        && word
+            .get(word.len() - 1..)
+            .is_some_and(|sfx| sfx.eq_ignore_ascii_case("s"))
+        && texts[i + 1..].iter().all(|t| {
+            let w = t.as_str();
+            matches!(w, "." | "!" | "?" | ";" | ":" | "," | "—" | "--")
+        })
 }
 
 /// Bare object noun after a verb (`She won't answer calls`). A closed-verb
