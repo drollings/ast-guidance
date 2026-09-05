@@ -142,13 +142,12 @@ impl Lemmatizer {
             return cached.clone();
         }
 
-        let univ_pos = pos.to_string();
         let base = matches!(pos, Upos::NoTag | Upos::Eol | Upos::Space)
             || self.is_base_form(pos, morph_key);
         let forms = if base {
             vec![orth.to_lowercase()]
-        } else if !self.has_tables(&univ_pos) {
-            if univ_pos == "propn" {
+        } else if !self.has_tables(pos) {
+            if pos == Upos::Propn {
                 vec![orth.to_string()]
             } else {
                 vec![orth.to_lowercase()]
@@ -162,7 +161,7 @@ impl Lemmatizer {
             // unit-pinned alongside `proper_nouns_keep_case`).
             let shouty = orth.chars().any(|c| c.is_alphabetic())
                 && orth.chars().all(|c| !c.is_lowercase());
-            self.apply_rules(orth, &univ_pos, pos == Upos::Verb || shouty)
+            self.apply_rules(orth, pos, pos == Upos::Verb || shouty)
         };
 
         self.cache
@@ -172,11 +171,9 @@ impl Lemmatizer {
         forms
     }
 
-    /// Whether any rule table covers `univ_pos`.
-    fn has_tables(&self, univ_pos: &str) -> bool {
-        self.blob
-            .as_ref()
-            .is_some_and(|b| b.pos_keys().any(|k| k == univ_pos))
+    /// Whether any rule table covers `pos` (enum match — no string probe).
+    fn has_tables(&self, pos: Upos) -> bool {
+        self.blob.as_ref().is_some_and(|b| b.has_pos(pos))
     }
 
     /// The core rule application (`lemmatizer.py:207-240`): endswith rules,
@@ -184,12 +181,12 @@ impl Lemmatizer {
     /// `lowercase_fallback` selects the lowercased surface when no rule
     /// fires (verbs / acronyms); otherwise the surface is kept for
     /// title-case nominals (proper-noun convention).
-    fn apply_rules(&self, orth: &str, univ_pos: &str, lowercase_fallback: bool) -> Vec<String> {
+    fn apply_rules(&self, orth: &str, pos: Upos, lowercase_fallback: bool) -> Vec<String> {
         let orig = orth.to_string();
         let string = orth.to_lowercase();
 
         let blob = self.blob.as_ref().expect("rule mode carries a blob");
-        let rules = blob.rules(univ_pos);
+        let rules = blob.rules_for(pos);
 
         let mut forms: Vec<String> = Vec::new();
         let mut oov_forms: Vec<String> = Vec::new();
@@ -199,7 +196,7 @@ impl Lemmatizer {
                 if form.is_empty() {
                     continue;
                 }
-                let in_index = blob.index_contains(univ_pos, &form);
+                let in_index = blob.index_contains_pos(pos, &form);
                 if in_index || !lex_attrs::is_alpha(&form) {
                     if in_index {
                         forms.insert(0, form);
@@ -217,7 +214,7 @@ impl Lemmatizer {
         forms.retain(|f| seen.insert(f.clone()));
 
         // Exceptions go first, so they get priority.
-        if let Some(lemmas) = blob.exc_for(univ_pos, string.as_str()) {
+        if let Some(lemmas) = blob.exc_for_pos(pos, string.as_str()) {
             for lemma in lemmas.split(|&b| b == 0) {
                 if lemma.is_empty() {
                     continue;
@@ -247,27 +244,26 @@ impl Lemmatizer {
     /// the token's morphology key via the attached table.
     #[must_use]
     pub fn is_base_form(&self, pos: Upos, morph_key: u64) -> bool {
-        let univ_pos = pos.to_string();
         let dict = self
             .morphology
             .as_ref()
             .and_then(|m| m.to_dict(morph_key))
             .unwrap_or_default();
         let get = |k: &str| dict.get(k).map(String::as_str);
-        if univ_pos == "noun" && get("Number") == Some("Sing") {
+        if pos == Upos::Noun && get("Number") == Some("Sing") {
             return true;
         }
-        if univ_pos == "verb" && get("VerbForm") == Some("Inf") {
+        if pos == Upos::Verb && get("VerbForm") == Some("Inf") {
             return true;
         }
-        if univ_pos == "verb"
+        if pos == Upos::Verb
             && get("VerbForm") == Some("Fin")
             && get("Tense") == Some("Pres")
             && get("Number").is_none()
         {
             return true;
         }
-        if univ_pos == "adj" && get("Degree") == Some("Pos") {
+        if pos == Upos::Adj && get("Degree") == Some("Pos") {
             return true;
         }
         if get("VerbForm") == Some("Inf") {

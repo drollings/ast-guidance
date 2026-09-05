@@ -111,6 +111,32 @@ impl Accum {
     }
 }
 
+/// Rubric completeness: every reference token pins `pos`, `dep`, `head`
+/// AND `lemma`. A missing lemma auto-credits (`Accum::add`), silently
+/// inflating the lemma metric — an incomplete rubric is a dishonest meter.
+#[test]
+fn refs_are_fully_annotated() {
+    let raw = std::fs::read_to_string(data_dir().join("parse_bench.refs.json")).expect("refs readable");
+    let refs: Refs = serde_json::from_str(&raw).expect("refs parse");
+    let mut gaps: Vec<String> = Vec::new();
+    for (id, recs) in &refs.refs {
+        for r in recs {
+            if r.pos.is_empty() || r.dep.is_empty() {
+                gaps.push(format!("{id}: {:?} missing pos/dep", r.text));
+            }
+            if r.lemma.is_empty() {
+                gaps.push(format!("{id}: {:?} missing lemma", r.text));
+            }
+        }
+    }
+    assert!(
+        gaps.is_empty(),
+        "rubric has {} unannotated tokens:\n{}",
+        gaps.len(),
+        gaps.join("\n")
+    );
+}
+
 #[test]
 fn dataset_is_stratified() {
     let raw = std::fs::read_to_string(data_dir().join("parse_bench.json")).expect("dataset readable");

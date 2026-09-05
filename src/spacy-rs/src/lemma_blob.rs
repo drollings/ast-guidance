@@ -11,6 +11,7 @@
 use std::cmp::Ordering;
 
 use crate::error::SpacyError;
+use crate::labels::Upos;
 
 /// Magic bytes `"SLM1"` legacy.
 pub const BLOB_MAGIC: u32 = 0x534C_4D31;
@@ -114,6 +115,34 @@ impl LemmaBlob {
             .iter()
             .find(|p| p.key == key)
             .map_or(&[], |p| p.rules.as_slice())
+    }
+
+    /// Whether any rule table covers `pos` (the enum-keyed twin of the
+    /// `&str` probe — the lemmatizer matches on [`Upos`], never on a
+    /// string literal).
+    #[must_use]
+    pub fn has_pos(&self, pos: Upos) -> bool {
+        let key = pos.lemma_key();
+        self.pos.iter().any(|p| p.key == key)
+    }
+
+    /// The suffix rules for `pos`, or an empty slice if absent.
+    #[must_use]
+    pub fn rules_for(&self, pos: Upos) -> &[(&'static str, &'static str)] {
+        self.rules(pos.lemma_key())
+    }
+
+    /// Whether `word` is a known lemma-index word for `pos` (binary search).
+    #[must_use]
+    pub fn index_contains_pos(&self, pos: Upos, word: &str) -> bool {
+        self.index_contains(pos.lemma_key(), word)
+    }
+
+    /// The NUL-joined lemma list for an exception surface under `pos`, if it
+    /// exists (binary search). Split on `\0` for the individual lemmas.
+    #[must_use]
+    pub fn exc_for_pos(&self, pos: Upos, surface: &str) -> Option<&'static [u8]> {
+        self.exc_for(pos.lemma_key(), surface)
     }
 
     /// Whether `word` is a known lemma-index word for `key` (binary search).

@@ -5,7 +5,8 @@
         "dep": "root",
         "head": 0,
         "pos": "verb",
-        "text": "Summarize"
+        "text": "Summarize",
+        "lemma": "summarize"
       },
       {
         "dep": "det",
@@ -233,13 +234,15 @@
         "dep": "neg",
         "head": 1,
         "pos": "part",
-        "text": "n't"
+        "text": "n't",
+        "lemma": "not"
       },
       {
         "dep": "root",
         "head": 0,
         "pos": "verb",
-        "text": "help"
+        "text": "help",
+        "lemma": "help"
       },
       {
         "dep": "dobj",
@@ -467,7 +470,8 @@
         "dep": "nsubj",
         "head": 3,
         "pos": "noun",
-        "text": "Cats"
+        "text": "Cats",
+        "lemma": "cat"
       },
       {
         "dep": "cc",
@@ -480,13 +484,15 @@
         "dep": "conj",
         "head": -1,
         "pos": "noun",
-        "text": "dogs"
+        "text": "dogs",
+        "lemma": "dog"
       },
       {
         "dep": "root",
         "head": 0,
         "pos": "verb",
-        "text": "play"
+        "text": "play",
+        "lemma": "play"
       },
       {
         "dep": "punct",
@@ -538,7 +544,8 @@
         "text": "Buy",
         "pos": "verb",
         "dep": "root",
-        "head": 0
+        "head": 0,
+        "lemma": "buy"
       },
       {
         "text": "milk",
@@ -581,7 +588,8 @@
         "text": "laughed",
         "pos": "verb",
         "dep": "root",
-        "head": 0
+        "head": 0,
+        "lemma": "laugh"
       },
       {
         "text": "and",
@@ -594,7 +602,8 @@
         "text": "cried",
         "pos": "verb",
         "dep": "conj",
-        "head": -2
+        "head": -2,
+        "lemma": "cry"
       },
       {
         "text": ".",
@@ -646,7 +655,8 @@
         "text": "Tea",
         "pos": "noun",
         "dep": "nsubj",
-        "head": 3
+        "head": 3,
+        "lemma": "tea"
       },
       {
         "text": "or",
@@ -659,19 +669,22 @@
         "text": "coffee",
         "pos": "noun",
         "dep": "conj",
-        "head": -2
+        "head": -2,
+        "lemma": "coffee"
       },
       {
         "text": "helps",
         "pos": "verb",
         "dep": "root",
-        "head": 0
+        "head": 0,
+        "lemma": "help"
       },
       {
         "text": "mornings",
         "pos": "noun",
         "dep": "dobj",
-        "head": -1
+        "head": -1,
+        "lemma": "morning"
       },
       {
         "text": ".",
@@ -700,13 +713,15 @@
         "dep": "cop",
         "head": 1,
         "pos": "aux",
-        "text": "is"
+        "text": "is",
+        "lemma": "be"
       },
       {
         "dep": "root",
         "head": 0,
         "pos": "adj",
-        "text": "low"
+        "text": "low",
+        "lemma": "low"
       },
       {
         "dep": "punct",
@@ -735,13 +750,15 @@
         "dep": "cop",
         "head": 1,
         "pos": "aux",
-        "text": "is"
+        "text": "is",
+        "lemma": "be"
       },
       {
         "dep": "root",
         "head": 0,
         "pos": "adj",
-        "text": "blue"
+        "text": "blue",
+        "lemma": "blue"
       },
       {
         "dep": "punct",
@@ -897,7 +914,8 @@
         "dep": "root",
         "head": 0,
         "pos": "verb",
-        "text": "Show"
+        "text": "Show",
+        "lemma": "show"
       },
       {
         "dep": "iobj",
@@ -933,7 +951,8 @@
         "dep": "root",
         "head": 0,
         "pos": "verb",
-        "text": "Open"
+        "text": "Open",
+        "lemma": "open"
       },
       {
         "dep": "det",
@@ -1901,13 +1920,15 @@
         "dep": "root",
         "head": 0,
         "pos": "verb",
-        "text": "called"
+        "text": "called",
+        "lemma": "call"
       },
       {
         "dep": "advmod",
         "head": -1,
         "pos": "adv",
-        "text": "earlier"
+        "text": "earlier",
+        "lemma": "earlier"
       },
       {
         "dep": "punct",
@@ -2061,13 +2082,15 @@
         "dep": "relcl",
         "head": -2,
         "pos": "verb",
-        "text": "called"
+        "text": "called",
+        "lemma": "call"
       },
       {
         "dep": "root",
         "head": 0,
         "pos": "verb",
-        "text": "left"
+        "text": "left",
+        "lemma": "leave"
       },
       {
         "dep": "punct",
@@ -2133,7 +2156,8 @@
         "text": "People",
         "pos": "noun",
         "dep": "nsubj",
-        "head": 3
+        "head": 3,
+        "lemma": "people"
       },
       {
         "text": "who",
@@ -2146,13 +2170,15 @@
         "text": "wait",
         "pos": "verb",
         "dep": "relcl",
-        "head": -2
+        "head": -2,
+        "lemma": "wait"
       },
       {
         "text": "succeed",
         "pos": "verb",
         "dep": "root",
-        "head": 0
+        "head": 0,
+        "lemma": "succeed"
       },
       {
         "text": ".",
@@ -2318,13 +2344,15 @@
         "dep": "cop",
         "head": 1,
         "pos": "aux",
-        "text": "is"
+        "text": "is",
+        "lemma": "be"
       },
       {
         "dep": "root",
         "head": 0,
         "pos": "adj",
-        "text": "low"
+        "text": "low",
+        "lemma": "low"
       },
       {
         "dep": "punct",
@@ -2594,7 +2622,8 @@
         "dep": "root",
         "head": 0,
         "pos": "verb",
-        "text": "sat"
+        "text": "sat",
+        "lemma": "sit"
       },
       {
         "dep": "prep",
@@ -2651,7 +2680,8 @@
         "dep": "advmod",
         "head": -2,
         "pos": "adv",
-        "text": "loudly"
+        "text": "loudly",
+        "lemma": "loudly"
       },
       {
         "dep": "punct",
@@ -2807,7 +2837,8 @@
         "text": "Students",
         "pos": "noun",
         "dep": "nsubj",
-        "head": 3
+        "head": 3,
+        "lemma": "student"
       },
       {
         "text": "who",
@@ -2820,13 +2851,15 @@
         "text": "study",
         "pos": "verb",
         "dep": "relcl",
-        "head": -2
+        "head": -2,
+        "lemma": "study"
       },
       {
         "text": "pass",
         "pos": "verb",
         "dep": "root",
-        "head": 0
+        "head": 0,
+        "lemma": "pass"
       },
       {
         "text": ".",
@@ -2943,7 +2976,8 @@
         "dep": "advmod",
         "head": -1,
         "pos": "adv",
-        "text": "late"
+        "text": "late",
+        "lemma": "late"
       },
       {
         "dep": "punct",
@@ -3270,7 +3304,8 @@
         "dep": "cop",
         "head": 1,
         "pos": "aux",
-        "text": "was"
+        "text": "was",
+        "lemma": "be"
       },
       {
         "dep": "root",
@@ -3306,7 +3341,8 @@
         "dep": "cop",
         "head": 1,
         "pos": "aux",
-        "text": "is"
+        "text": "is",
+        "lemma": "be"
       },
       {
         "dep": "root",
@@ -3342,7 +3378,8 @@
         "dep": "cop",
         "head": 1,
         "pos": "aux",
-        "text": "is"
+        "text": "is",
+        "lemma": "be"
       },
       {
         "dep": "root",
@@ -3378,7 +3415,8 @@
         "dep": "cop",
         "head": 1,
         "pos": "aux",
-        "text": "was"
+        "text": "was",
+        "lemma": "be"
       },
       {
         "dep": "root",
@@ -3421,7 +3459,8 @@
         "dep": "acomp",
         "head": -1,
         "pos": "adj",
-        "text": "boring"
+        "text": "boring",
+        "lemma": "boring"
       },
       {
         "dep": "punct",
@@ -3436,7 +3475,8 @@
         "dep": "nsubj",
         "head": 1,
         "pos": "noun",
-        "text": "Dinner"
+        "text": "Dinner",
+        "lemma": "dinner"
       },
       {
         "dep": "root",
@@ -3894,7 +3934,8 @@
         "dep": "nsubj",
         "head": 5,
         "pos": "noun",
-        "text": "Soccer"
+        "text": "Soccer",
+        "lemma": "soccer"
       },
       {
         "dep": "punct",
@@ -4734,7 +4775,8 @@
         "dep": "aux",
         "head": 2,
         "pos": "aux",
-        "text": "is"
+        "text": "is",
+        "lemma": "be"
       },
       {
         "dep": "neg",
@@ -4777,7 +4819,8 @@
         "dep": "aux",
         "head": 2,
         "pos": "aux",
-        "text": "are"
+        "text": "are",
+        "lemma": "be"
       },
       {
         "dep": "neg",
@@ -4945,7 +4988,8 @@
         "dep": "nsubj",
         "head": 1,
         "pos": "noun",
-        "text": "Rain"
+        "text": "Rain",
+        "lemma": "rain"
       },
       {
         "dep": "root",
@@ -5192,7 +5236,8 @@
         "dep": "punct",
         "head": -2,
         "pos": "punct",
-        "text": "?"
+        "text": "?",
+        "lemma": "?"
       }
     ],
     "question-08": [
@@ -5228,7 +5273,8 @@
         "dep": "punct",
         "head": -3,
         "pos": "punct",
-        "text": "?"
+        "text": "?",
+        "lemma": "?"
       }
     ],
     "question-09": [
@@ -5264,7 +5310,8 @@
         "dep": "punct",
         "head": -1,
         "pos": "punct",
-        "text": "?"
+        "text": "?",
+        "lemma": "?"
       }
     ],
     "question-10": [
@@ -5300,7 +5347,8 @@
         "dep": "punct",
         "head": -2,
         "pos": "punct",
-        "text": "?"
+        "text": "?",
+        "lemma": "?"
       }
     ],
     "question-11": [
@@ -5329,7 +5377,8 @@
         "dep": "punct",
         "head": -1,
         "pos": "punct",
-        "text": "?"
+        "text": "?",
+        "lemma": "?"
       }
     ],
     "question-12": [
@@ -5365,7 +5414,8 @@
         "dep": "punct",
         "head": -2,
         "pos": "punct",
-        "text": "?"
+        "text": "?",
+        "lemma": "?"
       }
     ],
     "command-07": [
@@ -8507,7 +8557,8 @@
         "dep": "neg",
         "head": 1,
         "pos": "part",
-        "text": "n't"
+        "text": "n't",
+        "lemma": "not"
       },
       {
         "dep": "root",
@@ -8712,7 +8763,8 @@
         "dep": "neg",
         "head": 1,
         "pos": "part",
-        "text": "n't"
+        "text": "n't",
+        "lemma": "not"
       },
       {
         "dep": "root",
@@ -8976,9 +9028,9 @@
       {
         "dep": "punct",
         "head": -1,
-        "lemma": "—",
+        "lemma": "\u2014",
         "pos": "punct",
-        "text": "—"
+        "text": "\u2014"
       },
       {
         "dep": "advmod",

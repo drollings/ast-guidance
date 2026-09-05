@@ -167,6 +167,23 @@ fn english_rule_data_is_loaded() {
     assert_eq!(l.mode(), LemmatizerMode::Rule);
 }
 
+#[test]
+fn lemma_key_is_display_without_alloc() {
+    // Single source of truth for the `Upos` → lemma-blob-key mapping: the
+    // hot path must match on the enum (zero-cost, typo-impossible) instead
+    // of round-tripping through `to_string()` plus `== "noun"` literals.
+    // Every key renders exactly as `Display` (the blob's contract), as a
+    // `&'static str` with no per-token allocation.
+    for pos in Upos::UPOS {
+        let key: &'static str = pos.lemma_key();
+        assert_eq!(key, pos.to_string(), "{pos:?}");
+    }
+    assert_eq!(Upos::Propn.lemma_key(), "propn");
+    assert_eq!(Upos::Noun.lemma_key(), "noun");
+    assert_eq!(Upos::Verb.lemma_key(), "verb");
+    assert_eq!(Upos::Adj.lemma_key(), "adj");
+}
+
 /// Side-by-side probe (diagnostic only — asserts no score): for every bench
 /// token whose deterministic UPOS misses the ref, compare lemma-support
 /// under the predicted vs gold POS. Support ladder (higher wins):

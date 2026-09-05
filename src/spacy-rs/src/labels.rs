@@ -110,6 +110,38 @@ impl Upos {
             other => Err(SpacyError::UnknownPos(other.to_string())),
         }
     }
+
+    /// The lemma-blob table key for this tag: the same lowercase label
+    /// [`Display`](fmt::Display) renders, as a `&'static str` with no
+    /// allocation. Single source of truth — the lemmatizer matches on the
+    /// enum and keys the blob through this, never through `to_string()`
+    /// plus string literals (typo-impossible, zero-cost on the hot path).
+    #[must_use]
+    pub const fn lemma_key(self) -> &'static str {
+        match self {
+            Self::NoTag => "",
+            Self::Adj => "adj",
+            Self::Adp => "adp",
+            Self::Adv => "adv",
+            Self::Aux => "aux",
+            Self::Conj => "conj",
+            Self::Cconj => "cconj",
+            Self::Det => "det",
+            Self::Intj => "intj",
+            Self::Noun => "noun",
+            Self::Num => "num",
+            Self::Part => "part",
+            Self::Pron => "pron",
+            Self::Propn => "propn",
+            Self::Punct => "punct",
+            Self::Sconj => "sconj",
+            Self::Sym => "sym",
+            Self::Verb => "verb",
+            Self::X => "x",
+            Self::Eol => "eol",
+            Self::Space => "space",
+        }
+    }
 }
 
 impl fmt::Display for Upos {

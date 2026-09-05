@@ -3712,3 +3712,39 @@ fn sentence_start_gate_must_not_fire_controls() {
     assert_eq!(set.0[at("call")].pos, "verb", "call crowns");
     assert_eq!(set.0[at("call")].dep, "root");
 }
+
+#[test]
+fn lemma_fallback_split_golden() {
+    // Lemma-behavior pins for the stringly-typed-UPOS refactor (lemmatizer
+    // hot path must stop round-tripping `Upos` through `String`): the
+    // PROPN-vs-NOUN fallback split and the closed be-lemma must not move.
+    // Attachment-level assertions (exact dep + head) plus lemma per token.
+    let (_doc, set) = parse("Apple sells cheese.");
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (apple, sells, cheese) = (at("Apple"), at("sells"), at("cheese"));
+    assert_eq!(set.0[apple].pos, "noun", "Apple stays nominal");
+    assert_eq!(set.0[apple].dep, "nsubj", "Apple attaches as subject");
+    assert_eq!(
+        set.0[apple].head,
+        sells as i32 - apple as i32,
+        "Apple points at sells (relative)"
+    );
+    assert_eq!(set.0[apple].lemma, "Apple", "title-case nominal keeps surface");
+    assert_eq!(set.0[sells].pos, "verb", "sells crowns");
+    assert_eq!(set.0[sells].dep, "root");
+    assert_eq!(set.0[sells].lemma, "sell", "verb inflection reduces");
+    assert_eq!(set.0[cheese].dep, "dobj", "cheese attaches as object");
+    assert_eq!(set.0[cheese].lemma, "cheese", "base noun keeps surface");
+}
+
+#[test]
+fn lemma_closed_be_and_plural_must_not_fire_controls() {
+    // Must-NOT-fire controls for the same refactor: plural reduction and
+    // the closed auxiliary be-lemma share the touched code path and must
+    // not move while the fallback split is pinned above.
+    let (_doc, set) = parse("The cats are running.");
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(set.0[at("cats")].lemma, "cat", "plural reduces");
+    assert_eq!(set.0[at("cats")].dep, "nsubj", "cats attaches as subject");
+    assert_eq!(set.0[at("are")].lemma, "be", "aux be-form resolves");
+}
