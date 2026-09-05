@@ -432,3 +432,248 @@ fn random_pos_sequences_produce_valid_trees() {
         validator.validate(&doc, result.records()).expect("7-check gate");
     }
 }
+
+// ── DRY: shared suffix primitive equivalence ───────────────────────────
+// `has_suffix_ci` consolidates the ~20 bespoke allocation-free suffix
+// idioms (`word.get(word.len() - N..).is_some_and(eq_ignore_ascii_case)`,
+// suffixes "s" / "ly" / "ed" / "ing") plus the one allocating
+// `to_ascii_lowercase().ends_with("ing")` site. Length guards stay at the
+// call sites verbatim; this test proves the primitive agrees with every
+// legacy spelling on guarded inputs (zero behavior change), returns false
+// without panicking on unguarded shorts, and matches the allocating site.
+#[test]
+fn suffix_ci_matches_every_legacy_spelling() {
+    fn legacy(word: &str, suffix: &str) -> bool {
+        word.get(word.len() - suffix.len()..)
+            .is_some_and(|sfx| sfx.eq_ignore_ascii_case(suffix))
+    }
+    let words = [
+        "calls", "CALLS", "Calls", "as", "AS", "x", "quarterly", "QUARTERLY", "Quarterly",
+        "July", "family", "daily", "opened", "OPENED", "Opened", "red", "bed",
+        "smiling", "SMILING", "Smiling", "coming", "morning", "building", "king",
+        "sing", "rain", "raining", "RAINING", "go", "a", "today", "yet", "hard",
+        "it", "answer", "status", "statuses",
+    ];
+    for suffix in ["s", "ly", "ed", "ing"] {
+        for word in words {
+            if word.len() >= suffix.len() {
+                assert_eq!(
+                    has_suffix_ci(word, suffix),
+                    legacy(word, suffix),
+                    "word={word:?} suffix={suffix:?}"
+                );
+                // The one allocating site must agree too.
+                assert_eq!(
+                    has_suffix_ci(word, suffix),
+                    word.to_ascii_lowercase().ends_with(suffix),
+                    "alloc-parity word={word:?} suffix={suffix:?}"
+                );
+            } else {
+                // Unguarded shorts never reach the primitive (call-site length
+                // guards stay verbatim), but it must be total, not panicking.
+                assert!(!has_suffix_ci(word, suffix), "short word={word:?}");
+            }
+        }
+        // Empty word and empty suffix are total as well.
+        assert!(!has_suffix_ci("", suffix), "empty word suffix={suffix:?}");
+    }
+    assert!(has_suffix_ci("calls", ""));
+}
+
+// ── DRY: shared trailing-punctuation primitive equivalence ─────────────
+// `is_trailing_punct_only` consolidates the 8 bespoke clause-final guards
+// (`texts[from..].iter().all(|t| matches!(…))` over ". ! ? ; : , — --").
+// This test proves the primitive agrees with the legacy spelling at every
+// slice start (zero behavior change) across a token matrix covering empty,
+// punct-only, word-only, mixed, multi-char-punct ("..."), and unicode-dash
+// edges.
+#[test]
+fn trailing_punct_only_matches_legacy_idiom() {
+    fn legacy(texts: &[String], from: usize) -> bool {
+        texts[from..].iter().all(|t| {
+            let w = t.as_str();
+            matches!(w, "." | "!" | "?" | ";" | ":" | "," | "—" | "--")
+        })
+    }
+    let streams: Vec<Vec<String>> = [
+        Vec::<&str>::new(),
+        vec!["."],
+        vec!["!"],
+        vec!["--"],
+        vec!["—"],
+        vec!["calls"],
+        vec!["today"],
+        vec!["..."],
+        vec![",", "—", "--", "."],
+        vec!["calls", "."],
+        vec!["today", "."],
+        vec![".", "calls"],
+        vec!["?", "x"],
+        vec!["a", "b", "."],
+        vec!["ready", "yet", "."],
+        vec!["work", "?"],
+        vec!["loudly", "."],
+    ]
+    .iter()
+    .map(|s| s.iter().map(|t| t.to_string()).collect())
+    .collect();
+    for texts in &streams {
+        for from in 0..=texts.len() {
+            assert_eq!(
+                is_trailing_punct_only(texts, from),
+                legacy(texts, from),
+                "texts={texts:?} from={from}"
+            );
+        }
+    }
+}
+
+// ── DRY: shared lowercase-initial primitive equivalence ────────────────
+// `starts_lowercase` consolidates the 10 bespoke finite-verb guards
+// (`word.chars().next().is_some_and(|c| c.is_lowercase())` over both the
+// `word` and `texts[i]` receiver spellings, both polarities). This test
+// proves the primitive agrees with the legacy spelling on every input
+// (zero behavior change), including empty, non-alpha-first, digit-first,
+// and unicode (ß/ẞ, É/é) edges where `chars().next()` — never byte
+// indexing — is the correct operation.
+#[test]
+fn starts_lowercase_matches_legacy_spelling() {
+    fn legacy(word: &str) -> bool {
+        word.chars().next().is_some_and(|c| c.is_lowercase())
+    }
+    let words = [
+        "opened", "failed", "left", "stands", "ended", "fell", "ready", "work", "calls",
+        "wittily", "unlikely", "loudly", "quarterly", "smiling", "raining",
+        "Anna", "July", "CEO", "NASA", "Big", "Dogs", "She", "It", "S", "A",
+        "yet", "today", "hard", "go", "a", "x", "", "5", "2fast", ".", ",", "—",
+        "éclair", "Éclair", "ßeta", "ẞeta", "über", "Über",
+    ];
+    for word in words {
+        assert_eq!(
+            starts_lowercase(word),
+            legacy(word),
+            "word={word:?}"
+        );
+        // Both receiver spellings in the file (`word` and `texts[i]`)
+        // route through the same `&str` primitive.
+        let owned = word.to_string();
+        assert_eq!(starts_lowercase(&owned), legacy(word), "owned {word:?}");
+    }
+}
+
+// ── DRY: shared copula-attachment primitive equivalence ────────────────
+// `copula_is_attached` consolidates the 6 bespoke copula-frame guards
+// (`left_children[b].iter().any(|&c| labels[c] == cop)` over both the
+// `self` (candidate arms) and `state` (oracle weights) receiver
+// spellings). This test proves the primitive agrees with the legacy
+// spelling on controlled fixtures (zero behavior change): empty children,
+// non-cop labels, cop NOT first among several children, and a cop label
+// attached to a different head.
+#[test]
+fn copula_is_attached_matches_legacy_spelling() {
+    let vocab = en_vocab();
+    let labels = label_hashes(&vocab);
+    fn legacy(state: &ArcEagerState, b: usize, cop: u64) -> bool {
+        state.left_children[b]
+            .iter()
+            .any(|&c| state.labels[c] == cop)
+    }
+    // Fixture 1: cop attached (with a non-cop sibling before it).
+    let mut attached = ArcEagerState::new(5, 0);
+    attached.left_children[3].push(1);
+    attached.labels[1] = labels.det;
+    attached.left_children[3].push(2);
+    attached.labels[2] = labels.cop;
+    // Fixture 2: children present but none is a cop.
+    let mut bare = ArcEagerState::new(5, 0);
+    bare.left_children[3].push(1);
+    bare.labels[1] = labels.det;
+    // Fixture 3: a cop attached to a DIFFERENT head (b=1), not b=3.
+    let mut elsewhere = ArcEagerState::new(5, 0);
+    elsewhere.left_children[1].push(0);
+    elsewhere.labels[0] = labels.cop;
+    // Fixture 4: no children at all.
+    let empty = ArcEagerState::new(5, 0);
+    for (state, b, expected) in [
+        (&attached, 3, true),
+        (&attached, 1, false),
+        (&bare, 3, false),
+        (&elsewhere, 3, false),
+        (&elsewhere, 1, true),
+        (&empty, 3, false),
+        (&empty, 0, false),
+    ] {
+        assert_eq!(legacy(state, b, labels.cop), expected, "legacy b={b}");
+        assert_eq!(
+            copula_is_attached(state, b, labels.cop),
+            legacy(state, b, labels.cop),
+            "b={b}"
+        );
+    }
+}
+
+// ── DRY: shared sentence-start primitive equivalence ───────────────────
+// `is_sentence_start` consolidates the 3 bespoke sentence-boundary guards
+// (`i == 0 || matches!(texts[i-1])` over ". ! ? ; : — --" — commas never
+// split sentences here; the comma-frame rules own those). This test proves
+// the primitive agrees with the legacy spelling at every position (zero
+// behavior change), including the comma-after (false), mid-word (false),
+// and empty-stream edges.
+#[test]
+fn sentence_start_matches_legacy_spelling() {
+    fn legacy(texts: &[String], i: usize) -> bool {
+        i == 0
+            || matches!(
+                texts[i - 1].as_str(),
+                "." | "!" | "?" | ";" | ":" | "—" | "--"
+            )
+    }
+    let streams: Vec<Vec<String>> = [
+        vec!["Call", "the", "office", "now", "."],
+        vec!["Well", ",", "we", "won", "."],
+        vec!["Eat", "apples", "daily", "."],
+        vec!["Please", "call", "the", "office", "."],
+        vec!["Sit", "down", ".", "Call", "the", "office", "."],
+        vec!["What", "?", "Eat", "apples", "."],
+        vec!["Go", ";", "run", "fast", "."],
+        vec!["Wait", "--", "listen", "."],
+        vec!["Yes", "—", "go", "."],
+        vec![",", "go", "."],
+        vec!["go"],
+    ]
+    .iter()
+    .map(|s| s.iter().map(|t| t.to_string()).collect())
+    .collect();
+    for texts in &streams {
+        for i in 0..texts.len() {
+            assert_eq!(
+                is_sentence_start(texts, i),
+                legacy(texts, i),
+                "texts={texts:?} i={i}"
+            );
+        }
+    }
+    // Commas never open sentences; every true boundary token does.
+    let comma: Vec<String> = ["Hi", ",", "there"]
+        .iter()
+        .map(|t| t.to_string())
+        .collect();
+    assert!(!is_sentence_start(&comma, 2));
+    for (boundary, after) in [
+        (".", "Call"),
+        ("!", "Run"),
+        ("?", "Eat"),
+        (";", "go"),
+        (":", "see"),
+        ("—", "go"),
+        ("--", "listen"),
+    ] {
+        let texts: Vec<String> = ["Sat", boundary, after]
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        assert!(is_sentence_start(&texts, 0), "{boundary}");
+        assert!(!is_sentence_start(&texts, 1), "{boundary}");
+        assert!(is_sentence_start(&texts, 2), "{boundary}");
+    }
+}

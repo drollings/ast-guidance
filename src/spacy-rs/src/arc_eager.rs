@@ -1,4 +1,4 @@
-//! The deterministic transition parser (ROADMAP §8 — F6, F8).
+//! The deterministic transition parser
 //!
 //! # Honest framing
 //!
@@ -7,28 +7,7 @@
 //! transition model. It does **not** claim dependency parity with spaCy. It
 //! exists to lift the fallback ladder's output from a flat star parse to a
 //! shallow `nsubj`/`dobj`/`iobj`/`compound`/`prep`+`pobj` structure so routing
-//! signals are usable even with no LLM (VISION: deterministic before
-//! probabilistic; the LLM stays the primary rung, this parser the middle
-//! fallback, `RuleAnnotator` the terminal infallible rung).
-//!
-//! # Head convention (F8)
-//!
-//! - **Internal** `heads[i]` holds the **absolute** index of `i`'s head, `-1`
-//!   while unset. The virtual root is represented by the dep label `root`,
-//!   **not** by any head value — so the ROOT test is
-//!   `labels[i] == hash_utf8("root")`, never `heads[i] == 0` (which would
-//!   misread token 0's head).
-//! - **Output** converts to spaCy's **relative signed offset** convention on
-//!   `to_annotation_set`: non-root `head = abs_head - i`, root `head = 0`.
-//!
-//! # POS heuristics (F6)
-//!
-//! [`infer_pos`] derives UPOS from lexeme flags plus a closed English
-//! function-word map. PROPN fires on `is_upper()` **only** — never
-//! `is_title()`, which matches sentence-initial common nouns. This asymmetry
-//! is inherent to lexeme-only POS and is exactly why the LLM rung remains
-//! primary; the golden corpus asserts both the negative case (Title Case
-//! non-entity → NOT PROPN) and the positive case (ALL-CAPS → PROPN).
+//! signals are usable even with no LLM.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -47,16 +26,13 @@ use crate::validate::{AnnotationError, AnnotationValidator};
 use crate::vocab::Vocab;
 
 // ─────────────────────────────────────────────────────────────────────────
-// POS heuristics (§8.2)
+// POS heuristics
 // ─────────────────────────────────────────────────────────────────────────
 
 /// The closed function-word POS map — the only way a lexeme-only heuristic
 /// gets DET/ADP/AUX/CCONJ/SCONJ. Reads per-language
 /// [`LexemeFlags`] bits (populated from `LexiconConfig::function_words`)
-/// instead of hard-coded spellings; priority order (DET > ADP > AUX >
-/// CCONJ > SCONJ > PRON) decides multi-category forms (`after` is ADP,
-/// `that`/`her` are DET). Honest about its limits: it is a finite
-/// data table, not a trained tagger.
+/// instead of hard-coded spellings.
 fn closed_funcword_pos(flags: LexemeFlags) -> Option<Upos> {
     if flags.is_det_word() {
         Some(Upos::Det)
@@ -75,19 +51,80 @@ fn closed_funcword_pos(flags: LexemeFlags) -> Option<Upos> {
     }
 }
 
+/// Allocation-free case-insensitive ASCII suffix check — the single shared
+/// spelling of the `word.get(word.len() - N..).is_some_and(eq_ignore_ascii_case)`
+/// idiom used across the POS refines, the candidate arms, and the root
+/// helpers (suffixes `"s"`, `"ly"`, `"ed"`, `"ing"). It also replaces the one
+/// allocating `to_ascii_lowercase().ends_with("ing")` site with identical
+/// semantics (ASCII-only case folding either way). Length guards stay at the
+/// call sites verbatim, so behavior is unchanged; this only collapses the
+/// idiom. `#[inline]` for the O(n) frame scans (zero-cost-idiom rule).
+#[inline]
+fn has_suffix_ci(word: &str, suffix: &str) -> bool {
+    word.len() >= suffix.len()
+        && word
+            .get(word.len() - suffix.len()..)
+            .is_some_and(|sfx| sfx.eq_ignore_ascii_case(suffix))
+}
+
+/// Whether only clause-terminating punctuation follows — the single shared
+/// spelling of the clause-final guard (`is_sform_final`, the bare-object,
+/// relative-matrix (final and complement), predicative-ly, final-adverbial,
+/// temporal-yet, and modal-question frames). The 8-token set
+/// (`. ! ? ; : , — --`) is load-bearing: commas count as final here because
+/// every call site pairs this with its own comma-frame rule. `#[inline]`
+/// for the O(n) frame scans (zero-cost-idiom rule).
+#[inline]
+fn is_trailing_punct_only(texts: &[String], from: usize) -> bool {
+    texts[from..].iter().all(|t| {
+        matches!(
+            t.as_str(),
+            "." | "!" | "?" | ";" | ":" | "," | "—" | "--"
+        )
+    })
+}
+
+/// Whether the word begins with a lowercase letter — the single shared
+/// spelling of the finite-verb guard ("a finite verb is never capitalized".
+/// Covers both receiver spellings in the file (`word` and `texts[i]`) and
+/// both polarities (guard and upgrade gate).  `chars().next()` — never byte
+/// indexing — is load-bearing for unicode initials.
+#[inline]
+fn starts_lowercase(word: &str) -> bool {
+    word.chars().next().is_some_and(|c| c.is_lowercase())
+}
+
+/// Whether a `cop` dependent is already attached to `b` — the single shared
+/// spelling of the copula-frame guard (the `copular_subject_frame` helper,
+/// the two `there`-expletive candidate arms, and the three oracle cop/attr
+/// weights). Taking `&ArcEagerState` covers both receiver spellings in the
+/// file (`self` in the candidate arms, `state` in the oracle).
+#[inline]
+fn copula_is_attached(state: &ArcEagerState, b: usize, cop: u64) -> bool {
+    state.left_children[b]
+        .iter()
+        .any(|&c| state.labels[c] == cop)
+}
+
+/// Whether token `i` opens a sentence — position 0 or right after a
+/// sentence-terminating boundary (`. ! ? ; : — --`). The single shared
+/// spelling of the initial-frame guard (directive-initial,
+/// discourse-initial, imperative-non-det). Commas never split sentences
+/// here — the comma-frame rules own those. `#[inline]` for the O(n) frame
+/// scans (zero-cost-idiom rule).
+#[inline]
+fn is_sentence_start(texts: &[String], i: usize) -> bool {
+    i == 0
+        || matches!(
+            texts[i - 1].as_str(),
+            "." | "!" | "?" | ";" | ":" | "-" | "—" | "--"
+        )
+}
+
 /// Determiner-led nominal colliding with the closed verb list (`the
 /// report`, `a saw`). The closed verb check in [`infer_pos`] fires before
 /// any nominal guard, so a determiner-led noun that shares a form with the
-/// list tags VERB, steals root, and strands the true predicate. A
-/// determiner never governs a finite verb, so DET + closed-verb-form reads
-/// nominal. Downgrades VERB to NOUN only directly after a DET, sequenced
-/// FIRST among the refines so only [`infer_pos`] verbs (the closed list)
-/// are candidates — every VERB-upgrade pass below reads the corrected
-/// tags, and no upgrade output is ever touched. Guards: bare verbs (`Dogs
-/// bark`, `Close your books` — no determiner) never match. Known
-/// boundary: determiner-shaped relativizers (`the book that reports…`)
-/// have no corpus instance — `that`-headed verb disambiguation is its own
-/// rule.
+/// list tags VERB, steals root, and strands the true predicate.
 fn refine_pos_det_closed_verb(_texts: &[String], pos: &mut [Upos], __flags: &[LexemeFlags]) {
     for i in 1..pos.len() {
         if pos[i] != Upos::Verb || pos[i - 1] != Upos::Det {
@@ -113,19 +150,6 @@ fn is_aux_negator(flags: LexemeFlags) -> bool {
 /// auxiliary (`Do help them`, `Don't help them`, `She won't answer calls`).
 /// The tokenizer splits `n't` off its host, so the infinitive — outside the
 /// closed verb list — falls through to NOUN and the clause loses its root.
-///
-/// Upgrades an alpha-fallback NOUN to VERB only when the previous token is a
-/// do-modal host, or a negator (`n't`/`not`) hosted by one. Clitic forms
-/// (`'s`, `'re`, `'ll`, …) are deliberately excluded: possessive `'s`
-/// (`Bell's theorem`) must not trigger. Lexical verbs (`need help`), nouns
-/// (`go today`), and determiners never match, so true nominals are untouched.
-/// A finite verb later in the clause withholds the upgrade: the post-host
-/// nominal is then the inverted subject, not the infinitive (`Does
-/// photosynthesis work` — `work` crowns, `photosynthesis` subjects — while
-/// `Do help them`, with no verb ahead, keeps the infinitive reading).
-/// Clause-final s-forms don't count as the later verb: they are plural
-/// object nouns (`She won't answer calls`), owned by the bare-object rule
-/// below, so `answer` still upgrades.
 fn refine_pos_bare_infinitive(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
     for i in 1..texts.len() {
         if pos[i] != Upos::Noun {
@@ -151,19 +175,10 @@ fn refine_pos_bare_infinitive(texts: &[String], pos: &mut [Upos], flags: &[Lexem
 }
 
 /// A verb-form token reading as a plural object noun: an s-form with nothing
-/// but punctuation after it (`calls` in `She won't answer calls`). Shared by
-/// the bare-object rule below and the bare-infinitive gate above (which must
-/// not mistake such objects for the clause predicate).
+/// but punctuation after it (`calls` in `She won't answer calls`).
 fn is_sform_final(texts: &[String], i: usize) -> bool {
     let word = texts[i].as_str();
-    word.len() > 2
-        && word
-            .get(word.len() - 1..)
-            .is_some_and(|sfx| sfx.eq_ignore_ascii_case("s"))
-        && texts[i + 1..].iter().all(|t| {
-            let w = t.as_str();
-            matches!(w, "." | "!" | "?" | ";" | ":" | "," | "—" | "--")
-        })
+    word.len() > 2 && has_suffix_ci(word, "s") && is_trailing_punct_only(texts, i + 1)
 }
 
 /// Bare object noun after a verb (`She won't answer calls`). A closed-verb
@@ -171,26 +186,17 @@ fn is_sform_final(texts: &[String], i: usize) -> bool {
 /// English morphosyntax forbids a finite s-form after a bare verb
 /// (modals and causatives govern bare forms), so the s-form reads
 /// nominal. Downgrades VERB → NOUN only finally (nothing but punctuation
-/// follows) with a VERB host. Guards: pronoun hosts (`she calls` —
-/// finite 3sg), non-s-forms (`called left` — matrix root), and DET hosts
-/// (the determiner rule owns those) never match.
+/// follows) with a VERB host.
 fn refine_pos_bare_object_noun(texts: &[String], pos: &mut [Upos], __flags: &[LexemeFlags]) {
     for i in 1..texts.len() {
         if pos[i] != Upos::Verb || pos[i - 1] != Upos::Verb {
             continue;
         }
         let word = texts[i].as_str();
-        if word.len() <= 2
-            || !word
-                .get(word.len() - 1..)
-                .is_some_and(|sfx| sfx.eq_ignore_ascii_case("s"))
-        {
+        if word.len() <= 2 || !has_suffix_ci(word, "s") {
             continue;
         }
-        if !texts[i + 1..].iter().all(|t| {
-            let w = t.as_str();
-            matches!(w, "." | "!" | "?" | ";" | ":" | "," | "—" | "--")
-        }) {
+        if !is_trailing_punct_only(texts, i + 1) {
             continue;
         }
         pos[i] = Upos::Noun;
@@ -245,11 +251,7 @@ fn refine_pos_directive_initial(texts: &[String], pos: &mut [Upos], __flags: &[L
         if pos[i] != Upos::Noun {
             continue;
         }
-        let at_start = i == 0
-            || matches!(
-                texts[i - 1].as_str(),
-                "." | "!" | "?" | ";" | ":" | "—" | "--"
-            );
+        let at_start = is_sentence_start(texts, i);
         if !at_start || i + 2 >= texts.len() {
             continue;
         }
@@ -321,11 +323,7 @@ fn refine_pos_discourse_initial_verb(texts: &[String], pos: &mut [Upos], flags: 
         if pos[i] != Upos::Noun || !flags[i].is_discourse_marker() {
             continue;
         }
-        let at_start = i == 0
-            || matches!(
-                texts[i - 1].as_str(),
-                "." | "!" | "?" | ";" | ":" | "—" | "--"
-            );
+        let at_start = is_sentence_start(texts, i);
         if !at_start || i + 2 >= texts.len() {
             continue;
         }
@@ -364,11 +362,7 @@ fn refine_pos_attributive_ly(texts: &[String], pos: &mut [Upos], __flags: &[Lexe
             continue;
         }
         let word = texts[i].as_str();
-        if word.len() <= 4
-            || !word
-                .get(word.len() - 2..)
-                .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ly"))
-        {
+        if word.len() <= 4 || !has_suffix_ci(word, "ly") {
             continue;
         }
         if i + 1 < texts.len() && matches!(pos[i + 1], Upos::Noun | Upos::Propn) {
@@ -406,11 +400,7 @@ fn refine_pos_imperative_non_det_object(texts: &[String], pos: &mut [Upos], flag
         if pos[i] != Upos::Noun {
             continue;
         }
-        let at_start = i == 0
-            || matches!(
-                texts[i - 1].as_str(),
-                "." | "!" | "?" | ";" | ":" | "—" | "--"
-            );
+        let at_start = is_sentence_start(texts, i);
         if !at_start || i + 1 >= texts.len() {
             continue;
         }
@@ -485,10 +475,8 @@ fn refine_pos_bare_ed_transitive(texts: &[String], pos: &mut [Upos], __flags: &[
     }
     let word = texts[1].as_str();
     if word.len() <= 3
-        || !word
-            .get(word.len() - 2..)
-            .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ed"))
-        || !word.chars().next().is_some_and(|c| c.is_lowercase())
+        || !has_suffix_ci(word, "ed")
+        || !starts_lowercase(word)
     {
         return;
     }
@@ -576,7 +564,7 @@ fn refine_pos_shifted_det_noun_verb(texts: &[String], pos: &mut [Upos], __flags:
         if !matches!(pos[i - 1], Upos::Noun | Upos::Propn) {
             continue;
         }
-        if !texts[i].chars().next().is_some_and(|c| c.is_lowercase()) {
+        if !starts_lowercase(&texts[i]) {
             continue;
         }
         if pos[i + 1..]
@@ -591,19 +579,7 @@ fn refine_pos_shifted_det_noun_verb(texts: &[String], pos: &mut [Upos], __flags:
 /// Matrix finite verb after a relative clause (`The man who called left`,
 /// `The book that I bought vanished`). The closed verb list misses the
 /// matrix predicate, so it falls through to NOUN and the relcl verb steals
-/// root. Upgrades a sentence-final alpha-fallback NOUN to VERB only when it
-/// directly follows the FIRST verb after a nominal-headed who/that/where
-/// (the relcl predicate — closed-list or pronoun-rule-upgraded). The
-/// first-verb scope is load-bearing: a second verb after the marker is the
-/// matrix verb itself, so a nominal following it is its adverbial/object
-/// (`work hard`: hard stays NOUN, its dobj→work head was already right).
-/// Guards: complementizer `that` headed by a verb (`I know that they play
-/// soccer`) never matches; title-case finals (`called Anna`, the §8.2
-/// proper-noun class) never match; interrogative initials (`Who called
-/// earlier?`) have no nominal head. Known boundary: medial matrix verbs
-/// with a trailing predicate nominal/adverbial (`stands empty`, `improve
-/// fast`) and DET-headed relcl verbs (`that cried`) are out of scope — they
-/// need verb-capability or relcl-subject knowledge, not this frame.
+/// root.
 fn refine_pos_relative_matrix_verb(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
     // Nominal-headed relativizer positions (the relative-frame gate).
     let markers: Vec<usize> = (1..texts.len())
@@ -619,14 +595,11 @@ fn refine_pos_relative_matrix_verb(texts: &[String], pos: &mut [Upos], flags: &[
             continue;
         }
         // A finite matrix verb is never capitalized.
-        if !texts[i].chars().next().is_some_and(|c| c.is_lowercase()) {
+        if !starts_lowercase(&texts[i]) {
             continue;
         }
         // Sentence-final: only trailing punctuation may follow.
-        if !texts[i + 1..].iter().all(|t| {
-            let w = t.as_str();
-            matches!(w, "." | "!" | "?" | ";" | ":" | "," | "—" | "--")
-        }) {
+        if !is_trailing_punct_only(texts, i + 1) {
             continue;
         }
         // The host verb must be the first verb after some marker: no other
@@ -678,14 +651,11 @@ fn refine_pos_relcl_matrix_complement(texts: &[String], pos: &mut [Upos], flags:
             continue;
         }
         // A finite matrix verb is never capitalized.
-        if !texts[i].chars().next().is_some_and(|c| c.is_lowercase()) {
+        if !starts_lowercase(&texts[i]) {
             continue;
         }
         // Sentence-final targets belong to the existing matrix pass.
-        if texts[i + 1..].iter().all(|t| {
-            let w = t.as_str();
-            matches!(w, "." | "!" | "?" | ";" | ":" | "," | "—" | "--")
-        }) {
+        if is_trailing_punct_only(texts, i + 1) {
             continue;
         }
         // The host verb must be the first verb after some marker: no other
@@ -697,10 +667,7 @@ fn refine_pos_relcl_matrix_complement(texts: &[String], pos: &mut [Upos], flags:
             continue;
         }
         let word = texts[i].as_str();
-        let s_form = word.len() > 3
-            && word
-                .get(word.len() - 1..)
-                .is_some_and(|sfx| sfx.eq_ignore_ascii_case("s"));
+        let s_form = word.len() > 3 && has_suffix_ci(word, "s");
         let next = pos[i + 1];
         // Bare forms need a nominal/adjectival/adverbial complement or a
         // determiner; `-s` morphology additionally licenses a following
@@ -729,11 +696,7 @@ fn refine_pos_comma_adverbial(texts: &[String], pos: &mut [Upos], __flags: &[Lex
             continue;
         }
         let word = texts[i].as_str();
-        if word.len() <= 4
-            || !word
-                .get(word.len() - 2..)
-                .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ly"))
-        {
+        if word.len() <= 4 || !has_suffix_ci(word, "ly") {
             continue;
         }
         if !texts.get(i + 1).is_some_and(|next| next == ",") {
@@ -891,14 +854,10 @@ fn refine_pos_predicative_ly(texts: &[String], pos: &mut [Upos], flags: &[Lexeme
             continue;
         }
         let word = texts[i].as_str();
-        if word.len() <= 4
-            || !word
-                .get(word.len() - 2..)
-                .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ly"))
-        {
+        if word.len() <= 4 || !has_suffix_ci(word, "ly") {
             continue;
         }
-        if !word.chars().next().is_some_and(|c| c.is_lowercase()) {
+        if !starts_lowercase(word) {
             continue;
         }
         // The host is keyed on lexeme flags, not refined POS: linking
@@ -912,10 +871,7 @@ fn refine_pos_predicative_ly(texts: &[String], pos: &mut [Upos], flags: &[Lexeme
         if !hosted {
             continue;
         }
-        if !texts[i + 1..].iter().all(|t| {
-            let w = t.as_str();
-            matches!(w, "." | "!" | "?" | ";" | ":" | "," | "—" | "--")
-        }) {
+        if !is_trailing_punct_only(texts, i + 1) {
             continue;
         }
         pos[i] = Upos::Adj;
@@ -945,11 +901,7 @@ fn refine_pos_final_adverbial(texts: &[String], pos: &mut [Upos], flags: &[Lexem
         }
         let word = texts[i].as_str();
         let in_set = flags[i].is_adverb_word();
-        let ly = !in_set
-            && word.len() > 4
-            && word
-                .get(word.len() - 2..)
-                .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ly"));
+        let ly = !in_set && word.len() > 4 && has_suffix_ci(word, "ly");
         if !in_set && !ly {
             continue;
         }
@@ -962,10 +914,7 @@ fn refine_pos_final_adverbial(texts: &[String], pos: &mut [Upos], flags: &[Lexem
         if i > 0 && matches!(pos[i - 1], Upos::Det | Upos::Cconj) {
             continue;
         }
-        let trailing_punct = texts[i + 1..].iter().all(|t| {
-            let w = t.as_str();
-            matches!(w, "." | "!" | "?" | ";" | ":" | "," | "—" | "--")
-        });
+        let trailing_punct = is_trailing_punct_only(texts, i + 1);
         // `-ly` forms upgrade only sentence-finally (the comma frame belongs
         // to the comma-adverbial pass, whose clause-edge host guard keeps
         // `July`-class nominals out); set members also fire before a comma
@@ -1014,10 +963,7 @@ fn refine_pos_temporal_yet(texts: &[String], pos: &mut [Upos], flags: &[LexemeFl
         if pos[i - 1] != Upos::Adj {
             continue;
         }
-        if !texts[i + 1..].iter().all(|t| {
-            let w = t.as_str();
-            matches!(w, "." | "!" | "?" | ";" | ":" | "," | "—" | "--")
-        }) {
+        if !is_trailing_punct_only(texts, i + 1) {
             continue;
         }
         let verb_ahead = (i + 1..texts.len())
@@ -1090,11 +1036,7 @@ fn refine_pos_linking_predicate(texts: &[String], pos: &mut [Upos], flags: &[Lex
         // skips in the copular passes.
         if flags[i - 1].is_sensory_verb() || flags[i - 1].is_epistemic_verb() {
             let word = texts[i].as_str();
-            if word.len() > 4
-                && word
-                    .get(word.len() - 2..)
-                    .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ly"))
-            {
+            if word.len() > 4 && has_suffix_ci(word, "ly") {
                 continue;
             }
         }
@@ -1148,14 +1090,10 @@ fn refine_pos_medial_manner_ly(texts: &[String], pos: &mut [Upos], flags: &[Lexe
             continue;
         }
         let word = texts[i].as_str();
-        if word.len() <= 4
-            || !word
-                .get(word.len() - 2..)
-                .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ly"))
-        {
+        if word.len() <= 4 || !has_suffix_ci(word, "ly") {
             continue;
         }
-        if !word.chars().next().is_some_and(|c| c.is_lowercase()) {
+        if !starts_lowercase(word) {
             continue;
         }
         if pos[i - 1] != Upos::Verb {
@@ -1192,11 +1130,7 @@ fn refine_pos_post_comma_verb(texts: &[String], pos: &mut [Upos], __flags: &[Lex
             continue;
         }
         let word = texts[i].as_str();
-        if word.len() > 4
-            && word
-                .get(word.len() - 3..)
-                .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ing"))
-        {
+        if word.len() > 4 && has_suffix_ci(word, "ing") {
             continue;
         }
         // Coordinated predicate adjectives (`red and fast`) and
@@ -1236,11 +1170,7 @@ fn refine_pos_comma_participle(texts: &[String], pos: &mut [Upos], __flags: &[Le
             continue;
         }
         let word = texts[i].as_str();
-        if word.len() <= 4
-            || !word
-                .get(word.len() - 3..)
-                .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ing"))
-        {
+        if word.len() <= 4 || !has_suffix_ci(word, "ing") {
             continue;
         }
         if texts.get(i + 1).is_none_or(|t| t != ",") {
@@ -1277,7 +1207,7 @@ fn refine_pos_initial_noun_verb(texts: &[String], pos: &mut [Upos], flags: &[Lex
         return;
     }
     // A finite verb in third position is never capitalized.
-    if !texts[2].chars().next().is_some_and(|c| c.is_lowercase()) {
+    if !starts_lowercase(&texts[2]) {
         return;
     }
     pos[2] = Upos::Verb;
@@ -1285,20 +1215,13 @@ fn refine_pos_initial_noun_verb(texts: &[String], pos: &mut [Upos], flags: &[Lex
 
 /// Finite verb of a conjoined clause (`floods stayed`, `spirits rose`,
 /// `cats nap`, `rice fill`, `coffee helps`). The closed verb list misses
-/// these, so the second clause loses its predicate. Upgrades an
-/// alpha-fallback NOUN to VERB only in CC + NOUN + NOUN position — the
-/// middle noun is the post-conjunction subject, the third its verb. Guards:
-/// the third token must be lowercase (title-case is the §8.2 proper-noun
-/// class); clause-final CC + NOUN (`and eggs`, conjoined objects) has no
-/// third token and never fires. Known boundary: clause-final conjoined
-/// verbs (`but failed`, `or quit`) share their shape with conjoined objects
-/// and need clause-subject tracking — left for later work.
+/// these, so the second clause loses its predicate.
 fn refine_pos_conjoined_clause_verb(texts: &[String], pos: &mut [Upos], __flags: &[LexemeFlags]) {
     for i in 2..texts.len() {
         if pos[i] != Upos::Noun || pos[i - 1] != Upos::Noun || pos[i - 2] != Upos::Cconj {
             continue;
         }
-        if texts[i].chars().next().is_some_and(|c| c.is_lowercase()) {
+        if starts_lowercase(&texts[i]) {
             pos[i] = Upos::Verb;
         }
     }
@@ -1330,14 +1253,10 @@ fn refine_pos_inverted_copular(texts: &[String], pos: &mut [Upos], flags: &[Lexe
             continue;
         }
         let word = texts[i].as_str();
-        if word.len() > 4
-            && word
-                .get(word.len() - 3..)
-                .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ing"))
-        {
+        if word.len() > 4 && has_suffix_ci(word, "ing") {
             continue;
         }
-        if !word.chars().next().is_some_and(|c| c.is_lowercase()) {
+        if !starts_lowercase(word) {
             continue;
         }
         if flags[i].is_today_word() {
@@ -1371,10 +1290,7 @@ fn refine_pos_be_predicate(texts: &[String], pos: &mut [Upos], flags: &[LexemeFl
         // Participles end in -ing (allocation-free suffix check); they are
         // verbs or participial adjectives, never copular predicates.
         let word = texts[i].as_str();
-        let is_participle = word.len() > 4
-            && word
-                .get(word.len() - 3..)
-                .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ing"));
+        let is_participle = word.len() > 4 && has_suffix_ci(word, "ing");
         if is_participle {
             continue;
         }
@@ -1430,11 +1346,7 @@ fn refine_pos_progressive_ing(texts: &[String], pos: &mut [Upos], flags: &[Lexem
             continue;
         }
         let word = texts[i].as_str();
-        if word.len() <= 4
-            || !word
-                .get(word.len() - 3..)
-                .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ing"))
-        {
+        if word.len() <= 4 || !has_suffix_ci(word, "ing") {
             continue;
         }
         let direct = pos[i - 1] == Upos::Aux && is_be_form(flags[i - 1]);
@@ -1502,14 +1414,11 @@ fn refine_pos_modal_question_verb(texts: &[String], pos: &mut [Upos], flags: &[L
         if pos[i] != Upos::Noun {
             continue;
         }
-        if !texts[i].chars().next().is_some_and(|c| c.is_lowercase()) {
+        if !starts_lowercase(&texts[i]) {
             continue;
         }
         // Clause-final predicate: only trailing punctuation may follow.
-        if !texts[i + 1..].iter().all(|t| {
-            let w = t.as_str();
-            matches!(w, "." | "!" | "?" | ";" | ":" | "," | "—" | "--")
-        }) {
+        if !is_trailing_punct_only(texts, i + 1) {
             continue;
         }
         if !matches!(
@@ -1605,7 +1514,7 @@ fn refine_pos_contracted_be(texts: &[String], pos: &mut [Upos], flags: &[LexemeF
             continue;
         }
         let clitic_aux = pos[i - 1] == Upos::Aux && flags[i - 1].is_be_clitic();
-        if clitic_aux && texts[i].len() > 4 && texts[i].to_ascii_lowercase().ends_with("ing") {
+        if clitic_aux && texts[i].len() > 4 && has_suffix_ci(&texts[i], "ing") {
             pos[i] = Upos::Verb;
         }
     }
@@ -1614,7 +1523,7 @@ fn refine_pos_contracted_be(texts: &[String], pos: &mut [Upos], flags: &[LexemeF
 /// Derive UPOS from lexeme flags + the closed function-word map. PROPN fires
 /// on `is_upper()` **only** (never `is_title()`, which matches sentence-initial
 /// common nouns); Title-Case proper nouns (Google, Paris, Tuesday) fall
-/// through to `NOUN` — the documented false-negative class (§8.2).
+/// through to `NOUN` — the documented false-negative class.
 #[must_use]
 pub fn infer_pos(flags: LexemeFlags) -> Upos {
     if flags.is_punct() {
@@ -1650,7 +1559,7 @@ pub fn infer_pos(flags: LexemeFlags) -> Upos {
     }
     // A closed set of common verbs gives the parser a predicate to govern
     // nsubj/dobj around. Verbs outside the set are an honest NOUN false
-    // negative (open class; the LLM rung is the primary POS source, §8.1).
+    // negative (open class; the LLM rung is the primary POS source).
     if flags.is_verb_word() {
         return Upos::Verb;
     }
@@ -1667,7 +1576,7 @@ pub fn infer_pos(flags: LexemeFlags) -> Upos {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// The transition system (§8.3)
+// The transition system
 // ─────────────────────────────────────────────────────────────────────────
 
 /// A parser action: a move plus (for LEFT/RIGHT) the dependency label hash.
@@ -1773,9 +1682,7 @@ impl ArcEagerState {
             Upos::Noun | Upos::Propn | Upos::Pron | Upos::Det
         ) && matches!(pos[b], Upos::Noun | Upos::Propn)
             && !flags[s].is_locative()
-            && self.left_children[b]
-                .iter()
-                .any(|&c| self.labels[c] == labels.cop)
+            && copula_is_attached(self, b, labels.cop)
     }
 
     /// The set of candidate actions for the current state, given per-token
@@ -1897,9 +1804,7 @@ impl ArcEagerState {
                     // unframed progressives (`It's raining`) never match.
                     let word = texts[b].as_str();
                     let framed_participle = word.len() > 4
-                        && word
-                            .get(word.len() - 3..)
-                            .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ing"))
+                        && has_suffix_ci(word, "ing")
                         && b > 0
                         && texts[b - 1] == ",";
                     if !framed_participle {
@@ -1955,9 +1860,7 @@ impl ArcEagerState {
                     // attached — locative nominals without one keep the
                     // compound dynamics above.
                     if flags[s].is_there_word()
-                        && self.left_children[b]
-                            .iter()
-                            .any(|&c| self.labels[c] == labels.cop)
+                        && copula_is_attached(self, b, labels.cop)
                     {
                         out.push(Self::act(ArcEagerMove::Left, labels.expl));
                     }
@@ -1988,9 +1891,7 @@ impl ArcEagerState {
                     // same word-gate and copula frame as the nominal arm
                     // above — the POS retag must not lose the expletive.
                     if flags[s].is_there_word()
-                        && self.left_children[b]
-                            .iter()
-                            .any(|&c| self.labels[c] == labels.cop)
+                        && copula_is_attached(self, b, labels.cop)
                     {
                         out.push(Self::act(ArcEagerMove::Left, labels.expl));
                     }
@@ -2059,11 +1960,7 @@ impl ArcEagerState {
                     // copulars stay tie-free.
                     if is_be_form(flags[s]) {
                         let word = texts[b].as_str();
-                        if word.len() > 4
-                            && word
-                                .get(word.len() - 3..)
-                                .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ing"))
-                        {
+                        if word.len() > 4 && has_suffix_ci(word, "ing") {
                             out.push(Self::act(ArcEagerMove::Left, labels.dep));
                         }
                     }
@@ -2464,9 +2361,7 @@ impl ArcEagerState {
                     if b > 0
                         && texts[b - 1] == ","
                         && word.len() > 4
-                        && word
-                            .get(word.len() - 3..)
-                            .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ing"))
+                        && has_suffix_ci(word, "ing")
                     {
                         out.push(Self::act(ArcEagerMove::Right, labels.amod));
                     }
@@ -2745,13 +2640,13 @@ impl ArcEagerState {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// The heuristic oracle (§8.5)
+// The heuristic oracle
 // ─────────────────────────────────────────────────────────────────────────
 
 /// The deterministic heuristic oracle. Scores each candidate action for the
 /// current `(stack_top, buffer head)` POS pair; `best_with_margin` picks the
 /// winner and reports how much it beat the runner-up by (margin 0 on ties —
-/// the load-bearing input to [`ParseConfidence`], §8.5/§9.3).
+/// the load-bearing input to [`ParseConfidence`]).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DeterministicOracle;
 
@@ -2879,9 +2774,7 @@ impl DeterministicOracle {
                         if pos[s] == Upos::Aux
                             && (pos[b] == Upos::Adj
                                 || (matches!(pos[b], Upos::Noun | Upos::Propn)
-                                    && state.left_children[b]
-                                        .iter()
-                                        .any(|&c| state.labels[c] == labels.cop)))
+                                    && copula_is_attached(state, b, labels.cop)))
                         {
                             95.0
                         } else {
@@ -2900,9 +2793,7 @@ impl DeterministicOracle {
                             pos[s],
                             Upos::Noun | Upos::Propn | Upos::Pron | Upos::Det
                         )
-                        && state.left_children[b]
-                            .iter()
-                            .any(|&c| state.labels[c] == labels.cop) =>
+                        && copula_is_attached(state, b, labels.cop) =>
                     {
                         100.0
                     }
@@ -2911,9 +2802,7 @@ impl DeterministicOracle {
                     l if l == labels.expl
                         && matches!(pos[s], Upos::Noun | Upos::Propn | Upos::Pron)
                         && matches!(pos[b], Upos::Noun | Upos::Propn)
-                        && state.left_children[b]
-                            .iter()
-                            .any(|&c| state.labels[c] == labels.cop) =>
+                        && copula_is_attached(state, b, labels.cop) =>
                     {
                         95.0
                     }
@@ -3268,7 +3157,7 @@ impl DepLabels {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// ParseConfidence (§9.3)
+// ParseConfidence
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Margin-aware parse confidence. `overall = max(0, mean(token_scores) -
@@ -3319,7 +3208,7 @@ impl ParseConfidence {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// The annotator (§8.6)
+// The annotator
 // ─────────────────────────────────────────────────────────────────────────
 
 /// The deterministic transition annotator over a tokenized doc. Always returns
@@ -3831,24 +3720,6 @@ fn partition_sentences(starts: &[bool], len: usize) -> Vec<(usize, usize)> {
 /// clause; else the leftmost adjective (copular predicates head their
 /// clause); else the leftmost NOUN/PROPN/PRON; else the first token (the
 /// minimal star fallback for degenerate sentences).
-///
-/// The first rung is a first-accept walk with a skip predicate, not a bare
-/// leftmost pick: a verb pending after a nominal-headed who/that/where is
-/// the relcl predicate, never the matrix root (`The man who called left`
-/// roots at `left`). The skip resets at every verb, so only the clause the
-/// marker opens is skipped — a matrix-first verb (`I know the man who
-/// called`) still wins, and complementizer `that` (verb-headed) or
-/// sentence-initial interrogatives (no nominal head) never arm the skip.
-/// Load-bearing for the relcl arm: a pre-designated root is excluded from
-/// re-attachment, so the label arm can only fire once the crown moves.
-/// Comma-framed participles (`The CEO, smiling, took questions`) skip the
-/// same way: a modifier is never the matrix root, by the same logic as
-/// the relcl predicate.
-/// A subordinate-clause verb (SCONJ + nominal subject frame before it, as
-/// in `As you know, ...`) skips the same way — but only with a well-formed
-/// matrix predicate (VERB or ADJ) later in the sentence. Without one (`If
-/// it rains, stay home`: stay tags NOUN), skipping would orphan the only
-/// predicate, so the subordinate verb keeps the crown exactly as before.
 fn pick_root(pos: &[Upos], texts: &[String], flags: &[LexemeFlags], s: usize, e: usize) -> usize {
     let mut rel_pending = false;
     for i in s..e {
@@ -3874,12 +3745,6 @@ fn pick_root(pos: &[Upos], texts: &[String], flags: &[LexemeFlags], s: usize, e:
     // VERB or ADJ crowns — and the refs root the be-AUX itself
     // (question-02/08: is → root, station/bag → dobj → is). Crown the
     // leftmost be-form AUX when a nominal follows it in the sentence.
-    // Guards: any VERB (the first rung already won those, e.g. `Where did
-    // she go` → go) or any ADJ (copular predicates head, e.g. `Is lunch
-    // ready` → ready) keeps its crown; non-Where sentences (`She is a
-    // doctor`) and What/Why-initial questions (`What is 2+2`) keep
-    // incumbent dynamics. Purely categorial — no lexicon beyond the
-    // closed be-forms and the interrogative word itself.
     if flags.get(s).is_some_and(|f| f.is_where_word())
         && !(s..e).any(|k| pos[k] == Upos::Verb || pos[k] == Upos::Adj)
     {
@@ -3899,14 +3764,6 @@ fn pick_root(pos: &[Upos], texts: &[String], flags: &[LexemeFlags], s: usize, e:
     // (finite verbs still win) and before the ADJ fallback — and only when
     // no ADJ stands after be in the sentence, so `Is the report ready`
     // and `Is the sky blue` keep their predicate-adjective crowns.
-    // Guards: the DET must sit immediately after a be-form word (`is on
-    // the table`, `is raining`, `is not correct` never match — ADP, VERB,
-    // PART after be), and any VERB/AUX/ADJ/ADP/SCONJ/CCONJ/PRON inside the
-    // span aborts it (`Will this work`, `What does the API return`,
-    // `Is lunch on the table` keep incumbent crowns). Where-initial
-    // interrogatives are excluded throughout the package: question-02/08
-    // pin be-as-root, and reconciling those two conventions is its own
-    // design decision — `Where is the station` keeps incumbent dynamics.
     if !flags
         .get(s)
         .is_some_and(|f| f.is_where_word())
@@ -4011,21 +3868,16 @@ fn is_comma_framed_participle(texts: &[String], pos: &[Upos], i: usize) -> bool 
         return false;
     }
     let word = texts[i].as_str();
-    word.len() > 4
-        && word
-            .get(word.len() - 3..)
-            .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ing"))
+    word.len() > 4 && has_suffix_ci(word, "ing")
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// The rung (§8.6, F7)
+// The rung
 // ─────────────────────────────────────────────────────────────────────────
 
 /// The ladder rung wrapping the deterministic parser. **Always returns** its
 /// parse — confidence rides in `AnnotationResult` and gates *downstream*
-/// routing, never rung fallthrough (F7). `Ok(None)` is reserved for genuine
-/// structural failure (empty doc) — the only case that falls through to
-/// `RuleRung`.
+/// routing, never rung fallthrough.
 pub struct ArcEagerRung {
     annotator: Arc<ArcEagerAnnotator>,
     validator: Arc<AnnotationValidator>,

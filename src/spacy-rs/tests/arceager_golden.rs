@@ -3480,3 +3480,235 @@ fn imperative_upgrade_skips_aux_clauses() {
     let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
     assert_eq!(pos[at("Big")], "noun", "pos: {pos:?}");
 }
+
+#[test]
+fn suffix_governed_parses_hold_across_families() {
+    // DRY-refactor characterization: one attachment-level pin per
+    // case-insensitive-suffix family ("s" / "ed" / "ing" / "ly"), each
+    // exercising a distinct call site of the shared suffix idiom. A pure
+    // idiom consolidation must leave every one of these unchanged
+    // (the "ly"-attributive family is already pinned by
+    // `attributive_ly_before_nominal_is_adjective`).
+    // (head is the relative signed offset: target.head == head_idx - target_idx)
+    let cases = [
+        ("She won't answer calls.", "calls", "noun", "dobj", "answer"),
+        ("John opened the door.", "opened", "verb", "root", ""),
+        ("It's raining.", "raining", "verb", "root", ""),
+        ("The CEO, smiling, took questions.", "smiling", "verb", "amod", "CEO"),
+        ("That seems unlikely.", "unlikely", "adj", "acomp", "seems"),
+    ];
+    for (text, target, pos, dep, head_word) in cases {
+        let (_doc, set) = parse(text);
+        let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+        let i = at(target);
+        assert_eq!(set.0[i].pos, pos, "{text} pos of {target}");
+        assert_eq!(set.0[i].dep, dep, "{text} dep of {target}");
+        if head_word.is_empty() {
+            assert_eq!(set.0[i].head, 0, "{text} root head");
+        } else {
+            let j = at(head_word);
+            assert_eq!(
+                set.0[i].head,
+                j as i32 - i as i32,
+                "{text} head of {target}"
+            );
+        }
+    }
+}
+
+#[test]
+fn suffix_governed_must_not_fire_controls() {
+    // Must-NOT-fire controls for the same idiom: a pronoun-hosted finite
+    // s-form stays verbal (the bare-object downgrade never sees it), and a
+    // temporal -ly nominal after a preposition stays nominal (the
+    // comma-adverbial upgrade never sees it).
+    let (_doc, set) = parse("She calls me.");
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(set.0[at("calls")].pos, "verb", "calls stays finite verb");
+    assert_eq!(set.0[at("calls")].dep, "root");
+    let (_doc, set) = parse("In July, we met.");
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(set.0[at("July")].pos, "noun", "July stays nominal");
+}
+
+#[test]
+fn trailing_final_parses_hold_across_families() {
+    // DRY-refactor characterization: one attachment-level pin per
+    // trailing-punctuation-final family, each exercising a distinct call
+    // site of the shared clause-final idiom. A pure idiom consolidation
+    // must leave every one of these unchanged (the s-form/bare-object and
+    // predicative-ly families are already pinned by
+    // `suffix_governed_parses_hold_across_families`).
+    // (head is the relative signed offset: target.head == head_idx - target_idx)
+    let cases = [
+        ("The man who called left.", "left", "verb", "root", ""),
+        ("She is not ready yet.", "yet", "adv", "advmod", "ready"),
+        ("Will this work?", "work", "verb", "root", ""),
+        ("The dog barks loudly.", "loudly", "adv", "advmod", "barks"),
+    ];
+    for (text, target, pos, dep, head_word) in cases {
+        let (_doc, set) = parse(text);
+        let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+        let i = at(target);
+        assert_eq!(set.0[i].pos, pos, "{text} pos of {target}");
+        assert_eq!(set.0[i].dep, dep, "{text} dep of {target}");
+        if head_word.is_empty() {
+            assert_eq!(set.0[i].head, 0, "{text} root head");
+        } else {
+            let j = at(head_word);
+            assert_eq!(
+                set.0[i].head,
+                j as i32 - i as i32,
+                "{text} head of {target}"
+            );
+        }
+    }
+}
+
+#[test]
+fn trailing_final_must_not_fire_controls() {
+    // Must-NOT-fire control for the same idiom: a verb-form token with a
+    // non-punctuation token after it never reads clause-final — the
+    // bare-object downgrade withholds and `calls` stays verbal.
+    let (_doc, set) = parse("She will answer calls today.");
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(set.0[at("calls")].pos, "verb", "calls stays verbal");
+}
+
+#[test]
+fn lowercase_gated_parses_hold_across_families() {
+    // DRY-refactor characterization: one attachment-level pin per
+    // lowercase-gated family, each exercising a distinct call site of the
+    // shared finite-verb-initial idiom. A pure idiom consolidation must
+    // leave every one of these unchanged (the -ed-transitive,
+    // relative-matrix, predicative-ly, and modal-question families are
+    // already pinned by the suffix/trailing suites).
+    // (head is the relative signed offset: target.head == head_idx - target_idx)
+    let cases = [
+        ("Truthfully, the plan failed.", "failed", "verb", "root", ""),
+        ("The game ended.", "ended", "verb", "root", ""),
+        ("Is lunch ready?", "ready", "adj", "root", ""),
+        ("She spoke wittily at dinner.", "wittily", "adv", "advmod", "spoke"),
+        ("Prices rose and spirits fell.", "fell", "verb", "conj", "rose"),
+        ("The dog that barked stands empty.", "stands", "verb", "root", ""),
+    ];
+    for (text, target, pos, dep, head_word) in cases {
+        let (_doc, set) = parse(text);
+        let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+        let i = at(target);
+        assert_eq!(set.0[i].pos, pos, "{text} pos of {target}");
+        assert_eq!(set.0[i].dep, dep, "{text} dep of {target}");
+        if head_word.is_empty() {
+            assert_eq!(set.0[i].head, 0, "{text} root head");
+        } else {
+            let j = at(head_word);
+            assert_eq!(
+                set.0[i].head,
+                j as i32 - i as i32,
+                "{text} head of {target}"
+            );
+        }
+    }
+}
+
+#[test]
+fn lowercase_gate_must_not_fire_controls() {
+    // Must-NOT-fire control for the same idiom: a capitalized
+    // sentence-final nominal never reads as a finite matrix verb — the
+    // relative-matrix upgrade withholds and `Anna` stays nominal.
+    let (_doc, set) = parse("The man who called Anna.");
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(set.0[at("Anna")].pos, "noun", "Anna stays nominal");
+    assert_eq!(set.0[at("Anna")].dep, "dobj");
+}
+
+#[test]
+fn copula_frame_parses_hold_across_families() {
+    // DRY-refactor characterization: one attachment-level pin per
+    // copula-frame family, each exercising a distinct call site of the
+    // shared copula-attachment idiom (subject frame, expletive arms,
+    // oracle cop/attr weights). A pure idiom consolidation must leave
+    // every one of these unchanged.
+    // (head is the relative signed offset: target.head == head_idx - target_idx)
+    let cases = [
+        ("She is a teacher.", "teacher", "noun", "root", ""),
+        ("She is a teacher.", "is", "aux", "cop", "teacher"),
+        ("There is a problem.", "There", "pron", "expl", "problem"),
+        ("There is a problem.", "problem", "noun", "root", ""),
+        ("The sky is blue.", "blue", "adj", "root", ""),
+        ("The sky is blue.", "sky", "noun", "nsubj", "blue"),
+    ];
+    for (text, target, pos, dep, head_word) in cases {
+        let (_doc, set) = parse(text);
+        let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+        let i = at(target);
+        assert_eq!(set.0[i].pos, pos, "{text} pos of {target}");
+        assert_eq!(set.0[i].dep, dep, "{text} dep of {target}");
+        if head_word.is_empty() {
+            assert_eq!(set.0[i].head, 0, "{text} root head");
+        } else {
+            let j = at(head_word);
+            assert_eq!(
+                set.0[i].head,
+                j as i32 - i as i32,
+                "{text} head of {target}"
+            );
+        }
+    }
+}
+
+#[test]
+fn copula_frame_must_not_fire_controls() {
+    // Must-NOT-fire control for the same idiom: `There` with no attached
+    // copula never reads expletive — the copula frame withholds.
+    let (_doc, set) = parse("There quietly sat a cat.");
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_ne!(set.0[at("There")].dep, "expl", "There stays non-expletive");
+}
+
+#[test]
+fn sentence_start_gated_parses_hold_across_families() {
+    // DRY-refactor characterization: one attachment-level pin per
+    // sentence-start-gated family, each exercising a distinct call site of
+    // the shared boundary idiom. A pure idiom consolidation must leave
+    // every one of these unchanged (the discourse-initial family is
+    // already pinned by `discourse_initial_imperative_crowns_verb`,
+    // `discourse_initial_never_takes_advmod`, and
+    // `discourse_frame_needs_verbal_complement`).
+    // (head is the relative signed offset: target.head == head_idx - target_idx)
+    let cases = [
+        ("Call the office now.", "Call", "verb", "root", ""),
+        ("Eat apples daily.", "Eat", "verb", "root", ""),
+        ("Eat apples daily.", "apples", "noun", "dobj", "Eat"),
+    ];
+    for (text, target, pos, dep, head_word) in cases {
+        let (_doc, set) = parse(text);
+        let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+        let i = at(target);
+        assert_eq!(set.0[i].pos, pos, "{text} pos of {target}");
+        assert_eq!(set.0[i].dep, dep, "{text} dep of {target}");
+        if head_word.is_empty() {
+            assert_eq!(set.0[i].head, 0, "{text} root head");
+        } else {
+            let j = at(head_word);
+            assert_eq!(
+                set.0[i].head,
+                j as i32 - i as i32,
+                "{text} head of {target}"
+            );
+        }
+    }
+}
+
+#[test]
+fn sentence_start_gate_must_not_fire_controls() {
+    // Must-NOT-fire control for the same idiom: a directive-shaped token
+    // mid-sentence (no boundary before it) never upgrades via the
+    // directive frame — `Please` stays nominal and the verb crowns through
+    // the bare-infinitive gate instead.
+    let (_doc, set) = parse("Please call the office.");
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(set.0[at("Please")].pos, "noun", "Please stays nominal");
+    assert_eq!(set.0[at("call")].pos, "verb", "call crowns");
+    assert_eq!(set.0[at("call")].dep, "root");
+}
