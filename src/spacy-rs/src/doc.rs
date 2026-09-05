@@ -529,7 +529,10 @@ pub fn get_token_attr(token: &TokenRecord, attr: Attribute) -> Result<u64, Spacy
         | Attribute::IsBeClitic
         | Attribute::IsThereWord
         | Attribute::IsWhAdverbial
-        | Attribute::IsGetWord => u64::from(token.lexeme.flags.check(attr.id())),
+        | Attribute::IsGetWord
+        | Attribute::IsHaveClitic
+        | Attribute::IsWillClitic
+        | Attribute::IsIndefinitePronoun => u64::from(token.lexeme.flags.check(attr.id())),
         Attribute::Id => token.lexeme.id,
         Attribute::Orth => token.lexeme.orth,
         Attribute::Lower => token.lexeme.lower,
@@ -667,6 +670,9 @@ pub fn set_token_attr(
         | Attribute::IsThereWord
         | Attribute::IsWhAdverbial
         | Attribute::IsGetWord
+        | Attribute::IsHaveClitic
+        | Attribute::IsWillClitic
+        | Attribute::IsIndefinitePronoun
         | Attribute::Id
         | Attribute::Orth
         | Attribute::Lower

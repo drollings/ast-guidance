@@ -20,7 +20,7 @@ pub const OOV_RANK: u64 = u64::MAX;
 
 /// The 64-bit lexeme flag bitmask. Bit `i` is set iff attribute id `i` is
 /// true (ids 1–18 are the named surface flags from `spacy/attrs.pxd`;
-/// ids 19–47 are the closed-class function-word flags populated per
+/// ids 19–55 are the closed-class function-word flags populated per
 /// language from [`LexiconConfig::function_words`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct LexemeFlags(u64);
@@ -326,6 +326,21 @@ impl LexemeFlags {
     #[must_use]
     pub const fn is_get_word(self) -> bool {
         self.check(Attribute::IsGetWord.id())
+    }
+    /// Have-clitic `'ve` (closed lemma-map gate).
+    #[must_use]
+    pub const fn is_have_clitic(self) -> bool {
+        self.check(Attribute::IsHaveClitic.id())
+    }
+    /// Will-clitic `'ll` (closed lemma-map gate).
+    #[must_use]
+    pub const fn is_will_clitic(self) -> bool {
+        self.check(Attribute::IsWillClitic.id())
+    }
+    /// Indefinite pronouns (never common nouns).
+    #[must_use]
+    pub const fn is_indefinite_pronoun(self) -> bool {
+        self.check(Attribute::IsIndefinitePronoun.id())
     }
 }
 

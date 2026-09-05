@@ -197,6 +197,41 @@ fn refine_pos_bare_object_noun(texts: &[String], pos: &mut [Upos], __flags: &[Le
     }
 }
 
+/// Indefinite pronouns and presentational pro-forms (`something`,
+/// `There is`, `Here is`). Indefinites fall through to NOUN but never
+/// head common-noun phrases; expletive `There` and locative `Here`
+/// before `be` are pronominal/adverbial, never nominal. Upgrades
+/// bit-members → PRON unconditionally (closed class, no ambiguous
+/// reading), `there`-bit + be-AUX-next → PRON, and locative (non-`there`)
+/// + be-next → ADV. Guards: non-member nominals and non-`be` frames
+/// (`there goes`, `put it there`) never match. Same O(n) frame-scan
+/// shape.
+fn refine_pos_indefinite_pronouns(
+    texts: &[String],
+    pos: &mut [Upos],
+    flags: &[LexemeFlags],
+) {
+    for i in 0..texts.len() {
+        if flags[i].is_indefinite_pronoun() {
+            if pos[i] == Upos::Noun {
+                pos[i] = Upos::Pron;
+            }
+            continue;
+        }
+        if pos[i] != Upos::Noun {
+            continue;
+        }
+        if pos.get(i + 1) != Some(&Upos::Aux) {
+            continue;
+        }
+        if flags[i].is_there_word() {
+            pos[i] = Upos::Pron;
+        } else if flags[i].is_locative() {
+            pos[i] = Upos::Adv;
+        }
+    }
+}
+
 /// Sentence-initial directive verb (`Close your books`, `Solve this
 /// equation`, `Search the web`). Directives outside the closed verb list
 /// fall through to NOUN and the clause loses its root. Upgrades an
@@ -835,6 +870,58 @@ fn refine_pos_clausal_after(texts: &[String], pos: &mut [Upos], flags: &[LexemeF
     }
 }
 
+/// Predicative `-ly` adjective (`seems unlikely`, `is lively`). The
+/// final-adverbial pass owns `-ly` finals as manner adverbials, but after
+/// a copular AUX or linking verb the predicative position is adjectival —
+/// the `-ly` adjectives (`unlikely`, `lively`, `lonely`, `lovely`,
+/// `likely`, and closed-set members used predicatively: `seems hard`)
+/// strand as manner modifiers and the copula loses its complement.
+/// Upgrades a clause-final `-ly` NOUN to ADJ only after an AUX or
+/// sensory/epistemic VERB. Guards: capitalized targets (`Italy`) and
+/// non-final shapes (`tastes sweetly of oak` — manner with a complement)
+/// never match. Closed-set members keep their old dynamics everywhere
+/// except this frame (their only predicative slot): `late` still rides
+/// be-predicate after be and final-adverbial after plain verbs.
+/// Sequenced before the final pass (disjoint: that pass never sees these
+/// targets); ADJ outputs feed the cop dynamics below. Same O(n)
+/// frame-scan shape as the other refines.
+fn refine_pos_predicative_ly(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
+    for i in 1..texts.len() {
+        if pos[i] != Upos::Noun {
+            continue;
+        }
+        let word = texts[i].as_str();
+        if word.len() <= 4
+            || !word
+                .get(word.len() - 2..)
+                .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ly"))
+        {
+            continue;
+        }
+        if !word.chars().next().is_some_and(|c| c.is_lowercase()) {
+            continue;
+        }
+        // The host is keyed on lexeme flags, not refined POS: linking
+        // verbs often tag NOUN until the linking pass itself verbs them
+        // (`seems` in `That seems unlikely`), which runs after the final
+        // pass this rule must precede. AUX hosts read refined (closed-map
+        // AUX survives every earlier pass).
+        let hosted = pos[i - 1] == Upos::Aux
+            || flags[i - 1].is_sensory_verb()
+            || flags[i - 1].is_epistemic_verb();
+        if !hosted {
+            continue;
+        }
+        if !texts[i + 1..].iter().all(|t| {
+            let w = t.as_str();
+            matches!(w, "." | "!" | "?" | ";" | ":" | "," | "—" | "--")
+        }) {
+            continue;
+        }
+        pos[i] = Upos::Adj;
+    }
+}
+
 /// Closed-class time/manner adverbials in sentence-final position (`The
 /// dog barks loudly`, `She reads books daily`, `Work hard, play fair`).
 /// The tagger has no adverb lexicon, so these fall through to NOUN — and
@@ -887,6 +974,28 @@ fn refine_pos_final_adverbial(texts: &[String], pos: &mut [Upos], flags: &[Lexem
         if trailing_punct || comma_next {
             pos[i] = Upos::Adv;
         }
+    }
+}
+
+/// Coordinated adverbial before a conjunction (`Run daily or quit`, `Run
+/// fast or lose`). A closed-list adverb word between a verb and a
+/// conjunction modifies the first conjunct — neither the final
+/// (needs trailing punctuation/comma) nor the comma frame sees it.
+/// Upgrades NOUN → ADV only for closed-set members with a VERB host and
+/// CCONJ next. Guards: determiner/conjunction hosts never match (the
+/// final pass owns those); `-ly` forms are out of scope here (final and
+/// comma passes own those shapes). Sequenced right after the final pass
+/// (disjoint: that pass needs trailing punctuation or comma-next, this
+/// one CCONJ-next).
+fn refine_pos_coordinated_adverbial(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
+    for i in 1..texts.len() {
+        if pos[i] != Upos::Noun || !flags[i].is_adverb_word() {
+            continue;
+        }
+        if pos[i - 1] != Upos::Verb || pos.get(i + 1) != Some(&Upos::Cconj) {
+            continue;
+        }
+        pos[i] = Upos::Adv;
     }
 }
 
@@ -957,14 +1066,14 @@ fn refine_pos_linking_predicate(texts: &[String], pos: &mut [Upos], flags: &[Lex
         if pos[i] != Upos::Noun || !flags[i].is_epistemic_verb() {
             continue;
         }
-        // Epistemic linkers take adjectival complements, so ADV- and
-        // VERB-next count alongside nominals (sensory linkers keep the
+        // Epistemic linkers take adjectival complements, so ADV-, VERB-,
+        // and ADJ-next count alongside nominals (sensory linkers keep the
         // nominal-only shape above — their complements are always nominal
         // in corpus).
         if texts.len() > i + 1
             && matches!(
                 pos[i + 1],
-                Upos::Noun | Upos::Propn | Upos::Adv | Upos::Verb
+                Upos::Noun | Upos::Propn | Upos::Adv | Upos::Verb | Upos::Adj
             )
         {
             pos[i] = Upos::Verb;
@@ -974,8 +1083,91 @@ fn refine_pos_linking_predicate(texts: &[String], pos: &mut [Upos], flags: &[Lex
         if pos[i] != Upos::Noun || pos[i - 1] != Upos::Verb {
             continue;
         }
+        // Linking verbs take `-ly` adjectival complements through the
+        // predicative-ly pass (`seems unlikely`), never here: an `-ly`
+        // form after a sensory/epistemic verb is manner (`tastes sweetly
+        // of oak`) until that pass proves predicative. Mirrors the `-ing`
+        // skips in the copular passes.
+        if flags[i - 1].is_sensory_verb() || flags[i - 1].is_epistemic_verb() {
+            let word = texts[i].as_str();
+            if word.len() > 4
+                && word
+                    .get(word.len() - 2..)
+                    .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ly"))
+            {
+                continue;
+            }
+        }
         if flags[i - 1].is_sensory_verb() || flags[i - 1].is_epistemic_verb() {
             pos[i] = Upos::Adj;
+        }
+    }
+}
+
+/// Demonstrative subject (`That seems unlikely`, `This is a Rust
+/// project`). A demonstrative determiner directly before a VERB or AUX is
+/// the clause subject — never a determiner (determiners govern nominals:
+/// `that book`, `this morning`). Upgrades DET → PRON only for
+/// demonstrative/`that` flags with a VERB/AUX next. Guards: relative and
+/// complementizer frames (`the book that I bought`, `know that he left` —
+/// nominal/pronoun next) never match. Sequenced with the demonstrative
+/// pass (disjoint: that pass needs bare punct/ADP-next, this one
+/// VERB/AUX-next); PRON outputs feed the standard subject dynamics, and
+/// the pronoun-subject pass never matches (demonstratives are not
+/// nominative-listed). Same O(n) frame-scan shape as the other refines.
+fn refine_pos_demonstrative_subject(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
+    for i in 0..texts.len() {
+        if pos[i] != Upos::Det {
+            continue;
+        }
+        if !(flags[i].is_demonstrative() || flags[i].is_that_word()) {
+            continue;
+        }
+        if !matches!(pos.get(i + 1), Some(Upos::Verb | Upos::Aux)) {
+            continue;
+        }
+        pos[i] = Upos::Pron;
+    }
+}
+
+/// Medial manner `-ly` adverbial (`spoke wittily at dinner`). The
+/// final-adverbial pass owns trailing `-ly` (`smiled wittily`), and the
+/// attributive pass owns pre-nominal `-ly` (`quarterly sales`) — a manner
+/// adverbial with a particle or conjunction after it matches neither and
+/// strands as the verb's nominal object. Upgrades NOUN → ADV only for
+/// `-ly` forms (never closed-set members, which have their own passes)
+/// directly after a VERB with a non-nominal, non-final continuation
+/// (ADP, CCONJ, SCONJ, or comma). Guards: pre-nominal position
+/// (attributive owns it), AUX hosts (copular frames own them), and
+/// capitalized forms never match. Sequenced with the frame passes; ADV
+/// outputs feed the standard advmod dynamics below. Same O(n) frame-scan
+/// shape as the other refines.
+fn refine_pos_medial_manner_ly(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
+    for i in 1..texts.len() {
+        if pos[i] != Upos::Noun || flags[i].is_adverb_word() {
+            continue;
+        }
+        let word = texts[i].as_str();
+        if word.len() <= 4
+            || !word
+                .get(word.len() - 2..)
+                .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ly"))
+        {
+            continue;
+        }
+        if !word.chars().next().is_some_and(|c| c.is_lowercase()) {
+            continue;
+        }
+        if pos[i - 1] != Upos::Verb {
+            continue;
+        }
+        let continues = match pos.get(i + 1) {
+            Some(Upos::Adp | Upos::Cconj | Upos::Sconj) => true,
+            Some(Upos::Punct) => texts.get(i + 1).is_some_and(|t| t == ","),
+            _ => false,
+        };
+        if continues {
+            pos[i] = Upos::Adv;
         }
     }
 }
@@ -1790,6 +1982,17 @@ impl ArcEagerState {
                 (Upos::Pron, Upos::Noun | Upos::Propn) => {
                     if self.copular_subject_frame(flags, s, b, pos, labels) {
                         out.push(Self::act(ArcEagerMove::Left, labels.nsubj));
+                    }
+                    // Existential `there` after the indefinite retag
+                    // (`There is a problem` with PRON-tagged `There`):
+                    // same word-gate and copula frame as the nominal arm
+                    // above — the POS retag must not lose the expletive.
+                    if flags[s].is_there_word()
+                        && self.left_children[b]
+                            .iter()
+                            .any(|&c| self.labels[c] == labels.cop)
+                    {
+                        out.push(Self::act(ArcEagerMove::Left, labels.expl));
                     }
                 }
                 // A pre-nominal designator depends on its head (204 →
@@ -2706,7 +2909,7 @@ impl DeterministicOracle {
                     // Existential `there` (There → expl → problem): same
                     // gate shape as the subject above, expletive weight.
                     l if l == labels.expl
-                        && matches!(pos[s], Upos::Noun | Upos::Propn)
+                        && matches!(pos[s], Upos::Noun | Upos::Propn | Upos::Pron)
                         && matches!(pos[b], Upos::Noun | Upos::Propn)
                         && state.left_children[b]
                             .iter()
@@ -3226,6 +3429,10 @@ impl ArcEagerAnnotator {
         // -ing participle → VERB. Sequenced after the infinitive pass; the
         // two govern disjoint contexts (aux-host vs. clitic-host).
         refine_pos_contracted_be(&texts, &mut pos, &flags);
+        // Indefinite-pronoun pass (`something`, `There is`, `Here is`):
+        // closed-class pro-forms that never read as common nouns.
+        // Sequenced with the retags; subject dynamics do the rest.
+        refine_pos_indefinite_pronouns(&texts, &mut pos, &flags);
         // Directive pass: sentence-initial NOUN + DET + NOUN → VERB.
         // Sequenced last; disjoint from the aux/clitic triggers above.
         refine_pos_directive_initial(&texts, &mut pos, &flags);
@@ -3301,14 +3508,38 @@ impl ArcEagerAnnotator {
         // Final-adverbial pass: closed time/manner set + -ly finals →
         // ADV. Targets are disjoint from the comma-adverbial pass (which
         // owns comma -ly with its clause-edge host guard; this pass skips
-        // comma -ly), and ADV outputs feed no verb/ADJ upgrade.
+        // comma -ly), and ADV outputs feed no verb/ADJ upgrade. The
+        // predicative-ly pass runs immediately before (disjoint:
+        // predicative owns copular-hosted -ly, final owns the rest) —
+        // splitting them lets final steal predicative targets (`unlikely`
+        // read manner).
+        refine_pos_predicative_ly(&texts, &mut pos, &flags);
         refine_pos_final_adverbial(&texts, &mut pos, &flags);
+        // Coordinated-adverbial pass: closed-set manner word between a
+        // VERB and a CCONJ → ADV (`Run fast or lose`). Sequenced right
+        // after the final pass (disjoint: that pass needs trailing
+        // punctuation or a comma next, this one CCONJ-next).
+        refine_pos_coordinated_adverbial(&texts, &mut pos, &flags);
         // Linking-predicate pass: bare-initial sensory verb → VERB, then
         // the NOUN after a sensory VERB → ADJ. Sequenced with the frame
         // passes; targets (sensory words, their complements) are disjoint
         // from every relativizer/adverbial trigger, and ADJ outputs feed
         // nothing upstream of the be-predicate pass.
         refine_pos_linking_predicate(&texts, &mut pos, &flags);
+        // Demonstrative-subject pass: demonstrative DET + VERB/AUX →
+        // PRON (`That seems`, `This is`). Sequenced AFTER linking (the
+        // VERB-next gate reads verbs the linking pass itself crowns:
+        // `seems` tags NOUN until then); PRON outputs feed the
+        // standard subject dynamics below.
+        refine_pos_demonstrative_subject(&texts, &mut pos, &flags);
+        // Medial-manner-ly pass (`spoke wittily at dinner`, `tastes
+        // sweetly of oak`): -ly manner with a particle/conjunction after
+        // it matches neither the final nor the attributive shape.
+        // Sequenced AFTER the linking pass (disjoint: that pass -ly-skips
+        // its complements, and its freshly verbed sensory hosts are the
+        // VERB-prev this pass reads); ADV outputs feed the standard
+        // advmod dynamics below.
+        refine_pos_medial_manner_ly(&texts, &mut pos, &flags);
         // Post-comma pass: clause-initial NOUN after a parenthetical
         // boundary → VERB. Sequenced after the linking pass (sensory verbs
         // read first where both could apply — disjoint in practice: no

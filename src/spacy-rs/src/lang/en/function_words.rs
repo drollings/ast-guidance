@@ -4,7 +4,7 @@
 //! be-forms, relativizers, subordinator roles, …), previously hard-coded as
 //! `&[&str]` lists and inline comparisons inside `arc_eager.rs`. Each set maps
 //! to one [`LexemeFlags`](crate::lexeme::LexemeFlags) bit (attribute ids
-//! 19–47); [`function_word_bits`] builds the orth → bits map that
+//! 19–55); [`function_word_bits`] builds the orth → bits map that
 //! [`LexiconConfig`](crate::lexeme::LexiconConfig) feeds to lexeme interning,
 //! so the parser matches bits and never sees these spellings.
 //!
@@ -117,7 +117,7 @@ pub const DISCOURSE_MARKERS: &[&str] = &["please", "kindly", "just", "never", "a
 /// stay suffix-ruled, not listed).
 pub const ADVERBS: &[&str] = &[
     "now", "early", "again", "always", "hard", "fast", "well", "fair", "here", "daily", "much",
-    "yet", "late",
+    "yet", "late", "still",
 ];
 
 /// Complement subordinators (govern `ccomp`).
@@ -178,6 +178,22 @@ pub const WH_ADVERBIAL: &[&str] = &["where", "why", "how", "when"];
 /// VERB through the closed verb list).
 pub const GET: &[&str] = &["get", "got"];
 
+/// Indefinite pronouns (`something`, `everyone`, …). The tagger's
+/// alpha-fallback is NOUN, but these are never common nouns (no
+/// determiner-led reading: `*the something`). Closed class like the
+/// rest here; `everybody` already rides [`PRON`].
+pub const INDEFINITE_PRONOUNS: &[&str] = &[
+    "something", "nothing", "everything", "anything", "someone", "everyone", "anyone",
+    "nobody", "somebody", "anybody",
+];
+
+/// Have-clitic `'ve` (closed lemma-map gate: the tokenizer splinter with no
+/// flag coverage until now).
+pub const HAVE_CLITIC: &[&str] = &["'ve"];
+
+/// Will-clitic `'ll` (same closed lemma-map gate).
+pub const WILL_CLITIC: &[&str] = &["'ll"];
+
 /// Build the lowercased-orth → flag-bits map for [`LexiconConfig`](crate::lexeme::LexiconConfig).
 #[must_use]
 pub fn function_word_bits() -> HashMap<String, u64> {
@@ -216,6 +232,9 @@ pub fn function_word_bits() -> HashMap<String, u64> {
         (THERE, Attribute::IsThereWord),
         (WH_ADVERBIAL, Attribute::IsWhAdverbial),
         (GET, Attribute::IsGetWord),
+        (HAVE_CLITIC, Attribute::IsHaveClitic),
+        (WILL_CLITIC, Attribute::IsWillClitic),
+        (INDEFINITE_PRONOUNS, Attribute::IsIndefinitePronoun),
     ];
     let mut map = HashMap::new();
     for (words, attr) in sets {

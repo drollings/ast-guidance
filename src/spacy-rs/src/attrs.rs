@@ -9,8 +9,8 @@
 use crate::error::SpacyError;
 
 /// A token/lexeme attribute id. Named variants cover the ids spaCy defines
-/// plus the closed-class function-word flags (19–51);
-/// [`Attribute::Other`] catches reserved flag slots (48–63) and unknown ids.
+/// plus the closed-class function-word flags (19–55);
+/// [`Attribute::Other`] catches reserved flag slots (56–63) and unknown ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum Attribute {
@@ -33,11 +33,11 @@ pub enum Attribute {
     IsLeftPunct = 16,
     IsRightPunct = 17,
     IsCurrency = 18,
-    // ── closed-class function-word flags (ids 19..=52) ──
+    // ── closed-class function-word flags (ids 19..=55) ──
     // Populated per language from `LexiconConfig::function_words` at lexeme
     // intern time; the parser matches these bits instead of hard-coded word
     // lists, so a different language blob re-categorizes without code
-    // changes. Bits 53–63 stay reserved.
+    // changes. Bits 56–63 stay reserved.
     /// Closed POS-class words (determiners).
     IsDetWord = 19,
     /// Closed POS-class words (adpositions).
@@ -108,6 +108,14 @@ pub enum Attribute {
     /// Dual-class `get`/`got` (AUX-lexed passive/causative host vs. lexical
     /// main verb — the imperative gate reads this bit).
     IsGetWord = 52,
+    /// Have-clitic `'ve` (closed lemma-map gate: tokenizer splinter with no
+    /// flag coverage until now — every other closed lemma surface already
+    /// rides a bit).
+    IsHaveClitic = 53,
+    /// Will-clitic `'ll` (same closed lemma-map gate as [`Self::IsHaveClitic`]).
+    IsWillClitic = 54,
+    /// Indefinite pronouns (`something`, `everyone`, … — never common nouns).
+    IsIndefinitePronoun = 55,
     // ── value attributes (ids ≥ 64) ──
     Id = 64,
     Orth = 65,
@@ -201,6 +209,9 @@ impl Attribute {
             Self::IsThereWord => 50,
             Self::IsWhAdverbial => 51,
             Self::IsGetWord => 52,
+            Self::IsHaveClitic => 53,
+            Self::IsWillClitic => 54,
+            Self::IsIndefinitePronoun => 55,
             Self::Id => 64,
             Self::Orth => 65,
             Self::Lower => 66,
@@ -234,7 +245,7 @@ impl Attribute {
     }
 
     /// Reconstruct an [`Attribute`] from a numeric id, mapping the reserved
-    /// flag slots 53–63 (and anything unknown) to [`Attribute::Other`].
+    /// flag slots 56–63 (and anything unknown) to [`Attribute::Other`].
     #[must_use]
     pub const fn from_id(id: u16) -> Self {
         match id {
@@ -290,6 +301,9 @@ impl Attribute {
             50 => Self::IsThereWord,
             51 => Self::IsWhAdverbial,
             52 => Self::IsGetWord,
+            53 => Self::IsHaveClitic,
+            54 => Self::IsWillClitic,
+            55 => Self::IsIndefinitePronoun,
             64 => Self::Id,
             65 => Self::Orth,
             66 => Self::Lower,
@@ -384,6 +398,9 @@ impl Attribute {
             "IS_BE_CLITIC" => Self::IsBeClitic,
             "IS_THERE_WORD" => Self::IsThereWord,
             "IS_WH_ADVERBIAL" => Self::IsWhAdverbial,
+            "IS_HAVE_CLITIC" => Self::IsHaveClitic,
+            "IS_WILL_CLITIC" => Self::IsWillClitic,
+            "IS_INDEFINITE_PRONOUN" => Self::IsIndefinitePronoun,
             "ID" => Self::Id,
             "ORTH" => Self::Orth,
             "LOWER" => Self::Lower,

@@ -1323,15 +1323,18 @@ fn final_manner_adverbial_is_adv() {
 }
 
 #[test]
-fn coordinated_adverbial_candidate_stays_noun() {
-    // Must-NOT-fire (boundary): "daily" before a conjunction ("Run daily
-    // or quit") sits in a coordination frame, not a final/comma adverbial
-    // slot — CC-disambiguation is its own rule, so it stays NOUN even
-    // though the sibling ref reads ADV.
+fn coordinated_adverbial_before_conjunction_is_adv() {
+    // Refs (UD coordination-11): daily → adv/advmod → Run. A closed-list
+    // adverb word between a verb and a conjunction modifies the first
+    // conjunct — the CC-disambiguation this pin deferred now exists.
     let (_doc, set) = parse("Run daily or quit.");
     let pos = pos_of(&set);
+    let deps = deps(&set);
     let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
-    assert_eq!(pos[at("daily")], "noun", "pos: {pos:?}");
+    let (run, daily) = (at("Run"), at("daily"));
+    assert_eq!(pos[daily], "adv", "pos: {pos:?}");
+    assert_eq!(deps[daily], "advmod", "deps: {deps:?}");
+    assert_eq!(daily as i32 + set.0[daily].head, run as i32);
 }
 
 #[test]
@@ -2009,6 +2012,101 @@ fn nominal_pair_without_clausal_frame_stays_noun() {
     let pos = pos_of(&set);
     let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
     assert_eq!(pos[at("chase")], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn sform_target_after_plural_stays_nominal() {
+    // Must-NOT-fire control for the target morphology gate: an `-s` word
+    // after a plural (`Dickens novels`) is the compound head, never the
+    // predicate — the verb reading needs a bare-form target.
+    let (_doc, set) = parse("Dickens novels thrill me.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("novels")], "noun", "pos: {pos:?}");
+    assert_eq!(deps[at("novels")], "compound", "deps: {deps:?}");
+}
+
+#[test]
+fn demonstrative_subject_with_nominal_continuation_stays_det() {
+    // Must-NOT-fire control for the continuation gate: a demonstrative
+    // before a nominal predicate frame (`This house stands`) is the
+    // determiner — only adverbial/final continuations license the
+    // pronominal reading.
+    let (_doc, set) = parse("This house stands empty.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("This")], "det", "pos: {pos:?}");
+    assert_eq!(deps[at("house")], "nsubj", "deps: {deps:?}");
+}
+
+#[test]
+fn predicative_ly_after_linking_is_adjective() {
+    // Refs (UD copular-edge-04): That → pron/nsubj → seems, seems →
+    // verb/root, unlikely → adj/acomp → seems. A clause-final `-ly` word
+    // after a linking verb is the predicate adjective, not a manner
+    // adverbial — the demonstrative-subject license pronounces `That`
+    // alongside.
+    let (_doc, set) = parse("That seems unlikely.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (that, seems, unlikely) = (at("That"), at("seems"), at("unlikely"));
+    assert_eq!(pos[unlikely], "adj", "pos: {pos:?}");
+    assert_eq!(deps[unlikely], "acomp", "deps: {deps:?}");
+    assert_eq!(unlikely as i32 + set.0[unlikely].head, seems as i32);
+    assert_eq!(deps[seems], "root");
+    assert_eq!(pos[that], "pron", "pos: {pos:?}");
+    assert_eq!(deps[that], "nsubj", "deps: {deps:?}");
+    assert_eq!(that as i32 + set.0[that].head, seems as i32);
+    // Determined frame: the predicative license leaves no POS doubt, so
+    // Track B stays quiet.
+    let (conf, _, _) = ambiguity_of("That seems unlikely.");
+    assert_eq!(conf.oracle_tie_count, 0, "licensed predicative must not tie: {conf:?}");
+}
+
+#[test]
+fn manner_ly_with_complement_stays_adverb() {
+    // Must-NOT-fire controls for the final gate: a `-ly` manner word with
+    // a complement after it (`tastes sweetly of oak`) or a plain-verb host
+    // (`smiled wittily`) keeps its adverbial reading — only copular/
+    // linking hosts in final position license the adjective.
+    for (text, word, host) in [
+        ("The wine tastes sweetly of oak.", "sweetly", "tastes"),
+        ("She smiled wittily.", "wittily", "smiled"),
+    ] {
+        let (_doc, set) = parse(text);
+        let pos = pos_of(&set);
+        let deps = deps(&set);
+        let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+        assert_eq!(pos[at(word)], "adv", "{text} pos: {pos:?}");
+        assert_eq!(deps[at(word)], "advmod", "{text} deps: {deps:?}");
+        assert_eq!(
+            at(word) as i32 + set.0[at(word)].head, at(host) as i32,
+            "{text} deps: {deps:?}"
+        );
+    }
+}
+
+#[test]
+fn medial_manner_ly_after_verb_is_adv() {
+    // The user-reported frame: a `-ly` manner adverbial with a particle
+    // after it (`spoke wittily at dinner`) matches neither the final nor
+    // the attributive shape — the medial license restores it, and the
+    // prepositional frame lands around it.
+    let (_doc, set) = parse("He spoke wittily at dinner.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (spoke, wittily, dinner) = (at("spoke"), at("wittily"), at("dinner"));
+    assert_eq!(pos[wittily], "adv", "pos: {pos:?}");
+    assert_eq!(deps[wittily], "advmod", "deps: {deps:?}");
+    assert_eq!(wittily as i32 + set.0[wittily].head, spoke as i32);
+    assert_eq!(deps[dinner], "pobj", "deps: {deps:?}");
+    // Determined frame: quiet.
+    let (conf, _, _) = ambiguity_of("He spoke wittily at dinner.");
+    assert_eq!(conf.oracle_tie_count, 0, "licensed manner must not tie: {conf:?}");
 }
 
 #[test]
