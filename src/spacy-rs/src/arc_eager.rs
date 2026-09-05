@@ -650,6 +650,44 @@ fn refine_pos_that_relative(texts: &[String], pos: &mut [Upos], flags: &[LexemeF
     }
 }
 
+/// Interrogative WH-adverbial (`Where is my bag`, `Why is the sky blue`,
+/// `How does photosynthesis work`, `When does the store close`). The tagger
+/// leaves where/why/how as NOUN and `when` as SCONJ, so interrogative
+/// adverbials read as subjects and markers — yet the refs pin ADV/advmod
+/// for all four unanimously. Upgrades NOUN where/why/how → ADV when no
+/// nominal or determiner precedes (sentence-initial or after a boundary —
+/// the exact mirror of the where-marker gate below, disjoint by
+/// construction), and SCONJ `when` → ADV only before an AUX (the inversion
+/// frame; fronted subordinates like `When it rains` and medial uses keep
+/// SCONJ). Sequenced immediately before the where-marker pass. Guards:
+/// nominal- or determiner-headed uses (`The store where`, `the where`)
+/// keep their incumbent NOUN (→ SCONJ via the marker rule); `who`/`what`
+/// (true nominals) never match — the bit covers only the adverbial four.
+/// Known divergence kept: medial non-headed `where` stays the pinned NOUN
+/// residual.
+fn refine_pos_interrogative_wh_adverbial(
+    texts: &[String],
+    pos: &mut [Upos],
+    flags: &[LexemeFlags],
+) {
+    for i in 0..texts.len() {
+        if !flags[i].is_wh_adverbial() {
+            continue;
+        }
+        if pos[i] == Upos::Noun {
+            if i > 0 && matches!(pos[i - 1], Upos::Noun | Upos::Propn | Upos::Det) {
+                continue;
+            }
+            pos[i] = Upos::Adv;
+        } else if pos[i] == Upos::Sconj
+            && i + 1 < texts.len()
+            && pos[i + 1] == Upos::Aux
+        {
+            pos[i] = Upos::Adv;
+        }
+    }
+}
+
 /// Locative relativizer `where` (`The store where we met closed`). The
 /// tagger leaves it NOUN, so the Sconj-keyed mark arm — which fires for
 /// `when`/`because` — never sees it, and the anchor compounds onto it.
@@ -714,7 +752,8 @@ fn refine_pos_clausal_after(texts: &[String], pos: &mut [Upos], flags: &[LexemeF
 /// `'re late` stay ADJ). Deliberately outside the set: `today` (frozen refs
 /// irreconcilable — NOUN/advmod vs ADV), `later`/`earlier` (golden-pinned
 /// NOUN), `still` (pre-verbal frame only — predicative `be still` must not
-/// match), WH-initials (`Why`/`Where`, interrogative frame), and
+/// match), WH-initials (`Why`/`Where`/`How` — upgraded to ADV by the
+/// interrogative-WH pass before this runs, so they never reach it), and
 /// coordination-`or` slots (`Run daily or quit` — CC-disambiguation is its
 /// own rule). Same O(n) frame-scan shape as the other refines.
 fn refine_pos_final_adverbial(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
@@ -1626,6 +1665,32 @@ impl ArcEagerState {
                 }
                 (Upos::Adv, Upos::Verb) => {
                     out.push(Self::act(ArcEagerMove::Left, labels.advmod));
+                }
+                // An interrogative adverbial on a crowned be-predicate
+                // (`Where is the station`: Where → advmod → is). The generic
+                // arm above only sees verbal predicates; this one is gated
+                // on the WH bit, a be-form head, and the head holding the
+                // sentence crown — non-root be (`is` in `Why is the sky
+                // blue`, `does` in `How does photosynthesis work`) keeps
+                // repair dynamics, and the predicate adjective or verb owns
+                // those attachments. Sole offer on its pairs (no nsubj/det
+                // arm matches ADV tops), so it wins outright at fallthrough
+                // weight with no tie.
+                (Upos::Adv, Upos::Aux) => {
+                    if flags[s].is_wh_adverbial()
+                        && is_be_form(flags[b])
+                        && self.labels[b] == labels.root
+                    {
+                        out.push(Self::act(ArcEagerMove::Left, labels.advmod));
+                    }
+                }
+                // An interrogative adverbial on a predicate adjective
+                // (`Why is the sky blue`: Why → advmod → blue). WH-gated so
+                // plain adverbials keep repair dynamics; sole offer, no tie.
+                (Upos::Adv, Upos::Adj) => {
+                    if flags[s].is_wh_adverbial() {
+                        out.push(Self::act(ArcEagerMove::Left, labels.advmod));
+                    }
                 }
                 (Upos::Cconj, _) => {
                     // Defers under `clausal_cc_defer` above (withholds the
@@ -2964,6 +3029,11 @@ impl ArcEagerAnnotator {
         // relative-matrix pass, whose VERB-host gate reads the clause verbs
         // upgraded here (cried → slept). Disjoint targets from both.
         refine_pos_that_relative(&texts, &mut pos, &flags);
+        // Interrogative WH-adverbial pass: clause-initial where/why/how
+        // (and AUX-led `when`) → ADV. Sequenced immediately before the
+        // where-marker pass; the two gates mirror each other (nominal-prev
+        // vs. not) so no token can match both.
+        refine_pos_interrogative_wh_adverbial(&texts, &mut pos, &flags);
         // Where-marker pass: nominal-headed where → SCONJ so the existing
         // mark arm fires. Sequenced with the other frame passes; targets
         // (NOUN-where) are disjoint from every verb/ADJ upgrade, and no

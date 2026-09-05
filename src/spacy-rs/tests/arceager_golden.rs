@@ -972,24 +972,32 @@ fn nominal_headed_where_is_sconj_mark() {
 }
 
 #[test]
-fn interrogative_where_stays_noun() {
-    // Must-NOT-fire: sentence-initial interrogative `where` has no nominal
-    // head — stays NOUN (its ADV reading belongs to the adverb-lexicon
-    // gap, explicitly out of scope).
-    let (_doc, set) = parse("Where is my bag?");
-    let pos = pos_of(&set);
-    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
-    assert_eq!(pos[at("Where")], "noun", "pos: {pos:?}");
+fn interrogative_where_is_adverbial() {
+    // Refs (UD question-02/08, wh-aux-04, wh-copula-03): clause-initial
+    // interrogative `where` is ADV/advmod — unanimously across all four
+    // refs — so it reads from the WH-adverbial bit, not the adverb-lexicon
+    // gap. (This retires the old NOUN pin: the gap doctrine stands for open
+    // adverbs, but closed WH-forms are data, and every ref agrees.)
+    // Medial `where` keeps its own dynamics (see `nominal_headed_where`).
+    for text in [
+        "Where is my bag?",
+        "Where is the station?",
+        "Where did she go?",
+        "Where is the invoice?",
+    ] {
+        let (_doc, set) = parse(text);
+        let pos = pos_of(&set);
+        let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+        assert_eq!(pos[at("Where")], "adv", "{text}: pos: {pos:?}");
+    }
 }
 
 #[test]
 fn where_be_question_crowns_aux() {
     // Refs (UD question-02/08): is → aux/root, station/bag → noun/dobj →
-    // is, the/my → det → station/bag. The WH-word is pinned NOUN (the
-    // control above), so no VERB/ADJ crowns; the Where-be root rung crowns
-    // the be-AUX and the gated be-dobj arm lands the complement. (UD pins
-    // adv/advmod for Where itself — the POS half stays a documented
-    // residual; only heads/labels of the determined tokens are asserted.)
+    // is, the/my → det → station/bag, Where → adv/advmod → is. The Where-be
+    // root rung crowns the be-AUX, the gated be-dobj arm lands the
+    // complement, and the WH-adverbial arm lands Where on the crowned be.
     // No oracle tie: the frame is determined, so Track B stays quiet.
     for (text, det, comp) in [
         ("Where is the station?", "the", "station"),
@@ -1007,7 +1015,8 @@ fn where_be_question_crowns_aux() {
         assert_eq!(comp_ as i32 + set.0[comp_].head, is as i32, "{text}");
         assert_eq!(deps[det_], "det", "{text}: deps: {deps:?}");
         assert_eq!(det_ as i32 + set.0[det_].head, comp_ as i32, "{text}");
-        assert_eq!(pos[where_], "noun", "{text}: Where stays NOUN: {pos:?}");
+        assert_eq!(pos[where_], "adv", "{text}: pos: {pos:?}");
+        assert_eq!(deps[where_], "advmod", "{text}: deps: {deps:?}");
         let abs = where_ as i32 + set.0[where_].head;
         assert_eq!(abs, is as i32, "{text}: Where headed by be");
         let (conf, _, _) = ambiguity_of(text);
@@ -1020,7 +1029,8 @@ fn where_aux_with_verb_keeps_verb_root() {
     // Must-NOT-fire: `Where did she go` has a finite verb — the VERB rung
     // wins before the Where-be rung is consulted, and `did` is not a
     // be-form anyway. go stays root with did → aux → go and she → nsubj
-    // → go; the gated be-dobj arm never sees the pair.
+    // → go; the gated be-dobj arm never sees the pair. Where itself reads
+    // ADV/advmod via the generic (Adv, Verb) arm.
     let (_doc, set) = parse("Where did she go?");
     let pos = pos_of(&set);
     let deps = deps(&set);
@@ -1032,7 +1042,60 @@ fn where_aux_with_verb_keeps_verb_root() {
     assert_eq!(did as i32 + set.0[did].head, go as i32);
     assert_eq!(deps[she], "nsubj", "deps: {deps:?}");
     assert_eq!(she as i32 + set.0[she].head, go as i32);
-    assert_eq!(pos[at("Where")], "noun", "pos: {pos:?}");
+    assert_eq!(pos[at("Where")], "adv", "pos: {pos:?}");
+    assert_eq!(deps[at("Where")], "advmod", "deps: {deps:?}");
+}
+
+#[test]
+fn initial_when_with_inversion_is_adverbial() {
+    // Refs (UD wh-aux-03): clause-initial `when` before an AUX is the
+    // interrogative adverbial (ADV/advmod → close), not the subordinator —
+    // while medial `when` keeps SCONJ/mark (see
+    // `when_marker_attaches_to_clause_verb`). Determined frame, no tie.
+    let (_doc, set) = parse("When does the store close?");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (when, close) = (at("When"), at("close"));
+    assert_eq!(pos[when], "adv", "pos: {pos:?}");
+    assert_eq!(deps[when], "advmod", "deps: {deps:?}");
+    assert_eq!(when as i32 + set.0[when].head, close as i32);
+    assert_eq!(deps[close], "root", "deps: {deps:?}");
+    let (conf, _, _) = ambiguity_of("When does the store close?");
+    assert_eq!(conf.oracle_tie_count, 0, "determined frame must not tie: {conf:?}");
+}
+
+#[test]
+fn fronted_when_without_inversion_keeps_subordinator() {
+    // Must-NOT-fire: initial `when` NOT followed by an AUX is a fronted
+    // subordinate marker (`When available, call me back`) — SCONJ stands,
+    // the inversion upgrade never sees the pair.
+    let (_doc, set) = parse("When available, call me back.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("When")], "sconj", "pos: {pos:?}");
+}
+
+#[test]
+fn why_how_initial_read_adverbial() {
+    // Refs (UD question-05, wh-aux-02): clause-initial `why`/`how` are
+    // ADV — the same closed-class exception as interrogative `where`
+    // (the open-adverb gap doctrine is untouched). Attachments follow
+    // their predicates: Why → advmod → blue via the WH-adjective arm,
+    // How → advmod → work via the generic (Adv, Verb) arm.
+    for (text, wh, pred) in [
+        ("Why is the sky blue?", "Why", "blue"),
+        ("How does photosynthesis work?", "How", "work"),
+    ] {
+        let (_doc, set) = parse(text);
+        let pos = pos_of(&set);
+        let deps = deps(&set);
+        let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+        let (wh_, pred_) = (at(wh), at(pred));
+        assert_eq!(pos[wh_], "adv", "{text}: pos: {pos:?}");
+        assert_eq!(deps[wh_], "advmod", "{text}: deps: {deps:?}");
+        assert_eq!(wh_ as i32 + set.0[wh_].head, pred_ as i32, "{text}");
+    }
 }
 
 #[test]

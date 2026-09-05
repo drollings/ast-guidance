@@ -9,7 +9,7 @@
 use crate::error::SpacyError;
 
 /// A token/lexeme attribute id. Named variants cover the ids spaCy defines
-/// plus the closed-class function-word flags (19–50);
+/// plus the closed-class function-word flags (19–51);
 /// [`Attribute::Other`] catches reserved flag slots (48–63) and unknown ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
@@ -103,6 +103,8 @@ pub enum Attribute {
     /// Locative/existential pro-forms are covered by [`Attribute::IsLocative`];
     /// this bit is the expletive `there` alone (subject slot).
     IsThereWord = 50,
+    /// Interrogative adverbials (`where`, `why`, `how`, `when`).
+    IsWhAdverbial = 51,
     // ── value attributes (ids ≥ 64) ──
     Id = 64,
     Orth = 65,
@@ -194,6 +196,7 @@ impl Attribute {
             Self::IsBeCliticS => 48,
             Self::IsBeClitic => 49,
             Self::IsThereWord => 50,
+            Self::IsWhAdverbial => 51,
             Self::Id => 64,
             Self::Orth => 65,
             Self::Lower => 66,
@@ -281,6 +284,7 @@ impl Attribute {
             48 => Self::IsBeCliticS,
             49 => Self::IsBeClitic,
             50 => Self::IsThereWord,
+            51 => Self::IsWhAdverbial,
             64 => Self::Id,
             65 => Self::Orth,
             66 => Self::Lower,
@@ -374,6 +378,7 @@ impl Attribute {
             "IS_BE_CLITIC_S" => Self::IsBeCliticS,
             "IS_BE_CLITIC" => Self::IsBeClitic,
             "IS_THERE_WORD" => Self::IsThereWord,
+            "IS_WH_ADVERBIAL" => Self::IsWhAdverbial,
             "ID" => Self::Id,
             "ORTH" => Self::Orth,
             "LOWER" => Self::Lower,

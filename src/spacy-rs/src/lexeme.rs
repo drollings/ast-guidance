@@ -317,6 +317,11 @@ impl LexemeFlags {
     pub const fn is_there_word(self) -> bool {
         self.check(Attribute::IsThereWord.id())
     }
+    /// Interrogative adverbials (`where`, `why`, `how`, `when`).
+    #[must_use]
+    pub const fn is_wh_adverbial(self) -> bool {
+        self.check(Attribute::IsWhAdverbial.id())
+    }
 }
 
 /// A word-type record: the surface-shape facts for one orth, shared by all

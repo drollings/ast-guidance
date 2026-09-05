@@ -169,6 +169,10 @@ pub const BE_CLITIC: &[&str] = &["'s", "'re", "'m"];
 /// [`LOCATIVES`]).
 pub const THERE: &[&str] = &["there"];
 
+/// Interrogative adverbials (clause-initial ADV upgrade + adverbial
+/// attachment gates; relative/subordinator uses keep their own categories).
+pub const WH_ADVERBIAL: &[&str] = &["where", "why", "how", "when"];
+
 /// Build the lowercased-orth → flag-bits map for [`LexiconConfig`](crate::lexeme::LexiconConfig).
 #[must_use]
 pub fn function_word_bits() -> HashMap<String, u64> {
@@ -205,6 +209,7 @@ pub fn function_word_bits() -> HashMap<String, u64> {
         (BE_CLITIC_S, Attribute::IsBeCliticS),
         (BE_CLITIC, Attribute::IsBeClitic),
         (THERE, Attribute::IsThereWord),
+        (WH_ADVERBIAL, Attribute::IsWhAdverbial),
     ];
     let mut map = HashMap::new();
     for (words, attr) in sets {
