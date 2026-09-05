@@ -48,6 +48,7 @@ pub mod yago_resolve;
 pub mod lexeme;
 pub mod llm;
 pub mod morph;
+pub mod ortho;
 pub mod pipeline;
 pub mod cache;
 pub mod routing;

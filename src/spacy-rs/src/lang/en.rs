@@ -32,6 +32,14 @@ pub fn tag_map() -> TagMap {
 pub static LEMMAS_BLOB: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/en_lemmas.bin"));
 
+/// The versioned English tagger orthography (morpheme suffixes, clause
+/// punctuation, sentence boundaries), compiled from
+/// `../../env/en_orthography.json` by `build.rs` into the `SOR1` blob the
+/// ArcEager parser evaluates through [`crate::ortho::TaggerOrtho`] — never
+/// as literals in the parser.
+pub static ORTHO_BLOB: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/en_ortho.bin"));
+
 /// The English `LexiconConfig`: `lang = "en"`, the stop-word set, the merged
 /// cardinal + ordinal number words (English `LIKE_NUM`), no norm overrides,
 /// and the closed-class function-word categories (attribute ids 19–47) the

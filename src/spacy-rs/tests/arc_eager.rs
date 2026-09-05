@@ -23,6 +23,10 @@ fn label_hashes(vocab: &Arc<Vocab>) -> DepLabels {
     DepLabels::new(vocab.strings())
 }
 
+fn ortho() -> TaggerOrtho<'static> {
+    TaggerOrtho::english()
+}
+
 // ── 9.1 infer_pos ──────────────────────────────────────────────────────
 
 #[test]
@@ -111,7 +115,7 @@ fn candidate_actions_noun_before_verb() {
         .iter()
         .map(|t| vocab.lexicon().get_or_create(t).flags)
         .collect();
-    let actions = st.candidate_actions(&pos, &texts, &flags, &labels);
+    let actions = st.candidate_actions(&pos, &texts, &flags, &labels, &ortho());
     assert!(actions.iter().any(|a| a.move_type == ArcEagerMove::Shift));
     assert!(
         actions
@@ -134,7 +138,7 @@ fn candidate_actions_verb_before_noun() {
         .iter()
         .map(|t| vocab.lexicon().get_or_create(t).flags)
         .collect();
-    let actions = st.candidate_actions(&pos, &texts, &flags, &labels);
+    let actions = st.candidate_actions(&pos, &texts, &flags, &labels, &ortho());
     assert!(
         actions
             .iter()
@@ -154,7 +158,7 @@ fn candidate_actions_punct_with_empty_stack() {
         .iter()
         .map(|t| vocab.lexicon().get_or_create(t).flags)
         .collect();
-    let actions = st.candidate_actions(&pos, &texts, &flags, &labels);
+    let actions = st.candidate_actions(&pos, &texts, &flags, &labels, &ortho());
     assert!(
         !actions.iter().any(|a| a.move_type == ArcEagerMove::Right),
         "nothing to attach punctuation to"
@@ -172,7 +176,7 @@ fn candidate_actions_drain_on_empty_buffer() {
     let pos = vec![Upos::Noun, Upos::Noun];
     let texts: Vec<String> = vec![];
     let flags: Vec<LexemeFlags> = vec![];
-    let actions = st.candidate_actions(&pos, &texts, &flags, &labels);
+    let actions = st.candidate_actions(&pos, &texts, &flags, &labels, &ortho());
     assert_eq!(
         actions,
         vec![ArcEagerAction {
@@ -315,7 +319,7 @@ fn oracle_best_with_margin_reports_ties() {
         .iter()
         .map(|t| vocab.lexicon().get_or_create(t).flags)
         .collect();
-    let actions = st.candidate_actions(&pos, &texts, &flags, &labels);
+    let actions = st.candidate_actions(&pos, &texts, &flags, &labels, &ortho());
     assert!(actions.len() >= 2);
     let (best, margin) = oracle
         .best_with_margin(&st, &actions, &pos, &labels)
@@ -433,101 +437,6 @@ fn random_pos_sequences_produce_valid_trees() {
     }
 }
 
-// ── DRY: shared suffix primitive equivalence ───────────────────────────
-// `has_suffix_ci` consolidates the ~20 bespoke allocation-free suffix
-// idioms (`word.get(word.len() - N..).is_some_and(eq_ignore_ascii_case)`,
-// suffixes "s" / "ly" / "ed" / "ing") plus the one allocating
-// `to_ascii_lowercase().ends_with("ing")` site. Length guards stay at the
-// call sites verbatim; this test proves the primitive agrees with every
-// legacy spelling on guarded inputs (zero behavior change), returns false
-// without panicking on unguarded shorts, and matches the allocating site.
-#[test]
-fn suffix_ci_matches_every_legacy_spelling() {
-    fn legacy(word: &str, suffix: &str) -> bool {
-        word.get(word.len() - suffix.len()..)
-            .is_some_and(|sfx| sfx.eq_ignore_ascii_case(suffix))
-    }
-    let words = [
-        "calls", "CALLS", "Calls", "as", "AS", "x", "quarterly", "QUARTERLY", "Quarterly",
-        "July", "family", "daily", "opened", "OPENED", "Opened", "red", "bed",
-        "smiling", "SMILING", "Smiling", "coming", "morning", "building", "king",
-        "sing", "rain", "raining", "RAINING", "go", "a", "today", "yet", "hard",
-        "it", "answer", "status", "statuses",
-    ];
-    for suffix in ["s", "ly", "ed", "ing"] {
-        for word in words {
-            if word.len() >= suffix.len() {
-                assert_eq!(
-                    has_suffix_ci(word, suffix),
-                    legacy(word, suffix),
-                    "word={word:?} suffix={suffix:?}"
-                );
-                // The one allocating site must agree too.
-                assert_eq!(
-                    has_suffix_ci(word, suffix),
-                    word.to_ascii_lowercase().ends_with(suffix),
-                    "alloc-parity word={word:?} suffix={suffix:?}"
-                );
-            } else {
-                // Unguarded shorts never reach the primitive (call-site length
-                // guards stay verbatim), but it must be total, not panicking.
-                assert!(!has_suffix_ci(word, suffix), "short word={word:?}");
-            }
-        }
-        // Empty word and empty suffix are total as well.
-        assert!(!has_suffix_ci("", suffix), "empty word suffix={suffix:?}");
-    }
-    assert!(has_suffix_ci("calls", ""));
-}
-
-// ── DRY: shared trailing-punctuation primitive equivalence ─────────────
-// `is_trailing_punct_only` consolidates the 8 bespoke clause-final guards
-// (`texts[from..].iter().all(|t| matches!(…))` over ". ! ? ; : , — --").
-// This test proves the primitive agrees with the legacy spelling at every
-// slice start (zero behavior change) across a token matrix covering empty,
-// punct-only, word-only, mixed, multi-char-punct ("..."), and unicode-dash
-// edges.
-#[test]
-fn trailing_punct_only_matches_legacy_idiom() {
-    fn legacy(texts: &[String], from: usize) -> bool {
-        texts[from..].iter().all(|t| {
-            let w = t.as_str();
-            matches!(w, "." | "!" | "?" | ";" | ":" | "," | "—" | "--")
-        })
-    }
-    let streams: Vec<Vec<String>> = [
-        Vec::<&str>::new(),
-        vec!["."],
-        vec!["!"],
-        vec!["--"],
-        vec!["—"],
-        vec!["calls"],
-        vec!["today"],
-        vec!["..."],
-        vec![",", "—", "--", "."],
-        vec!["calls", "."],
-        vec!["today", "."],
-        vec![".", "calls"],
-        vec!["?", "x"],
-        vec!["a", "b", "."],
-        vec!["ready", "yet", "."],
-        vec!["work", "?"],
-        vec!["loudly", "."],
-    ]
-    .iter()
-    .map(|s| s.iter().map(|t| t.to_string()).collect())
-    .collect();
-    for texts in &streams {
-        for from in 0..=texts.len() {
-            assert_eq!(
-                is_trailing_punct_only(texts, from),
-                legacy(texts, from),
-                "texts={texts:?} from={from}"
-            );
-        }
-    }
-}
-
 // ── DRY: shared lowercase-initial primitive equivalence ────────────────
 // `starts_lowercase` consolidates the 10 bespoke finite-verb guards
 // (`word.chars().next().is_some_and(|c| c.is_lowercase())` over both the
@@ -612,68 +521,80 @@ fn copula_is_attached_matches_legacy_spelling() {
     }
 }
 
-// ── DRY: shared sentence-start primitive equivalence ───────────────────
-// `is_sentence_start` consolidates the 3 bespoke sentence-boundary guards
-// (`i == 0 || matches!(texts[i-1])` over ". ! ? ; : — --" — commas never
-// split sentences here; the comma-frame rules own those). This test proves
-// the primitive agrees with the legacy spelling at every position (zero
-// behavior change), including the comma-after (false), mid-word (false),
-// and empty-stream edges.
+// ── STREAMLINE: refine early-out contract (no candidate → no write) ────
+// Every `refine_pos_*` loop body provably no-ops when its candidate POS is
+// absent (all writes sit after the POS guard), so a
+// `pos.iter().any(...)` pre-scan that skips the loop is behavior-neutral.
+// This test pins that contract per rule on REAL flag streams (trigger bits
+// set — relativizers, yet/clitic/wh/after/adverb words — with the POS
+// scrubbed target-absent), proving flags alone can never trigger a write.
+// It passes before the early-outs land (loop no-ops naturally) and must
+// keep passing after (early-out skips legally).
 #[test]
-fn sentence_start_matches_legacy_spelling() {
-    fn legacy(texts: &[String], i: usize) -> bool {
-        i == 0
-            || matches!(
-                texts[i - 1].as_str(),
-                "." | "!" | "?" | ";" | ":" | "—" | "--"
-            )
+fn refine_early_out_no_candidate_no_write() {
+    type Plain = fn(&[String], &mut [Upos], &[LexemeFlags]);
+    type WithOrtho = for<'a, 'b> fn(
+        &'a [String],
+        &'a mut [Upos],
+        &'a [LexemeFlags],
+        &'a TaggerOrtho<'b>,
+    );
+    // Rules whose frames evaluate blob strings take `ortho`; the rest keep
+    // the plain shape (interface segregation — no unused params).
+    // (rule, refine fn, sentence with realistic trigger flags, scrub POS
+    //  that leaves the rule's candidate set empty)
+    let plain: &[(&str, Plain, &str, Upos)] = &[
+    ];
+    let ortho_table: &[(&str, WithOrtho, &str, Upos)] = &[
+        ("bare_infinitive", refine_pos_bare_infinitive, "She won't answer calls.", Upos::Verb),
+        ("bare_object_noun", refine_pos_bare_object_noun, "She won't answer calls.", Upos::Noun),
+        ("directive_initial", refine_pos_directive_initial, "Call the office now.", Upos::Verb),
+        ("demonstrative_object", refine_pos_demonstrative_object, "Translate this to French.", Upos::Noun),
+        ("attributive_ly", refine_pos_attributive_ly, "quarterly sales report", Upos::Verb),
+        ("shifted_det_noun_verb", refine_pos_shifted_det_noun_verb, "Truthfully, the plan failed.", Upos::Verb),
+        ("relative_matrix_verb", refine_pos_relative_matrix_verb, "The man who called left.", Upos::Verb),
+        ("relcl_matrix_complement", refine_pos_relcl_matrix_complement, "The dog that barked stands empty.", Upos::Verb),
+        ("comma_adverbial", refine_pos_comma_adverbial, "In July, we met.", Upos::Verb),
+        ("predicative_ly", refine_pos_predicative_ly, "That seems unlikely.", Upos::Verb),
+        ("final_adverbial", refine_pos_final_adverbial, "The dog barks loudly.", Upos::Verb),
+        ("temporal_yet", refine_pos_temporal_yet, "She is not ready yet.", Upos::Verb),
+        ("linking_predicate", refine_pos_linking_predicate, "That seems unlikely.", Upos::Verb),
+        ("medial_manner_ly", refine_pos_medial_manner_ly, "She spoke wittily at dinner.", Upos::Verb),
+        ("post_comma_verb", refine_pos_post_comma_verb, "The test, honestly, scared us.", Upos::Verb),
+        ("comma_participle", refine_pos_comma_participle, "The CEO, smiling, took questions.", Upos::Verb),
+        ("inverted_copular", refine_pos_inverted_copular, "Is lunch ready?", Upos::Verb),
+        ("be_predicate", refine_pos_be_predicate, "It's raining.", Upos::Verb),
+        ("progressive_ing", refine_pos_progressive_ing, "It's raining.", Upos::Verb),
+        ("modal_question_verb", refine_pos_modal_question_verb, "Will this work?", Upos::Verb),
+        ("contracted_be", refine_pos_contracted_be, "It's raining.", Upos::Verb),
+        ("discourse_initial_verb", refine_pos_discourse_initial_verb, "Please confirm the date.", Upos::Verb),
+        ("imperative_non_det_object", refine_pos_imperative_non_det_object, "Eat apples daily.", Upos::Verb),
+        ("bare_ed_transitive", refine_pos_bare_ed_transitive, "John opened the door.", Upos::Verb),
+    ];
+    for (name, refine, text, scrub) in plain {
+        let doc = tokenize(text);
+        let texts: Vec<String> = (0..doc.len()).map(|i| doc.token_text(i)).collect();
+        let flags: Vec<LexemeFlags> =
+            (0..doc.len()).map(|i| doc.token(i).lexeme.flags).collect();
+        let mut pos = vec![*scrub; doc.len()];
+        refine(&texts, &mut pos, &flags);
+        assert_eq!(
+            pos,
+            vec![*scrub; doc.len()],
+            "{name}: write without candidate POS"
+        );
     }
-    let streams: Vec<Vec<String>> = [
-        vec!["Call", "the", "office", "now", "."],
-        vec!["Well", ",", "we", "won", "."],
-        vec!["Eat", "apples", "daily", "."],
-        vec!["Please", "call", "the", "office", "."],
-        vec!["Sit", "down", ".", "Call", "the", "office", "."],
-        vec!["What", "?", "Eat", "apples", "."],
-        vec!["Go", ";", "run", "fast", "."],
-        vec!["Wait", "--", "listen", "."],
-        vec!["Yes", "—", "go", "."],
-        vec![",", "go", "."],
-        vec!["go"],
-    ]
-    .iter()
-    .map(|s| s.iter().map(|t| t.to_string()).collect())
-    .collect();
-    for texts in &streams {
-        for i in 0..texts.len() {
-            assert_eq!(
-                is_sentence_start(texts, i),
-                legacy(texts, i),
-                "texts={texts:?} i={i}"
-            );
-        }
-    }
-    // Commas never open sentences; every true boundary token does.
-    let comma: Vec<String> = ["Hi", ",", "there"]
-        .iter()
-        .map(|t| t.to_string())
-        .collect();
-    assert!(!is_sentence_start(&comma, 2));
-    for (boundary, after) in [
-        (".", "Call"),
-        ("!", "Run"),
-        ("?", "Eat"),
-        (";", "go"),
-        (":", "see"),
-        ("—", "go"),
-        ("--", "listen"),
-    ] {
-        let texts: Vec<String> = ["Sat", boundary, after]
-            .iter()
-            .map(|t| t.to_string())
-            .collect();
-        assert!(is_sentence_start(&texts, 0), "{boundary}");
-        assert!(!is_sentence_start(&texts, 1), "{boundary}");
-        assert!(is_sentence_start(&texts, 2), "{boundary}");
+    for (name, refine, text, scrub) in ortho_table {
+        let doc = tokenize(text);
+        let texts: Vec<String> = (0..doc.len()).map(|i| doc.token_text(i)).collect();
+        let flags: Vec<LexemeFlags> =
+            (0..doc.len()).map(|i| doc.token(i).lexeme.flags).collect();
+        let mut pos = vec![*scrub; doc.len()];
+        refine(&texts, &mut pos, &flags, &ortho());
+        assert_eq!(
+            pos,
+            vec![*scrub; doc.len()],
+            "{name}: write without candidate POS"
+        );
     }
 }

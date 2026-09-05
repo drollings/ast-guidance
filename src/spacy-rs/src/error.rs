@@ -78,4 +78,10 @@ pub enum SpacyError {
     /// magic/version, a truncated or out-of-range section, or invalid UTF-8.
     #[error("invalid lemma blob: {0}")]
     LemmaBlob(String),
+
+    /// A versioned tagger-orthography blob (`build.rs` output) failed to
+    /// parse: bad magic/version, truncation, framing drift, or an empty
+    /// entry — the data bug must fail at load, never mis-parse.
+    #[error("invalid orthography blob: {0}")]
+    OrthoBlob(String),
 }

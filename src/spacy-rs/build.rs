@@ -99,6 +99,53 @@ fn main() {
     fs::write(&out_path, &blob).expect("write");
     println!("cargo:rustc-env=LEMMA_BLOB={}", out_path.display());
     eprintln!("lemmas blob SLM2: {} bytes -> {}", blob.len(), out_path.display());
+    // Tagger orthography blob (SOR1): the string fragments/suffixes the
+    // ArcEager parser evaluates, compiled from env/en_orthography.json so
+    // each language ships data, not parser edits. Layout (see ortho.rs):
+    // magic SOR1 (u32) + version (u16) + 3 lists [u32 count][u32 bytelen]
+    // [NUL-joined bytes] (trailing, boundary, bare_follow) + 5 scalars
+    // [u32 bytelen][bytes] (plural_s, manner_ly, past_ed, part_ing, comma).
+    let ortho_path = manifest_dir.join("../../env/en_orthography.json");
+    println!("cargo:rerun-if-changed={}", ortho_path.display());
+    let ortho_text = fs::read_to_string(&ortho_path).expect("read ortho json");
+    let ortho_root: Value = serde_json::from_str(&ortho_text).expect("parse ortho");
+    let mut ortho = Vec::new();
+    ortho.extend_from_slice(&0x534F5231u32.to_le_bytes());
+    ortho.extend_from_slice(&1u16.to_le_bytes());
+    for key in ["trailing_punct", "sentence_boundary", "bare_demonstrative_follow"] {
+        let items: Vec<&str> = ortho_root[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("ortho list {key}"))
+            .iter()
+            .map(|v| v.as_str().unwrap_or_else(|| panic!("ortho string in {key}")))
+            .collect();
+        assert!(!items.is_empty(), "ortho list {key} must not be empty");
+        let mut body = Vec::new();
+        for w in &items {
+            assert!(
+                !w.is_empty() && !w.as_bytes().contains(&0),
+                "ortho entry in {key} must be non-empty NUL-free UTF-8"
+            );
+            body.extend_from_slice(w.as_bytes());
+            body.push(0);
+        }
+        ortho.extend_from_slice(&(items.len() as u32).to_le_bytes());
+        ortho.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        ortho.extend_from_slice(&body);
+    }
+    for key in ["suffix_plural_s", "suffix_manner_ly", "suffix_past_ed", "suffix_part_ing", "clause_comma"] {
+        let s = ortho_root[key].as_str().unwrap_or_else(|| panic!("ortho scalar {key}"));
+        assert!(
+            !s.is_empty() && !s.as_bytes().contains(&0),
+            "ortho scalar {key} must be non-empty NUL-free UTF-8"
+        );
+        ortho.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        ortho.extend_from_slice(s.as_bytes());
+    }
+    let ortho_out = Path::new(&out_dir).join("en_ortho.bin");
+    fs::write(&ortho_out, &ortho).expect("write ortho blob");
+    println!("cargo:rustc-env=ORTHO_BLOB={}", ortho_out.display());
+    eprintln!("ortho blob SOR1: {} bytes -> {}", ortho.len(), ortho_out.display());
 }
 fn encode_rules(v: &Value) -> Vec<u8> {
     let rules = v.as_array().expect("rules array");
