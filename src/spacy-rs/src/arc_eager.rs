@@ -50,80 +50,29 @@ use crate::vocab::Vocab;
 // POS heuristics (§8.2)
 // ─────────────────────────────────────────────────────────────────────────
 
-/// The closed English function-word POS map — the only way a lexeme-only
-/// heuristic gets DET/ADP/AUX/CCONJ/SCONJ. Honest about its limits: it is a
-/// fixed list, not a trained tagger.
-fn closed_funcword_pos(text: &str) -> Option<Upos> {
-    let w = text.to_ascii_lowercase();
-    let det = [
-        "the", "a", "an", "this", "that", "these", "those", "every", "each", "some", "any", "no",
-        "my", "your", "his", "her", "its", "our", "their",
-    ];
-    let adp = [
-        "of", "in", "on", "at", "to", "for", "with", "by", "from", "as", "into", "about", "after",
-        "before", "under", "over", "through", "between", "among", "during", "within", "without",
-        "against", "across", "behind", "above", "below", "near", "off", "out", "up", "down",
-        "toward", "towards", "upon", "along", "around", "beside", "beyond",
-    ];
-    let aux = [
-        "is", "are", "was", "were", "be", "been", "being", "am", "do", "does", "did", "have",
-        "has", "had", "will", "would", "shall", "should", "can", "could", "may", "might", "must",
-        "ought", "get", "got",
-    ];
-    let cconj = ["and", "or", "but", "nor", "yet", "so"];
-    let sconj = [
-        "if", "because", "although", "while", "when", "since", "unless", "whereas", "though",
-        "until", "once",
-    ];
-    let pron = [
-        "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "them", "us", "my",
-        "mine", "your", "yours", "his", "hers", "ours", "theirs", "who", "whom", "what", "which",
-        "everybody",
-    ];
-    if det.contains(&w.as_str()) {
+/// The closed function-word POS map — the only way a lexeme-only heuristic
+/// gets DET/ADP/AUX/CCONJ/SCONJ. Reads per-language
+/// [`LexemeFlags`] bits (populated from `LexiconConfig::function_words`)
+/// instead of hard-coded spellings; priority order (DET > ADP > AUX >
+/// CCONJ > SCONJ > PRON) decides multi-category forms (`after` is ADP,
+/// `that`/`her` are DET). Honest about its limits: it is a finite
+/// data table, not a trained tagger.
+fn closed_funcword_pos(flags: LexemeFlags) -> Option<Upos> {
+    if flags.is_det_word() {
         Some(Upos::Det)
-    } else if adp.contains(&w.as_str()) {
+    } else if flags.is_adp_word() {
         Some(Upos::Adp)
-    } else if aux.contains(&w.as_str()) {
+    } else if flags.is_aux_word() {
         Some(Upos::Aux)
-    } else if cconj.contains(&w.as_str()) {
+    } else if flags.is_cconj_word() {
         Some(Upos::Cconj)
-    } else if sconj.contains(&w.as_str()) {
+    } else if flags.is_sconj_word() {
         Some(Upos::Sconj)
-    } else if pron.contains(&w.as_str()) {
+    } else if flags.is_pron_word() {
         Some(Upos::Pron)
     } else {
         None
     }
-}
-
-/// A closed set of common English verbs so the heuristic parser can detect
-/// the predicate it needs for `nsubj`/`dobj` extraction. Verbs are an open
-/// class, so this list is deliberately finite and honest: verbs outside it
-/// fall through to NOUN (the documented false-negative class that keeps the
-/// LLM rung primary, §8.1).
-fn is_closed_verb(text: &str) -> bool {
-    matches!(
-        text.to_ascii_lowercase().as_str(),
-        "be" | "am" | "are" | "is" | "was" | "were" | "been" | "being" | "have" | "has"
-            | "had" | "do" | "does" | "did" | "go" | "goes" | "went" | "gone" | "make"
-            | "makes" | "made" | "take" | "takes" | "took" | "taken" | "see" | "sees" | "saw"
-            | "seen" | "come" | "comes" | "came" | "get" | "gets" | "got" | "give" | "gives"
-            | "gave" | "given" | "use" | "uses" | "used" | "find" | "finds" | "found" | "want"
-            | "wants" | "wanted" | "look" | "looks" | "looked" | "put" | "puts" | "run" | "runs"
-            | "ran" | "sat" | "sits" | "sit" | "launch" | "launches" | "launched" | "show"
-            | "shows" | "showed" | "shown" | "display" | "displays" | "displayed" | "report"
-            | "reports" | "reported" | "buy" | "buys" | "bought" | "sell" | "sells" | "sold"
-            | "read" | "reads" | "write" | "writes" | "wrote" | "written" | "call" | "calls"
-            | "called" | "need" | "needs" | "needed" | "know" | "knows" | "knew" | "known"
-            | "think" | "thinks" | "thought" | "say" | "says" | "said" | "tell" | "tells"
-            | "told" | "ask" | "asks" | "asked" | "work" | "works" | "worked" | "play" | "plays"
-            | "played" | "move" | "moves" | "moved" | "live" | "lives" | "lived" | "believe"
-            | "believes" | "believed" | "hold" | "holds" | "held" | "bring" | "brings" | "brought"
-            | "happen" | "happens" | "happened" | "bark" | "barks" | "barked" | "eat" | "eats"
-            | "ate" | "eaten" | "drink" | "drinks" | "drank" | "drunk" | "walk" | "walks"
-            | "walked" | "create" | "creates" | "created" | "build" | "builds" | "built"
-    )
 }
 
 /// Determiner-led nominal colliding with the closed verb list (`the
@@ -139,7 +88,7 @@ fn is_closed_verb(text: &str) -> bool {
 /// boundary: determiner-shaped relativizers (`the book that reports…`)
 /// have no corpus instance — `that`-headed verb disambiguation is its own
 /// rule.
-fn refine_pos_det_closed_verb(_texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_det_closed_verb(_texts: &[String], pos: &mut [Upos], __flags: &[LexemeFlags]) {
     for i in 1..pos.len() {
         if pos[i] != Upos::Verb || pos[i - 1] != Upos::Det {
             continue;
@@ -149,19 +98,15 @@ fn refine_pos_det_closed_verb(_texts: &[String], pos: &mut [Upos]) {
 }
 
 /// Hosts that govern a bare infinitive: do-support and the modals, plus the
-/// `n't`-split stubs the tokenizer emits (`wo`/`n't`, `ca`/`n't`). Checked
-/// case-insensitively without allocating (`eq_ignore_ascii_case`).
-fn is_bare_infinitive_host(text: &str) -> bool {
-    const HOSTS: &[&str] = &[
-        "do", "does", "did", "can", "could", "will", "would", "shall", "should", "may", "might",
-        "must", "ca", "wo",
-    ];
-    HOSTS.iter().any(|h| text.eq_ignore_ascii_case(h))
+/// `n't`-split stubs the tokenizer emits (`wo`/`n't`, `ca`/`n't`). Matched
+/// as a lexeme bit, not a spelling list.
+fn is_bare_infinitive_host(flags: LexemeFlags) -> bool {
+    flags.is_bare_inf_host()
 }
 
-/// Whether `text` is a negator hosted by an auxiliary (`n't`, `not`).
-fn is_aux_negator(text: &str) -> bool {
-    text.eq_ignore_ascii_case("n't") || text.eq_ignore_ascii_case("not")
+/// Whether the lexeme is a negator hosted by an auxiliary (`n't`, `not`).
+fn is_aux_negator(flags: LexemeFlags) -> bool {
+    flags.is_negator()
 }
 
 /// Contextual verb detection for the bare infinitive after a do-modal
@@ -174,15 +119,14 @@ fn is_aux_negator(text: &str) -> bool {
 /// (`'s`, `'re`, `'ll`, …) are deliberately excluded: possessive `'s`
 /// (`Bell's theorem`) must not trigger. Lexical verbs (`need help`), nouns
 /// (`go today`), and determiners never match, so true nominals are untouched.
-fn refine_pos_bare_infinitive(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_bare_infinitive(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
     for i in 1..texts.len() {
         if pos[i] != Upos::Noun {
             continue;
         }
-        let prev = texts[i - 1].as_str();
-        let governed = if is_bare_infinitive_host(prev) {
+        let governed = if is_bare_infinitive_host(flags[i - 1]) {
             true
-        } else if is_aux_negator(prev) && i >= 2 && is_bare_infinitive_host(texts[i - 2].as_str()) {
+        } else if is_aux_negator(flags[i - 1]) && i >= 2 && is_bare_infinitive_host(flags[i - 2]) {
             true
         } else {
             false
@@ -201,7 +145,7 @@ fn refine_pos_bare_infinitive(texts: &[String], pos: &mut [Upos]) {
 /// follows) with a VERB host. Guards: pronoun hosts (`she calls` —
 /// finite 3sg), non-s-forms (`called left` — matrix root), and DET hosts
 /// (the determiner rule owns those) never match.
-fn refine_pos_bare_object_noun(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_bare_object_noun(texts: &[String], pos: &mut [Upos], __flags: &[LexemeFlags]) {
     for i in 1..texts.len() {
         if pos[i] != Upos::Verb || pos[i - 1] != Upos::Verb {
             continue;
@@ -232,7 +176,7 @@ fn refine_pos_bare_object_noun(texts: &[String], pos: &mut [Upos]) {
 /// `Translate hello`, `Explain Bell's`) or a conjunction (`Dogs and cats`),
 /// pronoun (`Help them`), or verb (`Dogs bark`) second never fires, so
 /// subjects and bare/proper objects are untouched.
-fn refine_pos_directive_initial(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_directive_initial(texts: &[String], pos: &mut [Upos], __flags: &[LexemeFlags]) {
     for i in 0..texts.len() {
         if pos[i] != Upos::Noun {
             continue;
@@ -263,15 +207,12 @@ fn refine_pos_directive_initial(texts: &[String], pos: &mut [Upos]) {
 /// Sequenced before the imperative pass so the retagged pronoun feeds its
 /// pronoun-object frame (`Translate this` crowns via the PRON second, the
 /// same dynamics as `Remind me`).
-fn refine_pos_demonstrative_object(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_demonstrative_object(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
     for i in 0..texts.len() {
         if pos[i] != Upos::Det {
             continue;
         }
-        if !(texts[i].eq_ignore_ascii_case("this")
-            || texts[i].eq_ignore_ascii_case("these")
-            || texts[i].eq_ignore_ascii_case("those"))
-        {
+        if !flags[i].is_demonstrative() {
             continue;
         }
         let bare = match texts.get(i + 1) {
@@ -280,7 +221,7 @@ fn refine_pos_demonstrative_object(texts: &[String], pos: &mut [Upos]) {
                 matches!(
                     next.as_str(),
                     "." | "!" | "?" | ";" | ":" | "—" | "--" | "," | "(" | ")" | "..."
-                ) || closed_funcword_pos(next.as_str()) == Some(Upos::Adp)
+                ) || flags.get(i + 1).is_some_and(|f| f.is_adp_word())
             }
         };
         if bare {
@@ -305,8 +246,7 @@ fn refine_pos_demonstrative_object(texts: &[String], pos: &mut [Upos]) {
 /// markers (`as always,`, `... please.`) never match. Known boundary:
 /// `twice`/`now`-class temporal complements keep their own (mis)tagging —
 /// the arm crowns the verb, the adjunct stays residual.
-fn refine_pos_discourse_initial_verb(texts: &[String], pos: &mut [Upos]) {
-    const MARKER: &[&str] = &["please", "kindly", "just", "never", "always"];
+fn refine_pos_discourse_initial_verb(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
     if !pos.iter().any(|&p| p == Upos::Noun) {
         return;
     }
@@ -314,9 +254,7 @@ fn refine_pos_discourse_initial_verb(texts: &[String], pos: &mut [Upos]) {
         return;
     }
     for i in 0..texts.len() {
-        if pos[i] != Upos::Noun
-            || !MARKER.iter().any(|m| texts[i].eq_ignore_ascii_case(m))
-        {
+        if pos[i] != Upos::Noun || !flags[i].is_discourse_marker() {
             continue;
         }
         let at_start = i == 0
@@ -331,12 +269,12 @@ fn refine_pos_discourse_initial_verb(texts: &[String], pos: &mut [Upos]) {
             continue;
         }
         let third_ok = matches!(pos[i + 2], Upos::Det | Upos::Pron | Upos::Adv)
-            || texts[i + 2].eq_ignore_ascii_case("twice");
+            || flags[i + 2].is_twice_word();
         if !third_ok {
             continue;
         }
         pos[i + 1] = Upos::Verb;
-        pos[i] = if texts[i].eq_ignore_ascii_case("please") {
+        pos[i] = if flags[i].is_please_word() {
             Upos::Intj
         } else {
             Upos::Adv
@@ -356,7 +294,7 @@ fn refine_pos_discourse_initial_verb(texts: &[String], pos: &mut [Upos]) {
 /// NOUNs — and conjunctions/punctuation next keep the nominal reading
 /// (`Run daily or quit` stays put). Sequenced after the discourse pass so
 /// `Kindly review` (retagged ADV there) is never re-read as attributive.
-fn refine_pos_attributive_ly(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_attributive_ly(texts: &[String], pos: &mut [Upos], __flags: &[LexemeFlags]) {
     for i in 0..texts.len() {
         if pos[i] != Upos::Noun {
             continue;
@@ -393,7 +331,7 @@ fn refine_pos_attributive_ly(texts: &[String], pos: &mut [Upos]) {
 /// verbless-fragment tie owns those) never fire, so subjects and NP
 /// fragments are untouched. Known boundary: verbless headlines with a PP
 /// adjunct (`Markets rally in Asia`) read imperative — no corpus instance.
-fn refine_pos_imperative_non_det_object(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_imperative_non_det_object(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
     if !pos.iter().any(|&p| p == Upos::Noun) {
         return;
     }
@@ -417,7 +355,7 @@ fn refine_pos_imperative_non_det_object(texts: &[String], pos: &mut [Upos]) {
         // finite clauses (`People who wait`, the mirror of the
         // pronoun-subject pass, which upgrades after exactly these forms),
         // so they never read as imperative objects.
-        if pos[i + 1] == Upos::Pron && !is_nominative_subject(texts[i + 1].as_str()) {
+        if pos[i + 1] == Upos::Pron && !is_nominative_subject(flags[i + 1]) {
             pos[i] = Upos::Verb;
             continue;
         }
@@ -427,13 +365,17 @@ fn refine_pos_imperative_non_det_object(texts: &[String], pos: &mut [Upos]) {
         // (`Dogs chase red cars`) keep the compound dynamics.
         if matches!(pos[i + 1], Upos::Noun | Upos::Propn) {
             let rest = &texts[i + 2..];
-            let has_pp = rest
-                .iter()
-                .take_while(|t| !matches!(t.as_str(), "." | "!" | "?" | ";" | ":" | "," | "—" | "--"))
-                .any(|t| closed_funcword_pos(t.as_str()) == Some(Upos::Adp));
-            let has_possessive = texts
+            let has_pp = (0..rest.len())
+                .take_while(|&k| {
+                    !matches!(
+                        rest[k].as_str(),
+                        "." | "!" | "?" | ";" | ":" | "," | "—" | "--"
+                    )
+                })
+                .any(|k| flags[i + 2 + k].is_adp_word());
+            let has_possessive = flags
                 .get(i + 2)
-                .is_some_and(|t| t.eq_ignore_ascii_case("'s"));
+                .is_some_and(|f| f.is_be_clitic_s());
             if has_pp || has_possessive {
                 pos[i] = Upos::Verb;
             }
@@ -446,7 +388,7 @@ fn refine_pos_imperative_non_det_object(texts: &[String], pos: &mut [Upos]) {
 /// determiner-led object is a past-tense predicate: -ed adjectives live in
 /// attributive (DET-led) or predicative-after-linking/be (AUX-prev)
 /// position, never here.
-fn refine_pos_bare_ed_transitive(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_bare_ed_transitive(texts: &[String], pos: &mut [Upos], __flags: &[LexemeFlags]) {
     if texts.len() < 4
         || !matches!(pos[0], Upos::Noun | Upos::Propn)
         || pos[1] != Upos::Noun
@@ -467,24 +409,20 @@ fn refine_pos_bare_ed_transitive(texts: &[String], pos: &mut [Upos]) {
     pos[1] = Upos::Verb;
 }
 
-/// Whether `text` is a possessive determiner (obligatorily heads a nominal
+/// Whether the lexeme is a possessive determiner (obligatorily heads a nominal
 /// on its right: my/your/her snack). Articles route through the existing
-/// det dynamics; complementizer `that` (verb-headed) is excluded by word
+/// det dynamics; complementizer `that` (verb-headed) is excluded by category
 /// at the call site; object/possessive pronouns (`me`, `mine`) lex as
 /// PRON, never DET.
-fn is_possessive_determiner(text: &str) -> bool {
-    const POSSESSIVE: &[&str] = &[
-        "my", "your", "his", "her", "its", "our", "their",
-    ];
-    POSSESSIVE.iter().any(|p| text.eq_ignore_ascii_case(p))
+fn is_possessive_determiner(flags: LexemeFlags) -> bool {
+    flags.is_possessive()
 }
 
-/// Whether `text` is a nominative pronoun surface (finite-clause subject).
+/// Whether the lexeme is a nominative pronoun surface (finite-clause subject).
 /// Object/possessive forms (`me`, `them`, `mine`) are excluded even though
 /// the closed map tags them PRON.
-fn is_nominative_subject(text: &str) -> bool {
-    const NOMINATIVE: &[&str] = &["i", "you", "he", "she", "it", "we", "they", "who"];
-    NOMINATIVE.iter().any(|h| text.eq_ignore_ascii_case(h))
+fn is_nominative_subject(flags: LexemeFlags) -> bool {
+    flags.is_nominative()
 }
 
 /// Finite verb after a nominative pronoun subject (`We stayed`, `it snowed`,
@@ -497,12 +435,12 @@ fn is_nominative_subject(text: &str) -> bool {
 /// noun subjects (`Anna finished`) never match. Known boundary: vocative
 /// collectives (`you guys`) would over-fire — no corpus instance; left for
 /// later work.
-fn refine_pos_pronoun_subject_verb(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_pronoun_subject_verb(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
     for i in 1..texts.len() {
         if pos[i] != Upos::Noun || pos[i - 1] != Upos::Pron {
             continue;
         }
-        if is_nominative_subject(texts[i - 1].as_str()) {
+        if is_nominative_subject(flags[i - 1]) {
             pos[i] = Upos::Verb;
         }
     }
@@ -515,8 +453,8 @@ fn refine_pos_pronoun_subject_verb(texts: &[String], pos: &mut [Upos]) {
 /// SCONJ only with a nominal next (the comment subject). Guards: medial
 /// `as` (`Paris, as always, …`) never matches — comment position is
 /// initial by construction. Same O(n) frame-scan shape.
-fn refine_pos_comment_as(texts: &[String], pos: &mut [Upos]) {
-    if texts.len() < 2 || pos[0] != Upos::Adp || !texts[0].eq_ignore_ascii_case("as") {
+fn refine_pos_comment_as(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
+    if texts.len() < 2 || pos[0] != Upos::Adp || !flags[0].is_as_word() {
         return;
     }
     if matches!(pos[1], Upos::Noun | Upos::Propn | Upos::Pron) {
@@ -524,13 +462,11 @@ fn refine_pos_comment_as(texts: &[String], pos: &mut [Upos]) {
     }
 }
 
-/// Whether `text` is a nominal relativizer with corpus evidence (`who`,
+/// Whether the lexeme is a nominal relativizer with corpus evidence (`who`,
 /// `that`, `where`). Only forms attested in the bench; `which`/`whom` have
 /// no instance and stay out until one appears.
-fn is_relative_marker(text: &str) -> bool {
-    text.eq_ignore_ascii_case("who")
-        || text.eq_ignore_ascii_case("that")
-        || text.eq_ignore_ascii_case("where")
+fn is_relative_marker(flags: LexemeFlags) -> bool {
+    flags.is_relativizer()
 }
 
 /// Shifted DET+NOUN predicate after a clause boundary (`Truthfully, the
@@ -543,7 +479,7 @@ fn is_relative_marker(text: &str) -> bool {
 /// Guards (mirroring the initial-noun rule): lowercase target, and the
 /// comma must sit directly before the determiner (comma-free triples like
 /// `the sales report` never match). Same O(n) frame-scan shape.
-fn refine_pos_shifted_det_noun_verb(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_shifted_det_noun_verb(texts: &[String], pos: &mut [Upos], __flags: &[LexemeFlags]) {
     for i in 3..texts.len() {
         if pos[i] != Upos::Noun {
             continue;
@@ -582,11 +518,11 @@ fn refine_pos_shifted_det_noun_verb(texts: &[String], pos: &mut [Upos]) {
 /// with a trailing predicate nominal/adverbial (`stands empty`, `improve
 /// fast`) and DET-headed relcl verbs (`that cried`) are out of scope — they
 /// need verb-capability or relcl-subject knowledge, not this frame.
-fn refine_pos_relative_matrix_verb(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_relative_matrix_verb(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
     // Nominal-headed relativizer positions (the relative-frame gate).
     let markers: Vec<usize> = (1..texts.len())
         .filter(|&r| {
-            is_relative_marker(texts[r].as_str()) && matches!(pos[r - 1], Upos::Noun | Upos::Propn)
+            is_relative_marker(flags[r]) && matches!(pos[r - 1], Upos::Noun | Upos::Propn)
         })
         .collect();
     if markers.is_empty() {
@@ -628,7 +564,7 @@ fn refine_pos_relative_matrix_verb(texts: &[String], pos: &mut [Upos]) {
 /// determiner-headed ones (`The family …`) never match. Known boundary:
 /// non-`ly` adverbials (`early`, `still`, `always`, `daily`, `hard`) need an
 /// adverb lexicon, not a suffix frame.
-fn refine_pos_comma_adverbial(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_comma_adverbial(texts: &[String], pos: &mut [Upos], __flags: &[LexemeFlags]) {
     for i in 0..texts.len() {
         if pos[i] != Upos::Noun {
             continue;
@@ -666,10 +602,10 @@ fn refine_pos_comma_adverbial(texts: &[String], pos: &mut [Upos]) {
 /// Known boundary: `fact`-complements (`The fact that he left`) tag `that`
 /// PRON where UD reads SCONJ — complementizer disambiguation is its own
 /// rule.
-fn refine_pos_that_relative(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_that_relative(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
     for i in 1..texts.len() {
         if pos[i] == Upos::Det
-            && texts[i].eq_ignore_ascii_case("that")
+            && flags[i].is_that_word()
             && matches!(pos[i - 1], Upos::Noun | Upos::Propn)
         {
             pos[i] = Upos::Pron;
@@ -679,7 +615,7 @@ fn refine_pos_that_relative(texts: &[String], pos: &mut [Upos]) {
         if pos[i] != Upos::Noun || pos[i - 1] != Upos::Pron {
             continue;
         }
-        if texts[i - 1].eq_ignore_ascii_case("that") {
+        if flags[i - 1].is_that_word() {
             pos[i] = Upos::Verb;
         }
     }
@@ -695,9 +631,9 @@ fn refine_pos_that_relative(texts: &[String], pos: &mut [Upos]) {
 /// the functional (mark-taking) reading, so UPOS stays divergent either
 /// way and only the attachment is claimed. Disjoint from the `that` frame
 /// above (different word, different target tag).
-fn refine_pos_where_marker(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_where_marker(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
     for i in 1..texts.len() {
-        if pos[i] != Upos::Noun || !texts[i].eq_ignore_ascii_case("where") {
+        if pos[i] != Upos::Noun || !flags[i].is_where_word() {
             continue;
         }
         if matches!(pos[i - 1], Upos::Noun | Upos::Propn) {
@@ -717,9 +653,9 @@ fn refine_pos_where_marker(texts: &[String], pos: &mut [Upos]) {
 /// pass so clause verbs upgraded there (`spoke`, `scored`) are visible
 /// as the VERB host. Known boundary: `before` is the same dual class
 /// with no corpus instance — left out until one appears.
-fn refine_pos_clausal_after(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_clausal_after(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
     for i in 0..texts.len() {
-        if pos[i] != Upos::Adp || !texts[i].eq_ignore_ascii_case("after") {
+        if pos[i] != Upos::Adp || !flags[i].is_after_word() {
             continue;
         }
         // Pattern A: nominal subject + verb (`after he spoke`).
@@ -752,17 +688,13 @@ fn refine_pos_clausal_after(texts: &[String], pos: &mut [Upos]) {
 /// match), WH-initials (`Why`/`Where`, interrogative frame), and
 /// coordination-`or` slots (`Run daily or quit` — CC-disambiguation is its
 /// own rule). Same O(n) frame-scan shape as the other refines.
-fn refine_pos_final_adverbial(texts: &[String], pos: &mut [Upos]) {
-    const ADVERBS: &[&str] = &[
-        "now", "early", "again", "always", "hard", "fast", "well", "fair", "here", "daily", "much",
-        "yet", "late",
-    ];
+fn refine_pos_final_adverbial(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
     for i in 0..texts.len() {
         if pos[i] != Upos::Noun {
             continue;
         }
         let word = texts[i].as_str();
-        let in_set = ADVERBS.iter().any(|a| word.eq_ignore_ascii_case(a));
+        let in_set = flags[i].is_adverb_word();
         let ly = !in_set
             && word.len() > 4
             && word
@@ -771,8 +703,10 @@ fn refine_pos_final_adverbial(texts: &[String], pos: &mut [Upos]) {
         if !in_set && !ly {
             continue;
         }
-        // Copular `late` is adjectival, never adverbial.
-        if word.eq_ignore_ascii_case("late") && i > 0 && pos[i - 1] == Upos::Aux {
+        // Predicative position after AUX is adjectival, never adverbial
+        // (`was late`; the category bit covers every closed adverbial, so
+        // the old `late`-only spelling check generalizes to the category).
+        if in_set && i > 0 && pos[i - 1] == Upos::Aux {
             continue;
         }
         if i > 0 && matches!(pos[i - 1], Upos::Det | Upos::Cconj) {
@@ -800,9 +734,9 @@ fn refine_pos_final_adverbial(texts: &[String], pos: &mut [Upos]) {
 /// punctuation follows), with an ADJ host, and with no finite verb ahead
 /// before any punctuation. Guards: clausal frames (`rose yet wages
 /// stalled`: verb ahead) never match. The (Adj, Adv) arm below lands it.
-fn refine_pos_temporal_yet(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_temporal_yet(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
     for i in 1..texts.len() {
-        if pos[i] != Upos::Cconj || !texts[i].eq_ignore_ascii_case("yet") {
+        if pos[i] != Upos::Cconj || !flags[i].is_yet_word() {
             continue;
         }
         if pos[i - 1] != Upos::Adj {
@@ -847,17 +781,9 @@ fn refine_pos_temporal_yet(texts: &[String], pos: &mut [Upos]) {
 /// and seem-to-VP infinitives (`It seems to work`, ADP-next) are
 /// positionally identical with no bench instance — lexical
 /// subcategorization is its own rule.
-fn refine_pos_linking_predicate(texts: &[String], pos: &mut [Upos]) {
-    const SENSORY: &[&str] = &[
-        "taste", "tastes", "sound", "sounds", "smell", "smells",
-    ];
-    const EPISTEMIC: &[&str] = &[
-        "feel", "feels", "seem", "seems", "remain", "remains", "appear", "appears",
-    ];
-    let is_sensory = |w: &str| SENSORY.iter().any(|s| w.eq_ignore_ascii_case(s));
-    let is_epistemic = |w: &str| EPISTEMIC.iter().any(|s| w.eq_ignore_ascii_case(s));
+fn refine_pos_linking_predicate(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
     for i in 0..texts.len() {
-        if pos[i] != Upos::Noun || !is_sensory(texts[i].as_str()) {
+        if pos[i] != Upos::Noun || !flags[i].is_sensory_verb() {
             continue;
         }
         if texts.len() > i + 1 && matches!(pos[i + 1], Upos::Noun | Upos::Propn) {
@@ -865,7 +791,7 @@ fn refine_pos_linking_predicate(texts: &[String], pos: &mut [Upos]) {
         }
     }
     for i in 0..texts.len() {
-        if pos[i] != Upos::Noun || !is_epistemic(texts[i].as_str()) {
+        if pos[i] != Upos::Noun || !flags[i].is_epistemic_verb() {
             continue;
         }
         // Epistemic linkers take adjectival complements, so ADV- and
@@ -885,7 +811,7 @@ fn refine_pos_linking_predicate(texts: &[String], pos: &mut [Upos]) {
         if pos[i] != Upos::Noun || pos[i - 1] != Upos::Verb {
             continue;
         }
-        if is_sensory(texts[i - 1].as_str()) || is_epistemic(texts[i - 1].as_str()) {
+        if flags[i - 1].is_sensory_verb() || flags[i - 1].is_epistemic_verb() {
             pos[i] = Upos::Adj;
         }
     }
@@ -905,7 +831,7 @@ fn refine_pos_linking_predicate(texts: &[String], pos: &mut [Upos]) {
 /// (coordinated predicate adjectives: `red and fast`), and VERB-next
 /// (infinitival/complement adjacency: `still works`). Same O(n)
 /// frame-scan shape as the other refines.
-fn refine_pos_post_comma_verb(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_post_comma_verb(texts: &[String], pos: &mut [Upos], __flags: &[LexemeFlags]) {
     for i in 1..texts.len() {
         if pos[i] != Upos::Noun || texts[i - 1] != "," {
             continue;
@@ -949,7 +875,7 @@ fn refine_pos_post_comma_verb(texts: &[String], pos: &mut [Upos]) {
 /// frame), AUX-governed progressives (`are coming` — AUX, not comma,
 /// precedes), and coordinated predicate adjectives (`red and fast` — no
 /// -ing) never match.
-fn refine_pos_comma_participle(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_comma_participle(texts: &[String], pos: &mut [Upos], __flags: &[LexemeFlags]) {
     for i in 1..texts.len() {
         if pos[i] != Upos::Noun || texts[i - 1] != "," {
             continue;
@@ -970,8 +896,8 @@ fn refine_pos_comma_participle(texts: &[String], pos: &mut [Upos]) {
 }
 /// subject position (`The store where …`). Only forms with corpus evidence;
 /// `when`/`that`/`who` lex out of NOUN already and need no guard.
-fn is_noun_subject_verb_blocker(text: &str) -> bool {
-    text.eq_ignore_ascii_case("where")
+fn is_noun_subject_verb_blocker(flags: LexemeFlags) -> bool {
+    flags.is_where_word()
 }
 
 /// Finite verb after an initial determiner-led noun subject (`The game
@@ -985,14 +911,14 @@ fn is_noun_subject_verb_blocker(text: &str) -> bool {
 /// `Translate hello`) — subject–verb and verb–object readings are
 /// POS-identical there (`Define photosynthesis.` proves it), so that frame
 /// needs verb-capability knowledge, not another positional guard.
-fn refine_pos_initial_noun_verb(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_initial_noun_verb(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
     if texts.len() < 3 || pos[2] != Upos::Noun {
         return;
     }
     if pos[0] != Upos::Det || pos[1] != Upos::Noun {
         return;
     }
-    if is_noun_subject_verb_blocker(texts[2].as_str()) {
+    if is_noun_subject_verb_blocker(flags[2]) {
         return;
     }
     // A finite verb in third position is never capitalized.
@@ -1012,7 +938,7 @@ fn refine_pos_initial_noun_verb(texts: &[String], pos: &mut [Upos]) {
 /// third token and never fires. Known boundary: clause-final conjoined
 /// verbs (`but failed`, `or quit`) share their shape with conjoined objects
 /// and need clause-subject tracking — left for later work.
-fn refine_pos_conjoined_clause_verb(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_conjoined_clause_verb(texts: &[String], pos: &mut [Upos], __flags: &[LexemeFlags]) {
     for i in 2..texts.len() {
         if pos[i] != Upos::Noun || pos[i - 1] != Upos::Noun || pos[i - 2] != Upos::Cconj {
             continue;
@@ -1023,13 +949,11 @@ fn refine_pos_conjoined_clause_verb(texts: &[String], pos: &mut [Upos]) {
     }
 }
 
-/// Whether `text` is a finite `be` form (copula host). Sensory and
-/// resultative copulas (`taste`, `become`) are their own rules.
-fn is_be_form(text: &str) -> bool {
-    const BE: &[&str] = &[
-        "is", "are", "was", "were", "be", "been", "being", "am", "'s", "'re", "'m",
-    ];
-    BE.iter().any(|h| text.eq_ignore_ascii_case(h))
+/// Whether the lexeme is a finite `be` form (copula host). Matched as a
+/// lexeme bit, not a spelling list; sensory and resultative copulas
+/// (`taste`, `become`) are their own rules.
+fn is_be_form(flags: LexemeFlags) -> bool {
+    flags.is_be_verb()
 }
 
 /// Inverted copular predicate (`Is lunch ready?`, `is the sky blue`). The
@@ -1044,7 +968,7 @@ fn is_be_form(text: &str) -> bool {
 /// — bare determiners never match). Sequenced just before be-predicate;
 /// disjoint from it by construction (its direct/bridged shapes have no
 /// nominal between be and target).
-fn refine_pos_inverted_copular(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_inverted_copular(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
     for i in 1..texts.len() {
         if pos[i] != Upos::Noun {
             continue;
@@ -1060,7 +984,7 @@ fn refine_pos_inverted_copular(texts: &[String], pos: &mut [Upos]) {
         if !word.chars().next().is_some_and(|c| c.is_lowercase()) {
             continue;
         }
-        let Some(j) = (0..i).rfind(|&j| pos[j] == Upos::Aux && is_be_form(texts[j].as_str()))
+        let Some(j) = (0..i).rfind(|&j| pos[j] == Upos::Aux && is_be_form(flags[j]))
         else {
             continue;
         };
@@ -1080,7 +1004,7 @@ fn refine_pos_inverted_copular(texts: &[String], pos: &mut [Upos]) {
 /// untouched; `-ing` forms are participles, not predicates (`are coming`,
 /// `were surprising` stay for participle handling); determiners and verbs
 /// never match. Sensory copulas (`tastes salty`) are a separate rule.
-fn refine_pos_be_predicate(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_be_predicate(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
     for i in 1..texts.len() {
         if pos[i] != Upos::Noun {
             continue;
@@ -1095,13 +1019,12 @@ fn refine_pos_be_predicate(texts: &[String], pos: &mut [Upos]) {
         if is_participle {
             continue;
         }
-        let direct = pos[i - 1] == Upos::Aux
-            && is_be_form(texts[i - 1].as_str())
-            && i - 1 >= 1;
+        let direct =
+            pos[i - 1] == Upos::Aux && is_be_form(flags[i - 1]) && i - 1 >= 1;
         let bridged = i >= 2
-            && (texts[i - 1].eq_ignore_ascii_case("n't") || texts[i - 1].eq_ignore_ascii_case("not"))
+            && flags[i - 1].is_negator()
             && pos[i - 2] == Upos::Aux
-            && is_be_form(texts[i - 2].as_str())
+            && is_be_form(flags[i - 2])
             && i - 2 >= 1;
         if direct || bridged {
             pos[i] = Upos::Adj;
@@ -1113,12 +1036,12 @@ fn refine_pos_be_predicate(texts: &[String], pos: &mut [Upos]) {
 /// do-modal-hosted DET-led nominal subject is the finite verb of an
 /// inverted clause. Sequenced after the copular passes (ADJ outputs never
 /// match) and keyed on do-modal hosts (be-hosts never match).
-fn refine_pos_inversion_verb(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_inversion_verb(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
     for i in 3..texts.len() {
         if pos[i] != Upos::Noun
             || !matches!(pos[i - 1], Upos::Noun | Upos::Propn)
             || pos[i - 2] != Upos::Det
-            || !is_bare_infinitive_host(texts[i - 3].as_str())
+            || !is_bare_infinitive_host(flags[i - 3])
         {
             continue;
         }
@@ -1129,7 +1052,7 @@ fn refine_pos_inversion_verb(texts: &[String], pos: &mut [Upos]) {
 /// First predicate of a clausal coordination (`Prices rose yet wages
 /// stalled`). Coordination joins likes: a CCONJ-headed second clause with
 /// an overt VERB predicate proves the first predicate verbal too.
-fn refine_pos_clausal_first_predicate(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_clausal_first_predicate(texts: &[String], pos: &mut [Upos], __flags: &[LexemeFlags]) {
     for i in 1..texts.len() {
         if pos[i] != Upos::Noun || !matches!(pos[i - 1], Upos::Noun | Upos::Propn) {
             continue;
@@ -1162,7 +1085,7 @@ fn refine_pos_clausal_first_predicate(texts: &[String], pos: &mut [Upos]) {
 /// told apart by what follows: an elliptical predicate is clause-final
 /// (no finite verb ahead before any punctuation), while an overt subject
 /// is followed by its predicate.
-fn refine_pos_conjoined_predicate_agreement(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_conjoined_predicate_agreement(texts: &[String], pos: &mut [Upos], __flags: &[LexemeFlags]) {
     for i in 2..texts.len() {
         if pos[i] != Upos::Noun || pos[i - 1] != Upos::Cconj || pos[i - 2] != Upos::Verb {
             continue;
@@ -1188,12 +1111,12 @@ fn refine_pos_conjoined_predicate_agreement(texts: &[String], pos: &mut [Upos]) 
 ///   (`'s`/`'re`/`'m`) — the progressive participle. Full be-forms (`were
 ///   surprising`) are excluded: participial adjectives after full be belong
 ///   to copular handling, and firing there would mistag them.
-fn refine_pos_contracted_be(texts: &[String], pos: &mut [Upos]) {
+fn refine_pos_contracted_be(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
     for i in 0..texts.len() {
         if pos[i] != Upos::X {
             continue;
         }
-        if texts[i].eq_ignore_ascii_case("'s") && i >= 1 && pos[i - 1] == Upos::Pron {
+        if flags[i].is_be_clitic_s() && i >= 1 && pos[i - 1] == Upos::Pron {
             pos[i] = Upos::Aux;
         }
     }
@@ -1201,11 +1124,7 @@ fn refine_pos_contracted_be(texts: &[String], pos: &mut [Upos]) {
         if pos[i] != Upos::Noun {
             continue;
         }
-        let prev = texts[i - 1].as_str();
-        let clitic_aux = pos[i - 1] == Upos::Aux
-            && (prev.eq_ignore_ascii_case("'s")
-                || prev.eq_ignore_ascii_case("'re")
-                || prev.eq_ignore_ascii_case("'m"));
+        let clitic_aux = pos[i - 1] == Upos::Aux && flags[i - 1].is_be_clitic();
         if clitic_aux && texts[i].len() > 4 && texts[i].to_ascii_lowercase().ends_with("ing") {
             pos[i] = Upos::Verb;
         }
@@ -1217,7 +1136,7 @@ fn refine_pos_contracted_be(texts: &[String], pos: &mut [Upos]) {
 /// common nouns); Title-Case proper nouns (Google, Paris, Tuesday) fall
 /// through to `NOUN` — the documented false-negative class (§8.2).
 #[must_use]
-pub fn infer_pos(flags: LexemeFlags, text: &str) -> Upos {
+pub fn infer_pos(flags: LexemeFlags) -> Upos {
     if flags.is_punct() {
         return Upos::Punct;
     }
@@ -1227,34 +1146,32 @@ pub fn infer_pos(flags: LexemeFlags, text: &str) -> Upos {
     if flags.is_space() {
         return Upos::Space;
     }
-    // Closed function-word map first, so "the"/"is"/"of" resolve before the
-    // alpha checks (and stay DET/AUX/ADP even when title-cased at sentence
-    // start).
-    if let Some(pos) = closed_funcword_pos(text) {
+    // Closed function-word categories first, so "the"/"is"/"of" resolve
+    // before the alpha checks (and stay DET/AUX/ADP even when title-cased
+    // at sentence start). Priority order lives in `closed_funcword_pos`.
+    if let Some(pos) = closed_funcword_pos(flags) {
         return pos;
     }
-    // Contraction splinters the tokenizer emits: `n't` is a particle (UD:
-    // PART), and the `n't`-split stubs `wo`/`ca` plus the unambiguous
-    // are-clitic `'re` are auxiliaries. The bare negator `not` is likewise
-    // categorically a particle — it has no nominal or verbal reading, so
-    // tagging it here (rather than letting it fall to NOUN and get stolen
-    // by the bare-infinitive upgrade: `She did not call` rooted `not`)
-    // needs no collision audit. Possessive/clitic `'s` is genuinely
+    // Contraction splinters the tokenizer emits: negators are particles
+    // (UD: PART), and bare-infinitive hosts double as auxiliaries here —
+    // the negator `not` has no nominal or verbal reading, so tagging it
+    // here (rather than letting it fall to NOUN and get stolen by the
+    // bare-infinitive upgrade: `She did not call` rooted `not`) needs no
+    // collision audit. Every host form is AUX in the closed map already
+    // except the `n't`-split stubs (`wo`/`ca`), which this line covers
+    // (`'re` rides the AUX bit). Possessive/clitic `'s` is genuinely
     // ambiguous (It's vs. Bell's) and is resolved contextually in
     // `refine_pos_contracted_be`, never here.
-    if text.eq_ignore_ascii_case("n't") || text.eq_ignore_ascii_case("not") {
+    if flags.is_negator() {
         return Upos::Part;
     }
-    if text.eq_ignore_ascii_case("wo")
-        || text.eq_ignore_ascii_case("ca")
-        || text.eq_ignore_ascii_case("'re")
-    {
+    if flags.is_bare_inf_host() {
         return Upos::Aux;
     }
     // A closed set of common verbs gives the parser a predicate to govern
-    // nsubj/dobj around. Verbs outside the list are an honest NOUN false
+    // nsubj/dobj around. Verbs outside the set are an honest NOUN false
     // negative (open class; the LLM rung is the primary POS source, §8.1).
-    if is_closed_verb(text) {
+    if flags.is_verb_word() {
         return Upos::Verb;
     }
     // is_upper() ONLY — never is_title(). Placed before is_alpha so an
@@ -1365,7 +1282,7 @@ impl ArcEagerState {
     /// documented residual).
     fn copular_subject_frame(
         &self,
-        texts: &[String],
+        flags: &[LexemeFlags],
         s: usize,
         b: usize,
         pos: &[Upos],
@@ -1375,8 +1292,7 @@ impl ArcEagerState {
             pos[s],
             Upos::Noun | Upos::Propn | Upos::Pron | Upos::Det
         ) && matches!(pos[b], Upos::Noun | Upos::Propn)
-            && !texts[s].eq_ignore_ascii_case("there")
-            && !texts[s].eq_ignore_ascii_case("here")
+            && !flags[s].is_locative()
             && self.left_children[b]
                 .iter()
                 .any(|&c| self.labels[c] == labels.cop)
@@ -1389,6 +1305,7 @@ impl ArcEagerState {
         &self,
         pos: &[Upos],
         texts: &[String],
+        flags: &[LexemeFlags],
         labels: &DepLabels,
     ) -> Vec<ArcEagerAction> {
         let mut out = Vec::new();
@@ -1514,7 +1431,7 @@ impl ArcEagerState {
                     // subject. Subject frames (no intervening pronoun) never
                     // offer it, so true subjects never compete.
                     if ps == Upos::Pron
-                        && ((s + 1)..b).any(|m| is_nominative_subject(texts[m].as_str()))
+                        && ((s + 1)..b).any(|m| is_nominative_subject(flags[m]))
                     {
                         out.push(Self::act(ArcEagerMove::Left, labels.obj));
                     }
@@ -1533,7 +1450,7 @@ impl ArcEagerState {
                     // copula is attached. Ungated push by design — without
                     // a copula on b it scores 1.0 and loses outright, so
                     // clean determiners never tie.
-                    if self.copular_subject_frame(texts, s, b, pos, labels) {
+                    if self.copular_subject_frame(flags, s, b, pos, labels) {
                         out.push(Self::act(ArcEagerMove::Left, labels.nsubj));
                     }
                 }
@@ -1557,7 +1474,7 @@ impl ArcEagerState {
                     // `there`) and frame-gated on the copula already
                     // attached — locative nominals without one keep the
                     // compound dynamics above.
-                    if texts[s].eq_ignore_ascii_case("there")
+                    if flags[s].is_there_word()
                         && self.left_children[b]
                             .iter()
                             .any(|&c| self.labels[c] == labels.cop)
@@ -1572,7 +1489,7 @@ impl ArcEagerState {
                     // and loses outright, so `Dogs chase red cars` never
                     // ties (the Track B flagship keeps its dynamics: chase
                     // holds no copula).
-                    if self.copular_subject_frame(texts, s, b, pos, labels) {
+                    if self.copular_subject_frame(flags, s, b, pos, labels) {
                         out.push(Self::act(ArcEagerMove::Left, labels.nsubj));
                     }
                 }
@@ -1583,7 +1500,7 @@ impl ArcEagerState {
                 // has no higher-scoring sibling to lose to) so clean
                 // pronoun-nominal meetings never see a tie.
                 (Upos::Pron, Upos::Noun | Upos::Propn) => {
-                    if self.copular_subject_frame(texts, s, b, pos, labels) {
+                    if self.copular_subject_frame(flags, s, b, pos, labels) {
                         out.push(Self::act(ArcEagerMove::Left, labels.nsubj));
                     }
                 }
@@ -1625,7 +1542,7 @@ impl ArcEagerState {
                     // Bare-subject frames (`Is lunch ready`, no DET between)
                     // and direct complements (`Your fee is low`) never
                     // match, so clean copulars stay tie-free.
-                    if is_be_form(texts[s].as_str())
+                    if is_be_form(flags[s])
                         && (s + 1..b).any(|k| pos[k] == Upos::Det)
                         && (s + 1..b).any(|k| {
                             matches!(pos[k], Upos::Noun | Upos::Propn | Upos::Pron)
@@ -1648,14 +1565,14 @@ impl ArcEagerState {
                 // the subject, and the ADJ crowns — offering cop would
                 // mishead be onto the subject (polar uas regression).
                 (Upos::Aux, Upos::Noun | Upos::Propn) => {
-                    if is_be_form(texts[s].as_str())
+                    if is_be_form(flags[s])
                         && ((s + 1)..b).any(|k| pos[k] == Upos::Det)
                         && !(b + 1..texts.len())
                             .take_while(|&k| pos[k] != Upos::Punct)
                             .any(|k| pos[k] == Upos::Adj)
-                        && !texts
+                        && !flags
                             .get(self.sent_start)
-                            .is_some_and(|t| t.eq_ignore_ascii_case("where"))
+                            .is_some_and(|f| f.is_where_word())
                     {
                         out.push(Self::act(ArcEagerMove::Left, labels.cop));
                     }
@@ -1780,7 +1697,7 @@ impl ArcEagerState {
                         // a direct object (Send the invoice today) — the
                         // advmod offer here owns it. Word-gated like the yet
                         // rule; daily/later shapes never match.
-                        if texts[b].eq_ignore_ascii_case("today") {
+                        if flags[b].is_today_word() {
                             out.push(Self::act(ArcEagerMove::Right, labels.advmod));
                         } else {
                             out.push(Self::act(ArcEagerMove::Right, labels.dobj));
@@ -1824,10 +1741,10 @@ impl ArcEagerState {
                         .rev()
                         .find(|&k| pos[k] == Upos::Punct)
                         .map_or(0, |k| k + 1);
-                    if texts
+                    if flags
                         .get(clause_start)
-                        .is_some_and(|t| t.eq_ignore_ascii_case("where"))
-                        && is_be_form(texts[s].as_str())
+                        .is_some_and(|f| f.is_where_word())
+                        && is_be_form(flags[s])
                         && ((s + 1)..b).all(|k| pos[k] != Upos::Punct)
                     {
                         out.push(Self::act(ArcEagerMove::Right, labels.dobj));
@@ -1863,17 +1780,13 @@ impl ArcEagerState {
                         // subject-less fragments never match. Needs the Verb
                         // Sconj wait below so the matrix verb survives until
                         // the clause verb arrives.
-                        let word = texts[marker].as_str();
                         let has_subject = ((marker + 1)..b).any(|k| {
                             matches!(pos[k], Upos::Noun | Upos::Propn | Upos::Pron)
                         });
                         if has_subject {
-                            if word.eq_ignore_ascii_case("because") {
+                            if flags[marker].is_subord_complement() {
                                 out.push(Self::act(ArcEagerMove::Right, labels.ccomp));
-                            } else if word.eq_ignore_ascii_case("when")
-                                || word.eq_ignore_ascii_case("if")
-                                || word.eq_ignore_ascii_case("after")
-                            {
+                            } else if flags[marker].is_subord_adverbial() {
                                 out.push(Self::act(ArcEagerMove::Right, labels.advcl));
                             }
                         }
@@ -1991,7 +1904,7 @@ impl ArcEagerState {
                 (Upos::Noun | Upos::Propn, Upos::Verb) => {
                     if ((s + 1)..b).any(|m| {
                         m > 0
-                            && is_relative_marker(texts[m].as_str())
+                            && is_relative_marker(flags[m])
                             && matches!(pos[m - 1], Upos::Noun | Upos::Propn)
                     }) {
                         out.push(Self::act(ArcEagerMove::Right, labels.relcl));
@@ -2146,7 +2059,8 @@ impl ArcEagerState {
             && !(self.heads[s] == -1
                 && ps == Upos::Verb
                 && pb == Upos::Det
-                && !is_closed_verb(&texts[s]))
+                && !flags[s].is_verb_word()
+            )
             && !(ps == Upos::Sconj && matches!(pb, Upos::Pron | Upos::Noun | Upos::Propn | Upos::Det))
             // And a verbless concessive marker facing a non-nominal holds
             // for its tie (Although [in]: popping the marker strands it
@@ -2158,19 +2072,19 @@ impl ArcEagerState {
             && !(ps == Upos::Noun && pb == Upos::Det)
             && !(matches!(ps, Upos::Noun | Upos::Propn)
                 && b > 0
-                && is_relative_marker(texts[b].as_str())
+                && is_relative_marker(flags[b])
                 && matches!(pos[b - 1], Upos::Noun | Upos::Propn))
             && !(matches!(ps, Upos::Noun | Upos::Propn)
                 && pb == Upos::Pron
                 && b >= 2
-                && is_relative_marker(texts[b - 1].as_str())
+                && is_relative_marker(flags[b - 1])
                 && matches!(pos[b - 2], Upos::Noun | Upos::Propn))
             && !(ps == Upos::Aux
                 && matches!(pb, Upos::Pron | Upos::Noun | Upos::Propn | Upos::Det))
             && !(ps == Upos::Pron
                 && pb == Upos::Pron
                 && b >= 2
-                && is_relative_marker(texts[b - 1].as_str())
+                && is_relative_marker(flags[b - 1])
                 && matches!(pos[b - 2], Upos::Noun | Upos::Propn))
             && !(ps == Upos::Verb && pb == Upos::Sconj)
             && !(matches!(ps, Upos::Noun | Upos::Propn)
@@ -2201,7 +2115,8 @@ impl ArcEagerState {
             // dynamics, complementizer `that` and pronouns never match.
             && !(ps == Upos::Verb
                 && pb == Upos::Det
-                && is_possessive_determiner(texts[b].as_str()))
+                && is_possessive_determiner(flags[b])
+            )
             // And a verbless fallback root holds for its tie (Define
             // [photosynthesis]: popping the root strands it before the tie
             // pair forms — Reduce outbids the Shift/dep parity, so without
@@ -2949,19 +2864,16 @@ impl ArcEagerAnnotator {
         }
 
         let texts: Vec<String> = (0..doc.len()).map(|i| doc.token_text(i)).collect();
-        let mut pos: Vec<Upos> = texts
-            .iter()
-            .enumerate()
-            .map(|(i, text)| infer_pos(doc.token(i).lexeme.flags, text))
-            .collect();
+        let flags: Vec<LexemeFlags> = (0..doc.len()).map(|i| doc.token(i).lexeme.flags).collect();
+        let mut pos: Vec<Upos> = flags.iter().map(|&f| infer_pos(f)).collect();
         // Contextual pass over the lexeme-only tags: determiner-led nominals
         // colliding with the closed verb list. Runs first so only infer_pos
         // verbs are candidates and every VERB-upgrade below reads corrected
         // tags.
-        refine_pos_det_closed_verb(&texts, &mut pos);
+        refine_pos_det_closed_verb(&texts, &mut pos, &flags);
         // Contextual pass over the lexeme-only tags: bare infinitive after a
         // do-modal host. Runs before root-picking so the oracle sees verbs.
-        refine_pos_bare_infinitive(&texts, &mut pos);
+        refine_pos_bare_infinitive(&texts, &mut pos, &flags);
         // Bare-object pass: closed-verb s-form after a VERB at sentence end
         // (`answer calls`) is a plural object noun — English morphosyntax
         // forbids a finite s-form after a bare verb. Sequenced after the
@@ -2969,14 +2881,14 @@ impl ArcEagerAnnotator {
         // dobj arm lands it. Guards: pronoun hosts (`she calls` — finite),
         // non-s-forms (`called left` — matrix root), and non-final
         // positions never match.
-        refine_pos_bare_object_noun(&texts, &mut pos);
+        refine_pos_bare_object_noun(&texts, &mut pos, &flags);
         // Contracted-be pass: pronoun-hosted 's → AUX, then clitic-hosted
         // -ing participle → VERB. Sequenced after the infinitive pass; the
         // two govern disjoint contexts (aux-host vs. clitic-host).
-        refine_pos_contracted_be(&texts, &mut pos);
+        refine_pos_contracted_be(&texts, &mut pos, &flags);
         // Directive pass: sentence-initial NOUN + DET + NOUN → VERB.
         // Sequenced last; disjoint from the aux/clitic triggers above.
-        refine_pos_directive_initial(&texts, &mut pos);
+        refine_pos_directive_initial(&texts, &mut pos, &flags);
         // Bare-ed-transitive pass: initial nominal + -ed word + DET-led
         // object (`John opened the door`, `Anna finished her lunch`) is a
         // past-tense transitive clause. Past morphology plus the
@@ -2990,7 +2902,7 @@ impl ArcEagerAnnotator {
         // called`), non- -ed forms (`Birds sing`, `Translate hello`),
         // non-determiner thirds (`Grades dropped yet`, `NASA launched
         // HTML5`), and titlecase verbs never match.
-        refine_pos_bare_ed_transitive(&texts, &mut pos);
+        refine_pos_bare_ed_transitive(&texts, &mut pos, &flags);
         // Imperative pass with a non-determiner complement (`Remind me`,
         // `Translate hello to French`, `Explain Bell's theorem`): the
         // closed-list gap the directive pass (DET-led objects only) leaves
@@ -3000,58 +2912,58 @@ impl ArcEagerAnnotator {
         // object pronouns (`Translate this`) take the pronoun frame;
         // targets (sentence-initial NOUN) are disjoint from both, and the
         // DET-second shape stays with the directive pass.
-        refine_pos_demonstrative_object(&texts, &mut pos);
-        refine_pos_imperative_non_det_object(&texts, &mut pos);
+        refine_pos_demonstrative_object(&texts, &mut pos, &flags);
+        refine_pos_imperative_non_det_object(&texts, &mut pos, &flags);
         // Discourse-initial imperative (`Please confirm`, `Never mind`):
         // the marker frame the imperative pass cannot see (its seconds are
         // verbs, never pronouns/PPs). Sequenced after it (disjoint:
         // marker-initial words never match the bare-noun frames) so the
         // crowned verb feeds the standard dobj dynamics below.
-        refine_pos_discourse_initial_verb(&texts, &mut pos);
+        refine_pos_discourse_initial_verb(&texts, &mut pos, &flags);
         // Attributive -ly (`quarterly sales`): adverbial by default, but
         // adjectival directly before a nominal head. Sequenced after the
         // discourse pass (Kindly is ADV by now) and after every ADV
         // tagger, so only stranded NOUNs are candidates.
-        refine_pos_attributive_ly(&texts, &mut pos);
+        refine_pos_attributive_ly(&texts, &mut pos, &flags);
         // Pronoun-subject pass: finite verb after a nominative pronoun.
         // Disjoint from all above (PRON prev never matches aux/clitic/
         // initial triggers).
-        refine_pos_pronoun_subject_verb(&texts, &mut pos);
+        refine_pos_pronoun_subject_verb(&texts, &mut pos, &flags);
         // That-relative pass: nominal-headed that → PRON, then the NOUN
         // after that- PRON → VERB. Sequenced after the pronoun pass (whose
         // nominative list never pronounces that) and before the
         // relative-matrix pass, whose VERB-host gate reads the clause verbs
         // upgraded here (cried → slept). Disjoint targets from both.
-        refine_pos_that_relative(&texts, &mut pos);
+        refine_pos_that_relative(&texts, &mut pos, &flags);
         // Where-marker pass: nominal-headed where → SCONJ so the existing
         // mark arm fires. Sequenced with the other frame passes; targets
         // (NOUN-where) are disjoint from every verb/ADJ upgrade, and no
         // refine reads SCONJ positionally (the initial-noun blocker keys on
         // the word, order-free).
-        refine_pos_where_marker(&texts, &mut pos);
+        refine_pos_where_marker(&texts, &mut pos, &flags);
         // Clausal-after pass: ADP after + subject + verb → SCONJ so the
         // existing mark arm fires. Sequenced after the pronoun-subject pass
         // (clause verbs upgraded there are the VERB host) with the other
         // SCONJ-frame passes; nominal complements never match, so prep/pobj
         // frames are untouched.
-        refine_pos_clausal_after(&texts, &mut pos);
+        refine_pos_clausal_after(&texts, &mut pos, &flags);
         // Final-adverbial pass: closed time/manner set + -ly finals →
         // ADV. Targets are disjoint from the comma-adverbial pass (which
         // owns comma -ly with its clause-edge host guard; this pass skips
         // comma -ly), and ADV outputs feed no verb/ADJ upgrade.
-        refine_pos_final_adverbial(&texts, &mut pos);
+        refine_pos_final_adverbial(&texts, &mut pos, &flags);
         // Linking-predicate pass: bare-initial sensory verb → VERB, then
         // the NOUN after a sensory VERB → ADJ. Sequenced with the frame
         // passes; targets (sensory words, their complements) are disjoint
         // from every relativizer/adverbial trigger, and ADJ outputs feed
         // nothing upstream of the be-predicate pass.
-        refine_pos_linking_predicate(&texts, &mut pos);
+        refine_pos_linking_predicate(&texts, &mut pos, &flags);
         // Post-comma pass: clause-initial NOUN after a parenthetical
         // boundary → VERB. Sequenced after the linking pass (sensory verbs
         // read first where both could apply — disjoint in practice: no
         // bench sensory verb sits post-comma) and before the
         // relative-matrix pass (disjoint: matrix needs a marker frame).
-        refine_pos_post_comma_verb(&texts, &mut pos);
+        refine_pos_post_comma_verb(&texts, &mut pos, &flags);
         // Participial-modifier pass: comma-framed -ing NOUN → VERB (The
         // CEO, smiling, took questions). The -ing morphology plus the
         // comma frame identifies reduced-relative modifiers; bare -ing
@@ -3060,43 +2972,43 @@ impl ArcEagerAnnotator {
         // (disjoint: that pass excludes -ing) with the other frame
         // passes; the amod-Right arm below and the guarded Left-nsubj
         // do the rest.
-        refine_pos_comma_participle(&texts, &mut pos);
+        refine_pos_comma_participle(&texts, &mut pos, &flags);
         // Shifted-initial pass: comma + DET + NOUN + clause-final NOUN →
         // VERB. Sequenced after the post-comma pass (disjoint: that pass
         // needs comma-adjacent targets, this one comma-distant) and before
         // the relative-matrix pass (disjoint: matrix needs a marker
         // frame). The ADV trailer reads final-adverbial outputs.
-        refine_pos_shifted_det_noun_verb(&texts, &mut pos);
+        refine_pos_shifted_det_noun_verb(&texts, &mut pos, &flags);
         // Comment-As pass: sentence-initial as + nominal → SCONJ so the
         // existing mark arm fires. First-token only, disjoint from every
         // medial frame; SCONJ outputs feed no refine (waits and arms read
         // them at transition time).
-        refine_pos_comment_as(&texts, &mut pos);
+        refine_pos_comment_as(&texts, &mut pos, &flags);
         // Relative-matrix pass: sentence-final NOUN after a relcl VERB with
         // a nominal-headed who/that/where earlier. Sequenced after the
         // pronoun pass so relcl verbs upgraded there (wait, study, sang)
         // are visible as the VERB host; disjoint targets (sentence-final
         // only) from the initial-noun positions.
-        refine_pos_relative_matrix_verb(&texts, &mut pos);
+        refine_pos_relative_matrix_verb(&texts, &mut pos, &flags);
         // Adverbial pass: comma-framed -ly NOUN → ADV. Sequenced after the
         // verb passes; targets (NOUN) are disjoint from every verb/ADJ
         // upgrade above, and comma-framed adverbials never feed those
         // triggers (no DET+NOUN initials, no PRON hosts, no be hosts).
-        refine_pos_comma_adverbial(&texts, &mut pos);
+        refine_pos_comma_adverbial(&texts, &mut pos, &flags);
         // Initial noun-subject pass: DET+NOUN+NOUN / NOUN+NOUN at the start.
         // Disjoint (targets positions the earlier passes leave as NOUN).
-        refine_pos_initial_noun_verb(&texts, &mut pos);
+        refine_pos_initial_noun_verb(&texts, &mut pos, &flags);
         // Conjoined-clause pass: CC + NOUN + NOUN → VERB. Disjoint (CC prev
         // matches none of the above triggers).
-        refine_pos_conjoined_clause_verb(&texts, &mut pos);
+        refine_pos_conjoined_clause_verb(&texts, &mut pos, &flags);
         // Inverted-copular pass: be-AUX + subject + predicate-NOUN → ADJ.
         // Sequenced just before be-predicate; disjoint from it (its
         // direct/bridged shapes have no nominal between be and target) and
         // from every verb trigger above (ADJ targets).
-        refine_pos_inverted_copular(&texts, &mut pos);
+        refine_pos_inverted_copular(&texts, &mut pos, &flags);
         // Copular-predicate pass: be + NOUN → ADJ. Disjoint (AUX prev with
         // NOUN target matches none of the verb triggers above).
-        refine_pos_be_predicate(&texts, &mut pos);
+        refine_pos_be_predicate(&texts, &mut pos, &flags);
         // Inversion-verb pass: do-modal host + DET + nominal + NOUN → VERB
         // (`Did the report arrive`: arrive is the finite verb of a
         // question-inverted clause). Sequenced LAST so copular predicates
@@ -3110,7 +3022,7 @@ impl ArcEagerAnnotator {
         // Known boundary: bare inversions without a determiner (`Did John
         // arrive`, no corpus instance) need subject-NP tracking, not this
         // DET-anchored shape.
-        refine_pos_inversion_verb(&texts, &mut pos);
+        refine_pos_inversion_verb(&texts, &mut pos, &flags);
         // Clausal-coordination predicate agreement: a CCONJ-headed second
         // clause with an overt VERB predicate proves the first predicate
         // verbal (`Prices rose yet wages stalled`: stalled is VERB, so rose
@@ -3122,7 +3034,7 @@ impl ArcEagerAnnotator {
         // CCONJ + subject + VERB frame ahead before any punctuation.
         // Known boundary: verb-capability without a clausal frame (`Dogs
         // chase red cars`) needs lexicon knowledge — Track B, out of scope.
-        refine_pos_clausal_first_predicate(&texts, &mut pos);
+        refine_pos_clausal_first_predicate(&texts, &mut pos, &flags);
         // Elliptical second predicate after a conjunction (`ran but fell`).
         // The first conjunct's category decides (coordination joins likes):
         // a VERB two back proves a verbal second conjunct, a nominal two
@@ -3132,7 +3044,7 @@ impl ArcEagerAnnotator {
         // rest. Guards: determiner-led nominals (DET, not CCONJ, precedes)
         // and adverbial-shielded frames (`daily or quit` — the pinned-NOUN
         // adverbial sits between) never match.
-        refine_pos_conjoined_predicate_agreement(&texts, &mut pos);
+        refine_pos_conjoined_predicate_agreement(&texts, &mut pos, &flags);
         // Temporal-`yet` pass: sentence-final `yet` after a predicate
         // adjective (`She isn't ready yet`) is the aspectual adverb, not
         // the adversative coordinator — coordinators always head a second
@@ -3142,7 +3054,7 @@ impl ArcEagerAnnotator {
         // host, so clausal frames (`Prices rose yet wages stalled`: verb
         // ahead) never match. ADV outputs feed nothing downstream. The
         // (Adj, Adv) arm lands it.
-        refine_pos_temporal_yet(&texts, &mut pos);
+        refine_pos_temporal_yet(&texts, &mut pos, &flags);
 
         // Sentence boundaries from the sentencizer.
         let starts = self.sentencizer.predict(doc);
@@ -3154,11 +3066,11 @@ impl ArcEagerAnnotator {
         let mut sentence_roots = Vec::new();
 
         for (s, e) in sentences {
-            let root = pick_root(&pos, &texts, s, e);
+            let root = pick_root(&pos, &texts, &flags, s, e);
             sentence_roots.push(root);
             state.reset_for_sentence(s, e, root, self.labels.root);
             while !state.is_final() {
-                let actions = state.candidate_actions(&pos, &texts, &self.labels);
+                let actions = state.candidate_actions(&pos, &texts, &flags, &self.labels);
                 let Some((best, margin)) = oracle.best_with_margin(&state, &actions, &pos, &self.labels)
                 else {
                     break;
@@ -3333,7 +3245,7 @@ fn partition_sentences(starts: &[bool], len: usize) -> Vec<(usize, usize)> {
 /// matrix predicate (VERB or ADJ) later in the sentence. Without one (`If
 /// it rains, stay home`: stay tags NOUN), skipping would orphan the only
 /// predicate, so the subordinate verb keeps the crown exactly as before.
-fn pick_root(pos: &[Upos], texts: &[String], s: usize, e: usize) -> usize {
+fn pick_root(pos: &[Upos], texts: &[String], flags: &[LexemeFlags], s: usize, e: usize) -> usize {
     let mut rel_pending = false;
     for i in s..e {
         if pos[i] == Upos::Verb {
@@ -3347,7 +3259,7 @@ fn pick_root(pos: &[Upos], texts: &[String], s: usize, e: usize) -> usize {
             continue;
         }
         if i > 0
-            && is_relative_marker(texts[i].as_str())
+            && is_relative_marker(flags[i])
             && matches!(pos[i - 1], Upos::Noun | Upos::Propn)
         {
             rel_pending = true;
@@ -3364,12 +3276,12 @@ fn pick_root(pos: &[Upos], texts: &[String], s: usize, e: usize) -> usize {
     // doctor`) and What/Why-initial questions (`What is 2+2`) keep
     // incumbent dynamics. Purely categorial — no lexicon beyond the
     // closed be-forms and the interrogative word itself.
-    if texts.get(s).is_some_and(|t| t.eq_ignore_ascii_case("where"))
+    if flags.get(s).is_some_and(|f| f.is_where_word())
         && !(s..e).any(|k| pos[k] == Upos::Verb || pos[k] == Upos::Adj)
     {
         let aux = (s..e).find(|&i| {
             pos[i] == Upos::Aux
-                && is_be_form(texts[i].as_str())
+                && is_be_form(flags[i])
                 && (i + 1..e).any(|k| matches!(pos[k], Upos::Noun | Upos::Propn | Upos::Pron))
         });
         if let Some(aux) = aux {
@@ -3391,11 +3303,11 @@ fn pick_root(pos: &[Upos], texts: &[String], s: usize, e: usize) -> usize {
     // interrogatives are excluded throughout the package: question-02/08
     // pin be-as-root, and reconciling those two conventions is its own
     // design decision — `Where is the station` keeps incumbent dynamics.
-    if !texts
+    if !flags
         .get(s)
-        .is_some_and(|t| t.eq_ignore_ascii_case("where"))
+        .is_some_and(|f| f.is_where_word())
     {
-        if let Some(pred) = copular_predicate_nominal(pos, texts, s, e) {
+        if let Some(pred) = copular_predicate_nominal(pos, texts, flags, s, e) {
             return pred;
         }
     }
@@ -3427,9 +3339,15 @@ fn compound_head_nominal(pos: &[Upos], s: usize, e: usize) -> Option<usize> {
 /// (`doctor` in `She is a doctor`, `project` in `This is a Rust project`),
 /// if the span is a clean copular predicate (see `pick_root`). `None`
 /// otherwise.
-fn copular_predicate_nominal(pos: &[Upos], texts: &[String], s: usize, e: usize) -> Option<usize> {
+fn copular_predicate_nominal(
+    pos: &[Upos],
+    _texts: &[String],
+    flags: &[LexemeFlags],
+    s: usize,
+    e: usize,
+) -> Option<usize> {
     for i in s..e {
-        if pos[i] != Upos::Aux || !is_be_form(texts[i].as_str()) {
+        if pos[i] != Upos::Aux || !is_be_form(flags[i]) {
             continue;
         }
         if i + 1 >= e || pos[i + 1] != Upos::Det {

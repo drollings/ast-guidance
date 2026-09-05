@@ -19,7 +19,9 @@ use crate::strings::StringStore;
 pub const OOV_RANK: u64 = u64::MAX;
 
 /// The 64-bit lexeme flag bitmask. Bit `i` is set iff attribute id `i` is
-/// true (ids 1–18 are the named flags from `spacy/attrs.pxd`).
+/// true (ids 1–18 are the named surface flags from `spacy/attrs.pxd`;
+/// ids 19–47 are the closed-class function-word flags populated per
+/// language from [`LexiconConfig::function_words`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct LexemeFlags(u64);
 
@@ -150,6 +152,171 @@ impl LexemeFlags {
     pub const fn is_currency(self) -> bool {
         self.check(Attribute::IsCurrency.id())
     }
+
+    /// Closed-class function-word flags (ids 19–47). Each is set iff the
+    /// lowercased orth is a member of the language's word set for that
+    /// category (see [`LexiconConfig::function_words`]); the parser matches
+    /// these bits instead of hard-coded word lists.
+    #[must_use]
+    pub const fn is_det_word(self) -> bool {
+        self.check(Attribute::IsDetWord.id())
+    }
+    /// Closed POS-class words (adpositions).
+    #[must_use]
+    pub const fn is_adp_word(self) -> bool {
+        self.check(Attribute::IsAdpWord.id())
+    }
+    /// Closed POS-class words (auxiliaries).
+    #[must_use]
+    pub const fn is_aux_word(self) -> bool {
+        self.check(Attribute::IsAuxWord.id())
+    }
+    /// Closed POS-class words (coordinating conjunctions).
+    #[must_use]
+    pub const fn is_cconj_word(self) -> bool {
+        self.check(Attribute::IsCconjWord.id())
+    }
+    /// Closed POS-class words (subordinating conjunctions).
+    #[must_use]
+    pub const fn is_sconj_word(self) -> bool {
+        self.check(Attribute::IsSconjWord.id())
+    }
+    /// Closed POS-class words (pronouns).
+    #[must_use]
+    pub const fn is_pron_word(self) -> bool {
+        self.check(Attribute::IsPronWord.id())
+    }
+    /// Closed verb forms (finite lexicon for the heuristic predicate).
+    #[must_use]
+    pub const fn is_verb_word(self) -> bool {
+        self.check(Attribute::IsVerbWord.id())
+    }
+    /// Be-forms (copula/auxiliary hosts, incl. clitics).
+    #[must_use]
+    pub const fn is_be_verb(self) -> bool {
+        self.check(Attribute::IsBeVerb.id())
+    }
+    /// Bare-infinitive hosts (do-support, modals, `n't`-split stubs).
+    #[must_use]
+    pub const fn is_bare_inf_host(self) -> bool {
+        self.check(Attribute::IsBareInfHost.id())
+    }
+    /// Auxiliary-hosted negators (`n't`, `not`).
+    #[must_use]
+    pub const fn is_negator(self) -> bool {
+        self.check(Attribute::IsNegator.id())
+    }
+    /// Nominative pronoun surfaces (finite-clause subjects).
+    #[must_use]
+    pub const fn is_nominative(self) -> bool {
+        self.check(Attribute::IsNominative.id())
+    }
+    /// Possessive determiners (obligatorily head a nominal rightward).
+    #[must_use]
+    pub const fn is_possessive(self) -> bool {
+        self.check(Attribute::IsPossessive.id())
+    }
+    /// Nominal relativizers with corpus evidence.
+    #[must_use]
+    pub const fn is_relativizer(self) -> bool {
+        self.check(Attribute::IsRelativizer.id())
+    }
+    /// Sensory linking verbs.
+    #[must_use]
+    pub const fn is_sensory_verb(self) -> bool {
+        self.check(Attribute::IsSensoryVerb.id())
+    }
+    /// Epistemic linking verbs.
+    #[must_use]
+    pub const fn is_epistemic_verb(self) -> bool {
+        self.check(Attribute::IsEpistemicVerb.id())
+    }
+    /// Discourse-imperative markers.
+    #[must_use]
+    pub const fn is_discourse_marker(self) -> bool {
+        self.check(Attribute::IsDiscourseMarker.id())
+    }
+    /// Closed time/manner adverbials.
+    #[must_use]
+    pub const fn is_adverb_word(self) -> bool {
+        self.check(Attribute::IsAdverbWord.id())
+    }
+    /// Complement subordinators (`because` class).
+    #[must_use]
+    pub const fn is_subord_complement(self) -> bool {
+        self.check(Attribute::IsSubordComplement.id())
+    }
+    /// Adjunct subordinators (`when`/`if`/`after` class).
+    #[must_use]
+    pub const fn is_subord_adverbial(self) -> bool {
+        self.check(Attribute::IsSubordAdverbial.id())
+    }
+    /// Interrogative `where` (clause-initial gate).
+    #[must_use]
+    pub const fn is_where_word(self) -> bool {
+        self.check(Attribute::IsWhereWord.id())
+    }
+    /// Locative/existential pro-forms (`there`, `here`).
+    #[must_use]
+    pub const fn is_locative(self) -> bool {
+        self.check(Attribute::IsLocative.id())
+    }
+    /// Demonstratives (`this`, `these`, `those`).
+    #[must_use]
+    pub const fn is_demonstrative(self) -> bool {
+        self.check(Attribute::IsDemonstrative.id())
+    }
+    /// Temporal adverbial with frozen refs (`today` class).
+    #[must_use]
+    pub const fn is_today_word(self) -> bool {
+        self.check(Attribute::IsTodayWord.id())
+    }
+    /// Comparative/comment `as`.
+    #[must_use]
+    pub const fn is_as_word(self) -> bool {
+        self.check(Attribute::IsAsWord.id())
+    }
+    /// Dual-class `after` (preposition vs. subordinator).
+    #[must_use]
+    pub const fn is_after_word(self) -> bool {
+        self.check(Attribute::IsAfterWord.id())
+    }
+    /// Complementizer/demonstrative `that`.
+    #[must_use]
+    pub const fn is_that_word(self) -> bool {
+        self.check(Attribute::IsThatWord.id())
+    }
+    /// Multiplicative `twice` (discourse-complement gate).
+    #[must_use]
+    pub const fn is_twice_word(self) -> bool {
+        self.check(Attribute::IsTwiceWord.id())
+    }
+    /// Temporal `yet` (CCONJ→ADV gate).
+    #[must_use]
+    pub const fn is_yet_word(self) -> bool {
+        self.check(Attribute::IsYetWord.id())
+    }
+    /// Interjection `please` (Intj vs. Adv split).
+    #[must_use]
+    pub const fn is_please_word(self) -> bool {
+        self.check(Attribute::IsPleaseWord.id())
+    }
+    /// Possessive/copula clitic `'s` (pronoun-hosted AUX gate).
+    #[must_use]
+    pub const fn is_be_clitic_s(self) -> bool {
+        self.check(Attribute::IsBeCliticS.id())
+    }
+    /// Be-clitics `'s`/`'re`/`'m` (progressive-participle host gate).
+    #[must_use]
+    pub const fn is_be_clitic(self) -> bool {
+        self.check(Attribute::IsBeClitic.id())
+    }
+    /// Expletive `there` alone (subject slot; locatives share
+    /// [`Attribute::IsLocative`]).
+    #[must_use]
+    pub const fn is_there_word(self) -> bool {
+        self.check(Attribute::IsThereWord.id())
+    }
 }
 
 /// A word-type record: the surface-shape facts for one orth, shared by all
@@ -224,6 +391,13 @@ pub struct LexiconConfig {
     /// Number words (cardinal + ordinal) for the language-specific `LIKE_NUM`
     /// override; empty uses the base digit/fraction `like_num`.
     pub num_words: HashSet<String>,
+    /// Closed-class function-word categories: lowercased orth → extra
+    /// [`LexemeFlags`] bits (attribute ids 19–47), ORed into the lexeme at
+    /// intern time. This is the per-language data the parser matches instead
+    /// of hard-coded word lists — a multilingual port supplies a different
+    /// map (the future blob-backed `FunctionWordView` fills this same
+    /// field). Words absent from every set gain no bits.
+    pub function_words: HashMap<String, u64>,
 }
 
 /// The lexicon: one immutable `Arc<Lexeme>` per orth, computed on first sight
@@ -354,6 +528,9 @@ impl Lexicon {
                 lex_attrs::is_right_punct(text),
             )
             .set_bool(Attribute::IsCurrency.id(), lex_attrs::is_currency(text));
+        if let Some(&extra) = self.config.function_words.get(&lower_text) {
+            flags = LexemeFlags::new(flags.bits() | extra);
+        }
 
         Lexeme {
             flags,

@@ -5,6 +5,7 @@
 //! `tools/gen_en_exceptions.py`).
 
 pub mod exceptions;
+pub mod function_words;
 pub mod num_words;
 pub mod patterns;
 pub mod stop_words;
@@ -32,7 +33,9 @@ pub static LEMMAS_BLOB: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/en_lemmas.bin"));
 
 /// The English `LexiconConfig`: `lang = "en"`, the stop-word set, the merged
-/// cardinal + ordinal number words (English `LIKE_NUM`), no norm overrides.
+/// cardinal + ordinal number words (English `LIKE_NUM`), no norm overrides,
+/// and the closed-class function-word categories (attribute ids 19–47) the
+/// parser matches as bits instead of hard-coded spellings.
 #[must_use]
 pub fn lexicon_config() -> LexiconConfig {
     LexiconConfig {
@@ -47,6 +50,7 @@ pub fn lexicon_config() -> LexiconConfig {
             .chain(num_words::ORDINAL_WORDS.iter())
             .map(|w| (*w).to_string())
             .collect(),
+        function_words: function_words::function_word_bits(),
     }
 }
 

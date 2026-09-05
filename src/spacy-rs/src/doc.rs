@@ -495,7 +495,39 @@ pub fn get_token_attr(token: &TokenRecord, attr: Attribute) -> Result<u64, Spacy
         | Attribute::IsQuote
         | Attribute::IsLeftPunct
         | Attribute::IsRightPunct
-        | Attribute::IsCurrency => u64::from(token.lexeme.flags.check(attr.id())),
+        | Attribute::IsCurrency
+        | Attribute::IsDetWord
+        | Attribute::IsAdpWord
+        | Attribute::IsAuxWord
+        | Attribute::IsCconjWord
+        | Attribute::IsSconjWord
+        | Attribute::IsPronWord
+        | Attribute::IsVerbWord
+        | Attribute::IsBeVerb
+        | Attribute::IsBareInfHost
+        | Attribute::IsNegator
+        | Attribute::IsNominative
+        | Attribute::IsPossessive
+        | Attribute::IsRelativizer
+        | Attribute::IsSensoryVerb
+        | Attribute::IsEpistemicVerb
+        | Attribute::IsDiscourseMarker
+        | Attribute::IsAdverbWord
+        | Attribute::IsSubordComplement
+        | Attribute::IsSubordAdverbial
+        | Attribute::IsWhereWord
+        | Attribute::IsLocative
+        | Attribute::IsDemonstrative
+        | Attribute::IsTodayWord
+        | Attribute::IsAsWord
+        | Attribute::IsAfterWord
+        | Attribute::IsThatWord
+        | Attribute::IsTwiceWord
+        | Attribute::IsYetWord
+        | Attribute::IsPleaseWord
+        | Attribute::IsBeCliticS
+        | Attribute::IsBeClitic
+        | Attribute::IsThereWord => u64::from(token.lexeme.flags.check(attr.id())),
         Attribute::Id => token.lexeme.id,
         Attribute::Orth => token.lexeme.orth,
         Attribute::Lower => token.lexeme.lower,
@@ -599,6 +631,38 @@ pub fn set_token_attr(
         | Attribute::IsLeftPunct
         | Attribute::IsRightPunct
         | Attribute::IsCurrency
+        | Attribute::IsDetWord
+        | Attribute::IsAdpWord
+        | Attribute::IsAuxWord
+        | Attribute::IsCconjWord
+        | Attribute::IsSconjWord
+        | Attribute::IsPronWord
+        | Attribute::IsVerbWord
+        | Attribute::IsBeVerb
+        | Attribute::IsBareInfHost
+        | Attribute::IsNegator
+        | Attribute::IsNominative
+        | Attribute::IsPossessive
+        | Attribute::IsRelativizer
+        | Attribute::IsSensoryVerb
+        | Attribute::IsEpistemicVerb
+        | Attribute::IsDiscourseMarker
+        | Attribute::IsAdverbWord
+        | Attribute::IsSubordComplement
+        | Attribute::IsSubordAdverbial
+        | Attribute::IsWhereWord
+        | Attribute::IsLocative
+        | Attribute::IsDemonstrative
+        | Attribute::IsTodayWord
+        | Attribute::IsAsWord
+        | Attribute::IsAfterWord
+        | Attribute::IsThatWord
+        | Attribute::IsTwiceWord
+        | Attribute::IsYetWord
+        | Attribute::IsPleaseWord
+        | Attribute::IsBeCliticS
+        | Attribute::IsBeClitic
+        | Attribute::IsThereWord
         | Attribute::Id
         | Attribute::Orth
         | Attribute::Lower

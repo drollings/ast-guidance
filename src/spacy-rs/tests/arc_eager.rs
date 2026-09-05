@@ -33,18 +33,18 @@ fn infer_pos_categories() {
         d.push_back(s, true).expect("push");
         d.token(0).lexeme.flags
     };
-    assert_eq!(infer_pos(flags("."), "."), Upos::Punct);
-    assert_eq!(infer_pos(flags("5"), "5"), Upos::Num);
-    assert_eq!(infer_pos(flags("is"), "is"), Upos::Aux);
-    assert_eq!(infer_pos(flags("of"), "of"), Upos::Adp);
-    assert_eq!(infer_pos(flags("the"), "the"), Upos::Det);
-    assert_eq!(infer_pos(flags("and"), "and"), Upos::Cconj);
-    assert_eq!(infer_pos(flags("if"), "if"), Upos::Sconj);
-    assert_eq!(infer_pos(flags("cat"), "cat"), Upos::Noun);
-    assert_eq!(infer_pos(flags("it"), "it"), Upos::Pron);
+    assert_eq!(infer_pos(flags(".")), Upos::Punct);
+    assert_eq!(infer_pos(flags("5")), Upos::Num);
+    assert_eq!(infer_pos(flags("is")), Upos::Aux);
+    assert_eq!(infer_pos(flags("of")), Upos::Adp);
+    assert_eq!(infer_pos(flags("the")), Upos::Det);
+    assert_eq!(infer_pos(flags("and")), Upos::Cconj);
+    assert_eq!(infer_pos(flags("if")), Upos::Sconj);
+    assert_eq!(infer_pos(flags("cat")), Upos::Noun);
+    assert_eq!(infer_pos(flags("it")), Upos::Pron);
     // Adjectives are an open class with no lexeme signal — "big" falls to
     // NOUN (the honest heuristic limit; no adjective list, §8.1).
-    assert_eq!(infer_pos(flags("big"), "big"), Upos::Noun);
+    assert_eq!(infer_pos(flags("big")), Upos::Noun);
 }
 
 #[test]
@@ -55,8 +55,8 @@ fn infer_pos_allcaps_is_propn_positive() {
         d.push_back(s, true).expect("push");
         d.token(0).lexeme.flags
     };
-    assert_eq!(infer_pos(flags("NASA"), "NASA"), Upos::Propn);
-    assert_eq!(infer_pos(flags("HTML5"), "HTML5"), Upos::Propn);
+    assert_eq!(infer_pos(flags("NASA")), Upos::Propn);
+    assert_eq!(infer_pos(flags("HTML5")), Upos::Propn);
 }
 
 #[test]
@@ -68,13 +68,13 @@ fn infer_pos_title_case_is_never_propn_negative() {
         let vocab = en_vocab();
         let mut d = Doc::new(Arc::clone(&vocab));
         d.push_back(w, true).expect("push");
-        let pos = infer_pos(d.token(0).lexeme.flags, w);
+        let pos = infer_pos(d.token(0).lexeme.flags);
         assert_ne!(pos, Upos::Propn, "{w} must not be PROPN");
     }
     let vocab = en_vocab();
     let mut d = Doc::new(Arc::clone(&vocab));
     d.push_back("Dogs", true).expect("push");
-    assert_eq!(infer_pos(d.token(0).lexeme.flags, "Dogs"), Upos::Noun);
+    assert_eq!(infer_pos(d.token(0).lexeme.flags), Upos::Noun);
 }
 
 // ── 9.2 state init / is_final ─────────────────────────────────────────
@@ -100,13 +100,18 @@ fn state_init_has_unset_heads_and_is_final() {
 
 #[test]
 fn candidate_actions_noun_before_verb() {
-    let labels = label_hashes(&en_vocab());
+    let vocab = en_vocab();
+    let labels = label_hashes(&vocab);
     let mut st = ArcEagerState::new(2, 0);
     st.stack.push(0); // noun
     st.buffer.extend(1..2); // verb
     let pos = vec![Upos::Noun, Upos::Verb];
     let texts = vec!["dogs".to_string(), "bark".to_string()];
-    let actions = st.candidate_actions(&pos, &texts, &labels);
+    let flags: Vec<LexemeFlags> = texts
+        .iter()
+        .map(|t| vocab.lexicon().get_or_create(t).flags)
+        .collect();
+    let actions = st.candidate_actions(&pos, &texts, &flags, &labels);
     assert!(actions.iter().any(|a| a.move_type == ArcEagerMove::Shift));
     assert!(
         actions
@@ -124,7 +129,12 @@ fn candidate_actions_verb_before_noun() {
     st.buffer.extend(1..2); // noun
     let pos = vec![Upos::Verb, Upos::Noun];
     let texts = vec!["find".to_string(), "milk".to_string()];
-    let actions = st.candidate_actions(&pos, &texts, &labels);
+    let vocab = en_vocab();
+    let flags: Vec<LexemeFlags> = texts
+        .iter()
+        .map(|t| vocab.lexicon().get_or_create(t).flags)
+        .collect();
+    let actions = st.candidate_actions(&pos, &texts, &flags, &labels);
     assert!(
         actions
             .iter()
@@ -139,7 +149,12 @@ fn candidate_actions_punct_with_empty_stack() {
     st.buffer.extend(0..1);
     let pos = vec![Upos::Punct];
     let texts = vec![".".to_string()];
-    let actions = st.candidate_actions(&pos, &texts, &labels);
+    let vocab = en_vocab();
+    let flags: Vec<LexemeFlags> = texts
+        .iter()
+        .map(|t| vocab.lexicon().get_or_create(t).flags)
+        .collect();
+    let actions = st.candidate_actions(&pos, &texts, &flags, &labels);
     assert!(
         !actions.iter().any(|a| a.move_type == ArcEagerMove::Right),
         "nothing to attach punctuation to"
@@ -156,7 +171,8 @@ fn candidate_actions_drain_on_empty_buffer() {
     st.buffer.clear();
     let pos = vec![Upos::Noun, Upos::Noun];
     let texts: Vec<String> = vec![];
-    let actions = st.candidate_actions(&pos, &texts, &labels);
+    let flags: Vec<LexemeFlags> = vec![];
+    let actions = st.candidate_actions(&pos, &texts, &flags, &labels);
     assert_eq!(
         actions,
         vec![ArcEagerAction {
@@ -294,7 +310,12 @@ fn oracle_best_with_margin_reports_ties() {
     st.buffer.extend(1..2);
     let pos = vec![Upos::Noun, Upos::Verb];
     let texts = vec!["dogs".to_string(), "bark".to_string()];
-    let actions = st.candidate_actions(&pos, &texts, &labels);
+    let vocab = en_vocab();
+    let flags: Vec<LexemeFlags> = texts
+        .iter()
+        .map(|t| vocab.lexicon().get_or_create(t).flags)
+        .collect();
+    let actions = st.candidate_actions(&pos, &texts, &flags, &labels);
     assert!(actions.len() >= 2);
     let (best, margin) = oracle
         .best_with_margin(&st, &actions, &pos, &labels)

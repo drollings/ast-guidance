@@ -2898,7 +2898,13 @@ fn async_sync_refine_agree() {
     // encoder (star parse) and an improving llm (full UD) indeed adopts the improving
     // one via the per-refiner gate, on both the sync path and an async simulation.
     {
-        let vocab = std::sync::Arc::new(crate::vocab::Vocab::new(crate::lexeme::LexiconConfig::default()));
+        // English config (not `LexiconConfig::default()`): the gate math
+        // needs the real ArcEager base parse, whose function-word categories
+        // come from the language config — an empty config leaves every word
+        // an uncategorized nominal and the coverage comparison is vacuous.
+        let vocab = std::sync::Arc::new(crate::vocab::Vocab::new(
+            crate::lang::en::lexicon_config(),
+        ));
         let tokenizer = crate::lang::en::tokenizer(std::sync::Arc::clone(&vocab)).expect("tokenizer");
         let store = std::sync::Arc::new(fluent_concept::InMemoryConceptStore::new());
         let resolver = std::sync::Arc::new(crate::interlingua::InterlinguaResolver::new(

@@ -8,8 +8,9 @@
 
 use crate::error::SpacyError;
 
-/// A token/lexeme attribute id. Named variants cover the ids spaCy defines;
-/// [`Attribute::Other`] catches reserved flag slots (19–63) and unknown ids.
+/// A token/lexeme attribute id. Named variants cover the ids spaCy defines
+/// plus the closed-class function-word flags (19–50);
+/// [`Attribute::Other`] catches reserved flag slots (48–63) and unknown ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum Attribute {
@@ -32,6 +33,76 @@ pub enum Attribute {
     IsLeftPunct = 16,
     IsRightPunct = 17,
     IsCurrency = 18,
+    // ── closed-class function-word flags (ids 19..=47) ──
+    // Populated per language from `LexiconConfig::function_words` at lexeme
+    // intern time; the parser matches these bits instead of hard-coded word
+    // lists, so a different language blob re-categorizes without code
+    // changes. Bits 48–63 stay reserved.
+    /// Closed POS-class words (determiners).
+    IsDetWord = 19,
+    /// Closed POS-class words (adpositions).
+    IsAdpWord = 20,
+    /// Closed POS-class words (auxiliaries).
+    IsAuxWord = 21,
+    /// Closed POS-class words (coordinating conjunctions).
+    IsCconjWord = 22,
+    /// Closed POS-class words (subordinating conjunctions).
+    IsSconjWord = 23,
+    /// Closed POS-class words (pronouns).
+    IsPronWord = 24,
+    /// Closed verb forms (finite lexicon for the heuristic predicate).
+    IsVerbWord = 25,
+    /// Be-forms (copula/auxiliary hosts, incl. clitics).
+    IsBeVerb = 26,
+    /// Bare-infinitive hosts (do-support, modals, `n't`-split stubs).
+    IsBareInfHost = 27,
+    /// Auxiliary-hosted negators (`n't`, `not`).
+    IsNegator = 28,
+    /// Nominative pronoun surfaces (finite-clause subjects).
+    IsNominative = 29,
+    /// Possessive determiners (obligatorily head a nominal rightward).
+    IsPossessive = 30,
+    /// Nominal relativizers with corpus evidence.
+    IsRelativizer = 31,
+    /// Sensory linking verbs (taste/sound/smell + -s).
+    IsSensoryVerb = 32,
+    /// Epistemic linking verbs (feel/seem/remain/appear + -s).
+    IsEpistemicVerb = 33,
+    /// Discourse-imperative markers (please/kindly/just/never/always).
+    IsDiscourseMarker = 34,
+    /// Closed time/manner adverbials.
+    IsAdverbWord = 35,
+    /// Complement subordinator (`because` class).
+    IsSubordComplement = 36,
+    /// Adjunct subordinators (`when`/`if`/`after` class).
+    IsSubordAdverbial = 37,
+    /// Interrogative `where` (clause-initial gate).
+    IsWhereWord = 38,
+    /// Locative/existential pro-forms (`there`, `here`).
+    IsLocative = 39,
+    /// Demonstratives (`this`, `these`, `those`).
+    IsDemonstrative = 40,
+    /// Temporal adverbial with frozen refs (`today` class).
+    IsTodayWord = 41,
+    /// Comparative/comment `as`.
+    IsAsWord = 42,
+    /// Dual-class `after` (preposition vs. subordinator).
+    IsAfterWord = 43,
+    /// Complementizer/demonstrative `that`.
+    IsThatWord = 44,
+    /// Multiplicative `twice` (discourse-complement gate).
+    IsTwiceWord = 45,
+    /// Temporal `yet` (CCONJ→ADV gate).
+    IsYetWord = 46,
+    /// Interjection `please` (Intj vs. Adv split).
+    IsPleaseWord = 47,
+    /// Possessive/copula clitic `'s` (pronoun-hosted AUX gate).
+    IsBeCliticS = 48,
+    /// Be-clitics `'s`/`'re`/`'m` (progressive-participle host gate).
+    IsBeClitic = 49,
+    /// Locative/existential pro-forms are covered by [`Attribute::IsLocative`];
+    /// this bit is the expletive `there` alone (subject slot).
+    IsThereWord = 50,
     // ── value attributes (ids ≥ 64) ──
     Id = 64,
     Orth = 65,
@@ -91,6 +162,38 @@ impl Attribute {
             Self::IsLeftPunct => 16,
             Self::IsRightPunct => 17,
             Self::IsCurrency => 18,
+            Self::IsDetWord => 19,
+            Self::IsAdpWord => 20,
+            Self::IsAuxWord => 21,
+            Self::IsCconjWord => 22,
+            Self::IsSconjWord => 23,
+            Self::IsPronWord => 24,
+            Self::IsVerbWord => 25,
+            Self::IsBeVerb => 26,
+            Self::IsBareInfHost => 27,
+            Self::IsNegator => 28,
+            Self::IsNominative => 29,
+            Self::IsPossessive => 30,
+            Self::IsRelativizer => 31,
+            Self::IsSensoryVerb => 32,
+            Self::IsEpistemicVerb => 33,
+            Self::IsDiscourseMarker => 34,
+            Self::IsAdverbWord => 35,
+            Self::IsSubordComplement => 36,
+            Self::IsSubordAdverbial => 37,
+            Self::IsWhereWord => 38,
+            Self::IsLocative => 39,
+            Self::IsDemonstrative => 40,
+            Self::IsTodayWord => 41,
+            Self::IsAsWord => 42,
+            Self::IsAfterWord => 43,
+            Self::IsThatWord => 44,
+            Self::IsTwiceWord => 45,
+            Self::IsYetWord => 46,
+            Self::IsPleaseWord => 47,
+            Self::IsBeCliticS => 48,
+            Self::IsBeClitic => 49,
+            Self::IsThereWord => 50,
             Self::Id => 64,
             Self::Orth => 65,
             Self::Lower => 66,
@@ -124,7 +227,7 @@ impl Attribute {
     }
 
     /// Reconstruct an [`Attribute`] from a numeric id, mapping the reserved
-    /// flag slots 19–63 (and anything unknown) to [`Attribute::Other`].
+    /// flag slots 48–63 (and anything unknown) to [`Attribute::Other`].
     #[must_use]
     pub const fn from_id(id: u16) -> Self {
         match id {
@@ -146,6 +249,38 @@ impl Attribute {
             16 => Self::IsLeftPunct,
             17 => Self::IsRightPunct,
             18 => Self::IsCurrency,
+            19 => Self::IsDetWord,
+            20 => Self::IsAdpWord,
+            21 => Self::IsAuxWord,
+            22 => Self::IsCconjWord,
+            23 => Self::IsSconjWord,
+            24 => Self::IsPronWord,
+            25 => Self::IsVerbWord,
+            26 => Self::IsBeVerb,
+            27 => Self::IsBareInfHost,
+            28 => Self::IsNegator,
+            29 => Self::IsNominative,
+            30 => Self::IsPossessive,
+            31 => Self::IsRelativizer,
+            32 => Self::IsSensoryVerb,
+            33 => Self::IsEpistemicVerb,
+            34 => Self::IsDiscourseMarker,
+            35 => Self::IsAdverbWord,
+            36 => Self::IsSubordComplement,
+            37 => Self::IsSubordAdverbial,
+            38 => Self::IsWhereWord,
+            39 => Self::IsLocative,
+            40 => Self::IsDemonstrative,
+            41 => Self::IsTodayWord,
+            42 => Self::IsAsWord,
+            43 => Self::IsAfterWord,
+            44 => Self::IsThatWord,
+            45 => Self::IsTwiceWord,
+            46 => Self::IsYetWord,
+            47 => Self::IsPleaseWord,
+            48 => Self::IsBeCliticS,
+            49 => Self::IsBeClitic,
+            50 => Self::IsThereWord,
             64 => Self::Id,
             65 => Self::Orth,
             66 => Self::Lower,
@@ -207,6 +342,38 @@ impl Attribute {
             "IS_LEFT_PUNCT" => Self::IsLeftPunct,
             "IS_RIGHT_PUNCT" => Self::IsRightPunct,
             "IS_CURRENCY" => Self::IsCurrency,
+            "IS_DET_WORD" => Self::IsDetWord,
+            "IS_ADP_WORD" => Self::IsAdpWord,
+            "IS_AUX_WORD" => Self::IsAuxWord,
+            "IS_CCONJ_WORD" => Self::IsCconjWord,
+            "IS_SCONJ_WORD" => Self::IsSconjWord,
+            "IS_PRON_WORD" => Self::IsPronWord,
+            "IS_VERB_WORD" => Self::IsVerbWord,
+            "IS_BE_VERB" => Self::IsBeVerb,
+            "IS_BARE_INF_HOST" => Self::IsBareInfHost,
+            "IS_NEGATOR" => Self::IsNegator,
+            "IS_NOMINATIVE" => Self::IsNominative,
+            "IS_POSSESSIVE" => Self::IsPossessive,
+            "IS_RELATIVIZER" => Self::IsRelativizer,
+            "IS_SENSORY_VERB" => Self::IsSensoryVerb,
+            "IS_EPISTEMIC_VERB" => Self::IsEpistemicVerb,
+            "IS_DISCOURSE_MARKER" => Self::IsDiscourseMarker,
+            "IS_ADVERB_WORD" => Self::IsAdverbWord,
+            "IS_SUBORD_COMPLEMENT" => Self::IsSubordComplement,
+            "IS_SUBORD_ADVERBIAL" => Self::IsSubordAdverbial,
+            "IS_WHERE_WORD" => Self::IsWhereWord,
+            "IS_LOCATIVE" => Self::IsLocative,
+            "IS_DEMONSTRATIVE" => Self::IsDemonstrative,
+            "IS_TODAY_WORD" => Self::IsTodayWord,
+            "IS_AS_WORD" => Self::IsAsWord,
+            "IS_AFTER_WORD" => Self::IsAfterWord,
+            "IS_THAT_WORD" => Self::IsThatWord,
+            "IS_TWICE_WORD" => Self::IsTwiceWord,
+            "IS_YET_WORD" => Self::IsYetWord,
+            "IS_PLEASE_WORD" => Self::IsPleaseWord,
+            "IS_BE_CLITIC_S" => Self::IsBeCliticS,
+            "IS_BE_CLITIC" => Self::IsBeClitic,
+            "IS_THERE_WORD" => Self::IsThereWord,
             "ID" => Self::Id,
             "ORTH" => Self::Orth,
             "LOWER" => Self::Lower,

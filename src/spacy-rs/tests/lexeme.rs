@@ -15,6 +15,7 @@ fn lexicon() -> Lexicon {
             stop_words,
             norm_exceptions,
             num_words: HashSet::new(),
+            function_words: HashMap::new(),
         },
     )
 }
@@ -70,6 +71,55 @@ fn stop_word_flag_matches_lowercased_orth() {
     assert!(lex.get_or_create("the").flags.is_stop());
     assert!(lex.get_or_create("The").flags.is_stop());
     assert!(!lex.get_or_create("cat").flags.is_stop());
+}
+
+#[test]
+fn function_word_bits_match_categories_case_insensitively() {
+    // The English category map behind `LexiconConfig::function_words`:
+    // spot-check every bit, multi-category overlap (`after` is ADP +
+    // SCONJ-word + adverbial-subordinator), and case-insensitivity.
+    let strings = Arc::new(StringStore::new());
+    let lex = Lexicon::new(
+        strings,
+        crate::lang::en::lexicon_config(),
+    );
+    let flags = |w: &str| lex.get_or_create(w).flags;
+    assert!(flags("the").is_det_word());
+    assert!(flags("of").is_adp_word());
+    assert!(flags("is").is_aux_word() && flags("is").is_be_verb() && flags("is").is_verb_word());
+    assert!(flags("and").is_cconj_word());
+    assert!(flags("because").is_sconj_word() && flags("because").is_subord_complement());
+    assert!(flags("when").is_subord_adverbial() && !flags("when").is_subord_complement());
+    assert!(flags("it").is_pron_word() && flags("it").is_nominative());
+    assert!(flags("me").is_pron_word() && !flags("me").is_nominative());
+    assert!(flags("sat").is_verb_word() && !flags("sat").is_aux_word());
+    assert!(flags("do").is_bare_inf_host() && flags("wo").is_bare_inf_host());
+    assert!(flags("n't").is_negator() && flags("NOT").is_negator());
+    assert!(flags("my").is_det_word() && flags("my").is_possessive() && flags("my").is_pron_word());
+    assert!(flags("who").is_relativizer() && flags("who").is_nominative());
+    assert!(flags("that").is_that_word() && flags("that").is_relativizer());
+    assert!(flags("that").is_det_word() && !flags("that").is_pron_word());
+    assert!(!flags("that").is_demonstrative());
+    assert!(flags("these").is_demonstrative());
+    assert!(flags("where").is_where_word() && flags("where").is_relativizer());
+    assert!(flags("there").is_locative() && flags("there").is_there_word());
+    assert!(flags("here").is_locative() && !flags("here").is_there_word());
+    assert!(flags("smells").is_sensory_verb() && !flags("smells").is_epistemic_verb());
+    assert!(flags("seems").is_epistemic_verb());
+    assert!(flags("please").is_discourse_marker() && flags("please").is_please_word());
+    assert!(flags("hard").is_adverb_word());
+    assert!(flags("today").is_today_word() && !flags("today").is_adverb_word());
+    assert!(flags("as").is_as_word() && flags("as").is_adp_word());
+    assert!(flags("after").is_adp_word() && !flags("after").is_sconj_word() && flags("after").is_after_word() && flags("after").is_subord_adverbial());
+    assert!(flags("twice").is_twice_word());
+    assert!(flags("yet").is_yet_word() && flags("yet").is_cconj_word() && flags("yet").is_adverb_word());
+    assert!(flags("'s").is_be_verb() && flags("'s").is_be_clitic() && flags("'s").is_be_clitic_s());
+    assert!(flags("'re").is_aux_word() && flags("'re").is_be_clitic() && !flags("'re").is_be_clitic_s());
+    assert!(flags("IS").is_be_verb() && flags("IS").is_aux_word());
+    assert!(flags("After").is_after_word());
+    // Open-class words gain no category bits.
+    let cat = flags("cat");
+    assert!(!cat.is_det_word() && !cat.is_verb_word() && !cat.is_be_verb() && !cat.is_adverb_word());
 }
 
 #[test]
