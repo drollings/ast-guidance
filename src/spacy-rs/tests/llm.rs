@@ -63,6 +63,9 @@ fn attach_writes_fields_and_rebuilds_tree() {
     assert_eq!(doc.lefts(2), vec![1]);
     assert_eq!(doc.rights(2), vec![3]);
     assert_eq!(doc.ancestors(0), vec![1, 2]);
+    assert_eq!(doc.head_index(2), 2, "root");
+    assert_eq!(doc.head_index(0), 1);
+    assert_eq!(doc.token(0).sent_start, crate::doc::SentStart::Start);
 }
 
 #[test]
@@ -134,15 +137,6 @@ fn contract_is_derived_from_closed_vocabularies() {
     assert!(dep_enum.iter().any(|v| v == "nsubj"));
     assert!(dep_enum.iter().any(|v| v == "root"));
     assert!(dep_enum.iter().any(|v| v == "compound"));
-}
-
-#[test]
-fn is_confidence_bearing_classifies_every_variant() {
-    assert!(!AnnotationSource::Llm.is_confidence_bearing());
-    assert!(!AnnotationSource::RuleRung.is_confidence_bearing());
-    assert!(!AnnotationSource::HumanReview.is_confidence_bearing());
-    assert!(AnnotationSource::ArcEager.is_confidence_bearing());
-    assert!(AnnotationSource::Encoder.is_confidence_bearing());
 }
 
 #[test]

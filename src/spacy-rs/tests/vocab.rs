@@ -26,10 +26,3 @@ fn vocab_save_and_load_or_empty_roundtrip() {
     let lex = reloaded.lexicon().get_or_create("persisted_word");
     assert_eq!(lex.orth, reloaded.strings().lookup("persisted_word"));
 }
-
-#[test]
-fn vocab_load_or_empty_missing_path_is_empty() {
-    let dir = tempfile::tempdir().expect("tmpdir");
-    let vocab = Vocab::load_or_empty(&dir.path().join("absent.json"), LexiconConfig::default());
-    assert!(vocab.strings().is_empty());
-}

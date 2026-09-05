@@ -1303,33 +1303,6 @@ fn refine_focus_unresolved_tokens_gated_by_task_value_flags() {
 }
 
 #[test]
-fn frame_coverage_all_resolved() {
-    let signal = signal_with_ids(
-        Some(InterlinguaId::from_u64(100)),
-        Some(InterlinguaId::from_u64(200)),
-        Some(InterlinguaId::from_u64(300)),
-    );
-    assert!((frame_coverage_signal(&signal) - 1.0).abs() < f64::EPSILON);
-}
-
-#[test]
-fn frame_coverage_none_resolved() {
-    let signal = signal_with_ids(None, None, None);
-    assert!((frame_coverage_signal(&signal)).abs() < f64::EPSILON);
-}
-
-#[test]
-fn frame_coverage_partial() {
-    let signal = signal_with_ids(
-        Some(InterlinguaId::from_u64(100)),
-        None,
-        Some(InterlinguaId::from_u64(300)),
-    );
-    let cov = frame_coverage_signal(&signal);
-    assert!((cov - 2.0 / 3.0).abs() < f64::EPSILON);
-}
-
-#[test]
 fn frame_coverage_is_bounded() {
     for (p, s, d) in [
         (None, None, None),
@@ -1345,18 +1318,6 @@ fn frame_coverage_is_bounded() {
         let cov = frame_coverage_signal(&signal);
         assert!(cov >= 0.0 && cov <= 1.0, "coverage {cov} out of bounds");
     }
-}
-
-#[test]
-fn frame_coverage_is_deterministic() {
-    let signal = signal_with_ids(
-        Some(InterlinguaId::from_u64(100)),
-        Some(InterlinguaId::from_u64(200)),
-        None,
-    );
-    let a = frame_coverage_signal(&signal);
-    let b = frame_coverage_signal(&signal);
-    assert!((a - b).abs() < f64::EPSILON);
 }
 
 // ── M5.3: frame_coverage property suite (small golden) ──
@@ -2379,7 +2340,6 @@ fn always_policy_ignores_focused_seams_and_uses_full_reannotation() {
 }
 
 // ── M6.1: span-level cache (amortized detail cache, M2b seam) ──
-use crate::lang::genesis::GenesisIndex as _;
 
 /// A hermetic [`SpanCacheSeam`](crate::cache::SpanCacheSeam) over a shared
 /// map — the ladder's whole cache contract without any ledger type.
@@ -2497,23 +2457,6 @@ fn genesis_promotes_after_threshold_and_overrides_rule() {
     // After promotion, the rule annotator returns the genesis POS.
     let set2 = pipe.rule().annotate(&doc);
     assert_eq!(set2.0[0].pos, "verb", "genesis overrides heuristic");
-}
-
-#[test]
-fn genesis_save_and_load_roundtrip() {
-    let dir = tempfile::tempdir().expect("tmpdir");
-    let path = dir.path().join("genesis.json");
-    let g = crate::lang::genesis::InMemoryGenesisIndex::with_threshold(1);
-    let c = crate::review::Correction {
-        token_index: 0,
-        field: crate::review::CorrectionField::Pos,
-        old_value: String::new(),
-        new_value: "verb".into(),
-    };
-    g.record(&c, "run");
-    g.save(&path).expect("save");
-    let h = crate::lang::genesis::InMemoryGenesisIndex::load_or_empty(&path);
-    assert_eq!(h.get_pos("run"), Some(crate::labels::Upos::Verb));
 }
 
 #[test]

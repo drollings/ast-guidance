@@ -111,14 +111,6 @@ fn ner_correction_ignored_before_threshold() {
 }
 
 #[test]
-fn first_ner_wins() {
-    let g = InMemoryGenesisIndex::with_threshold(2);
-    g.record(&ner_corr("Person"), "hello");
-    g.record(&ner_corr("Loc"), "hello");
-    assert_eq!(g.get_ner("hello"), Some(NerType::Person));
-}
-
-#[test]
 fn ner_threshold_is_higher_than_pos_and_isolated() {
     // Production defaults: POS 3, NER 5. POS evidence must not accelerate
     // NER promotion — entity type is context-variant (Washington/Jordan).
@@ -129,8 +121,10 @@ fn ner_threshold_is_higher_than_pos_and_isolated() {
     }
     assert_eq!(g.get_pos("washington"), Some(Upos::Noun));
     // Same orth: NER still not promoted — shared count would have falsely
-    // promoted it if the counter were shared.
+    // promoted it if the counter were shared (POS evidence leaves the NER
+    // counter at zero).
     assert!(g.get_ner("washington").is_none());
+    assert_eq!(g.ner_count_for("washington"), 0);
     // 4 NER corrections still below NER bar (5)
     for _ in 0..4 {
         g.record(&ner_corr("Loc"), "washington");
@@ -155,18 +149,6 @@ fn adversarial_same_orth_two_entity_types_first_wins() {
     g.record(&ner_corr("Loc"), "washington");
     g.record(&ner_corr("Loc"), "washington");
     assert_eq!(g.get_ner("washington"), Some(NerType::Person));
-}
-
-#[test]
-fn pos_evidence_does_not_count_toward_ner_promotion() {
-    let g = InMemoryGenesisIndex::with_thresholds(3, 5);
-    for _ in 0..10 {
-        g.record(&corr("noun"), "paris");
-    }
-    // 10 POS corrections but zero NER corrections → NER still not promoted
-    assert!(g.get_ner("paris").is_none());
-    assert_eq!(g.ner_count_for("paris"), 0);
-    assert_eq!(g.count_for("paris"), 10);
 }
 
 #[test]

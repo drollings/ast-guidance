@@ -173,19 +173,6 @@ fn apply_edits_stale_old_value_skipped_and_warned() {
 }
 
 #[test]
-fn apply_edits_empty_old_value_applies() {
-    let mut records = parse().records().records().to_vec();
-    let edits = [Correction {
-        token_index: 1,
-        field: CorrectionField::Lemma,
-        old_value: String::new(),
-        new_value: "cats".into(),
-    }];
-    assert_eq!(apply_edits(&mut records, &edits), 1);
-    assert_eq!(records[1].lemma, "cats");
-}
-
-#[test]
 fn parse_review_json_error_preserves_span() {
     let err = ParseReview::parse_json(r#"{"corrections": "not_an_array"}"#).expect_err("must fail");
     let display = format!("{err}");

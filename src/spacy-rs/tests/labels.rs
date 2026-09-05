@@ -87,11 +87,7 @@ fn dep_label_set_accepts_ud_and_reference() {
     assert!(set.contains("compound"));
     assert!(set.contains("case"));
     assert!(!set.contains("bogus_relation"));
-}
-
-#[test]
-fn dep_label_set_contains_is_case_insensitive() {
-    let set = DepLabelSet::ud_default();
+    // Membership is case-insensitive.
     assert!(set.contains("ROOT"));
     assert!(set.contains("NSUBJ"));
 }

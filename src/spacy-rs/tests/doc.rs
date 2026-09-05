@@ -43,10 +43,7 @@ fn first_token_is_sent_start() {
 fn text_reconstruction() {
     let doc = doc_with(&[("Hello", true), ("world", true), ("!", false)]);
     assert_eq!(doc.text(), "Hello world !");
-}
-
-#[test]
-fn text_reconstruction_preserves_trailing_space() {
+    // Trailing space is preserved when the last token carries `spacy`.
     let doc = doc_with(&[("Hello", true), ("world", true)]);
     assert_eq!(doc.text(), "Hello world ");
 }

@@ -305,10 +305,10 @@ fn transitive_dobj_structure() {
 // ── 9.6 oracle ────────────────────────────────────────────────────────
 
 #[test]
-fn oracle_best_with_margin_reports_ties() {
+fn oracle_best_with_margin_prefers_dominant() {
     let labels = label_hashes(&en_vocab());
     let oracle = DeterministicOracle;
-    // Two actions that score identically → margin 0.
+    // Two candidate actions: Left(nsubj) dominates noun-before-verb.
     let mut st = ArcEagerState::new(2, 0);
     st.stack.push(0);
     st.buffer.extend(1..2);
@@ -348,7 +348,6 @@ fn parse_confidence_ties_reduce_overall() {
     assert!((confident.overall - 1.0).abs() < 1e-9);
     assert_eq!(tied.oracle_tie_count, 1);
     assert!((tied.overall - 0.95).abs() < 1e-9, "one tie → 5% penalty");
-    assert!((tied.overall - (1.0 - 0.05)).abs() < 1e-9);
 }
 
 #[test]
@@ -532,19 +531,15 @@ fn copula_is_attached_matches_legacy_spelling() {
 // keep passing after (early-out skips legally).
 #[test]
 fn refine_early_out_no_candidate_no_write() {
-    type Plain = fn(&[String], &mut [Upos], &[LexemeFlags]);
     type WithOrtho = for<'a, 'b> fn(
         &'a [String],
         &'a mut [Upos],
         &'a [LexemeFlags],
         &'a TaggerOrtho<'b>,
     );
-    // Rules whose frames evaluate blob strings take `ortho`; the rest keep
-    // the plain shape (interface segregation — no unused params).
-    // (rule, refine fn, sentence with realistic trigger flags, scrub POS
-    //  that leaves the rule's candidate set empty)
-    let plain: &[(&str, Plain, &str, Upos)] = &[
-    ];
+    // Every `refine_pos_*` rule takes `ortho` (its frame may evaluate blob
+    // strings); (rule, refine fn, sentence with realistic trigger flags,
+    // scrub POS that leaves the rule's candidate set empty).
     let ortho_table: &[(&str, WithOrtho, &str, Upos)] = &[
         ("bare_infinitive", refine_pos_bare_infinitive, "She won't answer calls.", Upos::Verb),
         ("bare_object_noun", refine_pos_bare_object_noun, "She won't answer calls.", Upos::Noun),
@@ -571,19 +566,6 @@ fn refine_early_out_no_candidate_no_write() {
         ("imperative_non_det_object", refine_pos_imperative_non_det_object, "Eat apples daily.", Upos::Verb),
         ("bare_ed_transitive", refine_pos_bare_ed_transitive, "John opened the door.", Upos::Verb),
     ];
-    for (name, refine, text, scrub) in plain {
-        let doc = tokenize(text);
-        let texts: Vec<String> = (0..doc.len()).map(|i| doc.token_text(i)).collect();
-        let flags: Vec<LexemeFlags> =
-            (0..doc.len()).map(|i| doc.token(i).lexeme.flags).collect();
-        let mut pos = vec![*scrub; doc.len()];
-        refine(&texts, &mut pos, &flags);
-        assert_eq!(
-            pos,
-            vec![*scrub; doc.len()],
-            "{name}: write without candidate POS"
-        );
-    }
     for (name, refine, text, scrub) in ortho_table {
         let doc = tokenize(text);
         let texts: Vec<String> = (0..doc.len()).map(|i| doc.token_text(i)).collect();

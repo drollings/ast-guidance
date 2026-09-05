@@ -248,8 +248,8 @@ fn loading_gate_stamps_provisional_even_when_unambiguous() {
 }
 
 #[test]
-fn property_yago_stage_keeps_one_root() {
-    // 100+ random POS with YagoResolveStage-equivalent state (frame extraction) still yields valid trees
+fn property_random_parses_extract_frames_and_keep_one_root() {
+    // 100+ random POS with frame extraction still yields valid trees
     let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut next = move || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); seed >> 33 };
     let pos_words: &[(crate::labels::Upos, &str)] = &[

@@ -113,23 +113,25 @@ fn empty_and_whitespace_text() {
 
 #[test]
 fn filter_special_spans_prefers_longest() {
-    // Two overlapping single tokens where "cannot" is a longer match than
-    // "can not"-style overlaps: verify longest-first resolution keeps the
-    // longer span and drops the covered one.
-    let doc_orths = vec![hash_utf8("cannot")];
-    let rule_a = Arc::new(SpecialRule {
+    // Overlapping spans where "cannot" (0,2) is longer than "can" (0,1):
+    // longest-first resolution keeps the longer span and drops the covered
+    // one. A same-span tie keeps the first-listed rule.
+    let rule_long = Arc::new(SpecialRule {
         key: "cannot".into(),
         tokens: vec![],
         phrase: vec![hash_utf8("cannot")],
     });
-    let rule_b = Arc::new(SpecialRule {
+    let rule_short = Arc::new(SpecialRule {
         key: "can".into(),
         tokens: vec![],
         phrase: vec![hash_utf8("can")],
     });
-    let matches = vec![(Arc::clone(&rule_b), 0, 1), (Arc::clone(&rule_a), 0, 1)];
+    let matches = vec![
+        (Arc::clone(&rule_short), 0, 1),
+        (Arc::clone(&rule_long), 0, 2),
+    ];
     let filtered = filter_special_spans(matches);
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].0.key, "cannot");
-    let _ = doc_orths;
+    assert_eq!((filtered[0].1, filtered[0].2), (0, 2));
 }

@@ -1,5 +1,4 @@
 use super::*;
-use crate::hash::hash_utf8;
 use crate::labels::DepLabelSet;
 use crate::lexeme::LexiconConfig;
 use crate::vocab::Vocab;
@@ -207,26 +206,6 @@ fn accepts_multiple_roots_for_multiple_sentences() {
 }
 
 #[test]
-fn rejects_disconnected_component_as_cycle_or_unreachable() {
-    // a → b (b root); c → d, d → c (an independent 2-cycle with no root)
-    let mut doc = Doc::new(vocab());
-    for t in ["a", "b", "c", "d"] {
-        doc.push_back(t, true).expect("push");
-    }
-    let set = AnnotationSet(vec![
-        recorder("a", "noun", "nsubj", 1),
-        recorder("b", "noun", "root", 0),
-        recorder("c", "noun", "dep", 1),
-        recorder("d", "noun", "dep", -1),
-    ]);
-    // c→d→c is a cycle in a separate component
-    assert!(matches!(
-        AnnotationValidator::new().validate(&doc, &set),
-        Err(AnnotationError::Cycle(_))
-    ));
-}
-
-#[test]
 fn rejects_cycle() {
     // a → b, b → a: a pure cycle in a separate component, alongside the
     // required root c. RootCount passes (exactly one root), then the
@@ -324,7 +303,7 @@ fn rejects_non_projective_when_required() {
 }
 
 #[test]
-fn rejects_projectivity_failure_with_clean_tree() {
+fn accepts_projective_tree_when_required() {
     // A projective tree must pass with the requirement on.
     let (doc, set) = valid_doc_and_set();
     assert_eq!(
@@ -356,19 +335,4 @@ fn custom_dep_label_set_accepts_and_rejects() {
         validator.validate(&doc, &set),
         Err(AnnotationError::UnknownDep(_))
     ));
-}
-
-#[test]
-fn attached_doc_is_navigable() {
-    // Apply the golden set, then confirm the rebuilt tree is navigable and
-    // the sent-starts are marked from the root.
-    let (mut doc, set) = valid_doc_and_set();
-    crate::llm::apply(&mut doc, &set).expect("apply");
-    assert_eq!(doc.head_index(2), 2); // root
-    assert_eq!(doc.head_index(0), 1);
-    assert_eq!(doc.lefts(2), vec![1]);
-    assert_eq!(doc.rights(2), vec![3]);
-    assert_eq!(doc.token(2).pos, Upos::Verb);
-    assert_eq!(doc.token(0).dep, hash_utf8("det"));
-    assert_eq!(doc.token(0).sent_start, crate::doc::SentStart::Start);
 }

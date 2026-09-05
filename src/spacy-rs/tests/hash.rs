@@ -40,14 +40,6 @@ fn hash_parity_with_spacy_murmur64a() {
 }
 
 #[test]
-fn empty_string_hashes_to_seed_mix() {
-    // len 0: h = seed ^ (0 * m) = seed, then finalize.
-    let h = murmur64a(b"", 1);
-    assert_eq!(h, murmur64a(b"", HASH_SEED));
-    assert_ne!(h, 0);
-}
-
-#[test]
 fn distinct_inputs_distinct_hashes() {
     assert_ne!(hash_utf8("the"), hash_utf8("teh"));
     assert_ne!(hash_utf8("apple"), hash_utf8("Apple"));

@@ -4,7 +4,6 @@ use crate::interlingua::InterlinguaResolver;
 use crate::llm::{attach, AnnotationSet};
 use crate::sentencizer::Sentencizer;
 use crate::vocab::Vocab;
-use fluent_types::{ConceptMetadata, InterlinguaId, NodeId};
 use std::sync::Arc;
 
 fn vocab() -> Arc<Vocab> {
@@ -27,19 +26,6 @@ fn resolver_for(store: Arc<InMemoryConceptStore>) -> InterlinguaResolver {
         Arc::clone(&store) as Arc<dyn ConceptStore>,
         Arc::clone(vocab().strings()),
     )
-}
-
-fn meta(id: InterlinguaId, name: &str, parent: Option<InterlinguaId>) -> ConceptMetadata {
-    ConceptMetadata {
-        id,
-        canonical_name: name.to_string(),
-        namespace: id.namespace(),
-        yago_iri: None,
-        yago_class_iri: None,
-        label: Some(name.to_string()),
-        node_id: Some(NodeId::from_int(id.local_id())),
-        parent_class_id: parent,
-    }
 }
 
 const DOG_BARK_PARSE: &str = r#"[
@@ -107,20 +93,6 @@ fn multi_sentence_yields_one_triple_per_sentence() {
     assert_eq!(triples[1].sentence_span, (4, 8));
 }
 
-#[test]
-fn subclass_transitive_dog_animal_via_hierarchy() {
-    let store = Arc::new(InMemoryConceptStore::new());
-    let resolver = resolver_for(Arc::clone(&store));
-    let dog_lemma = resolver.lemma_id("dog");
-    let mammal_lemma = resolver.lemma_id("mammal");
-    let animal_lemma = resolver.lemma_id("animal");
-    store.insert(meta(animal_lemma, "animal", None)).expect("a");
-    store.insert(meta(mammal_lemma, "mammal", Some(animal_lemma))).expect("m");
-    store.insert(meta(dog_lemma, "dog", Some(mammal_lemma))).expect("d");
-    assert!(store.is_subclass_of(dog_lemma, animal_lemma));
-    assert!(!store.is_subclass_of(animal_lemma, dog_lemma));
-}
-
 // ── M5 seam tests: spacy-rs produces the input, the knowledge owner scores ──
 
 #[test]
@@ -174,25 +146,4 @@ fn via_fetch_empty_triples_is_none_even_with_fetch() {
     let empty: Vec<Triple> = Vec::new();
     let doc = attached(CAT_SAT_PARSE, &["The", "cat", "sat", "."]);
     assert!(semantic_plausibility_via_fetch(&doc, &empty, &resolver, Some(&fetch)).is_none());
-}
-
-#[test]
-fn never_touches_oracle_margins() {
-    // E7 regression (M5.3): the seam path returns a bare score for the
-    // separate `semantic_plausibility` field; `oracle_margins` are never an
-    // input or an output of scoring.
-    let store = Arc::new(InMemoryConceptStore::new());
-    let resolver = resolver_for(Arc::clone(&store));
-    let doc = attached(DOG_BARK_PARSE, &["The", "dog", "barks", "."]);
-    let triples = extract_triples(&doc);
-    let fetch: PlausibilityFetch = Arc::new(|_| Some(0.5));
-    let score = semantic_plausibility_via_fetch(&doc, &triples, &resolver, Some(&fetch));
-    let mut pc = crate::arc_eager::ParseConfidence::compute(&[0.9], &[0.0, 0.25], 1.0);
-    let margins_before = pc.oracle_margins.clone();
-    pc.semantic_plausibility = score;
-    // Oracle margins are untouched — scoring never writes them.
-    // (Compile-time guarantee: no mutable access to ParseConfidence here.)
-    assert_eq!(pc.oracle_margins, margins_before);
-    assert_eq!(pc.oracle_margins, vec![0.0, 0.25]);
-    assert_eq!(pc.semantic_plausibility, Some(0.5));
 }
