@@ -1328,9 +1328,8 @@ fn refine_pos_conjoined_predicate_agreement(texts: &[String], pos: &mut [Upos], 
 }
 
 /// Contracted-be disambiguation (`It's raining`, `You're late`, `I'm
-/// feeling` vs. `Bell's theorem`). Runs after the lexeme-only tags so it can
-/// read neighbor POS. Two guarded upgrades, in one ascending pass so the
-/// participle rule sees the freshly classified clitic:
+/// feeling` vs.  `Bell's theorem`).  Two guarded upgrades, in one ascending
+/// pass so the participle rule sees the freshly classified clitic:
 ///
 /// - a be-clitic (`'s`/`'re`/`'m`) → AUX only when its host is a pronoun
 ///   (`It`/`You`/`I`/…). After a noun it is the possessive case marker (UD:
@@ -3578,13 +3577,8 @@ fn pick_root(pos: &[Upos], texts: &[String], flags: &[LexemeFlags], s: usize, e:
             return aux;
         }
     }
-    // A copular predicate nominal (She is a doctor, Who is the president,
-    // There is a problem, This is a Rust project): be + DET + nominals
-    // with the nominal span running to the sentence end crowns the LAST
-    // nominal of the span (project, not Rust). Runs after the verb scan
-    // (finite verbs still win) and before the ADJ fallback — and only when
-    // no ADJ stands after be in the sentence, so `Is the report ready`
-    // and `Is the sky blue` keep their predicate-adjective crowns.
+    // A copular predicate nominal: be + DET + nominals with the nominal
+    // span running to the sentence end crowns the LAST nominal of the span.
     if !flags
         .get(s)
         .is_some_and(|f| f.is_where_word())
