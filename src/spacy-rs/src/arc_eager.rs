@@ -1767,6 +1767,33 @@ impl ArcEagerState {
                         }
                     }
                 }
+                // A be-AUX governs its nominal complement rightward in a
+                // Where-initial be-question (Where is the station: station →
+                // dobj → is, per question-02/08). The (Verb, nominal) arm
+                // above never sees the pair (be is AUX, not VERB), so the
+                // complement strands into repair-dep with the right head
+                // and the wrong label. Gated on the clause opening with
+                // Where (scan back to the previous punctuation boundary) and
+                // a be-form stack top, so copular declaratives (`She is a
+                // doctor`), inverted predicates (`Is lunch ready`), and
+                // modal AUX frames (`Can you help`) keep incumbent
+                // dynamics; pronouns stay out (subjects, never objects).
+                // Needs the Where-be root rung above (the AUX must hold the
+                // crown, or repair owns the heads).
+                (Upos::Aux, Upos::Noun | Upos::Propn) => {
+                    let clause_start = (0..s)
+                        .rev()
+                        .find(|&k| pos[k] == Upos::Punct)
+                        .map_or(0, |k| k + 1);
+                    if texts
+                        .get(clause_start)
+                        .is_some_and(|t| t.eq_ignore_ascii_case("where"))
+                        && is_be_form(texts[s].as_str())
+                        && ((s + 1)..b).all(|k| pos[k] != Upos::Punct)
+                    {
+                        out.push(Self::act(ArcEagerMove::Right, labels.dobj));
+                    }
+                }
                 // A second finite verb across a punctuation + nominal boundary
                 // (She texted; he called) is parataxis, not a complement:
                 // both a clause boundary and an intervening subject must
@@ -2389,6 +2416,19 @@ impl DeterministicOracle {
                     l if l == labels.dobj && pos[s] == Upos::Verb => {
                         if matches!(pos[b], Upos::Noun | Upos::Propn | Upos::Pron) {
                             100.0
+                        } else {
+                            10.0
+                        }
+                    }
+                    // The be-question complement (station → dobj → is):
+                    // aux-family confidence, below verbal dobj (100) so a
+                    // verb on the stack always keeps its own dynamics.
+                    // Ungated here by design — the Where-be candidate arm
+                    // above is the only offerer, so this weight only ever
+                    // ranks Where-be pairs.
+                    l if l == labels.dobj && pos[s] == Upos::Aux => {
+                        if matches!(pos[b], Upos::Noun | Upos::Propn) {
+                            90.0
                         } else {
                             10.0
                         }
@@ -3218,6 +3258,29 @@ fn pick_root(pos: &[Upos], texts: &[String], s: usize, e: usize) -> usize {
             && matches!(pos[i - 1], Upos::Noun | Upos::Propn)
         {
             rel_pending = true;
+        }
+    }
+    // Where-initial be-question (`Where is the station`, `Where is my
+    // bag`): the WH-word is pinned NOUN by the adverb-lexicon gap, so no
+    // VERB or ADJ crowns — and the refs root the be-AUX itself
+    // (question-02/08: is → root, station/bag → dobj → is). Crown the
+    // leftmost be-form AUX when a nominal follows it in the sentence.
+    // Guards: any VERB (the first rung already won those, e.g. `Where did
+    // she go` → go) or any ADJ (copular predicates head, e.g. `Is lunch
+    // ready` → ready) keeps its crown; non-Where sentences (`She is a
+    // doctor`) and What/Why-initial questions (`What is 2+2`) keep
+    // incumbent dynamics. Purely categorial — no lexicon beyond the
+    // closed be-forms and the interrogative word itself.
+    if texts.get(s).is_some_and(|t| t.eq_ignore_ascii_case("where"))
+        && !(s..e).any(|k| pos[k] == Upos::Verb || pos[k] == Upos::Adj)
+    {
+        let aux = (s..e).find(|&i| {
+            pos[i] == Upos::Aux
+                && is_be_form(texts[i].as_str())
+                && (i + 1..e).any(|k| matches!(pos[k], Upos::Noun | Upos::Propn | Upos::Pron))
+        });
+        if let Some(aux) = aux {
+            return aux;
         }
     }
     // A copular predicate nominal (She is a doctor, Who is the president,

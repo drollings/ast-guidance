@@ -947,6 +947,91 @@ fn interrogative_where_stays_noun() {
 }
 
 #[test]
+fn where_be_question_crowns_aux() {
+    // Refs (UD question-02/08): is → aux/root, station/bag → noun/dobj →
+    // is, the/my → det → station/bag. The WH-word is pinned NOUN (the
+    // control above), so no VERB/ADJ crowns; the Where-be root rung crowns
+    // the be-AUX and the gated be-dobj arm lands the complement. (UD pins
+    // adv/advmod for Where itself — the POS half stays a documented
+    // residual; only heads/labels of the determined tokens are asserted.)
+    // No oracle tie: the frame is determined, so Track B stays quiet.
+    for (text, det, comp) in [
+        ("Where is the station?", "the", "station"),
+        ("Where is my bag?", "my", "bag"),
+    ] {
+        let (_doc, set) = parse(text);
+        let pos = pos_of(&set);
+        let deps = deps(&set);
+        let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+        let (where_, is, det_, comp_) = (at("Where"), at("is"), at(det), at(comp));
+        assert_eq!(pos[is], "aux", "{text}: pos: {pos:?}");
+        assert_eq!(deps[is], "root", "{text}: deps: {deps:?}");
+        assert_eq!(set.0[is].head, 0, "{text}: root head");
+        assert_eq!(deps[comp_], "dobj", "{text}: deps: {deps:?}");
+        assert_eq!(comp_ as i32 + set.0[comp_].head, is as i32, "{text}");
+        assert_eq!(deps[det_], "det", "{text}: deps: {deps:?}");
+        assert_eq!(det_ as i32 + set.0[det_].head, comp_ as i32, "{text}");
+        assert_eq!(pos[where_], "noun", "{text}: Where stays NOUN: {pos:?}");
+        let abs = where_ as i32 + set.0[where_].head;
+        assert_eq!(abs, is as i32, "{text}: Where headed by be");
+        let (conf, _, _) = ambiguity_of(text);
+        assert_eq!(conf.oracle_tie_count, 0, "{text}: determined frame must not tie: {conf:?}");
+    }
+}
+
+#[test]
+fn where_aux_with_verb_keeps_verb_root() {
+    // Must-NOT-fire: `Where did she go` has a finite verb — the VERB rung
+    // wins before the Where-be rung is consulted, and `did` is not a
+    // be-form anyway. go stays root with did → aux → go and she → nsubj
+    // → go; the gated be-dobj arm never sees the pair.
+    let (_doc, set) = parse("Where did she go?");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (did, she, go) = (at("did"), at("she"), at("go"));
+    assert_eq!(pos[go], "verb", "pos: {pos:?}");
+    assert_eq!(deps[go], "root", "deps: {deps:?}");
+    assert_eq!(deps[did], "aux", "deps: {deps:?}");
+    assert_eq!(did as i32 + set.0[did].head, go as i32);
+    assert_eq!(deps[she], "nsubj", "deps: {deps:?}");
+    assert_eq!(she as i32 + set.0[she].head, go as i32);
+    assert_eq!(pos[at("Where")], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn where_invoice_convention_split_is_stable() {
+    // Must-NOT-fire (boundary documentation): wh-copula-03 pins the
+    // competing UD convention (invoice → noun/root, is → cop → invoice)
+    // for a POS-identical frame, so the Where-be rung crowns `is` there
+    // against that ref. Only the convention-agreed tokens are pinned
+    // (the → det → invoice, ? → punct → invoice); the split itself is
+    // pinned stable with no oracle tie rather than silently re-headed.
+    let (_doc, set) = parse("Where is the invoice?");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (the, invoice, q) = (at("the"), at("invoice"), at("?"));
+    assert_eq!(deps[the], "det", "deps: {deps:?}");
+    assert_eq!(the as i32 + set.0[the].head, invoice as i32);
+    assert_eq!(deps[q], "punct", "deps: {deps:?}");
+    assert_eq!(q as i32 + set.0[q].head, invoice as i32, "deps: {deps:?}");
+    let (conf, _, _) = ambiguity_of("Where is the invoice?");
+    assert_eq!(conf.oracle_tie_count, 0, "split frame must not tie: {conf:?}");
+}
+
+#[test]
+fn non_where_be_nominal_keeps_nominal_root() {
+    // Must-NOT-fire: the Where-be rung is clause-initial-Where-gated —
+    // `She is a doctor` (be + DET + nominal, no Where) keeps its nominal
+    // root and never sees the be-dobj arm.
+    let (_doc, set) = parse("She is a doctor.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(deps[at("doctor")], "root", "deps: {deps:?}");
+    assert_ne!(deps[at("is")], "root", "deps: {deps:?}");
+}
+
+#[test]
 fn object_relative_anchor_survives_embedded_subject() {
     // Refs (UD relative-02): bought → relcl → book, book → nsubj →
     // vanished. The anchor wait covers the marker ([book], that) but the
@@ -1965,6 +2050,12 @@ fn verbless_concessive_emits_attachment_tie() {
         keys.iter().any(|k| k.provisional),
         "ambiguous frame mints a provisional key"
     );
+    let (reason, should) = refine_of("Although tired, she kept pace.");
+    assert!(
+        matches!(reason, spacy_rs::RefineReason::Confidence(_)),
+        "confidence-axis refine must fire, got {reason:?}"
+    );
+    assert!(should, "should_refine must be true for {reason:?}");
     // Parse-stability pin: the tie must not re-head anything.
     let (_doc, set) = parse("Although tired, she kept pace.");
     let deps = deps(&set);
@@ -2677,13 +2768,12 @@ fn copular_package_keeps_predicate_adjectives() {
     // its crown (`Is the report ready`, `Is the sky blue`) — the
     // pick_root rule requires no ADJ after be, and prepositional spans
     // (`The book is on the table`, ADP after be) never match either.
-    // Where-initial interrogatives keep incumbent dynamics throughout
-    // (question-02/08 pin be-as-root; reconciling those conventions is a
-    // separate design decision).
+    // (Where-initial interrogatives crown be instead — see
+    // `where_be_question_crowns_aux`; they are deliberately not listed
+    // here.)
     for (text, crown) in [
         ("Is the report ready?", "ready"),
         ("The book is on the table.", "book"),
-        ("Where is the station?", "Where"),
     ] {
         let (_doc, set) = parse(text);
         let deps = deps(&set);
