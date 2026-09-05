@@ -278,6 +278,53 @@ fn contracted_be_progressive_frame() {
 }
 
 #[test]
+fn contracted_m_progressive_frame() {
+    // Refs (UD statement-desire-03): pronoun-hosted `'m` is the be-AUX
+    // (`I`/`'m`), so the complement-licensed progressive reads exactly
+    // like its full-be sibling (`are coming today`): `'m` → aux → feeling,
+    // `I` → nsubj → feeling, `feeling` crowns VERB, and the temporal
+    // adjunct lands through the today arm. (`sad` stays the honest
+    // residual: a bare nominal after a non-linking verb reads dobj, and
+    // only lexicon knowledge splits it from acomp.)
+    let (_doc, set) = parse("I'm feeling sad today.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (i, m, feeling, today) = (at("I"), at("'m"), at("feeling"), at("today"));
+    assert_eq!(pos[m], "aux", "pos: {pos:?}");
+    assert_eq!(deps[m], "aux", "deps: {deps:?}");
+    assert_eq!(m as i32 + set.0[m].head, feeling as i32);
+    assert_eq!(pos[feeling], "verb", "pos: {pos:?}");
+    assert_eq!(deps[feeling], "root");
+    assert_eq!(deps[i], "nsubj", "deps: {deps:?}");
+    assert_eq!(i as i32 + set.0[i].head, feeling as i32);
+    assert_eq!(pos[today], "noun", "pos: {pos:?}");
+    assert_eq!(deps[today], "advmod", "deps: {deps:?}");
+    assert_eq!(today as i32 + set.0[today].head, feeling as i32);
+    // Determined frame: complement-licensed, no POS doubt — quiet.
+    let (conf, _, _) = ambiguity_of("I'm feeling sad today.");
+    assert_eq!(conf.oracle_tie_count, 0, "licensed progressive must not tie: {conf:?}");
+}
+
+#[test]
+fn temporal_today_after_be_stays_nominal() {
+    // Must-NOT-fire control for the inverted-copular guard: a temporal
+    // `today` after a be-form with a nominal between (`are you coming
+    // today`) is the bare time adjunct, never a predicate adjective — it
+    // keeps NOUN so the today arm (not acomp) lands it.
+    let (_doc, set) = parse("Are you coming today?");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (coming, today) = (at("coming"), at("today"));
+    assert_eq!(pos[coming], "verb", "pos: {pos:?}");
+    assert_eq!(deps[coming], "root");
+    assert_eq!(pos[today], "noun", "pos: {pos:?}");
+    assert_eq!(deps[today], "advmod", "deps: {deps:?}");
+    assert_eq!(today as i32 + set.0[today].head, coming as i32);
+}
+
+#[test]
 fn possessive_s_is_not_aux() {
     // Must-NOT-fire: possessive 's (host is a noun, not a pronoun) keeps its
     // non-aux tag; the UD case-marker reading is future work, but aux is
@@ -291,14 +338,39 @@ fn possessive_s_is_not_aux() {
 
 #[test]
 fn full_be_participial_adjective_stays_non_verb() {
-    // Must-NOT-fire: "surprising" after full-form "were" is a participial
-    // adjective (ref: adj/root) — the clitic-hosted participle rule must not
-    // fire on full be-forms.
+    // Refs (UD copular-06): "surprising" after full-form "were" is a
+    // participial adjective (adj/root) — the clitic-hosted participle rule
+    // must not verb it, and the clause-final `-ing` reading lands the full
+    // copular tree (results → nsubj, were → cop, surprising crowns). The
+    // shape is genuinely ambiguous (bare progressive reads identically),
+    // so the `-ing` cop-rival records the near-tie alongside the right
+    // tree — flagged, not silently confident.
     let (doc, set) = parse("The results were surprising.");
     let pos = pos_of(&set);
+    let deps = deps(&set);
     let texts = token_texts(&doc);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
     let surprising = texts.iter().position(|t| t == "surprising").expect("surprising");
     assert_ne!(pos[surprising], "verb", "pos: {pos:?}");
+    assert_eq!(pos[surprising], "adj", "pos: {pos:?}");
+    let (results, were) = (at("results"), at("were"));
+    assert_eq!(deps[surprising], "root");
+    assert_eq!(deps[results], "nsubj", "deps: {deps:?}");
+    assert_eq!(results as i32 + set.0[results].head, surprising as i32);
+    assert_eq!(deps[were], "cop", "deps: {deps:?}");
+    assert_eq!(were as i32 + set.0[were].head, surprising as i32);
+    let (conf, analysis, _) = ambiguity_of("The results were surprising.");
+    assert!(
+        conf.oracle_tie_count >= 1,
+        "participial-adjective frame must tie: {conf:?}"
+    );
+    assert!(
+        analysis
+            .ambiguities
+            .iter()
+            .any(|a| a.kind == spacy_rs::AmbiguityKind::AttachmentNearTie),
+        "AttachmentNearTie expected: {analysis:?}"
+    );
 }
 
 fn lemmas(set: &spacy_rs::AnnotationSet) -> Vec<String> {
@@ -461,13 +533,32 @@ fn object_pronoun_does_not_govern_verb() {
 }
 
 #[test]
-fn aux_prev_does_not_govern_participle() {
-    // Must-NOT-fire: "coming" follows an AUX ("are"), not a pronoun subject
-    // — the full-be progressive stays for copular handling.
+fn aux_governed_progressive_with_complement_is_verbal() {
+    // Refs (UD contraction-10): a post-be `-ing` participle with an overt
+    // complement ahead (`coming today`) is the licensed progressive — the
+    // "copular handling" the old must-NOT-fire pin deferred. The negator
+    // bridge mirrors the copular pass (`aren't coming`), and the temporal
+    // adjunct lands through the today arm, not as a second object.
     let (_doc, set) = parse("They aren't coming today.");
     let pos = pos_of(&set);
+    let deps = deps(&set);
     let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
-    assert_eq!(pos[at("coming")], "noun", "pos: {pos:?}");
+    let (they, are, nt, coming, today) =
+        (at("They"), at("are"), at("n't"), at("coming"), at("today"));
+    assert_eq!(pos[coming], "verb", "pos: {pos:?}");
+    assert_eq!(deps[coming], "root");
+    assert_eq!(deps[they], "nsubj", "deps: {deps:?}");
+    assert_eq!(they as i32 + set.0[they].head, coming as i32);
+    assert_eq!(deps[are], "aux", "deps: {deps:?}");
+    assert_eq!(are as i32 + set.0[are].head, coming as i32);
+    assert_eq!(deps[nt], "neg", "deps: {deps:?}");
+    assert_eq!(nt as i32 + set.0[nt].head, coming as i32);
+    assert_eq!(deps[today], "advmod", "deps: {deps:?}");
+    assert_eq!(today as i32 + set.0[today].head, coming as i32);
+    // Determined frame: the complement license leaves no POS doubt, so
+    // Track B stays quiet.
+    let (conf, _, _) = ambiguity_of("They aren't coming today.");
+    assert_eq!(conf.oracle_tie_count, 0, "licensed progressive must not tie: {conf:?}");
 }
 
 #[test]
@@ -637,6 +728,22 @@ fn adjective_headed_sconj_does_not_mark() {
     let deps = deps(&set);
     let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
     assert_ne!(deps[at("Although")], "mark", "deps: {deps:?}");
+    // Track B: the NOUN-tagged verbless concessive is underdetermined through
+    // the nominal arm (same dynamics as the ADJ "Although tired" case pinned
+    // below) — the oracle must record a near-tie and the frame stage an
+    // AttachmentNearTie, never a confident silent misparse.
+    let (conf, analysis, _) = ambiguity_of("Although hungry, he shared lunch.");
+    assert!(
+        conf.oracle_tie_count >= 1,
+        "NOUN-tagged verbless concessive must tie: {conf:?}"
+    );
+    assert!(
+        analysis
+            .ambiguities
+            .iter()
+            .any(|a| a.kind == spacy_rs::AmbiguityKind::AttachmentNearTie),
+        "AttachmentNearTie expected: {analysis:?}"
+    );
 }
 
 #[test]
@@ -1922,15 +2029,49 @@ fn comma_framed_participle_modifies_anchor() {
 }
 
 #[test]
-fn unframed_participle_after_aux_stays_noun() {
-    // Must-NOT-fire: the participial upgrade needs the comma frame —
-    // "coming" after an AUX with no commas stays NOUN (its progressive
-    // reading belongs to copular handling, per the existing aux-prev
-    // pin).
-    let (_doc, set) = parse("They aren't coming today.");
+fn clause_final_ing_after_be_emits_pos_tie() {
+    // Track B (positive): a clause-final `-ing` participle after be (`is
+    // raining`) is genuinely ambiguous — bare progressive vs. participial
+    // adjective are POS-identical without lexicon knowledge. The tagger
+    // reads ADJ so the tree goes right (cop lands, subject attaches,
+    // participle crowns), and the `-ing` cop-rival records the near-tie (→
+    // `RefineReason::Confidence(Ties)` → `AttachmentNearTie` with a
+    // provisional key) instead of a confident mistag. The one POS miss
+    // against the verbal ref is the documented price of the ambiguity.
+    let (_doc, set) = parse("It is raining.");
     let pos = pos_of(&set);
+    let deps = deps(&set);
     let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
-    assert_eq!(pos[at("coming")], "noun", "pos: {pos:?}");
+    let (it, is, raining) = (at("It"), at("is"), at("raining"));
+    assert_eq!(pos[raining], "adj", "pos: {pos:?}");
+    assert_eq!(deps[raining], "root");
+    assert_eq!(deps[it], "nsubj", "deps: {deps:?}");
+    assert_eq!(it as i32 + set.0[it].head, raining as i32);
+    assert_eq!(deps[is], "cop", "deps: {deps:?}");
+    assert_eq!(is as i32 + set.0[is].head, raining as i32);
+    let (conf, analysis, keys) = ambiguity_of("It is raining.");
+    assert!(
+        conf.oracle_tie_count >= 1,
+        "clause-final -ing after be must tie: {conf:?}"
+    );
+    assert!(
+        analysis
+            .ambiguities
+            .iter()
+            .any(|a| a.kind == spacy_rs::AmbiguityKind::AttachmentNearTie),
+        "AttachmentNearTie expected: {analysis:?}"
+    );
+    assert!(
+        keys.iter().any(|k| k.provisional),
+        "ambiguous frame mints a provisional key"
+    );
+    let (reason, should) = refine_of("It is raining.");
+    assert_eq!(
+        reason,
+        spacy_rs::RefineReason::Confidence(spacy_rs::ConfidenceReason::Ties),
+        "clause-final -ing must refine on Ties, got {reason:?}"
+    );
+    assert!(should, "should_refine must be true for {reason:?}");
 }
 
 #[test]

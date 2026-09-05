@@ -1032,10 +1032,11 @@ fn is_be_form(flags: LexemeFlags) -> bool {
 /// alpha-fallback NOUN to ADJ only after the nearest preceding AUX-tagged
 /// be-form with ≥1 nominal strictly between (the overt subject). Guards
 /// (mirroring be-predicate/initial-noun): `-ing` participles, capitalized
-/// targets, and subject-less complements (`is a doctor`, `is the station`
-/// — bare determiners never match). Sequenced just before be-predicate;
-/// disjoint from it by construction (its direct/bridged shapes have no
-/// nominal between be and target).
+/// targets, temporal `today` (a bare time adjunct — `are coming today` —
+/// never a predicate adjective), and subject-less complements (`is a
+/// doctor`, `is the station` — bare determiners never match). Sequenced
+/// just before be-predicate; disjoint from it by construction (its
+/// direct/bridged shapes have no nominal between be and target).
 fn refine_pos_inverted_copular(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
     for i in 1..texts.len() {
         if pos[i] != Upos::Noun {
@@ -1050,6 +1051,9 @@ fn refine_pos_inverted_copular(texts: &[String], pos: &mut [Upos], flags: &[Lexe
             continue;
         }
         if !word.chars().next().is_some_and(|c| c.is_lowercase()) {
+            continue;
+        }
+        if flags[i].is_today_word() {
             continue;
         }
         let Some(j) = (0..i).rfind(|&j| pos[j] == Upos::Aux && is_be_form(flags[j]))
@@ -1096,6 +1100,81 @@ fn refine_pos_be_predicate(texts: &[String], pos: &mut [Upos], flags: &[LexemeFl
             && i - 2 >= 1;
         if direct || bridged {
             pos[i] = Upos::Adj;
+        }
+    }
+}
+
+/// Progressive vs. participial-adjective `-ing` after full be (`are coming
+/// today`, `were surprising`, `is raining`). The contracted-be rule owns
+/// clitic hosts; full be-forms reach here as NOUN (the tagger has no `-ing`
+/// verb), and both copular passes above deliberately skip participles (`are
+/// coming`, `were surprising` stay for participle handling) — so post-be
+/// `-ing` is a dead zone: always NOUN, always confidently wrong
+/// (progressives lose their predicate, participial adjectives lose their
+/// tree). This rule is that handling. Two licensed readings, split by what
+/// follows the participle:
+///
+/// - An overt complement or adjunct ahead (ADJ/ADV/nominal/DET before any
+///   punctuation: `feeling sad`, `raining hard`, `coming today`,
+///   `becoming the leader`) licenses the progressive → VERB. The
+///   negator bridge mirrors the copular pass (`aren't coming`), and
+///   bare `-ing` nominals (`the building`), gerund subjects (`Swimming is
+///   fun`), SCONJ/comma-framed participles (`While waiting`, `smiling,
+///   took`), and non-be AUX governors never match — no be-AUX immediately
+///   before, so the gate never sees them.
+/// - Clause-final position (punctuation or end next: `were surprising`,
+///   `is raining`) is genuinely ambiguous — a bare progressive and a
+///   participial adjective are POS-identical there without lexicon
+///   knowledge — so it reads ADJ: the tree goes right (the cop lands, the
+///   subject attaches, the participle crowns) and the `-ing` cop-rival in
+///   the oracle records the near-tie (→ `RefineReason::Confidence(Ties)` →
+///   `AttachmentNearTie`) instead of a confident mistag. The standing
+///   `full_be_participial_adjective_stays_non_verb` guard (`assert_ne`
+///   verb) keeps holding.
+///
+/// Known boundaries: `going to + VERB` futures (ADP next — no corpus
+/// instance), lexical `-ing` nouns (`It is morning/evening`), and
+/// attributive `-ing` + bare nominal (`surprising news`, no corpus
+/// instance) stay approximate. Same O(n) frame-scan shape as the other
+/// refines.
+fn refine_pos_progressive_ing(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
+    for i in 1..texts.len() {
+        if pos[i] != Upos::Noun {
+            continue;
+        }
+        let word = texts[i].as_str();
+        if word.len() <= 4
+            || !word
+                .get(word.len() - 3..)
+                .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ing"))
+        {
+            continue;
+        }
+        let direct = pos[i - 1] == Upos::Aux && is_be_form(flags[i - 1]);
+        let bridged = i >= 2
+            && flags[i - 1].is_negator()
+            && pos[i - 2] == Upos::Aux
+            && is_be_form(flags[i - 2]);
+        if !(direct || bridged) {
+            continue;
+        }
+        match pos.get(i + 1) {
+            // Clause-final: genuinely ambiguous → ADJ (tree-right) + the
+            // oracle tie below flags the POS doubt.
+            None | Some(Upos::Punct) => {
+                pos[i] = Upos::Adj;
+            }
+            // Overt complement/adjunct: licensed progressive → VERB.
+            Some(n)
+                if matches!(
+                    n,
+                    Upos::Adj | Upos::Adv | Upos::Noun | Upos::Propn | Upos::Pron | Upos::Det
+                ) =>
+            {
+                pos[i] = Upos::Verb;
+            }
+            // Anything else (going-to futures, auxiliaries, …): leave NOUN.
+            _ => {}
         }
     }
 }
@@ -1168,13 +1247,15 @@ fn refine_pos_conjoined_predicate_agreement(texts: &[String], pos: &mut [Upos], 
     }
 }
 
-/// Contracted-be disambiguation (`It's raining`, `You're late` vs. `Bell's
-/// theorem`). Runs after the lexeme-only tags so it can read neighbor POS.
-/// Two guarded upgrades, in one ascending pass so the participle rule sees
-/// the freshly classified `'s`:
+/// Contracted-be disambiguation (`It's raining`, `You're late`, `I'm
+/// feeling` vs. `Bell's theorem`). Runs after the lexeme-only tags so it can
+/// read neighbor POS. Two guarded upgrades, in one ascending pass so the
+/// participle rule sees the freshly classified clitic:
 ///
-/// - `'s` → AUX only when its host is a pronoun (`It`/`You`/…). After a noun
-///   it is the possessive case marker (UD: PART/case) and is left untouched.
+/// - a be-clitic (`'s`/`'re`/`'m`) → AUX only when its host is a pronoun
+///   (`It`/`You`/`I`/…). After a noun it is the possessive case marker (UD:
+///   PART/case) and is left untouched. `'re` already rides the closed-map
+///   AUX bit, so in practice this promotes `'s` and `'m`.
 /// - an `-ing` word → VERB only when its host is an aux-classified be-clitic
 ///   (`'s`/`'re`/`'m`) — the progressive participle. Full be-forms (`were
 ///   surprising`) are excluded: participial adjectives after full be belong
@@ -1184,7 +1265,7 @@ fn refine_pos_contracted_be(texts: &[String], pos: &mut [Upos], flags: &[LexemeF
         if pos[i] != Upos::X {
             continue;
         }
-        if flags[i].is_be_clitic_s() && i >= 1 && pos[i - 1] == Upos::Pron {
+        if flags[i].is_be_clitic() && i >= 1 && pos[i - 1] == Upos::Pron {
             pos[i] = Upos::Aux;
         }
     }
@@ -1617,6 +1698,32 @@ impl ArcEagerState {
                         })
                     {
                         out.push(Self::act(ArcEagerMove::Left, labels.dep));
+                    }
+                    // A clause-final `-ing` participle after be (`were
+                    // surprising`, `is raining`) is information-theoretically
+                    // ambiguous: the same shape reads as a participial
+                    // adjective or a bare progressive — and only lexicon
+                    // knowledge (which verbhood needs) splits them. Offer a
+                    // `dep` rival at cop parity (95, scored by the weight
+                    // arm's ungated (Aux, Adj) branch) so `best_with_margin`
+                    // records a near-tie (→ `RefineReason::Confidence(Ties)`
+                    // → `AttachmentNearTie`) instead of a confident cop. Same
+                    // Track B dynamics as the DET-tie above: pushed after,
+                    // loses ties by stable order — heads/labels unchanged,
+                    // only the margin drops. Gated on a be-form stack top
+                    // and the `-ing` suffix, so direct complements (`Your
+                    // fee is low`), inverted frames (`Is lunch ready`), and
+                    // non-participial predicates never match — clean
+                    // copulars stay tie-free.
+                    if is_be_form(flags[s]) {
+                        let word = texts[b].as_str();
+                        if word.len() > 4
+                            && word
+                                .get(word.len() - 3..)
+                                .is_some_and(|sfx| sfx.eq_ignore_ascii_case("ing"))
+                        {
+                            out.push(Self::act(ArcEagerMove::Left, labels.dep));
+                        }
                     }
                 }
                 // The copula depends on a nominal predicate (She is a
@@ -3108,6 +3215,15 @@ impl ArcEagerAnnotator {
         // Copular-predicate pass: be + NOUN → ADJ. Disjoint (AUX prev with
         // NOUN target matches none of the verb triggers above).
         refine_pos_be_predicate(&texts, &mut pos, &flags);
+        // Progressive-participle pass: post-be -ing NOUN → VERB with an
+        // overt complement ahead, ADJ when clause-final (genuinely
+        // ambiguous — the oracle tie below flags it). Sequenced right
+        // after be-predicate (whose -ing skip leaves exactly these
+        // targets); ADJ outputs feed the cop dynamics, VERB outputs the
+        // standard verbal ones, and the inversion-verb pass below never
+        // matches (targets are never NOUN by then, and be-hosts never
+        // match its do-modal key).
+        refine_pos_progressive_ing(&texts, &mut pos, &flags);
         // Inversion-verb pass: do-modal host + DET + nominal + NOUN → VERB
         // (`Did the report arrive`: arrive is the finite verb of a
         // question-inverted clause). Sequenced LAST so copular predicates
