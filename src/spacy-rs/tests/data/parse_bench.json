@@ -1,134 +1,1389 @@
-{"items": [
-  {"id": "svo-01", "category": "svo", "text": "The cat sat on the mat."},
-  {"id": "svo-02", "category": "svo", "text": "The dog barks loudly."},
-  {"id": "svo-03", "category": "svo", "text": "She reads books daily."},
-  {"id": "svo-04", "category": "svo", "text": "The chef cooked dinner."},
-  {"id": "svo-05", "category": "svo", "text": "Birds sing softly."},
-  {"id": "svo-06", "category": "svo", "text": "John opened the door."},
-  {"id": "imperative-01", "category": "imperative", "text": "Show me the report."},
-  {"id": "imperative-02", "category": "imperative", "text": "Open the door."},
-  {"id": "imperative-03", "category": "imperative", "text": "Let the dead go bury their dead."},
-  {"id": "imperative-04", "category": "imperative", "text": "Close the window now."},
-  {"id": "imperative-05", "category": "imperative", "text": "Send the invoice today."},
-  {"id": "imperative-06", "category": "imperative", "text": "Help them win."},
-  {"id": "copular-01", "category": "copular", "text": "Your fee is low."},
-  {"id": "copular-02", "category": "copular", "text": "The sky is blue."},
-  {"id": "copular-03", "category": "copular", "text": "She is a doctor."},
-  {"id": "copular-04", "category": "copular", "text": "The soup tastes salty."},
-  {"id": "copular-05", "category": "copular", "text": "He became president."},
-  {"id": "copular-06", "category": "copular", "text": "The results were surprising."},
-  {"id": "subordinate-01", "category": "subordinate", "text": "As you know, your fee is low."},
-  {"id": "subordinate-02", "category": "subordinate", "text": "I left because it rained."},
-  {"id": "subordinate-03", "category": "subordinate", "text": "She sings when she works."},
-  {"id": "subordinate-04", "category": "subordinate", "text": "If it rains, stay home."},
-  {"id": "subordinate-05", "category": "subordinate", "text": "The meeting ended after he spoke."},
-  {"id": "subordinate-06", "category": "subordinate", "text": "Although tired, she kept pace."},
-  {"id": "parenthetical-01", "category": "parenthetical", "text": "My brother, a doctor, lives here."},
-  {"id": "parenthetical-02", "category": "parenthetical", "text": "The report, frankly, was late."},
-  {"id": "parenthetical-03", "category": "parenthetical", "text": "Paris, as always, charmed us."},
-  {"id": "parenthetical-04", "category": "parenthetical", "text": "Her car, red and fast, won."},
-  {"id": "parenthetical-05", "category": "parenthetical", "text": "The CEO, smiling, took questions."},
-  {"id": "parenthetical-06", "category": "parenthetical", "text": "Truthfully, the plan failed."},
-  {"id": "relative-01", "category": "relative", "text": "The man who called left."},
-  {"id": "relative-02", "category": "relative", "text": "The book that I bought vanished."},
-  {"id": "relative-03", "category": "relative", "text": "People who wait succeed."},
-  {"id": "relative-04", "category": "relative", "text": "The house where I grew stands empty."},
-  {"id": "relative-05", "category": "relative", "text": "The dog that barked ran off."},
-  {"id": "relative-06", "category": "relative", "text": "Students who study pass."},
-  {"id": "coordination-01", "category": "coordination", "text": "Cats and dogs play."},
-  {"id": "coordination-02", "category": "coordination", "text": "She ran but fell."},
-  {"id": "coordination-03", "category": "coordination", "text": "Buy milk and eggs."},
-  {"id": "coordination-04", "category": "coordination", "text": "He laughed and cried."},
-  {"id": "coordination-05", "category": "coordination", "text": "Run fast or lose."},
-  {"id": "coordination-06", "category": "coordination", "text": "Tea or coffee helps mornings."},
-  {"id": "contraction-01", "category": "contraction", "text": "Don't help them."},
-  {"id": "contraction-02", "category": "contraction", "text": "I can't go today."},
-  {"id": "contraction-03", "category": "contraction", "text": "She won't answer calls."},
-  {"id": "contraction-04", "category": "contraction", "text": "We didn't see it."},
-  {"id": "contraction-05", "category": "contraction", "text": "It's raining hard."},
-  {"id": "contraction-06", "category": "contraction", "text": "You're late again."},
-  {"id": "multiclause-01", "category": "multiclause", "text": "Let the dead go bury their dead; don't help them."},
-  {"id": "multiclause-02", "category": "multiclause", "text": "She came; she saw; she left."},
-  {"id": "multiclause-03", "category": "multiclause", "text": "The storm passed but floods stayed."},
-  {"id": "multiclause-04", "category": "multiclause", "text": "Work hard, play fair."},
-  {"id": "multiclause-05", "category": "multiclause", "text": "He cooks, she cleans."},
-  {"id": "multiclause-06", "category": "multiclause", "text": "Prices rose yet wages stalled."},
-  {"id": "question-01", "category": "question", "text": "What is 2+2?"},
-  {"id": "question-02", "category": "question", "text": "Where is the station?"},
-  {"id": "question-03", "category": "question", "text": "Who called earlier?"},
-  {"id": "question-04", "category": "question", "text": "Can you help me?"},
-  {"id": "question-05", "category": "question", "text": "Why is the sky blue?"},
-  {"id": "question-06", "category": "question", "text": "Did the report arrive?"},
-  {"id": "command-01", "category": "command", "text": "Summarize this article."},
-  {"id": "command-02", "category": "command", "text": "Translate hello to French."},
-  {"id": "command-03", "category": "command", "text": "Find the cheapest flight."},
-  {"id": "command-04", "category": "command", "text": "Remind me at noon."},
-  {"id": "command-05", "category": "command", "text": "Search the web for pensions."},
-  {"id": "command-06", "category": "command", "text": "Explain Bell's theorem."},
-  {"id": "svo-07", "category": "svo", "text": "The kids ate pizza."},
-  {"id": "svo-08", "category": "svo", "text": "My sister lost her keys."},
-  {"id": "svo-09", "category": "svo", "text": "The bus arrived late."},
-  {"id": "svo-10", "category": "svo", "text": "Our teacher assigned homework."},
-  {"id": "svo-11", "category": "svo", "text": "The puppy chewed my shoe."},
-  {"id": "svo-12", "category": "svo", "text": "Anna finished her lunch."},
-  {"id": "imperative-07", "category": "imperative", "text": "Close your books."},
-  {"id": "imperative-08", "category": "imperative", "text": "Feed the dog."},
-  {"id": "imperative-09", "category": "imperative", "text": "Call me later."},
-  {"id": "imperative-10", "category": "imperative", "text": "Clean your room."},
-  {"id": "imperative-11", "category": "imperative", "text": "Pass the ball."},
-  {"id": "imperative-12", "category": "imperative", "text": "Finish your dinner."},
-  {"id": "copular-07", "category": "copular", "text": "The test was easy."},
-  {"id": "copular-08", "category": "copular", "text": "My room is messy."},
-  {"id": "copular-09", "category": "copular", "text": "The water is cold."},
-  {"id": "copular-10", "category": "copular", "text": "His joke was funny."},
-  {"id": "copular-11", "category": "copular", "text": "The movie sounds boring."},
-  {"id": "copular-12", "category": "copular", "text": "Dinner smells great."},
-  {"id": "subordinate-07", "category": "subordinate", "text": "We stayed because it snowed."},
-  {"id": "subordinate-08", "category": "subordinate", "text": "He snores when he sleeps."},
-  {"id": "subordinate-09", "category": "subordinate", "text": "If it snows, schools close."},
-  {"id": "subordinate-10", "category": "subordinate", "text": "The game ended after she scored."},
-  {"id": "subordinate-11", "category": "subordinate", "text": "Although hungry, he shared lunch."},
-  {"id": "subordinate-12", "category": "subordinate", "text": "As everybody knows, lunch ends early."},
-  {"id": "parenthetical-07", "category": "parenthetical", "text": "My phone, an old brick, still works."},
-  {"id": "parenthetical-08", "category": "parenthetical", "text": "The test, honestly, scared us."},
-  {"id": "parenthetical-09", "category": "parenthetical", "text": "Soccer, as always, tires us."},
-  {"id": "parenthetical-10", "category": "parenthetical", "text": "His bike, blue and rusty, squeaks."},
-  {"id": "parenthetical-11", "category": "parenthetical", "text": "The baby, giggling, grabbed toys."},
-  {"id": "parenthetical-12", "category": "parenthetical", "text": "Sadly, the trip ended early."},
-  {"id": "relative-07", "category": "relative", "text": "The girl who sang smiled."},
-  {"id": "relative-08", "category": "relative", "text": "The song that she sang ended."},
-  {"id": "relative-09", "category": "relative", "text": "Players who practice improve fast."},
-  {"id": "relative-10", "category": "relative", "text": "The store where we met closed."},
-  {"id": "relative-11", "category": "relative", "text": "The baby that cried slept."},
-  {"id": "relative-12", "category": "relative", "text": "Teachers who care work hard."},
-  {"id": "coordination-07", "category": "coordination", "text": "Dogs and cats nap."},
-  {"id": "coordination-08", "category": "coordination", "text": "She studied but failed."},
-  {"id": "coordination-09", "category": "coordination", "text": "Buy pencils and paper."},
-  {"id": "coordination-10", "category": "coordination", "text": "He tripped and laughed."},
-  {"id": "coordination-11", "category": "coordination", "text": "Run daily or quit."},
-  {"id": "coordination-12", "category": "coordination", "text": "Beans or rice fill plates."},
-  {"id": "contraction-07", "category": "contraction", "text": "He doesn't like peas."},
-  {"id": "contraction-08", "category": "contraction", "text": "We couldn't hear the bell."},
-  {"id": "contraction-09", "category": "contraction", "text": "She isn't ready yet."},
-  {"id": "contraction-10", "category": "contraction", "text": "They aren't coming today."},
-  {"id": "contraction-11", "category": "contraction", "text": "You shouldn't skip breakfast."},
-  {"id": "contraction-12", "category": "contraction", "text": "It doesn't matter much."},
-  {"id": "multiclause-07", "category": "multiclause", "text": "She texted; he called."},
-  {"id": "multiclause-08", "category": "multiclause", "text": "Rain fell but games continued."},
-  {"id": "multiclause-09", "category": "multiclause", "text": "Study hard, rest well."},
-  {"id": "multiclause-10", "category": "multiclause", "text": "I cook, you clean."},
-  {"id": "multiclause-11", "category": "multiclause", "text": "Grades dropped yet spirits rose."},
-  {"id": "multiclause-12", "category": "multiclause", "text": "They sang, we clapped."},
-  {"id": "question-07", "category": "question", "text": "What did you eat?"},
-  {"id": "question-08", "category": "question", "text": "Where is my bag?"},
-  {"id": "question-09", "category": "question", "text": "Who ate my snack?"},
-  {"id": "question-10", "category": "question", "text": "Can we leave early?"},
-  {"id": "question-11", "category": "question", "text": "Is lunch ready?"},
-  {"id": "question-12", "category": "question", "text": "Do you play soccer?"},
-  {"id": "command-07", "category": "command", "text": "Define photosynthesis."},
-  {"id": "command-08", "category": "command", "text": "Solve this equation."},
-  {"id": "command-09", "category": "command", "text": "Draw a volcano."},
-  {"id": "command-10", "category": "command", "text": "Name the planets."},
-  {"id": "command-11", "category": "command", "text": "List the capitals."},
-  {"id": "command-12", "category": "command", "text": "Describe your weekend."}
-]}
+{
+  "items": [
+    {
+      "id": "subverbobj-01",
+      "category": "subverbobj",
+      "text": "The cat sat on the mat."
+    },
+    {
+      "id": "subverbobj-02",
+      "category": "subverbobj",
+      "text": "The dog barks loudly."
+    },
+    {
+      "id": "subverbobj-03",
+      "category": "subverbobj",
+      "text": "She reads books daily."
+    },
+    {
+      "id": "subverbobj-04",
+      "category": "subverbobj",
+      "text": "The chef cooked dinner."
+    },
+    {
+      "id": "subverbobj-05",
+      "category": "subverbobj",
+      "text": "Birds sing softly."
+    },
+    {
+      "id": "subverbobj-06",
+      "category": "subverbobj",
+      "text": "John opened the door."
+    },
+    {
+      "id": "imperative-01",
+      "category": "imperative",
+      "text": "Show me the report."
+    },
+    {
+      "id": "imperative-02",
+      "category": "imperative",
+      "text": "Open the door."
+    },
+    {
+      "id": "imperative-03",
+      "category": "imperative",
+      "text": "Let the dead go bury their dead."
+    },
+    {
+      "id": "imperative-04",
+      "category": "imperative",
+      "text": "Close the window now."
+    },
+    {
+      "id": "imperative-05",
+      "category": "imperative",
+      "text": "Send the invoice today."
+    },
+    {
+      "id": "imperative-06",
+      "category": "imperative",
+      "text": "Help them win."
+    },
+    {
+      "id": "copular-01",
+      "category": "copular",
+      "text": "Your fee is low."
+    },
+    {
+      "id": "copular-02",
+      "category": "copular",
+      "text": "The sky is blue."
+    },
+    {
+      "id": "copular-03",
+      "category": "copular",
+      "text": "She is a doctor."
+    },
+    {
+      "id": "copular-04",
+      "category": "copular",
+      "text": "The soup tastes salty."
+    },
+    {
+      "id": "copular-05",
+      "category": "copular",
+      "text": "He became president."
+    },
+    {
+      "id": "copular-06",
+      "category": "copular",
+      "text": "The results were surprising."
+    },
+    {
+      "id": "subordinate-01",
+      "category": "subordinate",
+      "text": "As you know, your fee is low."
+    },
+    {
+      "id": "subordinate-02",
+      "category": "subordinate",
+      "text": "I left because it rained."
+    },
+    {
+      "id": "subordinate-03",
+      "category": "subordinate",
+      "text": "She sings when she works."
+    },
+    {
+      "id": "subordinate-04",
+      "category": "subordinate",
+      "text": "If it rains, stay home."
+    },
+    {
+      "id": "subordinate-05",
+      "category": "subordinate",
+      "text": "The meeting ended after he spoke."
+    },
+    {
+      "id": "subordinate-06",
+      "category": "subordinate",
+      "text": "Although tired, she kept pace."
+    },
+    {
+      "id": "parenthetical-01",
+      "category": "parenthetical",
+      "text": "My brother, a doctor, lives here."
+    },
+    {
+      "id": "parenthetical-02",
+      "category": "parenthetical",
+      "text": "The report, frankly, was late."
+    },
+    {
+      "id": "parenthetical-03",
+      "category": "parenthetical",
+      "text": "Paris, as always, charmed us."
+    },
+    {
+      "id": "parenthetical-04",
+      "category": "parenthetical",
+      "text": "Her car, red and fast, won."
+    },
+    {
+      "id": "parenthetical-05",
+      "category": "parenthetical",
+      "text": "The CEO, smiling, took questions."
+    },
+    {
+      "id": "parenthetical-06",
+      "category": "parenthetical",
+      "text": "Truthfully, the plan failed."
+    },
+    {
+      "id": "relative-01",
+      "category": "relative",
+      "text": "The man who called left."
+    },
+    {
+      "id": "relative-02",
+      "category": "relative",
+      "text": "The book that I bought vanished."
+    },
+    {
+      "id": "relative-03",
+      "category": "relative",
+      "text": "People who wait succeed."
+    },
+    {
+      "id": "relative-04",
+      "category": "relative",
+      "text": "The house where I grew stands empty."
+    },
+    {
+      "id": "relative-05",
+      "category": "relative",
+      "text": "The dog that barked ran off."
+    },
+    {
+      "id": "relative-06",
+      "category": "relative",
+      "text": "Students who study pass."
+    },
+    {
+      "id": "coordination-01",
+      "category": "coordination",
+      "text": "Cats and dogs play."
+    },
+    {
+      "id": "coordination-02",
+      "category": "coordination",
+      "text": "She ran but fell."
+    },
+    {
+      "id": "coordination-03",
+      "category": "coordination",
+      "text": "Buy milk and eggs."
+    },
+    {
+      "id": "coordination-04",
+      "category": "coordination",
+      "text": "He laughed and cried."
+    },
+    {
+      "id": "coordination-05",
+      "category": "coordination",
+      "text": "Run fast or lose."
+    },
+    {
+      "id": "coordination-06",
+      "category": "coordination",
+      "text": "Tea or coffee helps mornings."
+    },
+    {
+      "id": "contraction-01",
+      "category": "contraction",
+      "text": "Don't help them."
+    },
+    {
+      "id": "contraction-02",
+      "category": "contraction",
+      "text": "I can't go today."
+    },
+    {
+      "id": "contraction-03",
+      "category": "contraction",
+      "text": "She won't answer calls."
+    },
+    {
+      "id": "contraction-04",
+      "category": "contraction",
+      "text": "We didn't see it."
+    },
+    {
+      "id": "contraction-05",
+      "category": "contraction",
+      "text": "It's raining hard."
+    },
+    {
+      "id": "contraction-06",
+      "category": "contraction",
+      "text": "You're late again."
+    },
+    {
+      "id": "multiclause-01",
+      "category": "multiclause",
+      "text": "Let the dead go bury their dead; don't help them."
+    },
+    {
+      "id": "multiclause-02",
+      "category": "multiclause",
+      "text": "She came; she saw; she left."
+    },
+    {
+      "id": "multiclause-03",
+      "category": "multiclause",
+      "text": "The storm passed but floods stayed."
+    },
+    {
+      "id": "multiclause-04",
+      "category": "multiclause",
+      "text": "Work hard, play fair."
+    },
+    {
+      "id": "multiclause-05",
+      "category": "multiclause",
+      "text": "He cooks, she cleans."
+    },
+    {
+      "id": "multiclause-06",
+      "category": "multiclause",
+      "text": "Prices rose yet wages stalled."
+    },
+    {
+      "id": "question-01",
+      "category": "question",
+      "text": "What is 2+2?"
+    },
+    {
+      "id": "question-02",
+      "category": "question",
+      "text": "Where is the station?"
+    },
+    {
+      "id": "question-03",
+      "category": "question",
+      "text": "Who called earlier?"
+    },
+    {
+      "id": "question-04",
+      "category": "question",
+      "text": "Can you help me?"
+    },
+    {
+      "id": "question-05",
+      "category": "question",
+      "text": "Why is the sky blue?"
+    },
+    {
+      "id": "question-06",
+      "category": "question",
+      "text": "Did the report arrive?"
+    },
+    {
+      "id": "command-01",
+      "category": "command",
+      "text": "Summarize this article."
+    },
+    {
+      "id": "command-02",
+      "category": "command",
+      "text": "Translate hello to French."
+    },
+    {
+      "id": "command-03",
+      "category": "command",
+      "text": "Find the cheapest flight."
+    },
+    {
+      "id": "command-04",
+      "category": "command",
+      "text": "Remind me at noon."
+    },
+    {
+      "id": "command-05",
+      "category": "command",
+      "text": "Search the web for pensions."
+    },
+    {
+      "id": "command-06",
+      "category": "command",
+      "text": "Explain Bell's theorem."
+    },
+    {
+      "id": "subverbobj-07",
+      "category": "subverbobj",
+      "text": "The kids ate pizza."
+    },
+    {
+      "id": "subverbobj-08",
+      "category": "subverbobj",
+      "text": "My sister lost her keys."
+    },
+    {
+      "id": "subverbobj-09",
+      "category": "subverbobj",
+      "text": "The bus arrived late."
+    },
+    {
+      "id": "subverbobj-10",
+      "category": "subverbobj",
+      "text": "Our teacher assigned homework."
+    },
+    {
+      "id": "subverbobj-11",
+      "category": "subverbobj",
+      "text": "The puppy chewed my shoe."
+    },
+    {
+      "id": "subverbobj-12",
+      "category": "subverbobj",
+      "text": "Anna finished her lunch."
+    },
+    {
+      "id": "imperative-07",
+      "category": "imperative",
+      "text": "Close your books."
+    },
+    {
+      "id": "imperative-08",
+      "category": "imperative",
+      "text": "Feed the dog."
+    },
+    {
+      "id": "imperative-09",
+      "category": "imperative",
+      "text": "Call me later."
+    },
+    {
+      "id": "imperative-10",
+      "category": "imperative",
+      "text": "Clean your room."
+    },
+    {
+      "id": "imperative-11",
+      "category": "imperative",
+      "text": "Pass the ball."
+    },
+    {
+      "id": "imperative-12",
+      "category": "imperative",
+      "text": "Finish your dinner."
+    },
+    {
+      "id": "copular-07",
+      "category": "copular",
+      "text": "The test was easy."
+    },
+    {
+      "id": "copular-08",
+      "category": "copular",
+      "text": "My room is messy."
+    },
+    {
+      "id": "copular-09",
+      "category": "copular",
+      "text": "The water is cold."
+    },
+    {
+      "id": "copular-10",
+      "category": "copular",
+      "text": "His joke was funny."
+    },
+    {
+      "id": "copular-11",
+      "category": "copular",
+      "text": "The movie sounds boring."
+    },
+    {
+      "id": "copular-12",
+      "category": "copular",
+      "text": "Dinner smells great."
+    },
+    {
+      "id": "subordinate-07",
+      "category": "subordinate",
+      "text": "We stayed because it snowed."
+    },
+    {
+      "id": "subordinate-08",
+      "category": "subordinate",
+      "text": "He snores when he sleeps."
+    },
+    {
+      "id": "subordinate-09",
+      "category": "subordinate",
+      "text": "If it snows, schools close."
+    },
+    {
+      "id": "subordinate-10",
+      "category": "subordinate",
+      "text": "The game ended after she scored."
+    },
+    {
+      "id": "subordinate-11",
+      "category": "subordinate",
+      "text": "Although hungry, he shared lunch."
+    },
+    {
+      "id": "subordinate-12",
+      "category": "subordinate",
+      "text": "As everybody knows, lunch ends early."
+    },
+    {
+      "id": "parenthetical-07",
+      "category": "parenthetical",
+      "text": "My phone, an old brick, still works."
+    },
+    {
+      "id": "parenthetical-08",
+      "category": "parenthetical",
+      "text": "The test, honestly, scared us."
+    },
+    {
+      "id": "parenthetical-09",
+      "category": "parenthetical",
+      "text": "Soccer, as always, tires us."
+    },
+    {
+      "id": "parenthetical-10",
+      "category": "parenthetical",
+      "text": "His bike, blue and rusty, squeaks."
+    },
+    {
+      "id": "parenthetical-11",
+      "category": "parenthetical",
+      "text": "The baby, giggling, grabbed toys."
+    },
+    {
+      "id": "parenthetical-12",
+      "category": "parenthetical",
+      "text": "Sadly, the trip ended early."
+    },
+    {
+      "id": "relative-07",
+      "category": "relative",
+      "text": "The girl who sang smiled."
+    },
+    {
+      "id": "relative-08",
+      "category": "relative",
+      "text": "The song that she sang ended."
+    },
+    {
+      "id": "relative-09",
+      "category": "relative",
+      "text": "Players who practice improve fast."
+    },
+    {
+      "id": "relative-10",
+      "category": "relative",
+      "text": "The store where we met closed."
+    },
+    {
+      "id": "relative-11",
+      "category": "relative",
+      "text": "The baby that cried slept."
+    },
+    {
+      "id": "relative-12",
+      "category": "relative",
+      "text": "Teachers who care work hard."
+    },
+    {
+      "id": "coordination-07",
+      "category": "coordination",
+      "text": "Dogs and cats nap."
+    },
+    {
+      "id": "coordination-08",
+      "category": "coordination",
+      "text": "She studied but failed."
+    },
+    {
+      "id": "coordination-09",
+      "category": "coordination",
+      "text": "Buy pencils and paper."
+    },
+    {
+      "id": "coordination-10",
+      "category": "coordination",
+      "text": "He tripped and laughed."
+    },
+    {
+      "id": "coordination-11",
+      "category": "coordination",
+      "text": "Run daily or quit."
+    },
+    {
+      "id": "coordination-12",
+      "category": "coordination",
+      "text": "Beans or rice fill plates."
+    },
+    {
+      "id": "contraction-07",
+      "category": "contraction",
+      "text": "He doesn't like peas."
+    },
+    {
+      "id": "contraction-08",
+      "category": "contraction",
+      "text": "We couldn't hear the bell."
+    },
+    {
+      "id": "contraction-09",
+      "category": "contraction",
+      "text": "She isn't ready yet."
+    },
+    {
+      "id": "contraction-10",
+      "category": "contraction",
+      "text": "They aren't coming today."
+    },
+    {
+      "id": "contraction-11",
+      "category": "contraction",
+      "text": "You shouldn't skip breakfast."
+    },
+    {
+      "id": "contraction-12",
+      "category": "contraction",
+      "text": "It doesn't matter much."
+    },
+    {
+      "id": "multiclause-07",
+      "category": "multiclause",
+      "text": "She texted; he called."
+    },
+    {
+      "id": "multiclause-08",
+      "category": "multiclause",
+      "text": "Rain fell but games continued."
+    },
+    {
+      "id": "multiclause-09",
+      "category": "multiclause",
+      "text": "Study hard, rest well."
+    },
+    {
+      "id": "multiclause-10",
+      "category": "multiclause",
+      "text": "I cook, you clean."
+    },
+    {
+      "id": "multiclause-11",
+      "category": "multiclause",
+      "text": "Grades dropped yet spirits rose."
+    },
+    {
+      "id": "multiclause-12",
+      "category": "multiclause",
+      "text": "They sang, we clapped."
+    },
+    {
+      "id": "question-07",
+      "category": "question",
+      "text": "What did you eat?"
+    },
+    {
+      "id": "question-08",
+      "category": "question",
+      "text": "Where is my bag?"
+    },
+    {
+      "id": "question-09",
+      "category": "question",
+      "text": "Who ate my snack?"
+    },
+    {
+      "id": "question-10",
+      "category": "question",
+      "text": "Can we leave early?"
+    },
+    {
+      "id": "question-11",
+      "category": "question",
+      "text": "Is lunch ready?"
+    },
+    {
+      "id": "question-12",
+      "category": "question",
+      "text": "Do you play soccer?"
+    },
+    {
+      "id": "command-07",
+      "category": "command",
+      "text": "Define photosynthesis."
+    },
+    {
+      "id": "command-08",
+      "category": "command",
+      "text": "Solve this equation."
+    },
+    {
+      "id": "command-09",
+      "category": "command",
+      "text": "Draw a volcano."
+    },
+    {
+      "id": "command-10",
+      "category": "command",
+      "text": "Name the planets."
+    },
+    {
+      "id": "command-11",
+      "category": "command",
+      "text": "List the capitals."
+    },
+    {
+      "id": "command-12",
+      "category": "command",
+      "text": "Describe your weekend."
+    },
+    {
+      "id": "rare-verb-01",
+      "category": "rare_imperative_verb",
+      "text": "Enumerate the steps."
+    },
+    {
+      "id": "rare-verb-02",
+      "category": "rare_imperative_verb",
+      "text": "Itemize the expenses."
+    },
+    {
+      "id": "rare-verb-03",
+      "category": "rare_imperative_verb",
+      "text": "Tabulate the results."
+    },
+    {
+      "id": "rare-verb-04",
+      "category": "rare_imperative_verb",
+      "text": "Clarify your answer."
+    },
+    {
+      "id": "rare-verb-05",
+      "category": "rare_imperative_verb",
+      "text": "Elaborate on this."
+    },
+    {
+      "id": "rare-verb-06",
+      "category": "rare_imperative_verb",
+      "text": "Paraphrase the passage."
+    },
+    {
+      "id": "rare-verb-07",
+      "category": "rare_imperative_verb",
+      "text": "Synthesize the findings."
+    },
+    {
+      "id": "rare-verb-08",
+      "category": "rare_imperative_verb",
+      "text": "Extrapolate the trend."
+    },
+    {
+      "id": "rare-verb-09",
+      "category": "rare_imperative_verb",
+      "text": "Delineate the boundary."
+    },
+    {
+      "id": "rare-verb-10",
+      "category": "rare_imperative_verb",
+      "text": "Substantiate your claim."
+    },
+    {
+      "id": "rare-verb-11",
+      "category": "rare_imperative_verb",
+      "text": "Rectify the error."
+    },
+    {
+      "id": "rare-verb-12",
+      "category": "rare_imperative_verb",
+      "text": "Reconcile the accounts."
+    },
+    {
+      "id": "rare-verb-13",
+      "category": "rare_imperative_verb",
+      "text": "Annotate the diagram."
+    },
+    {
+      "id": "rare-verb-14",
+      "category": "rare_imperative_verb",
+      "text": "Corroborate the story."
+    },
+    {
+      "id": "rare-verb-15",
+      "category": "rare_imperative_verb",
+      "text": "Formalize the proposal."
+    },
+    {
+      "id": "rare-verb-16",
+      "category": "rare_imperative_verb",
+      "text": "Interrogate the witness."
+    },
+    {
+      "id": "rare-verb-17",
+      "category": "rare_imperative_verb",
+      "text": "Quantify the risk."
+    },
+    {
+      "id": "rare-verb-18",
+      "category": "rare_imperative_verb",
+      "text": "Sanitize the input."
+    },
+    {
+      "id": "rare-verb-19",
+      "category": "rare_imperative_verb",
+      "text": "Validate the ticket."
+    },
+    {
+      "id": "rare-verb-20",
+      "category": "rare_imperative_verb",
+      "text": "Consolidate the files."
+    },
+    {
+      "id": "homograph-01a",
+      "category": "homograph_imperative",
+      "text": "Watch the show."
+    },
+    {
+      "id": "homograph-01b",
+      "category": "homograph_declarative",
+      "text": "The watch is broken."
+    },
+    {
+      "id": "homograph-02a",
+      "category": "homograph_imperative",
+      "text": "Book the flight."
+    },
+    {
+      "id": "homograph-02b",
+      "category": "homograph_declarative",
+      "text": "The book is on the table."
+    },
+    {
+      "id": "homograph-03a",
+      "category": "homograph_imperative",
+      "text": "Table the motion."
+    },
+    {
+      "id": "homograph-03b",
+      "category": "homograph_declarative",
+      "text": "The table is round."
+    },
+    {
+      "id": "homograph-04a",
+      "category": "homograph_imperative",
+      "text": "Object to the ruling."
+    },
+    {
+      "id": "homograph-04b",
+      "category": "homograph_declarative",
+      "text": "The object fell."
+    },
+    {
+      "id": "homograph-05a",
+      "category": "homograph_imperative",
+      "text": "Contest the decision."
+    },
+    {
+      "id": "homograph-05b",
+      "category": "homograph_declarative",
+      "text": "The contest starts today."
+    },
+    {
+      "id": "homograph-06a",
+      "category": "homograph_imperative",
+      "text": "Address the crowd."
+    },
+    {
+      "id": "homograph-06b",
+      "category": "homograph_declarative",
+      "text": "The address is wrong."
+    },
+    {
+      "id": "homograph-07a",
+      "category": "homograph_imperative",
+      "text": "Permit the visit."
+    },
+    {
+      "id": "homograph-07b",
+      "category": "homograph_declarative",
+      "text": "The permit expired."
+    },
+    {
+      "id": "homograph-08a",
+      "category": "homograph_imperative",
+      "text": "Record the meeting."
+    },
+    {
+      "id": "homograph-08b",
+      "category": "homograph_declarative",
+      "text": "The record broke."
+    },
+    {
+      "id": "homograph-09a",
+      "category": "homograph_imperative",
+      "text": "Progress the project."
+    },
+    {
+      "id": "homograph-09b",
+      "category": "homograph_declarative",
+      "text": "The progress stalled."
+    },
+    {
+      "id": "homograph-10a",
+      "category": "homograph_imperative",
+      "text": "Transport the goods."
+    },
+    {
+      "id": "homograph-10b",
+      "category": "homograph_declarative",
+      "text": "The transport arrived."
+    },
+    {
+      "id": "homograph-11a",
+      "category": "homograph_imperative",
+      "text": "Insult the guest."
+    },
+    {
+      "id": "homograph-11b",
+      "category": "homograph_declarative",
+      "text": "The insult stung."
+    },
+    {
+      "id": "homograph-12a",
+      "category": "homograph_imperative",
+      "text": "Contract the illness."
+    },
+    {
+      "id": "homograph-12b",
+      "category": "homograph_declarative",
+      "text": "The contract expired."
+    },
+    {
+      "id": "garden-path-01",
+      "category": "garden_path",
+      "text": "The horse raced past the barn fell."
+    },
+    {
+      "id": "garden-path-02",
+      "category": "garden_path",
+      "text": "The old man the boat."
+    },
+    {
+      "id": "garden-path-03",
+      "category": "garden_path",
+      "text": "Time flies like an arrow."
+    },
+    {
+      "id": "garden-path-04",
+      "category": "garden_path",
+      "text": "The cotton clothing is made of grows in Texas."
+    },
+    {
+      "id": "garden-path-05",
+      "category": "garden_path",
+      "text": "The man who hunts ducks out on weekends."
+    },
+    {
+      "id": "garden-path-06",
+      "category": "garden_path",
+      "text": "Fat people eat accumulates."
+    },
+    {
+      "id": "garden-path-07",
+      "category": "garden_path",
+      "text": "The dog walked to the park was tired."
+    },
+    {
+      "id": "garden-path-08",
+      "category": "garden_path",
+      "text": "The prime minister denied the rumors were false."
+    },
+    {
+      "id": "elliptical-02",
+      "category": "elliptical",
+      "text": "Although happy, she smiled."
+    },
+    {
+      "id": "elliptical-03",
+      "category": "elliptical",
+      "text": "While young, he traveled widely."
+    },
+    {
+      "id": "elliptical-04",
+      "category": "elliptical",
+      "text": "Though nervous, she spoke clearly."
+    },
+    {
+      "id": "elliptical-05",
+      "category": "elliptical",
+      "text": "Once finished, submit the form."
+    },
+    {
+      "id": "elliptical-06",
+      "category": "elliptical",
+      "text": "If ready, proceed immediately."
+    },
+    {
+      "id": "elliptical-07",
+      "category": "elliptical",
+      "text": "Unless certain, do not sign."
+    },
+    {
+      "id": "elliptical-08",
+      "category": "elliptical",
+      "text": "When available, call me back."
+    },
+    {
+      "id": "elliptical-09",
+      "category": "elliptical",
+      "text": "While waiting, she read a book."
+    },
+    {
+      "id": "elliptical-10",
+      "category": "elliptical",
+      "text": "Though exhausted, he finished the race."
+    },
+    {
+      "id": "rare-lex-01",
+      "category": "rare_lexicon",
+      "text": "The auditor scrutinized the ledger."
+    },
+    {
+      "id": "rare-lex-02",
+      "category": "rare_lexicon",
+      "text": "The committee ratified the treaty."
+    },
+    {
+      "id": "rare-lex-03",
+      "category": "rare_lexicon",
+      "text": "The scholar refuted the theory."
+    },
+    {
+      "id": "rare-lex-04",
+      "category": "rare_lexicon",
+      "text": "The engineer calibrated the sensor."
+    },
+    {
+      "id": "rare-lex-05",
+      "category": "rare_lexicon",
+      "text": "The judge admonished the lawyer."
+    },
+    {
+      "id": "rare-lex-06",
+      "category": "rare_lexicon",
+      "text": "The chemist synthesized a compound."
+    },
+    {
+      "id": "rare-lex-07",
+      "category": "rare_lexicon",
+      "text": "The editor excised the paragraph."
+    },
+    {
+      "id": "rare-lex-08",
+      "category": "rare_lexicon",
+      "text": "The captain commandeered the vessel."
+    },
+    {
+      "id": "rare-lex-09",
+      "category": "rare_lexicon",
+      "text": "The negotiator placated both sides."
+    },
+    {
+      "id": "rare-lex-10",
+      "category": "rare_lexicon",
+      "text": "The regulator sanctioned the bank."
+    },
+    {
+      "id": "copular-edge-01",
+      "category": "copular_edge",
+      "text": "There is a problem."
+    },
+    {
+      "id": "copular-edge-02",
+      "category": "copular_edge",
+      "text": "Here is your receipt."
+    },
+    {
+      "id": "copular-edge-03",
+      "category": "copular_edge",
+      "text": "It is raining."
+    },
+    {
+      "id": "copular-edge-04",
+      "category": "copular_edge",
+      "text": "That seems unlikely."
+    },
+    {
+      "id": "copular-edge-05",
+      "category": "copular_edge",
+      "text": "This remains uncertain."
+    },
+    {
+      "id": "copular-edge-06",
+      "category": "copular_edge",
+      "text": "Something feels wrong."
+    },
+    {
+      "id": "copular-edge-07",
+      "category": "copular_edge",
+      "text": "Nothing seems right."
+    },
+    {
+      "id": "copular-edge-08",
+      "category": "copular_edge",
+      "text": "Everyone appears ready."
+    },
+    {
+      "id": "imperative-do-01",
+      "category": "imperative_edge",
+      "text": "Do not enter."
+    },
+    {
+      "id": "imperative-do-02",
+      "category": "imperative_edge",
+      "text": "Never mind that."
+    },
+    {
+      "id": "imperative-do-03",
+      "category": "imperative_edge",
+      "text": "Always check twice."
+    },
+    {
+      "id": "imperative-do-04",
+      "category": "imperative_edge",
+      "text": "Please confirm the date."
+    },
+    {
+      "id": "imperative-do-05",
+      "category": "imperative_edge",
+      "text": "Kindly review the draft."
+    },
+    {
+      "id": "imperative-do-06",
+      "category": "imperative_edge",
+      "text": "Just send it now."
+    },
+    {
+      "id": "imperative-do-07",
+      "category": "imperative_edge",
+      "text": "Go fetch the mail."
+    },
+    {
+      "id": "imperative-do-08",
+      "category": "imperative_edge",
+      "text": "Come sit with us."
+    },
+    {
+      "id": "command-target-01",
+      "category": "command_target",
+      "text": "Translate this to French."
+    },
+    {
+      "id": "command-target-02",
+      "category": "command_target",
+      "text": "Turn the script into a table."
+    },
+    {
+      "id": "command-target-03",
+      "category": "command_target",
+      "text": "Convert the file to PDF."
+    },
+    {
+      "id": "command-target-04",
+      "category": "command_target",
+      "text": "Rewrite this as a poem."
+    },
+    {
+      "id": "command-target-05",
+      "category": "command_target",
+      "text": "Extract the total from the invoice."
+    },
+    {
+      "id": "command-target-06",
+      "category": "command_target",
+      "text": "Turn this into a haiku."
+    },
+    {
+      "id": "command-target-07",
+      "category": "command_target",
+      "text": "Change the format to JSON."
+    },
+    {
+      "id": "command-target-08",
+      "category": "command_target",
+      "text": "Render the data as a chart."
+    },
+    {
+      "id": "dative-01",
+      "category": "dative",
+      "text": "Give me the report."
+    },
+    {
+      "id": "dative-02",
+      "category": "dative",
+      "text": "Tell me a joke."
+    },
+    {
+      "id": "dative-03",
+      "category": "dative",
+      "text": "Send her the invoice."
+    },
+    {
+      "id": "dative-04",
+      "category": "dative",
+      "text": "Show us the results."
+    },
+    {
+      "id": "dative-05",
+      "category": "dative",
+      "text": "Bring him the folder."
+    },
+    {
+      "id": "dative-06",
+      "category": "dative",
+      "text": "Get me a coffee."
+    },
+    {
+      "id": "dative-07",
+      "category": "dative",
+      "text": "Read me the summary."
+    },
+    {
+      "id": "dative-08",
+      "category": "dative",
+      "text": "Hand her the pen."
+    },
+    {
+      "id": "topic-bare-01",
+      "category": "topic_bare",
+      "text": "invoice 1001"
+    },
+    {
+      "id": "topic-bare-02",
+      "category": "topic_bare",
+      "text": "the greenhouse effect"
+    },
+    {
+      "id": "topic-bare-03",
+      "category": "topic_bare",
+      "text": "Rust borrow checker"
+    },
+    {
+      "id": "topic-bare-04",
+      "category": "topic_bare",
+      "text": "quarterly sales report"
+    },
+    {
+      "id": "topic-bare-05",
+      "category": "topic_bare",
+      "text": "blood pressure medication"
+    },
+    {
+      "id": "topic-bare-06",
+      "category": "topic_bare",
+      "text": "the French revolution"
+    },
+    {
+      "id": "topic-bare-07",
+      "category": "topic_bare",
+      "text": "server error logs"
+    },
+    {
+      "id": "topic-bare-08",
+      "category": "topic_bare",
+      "text": "flight 204 status"
+    },
+    {
+      "id": "negation-01",
+      "category": "negation",
+      "text": "Don't summarize this."
+    },
+    {
+      "id": "negation-02",
+      "category": "negation",
+      "text": "She did not call."
+    },
+    {
+      "id": "negation-03",
+      "category": "negation",
+      "text": "This is not correct."
+    },
+    {
+      "id": "negation-04",
+      "category": "negation",
+      "text": "Never send that email."
+    },
+    {
+      "id": "negation-05",
+      "category": "negation",
+      "text": "I cannot find the file."
+    },
+    {
+      "id": "negation-06",
+      "category": "negation",
+      "text": "They aren't ready yet."
+    },
+    {
+      "id": "wh-copula-01",
+      "category": "query_copula",
+      "text": "What is the water cycle?"
+    },
+    {
+      "id": "wh-copula-02",
+      "category": "query_copula",
+      "text": "Who is the president?"
+    },
+    {
+      "id": "wh-copula-03",
+      "category": "query_copula",
+      "text": "Where is the invoice?"
+    },
+    {
+      "id": "wh-aux-01",
+      "category": "query_aux",
+      "text": "What does the API return?"
+    },
+    {
+      "id": "wh-aux-02",
+      "category": "query_aux",
+      "text": "How does photosynthesis work?"
+    },
+    {
+      "id": "wh-aux-03",
+      "category": "query_aux",
+      "text": "When does the store close?"
+    },
+    {
+      "id": "wh-aux-04",
+      "category": "query_aux",
+      "text": "Where did she go?"
+    },
+    {
+      "id": "polar-01",
+      "category": "polar",
+      "text": "Do you believe in ghosts?"
+    },
+    {
+      "id": "polar-02",
+      "category": "polar",
+      "text": "Can you summarize this?"
+    },
+    {
+      "id": "polar-03",
+      "category": "polar",
+      "text": "Is the report ready?"
+    },
+    {
+      "id": "polar-04",
+      "category": "polar",
+      "text": "Are you coming today?"
+    },
+    {
+      "id": "polar-05",
+      "category": "polar",
+      "text": "Will this work?"
+    },
+    {
+      "id": "polar-06",
+      "category": "polar",
+      "text": "Have you seen this?"
+    },
+    {
+      "id": "statement-desire-01",
+      "category": "statement",
+      "text": "I want a poem."
+    },
+    {
+      "id": "statement-desire-02",
+      "category": "statement",
+      "text": "I need this fixed."
+    },
+    {
+      "id": "statement-desire-03",
+      "category": "statement",
+      "text": "I'm feeling sad today."
+    },
+    {
+      "id": "statement-desire-04",
+      "category": "statement",
+      "text": "This is a Rust project."
+    },
+    {
+      "id": "statement-desire-05",
+      "category": "statement",
+      "text": "We prefer the second option."
+    },
+    {
+      "id": "statement-desire-06",
+      "category": "statement",
+      "text": "She hopes to finish early."
+    },
+    {
+      "id": "capitalization-01",
+      "category": "case_edge",
+      "text": "define photosynthesis"
+    },
+    {
+      "id": "capitalization-02",
+      "category": "case_edge",
+      "text": "DEFINE PHOTOSYNTHESIS"
+    },
+    {
+      "id": "capitalization-03",
+      "category": "case_edge",
+      "text": "solve THIS equation"
+    },
+    {
+      "id": "capitalization-04",
+      "category": "case_edge",
+      "text": "please Help me"
+    },
+    {
+      "id": "punctuation-edge-01",
+      "category": "punctuation_edge",
+      "text": "Summarize this\u2014now."
+    },
+    {
+      "id": "punctuation-edge-02",
+      "category": "punctuation_edge",
+      "text": "Summarize this... please."
+    },
+    {
+      "id": "punctuation-edge-03",
+      "category": "punctuation_edge",
+      "text": "Summarize this!!"
+    },
+    {
+      "id": "punctuation-edge-04",
+      "category": "punctuation_edge",
+      "text": "Summarize this (quickly)."
+    },
+    {
+      "id": "punctuation-edge-05",
+      "category": "punctuation_edge",
+      "text": "Summarize this?"
+    }
+  ]
+}

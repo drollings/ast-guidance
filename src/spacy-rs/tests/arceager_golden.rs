@@ -977,7 +977,7 @@ fn matrix_first_relative_frame_is_stable() {
 
 #[test]
 fn final_manner_adverbial_is_adv() {
-    // Refs (UD svo-02): loudly → adv/advmod → barks. Closed-class
+    // Refs (UD subverbobj-02): loudly → adv/advmod → barks. Closed-class
     // time/manner adverbials in sentence-final position fall through to
     // NOUN; with the verb directly on the stack the existing Right-advmod
     // arm attaches them.
@@ -1747,7 +1747,7 @@ fn complementizer_that_does_not_wait() {
 
 #[test]
 fn bare_ed_predicate_with_transitive_frame_is_verb() {
-    // Refs (UD svo-06/12): bare -ed predicates with a nominal subject and
+    // Refs (UD subverbobj-06/12): bare -ed predicates with a nominal subject and
     // a determiner-led object (John opened the door) are past-tense
     // transitives, not noun compounds. Past morphology plus the
     // transitive frame identifies them: -ed adjectives are attributive
@@ -1988,4 +1988,717 @@ fn clean_subordinate_emits_no_tie() {
         keys.iter().all(|k| !k.provisional),
         "clean frames mint permanent keys"
     );
+}
+
+/// End-to-end Track B probe of the refine seam: the confidence-axis
+/// `RefineReason` for one input text, through the public seams only.
+///
+/// The policy is `OnUncertain` with the task-value flags OFF: the hermetic
+/// helper wires an empty concept store, which would trip
+/// `UnresolvedPropn` for every sentence (no registered senses) — that axis
+/// needs a populated store and is covered by `refine_calibration`. Track B
+/// isolates the confidence axis (`ParseConfidence` → `ConfidenceReason`),
+/// which is fully determined by the deterministic parse.
+fn refine_of(text: &str) -> (spacy_rs::RefineReason, bool) {
+    let vocab = en_vocab();
+    let tokenizer = spacy_rs::lang::en::tokenizer(vocab.clone()).expect("tokenizer");
+    let mut doc = tokenizer.tokenize(text).expect("tokenize");
+    let annotator = ArcEagerAnnotator::en_default(vocab.clone());
+    let (result, _conf) = annotator.annotate_with_confidence(&doc).expect("parse");
+    spacy_rs::llm::attach(&mut doc, &result.records).expect("attach");
+    spacy_rs::Sentencizer::new().process(&mut doc);
+    let store: std::sync::Arc<spacy_rs::InMemoryConceptStore> =
+        std::sync::Arc::new(spacy_rs::InMemoryConceptStore::new());
+    let resolver = spacy_rs::InterlinguaResolver::new(
+        store.clone() as std::sync::Arc<dyn spacy_rs::ConceptStore>,
+        std::sync::Arc::clone(vocab.strings()),
+    );
+    resolver.resolve_doc(&mut doc, result.token_confidence());
+    let (routing, signal) = spacy_rs::extract_routing_signals(&doc)
+        .into_iter()
+        .next()
+        .map(|s| {
+            let inter = s.interlingua.clone().unwrap_or(spacy_rs::InterlinguaSignal {
+                predicate_id: None,
+                subject_id: None,
+                direct_object_id: None,
+                indirect_object_id: None,
+                concept_ids: Vec::new(),
+                token_ids: Vec::new(),
+                confidence: None,
+            });
+            (s, inter)
+        })
+        .expect("one routing signal");
+    let policy = spacy_rs::RefinePolicy {
+        mode: spacy_rs::RefineMode::OnUncertain,
+        refine_on_unresolved_critical_role: false,
+        refine_on_unresolved_propn: false,
+        refine_on_collision_note: false,
+        ..Default::default()
+    };
+    let reason = spacy_rs::refine_reason(&result, &signal, &routing, policy);
+    let should = spacy_rs::should_refine(&result, &signal, &routing, policy);
+    // The bool and the reason agree by construction (`should == (reason !=
+    // NoTrigger)`); pin the agreement so the two seams cannot drift apart.
+    assert_eq!(
+        should,
+        reason != spacy_rs::RefineReason::NoTrigger,
+        "should_refine must agree with refine_reason for {text:?}"
+    );
+    (reason, should)
+}
+
+#[test]
+fn verbless_adp_concessive_emits_attachment_tie() {
+    // Track B (positive): "Although in pain" is a verbless concessive whose
+    // marker faces an ADP — no finite verb in the child span, so the
+    // marker's attachment is underdetermined. The oracle must record a
+    // near-tie and the frame stage an AttachmentNearTie with a provisional
+    // key — never a confident silent misparse. The confidence-axis refine
+    // reason must fire (Ties, or RoleCoverage while the residual misparse
+    // leaves the argument slots empty).
+    let (conf, analysis, keys) = ambiguity_of("Although in pain, he smiled.");
+    assert!(
+        conf.oracle_tie_count >= 1,
+        "verbless ADP concessive must tie: {conf:?}"
+    );
+    assert!(
+        conf.oracle_margins
+            .iter()
+            .any(|m| m.abs() <= spacy_rs::TIE_MARGIN_EPSILON),
+        "near-zero margin expected: {conf:?}"
+    );
+    assert!(
+        analysis
+            .ambiguities
+            .iter()
+            .any(|a| a.kind == spacy_rs::AmbiguityKind::AttachmentNearTie),
+        "AttachmentNearTie expected: {analysis:?}"
+    );
+    assert!(
+        keys.iter().any(|k| k.provisional),
+        "ambiguous frame mints a provisional key"
+    );
+    let (reason, should) = refine_of("Although in pain, he smiled.");
+    assert!(
+        matches!(reason, spacy_rs::RefineReason::Confidence(_)),
+        "confidence-axis refine must fire, got {reason:?}"
+    );
+    assert!(should, "should_refine must be true for {reason:?}");
+    // Parse-stability pin: the tie must not re-head anything. (`he →
+    // pobj` is the Track A residual the flag points at — flagged, not
+    // silently confident.)
+    let (_doc, set) = parse("Although in pain, he smiled.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (although, in_, pain, smiled) =
+        (at("Although"), at("in"), at("pain"), at("smiled"));
+    assert_eq!(deps[although], "dep", "deps: {deps:?}");
+    assert_eq!(although as i32 + set.0[although].head, smiled as i32);
+    assert_eq!(deps[in_], "dep", "deps: {deps:?}");
+    assert_eq!(in_ as i32 + set.0[in_].head, smiled as i32);
+    assert_eq!(deps[pain], "pobj", "deps: {deps:?}");
+    assert_eq!(pain as i32 + set.0[pain].head, in_ as i32);
+    assert_eq!(deps[smiled], "root");
+}
+
+#[test]
+fn unanchored_double_embedding_emits_attachment_tie() {
+    // Track B (positive): "I think she knows he left" doubly embeds — the
+    // second-level verb (left) has no subordinator, no boundary
+    // punctuation, and a non-root matrix (knows), so no licensed arm owns
+    // the pair and it strands in repair-dep. The oracle must record a
+    // near-tie (→ RefineReason::Confidence(Ties)) and the frame stage an
+    // AttachmentNearTie with a provisional key — never a confident silent
+    // strand. Heads/labels are unchanged (Shift wins ties by stable
+    // order); only the margin drops.
+    let (conf, analysis, keys) = ambiguity_of("I think she knows he left.");
+    assert!(
+        conf.oracle_tie_count >= 1,
+        "unanchored verb–verb embedding must tie: {conf:?}"
+    );
+    assert!(
+        conf.oracle_margins
+            .iter()
+            .any(|m| m.abs() <= spacy_rs::TIE_MARGIN_EPSILON),
+        "near-zero margin expected: {conf:?}"
+    );
+    assert!(
+        analysis
+            .ambiguities
+            .iter()
+            .any(|a| a.kind == spacy_rs::AmbiguityKind::AttachmentNearTie),
+        "AttachmentNearTie expected: {analysis:?}"
+    );
+    assert!(
+        keys.iter().any(|k| k.provisional),
+        "ambiguous frame mints a provisional key"
+    );
+    let (reason, should) = refine_of("I think she knows he left.");
+    assert_eq!(
+        reason,
+        spacy_rs::RefineReason::Confidence(spacy_rs::ConfidenceReason::Ties),
+        "double embedding must refine on Ties, got {reason:?}"
+    );
+    assert!(should, "should_refine must be true for {reason:?}");
+    // Parse-stability pin: the tie must not re-head anything (knows keeps
+    // its licensed ccomp; left keeps its repair-dep strand, flagged).
+    let (_doc, set) = parse("I think she knows he left.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (think, knows, left) = (at("think"), at("knows"), at("left"));
+    assert_eq!(deps[think], "root");
+    assert_eq!(deps[knows], "ccomp", "deps: {deps:?}");
+    assert_eq!(knows as i32 + set.0[knows].head, think as i32);
+    assert_eq!(deps[left], "dep", "deps: {deps:?}");
+}
+
+#[test]
+fn single_embedding_emits_no_tie() {
+    // Track B (must-NOT-fire control): a singly-embedded bare complement
+    // ("She thinks he left") is fully determined — the root-governed
+    // ccomp arm owns the pair, so no tie, no ambiguity entry, permanent
+    // keys, and no confidence-axis refine.
+    let (conf, analysis, keys) = ambiguity_of("She thinks he left.");
+    assert_eq!(conf.oracle_tie_count, 0, "licensed complement must not tie: {conf:?}");
+    assert!(
+        analysis.ambiguities.is_empty(),
+        "no ambiguity on a licensed complement: {analysis:?}"
+    );
+    assert!(
+        keys.iter().all(|k| !k.provisional),
+        "clean frames mint permanent keys"
+    );
+    let (reason, should) = refine_of("She thinks he left.");
+    assert_eq!(
+        reason,
+        spacy_rs::RefineReason::NoTrigger,
+        "licensed complement must not refine, got {reason:?}"
+    );
+    assert!(!should, "should_refine must be false");
+}
+
+#[test]
+fn clean_subverbobj_emits_no_refine() {
+    // Track B (must-NOT-fire control): an unambiguous SVO sentence keeps
+    // high ParseConfidence — no tie, no ambiguity, no refine.
+    let (conf, analysis, _) = ambiguity_of("Dogs bark loudly.");
+    assert_eq!(conf.oracle_tie_count, 0, "clean SVO must not tie: {conf:?}");
+    assert!(
+        analysis.ambiguities.is_empty(),
+        "no ambiguity on clean SVO: {analysis:?}"
+    );
+    let (reason, should) = refine_of("Dogs bark loudly.");
+    assert_eq!(
+        reason,
+        spacy_rs::RefineReason::NoTrigger,
+        "clean SVO must not refine, got {reason:?}"
+    );
+    assert!(!should, "should_refine must be false");
+}
+
+#[test]
+fn clean_copular_emits_no_refine() {
+    // Track B (must-NOT-fire control): an unambiguous copular sentence
+    // keeps high ParseConfidence — no tie, no ambiguity, no refine.
+    let (conf, analysis, _) = ambiguity_of("Your fee is low.");
+    assert_eq!(conf.oracle_tie_count, 0, "clean copular must not tie: {conf:?}");
+    assert!(
+        analysis.ambiguities.is_empty(),
+        "no ambiguity on clean copular: {analysis:?}"
+    );
+    let (reason, should) = refine_of("Your fee is low.");
+    assert_eq!(
+        reason,
+        spacy_rs::RefineReason::NoTrigger,
+        "clean copular must not refine, got {reason:?}"
+    );
+    assert!(!should, "should_refine must be false");
+}
+
+#[test]
+fn unsubordinated_single_verb_attaches_no_subordinate() {
+    // Track A must-NOT-fire control for the advcl/ccomp Verb–Verb arm: an
+    // un-subordinated matrix verb ("She sings loudly") has no second verb
+    // at all, so neither ccomp nor advcl (nor parataxis) may fire — and
+    // with no uncertainty the confidence axis stays quiet.
+    let (_doc, set) = parse("She sings loudly.");
+    let deps = deps(&set);
+    assert!(
+        deps.iter().all(|d| d != "ccomp" && d != "advcl" && d != "parataxis"),
+        "no subordinate attachment without a subordinate clause: {deps:?}"
+    );
+    let (conf, _, _) = ambiguity_of("She sings loudly.");
+    assert_eq!(conf.oracle_tie_count, 0, "single verb must not tie: {conf:?}");
+    let (reason, should) = refine_of("She sings loudly.");
+    assert_eq!(
+        reason,
+        spacy_rs::RefineReason::NoTrigger,
+        "unsubordinated matrix must not refine, got {reason:?}"
+    );
+    assert!(!should, "should_refine must be false");
+}
+#[test]
+fn imperative_pronoun_object_upgrades_initial_verb() {
+    // Refs (UD command-04): Remind → verb/root, me → dobj → Remind. The
+    // directive pass only covers DET-led objects, so pronoun objects strand
+    // the initial verb as NOUN. The verbless-clause gate plus the pronoun
+    // frame identifies them; the existing dobj arm lands the object, and
+    // verb lemmatization lowercases the lemma. (UD pins iobj for me; the
+    // oracle has no iobj arm, so dobj is the honest head with a label
+    // residual.)
+    let (_doc, set) = parse("Remind me at noon.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let lem = lemmas(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (remind, me) = (at("Remind"), at("me"));
+    assert_eq!(pos[remind], "verb", "pos: {pos:?}");
+    assert_eq!(deps[remind], "root");
+    assert_eq!(lem[remind], "remind", "lemmas: {lem:?}");
+    assert_eq!(deps[me], "dobj", "deps: {deps:?}");
+    assert_eq!(me as i32 + set.0[me].head, remind as i32);
+}
+
+#[test]
+fn imperative_pp_complement_upgrades_initial_verb() {
+    // Refs (UD command-02): Translate → verb/root, hello → dobj →
+    // Translate. A bare nominal object plus a prepositional adjunct later
+    // in the clause is the transitive frame without a determiner. Nominal
+    // pairs with no adjunct (`Dogs chase red cars`) keep the compound
+    // dynamics — pinned by the control below.
+    let (_doc, set) = parse("Translate hello to French.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let lem = lemmas(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (translate, hello) = (at("Translate"), at("hello"));
+    assert_eq!(pos[translate], "verb", "pos: {pos:?}");
+    assert_eq!(deps[translate], "root");
+    assert_eq!(lem[translate], "translate", "lemmas: {lem:?}");
+    assert_eq!(deps[hello], "dobj", "deps: {deps:?}");
+    assert_eq!(hello as i32 + set.0[hello].head, translate as i32);
+}
+
+#[test]
+fn imperative_possessive_object_upgrades_initial_verb() {
+    // Refs (UD command-06): Explain → verb/root, theorem → dobj → Explain.
+    // A nominal object plus a possessive 's is the proper-name object
+    // frame. Bell/'s keep their current tags (the PROPN/case gaps are
+    // their own iterations, deliberately unasserted beyond stability).
+    let (_doc, set) = parse("Explain Bell's theorem.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let lem = lemmas(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (explain, theorem) = (at("Explain"), at("theorem"));
+    assert_eq!(pos[explain], "verb", "pos: {pos:?}");
+    assert_eq!(deps[explain], "root");
+    assert_eq!(lem[explain], "explain", "lemmas: {lem:?}");
+    assert_eq!(deps[theorem], "dobj", "deps: {deps:?}");
+    assert_eq!(theorem as i32 + set.0[theorem].head, explain as i32);
+}
+
+#[test]
+fn imperative_upgrade_needs_verbless_clause() {
+    // Must-NOT-fire: the upgrade needs a verbless clause — "Anna" is a
+    // subject (finished is VERB via the bare-ed pass, sequenced before),
+    // and "Dogs" heads a nominal pair with no adjunct (the compound
+    // dynamics own it). Both stay nominal.
+    let (_doc, set) = parse("Anna finished her lunch.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_ne!(pos[at("Anna")], "verb", "pos: {pos:?}");
+    assert_eq!(pos[at("finished")], "verb", "pos: {pos:?}");
+    let (_doc, set) = parse("Dogs chase red cars.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("Dogs")], "noun", "pos: {pos:?}");
+    assert_eq!(pos[at("chase")], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn imperative_upgrade_skips_relative_pronouns() {
+    // Must-NOT-fire: "who" heads a relative clause (`People who wait`),
+    // so the initial noun is a subject, not an imperative verb — the
+    // pronoun frame is object-forms only (the mirror of the
+    // pronoun-subject pass, which upgrades after exactly the excluded
+    // nominative forms).
+    let (_doc, set) = parse("People who wait succeed.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_ne!(pos[at("People")], "verb", "pos: {pos:?}");
+    assert_eq!(pos[at("wait")], "verb", "pos: {pos:?}");
+    assert_eq!(deps[at("wait")], "relcl", "deps: {deps:?}");
+    assert_eq!(deps[at("succeed")], "root");
+}
+
+#[test]
+fn bare_negator_not_is_particle() {
+    // Refs (UD negation-02): the bare negator `not` is categorically PART
+    // (UD) — it has no nominal or verbal reading, so it tags in `infer_pos`
+    // beside `n't` with no collision audit. Before, it fell to NOUN and the
+    // bare-infinitive upgrade rooted it (`not` stole root, stranding `call`
+    // in ccomp). Now the true verb crowns and the hosted-infinitive logic
+    // is untouched.
+    let (_doc, set) = parse("She did not call.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let lem = lemmas(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (she, did, not, call) = (at("She"), at("did"), at("not"), at("call"));
+    assert_eq!(pos[not], "part", "pos: {pos:?}");
+    assert_eq!(lem[not], "not", "lemmas: {lem:?}");
+    assert_eq!(deps[not], "neg", "deps: {deps:?}");
+    assert_eq!(not as i32 + set.0[not].head, call as i32);
+    assert_eq!(pos[call], "verb", "pos: {pos:?}");
+    assert_eq!(deps[call], "root");
+    assert_eq!(deps[did], "aux", "deps: {deps:?}");
+    assert_eq!(did as i32 + set.0[did].head, call as i32);
+    assert_eq!(deps[she], "nsubj", "deps: {deps:?}");
+    assert_eq!(she as i32 + set.0[she].head, call as i32);
+}
+
+#[test]
+fn negator_never_steals_root() {
+    // Must-NOT-fire: `not` never tags VERB, in imperatives (`Do not enter`
+    // — enter crowns) or copular clauses (`This is not correct` — the
+    // predicate adjective crowns with be-copula, the n't-shape it already
+    // took in `isn't ready`).
+    let (_doc, set) = parse("Do not enter.");
+    let pos1 = pos_of(&set);
+    let deps1 = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos1[at("not")], "part", "pos: {pos1:?}");
+    assert_eq!(deps1[at("not")], "neg", "deps: {deps1:?}");
+    assert_eq!(deps1[at("enter")], "root");
+    let (_doc, set) = parse("This is not correct.");
+    let pos2 = pos_of(&set);
+    let deps2 = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos2[at("not")], "part", "pos: {pos2:?}");
+    assert_eq!(deps2[at("correct")], "root");
+    assert_eq!(deps2[at("is")], "cop", "deps: {deps2:?}");
+    assert_eq!(deps2[at("not")], "neg", "deps: {deps2:?}");
+}
+
+#[test]
+fn demonstrative_object_upgrades_pair() {
+    // Refs (UD command-target-01): a demonstrative with no nominal head is
+    // the object itself (UD: PRON), and the retag feeds the imperative
+    // pronoun frame — Translate crowns via the same dynamics as Remind me.
+    let (_doc, set) = parse("Translate this to French.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let lem = lemmas(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (translate, this) = (at("Translate"), at("this"));
+    assert_eq!(pos[this], "pron", "pos: {pos:?}");
+    assert_eq!(pos[translate], "verb", "pos: {pos:?}");
+    assert_eq!(deps[translate], "root");
+    assert_eq!(lem[translate], "translate", "lemmas: {lem:?}");
+    assert_eq!(deps[this], "dobj", "deps: {deps:?}");
+    assert_eq!(this as i32 + set.0[this].head, translate as i32);
+}
+
+#[test]
+fn demonstrative_final_this_is_pronoun() {
+    // Refs (UD punctuation-edge-05): sentence-final `this` has no nominal
+    // to determine — PRON/dobj, and the imperative crowns (the punctuation
+    // that broke the DET+NOUN frame no longer matters).
+    let (_doc, set) = parse("Summarize this?");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (summarize, this) = (at("Summarize"), at("this"));
+    assert_eq!(pos[this], "pron", "pos: {pos:?}");
+    assert_eq!(pos[summarize], "verb", "pos: {pos:?}");
+    assert_eq!(deps[summarize], "root");
+    assert_eq!(deps[this], "dobj", "deps: {deps:?}");
+    assert_eq!(this as i32 + set.0[this].head, summarize as i32);
+}
+
+#[test]
+fn demonstrative_before_noun_stays_determiner() {
+    // Must-NOT-fire: a demonstrative heading a nominal (`this equation`)
+    // keeps the determiner reading — the upgrade needs an ADP, boundary,
+    // or nothing after it. And `that` never retags: it relativizes (`Dogs
+    // that bark bite`), owned by the that-relative pass.
+    let (_doc, set) = parse("Solve this equation.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("this")], "det", "pos: {pos:?}");
+    let (_doc, set) = parse("Dogs that bark bite.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    // `that` never retags: it relativizes, owned by the that-relative
+    // pass. (`Dogs` crowns via the pre-existing directive DET+NOUN frame —
+    // a known over-fire, out of scope here; this test owns only the
+    // demonstrative line.)
+    assert_eq!(pos[at("that")], "det", "pos: {pos:?}");
+}
+
+#[test]
+fn epistemic_linking_frame_upgrades_pair() {
+    // Refs (UD copular-edge-06): epistemic linkers (feel/seem/remain/
+    // appear, base + -s) take the sensory two-step — the linker crowns as
+    // VERB and the nominal complement lands as predicate ADJ/acomp.
+    let (_doc, set) = parse("Something feels wrong.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let lem = lemmas(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (feels, wrong) = (at("feels"), at("wrong"));
+    assert_eq!(pos[feels], "verb", "pos: {pos:?}");
+    assert_eq!(deps[feels], "root");
+    assert_eq!(lem[feels], "feel", "lemmas: {lem:?}");
+    assert_eq!(pos[wrong], "adj", "pos: {pos:?}");
+    assert_eq!(deps[wrong], "acomp", "deps: {deps:?}");
+    assert_eq!(wrong as i32 + set.0[wrong].head, feels as i32);
+}
+
+#[test]
+fn epistemic_linking_before_verbal_complement() {
+    // Refs (UD copular-edge-05): `remains` fires before a VERB-tagged
+    // complement (`uncertain`, crowned by the initial-noun rule) — and
+    // because the linking pass runs first, the complement is still NOUN
+    // here, so the ADJ step lands it as acomp instead of tying. Pass
+    // ordering is load-bearing; pin it.
+    let (_doc, set) = parse("This remains uncertain.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (remains, uncertain) = (at("remains"), at("uncertain"));
+    assert_eq!(pos[remains], "verb", "pos: {pos:?}");
+    assert_eq!(deps[remains], "root");
+    assert_eq!(pos[uncertain], "adj", "pos: {pos:?}");
+    assert_eq!(deps[uncertain], "acomp", "deps: {deps:?}");
+}
+
+#[test]
+fn epistemic_linking_skips_nominal_readings() {
+    // Must-NOT-fire: plural-noun `remains` (AUX-next) and noun `feel`
+    // (ADP-next) keep their nominal readings — the verb step needs a
+    // nominal, adjectival, or verbal complement, never a determiner-led,
+    // auxiliary-led, or prepositional one.
+    let (_doc, set) = parse("The remains were buried.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("remains")], "noun", "pos: {pos:?}");
+    let (_doc, set) = parse("She has a feel for music.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("feel")], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn ditransitive_recipient_is_iobj() {
+    // Refs (UD dative-*): a bare pronoun between a verb and a DET-led
+    // nominal is the indirect object — the nominal takes dobj below. The
+    // 105 weight outbids dobj (100) inside the gated frame; routing and
+    // yago already consume iobj downstream, so only the oracle had to
+    // learn to emit it. (imperative-01's frozen ref pinned me→dobj,
+    // contradicting the 8 dative refs and UD — corrected to iobj with
+    // this arm.)
+    let (_doc, set) = parse("Give me the report.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (give, me, report) = (at("Give"), at("me"), at("report"));
+    assert_eq!(deps[me], "iobj", "deps: {deps:?}");
+    assert_eq!(me as i32 + set.0[me].head, give as i32);
+    assert_eq!(deps[report], "dobj", "deps: {deps:?}");
+    assert_eq!(report as i32 + set.0[report].head, give as i32);
+}
+
+#[test]
+fn single_object_pronoun_stays_dobj() {
+    // Must-NOT-fire: without a DET-led nominal after it, the pronoun is
+    // the direct object — before a preposition (Remind me at noon), a
+    // bare nominal (Help them win), or an adverb (Call me later).
+    for (text, verb, pron) in [
+        ("Remind me at noon.", "Remind", "me"),
+        ("Help them win.", "Help", "them"),
+        ("Call me later.", "Call", "me"),
+    ] {
+        let (_doc, set) = parse(text);
+        let deps = deps(&set);
+        let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+        assert_eq!(deps[at(pron)], "dobj", "{text} deps: {deps:?}");
+        assert_eq!(
+            at(pron) as i32 + set.0[at(pron)].head,
+            at(verb) as i32,
+            "{text} deps: {deps:?}"
+        );
+    }
+}
+
+#[test]
+fn discourse_initial_imperative_crowns_verb() {
+    // Refs (UD imperative-do-04): a discourse marker before a bare verb
+    // strands both — the marker roots as NOUN and the verb compounds into
+    // it. The frame upgrades the verb (standard dobj dynamics land `date`)
+    // and retags the marker (`please` → INTJ, inert: nothing else reads
+    // INTJ, so it strands honestly via repair-dep instead of corrupting
+    // the clause).
+    let (_doc, set) = parse("Please confirm the date.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (please, confirm, date) = (at("Please"), at("confirm"), at("date"));
+    assert_eq!(pos[please], "intj", "pos: {pos:?}");
+    assert_eq!(pos[confirm], "verb", "pos: {pos:?}");
+    assert_eq!(deps[confirm], "root");
+    assert_eq!(deps[date], "dobj", "deps: {deps:?}");
+    assert_eq!(date as i32 + set.0[date].head, confirm as i32);
+}
+
+#[test]
+fn discourse_initial_never_takes_advmod() {
+    // Refs (UD negation-04): `Never`/`Always`/`Just`/`Kindly` retag to ADV
+    // and take the existing (Adv, Verb) advmod arm — `Never send that
+    // email` goes fully correct (marker, crown, determiner, object).
+    let (_doc, set) = parse("Never send that email.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (never, send, email) = (at("Never"), at("send"), at("email"));
+    assert_eq!(pos[never], "adv", "pos: {pos:?}");
+    assert_eq!(deps[never], "advmod", "deps: {deps:?}");
+    assert_eq!(never as i32 + set.0[never].head, send as i32);
+    assert_eq!(pos[send], "verb", "pos: {pos:?}");
+    assert_eq!(deps[send], "root");
+    assert_eq!(deps[email], "dobj", "deps: {deps:?}");
+}
+
+#[test]
+fn discourse_frame_needs_verbal_complement() {
+    // Must-NOT-fire: nominal thirds (`Just good friends`) are fragments,
+    // not imperatives — the marker and the second noun both stay nominal.
+    // Mid-sentence markers (`... please.`) never match either (initial
+    // frame only).
+    let (_doc, set) = parse("Just good friends.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("Just")], "noun", "pos: {pos:?}");
+    assert_eq!(pos[at("good")], "noun", "pos: {pos:?}");
+    let (_doc, set) = parse("Summarize this... please.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("please")], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn copular_predicate_nominal_full_frame() {
+    // Refs (UD copular-03): predicate nominals (`is a doctor`) strand
+    // completely today — the subject crowns, be dangles, the predicate
+    // strands. The package (pick_root crowns the last nominal of the
+    // be+DET span; cop-Left attaches be; the gated nsubj lands the
+    // subject) restores the full frame. Order matters throughout: det
+    // fires before cop attaches, cop before the subject meets.
+    let (_doc, set) = parse("She is a doctor.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (she, is, doctor) = (at("She"), at("is"), at("doctor"));
+    assert_eq!(pos[doctor], "noun", "pos: {pos:?}");
+    assert_eq!(deps[doctor], "root");
+    assert_eq!(deps[is], "cop", "deps: {deps:?}");
+    assert_eq!(is as i32 + set.0[is].head, doctor as i32);
+    assert_eq!(deps[she], "nsubj", "deps: {deps:?}");
+    assert_eq!(she as i32 + set.0[she].head, doctor as i32);
+}
+
+#[test]
+fn wh_copular_predicate_nominal_full_frame() {
+    // Refs (UD wh-copula-02): same package through an interrogative
+    // subject — Who crowns nothing, the predicate does.
+    let (_doc, set) = parse("Who is the president?");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (who, is, president) = (at("Who"), at("is"), at("president"));
+    assert_eq!(deps[president], "root");
+    assert_eq!(deps[is], "cop", "deps: {deps:?}");
+    assert_eq!(is as i32 + set.0[is].head, president as i32);
+    assert_eq!(deps[who], "nsubj", "deps: {deps:?}");
+    assert_eq!(who as i32 + set.0[who].head, president as i32);
+    assert_eq!(pos[who], "pron", "pos: {pos:?}");
+}
+
+#[test]
+fn existential_there_is_expl() {
+    // Refs (UD copular-edge-01): existential `there` is an expletive, not
+    // a subject — word-gated expl arm on the copular frame (the nsubj
+    // gate excludes there/here explicitly).
+    let (_doc, set) = parse("There is a problem.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (there, problem) = (at("There"), at("problem"));
+    assert_eq!(deps[problem], "root");
+    assert_eq!(deps[there], "expl", "deps: {deps:?}");
+    assert_eq!(there as i32 + set.0[there].head, problem as i32);
+}
+
+#[test]
+fn numeric_modifier_is_nummod() {
+    // Refs (UD topic-bare-01): bare fragments strand numbers in
+    // repair-dep; a numeral after a nominal head is its numeric modifier.
+    let (_doc, set) = parse("invoice 1001");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (invoice, num) = (at("invoice"), at("1001"));
+    assert_eq!(pos[num], "num", "pos: {pos:?}");
+    assert_eq!(deps[invoice], "root");
+    assert_eq!(deps[num], "nummod", "deps: {deps:?}");
+    assert_eq!(num as i32 + set.0[num].head, invoice as i32);
+}
+
+#[test]
+fn attributive_ly_is_adjective() {
+    // Refs (UD topic-bare-04): `-ly` before a nominal head is an
+    // attributive adjective (quarterly sales), not an adverbial — the
+    // rule only sees NOUNs directly before nominals, so final (`daily`),
+    // conjunct (`daily or`), comma-framed (`Sadly,`), and retagged
+    // (`Kindly` is ADV by then) shapes never match.
+    let (_doc, set) = parse("quarterly sales report");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("quarterly")], "adj", "pos: {pos:?}");
+    assert_eq!(deps[at("quarterly")], "amod", "deps: {deps:?}");
+}
+
+#[test]
+fn copular_package_keeps_predicate_adjectives() {
+    // Must-NOT-fire: a predicative adjective after the nominal span keeps
+    // its crown (`Is the report ready`, `Is the sky blue`) — the
+    // pick_root rule requires no ADJ after be, and prepositional spans
+    // (`The book is on the table`, ADP after be) never match either.
+    // Where-initial interrogatives keep incumbent dynamics throughout
+    // (question-02/08 pin be-as-root; reconciling those conventions is a
+    // separate design decision).
+    for (text, crown) in [
+        ("Is the report ready?", "ready"),
+        ("The book is on the table.", "book"),
+        ("Where is the station?", "Where"),
+    ] {
+        let (_doc, set) = parse(text);
+        let deps = deps(&set);
+        let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+        assert_eq!(deps[at(crown)], "root", "{text} deps: {deps:?}");
+    }
+}
+
+#[test]
+fn imperative_upgrade_skips_aux_clauses() {
+    // Must-NOT-fire: a clause with an AUX (`Big Data is a trend`) is
+    // copular, not imperative — the initial nominal stays nominal even
+    // though no VERB is present.
+    let (_doc, set) = parse("Big Data is a trend.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("Big")], "noun", "pos: {pos:?}");
 }

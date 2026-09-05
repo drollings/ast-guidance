@@ -139,11 +139,15 @@ fn parse_bench_accuracy_floors() {
     let mut overall = Accum::default();
     let mut per_category: BTreeMap<String, Accum> = BTreeMap::new();
     let mut scored = 0usize;
-    let mut unscored: Vec<String> = Vec::new();
+    // (dataset category, item id + reason) — grouped by the true category
+    // below. Reconstructing the category from the id (`split('-')`) mangles
+    // multi-word categories (`command-target-*` landed under `command`,
+    // `rare-verb-*` and `rare-lex-*` lumped as `rare`).
+    let mut unscored: Vec<(String, String)> = Vec::new();
 
     for item in &dataset.items {
         let Some(gold) = refs.refs.get(&item.id) else {
-            unscored.push(format!("{} (no ref yet — generate via live ref-gen)", item.id));
+            unscored.push((item.category.clone(), item.id.clone()));
             continue;
         };
         let (doc, result) = pipe
@@ -159,7 +163,7 @@ fn parse_bench_accuracy_floors() {
         if set.0.len() != gold.len()
             || !set.0.iter().zip(gold.iter()).all(|(p, g)| p.text == g.text)
         {
-            unscored.push(format!("{} (tokenization drift vs ref)", item.id));
+            unscored.push((item.category.clone(), format!("{} [drift]", item.id)));
             continue;
         }
         scored += 1;
@@ -194,9 +198,8 @@ fn parse_bench_accuracy_floors() {
         // One line per category, not per item — the per-item list used to
         // bury the scoreboard under 50+ lines.
         let mut by_category: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for u in &unscored {
-            let category = u.split('-').next().unwrap_or("?").to_string();
-            by_category.entry(category).or_default().push(u.clone());
+        for (category, u) in &unscored {
+            by_category.entry(category.clone()).or_default().push(u.clone());
         }
         eprintln!("  unscored: {} (generate via live ref-gen)", unscored.len());
         for (category, ids) in &by_category {
