@@ -1587,6 +1587,20 @@ impl ArcEagerState {
                         out.push(Self::act(ArcEagerMove::Left, labels.nsubj));
                     }
                 }
+                // A pre-nominal designator depends on its head (204 →
+                // nummod → status). Pairs with the Right-nummod withhold in
+                // the b-free block (without it the number attaches to the
+                // preceding nominal before its head arrives) and the
+                // head-final root rung (the head must hold the crown, or
+                // repair owns the number). Lives in this s-free block
+                // because the head may be the pre-designated root, for
+                // which the b-free block is skipped. Gated on a
+                // punct-free pair, mirroring the compound arm.
+                (Upos::Num, Upos::Noun | Upos::Propn) => {
+                    if ((s + 1)..b).all(|k| pos[k] != Upos::Punct) {
+                        out.push(Self::act(ArcEagerMove::Left, labels.nummod));
+                    }
+                }
                 (Upos::Aux, Upos::Verb) => {
                     out.push(Self::act(ArcEagerMove::Left, labels.aux));
                 }
@@ -1594,6 +1608,31 @@ impl ArcEagerState {
                 // → low). Pairs with the be-predicate tagger rule above.
                 (Upos::Aux, Upos::Adj) => {
                     out.push(Self::act(ArcEagerMove::Left, labels.cop));
+                    // A copular complement with a DET-led nominal between
+                    // be and the predicate (`is the water cycle`, `is a
+                    // Rust project`) is information-theoretically
+                    // ambiguous: the same shape reads as an overt-subject
+                    // predicate adjective (`is the sky blue`) or a modified
+                    // predicate nominal — and only lexicon knowledge (which
+                    // adjective-hood needs) splits them. Offer a `dep`
+                    // rival at cop parity (95) so `best_with_margin`
+                    // records a near-tie (→ `RefineReason::Confidence(Ties)`
+                    // → `AttachmentNearTie` downstream) instead of a
+                    // confident cop. The cop arm above is unconditional, so
+                    // the rival can only tie, never outbid (pushed after,
+                    // loses ties by stable order) — heads/labels unchanged,
+                    // only the margin drops (Track B: flag, don't guess).
+                    // Bare-subject frames (`Is lunch ready`, no DET between)
+                    // and direct complements (`Your fee is low`) never
+                    // match, so clean copulars stay tie-free.
+                    if is_be_form(texts[s].as_str())
+                        && (s + 1..b).any(|k| pos[k] == Upos::Det)
+                        && (s + 1..b).any(|k| {
+                            matches!(pos[k], Upos::Noun | Upos::Propn | Upos::Pron)
+                        })
+                    {
+                        out.push(Self::act(ArcEagerMove::Left, labels.dep));
+                    }
                 }
                 // The copula depends on a nominal predicate (She is a
                 // doctor: is → cop → doctor). Pairs with the pick_root
@@ -1980,9 +2019,21 @@ impl ArcEagerState {
                 // (invoice 1001, flight 204: number → nummod → invoice).
                 // Numbers never govern leftward, so no Left arm competes;
                 // the bare-noun fallback (repair-dep with the right head)
-                // is what this replaces, deterministically.
+                // is what this replaces, deterministically. A pre-nominal
+                // designator (flight 204 status) belongs to the FOLLOWING
+                // head instead — withhold nummod when a nominal stands
+                // directly after the number (no punctuation between), so
+                // the number shifts into the Left-nummod arm in the s-free
+                // block below (Left arms must live there: the head may be
+                // the pre-designated root, for which the b-free block is
+                // skipped); number-final frames (invoice 1001) fire as before.
                 (Upos::Noun | Upos::Propn, Upos::Num) => {
-                    out.push(Self::act(ArcEagerMove::Right, labels.nummod));
+                    let prenominal = b + 1 < texts.len()
+                        && matches!(pos[b + 1], Upos::Noun | Upos::Propn | Upos::Pron)
+                        && (s + 1..b + 2).all(|k| pos[k] != Upos::Punct);
+                    if !prenominal {
+                        out.push(Self::act(ArcEagerMove::Right, labels.nummod));
+                    }
                 }
                 (Upos::Verb, Upos::Adv) => {
                     out.push(Self::act(ArcEagerMove::Right, labels.advmod));
@@ -2156,6 +2207,18 @@ impl ArcEagerState {
             // pair forms — Reduce outbids the Shift/dep parity, so without
             // this the margin never drops. Shared condition above).
             && !fallback_root_tie
+            // And a nominal head waits out a pre-nominal designator
+            // (flight [204]: popping on the number strands the head before
+            // the designator's own head arrives — the withhold above leaves
+            // Shift as the only arc, but Reduce outbids Shift, so without
+            // this the head falls to repair-dep instead of compound.
+            // Shared shape with the withhold; number-final frames (invoice
+            // [1001]) keep the old dynamics).
+            && !(matches!(ps, Upos::Noun | Upos::Propn)
+                && pb == Upos::Num
+                && b + 1 < texts.len()
+                && matches!(pos[b + 1], Upos::Noun | Upos::Propn | Upos::Pron)
+                && (s + 1..b + 2).all(|k| pos[k] != Upos::Punct))
         {
             out.push(ArcEagerAction {
                 move_type: ArcEagerMove::Reduce,
@@ -2404,6 +2467,36 @@ impl DeterministicOracle {
                         && pos[b] == Upos::Adj =>
                     {
                         90.0
+                    }
+                    // Pre-nominal designator (204 → nummod → status): same
+                    // determiner-level confidence as post-nominal nummod.
+                    // Ungated here by design — the Left arm in the s-free
+                    // block is the only offerer.
+                    l if l == labels.nummod => {
+                        if pos[s] == Upos::Num
+                            && matches!(pos[b], Upos::Noun | Upos::Propn)
+                        {
+                            90.0
+                        } else {
+                            5.0
+                        }
+                    }
+                    // The copular-complement category tie (is → dep →
+                    // cycle, at cop parity): the DET-led-nominal frame is
+                    // genuinely ambiguous (overt subject + predicate
+                    // adjective vs. modified predicate nominal), so the
+                    // rival must score exactly the incumbent cop weight —
+                    // never above (it would flip the head) and never at
+                    // Shift parity (it would never tie). Ungated here by
+                    // design — the gated arm above is the only (Aux, Adj)
+                    // dep offerer; every other Left-dep rival keeps its
+                    // Shift-parity 1.0 fallthrough below.
+                    l if l == labels.dep => {
+                        if pos[s] == Upos::Aux && pos[b] == Upos::Adj {
+                            95.0
+                        } else {
+                            1.0
+                        }
                     }
                     _ => 1.0,
                 }
@@ -3308,8 +3401,26 @@ fn pick_root(pos: &[Upos], texts: &[String], s: usize, e: usize) -> usize {
     }
     (s..e)
         .find(|&i| pos[i] == Upos::Adj)
+        .or_else(|| compound_head_nominal(pos, s, e))
         .or_else(|| (s..e).find(|&i| matches!(pos[i], Upos::Noun | Upos::Propn | Upos::Pron)))
         .unwrap_or(s)
+}
+
+/// The head-final crown of a bare nominal chain (`checker` in `Rust
+/// borrow checker`, `status` in `flight 204 status`): the last nominal of
+/// a sentence whose every content token is nominal (see `pick_root`).
+/// `None` otherwise.
+fn compound_head_nominal(pos: &[Upos], s: usize, e: usize) -> Option<usize> {
+    let mut content = (s..e).filter(|&i| pos[i] != Upos::Punct);
+    // Two-word fragments (`Define photosynthesis`) keep the first-crown +
+    // Track B tie dynamics — the imperative reading is still live there.
+    if content.clone().count() < 3 {
+        return None;
+    }
+    if !content.all(|i| matches!(pos[i], Upos::Noun | Upos::Propn | Upos::Num)) {
+        return None;
+    }
+    (s..e).rfind(|&i| matches!(pos[i], Upos::Noun | Upos::Propn))
 }
 
 /// The last nominal of a be + DET-led span running to the sentence end

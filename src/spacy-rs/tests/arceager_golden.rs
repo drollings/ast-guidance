@@ -1305,6 +1305,126 @@ fn inverted_copular_predicate_is_adjectival() {
     assert_eq!(lunch as i32 + set.0[lunch].head, ready as i32);
     assert_eq!(deps[is], "cop", "deps: {deps:?}");
     assert_eq!(is as i32 + set.0[is].head, ready as i32);
+    // Bare-subject frame: no DET between be and predicate, so the
+    // copular-complement category tie never fires — determined and quiet.
+    let (conf, _, _) = ambiguity_of("Is lunch ready?");
+    assert_eq!(conf.oracle_tie_count, 0, "bare-subject copular must not tie: {conf:?}");
+    let (reason, should) = refine_of("Is lunch ready?");
+    assert_eq!(
+        reason,
+        spacy_rs::RefineReason::NoTrigger,
+        "bare-subject copular must not refine, got {reason:?}"
+    );
+    assert!(!should, "should_refine must be false");
+}
+
+#[test]
+fn det_led_copular_complement_emits_category_tie() {
+    // Track B (positive): "What is the water cycle" has a DET-led nominal
+    // between be and the predicate — the same shape reads as an
+    // overt-subject predicate adjective (`is the sky blue`) or a modified
+    // predicate nominal, and only lexicon knowledge splits them. The oracle
+    // must record a near-tie (→ RefineReason::Confidence(Ties)) and the
+    // frame stage an AttachmentNearTie with a provisional key — never a
+    // confident cop. Heads/labels are unchanged (cop wins ties by stable
+    // order); only the margin drops.
+    let (conf, analysis, keys) = ambiguity_of("What is the water cycle?");
+    assert!(
+        conf.oracle_tie_count >= 1,
+        "DET-led copular complement must tie: {conf:?}"
+    );
+    assert!(
+        conf.oracle_margins
+            .iter()
+            .any(|m| m.abs() <= spacy_rs::TIE_MARGIN_EPSILON),
+        "near-zero margin expected: {conf:?}"
+    );
+    assert!(
+        analysis
+            .ambiguities
+            .iter()
+            .any(|a| a.kind == spacy_rs::AmbiguityKind::AttachmentNearTie),
+        "AttachmentNearTie expected: {analysis:?}"
+    );
+    assert!(
+        keys.iter().any(|k| k.provisional),
+        "ambiguous frame mints a provisional key"
+    );
+    let (reason, should) = refine_of("What is the water cycle?");
+    assert_eq!(
+        reason,
+        spacy_rs::RefineReason::Confidence(spacy_rs::ConfidenceReason::Ties),
+        "DET-led copular complement must refine on Ties, got {reason:?}"
+    );
+    assert!(should, "should_refine must be true for {reason:?}");
+    // Parse-stability pin: the tie must not re-head anything (is keeps
+    // its cop arc to the crowned predicate).
+    let (_doc, set) = parse("What is the water cycle?");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (is, cycle) = (at("is"), at("cycle"));
+    assert_eq!(deps[is], "cop", "deps: {deps:?}");
+    assert_eq!(is as i32 + set.0[is].head, cycle as i32);
+    assert_eq!(deps[cycle], "root", "deps: {deps:?}");
+}
+
+#[test]
+fn modified_predicate_nominal_emits_category_tie() {
+    // Track B (positive, second frame): "This is a Rust project" is the
+    // modified-predicate-nominal reading of the same ambiguous shape (a +
+    // Rust between be and project). Same dynamics: near-tie, provisional
+    // key, confidence-axis refine — with the parse itself untouched.
+    let (conf, analysis, keys) = ambiguity_of("This is a Rust project.");
+    assert!(
+        conf.oracle_tie_count >= 1,
+        "modified predicate nominal must tie: {conf:?}"
+    );
+    assert!(
+        analysis
+            .ambiguities
+            .iter()
+            .any(|a| a.kind == spacy_rs::AmbiguityKind::AttachmentNearTie),
+        "AttachmentNearTie expected: {analysis:?}"
+    );
+    assert!(
+        keys.iter().any(|k| k.provisional),
+        "ambiguous frame mints a provisional key"
+    );
+    let (reason, should) = refine_of("This is a Rust project.");
+    assert!(
+        matches!(reason, spacy_rs::RefineReason::Confidence(_)),
+        "confidence-axis refine must fire, got {reason:?}"
+    );
+    assert!(should, "should_refine must be true for {reason:?}");
+    let (_doc, set) = parse("This is a Rust project.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(deps[at("is")], "cop", "deps: {deps:?}");
+    assert_eq!(deps[at("project")], "root", "deps: {deps:?}");
+}
+
+#[test]
+fn direct_copular_complement_emits_no_tie() {
+    // Track B (must-NOT-fire control): a direct complement (`Your fee is
+    // low` — nothing between be and predicate) is fully determined — no
+    // tie, no ambiguity entry, permanent keys, no confidence-axis refine.
+    let (conf, analysis, keys) = ambiguity_of("Your fee is low.");
+    assert_eq!(conf.oracle_tie_count, 0, "direct copular must not tie: {conf:?}");
+    assert!(
+        analysis.ambiguities.is_empty(),
+        "no ambiguity on a direct complement: {analysis:?}"
+    );
+    assert!(
+        keys.iter().all(|k| !k.provisional),
+        "clean frames mint permanent keys"
+    );
+    let (reason, should) = refine_of("Your fee is low.");
+    assert_eq!(
+        reason,
+        spacy_rs::RefineReason::NoTrigger,
+        "direct copular must not refine, got {reason:?}"
+    );
+    assert!(!should, "should_refine must be false");
 }
 
 #[test]
@@ -2745,6 +2865,98 @@ fn numeric_modifier_is_nummod() {
     assert_eq!(deps[invoice], "root");
     assert_eq!(deps[num], "nummod", "deps: {deps:?}");
     assert_eq!(num as i32 + set.0[num].head, invoice as i32);
+}
+
+#[test]
+fn bare_nominal_chain_crowns_last() {
+    // Refs (UD topic-bare-03/05/07): English compounds are head-final —
+    // with no verb, aux, or adjective anywhere, a 3+ word bare-nominal
+    // chain crowns its last nominal (checker, medication, logs) and the
+    // earlier nouns chain as compound via the existing Left arm.
+    // Determined frames: no oracle tie (Track B stays quiet).
+    for (text, heads) in [
+        ("Rust borrow checker", ("Rust", "borrow", "checker")),
+        ("blood pressure medication", ("blood", "pressure", "medication")),
+        ("server error logs", ("server", "error", "logs")),
+    ] {
+        let (_doc, set) = parse(text);
+        let deps = deps(&set);
+        let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+        let (first, mid, last) = (at(heads.0), at(heads.1), at(heads.2));
+        assert_eq!(deps[last], "root", "{text}: deps: {deps:?}");
+        assert_eq!(set.0[last].head, 0, "{text}: root head");
+        assert_eq!(deps[mid], "compound", "{text}: deps: {deps:?}");
+        assert_eq!(mid as i32 + set.0[mid].head, last as i32, "{text}");
+        assert_eq!(deps[first], "compound", "{text}: deps: {deps:?}");
+        let (conf, _, _) = ambiguity_of(text);
+        assert_eq!(conf.oracle_tie_count, 0, "{text}: determined frame must not tie: {conf:?}");
+    }
+}
+
+#[test]
+fn prenominal_designator_heads_right() {
+    // Refs (UD topic-bare-08): a designator number with a nominal after it
+    // (flight 204 status) belongs to the FOLLOWING head — the Right-nummod
+    // withhold lets it shift, the Left-nummod arm lands it on status, and
+    // the head-final rung crowns status with flight compounding onto it.
+    let (_doc, set) = parse("flight 204 status");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (flight, num, status) = (at("flight"), at("204"), at("status"));
+    assert_eq!(pos[num], "num", "pos: {pos:?}");
+    assert_eq!(deps[status], "root", "deps: {deps:?}");
+    assert_eq!(deps[num], "nummod", "deps: {deps:?}");
+    assert_eq!(num as i32 + set.0[num].head, status as i32);
+    assert_eq!(deps[flight], "compound", "deps: {deps:?}");
+    assert_eq!(flight as i32 + set.0[flight].head, status as i32);
+}
+
+#[test]
+fn number_final_frame_still_heads_left() {
+    // Must-NOT-fire: the pre-nominal withhold needs a nominal AFTER the
+    // number — number-final `invoice 1001` attaches leftward exactly as
+    // before (see numeric_modifier_is_nummod for the attachment pins).
+    let (_doc, set) = parse("invoice 1001");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(deps[at("invoice")], "root", "deps: {deps:?}");
+    assert_eq!(deps[at("1001")], "nummod", "deps: {deps:?}");
+}
+
+#[test]
+fn two_word_fragment_keeps_first_crown_and_tie() {
+    // Must-NOT-fire: a two-word bare-nominal fragment (`Define
+    // photosynthesis`) keeps the first-crown + Track B tie dynamics — the
+    // imperative reading is still live there, so the head-final rung (3+
+    // content tokens) and the designator arms never see the pair.
+    let (_doc, set) = parse("Define photosynthesis.");
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(deps[at("Define")], "root", "deps: {deps:?}");
+    let (conf, _, _) = ambiguity_of("Define photosynthesis.");
+    assert!(
+        conf.oracle_tie_count >= 1,
+        "two-word fragment must still tie: {conf:?}"
+    );
+}
+
+#[test]
+fn nominal_chain_needs_pure_run() {
+    // Must-NOT-fire: the head-final rung needs a pure nominal run —
+    // determiner-led (`Send her the invoice`), adpositional (`Elaborate on
+    // this`), and adverbial (`Study hard, rest well`) frames keep their
+    // incumbent first crowns.
+    for (text, crown) in [
+        ("Send her the invoice.", "Send"),
+        ("Elaborate on this.", "Elaborate"),
+        ("Study hard, rest well.", "Study"),
+    ] {
+        let (_doc, set) = parse(text);
+        let deps = deps(&set);
+        let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+        assert_eq!(deps[at(crown)], "root", "{text}: deps: {deps:?}");
+    }
 }
 
 #[test]
