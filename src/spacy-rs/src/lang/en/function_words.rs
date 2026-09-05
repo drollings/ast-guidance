@@ -173,6 +173,11 @@ pub const THERE: &[&str] = &["there"];
 /// attachment gates; relative/subordinator uses keep their own categories).
 pub const WH_ADVERBIAL: &[&str] = &["where", "why", "how", "when"];
 
+/// Dual-class `get`/`got` (AUX-lexed passive/causative host vs. lexical main
+/// verb; `gets` never needs the bit — absent from [`AUX`], it already reads
+/// VERB through the closed verb list).
+pub const GET: &[&str] = &["get", "got"];
+
 /// Build the lowercased-orth → flag-bits map for [`LexiconConfig`](crate::lexeme::LexiconConfig).
 #[must_use]
 pub fn function_word_bits() -> HashMap<String, u64> {
@@ -210,6 +215,7 @@ pub fn function_word_bits() -> HashMap<String, u64> {
         (BE_CLITIC, Attribute::IsBeClitic),
         (THERE, Attribute::IsThereWord),
         (WH_ADVERBIAL, Attribute::IsWhAdverbial),
+        (GET, Attribute::IsGetWord),
     ];
     let mut map = HashMap::new();
     for (words, attr) in sets {

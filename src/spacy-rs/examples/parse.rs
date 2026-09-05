@@ -22,23 +22,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let pipe = NlpPipeline::en_default()?;
-    let (doc, result) =
+    let (_doc, result) =
         pipe.process_sync_with_confidence(&text, None, None, RefinePolicy::default())?;
 
-    println!("{:<4} {:<16} {:<8} {:<6} {:<10} {}", "i", "text", "upos", "head", "dep", "lemma");
-    for i in 0..doc.len() {
-        let tok = doc.token(i);
-        let strings = doc.vocab().strings();
-        let dep = strings.get(tok.dep).map(|s| s.to_string()).unwrap_or_else(|| format!("#{}", tok.dep));
-        let lemma = strings.get(tok.lemma).map(|s| s.to_string()).unwrap_or_default();
+    // The table reads the same `AnnotationSet` the JSON below serializes,
+    // so the two views cannot disagree (`head` is the relative offset from
+    // the record contract: `token.i + head == head_index`).
+    println!("{:<4} {:<16} {:<8} {:<6} {:<10} lemma", "i", "text", "upos", "head", "dep");
+    for (i, rec) in result.records.0.iter().enumerate() {
         println!(
-            "{:<4} {:<16} {:<8?} {:<6} {:<10} {}",
-            i,
-            doc.token_text(i),
-            tok.pos,
-            doc.head_index(i),
-            dep,
-            lemma
+            "{:<4} {:<16} {:<8} {:<6} {:<10} {}",
+            i, rec.text, rec.pos, rec.head, rec.dep, rec.lemma
         );
     }
     println!("\nwinning rung : {:?}", result.source);

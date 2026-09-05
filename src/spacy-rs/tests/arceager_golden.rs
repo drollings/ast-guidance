@@ -325,6 +325,46 @@ fn temporal_today_after_be_stays_nominal() {
 }
 
 #[test]
+fn modal_question_bare_verb_is_verbal() {
+    // Refs (UD polar-05): work → verb/root, this → pron/nsubj → work, Will
+    // → aux → work. The DET-anchored inversion pass needs a determiner-led
+    // subject (`Did the report arrive`); here the subject is a bare
+    // demonstrative, so the predicate strands as a nominal object under a
+    // stranded modal. The modal-question frame restores the verb tag and
+    // pronounces the demonstrative alongside.
+    let (_doc, set) = parse("Will this work?");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (will, this, work) = (at("Will"), at("this"), at("work"));
+    assert_eq!(pos[work], "verb", "pos: {pos:?}");
+    assert_eq!(deps[work], "root");
+    assert_eq!(pos[this], "pron", "pos: {pos:?}");
+    assert_eq!(deps[this], "nsubj", "deps: {deps:?}");
+    assert_eq!(this as i32 + set.0[this].head, work as i32);
+    assert_eq!(deps[will], "aux", "deps: {deps:?}");
+    assert_eq!(will as i32 + set.0[will].head, work as i32);
+    // Determined frame: the modal license leaves no POS doubt, so Track B
+    // stays quiet.
+    let (conf, _, _) = ambiguity_of("Will this work?");
+    assert_eq!(conf.oracle_tie_count, 0, "licensed inversion must not tie: {conf:?}");
+}
+
+#[test]
+fn be_hosted_question_keeps_nominal_subject() {
+    // Must-NOT-fire control for the modal-question gate: a be-host
+    // (`Is lunch ready`) is copular inversion, never a bare-infinitive
+    // frame — lunch keeps its nominal subject reading under the ADJ
+    // predicate.
+    let (_doc, set) = parse("Is lunch ready?");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("lunch")], "noun", "pos: {pos:?}");
+    assert_eq!(deps[at("lunch")], "nsubj", "deps: {deps:?}");
+}
+
+#[test]
 fn possessive_s_is_not_aux() {
     // Must-NOT-fire: possessive 's (host is a noun, not a pronoun) keeps its
     // non-aux tag; the UD case-marker reading is future work, but aux is
@@ -1701,6 +1741,80 @@ fn relative_matrix_verb_that_clause_is_verb() {
 }
 
 #[test]
+fn relcl_matrix_sform_with_complement_is_verbal() {
+    // Refs (UD relative-04): stands → verb/root, house → nsubj → stands,
+    // grew → relcl → house. The `-s` morphology is verbal after a finite
+    // verb — no nominal `-s` reading exists there — so the matrix verb
+    // crowns even with a complement (`empty`) ahead, which the
+    // sentence-final matrix pass never sees. (`empty` stays the honest
+    // residual: acomp after a non-linking verb needs lexicon knowledge.
+    // `where` keeps the parser's SCONJ mark-arm convention against the
+    // ref's ADP — a tag-convention split, not a parse error.)
+    let (_doc, set) = parse("The house where I grew stands empty.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (house, grew, stands) = (at("house"), at("grew"), at("stands"));
+    assert_eq!(pos[stands], "verb", "pos: {pos:?}");
+    assert_eq!(deps[stands], "root");
+    assert_eq!(deps[house], "nsubj", "deps: {deps:?}");
+    assert_eq!(house as i32 + set.0[house].head, stands as i32);
+    assert_eq!(deps[grew], "relcl", "deps: {deps:?}");
+    assert_eq!(grew as i32 + set.0[grew].head, house as i32);
+    // Determined frame: morphology licenses the reading outright, so
+    // Track B stays quiet.
+    let (conf, _, _) = ambiguity_of("The house where I grew stands empty.");
+    assert_eq!(conf.oracle_tie_count, 0, "licensed matrix must not tie: {conf:?}");
+}
+
+#[test]
+fn relcl_matrix_base_with_complement_is_verbal() {
+    // Refs (UD relative-09): improve → verb/root, Players → nsubj, fast →
+    // advmod → improve. A bare-form matrix verb is licensed by the relcl
+    // frame plus the overt adverbial complement ahead.
+    let (_doc, set) = parse("Players who practice improve fast.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (players, practice, improve, fast) =
+        (at("Players"), at("practice"), at("improve"), at("fast"));
+    assert_eq!(pos[improve], "verb", "pos: {pos:?}");
+    assert_eq!(deps[improve], "root");
+    assert_eq!(deps[players], "nsubj", "deps: {deps:?}");
+    assert_eq!(players as i32 + set.0[players].head, improve as i32);
+    assert_eq!(deps[practice], "relcl", "deps: {deps:?}");
+    assert_eq!(deps[fast], "advmod", "deps: {deps:?}");
+    assert_eq!(fast as i32 + set.0[fast].head, improve as i32);
+}
+
+#[test]
+fn markerless_verb_verb_stays_nominal() {
+    // Must-NOT-fire control for the relcl-frame gate: without a
+    // nominal-headed relativizer (`eat accumulates` — no who/that/where),
+    // an `-s` word after a verb keeps its object-noun reading. The
+    // garden-path misparse is information-theoretic without lexicon
+    // knowledge, and must stay a confident-structural miss rather than a
+    // rule invention.
+    let (_doc, set) = parse("Fat people eat accumulates.");
+    let pos = pos_of(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("accumulates")], "noun", "pos: {pos:?}");
+}
+
+#[test]
+fn sform_object_after_verb_stays_nominal() {
+    // Must-NOT-fire control for the complement gate: an `-s` word after a
+    // verb with no relativizer frame (`helps mornings` — coordination, not
+    // a relative clause) is the plural object noun, never a matrix verb.
+    let (_doc, set) = parse("Tea or coffee helps mornings.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    assert_eq!(pos[at("mornings")], "noun", "pos: {pos:?}");
+    assert_eq!(deps[at("mornings")], "dobj", "deps: {deps:?}");
+}
+
+#[test]
 fn because_clause_verb_attaches_ccomp() {
     // Refs (UD subordinate-02/07): snowed → ccomp → stayed. The clause verb
     // strands in repair-dep: the matrix verb reduces before the subordinate
@@ -2961,6 +3075,30 @@ fn ditransitive_recipient_is_iobj() {
     assert_eq!(me as i32 + set.0[me].head, give as i32);
     assert_eq!(deps[report], "dobj", "deps: {deps:?}");
     assert_eq!(report as i32 + set.0[report].head, give as i32);
+}
+
+#[test]
+fn get_imperative_is_verbal() {
+    // Refs (UD dative-06): Get → verb/root, me → iobj → Get, coffee →
+    // dobj → Get. The closed map lexes `get`/`got` as AUX, so the lexical
+    // main verb strands as an aux-dependent and the object pronoun roots.
+    // The get-word bit restores the verb tag; the existing ditransitive
+    // frame does the rest.
+    let (_doc, set) = parse("Get me a coffee.");
+    let pos = pos_of(&set);
+    let deps = deps(&set);
+    let at = |w: &str| set.0.iter().position(|r| r.text == w).expect(w);
+    let (get, me, coffee) = (at("Get"), at("me"), at("coffee"));
+    assert_eq!(pos[get], "verb", "pos: {pos:?}");
+    assert_eq!(deps[get], "root");
+    assert_eq!(deps[me], "iobj", "deps: {deps:?}");
+    assert_eq!(me as i32 + set.0[me].head, get as i32);
+    assert_eq!(deps[coffee], "dobj", "deps: {deps:?}");
+    assert_eq!(coffee as i32 + set.0[coffee].head, get as i32);
+    // Determined frame: the complement license leaves no POS doubt, so
+    // Track B stays quiet.
+    let (conf, _, _) = ambiguity_of("Get me a coffee.");
+    assert_eq!(conf.oracle_tie_count, 0, "licensed imperative must not tie: {conf:?}");
 }
 
 #[test]

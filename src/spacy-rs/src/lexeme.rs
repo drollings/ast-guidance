@@ -322,6 +322,11 @@ impl LexemeFlags {
     pub const fn is_wh_adverbial(self) -> bool {
         self.check(Attribute::IsWhAdverbial.id())
     }
+    /// Dual-class `get`/`got` (AUX-lexed host vs. lexical main verb).
+    #[must_use]
+    pub const fn is_get_word(self) -> bool {
+        self.check(Attribute::IsGetWord.id())
+    }
 }
 
 /// A word-type record: the surface-shape facts for one orth, shared by all

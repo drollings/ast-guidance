@@ -33,11 +33,11 @@ pub enum Attribute {
     IsLeftPunct = 16,
     IsRightPunct = 17,
     IsCurrency = 18,
-    // ── closed-class function-word flags (ids 19..=47) ──
+    // ── closed-class function-word flags (ids 19..=52) ──
     // Populated per language from `LexiconConfig::function_words` at lexeme
     // intern time; the parser matches these bits instead of hard-coded word
     // lists, so a different language blob re-categorizes without code
-    // changes. Bits 48–63 stay reserved.
+    // changes. Bits 53–63 stay reserved.
     /// Closed POS-class words (determiners).
     IsDetWord = 19,
     /// Closed POS-class words (adpositions).
@@ -105,6 +105,9 @@ pub enum Attribute {
     IsThereWord = 50,
     /// Interrogative adverbials (`where`, `why`, `how`, `when`).
     IsWhAdverbial = 51,
+    /// Dual-class `get`/`got` (AUX-lexed passive/causative host vs. lexical
+    /// main verb — the imperative gate reads this bit).
+    IsGetWord = 52,
     // ── value attributes (ids ≥ 64) ──
     Id = 64,
     Orth = 65,
@@ -197,6 +200,7 @@ impl Attribute {
             Self::IsBeClitic => 49,
             Self::IsThereWord => 50,
             Self::IsWhAdverbial => 51,
+            Self::IsGetWord => 52,
             Self::Id => 64,
             Self::Orth => 65,
             Self::Lower => 66,
@@ -230,7 +234,7 @@ impl Attribute {
     }
 
     /// Reconstruct an [`Attribute`] from a numeric id, mapping the reserved
-    /// flag slots 48–63 (and anything unknown) to [`Attribute::Other`].
+    /// flag slots 53–63 (and anything unknown) to [`Attribute::Other`].
     #[must_use]
     pub const fn from_id(id: u16) -> Self {
         match id {
@@ -285,6 +289,7 @@ impl Attribute {
             49 => Self::IsBeClitic,
             50 => Self::IsThereWord,
             51 => Self::IsWhAdverbial,
+            52 => Self::IsGetWord,
             64 => Self::Id,
             65 => Self::Orth,
             66 => Self::Lower,

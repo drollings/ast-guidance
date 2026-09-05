@@ -412,6 +412,28 @@ fn refine_pos_imperative_non_det_object(texts: &[String], pos: &mut [Upos], flag
     }
 }
 
+/// Dual-class `get`/`got` imperative (`Get me a coffee`). The closed map
+/// lexes both as AUX (passive/causative hosts), so a lexical main-verb
+/// `Get` strands as an aux-dependent and its object pronouns root the
+/// sentence. Upgrades a sentence-initial AUX-tagged get-word to VERB with
+/// a nominal/pronoun complement ahead in the clause — the ditransitive
+/// frame (`me a coffee`) then lands through the existing iobj/dobj arms.
+/// Guards: non-initial uses and complement-less frames (passives,
+/// causatives) never match. Known boundary: `get` + adjectival complement
+/// (`get dressed`, no corpus instance) stays approximate. Same O(n)
+/// frame-scan shape as the other refines.
+fn refine_pos_get_imperative(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
+    if texts.is_empty() || pos[0] != Upos::Aux || !flags[0].is_get_word() {
+        return;
+    }
+    let complement = (1..texts.len())
+        .take_while(|&k| pos[k] != Upos::Punct)
+        .any(|k| matches!(pos[k], Upos::Pron | Upos::Det | Upos::Noun | Upos::Propn));
+    if complement {
+        pos[0] = Upos::Verb;
+    }
+}
+
 /// Bare past-tense transitive (`John opened the door`, `Anna finished her
 /// lunch`). An -ed word with a bare-initial nominal subject and a
 /// determiner-led object is a past-tense predicate: -ed adjectives live in
@@ -583,7 +605,80 @@ fn refine_pos_relative_matrix_verb(texts: &[String], pos: &mut [Upos], flags: &[
     }
 }
 
-/// Comma-framed `-ly` adverbial (`Sadly, …`, `…, frankly, …`). The tagger
+/// Matrix predicate after a relative clause with a complement ahead
+/// (`stands empty`, `improve fast`, `ducks out …`). The existing
+/// relative-matrix pass owns the sentence-final shape (`barked ran off`);
+/// here the matrix verb carries material after it, so that pass's final
+/// gate never sees it and the verb strands as a nominal object — the
+/// relcl verb keeps the crown and the whole clause misattaches.
+/// Two licensed readings sharing one frame gate (a nominal-headed
+/// relativizer earlier whose clause verb is the immediately preceding
+/// VERB — the same `closes_relcl` shape as the final pass, so fragments
+/// and bare coordinations never match):
+///
+/// - an `-s` form (`stands`, `ducks`) is verbal by morphology — English
+///   has no nominal `-s` reading after a finite verb — and additionally
+///   licenses a following preposition (`ducks out on weekends`);
+/// - a bare form (`improve`) needs an overt nominal/adjectival/adverbial
+///   complement or determiner directly after it (`improve fast`).
+///
+/// Guards (mirroring the final pass): finite verbs are never capitalized,
+/// and pre-verbal coordinators/complementizers never match. Known
+/// boundaries: markerless verb–verb sequences (`eat accumulates` — no
+/// relativizer, reads as verb+object without lexicon knowledge) and
+/// bare-form + PP-adjunct (`run out of time`, no corpus instance) stay
+/// approximate. Same O(n) frame-scan shape as the other refines.
+fn refine_pos_relcl_matrix_complement(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
+    // Nominal-headed relativizer positions (the relative-frame gate).
+    let markers: Vec<usize> = (1..texts.len())
+        .filter(|&r| {
+            is_relative_marker(flags[r]) && matches!(pos[r - 1], Upos::Noun | Upos::Propn)
+        })
+        .collect();
+    if markers.is_empty() {
+        return;
+    }
+    for i in 1..texts.len() {
+        if pos[i] != Upos::Noun || pos[i - 1] != Upos::Verb {
+            continue;
+        }
+        // A finite matrix verb is never capitalized.
+        if !texts[i].chars().next().is_some_and(|c| c.is_lowercase()) {
+            continue;
+        }
+        // Sentence-final targets belong to the existing matrix pass.
+        if texts[i + 1..].iter().all(|t| {
+            let w = t.as_str();
+            matches!(w, "." | "!" | "?" | ";" | ":" | "," | "—" | "--")
+        }) {
+            continue;
+        }
+        // The host verb must be the first verb after some marker: no other
+        // VERB may stand between that marker and the host.
+        let closes_relcl = markers.iter().any(|&r| {
+            r < i - 1 && (r + 1..i - 1).all(|j| pos[j] != Upos::Verb)
+        });
+        if !closes_relcl {
+            continue;
+        }
+        let word = texts[i].as_str();
+        let s_form = word.len() > 3
+            && word
+                .get(word.len() - 1..)
+                .is_some_and(|sfx| sfx.eq_ignore_ascii_case("s"));
+        let next = pos[i + 1];
+        // Bare forms need a nominal/adjectival/adverbial complement or a
+        // determiner; `-s` morphology additionally licenses a following
+        // preposition (the adjunct PP of `ducks out on weekends`).
+        let licensed = matches!(
+            next,
+            Upos::Noun | Upos::Propn | Upos::Pron | Upos::Adj | Upos::Adv | Upos::Det
+        ) || (s_form && next == Upos::Adp);
+        if licensed {
+            pos[i] = Upos::Verb;
+        }
+    }
+}
 /// has no ADV path, so sentence/manner adverbials fall through to NOUN —
 /// and sentence-initial ones even steal root. Upgrades an alpha-fallback
 /// NOUN to ADV only for an `-ly` form (allocation-free suffix check, same
@@ -1193,6 +1288,50 @@ fn refine_pos_inversion_verb(texts: &[String], pos: &mut [Upos], flags: &[Lexeme
             continue;
         }
         pos[i] = Upos::Verb;
+    }
+}
+
+/// Bare verb of a modal-question inversion (`Will this work?`). The sibling
+/// inversion pass owns the DET-led-subject shape (`Did the report arrive`);
+/// here the subject is a bare nominal or pronoun with no determiner, so
+/// that pass's DET anchor never matches and the predicate strands as the
+/// sentence root's nominal object. Upgrades a clause-final alpha-fallback
+/// NOUN to VERB after a modal/do AUX + nominal subject. Guards: be-hosts
+/// (`Is lunch ready` — copular inversion keeps its own dynamics) never
+/// match the bare-infinitive-host key, and verbs found by earlier passes
+/// (`Can we leave`, `Do you play` via the pronoun-subject pass) never
+/// match. A demonstrative subject in this frame (`this`) is pronominal —
+/// retagged alongside, since the demonstrative-object pass only fires on
+/// bare (complement-less) position. Known boundary: bare inversions with a
+/// full-NP subject (`Did John arrive`, no corpus instance) need subject-NP
+/// tracking, not this DET-less shape.
+fn refine_pos_modal_question_verb(texts: &[String], pos: &mut [Upos], flags: &[LexemeFlags]) {
+    for i in 2..texts.len() {
+        if pos[i] != Upos::Noun {
+            continue;
+        }
+        if !texts[i].chars().next().is_some_and(|c| c.is_lowercase()) {
+            continue;
+        }
+        // Clause-final predicate: only trailing punctuation may follow.
+        if !texts[i + 1..].iter().all(|t| {
+            let w = t.as_str();
+            matches!(w, "." | "!" | "?" | ";" | ":" | "," | "—" | "--")
+        }) {
+            continue;
+        }
+        if !matches!(
+            pos[i - 1],
+            Upos::Pron | Upos::Noun | Upos::Propn | Upos::Det
+        ) || pos[i - 2] != Upos::Aux
+            || !is_bare_infinitive_host(flags[i - 2])
+        {
+            continue;
+        }
+        pos[i] = Upos::Verb;
+        if pos[i - 1] == Upos::Det && flags[i - 1].is_demonstrative() {
+            pos[i - 1] = Upos::Pron;
+        }
     }
 }
 
@@ -3121,6 +3260,12 @@ impl ArcEagerAnnotator {
         // marker-initial words never match the bare-noun frames) so the
         // crowned verb feeds the standard dobj dynamics below.
         refine_pos_discourse_initial_verb(&texts, &mut pos, &flags);
+        // Get-imperative pass: sentence-initial AUX-tagged get/got with a
+        // nominal complement → VERB (`Get me a coffee`). Sequenced after
+        // the discourse pass (disjoint: AUX-initial targets match none of
+        // the bare-noun frames); the crowned verb feeds the standard
+        // ditransitive dynamics below.
+        refine_pos_get_imperative(&texts, &mut pos, &flags);
         // Attributive -ly (`quarterly sales`): adverbial by default, but
         // adjectival directly before a nominal head. Sequenced after the
         // discourse pass (Kindly is ADV by now) and after every ADV
@@ -3196,6 +3341,13 @@ impl ArcEagerAnnotator {
         // are visible as the VERB host; disjoint targets (sentence-final
         // only) from the initial-noun positions.
         refine_pos_relative_matrix_verb(&texts, &mut pos, &flags);
+        // Relative-matrix complement pass: matrix NOUN after a relcl VERB
+        // with a complement ahead (`stands empty`, `improve fast`, `ducks
+        // out …`). Sequenced right after the final matrix pass (whose
+        // sentence-final gate leaves exactly these targets); disjoint from
+        // it by construction (non-final targets only). VERB outputs feed
+        // the standard verbal dynamics below.
+        refine_pos_relcl_matrix_complement(&texts, &mut pos, &flags);
         // Adverbial pass: comma-framed -ly NOUN → ADV. Sequenced after the
         // verb passes; targets (NOUN) are disjoint from every verb/ADJ
         // upgrade above, and comma-framed adverbials never feed those
@@ -3238,6 +3390,12 @@ impl ArcEagerAnnotator {
         // arrive`, no corpus instance) need subject-NP tracking, not this
         // DET-anchored shape.
         refine_pos_inversion_verb(&texts, &mut pos, &flags);
+        // Modal-question pass: modal/do AUX + bare nominal subject +
+        // clause-final NOUN → VERB (`Will this work`). Sequenced right
+        // after the DET-anchored inversion pass (disjoint: AUX at i-2 vs.
+        // DET at i-2); VERB outputs feed the standard verbal dynamics, and
+        // the coordination-agreement passes below never match (no CCONJ).
+        refine_pos_modal_question_verb(&texts, &mut pos, &flags);
         // Clausal-coordination predicate agreement: a CCONJ-headed second
         // clause with an overt VERB predicate proves the first predicate
         // verbal (`Prices rose yet wages stalled`: stalled is VERB, so rose
