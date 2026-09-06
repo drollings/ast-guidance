@@ -765,6 +765,11 @@ impl LlmFleet {
         is_onnx.then(|| ((**parsed.model()).to_string(), (**parsed.name()).to_string()))
     }
 }
+/// Fleet-onnx integration tests: every case pins onnx-present behavior
+/// (onnx rows, onnx unload/refuse, onnx id grammar). They need the `onnx`
+/// feature — without it `onnx_weights_impls` is empty by design (fail-open)
+/// and these expectations do not apply.
 #[cfg(test)]
+#[cfg(feature = "onnx")]
 #[path = "../../tests/instances_traits.rs"]
 mod tests;

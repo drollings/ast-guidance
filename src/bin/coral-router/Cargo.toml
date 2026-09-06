@@ -5,9 +5,11 @@ edition.workspace = true
 
 [dependencies]
 fluent-db = { path = "../../db" }
-fluent-router = { path = "../../router" }
+# `default-features = false` on both onnx-touching deps keeps the default
+# binary ort-free (`ort`/`tokenizers` only via the `onnx` feature below).
+fluent-router = { path = "../../router", default-features = false }
 fluent-concept = { path = "../../concept" }
-fluent-onnx = { path = "../../fluent-onnx" }
+fluent-onnx = { path = "../../fluent-onnx", default-features = false }
 fluent-types = { path = "../../types" }
 fluent-concurrency = { path = "../../fluent-concurrency" }
 common-core = { path = "../../common-core" }
@@ -25,5 +27,8 @@ tracing = { workspace = true }
 tracing-subscriber = "0.3"
 
 [features]
-default = ["onnx"]
+# Opt-in: `--features onnx` pulls `ort` + `tokenizers` via `fluent-onnx/onnx`
+# and enables the router's onnx wiring. The default binary is ort-free
+# (onnx-declared models fail open to plain HTTP entries with a loud warning).
+default = []
 onnx = ["fluent-router/onnx", "fluent-onnx/onnx"]

@@ -524,6 +524,11 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
             .and_then(|reg| {
                 fluent_router::ort::onnx_chat_backend(reg, onnx_llm_key).ok().flatten()
             });
+        // Context-bound backends need the onnx-gated `OnnxWeights` type, so
+        // they only exist in an `onnx` build. Ort-free builds resolve the bare
+        // generative key (always `None` there — the fallback above — fail-open)
+        // and never serve a named onnx context.
+        #[cfg(feature = "onnx")]
         let llm_weights = match (onnx_registry.as_ref(), role) {
             (Some(reg), Some(role)) => Some(Arc::new(
                 fluent_router::ort::OnnxWeights::new(
@@ -551,14 +556,25 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
                 return None;
             }
             match instance {
+                #[cfg(feature = "onnx")]
                 Some(name) => llm_weights.as_ref().and_then(|w| {
                     fluent_router::ort::onnx_context_backend(w, name).ok().flatten()
                 }),
+                #[cfg(not(feature = "onnx"))]
+                Some(_) => None,
                 None if has_instances => {
                     let ctx = pool_context.clone()?;
-                    llm_weights.as_ref().and_then(|w| {
-                        fluent_router::ort::onnx_context_backend(w, &ctx).ok().flatten()
-                    })
+                    #[cfg(feature = "onnx")]
+                    {
+                        llm_weights.as_ref().and_then(|w| {
+                            fluent_router::ort::onnx_context_backend(w, &ctx).ok().flatten()
+                        })
+                    }
+                    #[cfg(not(feature = "onnx"))]
+                    {
+                        let _ = ctx;
+                        None
+                    }
                 }
                 None => resolver_backend.clone(),
             }

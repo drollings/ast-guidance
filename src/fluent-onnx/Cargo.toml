@@ -7,11 +7,11 @@ edition.workspace = true
 description = "ONNX / ort workers for Coral Router + spacy-rs: encoder, two-tower, PII, ColBERT"
 
 [features]
-# Default-on (precedent: fluent-db's `sqlite`). The `ort` code paths (session
-# loading, encoder/two-tower/… workers) are gated behind this feature so a
-# no-ort build still compiles: the config/lifecycle types and the registry
-# (with its injected `SessionLoader` seam) are ort-free.
-default = ["onnx"]
+# Opt-in (off by default) so a default build is ort-free: the config/lifecycle
+# types and the registry (with its injected `SessionLoader` seam) compile
+# without `ort`/`tokenizers`. Enable `onnx` for the real session loading and
+# encoder/two-tower/… workers (pulls in `ort` + `tokenizers`).
+default = []
 onnx = ["dep:ort", "dep:tokenizers"]
 # Real-inference tests (tests/live/, `#[ignore]` + gated), run only via
 # `make ort-test-live` / `make test-live`.

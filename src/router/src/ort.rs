@@ -8,10 +8,12 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "onnx")]
 use fluent_llm::runtime::LlmWeights;
 use fluent_onnx::{OrtError, OrtSessionRegistry};
 
 use crate::config::RouterConfig;
+#[cfg(feature = "onnx")]
 use crate::instances::manager::resume_snapshot_name;
 
 #[cfg(feature = "onnx")]
@@ -1163,6 +1165,7 @@ impl OnnxWeights {
 /// `instances` block (name-or-key match, `max_ctx` applied), else a default
 /// profile inheriting the role's global `max_ctx` and pin. Shared by
 /// `OnnxWeights::ensure_context` and the context-bound `OnnxChatBackend`.
+#[cfg(feature = "onnx")]
 fn onnx_role_profile_for(role: &fluent_onnx::OnnxRoleConfig, name: &str) -> fluent_onnx::OnnxContextProfile {
     if let Some((key, p)) = role.instances.as_ref().and_then(|m| {
         m.iter()

@@ -1,8 +1,11 @@
+#[cfg(feature = "onnx")]
 use crate::session::ort_loader::is_gpu_provider;
 
     /// The GPU-provider classification the loader dispatches on — the
     /// `"gpu"`/`"migraphx"` config values must map to the AMD ROCm path
     /// (case-insensitive), and CPU must never be misclassified.
+    /// Loader-gated: `ort_loader` (and `is_gpu_provider`) need `ort`.
+    #[cfg(feature = "onnx")]
     #[test]
     fn gpu_provider_classification() {
         for gpu in ["gpu", "GPU", "migraphx", "MIGraphX", "Migraphx"] {

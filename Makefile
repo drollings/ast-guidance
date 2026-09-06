@@ -34,9 +34,22 @@ CONFIG      := .guidance/guidance-config.json
 INSTALLDIR  := $(HOME)/.local/bin
 
 # The MIGraphX-enabled ONNX Runtime dylib (AMD ROCm GPU EP) the router loads via
-# ort's `load-dynamic` for `execution_provider: "gpu"`. Override with
-# `make router-start ORT_DYLIB_PATH=/path/to/libonnxruntime.so`.
+# ort's `load-dynamic` for `execution_provider: "gpu"`. Only used by `onnx`
+# builds (see ROUTER_FEATURES below); ort-free default builds ignore it.
+# Override with `make router-start ORT_DYLIB_PATH=/path/to/libonnxruntime.so`.
 ORT_DYLIB_PATH ?= /lib64/libonnxruntime.so.1.28.0
+
+# ── ONNX / ort opt-in ────────────────────────────────────────────────────────
+# The `fluent-onnx` workers (`ort` + `tokenizers`) are NOT built by default:
+# `fluent-onnx`, `fluent-router`, and `coral-router` all ship `default = []`,
+# and the `onnx` feature (`fluent-onnx/onnx` → `ort` + `tokenizers`) is strictly
+# opt-in. A default build is ort-free (`cargo tree -p fluent-router -i ort`
+# matches nothing); onnx-declared models fail open with a loud warning.
+#
+#   make router ROUTER_FEATURES=onnx        # one-off onnx build
+#   make router-onnx / router-start-onnx    # convenience targets (same thing)
+ROUTER_FEATURES ?=
+ROUTER_FEATURE_ARGS := $(if $(ROUTER_FEATURES),--features $(ROUTER_FEATURES))
 
 RUST_SRC_DIR := src
 GUIDANCE_DIR  := .guidance
@@ -141,8 +154,8 @@ $(CARGO_BIN): $(RUST_SRC_FILES)
 	$(Q)cargo build --bin guidance
 
 $(CORAL_ROUTER_BIN): $(RUST_SRC_FILES)
-	$(Q)echo "Building coral-router"
-	$(Q)cargo build --bin coral-router
+	$(Q)echo "Building coral-router $(if $(ROUTER_FEATURES),with features: $(ROUTER_FEATURES), (ort-free default))"
+	$(Q)cargo build --bin coral-router $(ROUTER_FEATURE_ARGS)
 
 .PHONY: install
 install: $(CARGO_BIN) $(CORAL_ROUTER_BIN)
@@ -154,7 +167,11 @@ install: $(CARGO_BIN) $(CORAL_ROUTER_BIN)
 # ── Router Targets ────────────────────────────────────────────────────────────
 
 .PHONY: router
-router: $(CORAL_ROUTER_BIN) ## Build coral-router (fast, no run; the base for every other router target)
+router: $(CORAL_ROUTER_BIN) ## Build coral-router (fast, no run; ort-free unless ROUTER_FEATURES=onnx)
+
+.PHONY: router-onnx
+router-onnx: ## Build coral-router with the ONNX fleet (ort + tokenizers via --features onnx)
+	$(Q)$(MAKE) router ROUTER_FEATURES=onnx
 
 # Kill any running coral-router and wait for it to actually exit before the
 # caller starts a fresh one. The router is the process owner of its spawned
@@ -209,48 +226,56 @@ doc-check: ## Doc consistency lint — types named in skill/router docs must exi
 	$(Q)bin/doc-check.sh --types
 
 .PHONY: router-test
-router-test: $(CORAL_ROUTER_BIN) ## Run fluent-router unit/golden/e2e tests + a --help dry-run of the built binary (stops a running router first)
+router-test: $(CORAL_ROUTER_BIN) ## Run fluent-router unit/golden/e2e tests + a --help dry-run of the built binary (ort-free unless ROUTER_FEATURES=onnx; stops a running router first)
 	$(stop-router)
-	$(Q)echo "Running fluent-router unit + golden + e2e mock tests"
-	$(Q)cargo test -p fluent-router
+	$(Q)echo "Running fluent-router unit + golden + e2e mock tests $(if $(ROUTER_FEATURES),with features: $(ROUTER_FEATURES),(ort-free default))"
+	$(Q)cargo test -p fluent-router $(ROUTER_FEATURE_ARGS)
 	$(Q)echo "Validating coral-router --help"
 	$(Q)$(CORAL_ROUTER_BIN) --help > /dev/null && echo "All router tests passed." || echo "ERRROR: coral-router did NOT successfully run."
 
+.PHONY: router-test-onnx
+router-test-onnx: ## router-test with the ONNX fleet (ort + tokenizers via --features onnx)
+	$(Q)$(MAKE) router-test ROUTER_FEATURES=onnx
+
 .PHONY: router-test-all
-router-test-all: $(CORAL_ROUTER_BIN) ## router-test + coral-context HNSW benchmarks (large, slow; stops a running router first)
+router-test-all: $(CORAL_ROUTER_BIN) ## router-test + coral-context HNSW benchmarks (large, slow; ort-free unless ROUTER_FEATURES=onnx; stops a running router first)
 	$(stop-router)
 	$(Q)echo "Running fluent-router unit + golden + e2e mock tests"
-	$(Q)cargo test -p fluent-router
+	$(Q)cargo test -p fluent-router $(ROUTER_FEATURE_ARGS)
 	$(Q)echo "Running coral-context tests with HNSW benchmarks"
 	$(Q)cargo test -p coral-context --features hnsw-bench -- --ignored --nocapture
 	$(Q)echo "Validating coral-router --help"
 	$(Q)$(CORAL_ROUTER_BIN) --help > /dev/null && echo "All router tests passed." || echo "ERRROR: coral-router did NOT successfully run."
 
 .PHONY: router-start
-router-start: $(CORAL_ROUTER_BIN) ## Build (if needed), (re)start coral-router in real mode on :8079, and wait for /health (stops the old tree first)
+router-start: $(CORAL_ROUTER_BIN) ## Build (if needed), (re)start coral-router in real mode on :8079, and wait for /health (ort-free unless ROUTER_FEATURES=onnx; stops the old tree first)
 	$(stop-router)
-	$(Q)echo "Starting coral-router"
+	$(Q)echo "Starting coral-router $(if $(ROUTER_FEATURES),with features: $(ROUTER_FEATURES),(ort-free default))"
 	$(Q)nohup env ORT_DYLIB_PATH=$(ORT_DYLIB_PATH) $(CORAL_ROUTER_BIN) start -c $(CORAL_ROUTER_CONFIG) > $(ROUTER_LOG) 2>&1 &
 	$(Q)bash $(ROUTER_WAIT_SCRIPT) $(CORAL_ROUTER_HEALTH_URL) $(ROUTER_START_TIMEOUT_S) $(ROUTER_LOG)
 
+.PHONY: router-start-onnx
+router-start-onnx: ## router-start with the ONNX fleet (ort + tokenizers via --features onnx)
+	$(Q)$(MAKE) router-start ROUTER_FEATURES=onnx
+
 .PHONY: router-mock
-router-mock: ## Run the config-synced routing integration tests (intent -> model_group, derived from env/coral-router.json; replaces the former bin/router-mock-tests.sh curl smoke suite)
+router-mock: ## Run the config-synced routing integration tests (intent -> model_group, derived from env/coral-router.json; ort-free unless ROUTER_FEATURES=onnx)
 	$(stop-router)
 	$(Q)echo "Running config-synced routing integration tests (intent -> model_group)"
-	$(Q)cargo test -p fluent-router config_route_tests -- --nocapture
+	$(Q)cargo test -p fluent-router $(ROUTER_FEATURE_ARGS) config_route_tests -- --nocapture
 
 .PHONY: router-ledger
-router-ledger: ## Boot with --ledger-default and assert LOD0+LOD5 eager + LOD4 from LOD0 only + cache hit (M4)
+router-ledger: ## Boot with --ledger-default and assert LOD0+LOD5 eager + LOD4 from LOD0 only + cache hit (M4; honors ROUTER_FEATURES)
 	$(stop-router)
 	$(Q)echo "Running ledger LOD lifecycle tests (ledger-default)"
-	$(Q)CORAL_LEDGER_DEFAULT=1 cargo test -p fluent-router ledger -- --nocapture
-	$(Q)cargo test -p fluent-router ledger_golden -- --nocapture
+	$(Q)CORAL_LEDGER_DEFAULT=1 cargo test -p fluent-router $(ROUTER_FEATURE_ARGS) ledger -- --nocapture
+	$(Q)cargo test -p fluent-router $(ROUTER_FEATURE_ARGS) ledger_golden -- --nocapture
 
 .PHONY: router-tree
-router-tree: ## Run config-synced routing tests against the tree config (M7)
+router-tree: ## Run config-synced routing tests against the tree config (M7; honors ROUTER_FEATURES)
 	$(stop-router)
 	$(Q)echo "Running tree config routing tests (flat vs tree equivalence)"
-	$(Q)cargo test -p fluent-router flat_tree -- --nocapture
+	$(Q)cargo test -p fluent-router $(ROUTER_FEATURE_ARGS) flat_tree -- --nocapture
 
 # ── YaGO Taxonomy + Async Parse-Review ───────────────────────────────────────
 # The interlingua spine (ROADMAP_20260826_INTERLINGUA_V2): the YaGO 4.5 class
@@ -266,8 +291,8 @@ yago-load: ## Operator action: download the full YaGO 4.5 taxonomy and regenerat
 review-test: ## Run the async parse-review + interlingua suites: spacy-rs review types, the router review worker + /v1/sessions/{id}/review-parse endpoints, and the ontology loader/reconciliation
 	$(Q)echo "Running parse-review + interlingua suites"
 	$(Q)cargo test -p spacy-rs review
-	$(Q)cargo test -p fluent-router server::review
-	$(Q)cargo test -p fluent-router review_parse
+	$(Q)cargo test -p fluent-router $(ROUTER_FEATURE_ARGS) server::review
+	$(Q)cargo test -p fluent-router $(ROUTER_FEATURE_ARGS) review_parse
 	$(Q)cargo test -p guidance-ontology
 	$(Q)cargo test -p coral-router boot::
 
@@ -282,8 +307,8 @@ review-test: ## Run the async parse-review + interlingua suites: spacy-rs review
 # doc/fluent-onnx/ARCHITECTURE.md §Execution-provider selection.
 
 .PHONY: onnx-gpu-check
-onnx-gpu-check: ## Probe the linked onnxruntime for the AMD ROCm GPU (MIGraphX) EP; CPU-only means `execution_provider: "gpu"` fails open to CPU
-	$(Q)cargo test -p fluent-onnx --features live-ai --test live gpu_provider_available -- --ignored --nocapture
+onnx-gpu-check: ## Probe the linked onnxruntime for the AMD ROCm GPU (MIGraphX) EP; CPU-only means `execution_provider: "gpu"` fails open to CPU (requires --features onnx)
+	$(Q)cargo test -p fluent-onnx --features onnx,live-ai --test live gpu_provider_available -- --ignored --nocapture
 
 # ── Per-Crate Test Targets ──────────────────────────────────────────────────
 # Run one crate's Tier-0/1/2 suite (unit + integration) WITHOUT enabling
@@ -303,12 +328,18 @@ TEST_CRATES := \
 	spacy:spacy-rs \
 	ort:fluent-onnx
 
+# `test-ort` stays hermetic and ort-free (the default `fluent-onnx` build);
+# `test-ort-onnx` runs the same suite with the ort workers compiled in.
 define test-crate-rule
 .PHONY: test-$(1)
 test-$(1): ## Run the $(2) Tier-0/1/2 suite (hermetic; no live-AI)
 	$(Q)cargo test -p $(2)
 endef
 $(foreach pair,$(TEST_CRATES),$(eval $(call test-crate-rule,$(firstword $(subst :, ,$(pair))),$(lastword $(subst :, ,$(pair))))))
+
+.PHONY: test-ort-onnx
+test-ort-onnx: ## Run the fluent-onnx Tier-0/1/2 suite with the ort workers (onnx + tokenizers)
+	$(Q)cargo test -p fluent-onnx --features onnx
 
 # ── Live-AI Test Pathway ────────────────────────────────────────────────────
 # THE ONLY pathway that runs real inference. Every live test is `#[ignore]` +
@@ -325,19 +356,33 @@ LIVE_CRATES := \
 	spacy:spacy-rs \
 	ort:fluent-onnx
 
+# Live-AI feature sets per crate shorthand (the `ort` live tests drive real
+# `ort` sessions, so they need `onnx` on top of `live-ai`; every other crate's
+# live tests need `live-ai` only).
+LIVE_FEATURES_ort := onnx,live-ai
+LIVE_FEATURES_router := live-ai
+LIVE_FEATURES_guidance := live-ai
+LIVE_FEATURES_llm := live-ai
+LIVE_FEATURES_spacy := live-ai
+
 define live-crate-rule
 .PHONY: $(1)-test-live
 $(1)-test-live: ## Run the live-AI (real model) tests for $(2); skip-not-fail without env
-	$(Q)cargo test -p $(2) --features live-ai --test live -- --ignored
+	$(Q)cargo test -p $(2) --features $(LIVE_FEATURES_$(1)) --test live -- --ignored
 endef
 $(foreach pair,$(LIVE_CRATES),$(eval $(call live-crate-rule,$(firstword $(subst :, ,$(pair))),$(lastword $(subst :, ,$(pair))))))
 
 .PHONY: test-live
 test-live: ## Run ALL live-AI tests (the ONLY real-inference pathway); skips cleanly without env
 	$(Q)for pair in $(LIVE_CRATES); do \
+		shorthand="$${pair%%:*}"; \
 		pkg="$${pair##*:}"; \
-		echo "==> live-AI tests for $${pkg}"; \
-		cargo test -p "$${pkg}" --features live-ai --test live -- --ignored || exit 1; \
+		case "$$shorthand" in \
+			ort) features="onnx,live-ai" ;; \
+			*) features="live-ai" ;; \
+		esac; \
+		echo "==> live-AI tests for $${pkg} (--features $${features})"; \
+		cargo test -p "$${pkg}" --features "$${features}" --test live -- --ignored || exit 1; \
 	done
 
 # ── Standard Targets ──────────────────────────────────────────────────────────

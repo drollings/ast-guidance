@@ -179,6 +179,8 @@ fn nlp_encoder_fetch_returns_none_for_missing_model() {
 }
 
 /// A doc over the classic "The cat sat." sentence (4 tokens).
+/// Onnx-gated: only the `map_annotations` hermetic tests consume it.
+#[cfg(feature = "onnx")]
 fn doc_for_cat_sat() -> spacy_rs::Doc {
     let vocab = std::sync::Arc::new(spacy_rs::vocab::Vocab::new(
         spacy_rs::lang::en::lexicon_config(),
@@ -268,9 +270,7 @@ mod map_annotations_tests {
 #[test]
 #[cfg(not(feature = "onnx"))]
 fn nlp_encoder_fetch_noop_without_onnx_feature() {
-    let registry = Arc::new(fluent_onnx::OrtSessionRegistry::new(Arc::new(
-        fluent_onnx::OrtSessionLoader,
-    )));
+    let registry = Arc::new(fluent_onnx::OrtSessionRegistry::new(Arc::new(StubLoader)));
     let result = nlp_encoder_fetch(&registry, "encoder").expect("no ort error");
     assert!(result.is_none());
 }
@@ -559,6 +559,7 @@ mod onnx_backend_tests {
         let backend = onnx_chat_backend(&registry, encoder_key).expect("no ort error");
         assert!(backend.is_none(), "non-CausalLm key → None (fail-open)");
     }
+} // mod onnx_backend_tests
 
 /// A stub `ChatBackend` for the resolver-routing tests.
 struct StubBackend(&'static str);
@@ -615,6 +616,9 @@ fn lazy_llm_role() -> fluent_onnx::OnnxRoleConfig {
     }
 }
 
+/// Onnx-gated: only the `OnnxWeights` lifecycle test consumes it (the type
+/// needs `ort`).
+#[cfg(feature = "onnx")]
 fn stub_registry() -> Arc<OrtSessionRegistry> {
     Arc::new(OrtSessionRegistry::new(Arc::new(StubLoader::default())))
 }
@@ -622,6 +626,8 @@ fn stub_registry() -> Arc<OrtSessionRegistry> {
 /// ROADMAP M6: an `Unloadable`+unpinned onnx role stays unloaded at boot
 /// and loads on first `ensure_loaded` (the onnx lazy-residency rule);
 /// `unload` releases it. Registry-level (no real pool/session needed).
+/// Onnx-gated: exercises the real `OnnxWeights` lifecycle (needs `ort`).
+#[cfg(feature = "onnx")]
 #[tokio::test]
 async fn onnx_weights_lazy_role_loads_on_first_use_and_releases() {
     use fluent_llm::runtime::LlmWeights;
@@ -749,5 +755,4 @@ fn pii_prefilter_unregistered_model_falls_back_without_error() {
     // Unregistered key + no auto-enqueue → None.
     let filter = pii_prefilter(None, Some("no-such-pii-model"), false).expect("no ort error");
     assert!(filter.is_none());
-}
 }

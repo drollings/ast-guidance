@@ -2,6 +2,8 @@ use super::*;
 
 /// A shared tokenizer-backed fixture: tokenize `text` with the sample
 /// WordPiece tokenizer and return its per-token byte spans.
+/// Tokenizer-gated: needs the real `tokenizers` backend (`onnx` feature).
+#[cfg(feature = "onnx")]
 fn lfm_spans(text: &str) -> (Vec<String>, Vec<(usize, usize)>) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tokenizer.json");
@@ -27,6 +29,8 @@ fn lfm_spans(text: &str) -> (Vec<String>, Vec<(usize, usize)>) {
 /// A WordPiece tokenizer whose vocab produces subwords (`##` prefix),
 /// OOV (`[UNK]`), and special tokens — enough surface for the golden
 /// corpus to exercise every alignment branch.
+/// Tokenizer-gated with the golden corpus below.
+#[cfg(feature = "onnx")]
 const SAMPLE_TOKENIZER: &str = r####"{
     "version": "1.0",
     "truncation": null,
@@ -138,12 +142,14 @@ fn spacy_spans_handle_multibyte_utf8() {
     );
 }
 
-// ── Golden corpus ──
+// ── Golden corpus (tokenizer-gated: asserts the live tokenizer's offset
+// behavior alongside the aligner's math) ──
 
 /// A golden case: sentence text, its spacy orth list, the expected
 /// `lfm_to_spacy` mapping, and the expected `spacy_to_lfm` ranges. The
 /// LFM spans are produced live from `SAMPLE_TOKENIZER`, so this corpus
 /// asserts BOTH the tokenizer's offset behavior and the aligner's math.
+#[cfg(feature = "onnx")]
 struct Golden {
     text: &'static str,
     spacy_orth: &'static [&'static str],
@@ -152,6 +158,7 @@ struct Golden {
     spacy_to_lfm: &'static [Range<usize>],
 }
 
+#[cfg(feature = "onnx")]
 static GOLDEN_CORPUS: std::sync::LazyLock<Vec<Golden>> = std::sync::LazyLock::new(|| {
     vec![
         Golden {
@@ -188,6 +195,7 @@ static GOLDEN_CORPUS: std::sync::LazyLock<Vec<Golden>> = std::sync::LazyLock::ne
     ]
 });
 
+#[cfg(feature = "onnx")]
 #[test]
 fn golden_corpus_aligns_live_tokenizer_output() {
     for (i, g) in GOLDEN_CORPUS.iter().enumerate() {
@@ -208,6 +216,7 @@ fn golden_corpus_aligns_live_tokenizer_output() {
     }
 }
 
+#[cfg(feature = "onnx")]
 #[test]
 fn golden_corpus_maps_every_lfm_surface_back_through_spans() {
     // A stronger invariant: for every golden case, slicing the text by each
