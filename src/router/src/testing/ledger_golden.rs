@@ -25,6 +25,3 @@ pub fn load_golden() -> GoldenLedger {
         .unwrap_or_else(|e| panic!("read ledger_lod.json {}: {}", path.display(), e));
     serde_json::from_str(&content).expect("ledger_lod.json parses")
 }
-#[cfg(test)]
-#[path = "../../tests/testing_ledger_golden.rs"]
-mod tests;

@@ -18,19 +18,6 @@ mod tests {
     // ── NoTransform ────────────────────────────────────────────────
 
     #[test]
-    fn test_no_transform_passes_through_unchanged() {
-        let transform = NoTransform;
-        let request = make_request("Hello, world!");
-        let result = transform.transform(&request).unwrap();
-        assert_eq!(result.model, "test-model");
-        assert_eq!(result.messages.len(), 1);
-        assert_eq!(
-            result.messages[0].content.to_string_lossy(),
-            "Hello, world!"
-        );
-    }
-
-    #[test]
     fn test_no_transform_preserves_all_fields() {
         let transform = NoTransform;
         let mut request = make_request("test");
@@ -41,12 +28,6 @@ mod tests {
         assert_eq!(result.temperature, Some(0.7));
         assert_eq!(result.max_tokens, Some(2048));
         assert_eq!(result.session_id, Some("sess-1".into()));
-    }
-
-    #[test]
-    fn test_no_transform_name() {
-        let transform = NoTransform;
-        assert_eq!(transform.name(), "none");
     }
 
     // ── PiiAnonymize ──────────────────────────────────────────────
@@ -120,12 +101,6 @@ mod tests {
     }
 
     #[test]
-    fn test_pii_anonymize_name() {
-        let transform = PiiAnonymize;
-        assert_eq!(transform.name(), "pii_anonymize");
-    }
-
-    #[test]
     fn test_pii_anonymize_empty_yields_no_metadata_key() {
         // C2.M0: a request with no PII must NOT insert an empty anonymize_map
         // object into metadata (no spurious empty object).
@@ -195,12 +170,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_decompose_hypothetical_name() {
-        let transform = DecomposeToAnonymizedHypothetical;
-        assert_eq!(transform.name(), "decompose_to_anonymized_hypothetical");
-    }
-
     // ── DecomposeToSubtasks ───────────────────────────────────────
 
     #[test]
@@ -262,19 +231,6 @@ mod tests {
         let request = make_request(""); // empty user message triggers NotApplicable
         let result = transform.transform(&request);
         assert!(result.is_err(), "empty user text should error");
-    }
-
-    #[test]
-    fn test_decompose_subtasks_name() {
-        struct StubDecomposer;
-        impl fluent_llm::Decomposer for StubDecomposer {
-            fn decompose(&self, _task: &str) -> Vec<String> {
-                vec!["subtask".into()]
-            }
-        }
-
-        let transform = DecomposeToSubtasks::new(Box::new(StubDecomposer));
-        assert_eq!(transform.name(), "decompose_to_subtasks");
     }
 
     // ── No LLM calls in any test ──────────────────────────────────

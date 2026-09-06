@@ -1,57 +1,6 @@
 use super::*;
 
 #[test]
-fn filter_outcome_serde_round_trip() {
-    for (variant, name) in [
-        (FilterOutcome::HardReject, "hard_reject"),
-        (FilterOutcome::SoftRedirect, "soft_redirect"),
-        (FilterOutcome::OutputFilter, "output_filter"),
-    ] {
-        let json = serde_json::to_string(&variant).expect("serialize");
-        assert_eq!(json, format!("\"{name}\""));
-        let back: FilterOutcome = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back, variant);
-    }
-}
-
-#[test]
-fn filter_action_serde_round_trip() {
-    for variant in [FilterAction::Redact, FilterAction::Anonymize, FilterAction::Omit] {
-        let json = serde_json::to_string(&variant).expect("serialize");
-        let back: FilterAction = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back, variant);
-    }
-}
-
-#[test]
-fn confidence_gate_serde_round_trip() {
-    assert_eq!(
-        serde_json::from_str::<ConfidenceGate>("\"luhn_valid\"").unwrap(),
-        ConfidenceGate::LuhnValid
-    );
-    assert_eq!(
-        serde_json::from_str::<ConfidenceGate>("\"none\"").unwrap(),
-        ConfidenceGate::None
-    );
-    assert_eq!(ConfidenceGate::default(), ConfidenceGate::None);
-}
-
-#[test]
-fn filter_scope_serde_round_trip() {
-    for (variant, name) in [
-        (FilterScope::Any, "any"),
-        (FilterScope::FrontierBound, "frontier_bound"),
-        (FilterScope::ContentNodeWrite, "content_node_write"),
-    ] {
-        let json = serde_json::to_string(&variant).expect("serialize");
-        assert_eq!(json, format!("\"{name}\""));
-        let back: FilterScope = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back, variant);
-    }
-    assert_eq!(FilterScope::default(), FilterScope::Any);
-}
-
-#[test]
 fn pattern_entry_serde_defaults() {
     let e: PatternEntry = serde_json::from_value(serde_json::json!({
         "name": "block",

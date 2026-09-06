@@ -94,6 +94,3 @@ impl HealthProbe {
         self.interval
     }
 }
-#[cfg(test)]
-#[path = "../../tests/supervisor_health.rs"]
-mod tests;

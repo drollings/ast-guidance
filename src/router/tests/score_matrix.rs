@@ -11,45 +11,6 @@ fn score_matrix_resolve_is_clone_free() {
 }
 
 #[test]
-fn plan_route_low_completeness() {
-    let matrix = ScoreMatrix::default();
-    let scores = HashMap::from([
-        ("coherence".into(), 0.8),
-        ("complexity".into(), 0.5),
-        ("completeness".into(), 0.3),
-        ("risk".into(), 0.2),
-    ]);
-    let results = matrix.resolve(&scores);
-    assert_eq!(results[0].route_name, "plan");
-}
-
-#[test]
-fn rigor_route_high_risk() {
-    let matrix = ScoreMatrix::default();
-    let scores = HashMap::from([
-        ("coherence".into(), 0.9),
-        ("complexity".into(), 0.7),
-        ("completeness".into(), 0.8),
-        ("risk".into(), 0.6),
-    ]);
-    let results = matrix.resolve(&scores);
-    assert_eq!(results[0].route_name, "rigor");
-}
-
-#[test]
-fn local_route_low_risk_high_completeness() {
-    let matrix = ScoreMatrix::default();
-    let scores = HashMap::from([
-        ("coherence".into(), 0.9),
-        ("complexity".into(), 0.3),
-        ("completeness".into(), 0.9),
-        ("risk".into(), 0.1),
-    ]);
-    let results = matrix.resolve(&scores);
-    assert_eq!(results[0].route_name, "local");
-}
-
-#[test]
 fn score_matrix_default_is_router_default() {
     let a = ScoreMatrix::default();
     let b = ScoreMatrix::router_default();

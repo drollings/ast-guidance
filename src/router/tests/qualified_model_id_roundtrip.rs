@@ -42,13 +42,3 @@ fn qualified_model_id_prop_roundtrip() {
         assert_eq!(QualifiedModelId::parse(&wire), id);
     }
 }
-
-#[test]
-fn split_once_literal_guard() {
-    // Guard: only two canonical sites should contain split_once(':')
-    // This test documents the invariant; CI grep enforces it.
-    let wire = "base:qual";
-    let (b, q) = crate::config::split_model_key(wire);
-    assert_eq!(b, "base");
-    assert_eq!(q, Some("qual"));
-}

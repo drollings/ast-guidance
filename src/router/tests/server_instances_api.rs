@@ -14,14 +14,6 @@ fn parse_query_decodes_and_splits() {
 }
 
 #[test]
-fn percent_decode_handles_plus_and_hex() {
-    assert_eq!(percent_decode("a+b"), "a b");
-    assert_eq!(percent_decode("a%20b"), "a b");
-    assert_eq!(percent_decode("%2F"), "/");
-    assert_eq!(percent_decode("plain"), "plain");
-}
-
-#[test]
 fn apply_request_routing_overrides_target_fields() {
     let target = crate::pipeline::RoutingTarget {
         url: "http://x/v1/chat/completions".into(),

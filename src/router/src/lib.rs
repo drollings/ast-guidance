@@ -84,4 +84,5 @@ pub(crate) mod test_support;
 #[cfg(test)]
 pub(crate) mod test_stubs;
 #[cfg(test)]
+#[path = "../tests/mod.rs"]
 mod tests;
