@@ -3,7 +3,6 @@ name = "memory-plugin"
 version = "0.1.0"
 edition = "2021"
 description = "Pluggable memory tier for guidance — deterministic search with structured memory backends"
-license = "MIT OR Apache-2.0"
 
 [dependencies]
 common-core = { path = "../common-core" }
