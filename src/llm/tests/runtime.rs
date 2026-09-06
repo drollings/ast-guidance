@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// A stub weights instance for the hermetic engine tests. Tracks load /
@@ -16,6 +16,7 @@ struct StubWeights {
     rows: Vec<LlmResidencyRow>,
     unloaded: Mutex<usize>,
     contexts: Mutex<Vec<StubContext>>,
+    in_flight: AtomicUsize,
 }
 
 impl StubWeights {
@@ -37,6 +38,7 @@ impl StubWeights {
             rows,
             unloaded: Mutex::new(0),
             contexts: Mutex::new(Vec::new()),
+            in_flight: AtomicUsize::new(0),
         }
     }
 
@@ -59,12 +61,22 @@ impl StubWeights {
             rows: Vec::new(),
             unloaded: Mutex::new(0),
             contexts: Mutex::new(Vec::new()),
+            in_flight: AtomicUsize::new(0),
         }
     }
 
     fn with_refuse_unload(mut self) -> Self {
         self.refuse_unload = true;
         self
+    }
+
+    fn with_last_used(mut self, last_used: i64) -> Self {
+        self.last_used = AtomicI64::new(last_used);
+        self
+    }
+
+    fn set_in_flight(&self, n: usize) {
+        self.in_flight.store(n, Ordering::Relaxed);
     }
 
     fn unload_count(&self) -> usize {
@@ -127,13 +139,35 @@ impl LlmWeights for StubWeights {
     fn eviction_policy(&self) -> EvictionPolicy {
         self.policy
     }
+    fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
+    }
 }
 
-/// A stub context that records destroys (the M1 eviction action).
+/// A stub context that records destroys. A resume-marked stub models the
+/// save-before-evict contract in its `evict` override (snapshot event
+/// first, then the destroy), so the engine test below pins that the pass
+/// drives eviction through `evict()` in order.
 #[derive(Clone)]
 struct StubContext {
     name: &'static str,
     destroyed: Arc<Mutex<usize>>,
+    resume: bool,
+    events: Option<Arc<Mutex<Vec<String>>>>,
+}
+
+impl StubContext {
+    fn new(name: &'static str, destroyed: Arc<Mutex<usize>>) -> Self {
+        Self { name, destroyed, resume: false, events: None }
+    }
+
+    fn resume_marked(
+        name: &'static str,
+        destroyed: Arc<Mutex<usize>>,
+        events: Arc<Mutex<Vec<String>>>,
+    ) -> Self {
+        Self { name, destroyed, resume: true, events: Some(events) }
+    }
 }
 
 #[async_trait::async_trait]
@@ -169,10 +203,25 @@ impl LlmContext for StubContext {
     }
     async fn destroy(&self) -> Result<(), LlmRuntimeError> {
         *self.destroyed.lock().unwrap() += 1;
+        if let Some(events) = &self.events {
+            events.lock().unwrap().push(format!("destroy:{}", self.name));
+        }
         Ok(())
     }
     fn kv_cache(&self) -> Arc<dyn LlmKVCache> {
         Arc::new(StubKvCache)
+    }
+
+    async fn evict(&self) -> Result<(), LlmRuntimeError> {
+        // The resume-marked contract: snapshot first, destroy second. The
+        // engine must drive eviction through this method (never `destroy`
+        // directly) so adapters can preserve state before the drop.
+        if self.resume {
+            if let Some(events) = &self.events {
+                events.lock().unwrap().push(format!("snapshot:{}", self.name));
+            }
+        }
+        self.destroy().await
     }
 }
 
@@ -281,9 +330,9 @@ async fn budget_eviction_footprint_coldness_matches_eviction_order() {
     let destroyed_b = Arc::new(Mutex::new(0usize));
     let destroyed_pinned = Arc::new(Mutex::new(0usize));
     *w.contexts.lock().unwrap() = vec![
-        StubContext { name: "a", destroyed: Arc::clone(&destroyed_a) },
-        StubContext { name: "b", destroyed: Arc::clone(&destroyed_b) },
-        StubContext { name: "pinned", destroyed: Arc::clone(&destroyed_pinned) },
+        StubContext::new("a", Arc::clone(&destroyed_a)),
+        StubContext::new("b", Arc::clone(&destroyed_b)),
+        StubContext::new("pinned", Arc::clone(&destroyed_pinned)),
     ];
 
     // Crank the budget so the pass evicts (mirror the llama over-budget);
@@ -328,6 +377,102 @@ async fn budget_eviction_footprint_coldness_matches_eviction_order() {
     assert_eq!(*destroyed_a.lock().unwrap(), 1, "a destroyed");
     assert_eq!(*destroyed_b.lock().unwrap(), 0, "b untouched (batch reached)");
     assert_eq!(*destroyed_pinned.lock().unwrap(), 0, "pinned never evicted");
+}
+
+#[tokio::test]
+async fn budget_eviction_runs_snapshot_before_destroy_through_evict() {
+    // A resume-marked llama context over budget: the engine must drive the
+    // eviction through `evict()` (never `destroy()` directly) and the
+    // snapshot must be observed before the destroy.
+    let mut work = row("base", "work", false, 100);
+    work.vram_bytes = 2000;
+    let w = Arc::new(StubWeights::llama("base", 5000, true, vec![work]));
+    let destroyed = Arc::new(Mutex::new(0usize));
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    *w.contexts.lock().unwrap() = vec![StubContext::resume_marked(
+        "work",
+        Arc::clone(&destroyed),
+        Arc::clone(&events),
+    )];
+
+    // used = vram 2000 > 500 → exactly one context eviction.
+    let engine = LlmResidencyEngine::new_with_clock(
+        Duration::from_secs(1),
+        Some(500),
+        None,
+        30,
+        1,
+        Arc::new(|| 9_000_000_000i64),
+    );
+    engine.residency_cycle(&[w.clone() as Arc<dyn LlmWeights>]).await.expect("cycle");
+
+    assert_eq!(*destroyed.lock().unwrap(), 1, "context destroyed once");
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["snapshot:work".to_string(), "destroy:work".to_string()],
+        "snapshot observed before destroy, via evict()"
+    );
+}
+
+fn admission_engine(vram_budget: Option<u64>) -> Arc<LlmResidencyEngine> {
+    LlmResidencyEngine::new_with_clock(
+        Duration::from_secs(1),
+        vram_budget,
+        None,
+        30,
+        10,
+        Arc::new(|| 9_000_000_000i64),
+    )
+}
+
+/// One loaded llama weights with a single unpinned context row of `vram`
+/// bytes, registered for engine eviction. Returns the weights and its
+/// destroy counter.
+fn loaded_llama(key: &'static str, vram: u64, last_used: i64) -> (Arc<StubWeights>, Arc<Mutex<usize>>) {
+    let mut ctx = row(key, "work", false, last_used);
+    ctx.vram_bytes = vram;
+    let w = Arc::new(StubWeights::llama(key, 5000, true, vec![ctx]));
+    let destroyed = Arc::new(Mutex::new(0usize));
+    *w.contexts.lock().unwrap() =
+        vec![StubContext::new("work", Arc::clone(&destroyed))];
+    (w, destroyed)
+}
+
+#[tokio::test]
+async fn admission_no_eviction_within_budget() {
+    // used 1000 + required 500 <= 2000 → the load fits, nothing evicted.
+    let (a, destroyed) = loaded_llama("a", 1000, 100);
+    admission_engine(Some(2000))
+        .make_room_for(&[a.clone() as Arc<dyn LlmWeights>], "b", 500, MemoryPool::Vram)
+        .await;
+    assert_eq!(*destroyed.lock().unwrap(), 0, "no eviction within budget");
+}
+
+#[tokio::test]
+async fn admission_evicts_over_budget_and_excludes_target() {
+    // `b` is larger and colder but is the cold target: admission must evict
+    // from `a` and never touch `b`.
+    let (a, destroyed_a) = loaded_llama("a", 1000, 100);
+    let (b, destroyed_b) = loaded_llama("b", 5000, 50);
+    admission_engine(Some(2000))
+        .make_room_for(
+            &[a.clone() as Arc<dyn LlmWeights>, b.clone() as Arc<dyn LlmWeights>],
+            "b",
+            1500,
+            MemoryPool::Vram,
+        )
+        .await;
+    assert_eq!(*destroyed_a.lock().unwrap(), 1, "non-target evicted to make room");
+    assert_eq!(*destroyed_b.lock().unwrap(), 0, "cold target excluded");
+}
+
+#[tokio::test]
+async fn admission_no_budget_or_zero_required_is_noop() {
+    let (a, destroyed) = loaded_llama("a", 1000, 100);
+    let weights = vec![a.clone() as Arc<dyn LlmWeights>];
+    admission_engine(None).make_room_for(&weights, "b", 10_000, MemoryPool::Vram).await;
+    admission_engine(Some(100)).make_room_for(&weights, "b", 0, MemoryPool::Vram).await;
+    assert_eq!(*destroyed.lock().unwrap(), 0, "no budget / zero need → no-op");
 }
 
 #[tokio::test]
@@ -504,7 +649,7 @@ async fn vram_budget_ignores_cpu_offloaded_bytes() {
     let w = Arc::new(StubWeights::llama("base", 14000, true, vec![ctx]));
     let destroyed = Arc::new(Mutex::new(0usize));
     *w.contexts.lock().unwrap() =
-        vec![StubContext { name: "default", destroyed: Arc::clone(&destroyed) }];
+        vec![StubContext::new("default", Arc::clone(&destroyed))];
     let engine = LlmResidencyEngine::new_with_clock(
         Duration::from_secs(1),
         Some(19400),
@@ -529,7 +674,7 @@ async fn vram_budget_still_evicts_when_truly_over() {
     let w = Arc::new(StubWeights::llama("base", 14000, true, vec![ctx]));
     let destroyed = Arc::new(Mutex::new(0usize));
     *w.contexts.lock().unwrap() =
-        vec![StubContext { name: "default", destroyed: Arc::clone(&destroyed) }];
+        vec![StubContext::new("default", Arc::clone(&destroyed))];
     let engine = LlmResidencyEngine::new_with_clock(
         Duration::from_secs(1),
         Some(14000),
@@ -580,4 +725,113 @@ fn residency_row_round_trips() {
     let back: LlmResidencyRow = serde_json::from_str(&json).unwrap();
     assert_eq!(back.context_key, "base:scratch");
     assert_eq!(back.runtime, LlmRuntime::Llama);
+}
+
+/// The on-demand race: a llama weights instance loaded moments ago (touched
+/// by the dispatch that loaded it) must survive the next residency pass even
+/// with zero contexts — the first request has not materialized one yet.
+#[tokio::test]
+async fn unload_empty_skips_recently_touched_weights() {
+    // Clock 9_000_000s; touched this same second → age 0 < one pass grace.
+    let now_ms = 9_000_000_000i64;
+    let fresh = Arc::new(
+        StubWeights::llama("base/fresh", 5000, true, vec![]).with_last_used(now_ms / 1000),
+    );
+    let engine = LlmResidencyEngine::new_with_clock(
+        Duration::from_secs(1),
+        None,
+        None,
+        30,
+        1,
+        Arc::new(move || now_ms),
+    );
+    engine
+        .residency_cycle(&[fresh.clone() as Arc<dyn LlmWeights>])
+        .await
+        .expect("cycle");
+    assert_eq!(fresh.unload_count(), 0, "just-loaded model survives its first pass");
+}
+
+/// The grace is bounded: an empty weights instance untouched for an hour is
+/// still collected, so idle models do not linger.
+#[tokio::test]
+async fn unload_empty_unloads_stale_empty_weights() {
+    let now_ms = 9_000_000_000i64;
+    let stale = Arc::new(
+        StubWeights::llama("base/stale", 5000, true, vec![])
+            .with_last_used(now_ms / 1000 - 3600),
+    );
+    let engine = LlmResidencyEngine::new_with_clock(
+        Duration::from_secs(1),
+        None,
+        None,
+        30,
+        1,
+        Arc::new(move || now_ms),
+    );
+    engine
+        .residency_cycle(&[stale.clone() as Arc<dyn LlmWeights>])
+        .await
+        .expect("cycle");
+    assert_eq!(stale.unload_count(), 1, "long-idle empty model is collected");
+}
+
+/// An active inference holds its weights: an in-flight empty model is never
+/// unloaded, however stale its last use.
+#[tokio::test]
+async fn unload_empty_skips_in_flight_weights() {
+    let now_ms = 9_000_000_000i64;
+    let busy = Arc::new(
+        StubWeights::llama("base/busy", 5000, true, vec![])
+            .with_last_used(now_ms / 1000 - 3600),
+    );
+    busy.set_in_flight(1);
+    let engine = LlmResidencyEngine::new_with_clock(
+        Duration::from_secs(1),
+        None,
+        None,
+        30,
+        1,
+        Arc::new(move || now_ms),
+    );
+    engine
+        .residency_cycle(&[busy.clone() as Arc<dyn LlmWeights>])
+        .await
+        .expect("cycle");
+    assert_eq!(busy.unload_count(), 0, "in-flight model is never unloaded");
+}
+
+/// Over-budget eviction also respects the lease: the in-flight largest
+/// footprint is skipped and the next-coldest candidate frees the room.
+#[tokio::test]
+async fn budget_eviction_skips_in_flight_weights() {
+    let now_ms = 9_000_000_000i64;
+    let mut big_row = row("base/big", "ctx", false, 100);
+    big_row.vram_bytes = 4000;
+    let big = Arc::new(StubWeights::llama("base/big", 4000, true, vec![big_row]));
+    big.set_in_flight(1);
+    let mut small_row = row("base/small", "ctx", false, 200);
+    small_row.vram_bytes = 500;
+    let small = Arc::new(StubWeights::llama("base/small", 500, true, vec![small_row]));
+    let destroyed_small = Arc::new(Mutex::new(0usize));
+    *small.contexts.lock().unwrap() = vec![StubContext::new("ctx", Arc::clone(&destroyed_small))];
+    // used = 4000 + 4000 + 500 + 500 = 9000 > 1000: the pass must free room
+    // without touching the in-flight model.
+    let engine = LlmResidencyEngine::new_with_clock(
+        Duration::from_secs(1),
+        Some(1000),
+        None,
+        30,
+        10,
+        Arc::new(move || now_ms),
+    );
+    engine
+        .residency_cycle(&[big.clone() as Arc<dyn LlmWeights>, small.clone() as Arc<dyn LlmWeights>])
+        .await
+        .expect("cycle");
+    assert_eq!(big.unload_count(), 0, "in-flight weights never evicted");
+    assert!(
+        *destroyed_small.lock().unwrap() > 0 || small.unload_count() > 0,
+        "room is freed from the idle model instead"
+    );
 }

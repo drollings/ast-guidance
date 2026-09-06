@@ -22,12 +22,12 @@ async-trait = { workspace = true }
 spacy-rs = { path = "../spacy-rs" }
 # M3 (spacy-rs split): the neutral ConceptStore/TaxonomyHierarchy home.
 fluent-concept = { path = "../concept" }
-# Ort-free by default (`default-features = false`): the `fluent-onnx` config /
-# registry / trait surface (single source of truth — `OnnxFleetConfig`,
-# `OrtSessionRegistry`, `PiiSpanDetector`, overlay types) always compiles, but
-# the `ort`/`tokenizers` workers only build with the `onnx` feature below, so
-# a default Coral Router build never contains `ort`.
-fluent-onnx = { path = "../fluent-onnx", default-features = false }
+# Ort-free by default: `fluent-onnx` is optional and entirely absent from
+# default builds (its config / registry / trait surface now lives in
+# `fluent-llm`). The `ort`/`tokenizers` workers only build with the `onnx`
+# feature below, so a default Coral Router build contains neither `ort` nor
+# `fluent-onnx`.
+fluent-onnx = { path = "../fluent-onnx", default-features = false, optional = true }
 fluent-wvr-testutil = { path = "../fluent-wvr-testutil" }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -63,7 +63,7 @@ tempfile = { workspace = true }
 # loud warning (fail-open). Opt in with `--features onnx` (pulls `ort` +
 # `tokenizers` via `fluent-onnx/onnx`).
 default = []
-onnx = ["fluent-onnx/onnx"]
+onnx = ["dep:fluent-onnx", "fluent-onnx/onnx"]
 live-ai = []
 
 [[test]]

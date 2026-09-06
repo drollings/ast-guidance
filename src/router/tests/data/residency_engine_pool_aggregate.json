@@ -1,0 +1,57 @@
+{
+  "instances": [
+    {
+      "aliases": [
+        "base:ledger"
+      ],
+      "arch": "",
+      "compute_bytes": 1048576,
+      "context_bytes": 262144,
+      "group": "ledger",
+      "id": "base:ledger",
+      "is_default": false,
+      "last_used": 5,
+      "model_bytes": 100000000,
+      "n_ctx": 16384,
+      "parallel": 1,
+      "pinned": false,
+      "quant": "",
+      "resume": true,
+      "short_id": "",
+      "state": "loaded",
+      "total_bytes": 1310720,
+      "vram_bytes": 1000
+    },
+    {
+      "aliases": [
+        "base",
+        "base:latest",
+        "base:swarm"
+      ],
+      "arch": "",
+      "compute_bytes": 1048576,
+      "context_bytes": 262144,
+      "group": "swarm",
+      "id": "base:swarm",
+      "is_default": true,
+      "last_used": 9,
+      "model_bytes": 100000000,
+      "n_ctx": 16384,
+      "parallel": 1,
+      "pinned": true,
+      "quant": "",
+      "resume": false,
+      "short_id": "",
+      "state": "loaded",
+      "total_bytes": 1310720,
+      "vram_bytes": 1000
+    }
+  ],
+  "snapshots": [],
+  "total": {
+    "compute": 2097152,
+    "context": 524288,
+    "model": 100000000,
+    "total": 102621440
+  }
+}

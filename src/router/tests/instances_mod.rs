@@ -254,6 +254,7 @@ fn sidecar_policy() -> crate::config::SidecarConfig {
         liveness_failures_before_restart: 3,
         max_restarts: 5,
         onnx_working_set_budget_bytes: None,
+        server_state_path: None,
     }
 }
 
@@ -380,6 +381,58 @@ async fn client_mutating_calls_hit_expected_paths() {
     assert_eq!(body["ctx_size"], 32768);
     assert_eq!(body["parallel"], 2);
     assert_eq!(body["pinned"], true);
+}
+
+#[tokio::test]
+async fn client_snapshot_wire_is_per_instance() {
+    let handler: Arc<dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync> = Arc::new(
+        |method, path, _body| {
+            if method == "GET" && path == "/instances/work/snapshots" {
+                (
+                    200,
+                    serde_json::json!({
+                        "snapshots": [
+                            { "name": "snap1", "size": 32, "mtime": 7, "n_ctx_seq": 2048, "instance": "work" },
+                            { "name": "legacy", "size": 32, "mtime": 7, "n_ctx_seq": 2048, "instance": null },
+                            { "name": "bare", "size": 32 },
+                        ],
+                    })
+                    .to_string(),
+                )
+            } else if method == "POST" && path == "/instances/work/snapshot" {
+                (201, r#"{"success":true}"#.into())
+            } else {
+                (404, r#"{"error":{"message":"not found"}}"#.into())
+            }
+        },
+    );
+    let stub = StubServer::start(handler);
+    let client = InstanceClient::new(reqwest::Client::new(), stub.base_url(), None);
+
+    // Instance-tagged, legacy-null, and bare entries all parse.
+    let listed = client.list_snapshots("work").await.expect("list");
+    assert_eq!(listed.len(), 3);
+    assert_eq!(listed[0].name, "snap1");
+    assert_eq!(listed[0].instance.as_deref(), Some("work"));
+    assert_eq!(listed[0].n_ctx_seq, 2048);
+    assert_eq!(listed[1].name, "legacy");
+    assert!(listed[1].instance.is_none());
+    assert_eq!(listed[2].name, "bare");
+    assert!(listed[2].instance.is_none());
+
+    // Explicit slot and default-slot saves carry id_slot on the wire.
+    client.save_snapshot_slot("work", "snap1", 2).await.expect("save slot");
+    client.save_snapshot("work", "snap1").await.expect("save default");
+    let saves: Vec<serde_json::Value> = stub
+        .recorded()
+        .into_iter()
+        .filter(|(m, p, _)| m == "POST" && p == "/instances/work/snapshot")
+        .map(|(_, _, b)| serde_json::from_str(&b).unwrap())
+        .collect();
+    assert_eq!(saves.len(), 2);
+    assert_eq!(saves[0]["name"], "snap1");
+    assert_eq!(saves[0]["id_slot"], 2);
+    assert_eq!(saves[1]["id_slot"], 0);
 }
 
 #[tokio::test]
@@ -723,22 +776,34 @@ async fn reconcile_tolerates_duplicate_create() {
 
 #[tokio::test]
 async fn residency_evicts_lru_unpinned_and_never_pinned() {
-    // Device budget = 10000 - 2000 = 8000; used 10000 -> over budget.
+    // Device budget = 10000 - 2000 = 8000. The rows carry the shared
+    // weights footprint (7000, counted once) + 4x1000 VRAM = 11000 used,
+    // so the batch of 2 evicts the two oldest unpinned (lru1, lru2).
+    let mut pinned = instance_info("pinned", "g", true, 0); // exempt
+    pinned.model_bytes = 7000;
+    let mut lru1 = instance_info("lru1", "g", false, 100); // oldest unpinned
+    lru1.model_bytes = 7000;
+    let mut lru2 = instance_info("lru2", "g", false, 200);
+    lru2.model_bytes = 7000;
+    let mut recent = instance_info("recent", "g", false, 9000);
+    recent.model_bytes = 7000;
     let envelope = serde_json::json!({
-        "instances": [
-            instance_info("pinned", "g", true, 0),    // exempt
-            instance_info("lru1", "g", false, 100),   // oldest unpinned
-            instance_info("lru2", "g", false, 200),
-            instance_info("recent", "g", false, 9000),
-        ],
+        "instances": [ pinned, lru1, lru2, recent ],
         "snapshots": [],
         "total": { "model": 5000, "context": 2500, "compute": 2500, "total": 10000 }
     });
     let stub = residency_stub(envelope);
+    let policy = sidecar_policy();
+    let manager = Arc::new(InstanceManager::new(
+        "base",
+        InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
+        Vec::new(),
+        policy.clone(),
+    ));
     let mut managers = HashMap::new();
-    managers.insert("base".into(), manager_for_stub(&stub));
+    managers.insert("base".into(), manager);
     let pool = InstancePool::from_managers(managers, None);
-    pool.residency_cycle().await.expect("residency");
+    engine_cycle(&pool, &policy, &["base"]).await;
 
     // evict_batch = 2 and two 1000-byte evictions are needed to reach the
     // budget (10000 -> 8000): the two oldest unpinned (lru1, lru2) are
@@ -763,10 +828,14 @@ async fn residency_eviction_frees_largest_lru_context_first() {
     // candidate), isolating the context-level ordering.
     let mut big = instance_info("big", "g", false, 100);
     big.vram_bytes = 5000;
+    big.model_bytes = 5000;
     let mut small = instance_info("small", "g", false, 100);
     small.vram_bytes = 1000;
+    small.model_bytes = 5000;
+    let mut keep = instance_info("keep", "g", true, 0);
+    keep.model_bytes = 5000;
     let envelope = serde_json::json!({
-        "instances": [ small, big, instance_info("keep", "g", true, 0) ],
+        "instances": [ small, big, keep ],
         "snapshots": [],
         "total": { "model": 5000, "context": 2000, "compute": 2000, "total": 9000 }
     });
@@ -774,15 +843,15 @@ async fn residency_eviction_frees_largest_lru_context_first() {
     let mut policy = sidecar_policy();
     policy.evict_batch = 1;
     let manager = Arc::new(InstanceManager::new(
-        "base",
+        "swarm",
         InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
         Vec::new(),
-        policy,
+        policy.clone(),
     ));
     let mut managers = HashMap::new();
-    managers.insert("base".into(), manager);
+    managers.insert("swarm".into(), manager);
     let pool = InstancePool::from_managers(managers, None);
-    pool.residency_cycle().await.expect("residency");
+    engine_cycle(&pool, &policy, &["swarm"]).await;
 
     let deletes: Vec<String> = stub
         .recorded()
@@ -794,18 +863,73 @@ async fn residency_eviction_frees_largest_lru_context_first() {
 }
 
 #[tokio::test]
+async fn llama_context_evict_snapshots_resume_marked_context_before_destroy() {
+    // The save-before-evict order through the real adapter: a resume-marked
+    // context's KV snapshot must reach the fork before the destroy. The
+    // engine drives eviction through `LlmContext::evict`, so this order is
+    // the snapshot-before-destroy regression net.
+    use fluent_llm::runtime::LlmContext as _LlmContext;
+
+    let stub = residency_stub(serde_json::json!({
+        "instances": [],
+        "snapshots": [],
+        "total": { "model": 0, "context": 0, "compute": 0, "total": 0 }
+    }));
+    let manager = Arc::new(InstanceManager::new(
+        "base",
+        InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
+        Vec::new(),
+        sidecar_policy(),
+    ));
+    manager.set_resume("work", true);
+    let info = instance_info("work", "g", false, 100);
+    let ctx = LlamaContext::from_info(
+        Arc::clone(&manager),
+        manager.client().clone(),
+        &info,
+        None,
+    );
+    ctx.evict().await.expect("evict");
+
+    let order: Vec<String> = stub
+        .recorded()
+        .iter()
+        .filter(|(m, p, _)| {
+            (*m == "POST" && p.as_str() == "/instances/work/snapshot")
+                || (*m == "DELETE" && p.as_str() == "/instances/work")
+        })
+        .map(|(m, p, _)| format!("{m} {p}"))
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            "POST /instances/work/snapshot".to_string(),
+            "DELETE /instances/work".to_string(),
+        ],
+        "snapshot saved before the context is destroyed"
+    );
+}
+
+#[tokio::test]
 async fn residency_no_eviction_when_free_vram_within_budget() {
     let envelope = serde_json::json!({
         "instances": [],
         "snapshots": [],
         "total": { "model": 1000, "context": 200, "compute": 200, "total": 1400 }
     });
-    // used 1400 <= budget 8000 -> no eviction.
+    // Empty rows -> nothing resident -> no eviction.
     let stub = residency_stub(envelope);
+    let policy = sidecar_policy();
+    let manager = Arc::new(InstanceManager::new(
+        "base",
+        InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
+        Vec::new(),
+        policy.clone(),
+    ));
     let mut managers = HashMap::new();
-    managers.insert("base".into(), manager_for_stub(&stub));
+    managers.insert("base".into(), manager);
     let pool = InstancePool::from_managers(managers, None);
-    pool.residency_cycle().await.expect("residency");
+    engine_cycle(&pool, &policy, &["base"]).await;
     assert!(
         stub.recorded()
             .iter()
@@ -815,9 +939,11 @@ async fn residency_no_eviction_when_free_vram_within_budget() {
 }
 
 #[tokio::test]
-async fn residency_polls_without_budget_and_never_evicts() {
+async fn residency_without_budget_never_evicts() {
     // No vram_total_bytes and no minimum_remaining_vram -> no budget; the
-    // pass must still GET /instances and report, but must never DELETE.
+    // pass completes without evicting. The engine is lazy (budgets are
+    // injected, never probed), so unlike the old pool loop it issues no
+    // fork polls when there is nothing to decide.
     let envelope = serde_json::json!({
         "instances": [],
         "snapshots": [],
@@ -831,27 +957,14 @@ async fn residency_polls_without_budget_and_never_evicts() {
         "base",
         InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
         Vec::new(),
-        policy,
+        policy.clone(),
     ));
     let mut managers = HashMap::new();
     managers.insert("base".into(), manager);
     let pool = InstancePool::from_managers(managers, None);
-    // `residency_cycle` reads the ROCm sysfs VRAM total through the
-    // capability-gated fs helper; grant `FsCapability` as the serving
-    // path does.
-    fluent_concurrency::scope::CURRENT_CAPS
-        .scope(
-            fluent_concurrency::capability::default_capability_set(),
-            async { pool.residency_cycle().await.expect("residency") },
-        )
-        .await;
-    let recorded = stub.recorded();
+    engine_cycle(&pool, &policy, &["base"]).await;
     assert!(
-        recorded.iter().any(|(m, p, _)| m == "GET" && p == "/instances"),
-        "instances are always polled, budget or not"
-    );
-    assert!(
-        recorded.iter().all(|(m, _, _)| m != "DELETE"),
+        stub.recorded().iter().all(|(m, _, _)| m != "DELETE"),
         "no eviction without a budget"
     );
 }
@@ -1252,12 +1365,16 @@ async fn pool_residency_evicts_lru_largest_unpinned_across_managers() {
     // Device budget = 10000 (vram_total) - 2000 (minimum_remaining) = 8000.
     // Both managers together report used 10000 -> over budget. The coldest
     // largest unpinned context (old) is evicted first; pinned never is.
+    // Rows carry the shared weights footprint (8000, counted once) + 3x1000
+    // VRAM = 11000 used; the engine accounts from rows, never envelope totals.
+    let mut pinned = instance_info("pinned", "g", true, 0); // exempt
+    pinned.model_bytes = 8000;
+    let mut old = instance_info("old", "g", false, 100); // LRU, vram 1000
+    old.model_bytes = 8000;
+    let mut big = instance_info("big", "g", false, 200); // larger vram 1000
+    big.model_bytes = 8000;
     let env_a = serde_json::json!({
-        "instances": [
-            instance_info("pinned", "g", true, 0),    // exempt
-            instance_info("old", "g", false, 100),    // LRU, vram 1000
-            instance_info("big", "g", false, 200),    // larger vram 1000
-        ],
+        "instances": [ pinned, old, big ],
         "snapshots": [],
         "total": { "model": 5000, "context": 2500, "compute": 2500, "total": 10000 }
     });
@@ -1268,12 +1385,13 @@ async fn pool_residency_evicts_lru_largest_unpinned_across_managers() {
     });
     let stub_a = residency_stub(env_a);
     let stub_b = residency_stub(env_b);
+    let policy = sidecar_policy();
     let mut managers = HashMap::new();
     managers.insert("swarm".into(), manager_for_stub(&stub_a));
     managers.insert("other".into(), manager_for_stub(&stub_b));
     let pool = InstancePool::from_managers(managers, None);
 
-    pool.residency_cycle().await.expect("residency");
+    engine_cycle(&pool, &policy, &["swarm"]).await;
 
     let deletes_a = stub_a
         .recorded()
@@ -1304,10 +1422,11 @@ async fn pool_residency_no_eviction_within_budget() {
         "total": { "model": 4000, "context": 500, "compute": 500, "total": 5000 }
     });
     let stub = residency_stub(env);
+    let policy = sidecar_policy();
     let mut managers = HashMap::new();
     managers.insert("swarm".into(), manager_for_stub(&stub));
     let pool = InstancePool::from_managers(managers, None);
-    pool.residency_cycle().await.expect("residency");
+    engine_cycle(&pool, &policy, &["swarm"]).await;
     assert!(
         stub.recorded().iter().all(|(m, _, _)| m != "DELETE"),
         "no eviction within budget"
@@ -1409,19 +1528,13 @@ async fn pool_residency_without_budget_never_evicts() {
         "swarm",
         InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
         Vec::new(),
-        policy,
+        policy.clone(),
     ));
     let mut managers = HashMap::new();
     managers.insert("swarm".into(), manager);
     let pool = InstancePool::from_managers(managers, None);
-    // `residency_cycle` reads the ROCm sysfs VRAM total via the gated
-    // fs helper; grant `FsCapability` as the serving path does.
-    fluent_concurrency::scope::CURRENT_CAPS
-        .scope(
-            fluent_concurrency::capability::default_capability_set(),
-            async { pool.residency_cycle().await.expect("residency") },
-        )
-        .await;
+    // Budgets are injected (never probed), so no capability scope is needed.
+    engine_cycle(&pool, &policy, &["swarm"]).await;
     assert!(
         stub.recorded().iter().all(|(m, _, _)| m != "DELETE"),
         "no budget -> no eviction"
@@ -1650,10 +1763,10 @@ async fn touch_advances_plain_model_last_used() {
 }
 
 #[tokio::test]
-async fn residency_polls_plain_models_and_survives_without_supervisor() {
-    // A plain model awake at 10_000 bytes, budget 2000: over budget. With
-    // no supervisor the plain-model unload is a no-op break; the pass must
-    // still complete Ok and poll the plain server's /props.
+async fn residency_polls_plain_models_and_unloads_over_budget() {
+    // A plain model awake at 10_000 bytes, budget 2000: over budget. The
+    // pass must still complete Ok, poll the plain server's /props (the
+    // synthesized footprint row), and unload the weights to free VRAM.
     let props = serde_json::json!({
         "is_sleeping": false,
         "default_generation_settings": { "n_ctx": 8192 }
@@ -1667,14 +1780,14 @@ async fn residency_polls_plain_models_and_survives_without_supervisor() {
             "qwen",
             InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
             Vec::new(),
-            policy,
+            policy.clone(),
         )
         .with_weights_bytes(10_000),
     );
     let mut managers = HashMap::new();
     managers.insert("qwen".into(), manager);
     let pool = InstancePool::from_managers(managers, None);
-    pool.residency_cycle().await.expect("residency completes without supervisor");
+    engine_cycle(&pool, &policy, &["qwen"]).await;
     assert!(
         stub.recorded().iter().any(|(m, p, _)| m == "GET" && p == "/props"),
         "the plain-model branch must poll /props"
@@ -1682,6 +1795,51 @@ async fn residency_polls_plain_models_and_survives_without_supervisor() {
 }
 
 // -- load-time admission control (make_room_for) -------------------------
+//
+// Admission runs through the shared engine over `LlamaWeights` adapters, so
+// these tests wire a real engine (budgets from the same sidecar policy) and
+// a supervisor with test servers (no processes spawned). A pool with no
+// supervisor cannot build adapters and skips admission gracefully.
+
+/// The shared residency engine handle.
+type ResidencyEngine = Arc<fluent_llm::runtime::LlmResidencyEngine>;
+
+fn engine_for_policy(policy: &crate::config::SidecarConfig) -> ResidencyEngine {
+    fluent_llm::runtime::LlmResidencyEngine::new(
+        std::time::Duration::from_secs(1),
+        policy.allocation_limit(),
+        policy.onnx_working_set_budget_bytes,
+        30,
+        policy.evict_batch,
+    )
+}
+
+/// One shared-engine residency pass over the pool's managers, through the
+/// same `LlamaWeights` adapters the fleet build uses. Every residency
+/// behavior below is pinned through the engine (the pool owns no eviction
+/// ordering of its own).
+async fn engine_cycle(
+    pool: &InstancePool,
+    policy: &crate::config::SidecarConfig,
+    keys: &[&str],
+) {
+    let sup = supervisor_with_servers(keys);
+    let engine = engine_for_policy(policy);
+    let weights =
+        crate::instances::traits::llama_weights_for_pool(pool, &sup, policy);
+    engine.residency_cycle(&weights).await.expect("residency");
+}
+
+fn supervisor_with_servers(keys: &[&str]) -> Arc<crate::supervisor::LlamaServerSupervisor> {
+    let sup = Arc::new(crate::supervisor::LlamaServerSupervisor::with_client_for_test(
+        std::path::PathBuf::from("/bin/false"),
+        reqwest::Client::new(),
+    ));
+    for key in keys {
+        sup.register_test_server(key);
+    }
+    sup
+}
 
 #[tokio::test]
 async fn make_room_for_no_eviction_within_budget() {
@@ -1697,10 +1855,30 @@ async fn make_room_for_no_eviction_within_budget() {
         "is_sleeping": false,
         "default_generation_settings": { "n_ctx": 8192 }
     }));
+    let policy = sidecar_policy();
+    let swarm = Arc::new(InstanceManager::new(
+        "swarm",
+        InstanceClient::new(reqwest::Client::new(), swarm_stub.base_url(), None),
+        Vec::new(),
+        policy.clone(),
+    ));
+    let gemma = Arc::new(
+        InstanceManager::new(
+            "gemma",
+            InstanceClient::new(reqwest::Client::new(), gemma_stub.base_url(), None),
+            Vec::new(),
+            policy.clone(),
+        )
+        .with_weights_bytes(1000),
+    );
     let mut managers = HashMap::new();
-    managers.insert("swarm".into(), manager_for_stub(&swarm_stub));
-    managers.insert("gemma".into(), plain_manager(&gemma_stub, 1000));
-    let pool = InstancePool::from_managers(managers, None);
+    managers.insert("swarm".into(), swarm);
+    managers.insert("gemma".into(), gemma);
+    let pool = InstancePool::from_managers(
+        managers,
+        Some(supervisor_with_servers(&["swarm", "gemma"])),
+    );
+    pool.set_admission_engine(engine_for_policy(&policy));
     pool.make_room_for("gemma", 1000).await;
     assert!(
         swarm_stub
@@ -1714,9 +1892,14 @@ async fn make_room_for_no_eviction_within_budget() {
 #[tokio::test]
 async fn make_room_for_evicts_unpinned_instance_over_budget() {
     // Budget 4000 - 2000 = 2000; used 3000 + gemma 1000 = 4000 -> over.
-    // The only freeable chunk is the unpinned `scratch` instance.
+    // The whole-model candidate wins (largest footprint); its eviction
+    // destroys the unpinned `scratch` context on the way out. The row
+    // carries the shared weights footprint (the engine accounts VRAM from
+    // rows, never the envelope totals).
+    let mut scratch = instance_info("scratch", "scratch", false, 5);
+    scratch.model_bytes = 2000;
     let envelope = serde_json::json!({
-        "instances": [ instance_info("scratch", "scratch", false, 5) ],
+        "instances": [ scratch ],
         "snapshots": [],
         "total": { "model": 2000, "context": 500, "compute": 500, "total": 3000 }
     });
@@ -1727,11 +1910,15 @@ async fn make_room_for_evicts_unpinned_instance_over_budget() {
         "swarm",
         InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
         Vec::new(),
-        policy,
+        policy.clone(),
     ));
     let mut managers = HashMap::new();
     managers.insert("swarm".into(), manager);
-    let pool = InstancePool::from_managers(managers, None);
+    let pool = InstancePool::from_managers(
+        managers,
+        Some(supervisor_with_servers(&["swarm"])),
+    );
+    pool.set_admission_engine(engine_for_policy(&policy));
     pool.make_room_for("gemma", 1000).await;
     let recorded = stub.recorded();
     let deletes: Vec<&str> = recorded
@@ -1746,11 +1933,11 @@ async fn make_room_for_evicts_unpinned_instance_over_budget() {
 }
 
 #[tokio::test]
-async fn make_room_for_excludes_target_and_survives_without_supervisor() {
+async fn make_room_for_excludes_target_and_skips_without_supervisor() {
     // qwen (plain, awake, 10_000) resident; gemma (plain, 7_000) is the
-    // cold target. Budget 2000 -> over budget. Without a supervisor the
-    // plain unload is a no-op break; the pass must complete Ok and never
-    // poll the excluded target.
+    // cold target. Budget 2000 -> over budget. The cold target is excluded
+    // from the gather (never polled); without a supervisor there are no
+    // adapters to evict through, so admission is skipped gracefully.
     let props = serde_json::json!({
         "is_sleeping": false,
         "default_generation_settings": { "n_ctx": 8192 }
@@ -1773,7 +1960,7 @@ async fn make_room_for_excludes_target_and_survives_without_supervisor() {
             "gemma",
             InstanceClient::new(reqwest::Client::new(), gemma_stub.base_url(), None),
             Vec::new(),
-            policy,
+            policy.clone(),
         )
         .with_weights_bytes(7_000),
     );
@@ -1781,6 +1968,7 @@ async fn make_room_for_excludes_target_and_survives_without_supervisor() {
     managers.insert("qwen".into(), qwen);
     managers.insert("gemma".into(), gemma);
     let pool = InstancePool::from_managers(managers, None);
+    pool.set_admission_engine(engine_for_policy(&policy));
     pool.make_room_for("gemma", 7_000).await;
     assert!(
         gemma_stub.recorded().is_empty(),
@@ -1950,13 +2138,13 @@ async fn eviction_snapshots_resume_context_before_destroy() {
         "base",
         InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
         Vec::new(),
-        policy,
+        policy.clone(),
     ));
     manager.set_resume("agent", true);
     let mut managers = HashMap::new();
     managers.insert("base".into(), manager);
     let pool = InstancePool::from_managers(managers, None);
-    pool.residency_cycle().await.expect("residency");
+    engine_cycle(&pool, &policy, &["base"]).await;
 
     let recorded = stub.recorded();
     let snapshot_posts: Vec<&str> = recorded
@@ -1997,13 +2185,13 @@ async fn expire_resume_clears_idle_context_and_deletes_snapshot() {
         "base",
         InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
         Vec::new(),
-        policy,
+        policy.clone(),
     ));
     manager.set_resume("agent", true);
     let mut managers = HashMap::new();
     managers.insert("base".into(), manager);
     let pool = InstancePool::from_managers(managers, None);
-    pool.residency_cycle().await.expect("residency");
+    engine_cycle(&pool, &policy, &["base"]).await;
 
     assert!(
         !pool.manager("base").unwrap().resume_for("agent"),
@@ -2051,22 +2239,24 @@ async fn set_resume_false_deletes_snapshot() {
 #[tokio::test]
 async fn whole_model_is_largest_footprint_candidate() {
     // A model with NO pinned instances is a whole-model candidate: its
-    // weights + all contexts. Without a supervisor the model eviction
-    // still drops every context before breaking; the point is that the
-    // whole-model unit outranks the individual contexts.
+    // weights + all contexts. The whole-model unit outranks the individual
+    // contexts, so its eviction drops every context on the way out. Rows
+    // carry the shared weights footprint (the engine accounts from rows).
+    let mut ctx_a = instance_info("ctx-a", "g", false, 100);
+    ctx_a.model_bytes = 8000;
+    let mut ctx_b = instance_info("ctx-b", "g", false, 200);
+    ctx_b.model_bytes = 8000;
     let envelope = serde_json::json!({
-        "instances": [
-            instance_info("ctx-a", "g", false, 100),
-            instance_info("ctx-b", "g", false, 200),
-        ],
+        "instances": [ ctx_a, ctx_b ],
         "snapshots": [],
         "total": { "model": 8000, "context": 2000, "compute": 2000, "total": 12000 }
     });
     let stub = residency_stub(envelope);
+    let policy = sidecar_policy();
     let mut managers = HashMap::new();
     managers.insert("base".into(), manager_for_stub(&stub));
     let pool = InstancePool::from_managers(managers, None);
-    pool.residency_cycle().await.expect("residency");
+    engine_cycle(&pool, &policy, &["swarm"]).await;
     let recorded = stub.recorded();
     let deletes: Vec<&str> = recorded
         .iter()
@@ -2084,7 +2274,7 @@ async fn residency_all_pinned_over_budget_evicts_nothing() {
     // M10.1 characterization: over budget (used 10000 > budget 8000) but
     // every instance is pinned — there are no eviction candidates, so the
     // pass must DELETE nothing. Pinned instances never appear in the
-    // `Evictable` candidate set, and a model with any pinned instance is
+    // engine's candidate set, and a model with any pinned instance is
     // never a whole-model candidate.
     let envelope = serde_json::json!({
         "instances": [
@@ -2095,10 +2285,11 @@ async fn residency_all_pinned_over_budget_evicts_nothing() {
         "total": { "model": 5000, "context": 2500, "compute": 2500, "total": 10000 }
     });
     let stub = residency_stub(envelope);
+    let policy = sidecar_policy();
     let mut managers = HashMap::new();
     managers.insert("base".into(), manager_for_stub(&stub));
     let pool = InstancePool::from_managers(managers, None);
-    pool.residency_cycle().await.expect("residency");
+    engine_cycle(&pool, &policy, &["swarm"]).await;
     assert!(
         stub.recorded().iter().all(|(m, _, _)| m != "DELETE"),
         "all-pinned device over budget must still evict nothing"

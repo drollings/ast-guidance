@@ -1126,7 +1126,7 @@ fn kv_snapshot_policy_round_trips_through_serde() {
 
 #[test]
 fn top_level_onnx_roles_merge_into_fleet() {
-    use fluent_onnx::config::OnnxRole;
+    use fluent_llm::onnx_config::OnnxRole;
     let cfg: RouterConfig = serde_json::from_str(
         r#"{
             "encoder": {
@@ -1192,7 +1192,7 @@ fn nested_onnx_section_takes_precedence_over_top_level_keys() {
     cfg.apply_defaults();
 
     let fleet = cfg.onnx.as_ref().expect("onnx fleet present");
-    let enc = fleet.get(fluent_onnx::config::OnnxRole::Encoder).unwrap();
+    let enc = fleet.get(fluent_llm::onnx_config::OnnxRole::Encoder).unwrap();
     assert_eq!(enc.model.model_path, std::path::PathBuf::from("/nested/encoder.onnx"),
         "nested onnx section wins over top-level key");
     // Top-level key still present (not consumed, just warned about)
@@ -1219,14 +1219,14 @@ fn weights_alias_deserializes_as_model_path() {
     let mut cfg = cfg;
     cfg.apply_defaults();
     let fleet = cfg.onnx.as_ref().unwrap();
-    let enc = fleet.get(fluent_onnx::config::OnnxRole::Encoder).unwrap();
+    let enc = fleet.get(fluent_llm::onnx_config::OnnxRole::Encoder).unwrap();
     assert_eq!(enc.model.model_path, std::path::PathBuf::from("/models/encoder.onnx"),
         "weights alias maps to model_path");
 }
 
 #[test]
 fn fp8_quantization_parses() {
-    use fluent_onnx::config::Quant;
+    use fluent_llm::onnx_config::Quant;
     let q: Quant = serde_json::from_str(r#""fp8""#).expect("fp8 parses");
     assert_eq!(q, Quant::Fp8);
 }
@@ -1238,9 +1238,9 @@ fn router_config_field_access_round_trip() {
     // safety_threshold is accessible via FieldAccess
     cfg.set_field("safety_threshold", "0.7").expect("set_field safety_threshold");
     assert_eq!(cfg.get_field("safety_threshold").unwrap(), "0.7");
-    // onnx_resolver is skip -> NotFound
-    let err = cfg.set_field("onnx_resolver", "x").unwrap_err();
-    assert!(matches!(err, fluent_wvr::FieldError::NotFound(_)), "onnx_resolver should be NotFound, got {:?}", err);
+    // skipped fields (e.g. models) are NotFound
+    let err = cfg.set_field("models", "x").unwrap_err();
+    assert!(matches!(err, fluent_wvr::FieldError::NotFound(_)), "models should be NotFound, got {:?}", err);
 }
 
 #[test]

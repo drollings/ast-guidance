@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use fluent_concurrency::pool::{Limiter, ResultPool};
-use fluent_onnx::overlay::{OverlayContribution, OverlayError, Residual, ResidualKind, ResidualOverlay};
+use fluent_llm::backend::{OverlayContribution, OverlayError, Residual, ResidualKind, ResidualOverlay};
 use fluent_wvr::prelude::*;
 use spacy_rs::routing::RoutingSignal;
 

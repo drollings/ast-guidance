@@ -28,7 +28,7 @@ pub use client::{
 };
 pub use manager::{build_instance_managers, resume_snapshot_name, weights_identity, InstanceManager, WeightsIdentity};
 pub use pool::InstancePool;
-pub use traits::{LlamaContext, LlamaKVCache, LlamaWeights, LlmFleet};
+pub use traits::{LlamaBackend, LlamaContext, LlamaKVCache, LlamaWeights, LlmFleet};
 
 use crate::config::InstanceProfile;
 
@@ -248,3 +248,6 @@ pub(crate) mod stub {
 #[cfg(test)]
 #[path = "../../tests/instances_mod.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "../../tests/residency_engine_golden.rs"]
+mod residency_engine_golden_tests;

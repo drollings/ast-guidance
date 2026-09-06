@@ -460,6 +460,28 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
                 || fluent_router::supervisor::LlamaServerSupervisor::build(&config),
             )?;
             let supervisor = Arc::new(supervisor);
+            // Adopt-before-spawn: a previous router lifetime killed without
+            // graceful shutdown (SIGKILL, OOM-kill, crash) leaves its
+            // llama-servers alive on ports no config names. Re-adopt them
+            // (state file, then a /proc scan, both HTTP-verified) instead of
+            // spawning duplicates over their VRAM. Must run before
+            // `start_all`, which skips spawning adopted entries. The
+            // FsCapability grant covers the state-file read and /proc scan.
+            let adopt_report = fluent_concurrency::scope::CURRENT_CAPS
+                .scope(
+                    fluent_concurrency::capability::default_capability_set(),
+                    supervisor.adopt_orphans(&config),
+                )
+                .await;
+            for (key, base_url, instances_supported) in &adopt_report.adopted {
+                tracing::info!(
+                    target: "coral-router",
+                    model = %key,
+                    base_url = %base_url,
+                    instances_supported = instances_supported,
+                    "adopted live llama-server from a previous lifetime - spawn skipped",
+                );
+            }
             if let Err(e) = supervisor.start_all().await {
                 tracing::error!(target: "coral-router", error = %e, "fatal: managed llama-server failed to start");
                 eprintln!("FATAL: {e}");
@@ -478,6 +500,16 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
                     }
                 }
             }
+            // Persist the fleet map ({model: {port, pid}}) so the next boot's
+            // adopt-before-spawn pass can find these servers even if this
+            // lifetime ends without graceful shutdown. Best-effort; a missing
+            // `server_state_path` or a write failure falls back to /proc.
+            fluent_concurrency::scope::CURRENT_CAPS
+                .scope(
+                    fluent_concurrency::capability::default_capability_set(),
+                    supervisor.persist_state(&config),
+                )
+                .await;
             Some(supervisor)
         };
 
@@ -507,80 +539,25 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
             "onnx registry built",
         );
     }
-    // Install the onnx `ChatBackend` resolver (ROADMAP M2.3/M6): the generative
-    // LLM role's backend, served behind the single `RouterConfig::local_backend`
-    // factory. The `(key, instance)` shape lets the resolver build a
-    // **context-bound** backend for a named context (created on demand — the
-    // onnx lazy-residency load point) on first use. Absent / unregistered /
-    // non-CausalLm → `None` (fail-open to the HTTP/deterministic path). The
-    // role's default (`instance = None`) is the single-shot backend unless it
-    // declares an `instances` block, in which case it binds to the pool context
-    // (the `pool_qualifier` rule) — byte-identical to M0 for the shipped config.
-    let onnx_llm_backend = {
-        let onnx_llm_key = fluent_onnx::OnnxRole::Llm.registry_key();
-        let role = config.onnx.as_ref().and_then(|f| f.llm.as_ref());
-        let onnx_llm_backend = onnx_registry
-            .as_ref()
-            .and_then(|reg| {
-                fluent_router::ort::onnx_chat_backend(reg, onnx_llm_key).ok().flatten()
-            });
-        // Context-bound backends need the onnx-gated `OnnxWeights` type, so
-        // they only exist in an `onnx` build. Ort-free builds resolve the bare
-        // generative key (always `None` there — the fallback above — fail-open)
-        // and never serve a named onnx context.
-        #[cfg(feature = "onnx")]
-        let llm_weights = match (onnx_registry.as_ref(), role) {
-            (Some(reg), Some(role)) => Some(Arc::new(
-                fluent_router::ort::OnnxWeights::new(
-                    onnx_llm_key.to_string(),
-                    reg.clone(),
-                    role.clone(),
-                ),
-            )),
-            _ => None,
-        };
-        let has_instances = role
-            .is_some_and(|r| r.instances.as_ref().is_some_and(|m| !m.is_empty()));
-        let pool_context = role.and_then(fluent_router::ort::onnx_pool_context);
-        if onnx_llm_backend.is_some() {
-            tracing::info!(
-                target: "coral-router",
-                model = onnx_llm_key,
-                has_instances = has_instances,
-                "onnx generative backend wired as the default local backend",
-            );
-        }
-        let resolver_backend = onnx_llm_backend.clone();
-        config.install_onnx_resolver(move |key, instance| {
-            if key != onnx_llm_key {
-                return None;
-            }
-            match instance {
-                #[cfg(feature = "onnx")]
-                Some(name) => llm_weights.as_ref().and_then(|w| {
-                    fluent_router::ort::onnx_context_backend(w, name).ok().flatten()
-                }),
-                #[cfg(not(feature = "onnx"))]
-                Some(_) => None,
-                None if has_instances => {
-                    let ctx = pool_context.clone()?;
-                    #[cfg(feature = "onnx")]
-                    {
-                        llm_weights.as_ref().and_then(|w| {
-                            fluent_router::ort::onnx_context_backend(w, &ctx).ok().flatten()
-                        })
-                    }
-                    #[cfg(not(feature = "onnx"))]
-                    {
-                        let _ = ctx;
-                        None
-                    }
-                }
-                None => resolver_backend.clone(),
-            }
+    // Inference registry: the llama + onnx backends behind one routing
+    // surface. The onnx adapter registers now (its inputs — the boot registry
+    // and role config — are ready); the llama adapter registers after the
+    // instance pool builds below. Both `local_backend` paths resolve through
+    // the registry from here on. Absent / unregistered / non-CausalLm →
+    // `None` (fail-open to the HTTP/deterministic path), exactly as the
+    // previous resolver closure behaved.
+    let inference_registry = Arc::new(std::sync::RwLock::new(
+        fluent_llm::backend::InferenceRegistry::new(),
+    ));
+    let onnx_llm_backend = onnx_registry
+        .as_ref()
+        .and_then(|reg| fluent_router::ort::OnnxBackend::from_config(&config, reg))
+        .and_then(|backend| {
+            let single_shot = backend.single_shot();
+            common_core::sync::lock_write(&inference_registry).register(Arc::new(backend));
+            single_shot
         });
-        onnx_llm_backend
-    };
+    config.set_inference_registry(Arc::clone(&inference_registry));
     // The shared residency engine (M5): ONE loop over the fleet's weights
     // (llama adapters + onnx implementors), replacing both the llama sidecar
     // task and the onnx residency sibling. Built here so the `sidecar` knobs
@@ -594,7 +571,7 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
                     std::time::Duration::from_secs(config.sidecar.poll_interval_s.max(1)),
                     config.sidecar.allocation_limit(),
                     config.sidecar.onnx_working_set_budget_bytes,
-                    fluent_onnx::residency::DEFAULT_SLEEP_IDLE_SECONDS,
+                    fluent_router::ort::DEFAULT_SLEEP_IDLE_SECONDS,
                     config.sidecar.evict_batch,
                 )
             },
@@ -786,6 +763,11 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
         }
     };
 
+    // Load-time admission runs through the shared engine from here on: the
+    // pool keeps the transport duties (cold-load detection, target
+    // exclusion) while the engine owns the eviction ordering.
+    instance_pool.set_admission_engine(Arc::clone(&residency_engine));
+
     // The unified weights facade (ROADMAP M4): llama adapters + onnx
     // implementors behind the shared `LlmWeights` surface. Backs the
     // `/instances` + `/v1/models` aggregation (onnx rows), `ps`, and the
@@ -798,6 +780,20 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
         onnx_registry.clone(),
         &config,
     ));
+
+    // The llama inference backend registers now that its inputs (the managed
+    // pool, the `models` map, role keys, sidecar policy) exist. Onnx keys keep
+    // precedence on collision via the adapter's key exclusion.
+    {
+        let llama = fluent_router::instances::traits::LlamaBackend::new(
+            instance_pool.clone(),
+            config.models.clone(),
+            config.onnx_role_keys(),
+            config.sidecar.clone(),
+        );
+        common_core::sync::lock_write(&inference_registry)
+            .register(Arc::new(llama));
+    }
 
     // Background tiering: when the operator opts in via
     // `ledger.background_tiering`, attach a `LedgerTierWorker` to the shared
@@ -953,14 +949,14 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
         // role is configured and registered, else the deterministic regex
         // baseline when `auto_enqueue` is on. Fail-open — never a boot error.
         let pii_model = if onnx_registry.as_ref().is_some_and(|r| {
-            r.config(fluent_onnx::OnnxRole::Pii.registry_key())
+            r.config(fluent_llm::onnx_config::OnnxRole::Pii.registry_key())
                 .is_some()
         }) {
-            Some(fluent_onnx::OnnxRole::Pii.registry_key())
+            Some(fluent_llm::onnx_config::OnnxRole::Pii.registry_key())
         } else {
             None
         };
-        let pii_prefilter: Option<Arc<dyn fluent_onnx::PiiSpanDetector>> =
+        let pii_prefilter: Option<Arc<dyn fluent_llm::backend::PiiSpanDetector>> =
             match fluent_router::ort::pii_prefilter(
                 onnx_registry.as_ref(),
                 pii_model,
@@ -974,7 +970,7 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
                     "PII pre-filter build failed — falling back to the regex baseline",
                 );
                 review_cfg.auto_enqueue.then(|| {
-                    Arc::new(fluent_onnx::RegexPiiDetector) as Arc<dyn fluent_onnx::PiiSpanDetector>
+                    Arc::new(fluent_llm::RegexPiiDetector) as Arc<dyn fluent_llm::backend::PiiSpanDetector>
                 })
             }
         };
@@ -1041,7 +1037,7 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
             // concept store's labels at boot. Fail-open — the colbert role
             // unconfigured/unregistered → empty scorer, and the worker yields
             // no candidates (identical to a pre-colbert stub).
-            let colbert_key = fluent_onnx::OnnxRole::Colbert.registry_key();
+            let colbert_key = fluent_llm::onnx_config::OnnxRole::Colbert.registry_key();
             let scorer_model = onnx_registry
                 .as_ref()
                 .and_then(|r| r.config(colbert_key).map(|_| colbert_key));
@@ -1384,12 +1380,12 @@ fn build_plan_route(
     // resolves to a LateInteraction session, build the MaxSim reranker.
     #[cfg(feature = "onnx")]
     {
-        let colbert_key = fluent_onnx::OnnxRole::Colbert.registry_key();
+        let colbert_key = fluent_llm::onnx_config::OnnxRole::Colbert.registry_key();
         if let Some(registry) = &onnx {
             if config
                 .onnx
                 .as_ref()
-                .is_some_and(|f| f.has(fluent_onnx::OnnxRole::Colbert))
+                .is_some_and(|f| f.has(fluent_llm::onnx_config::OnnxRole::Colbert))
             {
                 match fluent_router::ort::onnx_colbert_reranker(registry, colbert_key) {
                     Ok(Some(retriever)) => {
@@ -1516,9 +1512,9 @@ fn default_chart_embedder(
             if config
                 .onnx
                 .as_ref()
-                .is_some_and(|f| f.has(fluent_onnx::OnnxRole::Encoder))
+                .is_some_and(|f| f.has(fluent_llm::onnx_config::OnnxRole::Encoder))
             {
-                let key = fluent_onnx::OnnxRole::Encoder.registry_key();
+                let key = fluent_llm::onnx_config::OnnxRole::Encoder.registry_key();
                 return match fluent_router::ort::onnx_chart_embedder(registry, key) {
                     Ok(Some(provider)) => Some(provider),
                     Ok(None) => {
@@ -1546,7 +1542,7 @@ fn default_chart_embedder(
         if config
             .onnx
             .as_ref()
-            .is_some_and(|f| f.has(fluent_onnx::OnnxRole::Encoder))
+            .is_some_and(|f| f.has(fluent_llm::onnx_config::OnnxRole::Encoder))
         {
             tracing::warn!(
                 target: "coral-router",
@@ -1754,8 +1750,8 @@ mod config_tests {
             .models
             .insert("embed".into(), serde_json::from_value(model).unwrap());
         config.embedding_model = Some("embed".into());
-        config.onnx = Some(fluent_onnx::OnnxFleetConfig {
-            encoder: Some(fluent_onnx::OnnxRoleConfig {
+        config.onnx = Some(fluent_llm::onnx_config::OnnxFleetConfig {
+            encoder: Some(fluent_llm::onnx_config::OnnxRoleConfig {
                 pinned: false,
                 no_sleep: false,
                 sleep_idle_seconds: None,
@@ -1763,7 +1759,7 @@ mod config_tests {
                 idle_timeout_ms: 0,
                 params: None,
                 instances: None,
-                model: fluent_onnx::OnnxConfig::new()
+                model: fluent_llm::onnx_config::OnnxConfig::new()
                     .model_path("/models/encoder/onnx/model_q8.onnx")
                     .tokenizer_path("/models/encoder/tokenizer.json")
                     .build(),
@@ -1782,15 +1778,15 @@ mod config_tests {
         // A stub registry: the encoder role registered as an Always FillMask
         // encoder, but its stub handle holds no real session — the encoder
         // build must fail.
-        let registry = fluent_onnx::OrtSessionRegistry::new(Arc::new(StubLoader));
+        let registry = fluent_llm::onnx_session::OrtSessionRegistry::new(Arc::new(StubLoader));
         let encoder_cfg = config
             .onnx
             .as_ref()
             .and_then(|f| f.encoder.as_ref())
-            .map(|rc| rc.clone().to_onnx_config(fluent_onnx::OnnxRole::Encoder))
+            .map(|rc| rc.clone().to_onnx_config(fluent_llm::onnx_config::OnnxRole::Encoder))
             .unwrap();
         registry
-            .register(fluent_onnx::OnnxRole::Encoder.registry_key().to_string(), encoder_cfg)
+            .register(fluent_llm::onnx_config::OnnxRole::Encoder.registry_key().to_string(), encoder_cfg)
             .expect("register");
 
         // The onnx encoder role is preferred: even though the endpoint is valid
@@ -1817,13 +1813,13 @@ mod config_tests {
     #[derive(Default)]
     struct StubLoader;
 
-    impl fluent_onnx::SessionLoader for StubLoader {
+    impl fluent_llm::onnx_session::SessionLoader for StubLoader {
         fn load(
             &self,
-            _config: &fluent_onnx::OnnxConfig,
+            _config: &fluent_llm::onnx_config::OnnxConfig,
             _model_key: &str,
-        ) -> Result<fluent_onnx::SessionHandle, fluent_onnx::OrtError> {
-            Ok(fluent_onnx::SessionHandle::new("stub"))
+        ) -> Result<fluent_llm::onnx_session::SessionHandle, fluent_llm::onnx_error::OrtError> {
+            Ok(fluent_llm::onnx_session::SessionHandle::new("stub"))
         }
     }
 }

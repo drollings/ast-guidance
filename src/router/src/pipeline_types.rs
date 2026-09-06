@@ -333,7 +333,7 @@ impl StageMetadata {
     }
 
     /// The overlay stage's raw contributions (kind/score/payload) for audit.
-    pub fn overlay_contributions(&self) -> Option<Vec<fluent_onnx::overlay::OverlayContribution>> {
+    pub fn overlay_contributions(&self) -> Option<Vec<fluent_llm::backend::OverlayContribution>> {
         self.0
             .get("overlay_contributions")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -398,7 +398,7 @@ impl StageMetadata {
     }
 
     /// Publish the `Overlay` stage's raw contributions for audit (§2.4).
-    pub fn set_overlay_contributions(&mut self, contributions: &[fluent_onnx::overlay::OverlayContribution]) {
+    pub fn set_overlay_contributions(&mut self, contributions: &[fluent_llm::backend::OverlayContribution]) {
         if let Ok(v) = serde_json::to_value(contributions) {
             self.0["overlay_contributions"] = v;
         }

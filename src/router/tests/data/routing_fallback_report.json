@@ -1,0 +1,9 @@
+{
+  "_doc": "Routing-fallback calibration report. Recomputed from routing_fallback_corpus.json on every test run; the test fails unless the recomputed values equal these AND the 1.0 targets. precision = fallbacks with a genuine recorded cause (miss / failed-readiness skip / non-terminal error) / all fallbacks. recall = genuine failures that fell through to the next rung / all genuine failures. control_pass_rate = controls with zero fallback and exact expected sequences / all controls. No caching, persistence, or traffic-shaping follows from this report — measurement only.",
+  "precision": 1.0,
+  "recall": 1.0,
+  "control_pass_rate": 1.0,
+  "fallback_cases": 14,
+  "control_cases": 10,
+  "total_cases": 24
+}

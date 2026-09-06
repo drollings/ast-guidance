@@ -1,11 +1,12 @@
-//! PII detection (ROADMAP_20260827_ORT §3.2): the deterministic regex
-//! baseline and the onnx PII-Detector behind one [`PiiSpanDetector`] seam.
+//! PII detection (ROADMAP_20260827_ORT §3.2): the BILUO decode, the label-map
+//! loading, and the onnx PII-Detector behind the [`PiiSpanDetector`] seam.
 //!
-//! Two implementations justify the trait: [`RegexPiiDetector`] (wrapping the
-//! canonical `fluent_llm::pii_patterns` table — never a duplicated pattern
-//! table) and the onnx-gated [`OrtPiiClassifier`] (token classification over
-//! the PII-Detector export, BILUO-decoded into char-aligned spans). The BILUO
-//! decode and the label-map loading are pure and unit-tested without a model.
+//! Two implementations justify the trait: [`fluent_llm::backend::RegexPiiDetector`]
+//! (wrapping the canonical `fluent_llm::pii_patterns` table — never a
+//! duplicated pattern table) and the onnx-gated [`OrtPiiClassifier`] (token
+//! classification over the PII-Detector export, BILUO-decoded into
+//! char-aligned spans). The BILUO decode and the label-map loading are pure
+//! and unit-tested without a model.
 //!
 //! The trait is the fail-open review pre-filter surface (§3.5): it only ever
 //! *adds* candidates (spans a review job records), never drops a job and
@@ -14,62 +15,12 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+
+use fluent_llm::backend::PiiSpan;
 
 use crate::config::OnnxConfig;
 use crate::error::OrtError;
-
-/// A detected PII span: byte offsets into the scanned text, the label (the
-/// regex pattern name or the token-classification label, e.g.
-/// `"credential.password"`), and the detector's confidence.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PiiSpan {
-    /// Byte offset of the span's start within the scanned text.
-    pub start: usize,
-    /// Byte offset of the span's end within the scanned text.
-    pub end: usize,
-    /// The PII label (`ssn`, `credential.api_key`, …).
-    pub label: String,
-    /// The detector's confidence (regex baseline: `1.0`; classifier: the
-    /// softmax probability of the span's tokens, averaged).
-    pub score: f64,
-}
-
-impl PiiSpan {
-    /// A span from byte offsets and a label, with the given confidence.
-    #[must_use]
-    pub fn new(start: usize, end: usize, label: impl Into<String>, score: f64) -> Self {
-        Self {
-            start,
-            end,
-            label: label.into(),
-            score,
-        }
-    }
-
-    /// Slice the span's text out of `source` (byte offsets are valid for
-    /// `&source[start..end]`). `None` when the offsets are out of bounds.
-    #[must_use]
-    pub fn slice<'a>(&self, source: &'a str) -> Option<&'a str> {
-        source.get(self.start..self.end)
-    }
-}
-
-/// A PII detection failure. The review pre-filter treats every error as an
-/// empty span set (fail-open — never a job drop and never a rejection).
-#[derive(Debug, thiserror::Error)]
-pub enum PiiError {
-    #[error("PII classifier inference failed: {0}")]
-    Inference(String),
-}
-
-/// The PII detection seam: `dyn` at the request boundary (the review worker
-/// holds `Option<Arc<dyn PiiSpanDetector>>`), concrete impls inside.
-pub trait PiiSpanDetector: Send + Sync {
-    /// Detect PII spans in `text`. Errors are fail-open at the boundary — the
-    /// caller maps an error to an empty span set, never to a job drop.
-    fn detect(&self, text: &str) -> Result<Vec<PiiSpan>, PiiError>;
-}
 
 /// Decode per-token BILUO labels into char-aligned spans.
 ///
@@ -250,25 +201,6 @@ struct ConfigJsonLabels {
     id2label: Option<HashMap<i64, String>>,
 }
 
-/// The deterministic PII baseline: wraps the canonical `fluent_llm::pii_patterns`
-/// table (never a duplicated pattern list) and reports every regex match as a
-/// `PiiSpan` at the pattern's byte offsets with confidence `1.0`. Always
-/// available — no model, no feature gate, fail-open by construction.
-#[derive(Debug, Clone, Default)]
-pub struct RegexPiiDetector;
-
-impl PiiSpanDetector for RegexPiiDetector {
-    fn detect(&self, text: &str) -> Result<Vec<PiiSpan>, PiiError> {
-        let mut spans = Vec::new();
-        for pattern in fluent_llm::pii_patterns::pii_patterns() {
-            for m in pattern.regex.find_iter(text) {
-                spans.push(PiiSpan::new(m.start(), m.end(), pattern.name, 1.0));
-            }
-        }
-        Ok(spans)
-    }
-}
-
 /// The onnx PII-Detector: token classification → per-token label + confidence
 /// → BILUO decode into char-aligned spans. Behind the `onnx` feature.
 ///
@@ -285,9 +217,11 @@ pub mod ort_pii {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
+    use fluent_llm::backend::{PiiError, PiiSpan, PiiSpanDetector};
+
     use crate::config::OnnxConfig;
     use crate::error::OrtError;
-    use crate::pii::{decode_biluo, label_map_for, PiiError, PiiSpan, PiiSpanDetector};
+    use crate::pii::{decode_biluo, label_map_for};
     use crate::session::SessionHandle;
     use crate::tokenizer::LfmTokenizer;
 

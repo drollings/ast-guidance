@@ -23,6 +23,7 @@ use tokio::process::{Child, Command};
 use crate::config::{InstanceProfile, RouterConfig};
 use crate::instances::instance_grammar_string;
 
+pub mod adopt;
 pub mod health;
 use health::HealthProbe;
 
@@ -128,6 +129,31 @@ impl LlamaServerSpec {
             extra_args: Vec::new(),
         }
     }
+}
+
+/// Library directory pinned onto a spawned server's `LD_LIBRARY_PATH`: the
+/// canonicalized parent of the `llama-server` binary. Canonicalization
+/// matters because the binary is usually reached through a symlink chain
+/// (`~/.local/bin` -> `/app/bin` -> the fork's `build-coral/bin`); the `.so`
+/// files live beside the real binary, not beside the symlink. `None` when the
+/// path cannot be canonicalized — the spawn then inherits the ambient
+/// environment unchanged.
+pub fn fleet_lib_dir(bin: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(bin)
+        .ok()?
+        .parent()
+        .map(Path::to_path_buf)
+}
+
+/// Prepend `dir` to an `LD_LIBRARY_PATH`-style value, preserving any
+/// inherited entries (ROCm, system) behind it. Pure and unit-tested.
+pub fn prepend_library_path(dir: &Path, existing: Option<std::ffi::OsString>) -> std::ffi::OsString {
+    let mut out = dir.as_os_str().to_os_string();
+    if let Some(rest) = existing.filter(|s| !s.is_empty()) {
+        out.push(":");
+        out.push(rest);
+    }
+    out
 }
 
 /// Render the exact argv for a spawned server (unit-testable, no side effects).
@@ -246,6 +272,16 @@ struct ServerInner {
     /// The live child while one is running (moved into the supervision task
     /// while it awaits `wait`).
     child: Mutex<Option<Child>>,
+    /// OS pid of the most recently spawned child (for the persisted fleet
+    /// map). Stale once the child exits; load-time reuse is guarded by
+    /// `adopt::pid_still_ours`.
+    child_pid: Mutex<Option<u32>>,
+    /// OS pid of an adopted (non-child) server this entry manages. Set by
+    /// `mark_adopted`, retained across `unload` (the orphan survives and is
+    /// re-driven via HTTP only — the router can never `wait()` on or signal
+    /// a process it did not spawn). Cleared by `stop` and when the watchdog
+    /// replaces a dead orphan with a fresh child.
+    adopted_pid: Mutex<Option<u32>>,
     /// Set by `stop()` so the supervision task never restarts.
     stopping: AtomicBool,
     /// Whether a child is currently expected to be alive (spawned, or being
@@ -291,6 +327,8 @@ impl ManagedServer {
             base_url,
             inner: Arc::new(ServerInner {
                 child: Mutex::new(None),
+                child_pid: Mutex::new(None),
+                adopted_pid: Mutex::new(None),
                 stopping: AtomicBool::new(false),
                 running: AtomicBool::new(false),
                 spawn_lock: tokio::sync::Mutex::new(()),
@@ -320,8 +358,63 @@ impl ManagedServer {
 
     /// Whether a spawned child is currently expected to be alive. `false` for
     /// a lazy model that has never been loaded (or was unloaded for VRAM).
+    /// Adopted orphans report `true` once marked (see `mark_adopted`).
     pub fn is_running(&self) -> bool {
         self.inner.running.load(Ordering::Relaxed)
+    }
+
+    /// Take over a live non-child `llama-server` on `spec.port` (adopt-before-
+    /// spawn). Called only pre-`start_all`, when no supervision task or child
+    /// exists for the entry. Marks the entry running: health and management
+    /// go through HTTP exactly as for a spawned server.
+    pub fn mark_adopted(&self, pid: u32) {
+        if let Ok(mut guard) = self.inner.adopted_pid.lock() {
+            *guard = Some(pid);
+        }
+        self.inner.running.store(true, Ordering::Relaxed);
+    }
+
+    /// The adopted non-child pid, if this entry manages an orphan.
+    pub fn adopted_pid(&self) -> Option<u32> {
+        self.inner
+            .adopted_pid
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+    }
+
+    /// Whether this entry manages an adopted (non-child) process.
+    pub fn is_adopted(&self) -> bool {
+        self.adopted_pid().is_some()
+    }
+
+    /// Forget an adoption (the orphan died and a fresh child takes over, or
+    /// the entry is stopped). The process itself is never signalled — the
+    /// router owns no handle on it.
+    pub(super) fn clear_adoption(&self) {
+        if let Ok(mut guard) = self.inner.adopted_pid.lock() {
+            *guard = None;
+        }
+    }
+
+    /// OS pid of the most recently spawned child, if any.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.inner.child_pid.lock().ok().and_then(|g| *g)
+    }
+
+    /// The liveness poll interval (adopted-watchdog parity with spawned).
+    pub fn liveness_poll(&self) -> Duration {
+        self.inner.liveness_poll
+    }
+
+    /// Consecutive failed probes before a hung server is restarted.
+    pub fn liveness_failures_before_restart(&self) -> u32 {
+        self.inner.liveness_failures_before_restart
+    }
+
+    /// The consecutive-crash containment budget.
+    pub fn max_restarts(&self) -> u32 {
+        self.inner.max_restarts
     }
 
     /// Spawn the child and wait for it to answer `/health`. Called at boot for
@@ -361,14 +454,27 @@ impl ManagedServer {
         if self.inner.stopping.load(Ordering::Relaxed) {
             return Err(format!("model '{}' is stopped", self.spec.model_key));
         }
-        self.spawn_child(bin);
-        self.inner.running.store(true, Ordering::Relaxed);
-        tracing::info!(
-            target: "router.supervisor",
-            model = %self.spec.model_key,
-            base_url = %self.base_url,
-            "llama-server loaded on demand",
-        );
+        if self.adopted_pid().is_some() {
+            // An adopted orphan survives `unload` (the router owns no handle
+            // on it, so there is nothing to respawn): re-driving it is just
+            // health + supervision again on the same port.
+            self.inner.running.store(true, Ordering::Relaxed);
+            tracing::info!(
+                target: "router.supervisor",
+                model = %self.spec.model_key,
+                base_url = %self.base_url,
+                "adopted llama-server re-driven on demand",
+            );
+        } else {
+            self.spawn_child(bin);
+            self.inner.running.store(true, Ordering::Relaxed);
+            tracing::info!(
+                target: "router.supervisor",
+                model = %self.spec.model_key,
+                base_url = %self.base_url,
+                "llama-server loaded on demand",
+            );
+        }
         // Start the supervision task if none is running (e.g. after an unload).
         {
             let mut guard = match self.inner.supervisor.lock() {
@@ -393,12 +499,26 @@ impl ManagedServer {
     /// containment state: a later load attempt starts from a fresh (bounded)
     /// crash budget, so an operator's fix to the weights/config takes effect
     /// on the next on-demand dispatch.
+    ///
+    /// An adopted orphan has no child to kill (and the router must never
+    /// signal a process it did not spawn): `unload` only marks it not-running
+    /// and stops supervision. Its KV/instances are freed fork-side by the
+    /// pool's destroy calls (delete-last unloads the weights); the next
+    /// `ensure_running` re-drives the same live process with no respawn.
     pub async fn unload(self: &Arc<Self>) {
         self.inner.failed.store(false, Ordering::Relaxed);
         self.inner.spawn_failures.store(0, Ordering::Relaxed);
         self.inner.running.store(false, Ordering::Relaxed);
         if let Some(handle) = self.inner.supervisor.lock().ok().and_then(|mut g| g.take()) {
             handle.abort();
+        }
+        if self.is_adopted() {
+            tracing::info!(
+                target: "router.supervisor",
+                model = %self.spec.model_key,
+                "adopted llama-server released (process survives for re-adoption)",
+            );
+            return;
         }
         let child = {
             let mut guard = match self.inner.child.lock() {
@@ -507,12 +627,25 @@ impl ManagedServer {
     /// by design, and `spawn_child` is the single process-spawn point in the
     /// supervisor. It is intentionally authorized to launch `llama-server`
     /// rather than token-gated.
+    ///
+    /// The child's `LD_LIBRARY_PATH` is pinned to the binary's own directory
+    /// (see [`fleet_lib_dir`]): the fork ships its `libllama-*.so` beside the
+    /// binary, and without the pin the loader resolves whatever stale system
+    /// copy sits in `/usr/local/lib` — silently running old fork code after a
+    /// rebuild.
     fn spawn_child(self: &Arc<Self>, bin: &Path) {
         if self.inner.stopping.load(Ordering::Relaxed) {
             return;
         }
         let args = build_server_args(&self.spec);
-        match Command::new(bin)
+        let mut cmd = Command::new(bin);
+        if let Some(lib_dir) = fleet_lib_dir(bin) {
+            cmd.env(
+                "LD_LIBRARY_PATH",
+                prepend_library_path(&lib_dir, std::env::var_os("LD_LIBRARY_PATH")),
+            );
+        }
+        match cmd
             .args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -520,6 +653,7 @@ impl ManagedServer {
             .spawn()
         {
             Ok(mut child) => {
+                let pid = child.id();
                 let stdout = child.stdout.take();
                 let stderr = child.stderr.take();
                 {
@@ -528,6 +662,9 @@ impl ManagedServer {
                         Err(e) => e.into_inner(),
                     };
                     *guard = Some(child);
+                }
+                if let Ok(mut guard) = self.inner.child_pid.lock() {
+                    *guard = pid;
                 }
                 // NOTE: `spawn_failures` is deliberately NOT reset here. An
                 // OS-level spawn that produces a process which dies before
@@ -589,6 +726,67 @@ impl ManagedServer {
         }
     }
 
+    /// Watch an adopted orphan by health probe (it has no child handle to
+    /// `wait()` on). Returns when the entry is stopping or the orphan has
+    /// failed `liveness_failures_before_restart` consecutive probes — in the
+    /// latter case the adoption is cleared so the caller falls through to a
+    /// fresh spawn on the same port. A healthy probe resets the crash budget,
+    /// exactly like the spawned liveness path.
+    async fn watch_adopted(
+        self: &Arc<Self>,
+        client: &reqwest::Client,
+        liveness_poll: Duration,
+        liveness_threshold: u32,
+    ) {
+        let mut failures: u32 = 0;
+        loop {
+            if self.inner.stopping.load(Ordering::Relaxed) {
+                return;
+            }
+            if self.adopted_pid().is_none() {
+                return;
+            }
+            tokio::time::sleep(liveness_poll).await;
+            if self.probe_health_with_client(client).await {
+                failures = 0;
+                self.inner.spawn_failures.store(0, Ordering::Relaxed);
+            } else {
+                failures += 1;
+                tracing::warn!(
+                    target: "router.supervisor",
+                    model = %self.spec.model_key,
+                    consecutive_failures = failures,
+                    threshold = liveness_threshold,
+                    "adopted llama-server /health probe failed",
+                );
+                if failures >= liveness_threshold {
+                    break;
+                }
+            }
+        }
+        tracing::error!(
+            target: "router.supervisor",
+            model = %self.spec.model_key,
+            base_url = %self.base_url,
+            failures = failures,
+            "adopted llama-server hung (stopped answering /health) - spawning a fresh child on the same port",
+        );
+        let failures = self.inner.spawn_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.contained() {
+            self.mark_contained();
+            tracing::error!(
+                target: "router.supervisor",
+                model = %self.spec.model_key,
+                base_url = %self.base_url,
+                failures = failures,
+                limit = self.inner.max_restarts,
+                "adopted llama-server failed too many times - giving up (contained); fix the model's weights/config or restart the router",
+            );
+            return;
+        }
+        self.clear_adoption();
+    }
+
     /// The supervision loop: watch the child for unexpected exit AND for
     /// post-boot liveness. A server that stays alive but stops answering
     /// `/health` for `liveness_failures_before_restart` consecutive probes is
@@ -598,6 +796,18 @@ impl ManagedServer {
     async fn supervise(self: Arc<Self>, bin: PathBuf, client: Arc<reqwest::Client>) {
         let liveness_poll = self.inner.liveness_poll;
         let liveness_threshold = self.inner.liveness_failures_before_restart;
+        // An adopted orphan has no child handle: watch it by probe until it
+        // dies (adoption cleared, fresh spawn below takes over) or we stop.
+        // A contained orphan stays contained — `watch_adopted` returns without
+        // clearing, and the loop below finds no child and exits via the
+        // containment branch.
+        if self.adopted_pid().is_some() {
+            self.watch_adopted(&client, liveness_poll, liveness_threshold)
+                .await;
+            if self.inner.stopping.load(Ordering::Relaxed) {
+                return;
+            }
+        }
         loop {
             let child = {
                 let mut guard = match self.inner.child.lock() {
@@ -729,6 +939,11 @@ impl ManagedServer {
     /// sees `stopping` and exits without restarting). Also clears any
     /// containment state — a router restart (`make router-start`) is the
     /// documented recovery path for a contained model.
+    ///
+    /// An adopted orphan is never killed (the router owns no handle on it and
+    /// must not signal a process it did not spawn): it is released to survive
+    /// shutdown and be re-adopted by the next boot, so restarts never churn
+    /// VRAM or drop live KV state.
     pub async fn stop(self: &Arc<Self>) {
         self.inner.failed.store(false, Ordering::Relaxed);
         self.inner.spawn_failures.store(0, Ordering::Relaxed);
@@ -736,6 +951,15 @@ impl ManagedServer {
         self.inner.running.store(false, Ordering::Relaxed);
         if let Some(handle) = self.inner.supervisor.lock().ok().and_then(|mut g| g.take()) {
             handle.abort();
+        }
+        if self.is_adopted() {
+            self.clear_adoption();
+            tracing::info!(
+                target: "router.supervisor",
+                model = %self.spec.model_key,
+                "adopted llama-server released on shutdown (process survives for re-adoption)",
+            );
+            return;
         }
         let child = {
             let mut guard = match self.inner.child.lock() {
@@ -770,6 +994,10 @@ fn build_shared_client() -> reqwest::Client {
 pub struct LlamaServerSupervisor {
     bin: PathBuf,
     servers: ConcurrentRegistry<String, ManagedServer>,
+    /// Per-boot adoption records (see `adopt.rs`). Keyed by model key;
+    /// verified against the entry's live adopted pid on read (a dead orphan
+    /// replaced by a fresh child self-heals to `None`).
+    adoptions: std::sync::Mutex<std::collections::HashMap<String, adopt::AdoptionInfo>>,
     http_client: Arc<reqwest::Client>,
 }
 
@@ -852,8 +1080,41 @@ impl LlamaServerSupervisor {
         Ok(Self {
             bin,
             servers,
+            adoptions: std::sync::Mutex::new(std::collections::HashMap::new()),
             http_client: Arc::new(build_shared_client()),
         })
+    }
+
+    /// Register a non-running test server for `model_key` (no process is
+    /// spawned; management traffic goes wherever the caller's client points).
+    /// Test-only: lets hermetic tests drive adapter paths that need a
+    /// `ManagedServer` handle without a real `llama-server` binary.
+    #[cfg(test)]
+    pub fn register_test_server(&self, model_key: &str) {
+        let spec = LlamaServerSpec {
+            model_key: model_key.to_string(),
+            name: model_key.to_string(),
+            weights: None,
+            hf_repo: None,
+            hf_file: None,
+            port: 1,
+            instances: Vec::new(),
+            boot: false,
+            slot_save_path: None,
+            api_key: None,
+            instance_wait_s: None,
+            defaults: crate::config::DefaultModelParams::default(),
+            extra_args: Vec::new(),
+        };
+        self.servers.insert(
+            model_key.to_string(),
+            ManagedServer::with_liveness(
+                spec,
+                std::time::Duration::from_secs(30),
+                3,
+                5,
+            ),
+        );
     }
 
     #[cfg(test)]
@@ -861,6 +1122,7 @@ impl LlamaServerSupervisor {
         Self {
             bin,
             servers: ConcurrentRegistry::new(),
+            adoptions: std::sync::Mutex::new(std::collections::HashMap::new()),
             http_client: Arc::new(client),
         }
     }
@@ -893,6 +1155,11 @@ impl LlamaServerSupervisor {
     /// rather than the sum. Returns the first health failure so boot aborts
     /// loudly (a boot model that cannot load its weights must not be silently
     /// skipped).
+    ///
+    /// Entries adopted by [`Self::adopt_orphans`] (run before this) skip the
+    /// spawn — the live process is already on the entry's port — but still get
+    /// a supervision task and a health gate, so a dead-on-arrival orphan fails
+    /// boot loudly instead of lingering.
     pub async fn start_all(self: &Arc<Self>) -> Result<(), String> {
         let bin = self.bin.clone();
         let mut keys: Vec<String> = self.servers.keys();
@@ -909,8 +1176,14 @@ impl LlamaServerSupervisor {
                 continue;
             }
             boot_keys.push(key.clone());
-            server.spawn_child(&bin);
-            server.inner.running.store(true, Ordering::Relaxed);
+            if server.is_adopted() {
+                // The orphan is already listening on the entry's port: no
+                // spawn, just supervision + the health gate below.
+                server.inner.running.store(true, Ordering::Relaxed);
+            } else {
+                server.spawn_child(&bin);
+                server.inner.running.store(true, Ordering::Relaxed);
+            }
             let client = Arc::clone(&self.http_client);
             let handle = {
                 let me = Arc::clone(&server);
@@ -956,6 +1229,14 @@ impl LlamaServerSupervisor {
     /// model is not managed.
     pub fn is_running(&self, model_key: &str) -> Option<bool> {
         self.servers.get(&model_key.to_string()).map(|s| s.is_running())
+    }
+
+    /// Whether a managed model's entry currently drives an adopted (non-child)
+    /// process. `false` for spawned children and unknown models.
+    pub fn is_adopted(&self, model_key: &str) -> bool {
+        self.servers
+            .get(&model_key.to_string())
+            .is_some_and(|s| s.is_adopted())
     }
 
     /// Unload a model's server on demand (frees its VRAM). The spec stays

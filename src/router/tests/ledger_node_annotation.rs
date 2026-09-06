@@ -290,11 +290,11 @@ fn node_annotation_materializes_from_sync_ladder_run() {
     // Signals derive from the sentencized doc (the constructor wires extraction).
     assert_eq!(ann.signals.len(), 1);
     // The predicate is the root verb's lemma as surfaced by the ArcEager rung
-    // (the deterministic lemmatizer does not lowercase a capitalized verb).
-    assert_eq!(ann.signals[0].predicate, "Show");
+    // (standard lemmatization lowercases the capitalized verb "Show" to "show").
+    assert_eq!(ann.signals[0].predicate, "show");
     // The primary signal is the whole (single-sentence) text.
     let primary = ann.primary_signal().expect("one signal");
-    assert_eq!(primary.predicate, "Show");
+    assert_eq!(primary.predicate, "show");
     assert_eq!(primary.sentence, "Show me the sales report");
     // The token baseline is the tokenizer's exact array (detail baseline).
     assert_eq!(ann.tokens.len(), doc.len());

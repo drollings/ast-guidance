@@ -54,9 +54,11 @@ fn parses_and_publishes_signals() {
         .nlp_parse()
         .expect("nlp_parse");
     assert_eq!(signals.len(), 1);
-    // Deterministic parser (middle rung): "show" is the verb predicate.
+    // Deterministic parser (middle rung): "show" is the verb predicate and
+    // "report" (the theme, UD's direct object — the recipient "me" is iobj)
+    // is its direct object.
     assert_eq!(signals[0].predicate, "show");
-    assert_eq!(signals[0].direct_object.as_deref(), Some("me"));
+    assert_eq!(signals[0].direct_object.as_deref(), Some("report"));
 }
 
 #[test]
@@ -147,7 +149,7 @@ fn llm_fetch_failure_falls_back_to_star_parse() {
         .nlp_parse()
         .expect("nlp_parse");
     assert_eq!(signals[0].predicate, "show");
-    assert_eq!(signals[0].direct_object.as_deref(), Some("me"));
+    assert_eq!(signals[0].direct_object.as_deref(), Some("report"));
 }
 
 #[test]

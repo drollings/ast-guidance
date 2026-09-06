@@ -480,7 +480,7 @@ fn annotation_for_derives_once_and_caches_same_arc() {
     let first = store.annotation_for(id).expect("derive").expect("annotation");
     let second = store.annotation_for(id).expect("derive").expect("annotation");
     assert!(Arc::ptr_eq(&first, &second), "the cache must share one Arc");
-    assert_eq!(first.signals[0].predicate, "Show");
+    assert_eq!(first.signals[0].predicate, "show");
     assert_eq!(first.primary_signal().unwrap().sentence, "Show me the sales report");
     // Bookkeeping: ready, from the spacy rung; value rides the shared node.
     let node = store.snapshot(id).unwrap();

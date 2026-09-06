@@ -133,9 +133,14 @@ pub struct InstanceList {
 }
 
 /// One snapshot entry from `GET /instances` or `GET /instances/:name/snapshots`.
+/// Snapshots are per-instance on the fork (`<slot_save_path>/<model>/<instance>/`):
+/// `instance` names the owning namespace (`None` for pre-scoping legacy flat
+/// files, which read back for migration).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SnapshotInfo {
     pub name: String,
+    #[serde(default)]
+    pub instance: Option<String>,
     #[serde(default)]
     pub size: u64,
     #[serde(default)]
@@ -343,9 +348,23 @@ impl InstanceClient {
         .map(|_| ())
     }
 
-    /// `POST /instances/:name/snapshot` - save the slot-0 KV to a named snapshot.
+    /// `POST /instances/:name/snapshot` - save one slot's KV to a named
+    /// snapshot in the instance's own namespace. Defaults to slot 0 (see
+    /// `save_snapshot_slot` for an explicit slot).
     pub async fn save_snapshot(&self, instance: &str, name: &str) -> Result<(), InstanceError> {
-        let body = serde_json::json!({ "name": name });
+        self.save_snapshot_slot(instance, name, 0).await
+    }
+
+    /// `POST /instances/:name/snapshot` with an explicit `id_slot`: save that
+    /// slot's KV under `name` in the instance's namespace and bind the slot to
+    /// it. The fork rejects an out-of-range slot loudly (400).
+    pub async fn save_snapshot_slot(
+        &self,
+        instance: &str,
+        name: &str,
+        id_slot: i32,
+    ) -> Result<(), InstanceError> {
+        let body = serde_json::json!({ "name": name, "id_slot": id_slot });
         self.request(
             reqwest::Method::POST,
             &format!("/instances/{instance}/snapshot"),
@@ -357,6 +376,7 @@ impl InstanceClient {
 
     /// `GET /instances/:name/snapshots` - list the instance's snapshots. The
     /// server wraps them as `{"snapshots": [...]}`; a bare array is tolerated.
+    /// Entries carry their owning `instance` (`None` for legacy flat files).
     pub async fn list_snapshots(&self, instance: &str) -> Result<Vec<SnapshotInfo>, InstanceError> {
         let value = self
             .request(

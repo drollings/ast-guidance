@@ -1,27 +1,14 @@
 use super::*;
 use std::collections::HashMap;
 
-use fluent_onnx::{
-    OnnxConfig, OnnxFleetConfig, OnnxRoleConfig, OnnxTask, OrtError, OrtSessionRegistry,
-    ResidencyPolicy, SessionHandle, SessionLoader,
+use fluent_llm::onnx_config::{
+    OnnxConfig, OnnxFleetConfig, OnnxRoleConfig, OnnxTask, ResidencyPolicy,
 };
+use fluent_llm::onnx_session::OrtSessionRegistry;
+use fluent_llm::testutil::StubSessionLoader;
 
 use super::super::stub::StubServer;
 use crate::config::SidecarConfig;
-
-/// Stub onnx loader (no ort, no model).
-#[derive(Default)]
-struct StubLoader;
-
-impl SessionLoader for StubLoader {
-    fn load(
-        &self,
-        _config: &OnnxConfig,
-        _model_key: &str,
-    ) -> Result<SessionHandle, OrtError> {
-        Ok(SessionHandle::new("stub"))
-    }
-}
 
 fn sidecar_policy() -> SidecarConfig {
     SidecarConfig::default()
@@ -50,7 +37,7 @@ fn llama_info(id: &str, group: &str, pinned: bool, last_used: i64) -> InstanceIn
 /// An `Always`-resident, pinned onnx `llm` role backed by a stub loader
 /// (the reference config's shape, minus the real model file).
 fn onnx_registry() -> Arc<OrtSessionRegistry> {
-    let registry = Arc::new(OrtSessionRegistry::new(Arc::new(StubLoader::default())));
+    let registry = Arc::new(OrtSessionRegistry::new(Arc::new(StubSessionLoader)));
     registry
         .register_with_lifecycle(
             "onnx/llm",
@@ -303,7 +290,7 @@ async fn fleet_unload_releases_unloadable_onnx_role_and_refuses_always() {
     // An `Unloadable`, unpinned onnx role unloads through the trait surface.
     // Registered under the config's role key (`onnx/llm` — the fleet's
     // generative role), exactly as `build_onnx_registry` would.
-    let lazy_registry = Arc::new(OrtSessionRegistry::new(Arc::new(StubLoader::default())));
+    let lazy_registry = Arc::new(OrtSessionRegistry::new(Arc::new(StubSessionLoader)));
     lazy_registry
         .register_with_lifecycle(
             "onnx/llm",

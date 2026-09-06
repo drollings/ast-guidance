@@ -45,3 +45,29 @@ fn weights_identity_defaults_for_missing_file() {
     assert_eq!(idn.quant, "");
     assert_eq!(idn.short_id.len(), 12, "placeholder short id for missing file");
 }
+
+#[test]
+fn in_flight_lease_counts_active_dispatches() {
+    // The residency engine must never evict a model serving a request, so
+    // each dispatch holds a lease across its server call: the count tracks
+    // concurrent holders and returns to zero when they drop.
+    let client = crate::instances::client::InstanceClient::new(
+        reqwest::Client::new(),
+        "http://127.0.0.1:1",
+        None,
+    );
+    let manager = std::sync::Arc::new(InstanceManager::new(
+        "base",
+        client,
+        vec![],
+        crate::config::SidecarConfig::default(),
+    ));
+    assert_eq!(manager.in_flight(), 0, "idle manager holds nothing");
+    let a = manager.hold_in_flight();
+    let b = manager.hold_in_flight();
+    assert_eq!(manager.in_flight(), 2, "two concurrent dispatches");
+    drop(a);
+    assert_eq!(manager.in_flight(), 1, "lease released on drop");
+    drop(b);
+    assert_eq!(manager.in_flight(), 0, "last lease returns the count to zero");
+}

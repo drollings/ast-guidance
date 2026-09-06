@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -54,6 +54,18 @@ pub fn weights_identity(weights_path: &Path) -> WeightsIdentity {
     }
 }
 
+/// A held dispatch on one managed server: releases the manager's in-flight
+/// count on drop, so every exit path (response, error, abort) frees the hold.
+pub struct InflightLease {
+    manager: Arc<InstanceManager>,
+}
+
+impl Drop for InflightLease {
+    fn drop(&mut self) {
+        self.manager.in_flight_count.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// The sidecar owner of instance lifecycle for ONE spawned `llama-server`.
 /// Holds the model key (public id), the management client talking directly to
 /// that server, the expanded configured profiles, and the residency policy.
@@ -68,10 +80,23 @@ pub struct InstanceManager {
     /// the fork's `/instances`; plain models need this to surface in the
     /// aggregate envelope and the residency budget.
     weights_bytes: u64,
+    /// Whether the server speaks the fork's `/instances` management API.
+    /// `false` for an adopted grammar-less orphan (spawned without
+    /// `--instance` flags, so the route 404s): reconcile and on-demand
+    /// creates are suspended until an explicit unload respawns it with the
+    /// correct grammar, while generation and the `/props` footprint keep
+    /// working. Set once at construction from the supervisor's adoption
+    /// record; a mid-life respawn self-heals via `adoption_info`.
+    has_instances_api: AtomicBool,
     /// Router-tracked last-use for plain models (the fork reports no
     /// `last_used` for them). Updated by [`Self::touch`] on every dispatch; the
     /// residency loop orders plain-model unloads by it.
     last_used: AtomicI64,
+    /// Active dispatches currently holding this manager's server. Each
+    /// dispatch holds an [`InflightLease`] across its server call; the
+    /// residency engine never evicts a weights instance with a nonzero
+    /// count, so a model is never unloaded mid-inference.
+    in_flight_count: AtomicUsize,
     /// Router-side preserve-on-evict map: instance name -> `resume`. Seeded
     /// from the configured profiles, updated by [`Self::set_resume`]. The fork
     /// knows nothing of it; the aggregate overlays it on the envelope.
@@ -98,7 +123,9 @@ impl InstanceManager {
             profiles,
             policy,
             weights_bytes: 0,
+            has_instances_api: AtomicBool::new(true),
             last_used: AtomicI64::new(-1),
+            in_flight_count: AtomicUsize::new(0),
             resume: Mutex::new(resume),
             identity: WeightsIdentity::default(),
         }
@@ -133,6 +160,19 @@ impl InstanceManager {
         !self.profiles.is_empty()
     }
 
+    /// Whether the server speaks the fork's `/instances` API. `false` only
+    /// for an adopted grammar-less orphan (see the field docs).
+    pub fn has_instances_api(&self) -> bool {
+        self.has_instances_api.load(Ordering::Relaxed)
+    }
+
+    /// Mark the server as grammar-less (adopted without `--instance` flags)
+    /// or fully API-capable. Called once at construction from the
+    /// supervisor's adoption record.
+    pub fn set_instances_supported(&self, supported: bool) {
+        self.has_instances_api.store(supported, Ordering::Relaxed);
+    }
+
     /// The resident weights size of this model (from the configured weights
     /// file). For instance models the fork reports `model_bytes` itself; this
     /// is the size a cold load needs and the plain-model footprint uses.
@@ -161,10 +201,12 @@ impl InstanceManager {
 
     /// Whether the fork currently has this model's weights slept out of VRAM
     /// (`is_sleeping` in `/props`). `None` when the server is unreachable.
-    /// Instance models never report sleeping (pinned contexts keep their
-    /// weights resident), so `Some(false)` short-circuits without a call.
+    /// Instance models with a live management API never report sleeping
+    /// (pinned contexts keep their weights resident), so `Some(false)`
+    /// short-circuits without a call. A grammar-less adopted pool model has no
+    /// `/instances` but its `/props` sleep flag is still meaningful.
     pub async fn is_sleeping(&self) -> Option<bool> {
-        if self.has_pool() {
+        if self.has_pool() && self.has_instances_api() {
             return Some(false);
         }
         self.client
@@ -190,6 +232,19 @@ impl InstanceManager {
         self.last_used.load(Ordering::Relaxed)
     }
 
+    /// Active dispatches currently holding this manager's server.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight_count.load(Ordering::Relaxed)
+    }
+
+    /// Hold this manager's server across one dispatch: the count is released
+    /// when the lease drops (end of the server call, success or failure), so
+    /// the residency engine never evicts a model mid-inference.
+    pub fn hold_in_flight(self: &Arc<Self>) -> InflightLease {
+        self.in_flight_count.fetch_add(1, Ordering::Relaxed);
+        InflightLease { manager: Arc::clone(self) }
+    }
+
     /// Ask this model's server to stop the generation running in a slot.
     /// Invoked on a downstream streaming disconnect (the abort arm of the
     /// dispatch path), as belt-and-suspenders on top of the transport close:
@@ -207,10 +262,12 @@ impl InstanceManager {
     /// file size, or 0 when the server reports `is_sleeping` (the fork's idle
     /// sleep has moved the weights out of VRAM). `state` mirrors that flag.
     /// `None` when the server is unreachable (down or never loaded).
+    ///
+    /// Also serves an adopted grammar-less pool model: a server spawned
+    /// without `--instance` flags 404s `/instances`, but its `/props` still
+    /// reports the resident weights, so the pool keeps residency visibility
+    /// instead of going blind until the next unload respawns it with grammar.
     pub(super) async fn plain_footprint(&self) -> Option<InstanceInfo> {
-        if self.has_pool() {
-            return None;
-        }
         let props = self.client.props().await?;
         let asleep = props
             .get("is_sleeping")
@@ -296,19 +353,36 @@ impl InstanceManager {
     ///
     /// A plain model (no instance profiles) has nothing to reconcile — returns
     /// `Ok` without touching the management API (a plain server exposes no
-    /// `/instances`).
+    /// `/instances`). An adopted grammar-less pool model is likewise skipped
+    /// with a loud warning: its server 404s every management call, so
+    /// reconcile would only spin; generation still works and the next explicit
+    /// unload respawns it with the correct grammar.
     pub async fn reconcile(&self) -> Result<(), InstanceError> {
         if self.profiles.is_empty() {
+            return Ok(());
+        }
+        if !self.has_instances_api() {
+            tracing::warn!(
+                target: "router.instances",
+                model = %self.model_key,
+                base_url = %self.client.base_url(),
+                "instance reconcile suspended - adopted server has no /instances API (spawned without --instance flags); generation continues, unload to respawn with grammar",
+            );
             return Ok(());
         }
         let existing = match self.client.list().await {
             Ok(envelope) => envelope,
             Err(e) => {
-                tracing::warn!(
+                // Quiet by design: `bootstrap` logs the first deferral (info)
+                // and subsequent retries (debug), and the sibling paths below
+                // propagate `Err` without logging. A WARN here would repeat on
+                // every backoff tick — including for lazy models whose server
+                // is legitimately not started yet.
+                tracing::debug!(
                     target: "router.instances",
                     base_url = %self.client.base_url(),
                     error = %e,
-                    "instance reconcile aborted - management API unreachable",
+                    "instance reconcile deferred - management API unreachable",
                 );
                 return Err(e);
             }
@@ -425,9 +499,20 @@ impl InstanceManager {
     /// Used by the dispatch path when a request targets a specific instance
     /// (e.g. `<base>:scratch`) that is unpinned and therefore absent after
     /// boot. No-op when the name has no configured profile (nothing to create)
-    /// or already exists.
+    /// or already exists. No-op on a grammar-less adopted server (its single
+    /// context serves every target; the fork has no management API to create
+    /// through).
     pub async fn ensure_instance(&self, name: &str) -> Result<(), InstanceError> {
         if name.is_empty() || self.profiles.is_empty() {
+            return Ok(());
+        }
+        if !self.has_instances_api() {
+            tracing::debug!(
+                target: "router.instances",
+                model = %self.model_key,
+                instance = %name,
+                "grammar-less server serves every target from its single context - nothing to create",
+            );
             return Ok(());
         }
         let existing = match self.client.list().await {
@@ -500,9 +585,8 @@ impl InstanceManager {
 
     /// Boot orchestration: reconcile the configured pinned instances against
     /// the fork, retrying until the management API is reachable (the container
-    /// may come up after the router). Residency is pool-wide
-    /// ([`InstancePool::run_residency`]), so this task stops after a
-    /// successful reconcile.
+    /// may come up after the router). Residency runs on the shared engine, so
+    /// this task stops after a successful reconcile.
     pub async fn bootstrap(&self) {
         let base = Duration::from_secs(self.policy.poll_interval_s.max(1));
         let poll = PollWithBackoff::new(base, 12);
@@ -537,8 +621,12 @@ impl InstanceManager {
     /// Allocate a fresh instance for `group` on a 503 group-miss. Uses the
     /// group's configured profile (name/group/ctx/parallel/pinned) with a
     /// unique `<group>-<uuid>` name. No-op when no profile configures the
-    /// group (there is nothing to allocate).
+    /// group (there is nothing to allocate), or on a grammar-less adopted
+    /// server (no management API to allocate through).
     pub async fn ensure_group(&self, group: &str) -> Result<(), InstanceError> {
+        if !self.has_instances_api() {
+            return Ok(());
+        }
         let Some(profile) = self
             .profiles
             .iter()
@@ -584,6 +672,9 @@ impl InstanceManager {
     /// whose sync client cannot trigger the dispatch path's allocate-on-miss.
     pub async fn ensure_group_ready(&self, group: &str) -> Result<(), InstanceError> {
         if self.profiles.is_empty() {
+            return Ok(());
+        }
+        if !self.has_instances_api() {
             return Ok(());
         }
         let existing = match self.client.list().await {
@@ -697,6 +788,16 @@ pub fn build_instance_managers(
                 .with_weights_bytes(weights_bytes)
                 .with_weights_identity(identity),
         );
+        // An adopted grammar-less orphan (no `--instance` flags, so no
+        // `/instances` route) serves generation but cannot be reconciled:
+        // suspend the management calls that would 404 against it. A mid-life
+        // respawn self-heals — `adoption_info` verifies the live pid.
+        if let Some(adoption) = supervisor
+            .as_ref()
+            .and_then(|sup| sup.adoption_info(key))
+        {
+            manager.set_instances_supported(adoption.instances_supported);
+        }
         managers.insert(key.clone(), manager);
     }
     Ok(InstancePool::from_managers(managers, supervisor))

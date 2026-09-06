@@ -31,7 +31,7 @@ pub use self::routing::{RouteRef, RoutingConfig};
 pub use common_core::constants::default_true;
 pub use self::root::{
     AuditLogConfig, ArcReadyConfig, ChartsConfig, ClassifierFailurePolicy, ClassifierOutput,
-    DefaultModelParams, EvictionPolicy, InstanceProfile, LedgerConfig, ModelEntry, OnnxResolver,
+    DefaultModelParams, EvictionPolicy, InstanceProfile, LedgerConfig, ModelEntry,
     OrchestratorSection, OverlayConfig, PostProcessConfig, ReviewConfig, RigorConfig,
     RouterConfig, ServerConfig, SessionConfig, SidecarConfig, WorkflowExtractionMode,
     DECLARATION_PARAM_KEYS, DEFAULT_LEDGER_MAX_SUMMARY_TOKENS, detect_device_vram_total,

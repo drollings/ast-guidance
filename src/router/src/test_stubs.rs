@@ -1,8 +1,10 @@
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 
 use common_core::sync::lock;
+use fluent_llm::backend::{BackendCaps, InferenceBackend, InferenceRegistry};
 use fluent_llm::client::ChatBackend;
+use fluent_llm::runtime::LlmWeights;
 use fluent_llm::{BatchEmbedding, ChatMessage, EmbeddingError, EmbeddingProvider, LlmError};
 use fluent_wvr::prelude::*;
 
@@ -235,5 +237,192 @@ impl EmbeddingProvider for HashEmbedder {
             count: texts.len(),
             dims: self.dims,
         })
+    }
+}
+
+/// Maps a requested instance to the marker text the stub answers with.
+type StubResponder = Arc<dyn Fn(Option<&str>) -> &'static str + Send + Sync>;
+
+/// A stub [`InferenceBackend`] serving exactly one key, so registry routing
+/// can be told apart per backend by marker text. The responder maps the
+/// requested instance to the marker text — the two resolution shapes
+/// `local_backend` (`None`) / `local_backend_for_instance` (`Some`) produce.
+pub struct StubInferenceBackend {
+    id: &'static str,
+    key: String,
+    respond: StubResponder,
+}
+
+impl StubInferenceBackend {
+    /// A stub serving `key`, answering through `respond` (instance → marker).
+    pub fn with_responder(
+        id: &'static str,
+        key: impl Into<String>,
+        respond: impl Fn(Option<&str>) -> &'static str + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            id,
+            key: key.into(),
+            respond: Arc::new(respond),
+        }
+    }
+
+    /// A stub serving `key` with distinct default/instance markers (`None`
+    /// instance → `marker`, `Some` instance → `instance_marker`).
+    pub fn named(
+        id: &'static str,
+        key: impl Into<String>,
+        marker: &'static str,
+        instance_marker: &'static str,
+    ) -> Self {
+        Self::with_responder(id, key, move |instance| {
+            if instance.is_some() {
+                instance_marker
+            } else {
+                marker
+            }
+        })
+    }
+
+    /// A stub serving `key` with one marker for both resolution shapes.
+    pub fn fixed(id: &'static str, key: impl Into<String>, marker: &'static str) -> Self {
+        Self::named(id, key, marker, marker)
+    }
+
+    /// A single-backend registry holding this stub, ready to install on a
+    /// config via `RouterConfig::set_inference_registry`.
+    pub fn into_registry(self) -> Arc<RwLock<InferenceRegistry>> {
+        let mut registry = InferenceRegistry::new();
+        registry.register(Arc::new(self));
+        Arc::new(RwLock::new(registry))
+    }
+}
+
+struct StubMarkerBackend {
+    text: String,
+}
+
+impl ChatBackend for StubMarkerBackend {
+    fn chat_complete(&self, _m: &[ChatMessage]) -> Result<String, LlmError> {
+        Ok(self.text.clone())
+    }
+}
+
+impl FieldAccess for StubInferenceBackend {
+    fn set_field(&mut self, name: &str, _v: &str) -> Result<(), FieldError> {
+        Err(FieldError::NotFound(name.into()))
+    }
+    fn get_field(&self, name: &str) -> Result<String, FieldError> {
+        Err(FieldError::NotFound(name.into()))
+    }
+    fn field_names(&self) -> &'static [&'static str] {
+        &[]
+    }
+}
+
+impl Describable for StubInferenceBackend {
+    fn describe(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+}
+
+impl WorkUnit for StubInferenceBackend {
+    fn name(&self) -> &str {
+        self.id
+    }
+    fn depends(&self) -> &[ArcIntern<str>] {
+        &[]
+    }
+    fn provides(&self) -> &[ArcIntern<str>] {
+        &[]
+    }
+    fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+        Ok(WorkOutput::ok("stub"))
+    }
+}
+
+impl_component!(StubInferenceBackend);
+
+impl InferenceBackend for StubInferenceBackend {
+    fn backend_id(&self) -> &'static str {
+        self.id
+    }
+    fn model_keys(&self) -> Vec<String> {
+        vec![self.key.clone()]
+    }
+    fn weights(&self, _key: &str) -> Option<Arc<dyn LlmWeights>> {
+        None
+    }
+    fn chat_backend(
+        &self,
+        key: &str,
+        instance: Option<&str>,
+    ) -> Option<Arc<dyn ChatBackend>> {
+        if key != self.key {
+            return None;
+        }
+        let text = (self.respond)(instance);
+        Some(Arc::new(StubMarkerBackend { text: text.into() }))
+    }
+    fn capabilities(&self) -> BackendCaps {
+        BackendCaps::default()
+    }
+}
+
+// ── Shared onnx decode doubles (single home for the grammar-seam fakes) ──
+
+/// Fixed token-id → text map for hermetic grammar tests.
+#[cfg(feature = "onnx")]
+pub struct StubVocab {
+    tokens: Vec<String>,
+}
+
+#[cfg(feature = "onnx")]
+impl StubVocab {
+    /// A vocab from an ordered token list (`id` = position).
+    pub fn from_list(tokens: &[&str]) -> Arc<Self> {
+        Arc::new(Self {
+            tokens: tokens.iter().map(|s| s.to_string()).collect(),
+        })
+    }
+}
+
+#[cfg(feature = "onnx")]
+impl fluent_onnx::TokenVocab for StubVocab {
+    fn token_text(&self, id: u32) -> Option<String> {
+        self.tokens.get(id as usize).cloned()
+    }
+}
+
+/// A fake decode runner recording whether each call was grammar-constrained.
+#[cfg(feature = "onnx")]
+pub struct RecordingRunner {
+    /// One entry per call: `true` when a grammar was supplied.
+    pub calls: Mutex<Vec<bool>>,
+    output: String,
+}
+
+#[cfg(feature = "onnx")]
+impl RecordingRunner {
+    /// A runner answering every call with `output`.
+    pub fn new(output: impl Into<String>) -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            output: output.into(),
+        }
+    }
+}
+
+#[cfg(feature = "onnx")]
+impl crate::ort::OnnxLlmRunner for RecordingRunner {
+    fn complete(
+        &self,
+        _messages: &[ChatMessage],
+        grammar: Option<&mut (dyn fluent_onnx::Grammar + 'static)>,
+        _max_tokens: Option<usize>,
+        _params: fluent_onnx::LlmParams,
+    ) -> Result<String, LlmError> {
+        lock(&self.calls).push(grammar.is_some());
+        Ok(self.output.clone())
     }
 }

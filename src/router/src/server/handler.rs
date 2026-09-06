@@ -60,7 +60,7 @@ pub struct ServerDeps {
     pub supervisor: Option<Arc<crate::supervisor::LlamaServerSupervisor>>,
     /// The ort ONNX session registry. Onnx-declared models are listed by
     /// `/v1/models`; `Always`-resident ones are refused by `/models/unload`.
-    pub onnx: Option<Arc<fluent_onnx::OrtSessionRegistry>>,
+    pub onnx: Option<Arc<fluent_llm::onnx_session::OrtSessionRegistry>>,
     /// The unified weights facade (ROADMAP M4): llama adapters + onnx
     /// implementors behind the shared `LlmWeights` surface. When present, the
     /// `/instances` + `/v1/models` handlers aggregate through it (onnx rows

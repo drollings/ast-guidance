@@ -800,21 +800,10 @@ fn encoder_model_serde_round_trips() {
     );
 }
 
-// ── ROADMAP M2: the onnx `ChatBackend` branch of the single factory ──
+// ── The onnx `ChatBackend` branch of the single factory ──
 
-/// A stub backend that identifies itself via a name, so tests can tell
-/// which backend the single factory resolved.
-#[derive(Clone)]
-struct StubBackend(&'static str);
-
-impl fluent_llm::client::ChatBackend for StubBackend {
-    fn chat_complete(&self, _m: &[fluent_llm::ChatMessage]) -> Result<String, fluent_llm::LlmError> {
-        Ok(self.0.to_string())
-    }
-}
-
-/// A config with an onnx resolver installed (as the composition root does).
-fn config_with_onnx_resolver() -> RouterConfig {
+/// A config with a stub onnx backend registered (as the composition root does).
+fn config_with_onnx_stub() -> RouterConfig {
     let mut config: RouterConfig = serde_json::from_value(serde_json::json!({
         "models": {
             "swarm": {
@@ -834,21 +823,22 @@ fn config_with_onnx_resolver() -> RouterConfig {
         }
     }))
     .expect("valid config");
-    config.install_onnx_resolver(|key, _instance| {
-        if key == fluent_onnx::OnnxRole::Llm.registry_key() {
-            Some(Arc::new(StubBackend("onnx-llm")))
-        } else {
-            None
-        }
-    });
+    config.set_inference_registry(
+        crate::test_stubs::StubInferenceBackend::fixed(
+            "onnx",
+            fluent_llm::onnx_config::OnnxRole::Llm.registry_key(),
+            "onnx-llm",
+        )
+        .into_registry(),
+    );
     config
 }
 
 #[test]
 fn local_backend_resolves_onnx_key_through_the_single_factory() {
-    let config = config_with_onnx_resolver();
+    let config = config_with_onnx_stub();
     // The onnx role key → the onnx backend via `local_backend`.
-    let backend = config.local_backend(fluent_onnx::OnnxRole::Llm.registry_key());
+    let backend = config.local_backend(fluent_llm::onnx_config::OnnxRole::Llm.registry_key());
     assert!(backend.is_some(), "onnx key resolves through local_backend");
     let text = backend.unwrap().chat_complete(&[]).unwrap();
     assert_eq!(text, "onnx-llm");
@@ -859,10 +849,10 @@ fn local_backend_resolves_onnx_key_through_the_single_factory() {
 
 #[test]
 fn onnx_llm_key_reports_role_key_when_configured() {
-    let config = config_with_onnx_resolver();
+    let config = config_with_onnx_stub();
     assert_eq!(
         config.onnx_llm_key().as_deref(),
-        Some(fluent_onnx::OnnxRole::Llm.registry_key())
+        Some(fluent_llm::onnx_config::OnnxRole::Llm.registry_key())
     );
     assert!(config.onnx_llm_backend().is_some(), "onnx_llm_backend resolves");
 
@@ -960,12 +950,16 @@ fn summarizer_and_tier_fall_back_to_onnx_llm_when_no_llama_ledger_instance() {
         "ledger": { "max_summary_tokens": 300, "background_tiering": true }
     }))
     .expect("valid config");
-    config.install_onnx_resolver(|key, _instance| {
-        (key == fluent_onnx::OnnxRole::Llm.registry_key())
-            .then(|| Arc::new(StubBackend("onnx-llm")) as Arc<dyn ChatBackend>)
-    });
+    config.set_inference_registry(
+        crate::test_stubs::StubInferenceBackend::fixed(
+            "onnx",
+            fluent_llm::onnx_config::OnnxRole::Llm.registry_key(),
+            "onnx-llm",
+        )
+        .into_registry(),
+    );
     // No `ledger.model` and no llama `ledger` instance → the onnx LLM is
-    // the default enrichment/tier backend (ROADMAP M2.6).
+    // the default enrichment/tier backend.
     assert!(config.summarizer_for_ledger().is_some(), "summarizer falls back to onnx");
     assert!(config.ledger_tier_backend(None).is_some(), "tier backend falls back to onnx");
 
@@ -981,9 +975,13 @@ fn summarizer_and_tier_fall_back_to_onnx_llm_when_no_llama_ledger_instance() {
         }
     }))
     .expect("valid config");
-    config.install_onnx_resolver(|key, _instance| {
-        (key == fluent_onnx::OnnxRole::Llm.registry_key())
-            .then(|| Arc::new(StubBackend("onnx-llm")) as Arc<dyn ChatBackend>)
-    });
+    config.set_inference_registry(
+        crate::test_stubs::StubInferenceBackend::fixed(
+            "onnx",
+            fluent_llm::onnx_config::OnnxRole::Llm.registry_key(),
+            "onnx-llm",
+        )
+        .into_registry(),
+    );
     assert!(config.summarizer_for_ledger().is_some(), "no ledger instance → onnx fallback");
 }

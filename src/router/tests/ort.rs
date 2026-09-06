@@ -25,8 +25,8 @@ fn plain_entry() -> ModelEntry {
     }
 }
 
-fn role_config(model_path: &str) -> fluent_onnx::OnnxRoleConfig {
-    fluent_onnx::OnnxRoleConfig {
+fn role_config(model_path: &str) -> fluent_llm::onnx_config::OnnxRoleConfig {
+    fluent_llm::onnx_config::OnnxRoleConfig {
         pinned: false,
         no_sleep: false,
         sleep_idle_seconds: None,
@@ -34,7 +34,7 @@ fn role_config(model_path: &str) -> fluent_onnx::OnnxRoleConfig {
         idle_timeout_ms: 0,
         params: None,
         instances: None,
-        model: fluent_onnx::OnnxConfig::new()
+        model: fluent_llm::onnx_config::OnnxConfig::new()
             .model_path(model_path)
             .tokenizer_path("/models/tokenizer.json")
             // Unloadable so registration does not attempt a real load.
@@ -59,24 +59,18 @@ fn is_managed_covers_only_llama_declarations() {
 
 #[test]
 fn no_onnx_config_yields_empty_registry() {
+    // Single leg covers both feature modes (the builder is fail-open without
+    // a fleet either way); kept as the registry-absence golden.
     let config = RouterConfig::default();
-    #[cfg(feature = "onnx")]
-    {
-        let registry = build_onnx_registry(&config).expect("build");
-        assert!(registry.is_none());
-    }
-    #[cfg(not(feature = "onnx"))]
-    {
-        let registry = build_onnx_registry(&config).expect("build");
-        assert!(registry.is_none());
-    }
+    let registry = build_onnx_registry(&config).expect("build");
+    assert!(registry.is_none());
 }
 
 #[cfg(feature = "onnx")]
 #[test]
 fn role_fleet_registers_under_role_keys_with_implied_tasks() {
 let mut config = RouterConfig::default();
-config.onnx = Some(fluent_onnx::OnnxFleetConfig {
+config.onnx = Some(fluent_llm::onnx_config::OnnxFleetConfig {
     encoder: Some(role_config("/models/encoder.onnx")),
     pii: None,
     router: None,
@@ -85,28 +79,28 @@ config.onnx = Some(fluent_onnx::OnnxFleetConfig {
     llm: None,
 });
 let registry = build_onnx_registry(&config).expect("build").expect("fleet");
-let encoder_key = fluent_onnx::OnnxRole::Encoder.registry_key();
-let colbert_key = fluent_onnx::OnnxRole::Colbert.registry_key();
+let encoder_key = fluent_llm::onnx_config::OnnxRole::Encoder.registry_key();
+let colbert_key = fluent_llm::onnx_config::OnnxRole::Colbert.registry_key();
 assert!(registry.config(encoder_key).is_some());
 assert!(registry.config(colbert_key).is_some());
 assert_eq!(
     registry.config(encoder_key).unwrap().task,
-    fluent_onnx::OnnxTask::FillMask
+    fluent_llm::onnx_config::OnnxTask::FillMask
 );
 assert_eq!(
     registry.config(colbert_key).unwrap().task,
-    fluent_onnx::OnnxTask::LateInteraction
+    fluent_llm::onnx_config::OnnxTask::LateInteraction
 );
 // Unconfigured roles are not registered.
-assert!(!registry.config(fluent_onnx::OnnxRole::Pii.registry_key()).is_some());
+assert!(!registry.config(fluent_llm::onnx_config::OnnxRole::Pii.registry_key()).is_some());
 }
 
 #[cfg(feature = "onnx")]
 #[test]
 fn llm_role_registers_as_causal_lm_with_lifecycle() {
 let mut config = RouterConfig::default();
-config.onnx = Some(fluent_onnx::OnnxFleetConfig {
-    llm: Some(fluent_onnx::OnnxRoleConfig {
+config.onnx = Some(fluent_llm::onnx_config::OnnxFleetConfig {
+    llm: Some(fluent_llm::onnx_config::OnnxRoleConfig {
         pinned: true,
         no_sleep: false,
         sleep_idle_seconds: Some(30),
@@ -114,21 +108,21 @@ config.onnx = Some(fluent_onnx::OnnxFleetConfig {
         idle_timeout_ms: 0,
         params: None,
         instances: None,
-        model: fluent_onnx::OnnxConfig::new()
+        model: fluent_llm::onnx_config::OnnxConfig::new()
             .model_path("/models/llm.onnx")
             .tokenizer_path("/models/llm/tokenizer.json")
             // Unloadable so registration does not attempt a real load.
             .resident(false)
-            .task(fluent_onnx::OnnxTask::CausalLm)
+            .task(fluent_llm::onnx_config::OnnxTask::CausalLm)
             .max_gen_tokens(512)
             .build(),
     }),
     ..Default::default()
 });
 let registry = build_onnx_registry(&config).expect("build").expect("fleet");
-let key = fluent_onnx::OnnxRole::Llm.registry_key();
+let key = fluent_llm::onnx_config::OnnxRole::Llm.registry_key();
 let cfg = registry.config(key).expect("llm registered");
-assert_eq!(cfg.task, fluent_onnx::OnnxTask::CausalLm);
+assert_eq!(cfg.task, fluent_llm::onnx_config::OnnxTask::CausalLm);
 assert_eq!(cfg.max_gen_tokens, 512);
 assert!(registry.is_pinned(key), "role pinned flag reaches the registry");
 assert_eq!(registry.sleep_idle_seconds(key), Some(30));
@@ -137,41 +131,48 @@ assert!(!registry.refuses_unload(key), "unloadable role is not Always");
 
 #[cfg(feature = "onnx")]
 #[test]
-fn build_onnx_residency_yields_loop_only_when_fleet_registered() {
-let mut config = RouterConfig::default();
-// No fleet → no loop.
-assert!(build_onnx_residency(&config, &Arc::new(fluent_onnx::OrtSessionRegistry::new(
-    Arc::new(fluent_onnx::OrtSessionLoader),
-)))
-.is_none());
+fn onnx_weights_impls_yield_one_engine_input_per_registered_role() {
+// No fleet → no engine inputs (the shared engine sees an empty onnx half).
+let bare = RouterConfig::default();
+assert!(onnx_weights_impls(
+    &Arc::new(fluent_llm::onnx_session::OrtSessionRegistry::new(
+        Arc::new(fluent_onnx::OrtSessionLoader),
+    )),
+    &bare,
+)
+.is_empty());
 
-config.onnx = Some(fluent_onnx::OnnxFleetConfig {
-    llm: Some(role_config("/models/llm.onnx")),
+let config = RouterConfig {
+    onnx: Some(fluent_llm::onnx_config::OnnxFleetConfig {
+        llm: Some(role_config("/models/llm.onnx")),
+        ..Default::default()
+    }),
     ..Default::default()
-});
+};
 let registry = build_onnx_registry(&config).expect("build").expect("fleet");
-let loop_ = build_onnx_residency(&config, &registry).expect("loop built");
-let _ = Arc::into_inner(loop_).expect("unique Arc for the test");
+let weights = onnx_weights_impls(&registry, &config);
+assert_eq!(weights.len(), 1, "one engine input per registered role");
+assert_eq!(weights[0].model_key(), "onnx/llm");
 }
 
 #[test]
 fn fleet_round_trip_keeps_roles() {
     let mut config = RouterConfig::default();
-    config.onnx = Some(fluent_onnx::OnnxFleetConfig {
+    config.onnx = Some(fluent_llm::onnx_config::OnnxFleetConfig {
         encoder: Some(role_config("/models/encoder.onnx")),
         ..Default::default()
     });
     let json = serde_json::to_string(&config).unwrap();
     let back: RouterConfig = serde_json::from_str(&json).unwrap();
     let fleet = back.onnx.expect("onnx fleet");
-    assert!(fleet.has(fluent_onnx::OnnxRole::Encoder));
-    assert!(!fleet.has(fluent_onnx::OnnxRole::Colbert));
+    assert!(fleet.has(fluent_llm::onnx_config::OnnxRole::Encoder));
+    assert!(!fleet.has(fluent_llm::onnx_config::OnnxRole::Colbert));
 }
 
 #[test]
 #[cfg(feature = "onnx")]
 fn nlp_encoder_fetch_returns_none_for_missing_model() {
-    let registry = Arc::new(fluent_onnx::OrtSessionRegistry::new(Arc::new(
+    let registry = Arc::new(fluent_llm::onnx_session::OrtSessionRegistry::new(Arc::new(
         fluent_onnx::OrtSessionLoader,
     )));
     let result = nlp_encoder_fetch(&registry, "nonexistent").expect("no ort error");
@@ -270,7 +271,7 @@ mod map_annotations_tests {
 #[test]
 #[cfg(not(feature = "onnx"))]
 fn nlp_encoder_fetch_noop_without_onnx_feature() {
-    let registry = Arc::new(fluent_onnx::OrtSessionRegistry::new(Arc::new(StubLoader)));
+    let registry = Arc::new(fluent_llm::onnx_session::OrtSessionRegistry::new(Arc::new(StubLoader)));
     let result = nlp_encoder_fetch(&registry, "encoder").expect("no ort error");
     assert!(result.is_none());
 }
@@ -419,46 +420,10 @@ fn score_span_resolves_canonical_and_respects_threshold() {
 #[cfg(feature = "onnx")]
 mod onnx_backend_tests {
     use super::*;
+    use crate::test_stubs::{RecordingRunner as FakeRunner, StubVocab as TestVocab};
     use fluent_llm::client::ChatBackend;
-    use fluent_llm::{ChatMessage, LlmError};
+    use fluent_llm::ChatMessage;
     use fluent_onnx::LlmParams;
-    use std::sync::Mutex;
-
-    /// A fixed token-id → text map (mirrors the hermetic grammar tests).
-    struct TestVocab {
-        tokens: Vec<String>,
-    }
-    impl TestVocab {
-        fn from_list(tokens: &[&str]) -> Arc<Self> {
-            Arc::new(Self {
-                tokens: tokens.iter().map(|s| s.to_string()).collect(),
-            })
-        }
-    }
-    impl fluent_onnx::TokenVocab for TestVocab {
-        fn token_text(&self, id: u32) -> Option<String> {
-            self.tokens.get(id as usize).cloned()
-        }
-    }
-
-    /// A fake decode runner that records whether each call was grammar-
-    /// constrained (the injected-fake-decoder seam for hermetic tests).
-    struct FakeRunner {
-        calls: Mutex<Vec<bool>>,
-        output: String,
-    }
-    impl OnnxLlmRunner for FakeRunner {
-        fn complete(
-            &self,
-            _messages: &[ChatMessage],
-            grammar: Option<&mut (dyn fluent_onnx::Grammar + 'static)>,
-            _max_tokens: Option<usize>,
-            _params: LlmParams,
-        ) -> Result<String, LlmError> {
-            self.calls.lock().unwrap().push(grammar.is_some());
-            Ok(self.output.clone())
-        }
-    }
 
     fn one_message() -> Vec<ChatMessage> {
         vec![ChatMessage {
@@ -470,10 +435,7 @@ mod onnx_backend_tests {
     #[test]
     fn free_text_call_passes_no_grammar() {
         let vocab = TestVocab::from_list(&["{", "}", ":", "\"action\"", "\"x\""]);
-        let runner = Arc::new(FakeRunner {
-            calls: Mutex::new(Vec::new()),
-            output: "free text".into(),
-        });
+        let runner = Arc::new(FakeRunner::new("free text"));
         let backend = OnnxChatBackend::new(runner.clone(), vocab, LlmParams::default());
         let out = backend.chat_complete(&one_message()).expect("free text");
         assert_eq!(out, "free text");
@@ -483,10 +445,7 @@ mod onnx_backend_tests {
     #[test]
     fn constrained_call_feeds_schema_into_a_grammar() {
         let vocab = TestVocab::from_list(&["{", "}", ":", ",", "\"action\"", "\"x\""]);
-        let runner = Arc::new(FakeRunner {
-            calls: Mutex::new(Vec::new()),
-            output: "{\"action\":\"x\"}".into(),
-        });
+        let runner = Arc::new(FakeRunner::new("{\"action\":\"x\"}"));
         let backend = OnnxChatBackend::new(runner.clone(), vocab, LlmParams::default());
         // The llama-fork `response_format.schema` vocabulary a constrained
         // caller (classifier / annotation) sends.
@@ -513,10 +472,7 @@ mod onnx_backend_tests {
     #[test]
     fn unrepresentable_schema_degrades_to_free_text() {
         let vocab = TestVocab::from_list(&["{", "}", ":", "\"action\"", "\"x\""]);
-        let runner = Arc::new(FakeRunner {
-            calls: Mutex::new(Vec::new()),
-            output: "whatever".into(),
-        });
+        let runner = Arc::new(FakeRunner::new("whatever"));
         let backend = OnnxChatBackend::new(runner.clone(), vocab, LlmParams::default());
         // A schema the structural grammar cannot represent (array-of-objects
         // fields, e.g. a review schema) → no grammar → free text (fail-open;
@@ -545,7 +501,7 @@ mod onnx_backend_tests {
 
         // A registry with only an encoder (FillMask) role.
         let mut cfg = RouterConfig::default();
-        cfg.onnx = Some(fluent_onnx::OnnxFleetConfig {
+        cfg.onnx = Some(fluent_llm::onnx_config::OnnxFleetConfig {
             encoder: Some(role_config("/models/encoder.onnx")),
             ..Default::default()
         });
@@ -554,52 +510,21 @@ mod onnx_backend_tests {
         let backend = onnx_chat_backend(&registry, "nonexistent").expect("no ort error");
         assert!(backend.is_none(), "unregistered key → None");
         // A registered but non-CausalLm key → None (loud warn).
-        let encoder_key = fluent_onnx::OnnxRole::Encoder.registry_key();
+        let encoder_key = fluent_llm::onnx_config::OnnxRole::Encoder.registry_key();
         assert!(registry.is_registered(encoder_key));
         let backend = onnx_chat_backend(&registry, encoder_key).expect("no ort error");
         assert!(backend.is_none(), "non-CausalLm key → None (fail-open)");
     }
 } // mod onnx_backend_tests
 
-/// A stub `ChatBackend` for the resolver-routing tests.
-struct StubBackend(&'static str);
-
-impl fluent_llm::client::ChatBackend for StubBackend {
-    fn chat_complete(
-        &self,
-        _messages: &[fluent_llm::ChatMessage],
-    ) -> Result<String, fluent_llm::LlmError> {
-        Ok(self.0.to_string())
-    }
-    fn chat_complete_with_extras(
-        &self,
-        _messages: &[fluent_llm::ChatMessage],
-        _extras: &serde_json::Value,
-    ) -> Result<String, fluent_llm::LlmError> {
-        Ok(self.0.to_string())
-    }
-}
-
-/// Stub onnx loader (no ort, no model) for the registry-level lazy-residency
-/// tests below — the `OnnxWeights` lifecycle (load/release) is exercised
-/// without constructing a real pool (which needs a real session).
-#[derive(Default)]
-struct StubLoader;
-
-impl fluent_onnx::SessionLoader for StubLoader {
-    fn load(
-        &self,
-        _config: &fluent_onnx::OnnxConfig,
-        _model_key: &str,
-    ) -> Result<fluent_onnx::SessionHandle, fluent_onnx::OrtError> {
-        Ok(fluent_onnx::SessionHandle::new("stub"))
-    }
-}
+/// Shared canned-handle session loader (the single home for this double is
+/// `fluent_llm::testutil`; covered there by the stub-loader contract test).
+use fluent_llm::testutil::StubSessionLoader as StubLoader;
 
 /// An Unloadable, unpinned `llm` role config (generative — `CausalLm`), the
 /// shape a lazy onnx role registers with (stays unloaded at boot).
-fn lazy_llm_role() -> fluent_onnx::OnnxRoleConfig {
-    fluent_onnx::OnnxRoleConfig {
+fn lazy_llm_role() -> fluent_llm::onnx_config::OnnxRoleConfig {
+    fluent_llm::onnx_config::OnnxRoleConfig {
         pinned: false,
         no_sleep: false,
         sleep_idle_seconds: Some(1),
@@ -607,11 +532,11 @@ fn lazy_llm_role() -> fluent_onnx::OnnxRoleConfig {
         idle_timeout_ms: 0,
         params: None,
         instances: None,
-        model: fluent_onnx::OnnxConfig::new()
+        model: fluent_llm::onnx_config::OnnxConfig::new()
             .model_path("/models/llm.onnx")
             .tokenizer_path("/models/llm/tokenizer.json")
             .resident(false)
-            .task(fluent_onnx::OnnxTask::CausalLm)
+            .task(fluent_llm::onnx_config::OnnxTask::CausalLm)
             .build(),
     }
 }
@@ -632,11 +557,11 @@ fn stub_registry() -> Arc<OrtSessionRegistry> {
 async fn onnx_weights_lazy_role_loads_on_first_use_and_releases() {
     use fluent_llm::runtime::LlmWeights;
     let reg = stub_registry();
-    let key = fluent_onnx::OnnxRole::Llm.registry_key();
+    let key = fluent_llm::onnx_config::OnnxRole::Llm.registry_key();
     reg.register_with_lifecycle(
         key,
-        lazy_llm_role().to_onnx_config(fluent_onnx::OnnxRole::Llm),
-        fluent_onnx::ResidencyPolicy::Unloadable {
+        lazy_llm_role().to_onnx_config(fluent_llm::onnx_config::OnnxRole::Llm),
+        fluent_llm::onnx_config::ResidencyPolicy::Unloadable {
             weights: true,
             context: true,
         },
@@ -656,25 +581,25 @@ async fn onnx_weights_lazy_role_loads_on_first_use_and_releases() {
     assert!(!weights.is_loaded(), "release returns the lazy role to unloaded");
 }
 
-/// ROADMAP M6: `local_backend_for_instance` routes an onnx key to the
-/// resolver's context-bound backend (the onnx analogue of `<base>:<instance>`
+/// `local_backend_for_instance` routes an onnx key to the registry's
+/// context-bound backend (the onnx analogue of `<base>:<instance>`
 /// dispatch), while `local_backend` keeps the role's default.
 #[test]
 fn local_backend_for_instance_onnx_branch_routes_to_resolver() {
 
     let mut config = RouterConfig::default();
-    let key = fluent_onnx::OnnxRole::Llm.registry_key();
-    config.install_onnx_resolver(move |k, instance| {
-        if k != key {
-            return None;
-        }
-        match instance {
-            Some(name) if name == "swarm" => {
-                Some(Arc::new(StubBackend("onnx-swarm")))
-            }
-            _ => Some(Arc::new(StubBackend("onnx-default"))),
-        }
-    });
+    let key = fluent_llm::onnx_config::OnnxRole::Llm.registry_key();
+    config.set_inference_registry(
+        crate::test_stubs::StubInferenceBackend::with_responder(
+            "onnx",
+            key,
+            |instance| match instance {
+                Some(name) if name == "swarm" => "onnx-swarm",
+                _ => "onnx-default",
+            },
+        )
+        .into_registry(),
+    );
 
     // A named onnx context resolves through `local_backend_for_instance`.
     let instance_backend = config.local_backend_for_instance(key, "swarm");

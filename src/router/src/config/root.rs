@@ -36,60 +36,6 @@ pub(crate) fn split_model_key(key: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// The resolver closure type (factored for `clippy::type_complexity`).
-/// Resolves an onnx key (and, for ROADMAP M6, an optional named context) to a
-/// `ChatBackend`. `None` instance = the role's default dispatch backend
-/// (single-shot, or the pool context when the role declares `instances`).
-type OnnxBackendResolverFn = Arc<
-    dyn Fn(&str, Option<&str>) -> Option<Arc<dyn fluent_llm::client::ChatBackend>> + Send + Sync,
->;
-
-/// Boot-injected onnx `ChatBackend` resolver (ROADMAP M2.3). Non-serialized:
-/// the composition root installs it after building the onnx registry so
-/// `local_backend` can resolve an onnx role key (the generative LLM) to the
-/// onnx backend — the single `ChatBackend` factory. Holds a boxed closure; a
-/// `dyn Fn` is not `Debug`, so this is a manual `Debug`.
-#[derive(Clone, Default)]
-pub struct OnnxResolver(Option<OnnxBackendResolverFn>);
-
-impl std::fmt::Debug for OnnxResolver {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OnnxResolver")
-            .field("installed", &self.0.is_some())
-            .finish()
-    }
-}
-
-impl OnnxResolver {
-    /// Install the resolver (boot-time, once, after the onnx registry builds).
-    pub fn install<F>(&mut self, f: F)
-    where
-        F: Fn(&str, Option<&str>) -> Option<Arc<dyn fluent_llm::client::ChatBackend>>
-            + Send
-            + Sync
-            + 'static,
-    {
-        self.0 = Some(Arc::new(f));
-    }
-
-    /// Resolve a key to its default onnx backend, or `None` when the key is not
-    /// onnx / no resolver is installed. HTTP `models` keys always resolve
-    /// `None` here.
-    pub fn resolve(&self, key: &str) -> Option<Arc<dyn fluent_llm::client::ChatBackend>> {
-        self.0.as_ref().and_then(|f| f(key, None))
-    }
-
-    /// Resolve a key bound to a named context (ROADMAP M6), or `None` when the
-    /// key is not onnx / no resolver is installed.
-    pub fn resolve_instance(
-        &self,
-        key: &str,
-        instance: &str,
-    ) -> Option<Arc<dyn fluent_llm::client::ChatBackend>> {
-        self.0.as_ref().and_then(|f| f(key, Some(instance)))
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, FieldAccess, Describable)]
 pub struct RouterConfig {
     /// Named pipeline stage tables (keyed by pipeline name). This is stage
@@ -219,23 +165,23 @@ pub struct RouterConfig {
     /// `ort` — never a spawned `llama-server`. Absent → fully fail-open.
     #[field(skip)]
     #[serde(default)]
-    pub onnx: Option<fluent_onnx::config::OnnxFleetConfig>,
+    pub onnx: Option<fluent_llm::onnx_config::OnnxFleetConfig>,
     /// Top-level ONNX role keys: an alternative to the nested `onnx` section.
     /// When `onnx` is absent but any of these are present, they are merged
     /// into `onnx` during `apply_defaults()`. This supports the simplified
     /// config format where roles are declared at the root level.
     #[field(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub colbert: Option<fluent_onnx::config::OnnxRoleConfig>,
+    pub colbert: Option<fluent_llm::onnx_config::OnnxRoleConfig>,
     #[field(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encoder: Option<fluent_onnx::config::OnnxRoleConfig>,
+    pub encoder: Option<fluent_llm::onnx_config::OnnxRoleConfig>,
     #[field(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pii: Option<fluent_onnx::config::OnnxRoleConfig>,
+    pub pii: Option<fluent_llm::onnx_config::OnnxRoleConfig>,
     #[field(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub router: Option<fluent_onnx::config::OnnxRoleConfig>,
+    pub router: Option<fluent_llm::onnx_config::OnnxRoleConfig>,
     /// ONNX CPU decode concurrency cap (M10): the single `Limiter` budget that
     /// bounds concurrent ONNX decodes (CPU-bound, never blocks the async executor).
     /// Defaults to `DEFAULT_ONNX_LIMITER_CAP` (2).
@@ -253,13 +199,17 @@ pub struct RouterConfig {
     #[field(skip)]
     #[serde(default)]
     pub gguf_dir: Option<String>,
-    /// Boot-injected onnx `ChatBackend` resolver (ROADMAP M2.3). Not serialized
-    /// — installed by the composition root after `build_onnx_registry` so
-    /// `local_backend` resolves the generative `onnx/llm` key to the onnx
-    /// backend (the single concrete `ChatBackend` factory).
+    /// The shared inference-backend registry (llama + onnx adapters),
+    /// installed by the composition root behind a lock so backends whose
+    /// inputs boot later (the llama pool) can register after the first
+    /// resolvers run. Not serialized. When present, `local_backend` /
+    /// `local_backend_for_instance` resolve through it; when absent (unit
+    /// tests, registry-less boots) the legacy construction path serves
+    /// instead, byte-identically.
     #[field(skip)]
     #[serde(skip)]
-    pub(crate) onnx_resolver: OnnxResolver,
+    pub(crate) inference_registry:
+        Option<Arc<std::sync::RwLock<fluent_llm::backend::InferenceRegistry>>>,
 }
 
 impl Default for RouterConfig {
@@ -298,7 +248,7 @@ impl Default for RouterConfig {
             encoder: None,
             pii: None,
             router: None,
-            onnx_resolver: OnnxResolver::default(),
+            inference_registry: None,
         }
     }
 }
@@ -361,7 +311,7 @@ impl RouterConfig {
         if !has_roles {
             return;
         }
-        let mut fleet = fluent_onnx::config::OnnxFleetConfig {
+        let mut fleet = fluent_llm::onnx_config::OnnxFleetConfig {
             encoder: self.encoder.take(),
             pii: self.pii.take(),
             router: self.router.take(),
@@ -1468,6 +1418,13 @@ pub struct SidecarConfig {
     /// a tight budget.
     #[serde(default)]
     pub onnx_working_set_budget_bytes: Option<u64>,
+    /// Persisted fleet map (`{model: {port, pid}}` for every running server)
+    /// the supervisor writes at boot and reads back on the next boot so an
+    /// orphaned `llama-server` (router killed without graceful shutdown) is
+    /// adopted instead of duplicated. `None` (the default) disables
+    /// persistence — adoption falls back to the `/proc` scan alone.
+    #[serde(default)]
+    pub server_state_path: Option<String>,
 }
 
 impl Default for SidecarConfig {
@@ -1485,6 +1442,7 @@ impl Default for SidecarConfig {
             liveness_failures_before_restart: default_sidecar_liveness_failures(),
             max_restarts: default_sidecar_max_restarts(),
             onnx_working_set_budget_bytes: None,
+            server_state_path: None,
         }
     }
 }

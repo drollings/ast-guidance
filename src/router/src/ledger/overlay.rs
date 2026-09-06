@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use fluent_db::store::SqliteStore;
-use fluent_onnx::overlay::ResidualKind;
+use fluent_llm::backend::ResidualKind;
 use fluent_types::{InterlinguaId, NodeId};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};

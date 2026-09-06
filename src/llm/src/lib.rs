@@ -2,6 +2,7 @@
 //! prompt utilities, context packing, and request queueing.
 
 pub mod anonymize;
+pub mod backend;
 pub mod cache;
 pub mod client;
 pub mod constants;
@@ -12,6 +13,9 @@ pub mod embeddings_cache;
 pub mod error;
 pub mod http_class;
 pub mod llm_queue;
+pub mod onnx_config;
+pub mod onnx_error;
+pub mod onnx_session;
 pub mod openai;
 pub mod parse;
 pub mod pii_patterns;
@@ -19,6 +23,7 @@ pub mod protocol;
 pub mod runtime;
 pub mod sse;
 pub mod telemetry;
+pub mod testutil;
 pub mod thinking;
 pub mod tokens;
 pub mod url;
@@ -31,6 +36,18 @@ pub use protocol::{
 };
 
 pub use anonymize::{anonymize, build_anonymize_map};
+pub use backend::{
+    BackendCaps, BackendError, BackendLoader, ContextProfile, EntityLinkScorer,
+    InferenceBackend, InferenceCapability, InferenceRegistry, NamedContexts, OverlayContribution,
+    OverlayError, PiiError, PiiSpan, PiiSpanDetector, Readiness, RegexPiiDetector, Residual,
+    ResidualKind, ResidualOverlay, RouteLabel,
+};
+pub use onnx_config::{
+    AnnotationHeads, AnnotationLabels, LlmIo, OnnxConfig, OnnxFleetConfig, OnnxInstanceProfile,
+    OnnxRole, OnnxRoleConfig, OnnxTask, Quant, ResidencyPolicy,
+};
+pub use onnx_error::OrtError;
+pub use onnx_session::{OrtSessionRegistry, ResidencyReportEntry, SessionHandle, SessionLoader};
 pub use client::{
     block_on, chat_complete_http, extract_comment_tag, is_blank_or_plausible,
     is_malformed_response, model_name, strip_preamble, ChatBackend, LlmClient,

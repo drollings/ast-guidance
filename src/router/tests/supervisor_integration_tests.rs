@@ -217,14 +217,38 @@ async fn supervisor_boot_rewrite_and_on_demand_residency() {
         "lazy model loaded on demand by the dispatch path"
     );
 
-    // Unload via residency: the lazy fake reports zero contexts, so
-    // `unload_empty_models` unloads its weights; the pinned model (which
-    // reports a pinned instance) is never unloaded.
-    pool.unload_empty_models().await;
+    // Unload via residency: the dispatch path stamped recency when it loaded
+    // the lazy model, so the pass right after the load must NOT unload it —
+    // the first request has not materialized a context yet. No budgets: only
+    // the zero-context unload acts on this pass.
+    let engine = fluent_llm::runtime::LlmResidencyEngine::new(
+        std::time::Duration::from_secs(1),
+        None,
+        None,
+        30,
+        10,
+    );
+    let weights = crate::instances::traits::llama_weights_for_pool(
+        &pool,
+        &sup,
+        &config.sidecar,
+    );
+    engine.residency_cycle(&weights).await.expect("residency");
+    assert_eq!(
+        sup.is_running("lazy-m"),
+        Some(true),
+        "just-loaded model survives the pass after its load"
+    );
+
+    // The grace is bounded: once the use stamp goes stale (poll 1s → 2s
+    // grace), the next pass unloads the zero-context lazy model; the pinned
+    // model (which reports a pinned instance) is never unloaded.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    engine.residency_cycle(&weights).await.expect("residency");
     assert_eq!(
         sup.is_running("lazy-m"),
         Some(false),
-        "lazy model unloaded when left with zero contexts"
+        "stale zero-context lazy model is collected"
     );
     assert_eq!(
         sup.is_running("pinned-m"),

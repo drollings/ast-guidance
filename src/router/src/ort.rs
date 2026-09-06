@@ -8,9 +8,13 @@
 
 use std::sync::Arc;
 
+use fluent_llm::backend::{BackendCaps, InferenceBackend, Readiness};
+use fluent_llm::client::ChatBackend;
 #[cfg(feature = "onnx")]
 use fluent_llm::runtime::LlmWeights;
-use fluent_onnx::{OrtError, OrtSessionRegistry};
+use fluent_llm::onnx_error::OrtError;
+use fluent_llm::onnx_session::OrtSessionRegistry;
+use fluent_wvr::prelude::*;
 
 use crate::config::RouterConfig;
 #[cfg(feature = "onnx")]
@@ -32,10 +36,10 @@ pub fn disambiguation_overlays<S: std::hash::BuildHasher>(
     registry: &OrtRegistry,
     model_keys: &[String],
     routes: &std::collections::HashMap<String, crate::config::RouteRef, S>,
-) -> Result<Vec<Arc<dyn fluent_onnx::overlay::ResidualOverlay>>, OrtError> {
-    let labels: Vec<fluent_onnx::overlay::RouteLabel> = routes
+) -> Result<Vec<Arc<dyn fluent_llm::backend::ResidualOverlay>>, OrtError> {
+    let labels: Vec<fluent_llm::backend::RouteLabel> = routes
         .iter()
-        .map(|(name, r)| fluent_onnx::overlay::RouteLabel {
+        .map(|(name, r)| fluent_llm::backend::RouteLabel {
             route: name.clone(),
             description: r.description.clone(),
         })
@@ -64,7 +68,7 @@ pub fn disambiguation_overlays<S: std::hash::BuildHasher>(
     _registry: &OrtRegistry,
     model_keys: &[String],
     _routes: &std::collections::HashMap<String, crate::config::RouteRef, S>,
-) -> Result<Vec<Arc<dyn fluent_onnx::overlay::ResidualOverlay>>, OrtError> {
+) -> Result<Vec<Arc<dyn fluent_llm::backend::ResidualOverlay>>, OrtError> {
     if !model_keys.is_empty() {
         tracing::warn!(
             target: "router.ort",
@@ -486,7 +490,7 @@ pub fn onnx_context_backend(
 
 /// The role's **pool context** — the largest non-default `instances` group,
 /// mirroring `ModelEntry::pool_qualifier` for the llama fleet (ROADMAP M6 §3.5).
-pub fn onnx_pool_context(role: &fluent_onnx::OnnxRoleConfig) -> Option<String> {
+pub fn onnx_pool_context(role: &fluent_llm::onnx_config::OnnxRoleConfig) -> Option<String> {
     let instances = role.instances.as_ref()?;
     if instances.is_empty() {
         return None;
@@ -774,9 +778,9 @@ pub fn nlp_encoder_fetch(
 /// regex baseline when `auto_enqueue` requires a pre-filter, else no
 /// pre-filter. The cfg split itself stays (the onnx classifier type does not
 /// exist without the feature); only the repeated tail is factored out.
-fn regex_baseline_or_none(auto_enqueue: bool) -> Option<Arc<dyn fluent_onnx::PiiSpanDetector>> {
+fn regex_baseline_or_none(auto_enqueue: bool) -> Option<Arc<dyn fluent_llm::backend::PiiSpanDetector>> {
     if auto_enqueue {
-        Some(Arc::new(fluent_onnx::RegexPiiDetector))
+        Some(Arc::new(fluent_llm::RegexPiiDetector))
     } else {
         None
     }
@@ -787,7 +791,7 @@ pub fn pii_prefilter(
     registry: Option<&OrtRegistry>,
     pii_model: Option<&str>,
     auto_enqueue: bool,
-) -> Result<Option<Arc<dyn fluent_onnx::PiiSpanDetector>>, OrtError> {
+) -> Result<Option<Arc<dyn fluent_llm::backend::PiiSpanDetector>>, OrtError> {
     let regex_fallback = || regex_baseline_or_none(auto_enqueue);
     match pii_model {
         Some(key) => {
@@ -830,7 +834,7 @@ pub fn pii_prefilter(
     _registry: Option<&OrtRegistry>,
     pii_model: Option<&str>,
     auto_enqueue: bool,
-) -> Result<Option<Arc<dyn fluent_onnx::PiiSpanDetector>>, OrtError> {
+) -> Result<Option<Arc<dyn fluent_llm::backend::PiiSpanDetector>>, OrtError> {
     if pii_model.is_some() {
         tracing::warn!(
             target: "router.ort",
@@ -993,7 +997,7 @@ pub fn build_onnx_registry(
     for (role, role_cfg) in fleet.iter() {
         let mut resolved_cfg = role_cfg.clone();
         if resolved_cfg.model.tokenizer_path.is_none()
-            && role != fluent_onnx::OnnxRole::Llm
+            && role != fluent_llm::onnx_config::OnnxRole::Llm
         {
             if let Some(ref tok) = encoder_tokenizer {
                 resolved_cfg.model.tokenizer_path = Some(tok.clone());
@@ -1033,28 +1037,11 @@ pub fn build_onnx_registry(
     Ok(Some(Arc::new(registry)))
 }
 
-/// Build the onnx residency loop — the router's wiring half of the M0
-/// residency parity. The loop is a sibling of the llama sidecar task: it reads
-/// `sidecar.poll_interval_s` for the poll cadence and
-/// `sidecar.onnx_working_set_budget_bytes` for the working-set budget (`None`
-/// → idle-only eviction). The idle threshold default is the loop's constant;
-/// per-role overrides come from each entry's `sleep_idle_seconds` (registered
-/// by `build_onnx_registry`). `None` when no onnx fleet is registered.
-pub fn build_onnx_residency(
-    config: &RouterConfig,
-    registry: &OrtRegistry,
-) -> Option<Arc<fluent_onnx::OrtResidencyLoop>> {
-    if registry.is_empty() {
-        return None;
-    }
-    let poll_interval = std::time::Duration::from_secs(config.sidecar.poll_interval_s.max(1));
-    Some(fluent_onnx::OrtResidencyLoop::new(
-        Arc::clone(registry),
-        poll_interval,
-        fluent_onnx::residency::DEFAULT_SLEEP_IDLE_SECONDS,
-        config.sidecar.onnx_working_set_budget_bytes,
-    ))
-}
+/// The default idle threshold (seconds) after which an onnx session may be
+/// released, when the role's `sleep_idle_seconds` is absent or zero. Feeds
+/// the shared residency engine; per-role overrides come from each entry's
+/// `sleep_idle_seconds` (registered by `build_onnx_registry`).
+pub const DEFAULT_SLEEP_IDLE_SECONDS: i32 = 30;
 
 // ── ROADMAP M4: the onnx half of the shared LlmWeights contract ─────────────
 //
@@ -1088,7 +1075,7 @@ fn map_ort_err(e: &OrtError) -> fluent_llm::runtime::LlmRuntimeError {
 pub struct OnnxWeights {
     model_key: String,
     registry: Arc<OrtSessionRegistry>,
-    role: fluent_onnx::OnnxRoleConfig,
+    role: fluent_llm::onnx_config::OnnxRoleConfig,
     pool: std::sync::Mutex<Option<Arc<fluent_onnx::OnnxContextPool>>>,
 }
 
@@ -1099,7 +1086,7 @@ impl OnnxWeights {
     pub fn new(
         model_key: String,
         registry: Arc<OrtSessionRegistry>,
-        role: fluent_onnx::OnnxRoleConfig,
+        role: fluent_llm::onnx_config::OnnxRoleConfig,
     ) -> Self {
         Self {
             model_key,
@@ -1111,7 +1098,7 @@ impl OnnxWeights {
 
     /// The role config (the `instances` block + `max_ctx` drive context
     /// profiles).
-    pub(crate) fn role(&self) -> &fluent_onnx::OnnxRoleConfig {
+    pub(crate) fn role(&self) -> &fluent_llm::onnx_config::OnnxRoleConfig {
         &self.role
     }
 
@@ -1128,7 +1115,7 @@ impl OnnxWeights {
     fn is_generative(&self) -> bool {
         self.registry
             .config(&self.model_key)
-            .is_some_and(|c| c.task == fluent_onnx::OnnxTask::CausalLm)
+            .is_some_and(|c| c.task == fluent_llm::onnx_config::OnnxTask::CausalLm)
     }
 
     /// Build the role's context pool on first use (loads the session through
@@ -1166,7 +1153,7 @@ impl OnnxWeights {
 /// profile inheriting the role's global `max_ctx` and pin. Shared by
 /// `OnnxWeights::ensure_context` and the context-bound `OnnxChatBackend`.
 #[cfg(feature = "onnx")]
-fn onnx_role_profile_for(role: &fluent_onnx::OnnxRoleConfig, name: &str) -> fluent_onnx::OnnxContextProfile {
+fn onnx_role_profile_for(role: &fluent_llm::onnx_config::OnnxRoleConfig, name: &str) -> fluent_onnx::OnnxContextProfile {
     if let Some((key, p)) = role.instances.as_ref().and_then(|m| {
         m.iter()
             .find(|(k, p)| p.name.as_deref() == Some(name) || k.as_str() == name)
@@ -1349,7 +1336,7 @@ pub fn build_onnx_registry(
 ) -> Result<Option<Arc<OrtSessionRegistry>>, OrtError> {
     if let Some(fleet) = config.onnx.as_ref() {
         if !fleet.is_empty() {
-            let roles: Vec<&'static str> = fluent_onnx::OnnxRole::all()
+            let roles: Vec<&'static str> = fluent_llm::onnx_config::OnnxRole::all()
                 .iter()
                 .filter(|r| fleet.has(**r))
                 .map(|r| r.registry_key())
@@ -1363,6 +1350,187 @@ pub fn build_onnx_registry(
         }
     }
     Ok(None)
+}
+
+/// The onnx inference backend: a thin [`InferenceBackend`] adapter over the
+/// boot-built onnx registry for the generative (`onnx/llm`) role.
+/// Single-shot dispatch delegates to [`onnx_chat_backend`], named-context
+/// dispatch to [`onnx_context_backend`] over the role's `OnnxWeights`, and
+/// `weights()` serves that same `OnnxWeights` — the adapter adds routing,
+/// never a second session or construction path.
+pub struct OnnxBackend {
+    llm_key: String,
+    registry: OrtRegistry,
+    single_shot: Option<Arc<dyn ChatBackend>>,
+    pool_context: Option<String>,
+    has_instances: bool,
+    #[cfg(feature = "onnx")]
+    llm_weights: Option<Arc<OnnxWeights>>,
+}
+
+impl OnnxBackend {
+    /// Build the adapter from the boot registry + config. `None` when no
+    /// generative llm role is configured (fail-open — the backend simply is
+    /// not registered).
+    pub fn from_config(config: &RouterConfig, registry: &OrtRegistry) -> Option<Self> {
+        let llm_key = fluent_llm::onnx_config::OnnxRole::Llm.registry_key().to_string();
+        let role = config.onnx.as_ref()?.llm.as_ref()?.clone();
+        let single_shot = onnx_chat_backend(registry, &llm_key).ok().flatten();
+        #[cfg(feature = "onnx")]
+        let llm_weights = Some(Arc::new(OnnxWeights::new(
+            llm_key.clone(),
+            Arc::clone(registry),
+            role.clone(),
+        )));
+        let has_instances = role
+            .instances
+            .as_ref()
+            .is_some_and(|m| !m.is_empty());
+        let pool_context = onnx_pool_context(&role);
+        if single_shot.is_some() {
+            tracing::info!(
+                target: "router.ort",
+                model = %llm_key,
+                has_instances = has_instances,
+                "onnx generative backend wired as the default local backend",
+            );
+        }
+        Some(Self {
+            llm_key,
+            registry: Arc::clone(registry),
+            single_shot,
+            pool_context,
+            has_instances,
+            #[cfg(feature = "onnx")]
+            llm_weights,
+        })
+    }
+
+    /// The role's single-shot backend (the default dispatch point when the
+    /// role declares no `instances` block). The composition root wires this
+    /// into the server's explicit onnx-llm seam.
+    pub fn single_shot(&self) -> Option<Arc<dyn ChatBackend>> {
+        self.single_shot.clone()
+    }
+}
+
+impl FieldAccess for OnnxBackend {
+    fn set_field(&mut self, name: &str, _value: &str) -> Result<(), FieldError> {
+        Err(FieldError::NotFound(name.into()))
+    }
+    fn get_field(&self, name: &str) -> Result<String, FieldError> {
+        Err(FieldError::NotFound(name.into()))
+    }
+    fn field_names(&self) -> &'static [&'static str] {
+        &[]
+    }
+}
+
+impl Describable for OnnxBackend {
+    fn describe(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "description": "onnx generative inference backend",
+        })
+    }
+}
+
+impl WorkUnit for OnnxBackend {
+    fn name(&self) -> &str {
+        "onnx"
+    }
+    fn depends(&self) -> &[ArcIntern<str>] {
+        &[]
+    }
+    fn provides(&self) -> &[ArcIntern<str>] {
+        &[]
+    }
+    fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+        Ok(WorkOutput::ok("onnx backend adapter"))
+    }
+}
+
+fluent_wvr::impl_component!(OnnxBackend);
+
+impl InferenceBackend for OnnxBackend {
+    fn backend_id(&self) -> &'static str {
+        "onnx"
+    }
+    fn model_keys(&self) -> Vec<String> {
+        vec![self.llm_key.clone()]
+    }
+    fn weights(&self, key: &str) -> Option<Arc<dyn fluent_llm::runtime::LlmWeights>> {
+        #[cfg(feature = "onnx")]
+        {
+            if key != self.llm_key || !self.registry.is_registered(key) {
+                return None;
+            }
+            self.llm_weights.clone().map(|w| w as _)
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            let _ = key;
+            None
+        }
+    }
+    fn chat_backend(
+        &self,
+        key: &str,
+        instance: Option<&str>,
+    ) -> Option<Arc<dyn ChatBackend>> {
+        if key != self.llm_key {
+            return None;
+        }
+        match instance {
+            #[cfg(feature = "onnx")]
+            Some(name) => self
+                .llm_weights
+                .as_ref()
+                .and_then(|w| onnx_context_backend(w, name).ok().flatten()),
+            #[cfg(not(feature = "onnx"))]
+            Some(_) => None,
+            None if self.has_instances => {
+                let ctx = self.pool_context.clone()?;
+                #[cfg(feature = "onnx")]
+                {
+                    self.llm_weights
+                        .as_ref()
+                        .and_then(|w| onnx_context_backend(w, &ctx).ok().flatten())
+                }
+                #[cfg(not(feature = "onnx"))]
+                {
+                    let _ = ctx;
+                    None
+                }
+            }
+            None => self.single_shot.clone(),
+        }
+    }
+    fn capabilities(&self) -> BackendCaps {
+        BackendCaps {
+            named_contexts: true,
+            kv_snapshot: true,
+            grammar_constrained: cfg!(feature = "onnx"),
+            ..BackendCaps::default()
+        }
+    }
+    fn readiness(&self, key: &str) -> Readiness {
+        if key != self.llm_key {
+            return Readiness::Unloaded;
+        }
+        if self
+            .registry
+            .residency_report()
+            .iter()
+            .any(|r| r.key == self.llm_key && r.loaded)
+        {
+            return Readiness::Loaded;
+        }
+        // Registered but lazy, or (no-ort builds) never loadable: known but
+        // not resident. Unregistered keys stay fail-open `Unloaded` too.
+        Readiness::Unloaded
+    }
 }
 
 #[cfg(test)]

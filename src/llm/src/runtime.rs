@@ -209,6 +209,14 @@ pub trait LlmWeights: Send + Sync {
     /// (falling back to the most recent context row's `last_used`) so a
     /// weights instance with no resident contexts still reports recency.
     fn last_used(&self) -> i64;
+    /// Active dispatches currently holding this weights instance. The engine
+    /// never evicts (context, whole-weights, or empty-model unload) a weights
+    /// instance with a nonzero count, so residency can never yank memory from
+    /// under a running inference. Defaults to zero — only adapters fronting
+    /// live dispatch traffic override this.
+    fn in_flight(&self) -> usize {
+        0
+    }
     /// The current residency view: one row per live context (a plain llama
     /// model reports one synthesized row; an onnx session with no contexts
     /// reports none).
@@ -223,6 +231,15 @@ pub trait LlmWeights: Send + Sync {
     /// Default no-op; `LlamaWeights` overrides with the existing `expire_resume`
     /// pass (idle past `resume_ttl_s` → clear flag + delete snapshot).
     async fn expire_resume(&self) {}
+    /// Engine hook: evict the whole weights instance (every unpinned context,
+    /// then the weights). Default = `unload`; the llama adapter overrides to
+    /// run the resume-snapshot-before-destroy order per context first, so a
+    /// later `snapshot=<name>-resume` request still restores. The engine's
+    /// whole-weights arm calls this (never `unload` directly); `unload` stays
+    /// the bare weights release for the empty-model and admin paths.
+    async fn evict_weights(&self) -> Result<(), LlmRuntimeError> {
+        self.unload().await
+    }
 }
 
 /// One named context window with its own KV cache, allocated from a weights
@@ -404,7 +421,7 @@ impl LlmResidencyEngine {
         // 4. Unload weights left with zero contexts (the llama rule — the
         //    onnx pool's weights are released by idle/budget, never by
         //    zero-context).
-        self.unload_empty(weights).await;
+        self.unload_empty(weights, now).await;
         Ok(())
     }
 
@@ -467,11 +484,22 @@ impl LlmResidencyEngine {
     /// weights instance of that pool. `used` = resident weights + every
     /// context's `total_bytes` (context + compute), mirroring the llama
     /// envelope's summed `total.total` and the onnx working-set sum.
-    async fn gather(&self, weights: &[Arc<dyn LlmWeights>], pool: MemoryPool) -> (u64, Vec<Candidate>) {
+    /// `exclude` names a weights key whose usage is omitted and which is
+    /// never an eviction candidate (load-time admission for the model about
+    /// to be loaded).
+    async fn gather(
+        &self,
+        weights: &[Arc<dyn LlmWeights>],
+        pool: MemoryPool,
+        exclude: Option<&str>,
+    ) -> (u64, Vec<Candidate>) {
         let mut used: u64 = 0;
         let mut candidates: Vec<Candidate> = Vec::new();
         for w in weights {
             if w.eviction_policy().pool() != pool {
+                continue;
+            }
+            if exclude == Some(w.model_key()) {
                 continue;
             }
             let rows = w.residency_rows().await;
@@ -528,6 +556,14 @@ impl LlmResidencyEngine {
             if w.refuse_unload() {
                 continue;
             }
+            // A weights instance serving a dispatch contributes its footprint
+            // to `used` but is never an eviction candidate: neither its
+            // contexts nor its weights may be freed from under a running
+            // inference. Admission for a cold model degrades to loading into
+            // the overshoot (the loop corrects it once the flight lands).
+            if w.in_flight() > 0 {
+                continue;
+            }
             // A weights instance with NO pinned context is fully evictable:
             // dropping every context unloads its weights too. Pinned contexts
             // keep a model's weights resident, so only weights with zero
@@ -567,6 +603,47 @@ impl LlmResidencyEngine {
         (used, candidates)
     }
 
+    /// Load-time admission control: before a cold model's weights are
+    /// (re)loaded (requiring `required_bytes`), evict candidates until the
+    /// projected pool usage fits the budget. The target model is never an
+    /// eviction candidate. Best-effort: if eviction cannot fully make room,
+    /// the load proceeds and the residency loop corrects the overshoot.
+    /// This is the engine's pre-dispatch hook — the single admission path.
+    pub async fn make_room_for(
+        &self,
+        weights: &[Arc<dyn LlmWeights>],
+        exclude_model_key: &str,
+        required_bytes: u64,
+        pool: MemoryPool,
+    ) {
+        if required_bytes == 0 {
+            return;
+        }
+        let budget = match pool {
+            MemoryPool::Vram => self.vram_budget_bytes,
+            MemoryPool::Ram => self.ram_budget_bytes,
+        };
+        let Some(budget) = budget else {
+            return;
+        };
+        let now = (self.clock)();
+        let (used, candidates) = self.gather(weights, pool, Some(exclude_model_key)).await;
+        let projected = used.saturating_add(required_bytes);
+        if projected <= budget {
+            return;
+        }
+        tracing::info!(
+            target: "fluent-llm.runtime",
+            pool = ?pool,
+            model = %exclude_model_key,
+            required_bytes = required_bytes,
+            used_bytes = used,
+            budget_bytes = budget,
+            "making room for cold model load",
+        );
+        self.evict_to_target(pool, candidates, projected, budget, now).await;
+    }
+
     /// When the pool's resident usage exceeds `budget`, order the candidates
     /// by the pool's injected `EvictionPolicy` and evict until under budget or
     /// the batch is reached.
@@ -580,7 +657,7 @@ impl LlmResidencyEngine {
         let Some(budget) = budget else {
             return;
         };
-        let (used, candidates) = self.gather(weights, pool).await;
+        let (used, candidates) = self.gather(weights, pool, None).await;
         if used <= budget {
             return;
         }
@@ -591,7 +668,21 @@ impl LlmResidencyEngine {
             budget_bytes = budget,
             "residency over budget - evicting coldest largest footprints",
         );
+        self.evict_to_target(pool, candidates, used, budget, now).await;
+    }
 
+    /// Order `candidates` best-eviction-first per the pool's injected
+    /// `EvictionPolicy` and evict until `used` fits `target` (or the batch is
+    /// reached). The one eviction-ordering call site — periodic over-budget
+    /// passes and load-time admission share it.
+    async fn evict_to_target(
+        &self,
+        pool: MemoryPool,
+        candidates: Vec<Candidate>,
+        used: u64,
+        target: u64,
+        now: i64,
+    ) {
         // Order best-eviction-first per the pool's injected policy.
         let ordered = match pool {
             MemoryPool::Vram => {
@@ -617,7 +708,7 @@ impl LlmResidencyEngine {
 
         let (used_after, _) = common_core::cache::evict_until_fit(
             used,
-            budget,
+            target,
             self.evict_batch,
             ordered,
             |c: &Candidate| {
@@ -651,7 +742,7 @@ impl LlmResidencyEngine {
                                 }
                             }
                         }
-                        CandidateKind::Weights { weights } => match weights.unload().await {
+                        CandidateKind::Weights { weights } => match weights.evict_weights().await {
                             Ok(()) => {
                                 tracing::info!(
                                     target: "fluent-llm.runtime",
@@ -684,7 +775,20 @@ impl LlmResidencyEngine {
     /// holding contexts (pinned instances keep their models resident), and
     /// never the onnx pool (its weights are released by idle/budget, and the
     /// single-shot path legitimately holds zero contexts).
-    async fn unload_empty(&self, weights: &[Arc<dyn LlmWeights>]) {
+    ///
+    /// Two holds keep an empty model resident. An in-flight dispatch holds it:
+    /// the pass must never unload a model serving a request (a fresh
+    /// on-demand server reports zero contexts until the first request
+    /// materializes one, and a plain-model dispatch never creates fork
+    /// contexts at all). Recent use holds it for one pass: the dispatch path
+    /// records recency when it loads the model, so the pass right after a
+    /// load always finds a fresh stamp. The grace is one poll interval plus
+    /// the seconds-clock truncation margin; anything older unloads as before.
+    async fn unload_empty(&self, weights: &[Arc<dyn LlmWeights>], now_ms: i64) {
+        // One pass of grace after any recorded use, plus a second for the
+        // seconds-resolution `last_used` clock (an age read can overshoot
+        // reality by nearly a second).
+        let grace_ms = self.poll_interval.as_millis() as i64 + 1000;
         for w in weights {
             if w.eviction_policy() != EvictionPolicy::FootprintColdness {
                 continue;
@@ -696,6 +800,15 @@ impl LlmResidencyEngine {
             // without this gate every residency pass would re-log (and re-try)
             // an unload for every unloaded model, churning forever.
             if !w.is_loaded() {
+                continue;
+            }
+            if w.in_flight() > 0 {
+                continue;
+            }
+            let last_used = w.last_used();
+            if last_used >= 0
+                && now_ms.saturating_sub(last_used.saturating_mul(1000)) < grace_ms
+            {
                 continue;
             }
             let rows = w.residency_rows().await;

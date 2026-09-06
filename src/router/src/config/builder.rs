@@ -32,8 +32,8 @@ use fluent_llm::client::ChatBackend;
 use fluent_llm::{LlmClient, LlmConfig};
 
 use super::{
-    default_true, refine_policy::RouterRefinePolicy, strip_declaration_params, RejectPatterns,
-    RouterConfig,
+    default_true, refine_policy::RouterRefinePolicy, strip_declaration_params, ModelEntry,
+    RejectPatterns, RouterConfig,
 };
 use crate::pipeline::PipelineOrchestrator;
 use crate::score_matrix::ScoreMatrix;
@@ -564,7 +564,7 @@ impl RouterConfig {
                     let encoder = nlp_cfg
                         .encoder_model
                         .as_deref()
-                        .map(|_| fluent_onnx::OnnxRole::Encoder.registry_key())
+                        .map(|_| fluent_llm::onnx_config::OnnxRole::Encoder.registry_key())
                         .and_then(|role_key| {
                             onnx.and_then(|reg| {
                                 match crate::ort::nlp_encoder_fetch(reg, role_key) {
@@ -623,7 +623,7 @@ impl RouterConfig {
         // served by the `router` role (a zero-shot two-tower model); the
         // per-pipeline `overlay_models` knob (when non-empty) enables it (A1a).
         if params.overlay_enabled() {
-            let router_keys = [fluent_onnx::OnnxRole::Router.registry_key().to_string()];
+            let router_keys = [fluent_llm::onnx_config::OnnxRole::Router.registry_key().to_string()];
             let overlays = if let Some(registry) = onnx {
                 let routing = self.routing_config();
                 match crate::ort::disambiguation_overlays(
@@ -1041,6 +1041,74 @@ fn build_classification_engine(
     )
 }
 
+/// Build the HTTP `LlmClient` for a `models` key — the llama construction
+/// half of `RouterConfig::local_backend`, shared with the `LlamaBackend`
+/// inference adapter so the construction site stays singular. `None` for an
+/// unknown base key. Never touches the onnx resolver (fail-open): onnx keys
+/// have no `models` entry and fall out here naturally.
+pub(crate) fn llama_chat_backend_for_key(
+    models: &HashMap<String, ModelEntry>,
+    key: &str,
+) -> Option<Arc<dyn ChatBackend>> {
+    let (base, explicit) = crate::config::split_model_key(key);
+    let entry = models.get(base)?;
+    let base_name = entry.name.as_deref().unwrap_or(base);
+    // A qualified key (`base:qualifier`) pins the named instance/group
+    // explicitly; a bare key uses the entry's internal pool qualifier
+    // (`latest` normalizes to the pool, i.e. the bare-key behavior).
+    let qualifier = explicit
+        .filter(|q| *q != "latest")
+        .map(String::from)
+        .or_else(|| entry.pool_qualifier());
+    let model = match &qualifier {
+        Some(qualifier) => format!("{base_name}:{qualifier}"),
+        None => base_name.to_string(),
+    };
+    // The pool is an instance/group of the model, so its sampling
+    // params (e.g. the swarm work pool's temperature) reach the body.
+    let params = qualifier
+        .as_deref()
+        .and_then(|q| entry.instance_params_for(q))
+        .or_else(|| entry.params.clone().map(strip_declaration_params));
+    let llm_config = LlmConfig::new()
+        .api_url(entry.endpoint.clone())
+        .model(model)
+        .timeout_ms(entry.total_timeout_ms)
+        .maybe_extra_body_params(params)
+        .build();
+    Some(Arc::new(LlmClient::with_config(llm_config)))
+}
+
+/// Build the HTTP `LlmClient` for a specific named inference point
+/// (`<base>:<instance_or_group>`) — the llama construction half of
+/// `RouterConfig::local_backend_for_instance`, shared with the
+/// `LlamaBackend` adapter. `None` for an unknown key or instance.
+pub(crate) fn llama_chat_backend_for_instance(
+    models: &HashMap<String, ModelEntry>,
+    key: &str,
+    instance_or_group: &str,
+) -> Option<Arc<dyn ChatBackend>> {
+    let (base, _) = crate::config::split_model_key(key);
+    let entry = models.get(base)?;
+    // Resolve the named profile; an unknown instance name -> None.
+    entry
+        .instance_profiles()
+        .into_iter()
+        .find(|p| p.name.as_deref() == Some(instance_or_group))?;
+    let base_name = entry.name.as_deref().unwrap_or(base);
+    let model = format!("{base_name}:{instance_or_group}");
+    let params = entry
+        .instance_params_for(instance_or_group)
+        .unwrap_or_else(|| strip_declaration_params(serde_json::Value::Null));
+    let llm_config = LlmConfig::new()
+        .api_url(entry.endpoint.clone())
+        .model(model)
+        .timeout_ms(entry.total_timeout_ms)
+        .maybe_extra_body_params(Some(params))
+        .build();
+    Some(Arc::new(LlmClient::with_config(llm_config)))
+}
+
 impl RouterConfig {
     /// Build the escalation ladder for every model group that configures one
     /// (`model_groups[g].escalation`). Groups without a ladder (or without a
@@ -1115,72 +1183,48 @@ impl RouterConfig {
     /// `pool_qualifier()` is `None` the id is bare `<base>` (upstream models,
     /// byte-identical to today). Declaration-only params are stripped.
     ///
-    /// **ONNX branch (ROADMAP M2.3):** a key that resolves to the onnx registry
-    /// (the generative `OnnxRole::Llm` key, via the boot-injected
-    /// `onnx_resolver`) yields the onnx `ChatBackend`. Absent registry /
-    /// unregistered / non-`CausalLm` → `None` (fail-open). HTTP `models` keys
-    /// are unchanged.
+    /// **ONNX branch:** a key served by a registered inference backend (the
+    /// generative `onnx/llm` key via the boot-installed registry) yields that
+    /// backend. Absent registry / unregistered key → `None` (fail-open).
+    /// HTTP `models` keys are unchanged.
     pub fn local_backend(&self, key: &str) -> Option<Arc<dyn ChatBackend>> {
-        if let Some(backend) = self.onnx_resolver.resolve(key) {
+        if let Some(backend) = self.inference_registry.as_ref().and_then(|r| {
+            common_core::sync::lock_read(r).route_chat(key, None)
+        }) {
             return Some(backend);
         }
-        let (base, explicit) = crate::config::split_model_key(key);
-        let entry = self.models.get(base)?;
-        let base_name = entry.name.as_deref().unwrap_or(base);
-        // A qualified key (`base:qualifier`) pins the named instance/group
-        // explicitly; a bare key uses the entry's internal pool qualifier
-        // (`latest` normalizes to the pool, i.e. the bare-key behavior).
-        let qualifier = explicit
-            .filter(|q| *q != "latest")
-            .map(String::from)
-            .or_else(|| entry.pool_qualifier());
-        let model = match &qualifier {
-            Some(qualifier) => format!("{base_name}:{qualifier}"),
-            None => base_name.to_string(),
-        };
-        // The pool is an instance/group of the model, so its sampling
-        // params (e.g. the swarm work pool's temperature) reach the body.
-        let params = qualifier
-            .as_deref()
-            .and_then(|q| entry.instance_params_for(q))
-            .or_else(|| entry.params.clone().map(strip_declaration_params));
-        let llm_config = LlmConfig::new()
-            .api_url(entry.endpoint.clone())
-            .model(model)
-            .timeout_ms(entry.total_timeout_ms)
-            .maybe_extra_body_params(params)
-            .build();
-        Some(Arc::new(LlmClient::with_config(llm_config)))
+        llama_chat_backend_for_key(&self.models, key)
     }
 
     /// The onnx LLM role's registry key when the generative role is configured
-    /// (`config.onnx.llm`). This is the **default wiring point** (ROADMAP M2.3):
-    /// the fallback backend for the LLM annotation rung, the review worker,
-    /// the ledger summarizer/tier worker, and the chart selector model when
-    /// their respective explicit keys are absent. `None` when no generative
-    /// onnx model is declared.
+    /// (`config.onnx.llm`). This is the **default wiring point**: the fallback
+    /// backend for the LLM annotation rung, the review worker, the ledger
+    /// summarizer/tier worker, and the chart selector model when their
+    /// respective explicit keys are absent. `None` when no generative onnx
+    /// model is declared.
     pub fn onnx_llm_key(&self) -> Option<String> {
         self.onnx.as_ref()?.llm.as_ref()?;
-        Some(fluent_onnx::OnnxRole::Llm.registry_key().to_string())
+        Some(fluent_llm::onnx_config::OnnxRole::Llm.registry_key().to_string())
     }
 
-    /// The onnx generative `ChatBackend` (the `OnnxRole::Llm` session) via the
+    /// The onnx generative `ChatBackend` (the `onnx/llm` role) via the
     /// single factory, for the default-wiring call sites. `None` when no onnx
-    /// LLM is configured / not registered as a `CausalLm` (fail-open).
+    /// LLM is registered (fail-open).
     pub fn onnx_llm_backend(&self) -> Option<Arc<dyn ChatBackend>> {
-        let key = fluent_onnx::OnnxRole::Llm.registry_key();
-        self.onnx_resolver.resolve(key)
+        let key = fluent_llm::onnx_config::OnnxRole::Llm.registry_key();
+        self.local_backend(key)
     }
 
-    /// Install the onnx `ChatBackend` resolver (ROADMAP M2.3). The composition
-    /// root calls this once at boot, after building the onnx registry, so
-    /// `local_backend` resolves the generative `onnx/llm` key to the onnx
-    /// backend. `f` resolves a key to an onnx backend (or `None` for HTTP keys).
-    pub fn install_onnx_resolver<F>(&mut self, f: F)
-    where
-        F: Fn(&str, Option<&str>) -> Option<Arc<dyn ChatBackend>> + Send + Sync + 'static,
-    {
-        self.onnx_resolver.install(f);
+    /// Install the shared inference registry (composition root, once at boot).
+    /// `local_backend` / `local_backend_for_instance` resolve through the
+    /// registry's backends first. The registry stays behind its lock so
+    /// later-booting backends (llama, whose pool builds after the first
+    /// resolvers run) can still register.
+    pub fn set_inference_registry(
+        &mut self,
+        registry: Arc<std::sync::RwLock<fluent_llm::backend::InferenceRegistry>>,
+    ) {
+        self.inference_registry = Some(registry);
     }
 
     /// Build a `ChatBackend` for a specific named inference point
@@ -1200,33 +1244,16 @@ impl RouterConfig {
         key: &str,
         instance_or_group: &str,
     ) -> Option<Arc<dyn ChatBackend>> {
-        // ROADMAP M6 onnx branch: a key that resolves to an onnx role (via the
-        // boot-injected resolver) builds a context-bound backend for the named
-        // context — the onnx analogue of `<base>:<instance>` dispatch. The
-        // context is created on demand and reused (idempotent, like
-        // `ensure_instance`). `None` for an HTTP/unknown key.
-        if let Some(backend) = self.onnx_resolver.resolve_instance(key, instance_or_group) {
+        // The shared registry (when installed by the composition root) serves
+        // both fleets: onnx keys yield context-bound backends, llama keys the
+        // named-instance `LlmClient`. Falls through to the legacy path below
+        // when no backend serves the key.
+        if let Some(backend) = self.inference_registry.as_ref().and_then(|r| {
+            common_core::sync::lock_read(r).route_chat(key, Some(instance_or_group))
+        }) {
             return Some(backend);
         }
-        let (base, _) = crate::config::split_model_key(key);
-        let entry = self.models.get(base)?;
-        // Resolve the named profile; an unknown instance name -> None.
-        entry
-            .instance_profiles()
-            .into_iter()
-            .find(|p| p.name.as_deref() == Some(instance_or_group))?;
-        let base_name = entry.name.as_deref().unwrap_or(base);
-        let model = format!("{base_name}:{instance_or_group}");
-        let params = entry
-            .instance_params_for(instance_or_group)
-            .unwrap_or_else(|| strip_declaration_params(serde_json::Value::Null));
-        let llm_config = LlmConfig::new()
-            .api_url(entry.endpoint.clone())
-            .model(model)
-            .timeout_ms(entry.total_timeout_ms)
-            .maybe_extra_body_params(Some(params))
-            .build();
-        Some(Arc::new(LlmClient::with_config(llm_config)))
+        llama_chat_backend_for_instance(&self.models, key, instance_or_group)
     }
 
     /// Build the ledger `Summarizer`'s DIP backend - the ledger
@@ -1402,3 +1429,9 @@ fn frontier_api_client(shared: &reqwest::Client, api_key_env: Option<&str>) -> r
 #[cfg(test)]
 #[path = "../../tests/config_builder.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "../../tests/backend_registry.rs"]
+mod backend_registry_tests;
+#[cfg(test)]
+#[path = "../../tests/routing_fallback_golden.rs"]
+mod routing_fallback_tests;

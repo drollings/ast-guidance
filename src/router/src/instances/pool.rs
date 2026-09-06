@@ -1,68 +1,22 @@
 //! The router's aggregate `/instances` facade over every managed model's
-//! server, and the device-wide VRAM residency engine that keeps the managed
-//! fleet within its allocation budget.
+//! server, plus dispatch-time load readiness (on-demand loads, admission,
+//! resize-to-demand).
 //!
-//! This file owns the residency background loop: it aggregates every manager's
-//! `/instances` into a device `used` total, compares it to the budget
-//! (`device_total - minimum_remaining_vram`), evicts LRU-largest unpinned
-//! contexts (snapshotting resume-marked ones first), and unloads models left
-//! with zero contexts. The `Evictable` union (one unpinned context vs a whole
-//! model) is what makes the largest resident footprints — e.g. a 10.5 GB
-//! weight pool — real eviction targets.
+//! Residency itself lives in the shared `fluent_llm::runtime::
+//! LlmResidencyEngine`: this pool keeps transport duties (detecting a cold
+//! load, excluding the target, naming the admission hook) while the engine
+//! owns eviction ordering, idle release, resume expiry, and the empty-model
+//! unload over the fleet's `LlmWeights` adapters.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
 use common_core::registry::ConcurrentRegistry;
+use fluent_llm::runtime::{LlmResidencyEngine, MemoryPool};
 
-use super::client::{InstanceError, InstanceInfo};
-use super::manager::{
-    instance_name_from_server_id, resume_snapshot_name, InstanceManager,
-};
+use super::client::InstanceError;
+use super::manager::InstanceManager;
 use super::management_base_url;
-
-/// One unit the residency/admission control can evict to free VRAM.
-///
-/// A unit is either a single unpinned context (frees its KV + compute; the
-/// model's weights stay) or a whole model with no pinned instances (frees its
-/// weights and every context). Including whole-model units is what makes the
-/// largest resident footprints - e.g. a 10.5 GB weight pool - real eviction
-/// targets instead of only the small per-context buffers.
-#[derive(Clone)]
-enum Evictable {
-    /// One unpinned context.
-    Context {
-        info: InstanceInfo,
-        manager: Arc<InstanceManager>,
-    },
-    /// A whole model: every unpinned context, then the shared weights.
-    Model {
-        manager: Arc<InstanceManager>,
-        /// The coldest context's last use (model recency).
-        last_used: i64,
-        /// Total VRAM freed: weights + all unpinned contexts.
-        freed_bytes: u64,
-        /// The unpinned contexts to drop first (resume ones are snapshotted).
-        contexts: Vec<InstanceInfo>,
-    },
-}
-
-impl Evictable {
-    fn last_used(&self) -> i64 {
-        match self {
-            Self::Context { info, .. } => info.last_used,
-            Self::Model { last_used, .. } => *last_used,
-        }
-    }
-
-    fn freed_bytes(&self) -> u64 {
-        match self {
-            Self::Context { info, .. } => info.vram_bytes,
-            Self::Model { freed_bytes, .. } => *freed_bytes,
-        }
-    }
-}
 
 /// The router's aggregate `/instances` facade over every managed model's
 /// server. Public instance ids are `<model_id>:<instance_name>`; `total` is
@@ -82,6 +36,10 @@ pub struct InstancePool {
     pub(super) supervisor: Option<Arc<crate::supervisor::LlamaServerSupervisor>>,
     /// Sidecar residency policy (device budget, poll interval, evict batch).
     pub(super) policy: crate::config::SidecarConfig,
+    /// The shared residency engine for load-time admission. Wired once at
+    /// boot (the engine is built before the pool); `None` only for pools
+    /// driven standalone in tests without an engine.
+    admission: Arc<Mutex<Option<Arc<LlmResidencyEngine>>>>,
 }
 
 impl InstancePool {
@@ -110,6 +68,17 @@ impl InstancePool {
             by_base,
             supervisor,
             policy,
+            admission: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Wire the shared residency engine for load-time admission
+    /// (`make_room_for`). Called once at boot after the engine is built; the
+    /// pool keeps transport duties (detecting the cold load, excluding the
+    /// target) while the engine owns the eviction ordering.
+    pub fn set_admission_engine(&self, engine: Arc<LlmResidencyEngine>) {
+        if let Ok(mut slot) = self.admission.lock() {
+            *slot = Some(engine);
         }
     }
 
@@ -146,14 +115,6 @@ impl InstancePool {
             .into_iter()
             .filter_map(|k| self.managers.get(&k).map(|a| a.as_ref().clone()))
             .collect()
-    }
-
-    /// A stable, owned snapshot of the managers for a residency pass. The
-    /// returned `Vec` lives as long as the caller holds it, so per-manager
-    /// references (e.g. the `&Arc<InstanceManager>` inside `Evictable`) are
-    /// valid for the duration of the pass.
-    fn managers_snapshot(&self) -> Vec<Arc<InstanceManager>> {
-        self.managers_iter()
     }
 
     /// Ensure the model behind a dispatch endpoint is loaded: spawn its
@@ -230,6 +191,11 @@ impl InstancePool {
         let Some(manager) = self.manager_for_url(endpoint_url) else {
             return Ok(());
         };
+        if !manager.has_instances_api() {
+            // Grammar-less adopted server: a single fixed context, nothing
+            // to resize through the (absent) management API.
+            return Ok(());
+        }
         // The targeted context's profile: the allocated `n_ctx` and the cap.
         let Some(profile) = manager
             .profiles()
@@ -264,461 +230,34 @@ impl InstancePool {
         manager.client().resize(instance, need).await
     }
 
-    /// One device-wide residency pass. The pool owns VRAM residency for the
-    /// whole device (all managed servers share it), so this aggregates every
-    /// manager's `/instances` into a device `used` total and compares it to
-    /// the allocation budget (`device_total - minimum_remaining_vram`).
-    ///
-    /// When the budget is exceeded, evicts up to `evict_batch` units - the
-    /// largest resident footprint first (see `Self::evict_to_fit`) - and
-    /// then unloads any model whose server is left with zero contexts. Resume
-    /// marked contexts are KV-snapshotted before they drop, and resume work
-    /// idle past `resume_ttl_s` is concluded (flag cleared, snapshot deleted)
-    /// first so the router never keeps saving context it has decided is done.
-    /// Pinned instances are never evicted.
-    pub async fn residency_cycle(&self) -> Result<(), InstanceError> {
-        self.expire_resume().await;
-        let Some(budget) = self.policy.allocation_limit() else {
-            tracing::info!(
-                target: "router.instances",
-                "residency: no allocation budget (set sidecar.minimum_remaining_vram or vram_total_bytes)",
-            );
-            return Ok(());
-        };
-        let (mut used, evictable) = self.gather_residency(None).await;
-        if used <= budget {
-            tracing::debug!(
-                target: "router.instances",
-                used_bytes = used,
-                budget_bytes = budget,
-                "device VRAM within budget - no eviction this pass",
-            );
-            return Ok(());
-        }
-        tracing::warn!(
-            target: "router.instances",
-            used_bytes = used,
-            budget_bytes = budget,
-            "device VRAM over budget - evicting largest coldest footprints",
-        );
-        self.evict_to_fit(&mut used, budget, evictable).await;
-        // Unload any model whose server now has zero contexts: its weights are
-        // freed, restoring VRAM that context-level eviction cannot.
-        self.unload_empty_models().await;
-        Ok(())
-    }
-
-    /// The device's resident VRAM usage and eviction candidates across every
-    /// managed server. `exclude` names a model key whose usage is omitted and
-    /// which is never an eviction candidate (the model about to be loaded).
-    ///
-    /// Every candidate is an [`Evictable`]: either one unpinned context (frees
-    /// its KV + compute) or a whole model with no pinned instances (frees its
-    /// weights *and* all its unpinned contexts - the largest footprint, and the
-    /// only way a 10.5 GB weight pool can actually be reclaimed when OOM
-    /// pressure demands it).
-    async fn gather_residency(
-        &self,
-        exclude: Option<&str>,
-    ) -> (u64, Vec<Evictable>) {
-        let mut used: u64 = 0;
-        let mut evictable: Vec<Evictable> = Vec::new();
-        let managers = self.managers_snapshot();
-        for manager in &managers {
-            if exclude == Some(manager.model_key()) {
-                continue;
-            }
-            let Some((envelope, plain)) = manager.list_with_fallback().await else {
-                tracing::debug!(
-                    target: "router.instances",
-                    model = %manager.model_key(),
-                    "residency poll skipped - server down",
-                );
-                continue;
-            };
-            used = used.saturating_add(envelope.total.total);
-            if plain {
-                // One synthesized entry per plain model; only a non-sleeping
-                // model's weights are a freeable resident chunk.
-                if let Some(info) = envelope.instances.first() {
-                    if info.model_bytes > 0 {
-                        evictable.push(Evictable::Model {
-                            manager: Arc::clone(manager),
-                            last_used: info.last_used,
-                            freed_bytes: info.model_bytes,
-                            contexts: vec![info.clone()],
-                        });
-                    }
-                }
-            } else {
-                let unpinned: Vec<InstanceInfo> = envelope
-                    .instances
-                    .iter()
-                    .filter(|i| !i.pinned)
-                    .cloned()
-                    .collect();
-                for info in &unpinned {
-                    evictable.push(Evictable::Context {
-                        info: info.clone(),
-                        manager: Arc::clone(manager),
-                    });
-                }
-                // A model with NO pinned context is fully evictable: dropping
-                // every context unloads its weights too. Pinned contexts keep
-                // a model's weights resident, so only models with zero pinned
-                // instances surface as whole-model candidates.
-                let has_pinned = envelope.instances.iter().any(|i| i.pinned);
-                if !has_pinned && envelope.total.model > 0 {
-                    let weights = envelope.total.model;
-                    let ctx_vram: u64 = unpinned.iter().map(|i| i.vram_bytes).sum();
-                    let last_used = unpinned.iter().map(|i| i.last_used).min().unwrap_or(-1);
-                    evictable.push(Evictable::Model {
-                        manager: Arc::clone(manager),
-                        last_used,
-                        freed_bytes: weights.saturating_add(ctx_vram),
-                        contexts: unpinned,
-                    });
-                }
-            }
-        }
-        (used, evictable)
-    }
-
     /// Load-time admission control: before a cold model spawns (requiring
     /// `required_bytes` of VRAM for its weights), evict units until the
     /// projected device usage fits the allocation budget. The target model is
     /// never an eviction candidate and pinned instances are never evicted.
     /// Best-effort: if eviction cannot fully make room, the load proceeds and
     /// the residency loop corrects the overshoot.
-    pub async fn make_room_for(&self, model_key: &str, required_bytes: u64) {
-        let Some(budget) = self.policy.allocation_limit() else {
-            return;
-        };
-        if required_bytes == 0 {
-            return;
-        }
-        let (used, evictable) = self.gather_residency(Some(model_key)).await;
-        let mut projected = used.saturating_add(required_bytes);
-        if projected <= budget {
-            return;
-        }
-        tracing::info!(
-            target: "router.instances",
-            model = %model_key,
-            required_bytes = required_bytes,
-            used_bytes = used,
-            budget_bytes = budget,
-            "making VRAM room for cold model load",
-        );
-        self.evict_to_fit(&mut projected, budget, evictable).await;
-    }
-
-    /// Evict candidates (snapshotting resume-marked contexts first) until
-    /// `used` fits the budget.
     ///
-    /// Priority is *footprint-weighted coldness*: the candidate that frees the
-    /// most VRAM from the coldest resident entity goes first. A whole model's
-    /// weights (say a 10.5 GB pool) outrank any handful of context buffers, so
-    /// OOM pressure reclaims the big chunks, while a just-used model scores
-    /// near zero and stays - protecting active agentic work from being evicted
-    /// underneath a running task.
-    async fn evict_to_fit(&self, used: &mut u64, budget: u64, evictable: Vec<Evictable>) {
-        let now = i64::try_from(common_core::now_secs()).unwrap_or(i64::MAX);
-        // Order best-eviction-first (footprint × coldness desc, then last-used
-        // desc), then evict until under budget or the batch is reached. The
-        // engine (ordering + budget loop) lives in `common_core::cache`.
-        let ordered = common_core::cache::eviction_order(
-            evictable,
-            now,
-            Evictable::freed_bytes,
-            Evictable::last_used,
-        );
-        let me = InstancePool::clone(self);
-        let (used_after, _) = common_core::cache::evict_until_fit(
-            *used,
-            budget,
-            self.policy.evict_batch,
-            ordered,
-            |unit| {
-                let me = InstancePool::clone(&me);
-                let unit = unit.clone();
-                async move {
-                    match unit {
-                        Evictable::Context { info, manager } => {
-                            me.evict_context(&manager, &info, "over_budget").await
-                        }
-                        Evictable::Model {
-                            manager,
-                            contexts,
-                            freed_bytes,
-                            ..
-                        } => me.evict_model(&manager, &contexts, freed_bytes).await,
-                    }
-                }
-            },
-        )
-        .await;
-        *used = used_after;
-    }
-
-    /// Snapshot (if resume-marked) then destroy one unpinned context. Returns
-    /// the freed bytes, or `None` when the destroy failed.
-    async fn evict_context(
-        &self,
-        manager: &Arc<InstanceManager>,
-        info: &InstanceInfo,
-        reason: &str,
-    ) -> Option<u64> {
-        let name = instance_name_from_server_id(&info.id);
-        self.snapshot_for_resume(manager, name).await;
-        match manager.client().destroy(name, false).await {
-            Ok(()) => {
-                tracing::info!(
-                    target: "router.instances",
-                    model = %manager.model_key(),
-                    instance = %info.id,
-                    vram_bytes = info.vram_bytes,
-                    reason = reason,
-                    "unpinned context evicted",
-                );
-                crate::audit::emit(
-                    "instances",
-                    serde_json::json!({
-                        "action": "evict",
-                        "instance": info.id,
-                        "reason": reason,
-                    }),
-                );
-                Some(info.vram_bytes)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "router.instances",
-                    instance = %info.id,
-                    error = %e,
-                    "context eviction failed",
-                );
-                None
-            }
-        }
-    }
-
-    /// Evict a whole model: snapshot (if resume-marked) and destroy every
-    /// unpinned context, then unload the weights. Returns the total freed
-    /// bytes, `None` when the weights could not be unloaded.
-    async fn evict_model(
-        &self,
-        manager: &Arc<InstanceManager>,
-        contexts: &[InstanceInfo],
-        freed_bytes: u64,
-    ) -> Option<u64> {
-        for info in contexts {
-            let name = instance_name_from_server_id(&info.id);
-            self.snapshot_for_resume(manager, name).await;
-            if let Err(e) = manager.client().destroy(name, false).await {
-                tracing::warn!(
-                    target: "router.instances",
-                    instance = %info.id,
-                    error = %e,
-                    "model-eviction context destroy failed",
-                );
-            }
-        }
-        let Some(sup) = &self.supervisor else {
-            return None;
-        };
-        let model_key = manager.model_key();
-        sup.unload(model_key).await;
-        tracing::info!(
-            target: "router.instances",
-            model = %model_key,
-            weights_bytes = freed_bytes,
-            "model unloaded to free VRAM (weights + contexts)",
-        );
-        crate::audit::emit(
-            "instances",
-            serde_json::json!({
-                "action": "unload_model",
-                "model": model_key,
-                "reason": "free_vram",
-            }),
-        );
-        Some(freed_bytes)
-    }
-
-    /// Best-effort KV snapshot of a resume-marked context before it drops. The
-    /// session transcript is already durable in the ledger; this preserves the
-    /// KV so a later `snapshot=<name>-resume` request restores it. A failed
-    /// save (no slot-save path, misconfigured snapshot dir) is logged and the
-    /// eviction still proceeds - the context simply drops unsnapshotted.
-    async fn snapshot_for_resume(&self, manager: &Arc<InstanceManager>, name: &str) {
-        if !manager.resume_for(name) {
-            return;
-        }
-        let snapshot = resume_snapshot_name(name);
-        match manager.client().save_snapshot(name, &snapshot).await {
-            Ok(()) => {
-                tracing::info!(
-                    target: "router.instances",
-                    instance = %name,
-                    snapshot = %snapshot,
-                    "resume context snapshotted before eviction",
-                );
-                crate::audit::emit(
-                    "instances",
-                    serde_json::json!({
-                        "action": "resume_snapshot",
-                        "instance": name,
-                        "snapshot": snapshot,
-                    }),
-                );
-            }
-            Err(e) => tracing::warn!(
+    /// Transport only: the pool detects the cold load and names the target,
+    /// then hands the pass to the shared engine's pre-dispatch hook over the
+    /// same `LlamaWeights` adapters the fleet build uses.
+    pub async fn make_room_for(&self, model_key: &str, required_bytes: u64) {
+        let engine = self.admission.lock().ok().and_then(|g| g.clone());
+        let Some(engine) = engine else {
+            tracing::debug!(
                 target: "router.instances",
-                instance = %name,
-                error = %e,
-                "resume snapshot save failed - context drops unsnapshotted",
-            ),
-        }
-    }
-
-    /// "Coral Router concludes its work is done": any resume-marked context
-    /// idle past `resume_ttl_s` has its flag cleared and its `-resume` snapshot
-    /// deleted. Runs each residency pass so eviction stops preserving context
-    /// the router has decided is stale.
-    async fn expire_resume(&self) {
-        let Some(ttl) = self.policy.resume_ttl_s else {
-            return;
-        };
-        let now = i64::try_from(common_core::now_secs()).unwrap_or(i64::MAX);
-        let managers = self.managers_snapshot();
-        for manager in &managers {
-            let Some((envelope, _)) = manager.list_with_fallback().await else {
-                continue;
-            };
-            for info in envelope.instances {
-                let name = instance_name_from_server_id(&info.id);
-                if !manager.resume_for(name) {
-                    continue;
-                }
-                let idle = now.saturating_sub(info.last_used);
-                if idle >= ttl as i64 {
-                    manager.set_resume(name, false);
-                    let snapshot = resume_snapshot_name(name);
-                    match manager.client().delete_snapshot(name, &snapshot).await {
-                        Ok(()) => {
-                            tracing::info!(
-                                target: "router.instances",
-                                instance = %name,
-                                idle_secs = idle,
-                                ttl_secs = ttl,
-                                "resume expired - work concluded, snapshot dropped",
-                            );
-                            crate::audit::emit(
-                                "instances",
-                                serde_json::json!({
-                                    "action": "expire_resume",
-                                    "instance": name,
-                                    "reason": "idle_ttl",
-                                }),
-                            );
-                        }
-                        Err(e) => tracing::warn!(
-                            target: "router.instances",
-                            instance = %name,
-                            error = %e,
-                            "resume snapshot delete on expiry failed",
-                        ),
-                    }
-                }
-            }
-        }
-    }
-
-    /// Unload managed models whose servers report zero contexts (all their
-    /// instances were evicted). Frees the weights. Never touches models still
-    /// holding contexts (pinned instances keep their models resident). Plain
-    /// models (no instance pool) report no `/instances` and are skipped — their
-    /// on-demand lifecycle is driven by `ensure_target_ready`/residency eviction
-    /// at the model level instead.
-    pub async fn unload_empty_models(&self) {
-        let Some(sup) = &self.supervisor else {
-            return;
-        };
-        let mut keys: Vec<String> = self.managers.keys();
-        keys.sort();
-        for key in keys {
-            let Some(manager) = self.managers.get(&key).map(|m| m.as_ref().clone()) else {
-                continue;
-            };
-            if manager.profiles.is_empty() {
-                continue;
-            }
-            let empty = match manager.client().list().await {
-                Ok(envelope) => envelope.instances.is_empty(),
-                Err(_) => continue,
-            };
-            if empty {
-                tracing::info!(
-                    target: "router.instances",
-                    model = %key,
-                    "model has no contexts left - unloading weights",
-                );
-                crate::audit::emit(
-                    "instances",
-                    serde_json::json!({
-                        "action": "unload_model",
-                        "model": key,
-                        "reason": "no_contexts",
-                    }),
-                );
-                sup.unload(&key).await;
-            }
-        }
-    }
-
-    /// The residency loop: poll device VRAM every `poll_interval_s`, evicting
-    /// LRU-largest unpinned instances when over budget, forever. Runs as a
-    /// spawned task owned by the server. Without an allocation budget
-    /// eviction is impossible, so the loop notes the disabled eviction once
-    /// and exits.
-    pub async fn run_residency(&self) {
-        if self.policy.allocation_limit().is_none() {
-            tracing::info!(
-                target: "router.instances",
-                "residency eviction disabled - no allocation budget (set sidecar.minimum_remaining_vram or vram_total_bytes)",
+                model = %model_key,
+                "admission skipped - no residency engine wired",
             );
             return;
-        }
-        let base = Duration::from_secs(self.policy.poll_interval_s.max(1));
-        let mut consecutive_failures = 0u32;
-        loop {
-            match self.residency_cycle().await {
-                Ok(()) => consecutive_failures = 0,
-                Err(e) => {
-                    consecutive_failures += 1;
-                    if consecutive_failures == 1 {
-                        tracing::warn!(
-                            target: "router.instances",
-                            error = %e,
-                            "residency poll failed - backing off (retrying with backoff)",
-                        );
-                    } else {
-                        tracing::debug!(
-                            target: "router.instances",
-                            error = %e,
-                            consecutive_failures = consecutive_failures,
-                            "residency poll still failing - backing off",
-                        );
-                    }
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(common_core::retry::capped_backoff_ms(
-                base.as_millis() as u64,
-                consecutive_failures,
-                12,
-            )))
+        };
+        let Some(supervisor) = &self.supervisor else {
+            return;
+        };
+        let weights =
+            super::traits::llama_weights_for_pool(self, supervisor, &self.policy);
+        engine
+            .make_room_for(&weights, model_key, required_bytes, MemoryPool::Vram)
             .await;
-        }
     }
+
 }

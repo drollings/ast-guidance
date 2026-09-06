@@ -81,7 +81,7 @@ pub struct RouterServer {
     /// per onnx-declared model. The llama.cpp supervisor, sidecar, and
     /// `/instances` never touch onnx models; the registry backs
     /// `/models/unload` refusals for `Always`-resident models.
-    onnx: Option<Arc<fluent_onnx::OrtSessionRegistry>>,
+    onnx: Option<Arc<fluent_llm::onnx_session::OrtSessionRegistry>>,
     /// The unified weights facade (ROADMAP M4): llama adapters + onnx
     /// implementors behind the shared `LlmWeights` surface. Backs the
     /// `/instances` + `/v1/models` aggregation (onnx rows), `ps`, and the
@@ -300,7 +300,7 @@ impl RouterServer {
     #[must_use]
     pub fn with_onnx_registry(
         mut self,
-        onnx: Option<Arc<fluent_onnx::OrtSessionRegistry>>,
+        onnx: Option<Arc<fluent_llm::onnx_session::OrtSessionRegistry>>,
     ) -> Self {
         self.onnx = onnx;
         self

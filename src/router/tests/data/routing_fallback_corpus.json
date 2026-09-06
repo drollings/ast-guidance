@@ -1,0 +1,171 @@
+{
+  "_doc": "Registry routing + readiness-gating calibration corpus. Each case scripts stub backends (behavior/readiness), routes one key, and pins the exact consultation sequence and outcome. rung behavior: miss | serve:MARKER | err-terminal:MSG | err-continue:MSG (ladder ops only). embed defaults to miss. readiness defaults to unloaded. expected_consults counts chat/embed construction calls only; expected_probes counts readiness probes (key-matching backends). outcome: {some: X} | {none: true} | {err: MSG}.",
+  "cases": [
+    {"id": "F1", "kind": "fallback", "op": "chat", "key": "m-a", "instance": null,
+     "rungs": [
+       {"id": "a", "keys": ["m-a"], "behavior": "miss"},
+       {"id": "b", "keys": ["m-a"], "behavior": "serve:B-OUT"}
+     ],
+     "expected_consults": ["a", "b"], "expected_probes": ["a", "b"],
+     "expected": {"some": "B-OUT"}},
+    {"id": "F2", "kind": "fallback", "op": "chat", "key": "m-a", "instance": null,
+     "rungs": [
+       {"id": "a", "keys": ["m-a"], "behavior": "miss"},
+       {"id": "b", "keys": ["m-a"], "behavior": "miss"},
+       {"id": "c", "keys": ["m-a"], "behavior": "serve:C-OUT"}
+     ],
+     "expected_consults": ["a", "b", "c"], "expected_probes": ["a", "b", "c"],
+     "expected": {"some": "C-OUT"}},
+    {"id": "F3", "kind": "fallback", "op": "chat", "key": "m-a", "instance": null,
+     "rungs": [
+       {"id": "a", "keys": ["m-a"], "behavior": "miss"},
+       {"id": "b", "keys": ["m-a"], "behavior": "miss"}
+     ],
+     "expected_consults": ["a", "b"], "expected_probes": ["a", "b"],
+     "expected": {"none": true}},
+    {"id": "F4", "kind": "fallback", "op": "chat", "key": "m-z", "instance": null,
+     "rungs": [
+       {"id": "a", "keys": ["m-a"], "behavior": "miss"},
+       {"id": "b", "keys": ["m-b"], "behavior": "miss"}
+     ],
+     "expected_consults": [], "expected_probes": [],
+     "expected": {"none": true}},
+    {"id": "F5", "kind": "fallback", "op": "chat", "key": "m-z:ctx", "instance": null,
+     "rungs": [
+       {"id": "a", "keys": ["m-a"], "behavior": "miss"},
+       {"id": "b", "keys": ["m-b"], "behavior": "miss"}
+     ],
+     "expected_consults": [], "expected_probes": [],
+     "expected": {"none": true}},
+    {"id": "F6", "kind": "fallback", "op": "chat", "key": "m-a", "instance": null,
+     "rungs": [
+       {"id": "a", "keys": ["m-a"], "behavior": "serve:A-OUT", "readiness": "failed"},
+       {"id": "b", "keys": ["m-a"], "behavior": "serve:B-OUT"}
+     ],
+     "expected_consults": ["b"], "expected_probes": ["a", "b"],
+     "expected": {"some": "B-OUT"}},
+    {"id": "F7", "kind": "fallback", "op": "embed", "key": "m-a", "instance": null,
+     "rungs": [
+       {"id": "a", "keys": ["m-a"], "behavior": "miss", "embed": "miss"},
+       {"id": "b", "keys": ["m-a"], "behavior": "miss", "embed": "serve:emb-b"}
+     ],
+     "expected_consults": ["a", "b"], "expected_probes": ["a", "b"],
+     "expected": {"some": "emb-b"}},
+    {"id": "F8", "kind": "fallback", "op": "embed", "key": "m-z", "instance": null,
+     "rungs": [
+       {"id": "a", "keys": ["m-a"], "behavior": "miss", "embed": "miss"},
+       {"id": "b", "keys": ["m-b"], "behavior": "miss", "embed": "miss"}
+     ],
+     "expected_consults": [], "expected_probes": [],
+     "expected": {"none": true}},
+    {"id": "F9", "kind": "fallback", "op": "chat", "key": "m-a", "instance": "ctx1",
+     "rungs": [
+       {"id": "a", "keys": ["m-a"], "behavior": "miss"},
+       {"id": "b", "keys": ["m-a"], "behavior": "serve:B-CTX"}
+     ],
+     "expected_consults": ["a", "b"], "expected_probes": ["a", "b"],
+     "expected": {"some": "B-CTX"}},
+    {"id": "F10", "kind": "fallback", "op": "chat", "key": "m-a", "instance": null,
+     "rungs": [
+       {"id": "a", "keys": ["m-a"], "behavior": "miss", "readiness": "failed"},
+       {"id": "b", "keys": ["m-a"], "behavior": "miss"}
+     ],
+     "expected_consults": ["b"], "expected_probes": ["a", "b"],
+     "expected": {"none": true}},
+    {"id": "F11", "kind": "fallback", "op": "ladder", "key": "", "instance": null,
+     "rungs": [
+       {"id": "r1", "behavior": "err-terminal:boom"},
+       {"id": "r2", "behavior": "serve:R2-OUT"}
+     ],
+     "expected_consults": ["r1"], "expected_probes": [],
+     "expected": {"err": "boom"}},
+    {"id": "F12", "kind": "fallback", "op": "ladder", "key": "", "instance": null,
+     "rungs": [
+       {"id": "r1", "behavior": "err-continue:soft"},
+       {"id": "r2", "behavior": "serve:R2-OUT"}
+     ],
+     "expected_consults": ["r1", "r2"], "expected_probes": [],
+     "expected": {"some": "R2-OUT"}},
+    {"id": "F13", "kind": "fallback", "op": "ladder", "key": "", "instance": null,
+     "rungs": [
+       {"id": "r1", "behavior": "err-continue:first"},
+       {"id": "r2", "behavior": "err-continue:last"}
+     ],
+     "expected_consults": ["r1", "r2"], "expected_probes": [],
+     "expected": {"err": "last"}},
+    {"id": "F14", "kind": "fallback", "op": "ladder", "key": "", "instance": null,
+     "rungs": [
+       {"id": "r1", "behavior": "miss"},
+       {"id": "r2", "behavior": "miss"}
+     ],
+     "expected_consults": ["r1", "r2"], "expected_probes": [],
+     "expected": {"none": true}},
+    {"id": "C1", "kind": "control", "op": "chat", "key": "m-a", "instance": null,
+     "rungs": [
+       {"id": "a", "keys": ["m-a"], "behavior": "serve:A-OUT"},
+       {"id": "b", "keys": ["m-a"], "behavior": "serve:B-OUT"}
+     ],
+     "expected_consults": ["a"], "expected_probes": ["a"],
+     "expected": {"some": "A-OUT"}},
+    {"id": "C2", "kind": "control", "op": "chat", "key": "m-a", "instance": "ctx1",
+     "rungs": [
+       {"id": "a", "keys": ["m-a"], "behavior": "serve:A-CTX"},
+       {"id": "b", "keys": ["m-a"], "behavior": "serve:B-CTX"}
+     ],
+     "expected_consults": ["a"], "expected_probes": ["a"],
+     "expected": {"some": "A-CTX"}},
+    {"id": "C3", "kind": "control", "op": "embed", "key": "m-a", "instance": null,
+     "rungs": [
+       {"id": "a", "keys": ["m-a"], "behavior": "miss", "embed": "serve:emb-a"},
+       {"id": "b", "keys": ["m-a"], "behavior": "miss", "embed": "serve:emb-b"}
+     ],
+     "expected_consults": ["a"], "expected_probes": ["a"],
+     "expected": {"some": "emb-a"}},
+    {"id": "C4", "kind": "control", "op": "chat", "key": "m-a", "instance": null,
+     "rungs": [
+       {"id": "a", "keys": ["m-a"], "behavior": "serve:A-OUT"}
+     ],
+     "expected_consults": ["a"], "expected_probes": ["a"],
+     "expected": {"some": "A-OUT"}},
+    {"id": "C5", "kind": "control", "op": "chat", "key": "m-a", "instance": null,
+     "rungs": [
+       {"id": "a", "keys": ["m-a"], "behavior": "miss"}
+     ],
+     "expected_consults": ["a"], "expected_probes": ["a"],
+     "expected": {"none": true}},
+    {"id": "C6", "kind": "control", "op": "chat", "key": "m-z", "instance": null,
+     "rungs": [
+       {"id": "a", "keys": ["m-a"], "behavior": "serve:A-OUT"}
+     ],
+     "expected_consults": [], "expected_probes": [],
+     "expected": {"none": true}},
+    {"id": "C7", "kind": "control", "op": "chat", "key": "m-a", "instance": null,
+     "rungs": [
+       {"id": "a", "keys": ["m-a"], "behavior": "serve:A-OUT", "readiness": "failed"}
+     ],
+     "expected_consults": [], "expected_probes": ["a"],
+     "expected": {"none": true}},
+    {"id": "C8", "kind": "control", "op": "chat", "key": "m-a", "instance": null,
+     "rungs": [
+       {"id": "a", "keys": ["m-a"], "behavior": "serve:A-OUT"},
+       {"id": "b", "keys": ["m-a"], "behavior": "serve:B-OUT"},
+       {"id": "c", "keys": ["m-a"], "behavior": "serve:C-OUT"}
+     ],
+     "expected_consults": ["a"], "expected_probes": ["a"],
+     "expected": {"some": "A-OUT"}},
+    {"id": "C9", "kind": "control", "op": "embed", "key": "m-z", "instance": null,
+     "rungs": [
+       {"id": "a", "keys": ["m-a"], "behavior": "miss", "embed": "serve:emb-a"},
+       {"id": "b", "keys": ["m-b"], "behavior": "miss", "embed": "serve:emb-b"}
+     ],
+     "expected_consults": [], "expected_probes": [],
+     "expected": {"none": true}},
+    {"id": "C10", "kind": "control", "op": "ladder", "key": "", "instance": null,
+     "rungs": [
+       {"id": "r1", "behavior": "serve:R1-OUT"},
+       {"id": "r2", "behavior": "serve:R2-OUT"}
+     ],
+     "expected_consults": ["r1"], "expected_probes": [],
+     "expected": {"some": "R1-OUT"}}
+  ]
+}

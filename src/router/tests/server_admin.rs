@@ -29,7 +29,8 @@ fn dedupe_metric_docs_keeps_first_help_and_type() {
 
 #[tokio::test]
 async fn unload_refuses_always_resident_onnx_model() {
-    use fluent_onnx::{OnnxConfig, OnnxTask, OrtSessionRegistry};
+    use fluent_llm::onnx_config::{OnnxConfig, OnnxTask};
+    use fluent_llm::onnx_session::OrtSessionRegistry;
 
     let config = crate::tests::common::make_config(
         "http://127.0.0.1:1/v1/chat/completions",
@@ -80,16 +81,6 @@ async fn unload_refuses_always_resident_onnx_model() {
     );
 }
 
-/// Stub loader for the hermetic unload-refusal test (no real ort session).
-#[derive(Default)]
-struct StubLoader;
-
-impl fluent_onnx::SessionLoader for StubLoader {
-    fn load(
-        &self,
-        _config: &fluent_onnx::OnnxConfig,
-        _model_key: &str,
-    ) -> Result<fluent_onnx::SessionHandle, fluent_onnx::OrtError> {
-        Ok(fluent_onnx::SessionHandle::new("stub"))
-    }
-}
+/// Shared canned-handle session loader (single home:
+/// `fluent_llm::testutil`; covered by its contract test).
+use fluent_llm::testutil::StubSessionLoader as StubLoader;

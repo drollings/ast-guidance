@@ -1,0 +1,36 @@
+[
+  {
+    "aliases": [
+      "base:ledger"
+    ],
+    "created": 0,
+    "id": "base:ledger",
+    "is_default": false,
+    "last_used": 5,
+    "n_ctx": 16384,
+    "object": "model",
+    "owned_by": "coral-router",
+    "parallel": 1,
+    "pinned": false,
+    "resume": true,
+    "state": "loaded"
+  },
+  {
+    "aliases": [
+      "base",
+      "base:latest",
+      "base:swarm"
+    ],
+    "created": 0,
+    "id": "base:swarm",
+    "is_default": true,
+    "last_used": 9,
+    "n_ctx": 16384,
+    "object": "model",
+    "owned_by": "coral-router",
+    "parallel": 1,
+    "pinned": true,
+    "resume": false,
+    "state": "loaded"
+  }
+]

@@ -15,92 +15,15 @@
 #[cfg(feature = "onnx")]
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
-
-/// What kind of parse residual a sentence (or span) carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ResidualKind {
-    /// A sentence whose parse was uncertain below the confidence floor.
-    Disambiguation,
-    /// A PII-shaped span (M3: PII-Detector / regex pre-filter).
-    PiiSpan,
-    /// A PROPN span with no resolved entity (M6: entity linking).
-    EntityLink,
-    /// A parse whose dependency structure wants correction.
-    ParseCorrection,
-    /// A span worth a concept-level summary.
-    ConceptSummary,
-}
-
-/// A deterministic parse residual: the sentence/span the deterministic layer
-/// was unsure about, plus byte span and structured context.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Residual {
-    pub kind: ResidualKind,
-    /// Optional byte span into the source request text.
-    pub span: Option<(usize, usize)>,
-    /// The sentence or span text the overlay scores.
-    pub text: String,
-    /// Structured context the producer attached (e.g. the confidence that
-    /// triggered the residual).
-    #[serde(default)]
-    pub meta: serde_json::Value,
-}
-
-impl Residual {
-    /// A disambiguation residual over a sentence.
-    #[must_use]
-    pub fn disambiguation(sentence: impl Into<String>) -> Self {
-        Self {
-            kind: ResidualKind::Disambiguation,
-            span: None,
-            text: sentence.into(),
-            meta: serde_json::Value::Object(Default::default()),
-        }
-    }
-}
-
-/// The result of running an overlay over a residual.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct OverlayContribution {
-    pub kind: ResidualKind,
-    /// The overlay's primary score, when the contribution is score-shaped.
-    pub score: Option<f64>,
-    /// Structured payload (e.g. `{"route_hints": [...]}` for disambiguation).
-    #[serde(default)]
-    pub payload: serde_json::Value,
-}
-
-/// A `ResidualOverlay` consumes residuals of one [`ResidualKind`] and produces
-/// contributions. `dyn` at the request boundary — the router composes these
-/// behind `Arc<dyn ResidualOverlay>` and runs them under a `Limiter`.
-pub trait ResidualOverlay: Send + Sync {
-    /// The residual kind this overlay consumes.
-    fn kind(&self) -> ResidualKind;
-
-    /// Score the residual. Errors are fail-open at the stage boundary (the
-    /// stage skips the contribution, never fails the request).
-    fn run(&self, residual: &Residual) -> Result<OverlayContribution, OverlayError>;
-}
-
-/// An overlay failure. The router's `OverlayStage` treats every error as
-/// skip-and-log (fail-open enrichment, never a gate).
-#[derive(Debug, thiserror::Error)]
-pub enum OverlayError {
-    #[error("overlay inference failed: {0}")]
-    Inference(String),
-    #[error("overlay rejected the residual: {0}")]
-    Rejected(String),
-}
-
-/// A route the disambiguation overlay scores against: its config key and the
-/// description the prompt line is built from.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RouteLabel {
-    pub route: String,
-    pub description: String,
-}
+// The neutral consumer types live in `fluent_llm::backend` (imported, not
+// re-exported — consumers name the `fluent_llm` paths directly).
+// Implementations (`PromptRouterOverlay`, builders) stay here. The import is
+// gated: without the `onnx` feature only the hermetic decode tests (which
+// name these types through the parent module) need it.
+#[cfg(any(feature = "onnx", test))]
+use fluent_llm::backend::{OverlayContribution, Residual, ResidualKind};
+#[cfg(feature = "onnx")]
+use fluent_llm::backend::{OverlayError, ResidualOverlay, RouteLabel};
 
 /// The M2 disambiguation overlay: a `TwoTowerWorker` (Prompt-Router) scoring a
 /// residual sentence against the route descriptions it was built with, exposed

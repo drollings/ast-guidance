@@ -14,22 +14,26 @@
 //! weights list; onnx rows are appended by rendering `dyn LlmWeights`
 //! residency rows. Llama behavior is never changed by the facade.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
+use fluent_llm::backend::{BackendCaps, InferenceBackend, Readiness};
+use fluent_llm::client::ChatBackend;
 use fluent_llm::runtime::{
     EvictionPolicy, LlmContext, LlmKVCache, LlmResidencyRow, LlmRuntime, LlmRuntimeError,
     LlmWeights, SnapshotMeta,
 };
+use fluent_wvr::prelude::*;
 
 use super::client::{InstanceClient, InstanceError, InstanceInfo, InstanceTotals};
 use super::manager::{instance_name_from_server_id, resume_snapshot_name, InstanceManager};
 use super::{instance_aliases, InstancePool};
-use crate::config::{InstanceProfile, RouterConfig, SidecarConfig};
+use crate::config::builder::{llama_chat_backend_for_instance, llama_chat_backend_for_key};
+use crate::config::{InstanceProfile, ModelEntry, RouterConfig, SidecarConfig};
 use crate::kv_cache::{KvSnapshot, SnapshotStore};
 use crate::supervisor::{LlamaServerSupervisor, ManagedServer};
 
@@ -177,7 +181,12 @@ impl LlmWeights for LlamaWeights {
         self.server
             .ensure_running(&self.bin)
             .await
-            .map_err(|e| map_server_err(&self.model_key, &e))
+            .map_err(|e| map_server_err(&self.model_key, &e))?;
+        // A load is a use: stamp recency so the residency pass right after an
+        // on-demand load finds a fresh stamp and never unloads a model that
+        // has not served its first request yet.
+        self.manager.touch();
+        Ok(())
     }
 
     async fn unload(&self) -> Result<(), LlmRuntimeError> {
@@ -191,6 +200,10 @@ impl LlmWeights for LlamaWeights {
 
     fn last_used(&self) -> i64 {
         self.manager.last_used()
+    }
+
+    fn in_flight(&self) -> usize {
+        self.manager.in_flight()
     }
 
     async fn residency_rows(&self) -> Vec<LlmResidencyRow> {
@@ -249,6 +262,35 @@ impl LlmWeights for LlamaWeights {
 
     fn eviction_policy(&self) -> EvictionPolicy {
         EvictionPolicy::FootprintColdness
+    }
+
+    /// Whole-model eviction: every listed context is evicted
+    /// (resume-marked ones snapshotted first, via `LlamaContext::evict`) and
+    /// then the weights are unloaded. The sidecar's whole-model eviction
+    /// order, now behind the engine's whole-weights arm.
+    async fn evict_weights(&self) -> Result<(), LlmRuntimeError> {
+        if let Some((envelope, _)) = self.manager.list_with_fallback().await {
+            for info in envelope.instances {
+                let name = instance_name_from_server_id(&info.id);
+                let ctx = LlamaContext::from_info(
+                    Arc::clone(&self.manager),
+                    self.manager.client().clone(),
+                    &info,
+                    self.profile_max_ctx(name),
+                );
+                if let Err(e) = ctx.evict().await {
+                    tracing::warn!(
+                        target: "router.instances",
+                        model = %self.model_key,
+                        instance = %name,
+                        error = %e,
+                        "model-eviction context destroy failed",
+                    );
+                }
+            }
+        }
+        self.server.unload().await;
+        Ok(())
     }
 
     async fn expire_resume(&self) {
@@ -318,8 +360,9 @@ pub struct LlamaContext {
 }
 
 impl LlamaContext {
-    /// Build the adapter from a live fork envelope row.
-    fn from_info(
+    /// Build the adapter from a live fork envelope row. Crate-visible so the
+    /// eviction-order tests can drive the real adapter against a stub fork.
+    pub(crate) fn from_info(
         manager: Arc<InstanceManager>,
         client: InstanceClient,
         info: &InstanceInfo,
@@ -571,6 +614,29 @@ pub struct LlmFleet {
     onnx: Option<crate::ort::OrtRegistry>,
 }
 
+/// One `LlamaWeights` adapter per managed model with a live supervisor
+/// server. The single construction site — the fleet build and the pool's
+/// engine admission share it, so the engine always sees the same adapters.
+pub(crate) fn llama_weights_for_pool(
+    pool: &InstancePool,
+    supervisor: &LlamaServerSupervisor,
+    policy: &SidecarConfig,
+) -> Vec<Arc<dyn LlmWeights>> {
+    let bin = supervisor.bin().to_path_buf();
+    let mut weights: Vec<Arc<dyn LlmWeights>> = Vec::new();
+    for manager in pool.managers_iter() {
+        if let Some(server) = supervisor.server_for(manager.model_key()) {
+            weights.push(Arc::new(LlamaWeights::new(
+                manager.clone(),
+                server,
+                bin.clone(),
+                policy.clone(),
+            )));
+        }
+    }
+    weights
+}
+
 impl LlmFleet {
     /// Build the fleet from the llama pool, the supervisor (for llama adapters'
     /// `ensure_running` bin), and the onnx registry. Onnx implementors read
@@ -583,17 +649,7 @@ impl LlmFleet {
     ) -> Self {
         let mut weights: Vec<Arc<dyn LlmWeights>> = Vec::new();
         if let Some(sup) = supervisor {
-            let bin = sup.bin().to_path_buf();
-            for manager in pool.managers_iter() {
-                if let Some(server) = sup.server_for(manager.model_key()) {
-                    weights.push(Arc::new(LlamaWeights::new(
-                        manager.clone(),
-                        server,
-                        bin.clone(),
-                        config.sidecar.clone(),
-                    )));
-                }
-            }
+            weights.extend(llama_weights_for_pool(&pool, sup, &config.sidecar));
         }
         if let Some(onnx) = &onnx {
             weights.extend(crate::ort::onnx_weights_impls(onnx, config));
@@ -765,6 +821,144 @@ impl LlmFleet {
         is_onnx.then(|| ((**parsed.model()).to_string(), (**parsed.name()).to_string()))
     }
 }
+/// The llama inference backend: a thin [`InferenceBackend`] adapter over the
+/// `InstancePool` + supervisor lookup. Chat construction delegates to the
+/// single shared `llama_chat_backend_for_*` constructors (the same functions
+/// `RouterConfig::local_backend` falls back to), and `weights()` builds the
+/// existing `LlamaWeights` adapter exactly as `LlmFleet::build` does — no
+/// second construction site for either.
+///
+/// Onnx precedence: a key whose base names a configured onnx role resolves
+/// `None` here even when a `models` entry exists, preserving today's
+/// resolver-first ordering (the onnx branch wins on collision).
+pub struct LlamaBackend {
+    pool: InstancePool,
+    models: HashMap<String, ModelEntry>,
+    onnx_keys: BTreeSet<String>,
+    sidecar: SidecarConfig,
+}
+
+impl LlamaBackend {
+    /// Build the adapter over the managed pool, the `models` map (for chat
+    /// construction), the configured onnx role keys (precedence), and the
+    /// sidecar policy (for `LlamaWeights` construction).
+    pub fn new(
+        pool: InstancePool,
+        models: HashMap<String, ModelEntry>,
+        onnx_keys: BTreeSet<String>,
+        sidecar: SidecarConfig,
+    ) -> Self {
+        Self {
+            pool,
+            models,
+            onnx_keys,
+            sidecar,
+        }
+    }
+}
+
+impl FieldAccess for LlamaBackend {
+    fn set_field(&mut self, name: &str, _value: &str) -> Result<(), FieldError> {
+        Err(FieldError::NotFound(name.into()))
+    }
+    fn get_field(&self, name: &str) -> Result<String, FieldError> {
+        Err(FieldError::NotFound(name.into()))
+    }
+    fn field_names(&self) -> &'static [&'static str] {
+        &[]
+    }
+}
+
+impl Describable for LlamaBackend {
+    fn describe(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "description": "llama-server fleet inference backend",
+        })
+    }
+}
+
+impl WorkUnit for LlamaBackend {
+    fn name(&self) -> &str {
+        "llama"
+    }
+    fn depends(&self) -> &[ArcIntern<str>] {
+        &[]
+    }
+    fn provides(&self) -> &[ArcIntern<str>] {
+        &[]
+    }
+    fn execute(&self, _ctx: &WorkContext) -> Result<WorkOutput, WorkError> {
+        Ok(WorkOutput::ok("llama backend adapter"))
+    }
+}
+
+impl_component!(LlamaBackend);
+
+impl InferenceBackend for LlamaBackend {
+    fn backend_id(&self) -> &'static str {
+        "llama"
+    }
+    fn model_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .models
+            .keys()
+            .filter(|k| {
+                let (base, _) = crate::config::split_model_key(k);
+                !self.onnx_keys.contains(base)
+            })
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+    fn weights(&self, key: &str) -> Option<Arc<dyn LlmWeights>> {
+        let manager = self.pool.manager(key)?;
+        let supervisor = self.pool.supervisor()?;
+        let server = supervisor.server_for(key)?;
+        let bin = supervisor.bin().to_path_buf();
+        Some(Arc::new(LlamaWeights::new(
+            manager,
+            server,
+            bin,
+            self.sidecar.clone(),
+        )))
+    }
+    fn chat_backend(
+        &self,
+        key: &str,
+        instance: Option<&str>,
+    ) -> Option<Arc<dyn ChatBackend>> {
+        let (base, _) = crate::config::split_model_key(key);
+        if self.onnx_keys.contains(base) {
+            return None;
+        }
+        match instance {
+            Some(name) => llama_chat_backend_for_instance(&self.models, key, name),
+            None => llama_chat_backend_for_key(&self.models, key),
+        }
+    }
+    fn capabilities(&self) -> BackendCaps {
+        BackendCaps::chat_with_contexts()
+    }
+    fn readiness(&self, key: &str) -> Readiness {
+        let Some(manager) = self.pool.manager(key) else {
+            return Readiness::Unloaded;
+        };
+        let running = self
+            .pool
+            .supervisor()
+            .and_then(|s| s.server_for(manager.model_key()))
+            .is_some_and(|s| s.is_running());
+        if running {
+            Readiness::Loaded
+        } else {
+            Readiness::Unloaded
+        }
+    }
+}
+
 /// Fleet-onnx integration tests: every case pins onnx-present behavior
 /// (onnx rows, onnx unload/refuse, onnx id grammar). They need the `onnx`
 /// feature — without it `onnx_weights_impls` is empty by design (fail-open)

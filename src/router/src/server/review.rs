@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use fluent_concurrency::credit_pool::CreditGatedPool;
 use fluent_concurrency::pool::PoolError;
-use fluent_onnx::pii::{PiiSpan, PiiSpanDetector};
+use fluent_llm::backend::{PiiSpan, PiiSpanDetector};
 use fluent_wvr::Runtime;
 use fluent_types::{AnnotationClaim, InterlinguaId, NodeId, ProvenanceTier};
 use spacy_rs::review::{apply_corrections, review_prompt, ParseReview};
@@ -90,7 +90,7 @@ pub struct ReviewWorker {
     /// it annotates job texts with `PiiSpan`s, never drops a job, never
     /// rejects, never blocks the hot path (an error surfaces as an empty set).
     ///
-    /// M6: this is the `fluent_onnx::pii::PiiSpanDetector` trait — genuinely
+    /// M6: this is the `fluent_llm::backend::PiiSpanDetector` trait — genuinely
     /// model-capable (the `OrtPiiClassifier` token-classification rung when
     /// an onnx PII model is registered, else the `RegexPiiDetector` baseline
     /// over the same `llm::pii_patterns` table). It is NOT unified with the

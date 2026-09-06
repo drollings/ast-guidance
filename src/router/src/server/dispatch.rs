@@ -463,6 +463,16 @@ pub async fn dispatch_real(
                 // unloaded) and that a specifically-targeted instance exists.
                 // Best-effort — a load failure surfaces as the target's own
                 // dispatch error below.
+                //
+                // Hold the target's server across this attempt so the
+                // residency engine never unloads it mid-inference; the lease
+                // drops at the end of the attempt (response, error, or
+                // allocate-on-503 retry) and frees the hold.
+                let _inflight = deps
+                    .instance_pool
+                    .as_ref()
+                    .and_then(|pool| pool.manager_for_url(&target.url))
+                    .map(|manager| manager.hold_in_flight());
                 if let Some(pool) = deps.instance_pool.as_ref() {
                     pool.ensure_target_ready(&target.url, target.instance.as_deref())
                         .await;

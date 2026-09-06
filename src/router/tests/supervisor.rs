@@ -29,6 +29,48 @@ fn defaults() -> crate::config::DefaultModelParams {
 }
 
 #[test]
+fn fleet_lib_dir_follows_symlinks_to_the_real_binary_dir() {
+    // A symlinked binary resolves to the directory holding the real file
+    // (where the fork ships its .so files), not the symlink's directory.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let real_dir = tmp.path().join("build-coral").join("bin");
+    std::fs::create_dir_all(&real_dir).expect("mkdirs");
+    let real_bin = real_dir.join("llama-server");
+    std::fs::write(&real_bin, b"fake").expect("write fake bin");
+    let link_dir = tmp.path().join("local").join("bin");
+    std::fs::create_dir_all(&link_dir).expect("mkdirs");
+    let link = link_dir.join("llama-server");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real_bin, &link).expect("symlink");
+    assert_eq!(fleet_lib_dir(&link).as_deref(), Some(real_dir.as_path()));
+}
+
+#[test]
+fn fleet_lib_dir_is_none_for_a_missing_binary() {
+    assert_eq!(
+        fleet_lib_dir(std::path::Path::new("/no/such/llama-server")),
+        None
+    );
+}
+
+#[test]
+fn prepend_library_path_pins_dir_first_and_keeps_inherited() {
+    let dir = std::path::Path::new("/opt/fork/build-coral/bin");
+    assert_eq!(
+        prepend_library_path(dir, Some("/usr/local/lib:/opt/lib".into())),
+        std::ffi::OsString::from("/opt/fork/build-coral/bin:/usr/local/lib:/opt/lib"),
+    );
+    assert_eq!(
+        prepend_library_path(dir, None),
+        std::ffi::OsString::from("/opt/fork/build-coral/bin"),
+    );
+    assert_eq!(
+        prepend_library_path(dir, Some(std::ffi::OsString::new())),
+        std::ffi::OsString::from("/opt/fork/build-coral/bin"),
+    );
+}
+
+#[test]
 fn resolve_llama_server_prefers_env_override() {
     let old = std::env::var_os(LLAMA_SERVER_ENV);
     std::env::set_var(LLAMA_SERVER_ENV, "/custom/llama-server");

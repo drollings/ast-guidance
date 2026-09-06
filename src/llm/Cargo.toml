@@ -24,11 +24,11 @@ rusqlite = { workspace = true }
 
 [dev-dependencies]
 httpmock = { workspace = true }
+tempfile = { workspace = true }
 # Test-only unification: the `embeddings_cache` parity test exercises the
 # M5–M10 deprecated `common_core::sqlite` shims, which need the `sqlite`
 # feature. Normal builds keep `common-core` at `["http"]` only.
 common-core = { path = "../common-core", features = ["sqlite"] }
-
 [features]
 live-ai = []
 
@@ -75,6 +75,14 @@ path = "tests/protocol_parity.rs"
 [[test]]
 name = "calibration"
 path = "tests/calibration.rs"
+
+[[test]]
+name = "backend"
+path = "tests/backend.rs"
+
+[[test]]
+name = "testutil"
+path = "tests/testutil.rs"
 
 
 [lints]

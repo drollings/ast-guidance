@@ -52,7 +52,7 @@ struct StubPrefilter {
 }
 
 impl PiiSpanDetector for StubPrefilter {
-    fn detect(&self, text: &str) -> Result<Vec<PiiSpan>, fluent_onnx::pii::PiiError> {
+    fn detect(&self, text: &str) -> Result<Vec<PiiSpan>, fluent_llm::backend::PiiError> {
         let Some(needle) = &self.needle else {
             return Ok(Vec::new());
         };
@@ -72,8 +72,8 @@ impl PiiSpanDetector for StubPrefilter {
 struct FailingPrefilter;
 
 impl PiiSpanDetector for FailingPrefilter {
-    fn detect(&self, _text: &str) -> Result<Vec<PiiSpan>, fluent_onnx::pii::PiiError> {
-        Err(fluent_onnx::pii::PiiError::Inference("boom".into()))
+    fn detect(&self, _text: &str) -> Result<Vec<PiiSpan>, fluent_llm::backend::PiiError> {
+        Err(fluent_llm::backend::PiiError::Inference("boom".into()))
     }
 }
 

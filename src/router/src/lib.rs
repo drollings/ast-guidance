@@ -77,6 +77,9 @@ mod config_route_tests;
 #[path = "../tests/deprecated_baseline.rs"]
 mod deprecated_baseline;
 #[cfg(test)]
+#[path = "../tests/build_graph.rs"]
+mod build_graph;
+#[cfg(test)]
 #[path = "../tests/supervisor_integration_tests.rs"]
 mod supervisor_integration_tests;
 #[cfg(test)]
