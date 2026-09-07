@@ -241,6 +241,7 @@ fn validate_skips_managed_models_with_no_endpoint() {
                     resume: false,
                     params: None,
                     max_ctx: None,
+                    session: false,
                 })]
                 .into_iter()
                 .collect(),

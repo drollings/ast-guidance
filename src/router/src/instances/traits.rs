@@ -303,6 +303,11 @@ impl LlmWeights for LlamaWeights {
         };
         for info in envelope.instances {
             let name = instance_name_from_server_id(&info.id);
+            // The resume-TTL path touches only multi-step contexts; one-shot
+            // contexts hold nothing to expire (vacuous for the rest).
+            if !self.manager.session_for(name) {
+                continue;
+            }
             if !self.manager.resume_for(name) {
                 continue;
             }
@@ -487,10 +492,12 @@ impl LlmContext for LlamaContext {
     }
 
     async fn evict(&self) -> Result<(), LlmRuntimeError> {
-        // Resume-marked contexts are KV-snapshotted BEFORE they drop (the
-        // sidecar's `evict_context` order) so a later `snapshot=<name>-resume`
-        // restores them. A failed save logs and the eviction still proceeds.
-        if self.manager.resume_for(&self.name) {
+        // Resume-marked multi-step contexts are KV-snapshotted BEFORE they
+        // drop (the sidecar's `evict_context` order) so a later
+        // `snapshot=<name>-resume` restores them. A failed save logs and the
+        // eviction still proceeds. One-shot contexts are plain-destroyed:
+        // they hold no multi-step state, so the snapshot pass is skipped.
+        if self.manager.session_for(&self.name) && self.manager.resume_for(&self.name) {
             let snapshot = resume_snapshot_name(&self.name);
             if let Err(e) = self.client.save_snapshot(&self.name, &snapshot).await {
                 tracing::warn!(
@@ -834,23 +841,31 @@ impl LlmFleet {
 pub struct LlamaBackend {
     pool: InstancePool,
     models: HashMap<String, ModelEntry>,
+    roles: HashMap<String, crate::config::RoleEntry>,
+    default_instances: Option<HashMap<String, InstanceProfile>>,
     onnx_keys: BTreeSet<String>,
     sidecar: SidecarConfig,
 }
 
 impl LlamaBackend {
     /// Build the adapter over the managed pool, the `models` map (for chat
-    /// construction), the configured onnx role keys (precedence), and the
-    /// sidecar policy (for `LlamaWeights` construction).
+    /// construction), the `roles` table (role-key resolution through the
+    /// single inference-point precedence), the fleet-default instance map
+    /// (for entries declaring none), the configured onnx role keys
+    /// (precedence), and the sidecar policy (for `LlamaWeights` construction).
     pub fn new(
         pool: InstancePool,
         models: HashMap<String, ModelEntry>,
+        roles: HashMap<String, crate::config::RoleEntry>,
+        default_instances: Option<HashMap<String, InstanceProfile>>,
         onnx_keys: BTreeSet<String>,
         sidecar: SidecarConfig,
     ) -> Self {
         Self {
             pool,
             models,
+            roles,
+            default_instances,
             onnx_keys,
             sidecar,
         }
@@ -934,9 +949,24 @@ impl InferenceBackend for LlamaBackend {
         if self.onnx_keys.contains(base) {
             return None;
         }
+        // Both halves resolve role keys through the single inference-point
+        // precedence (a role serves its head candidate at the role's point).
         match instance {
-            Some(name) => llama_chat_backend_for_instance(&self.models, key, name),
-            None => llama_chat_backend_for_key(&self.models, key),
+            // The adapter's fleet defaults come from the composition root
+            // (the hoisted `default_params.instances` map, if any).
+            Some(name) => llama_chat_backend_for_instance(
+                &self.models,
+                &self.roles,
+                key,
+                name,
+                self.default_instances.as_ref(),
+            ),
+            None => llama_chat_backend_for_key(
+                &self.models,
+                &self.roles,
+                key,
+                self.default_instances.as_ref(),
+            ),
         }
     }
     fn capabilities(&self) -> BackendCaps {

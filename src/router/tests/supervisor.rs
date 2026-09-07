@@ -175,6 +175,7 @@ fn all_unpinned_pool_declares_full_grammar_at_spawn() {
                     resume: false,
                     params: None,
                     max_ctx: None,
+                    session: false,
                 },
             ),
             (
@@ -192,6 +193,7 @@ fn all_unpinned_pool_declares_full_grammar_at_spawn() {
                     resume: false,
                     params: None,
                     max_ctx: None,
+                    session: false,
                 },
             ),
         ]

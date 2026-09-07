@@ -1,0 +1,731 @@
+{
+ "_doc": "Sentinel fallback + late-binding calibration corpus. Each case pins exact sequences through one hermetic op and the genuine causes of every fallback step. Ops: ladder (first_accept_in_order over scripted rungs; rung behavior serve:X | miss | err-terminal:MSG | err-continue:MSG; stop aborts only on err-terminal), expand (expand_group_keys over a fixture group; recency values are key:MEMBER (resolved to that member's wire id) or wire:LITERAL; loaded lists base keys reported running), climb (TargetMatcher over expanded candidates with per-candidate assess scripts err | N:reason | raw:TEXT), latebind (a live resolver table read per resolve; rewrite mutates the table between resolves), prefilter (deterministic filter match with a counting backend that must stay at zero calls), oneshot (instance-profile flag baseline). A fallback event is any step past a candidate with a recorded cause: rung transition after miss/err-continue, last-miss skip (no-record | removed-member), unloaded member ranked behind a loaded one, assess-err escalation, endpoint-rewrite, load-after-miss. A genuine failure is any injected availability gap (backend err/miss, missing/removed record, unloaded member in output, assess err, resolve miss); it must be followed (walk continues or cleanly exhausts). Controls must show zero fallback events with exact sequences. Precision = caused fallbacks / all fallbacks; recall = followed failures / all failures; control pass = controls clean / all controls. Nothing here enables caching, persistence, or traffic-shaping \u2014 measurement only.",
+ "cases": [
+  {
+   "expected": {
+    "some": "B-OUT"
+   },
+   "expected_causes": [
+    "err:a"
+   ],
+   "expected_consults": [
+    "a",
+    "b"
+   ],
+   "id": "F1",
+   "kind": "fallback",
+   "op": "ladder",
+   "rungs": [
+    {
+     "behavior": "err-continue:down",
+     "id": "a"
+    },
+    {
+     "behavior": "serve:B-OUT",
+     "id": "b"
+    }
+   ]
+  },
+  {
+   "expected": {
+    "err": "down"
+   },
+   "expected_causes": [
+    "err:a"
+   ],
+   "expected_consults": [
+    "a",
+    "b"
+   ],
+   "id": "F2",
+   "kind": "fallback",
+   "op": "ladder",
+   "rungs": [
+    {
+     "behavior": "err-continue:down",
+     "id": "a"
+    },
+    {
+     "behavior": "err-continue:down",
+     "id": "b"
+    }
+   ]
+  },
+  {
+   "expected": {
+    "err": "bad-request"
+   },
+   "expected_causes": [],
+   "expected_consults": [
+    "a"
+   ],
+   "id": "F3",
+   "kind": "fallback",
+   "op": "ladder",
+   "rungs": [
+    {
+     "behavior": "err-terminal:bad-request",
+     "id": "a"
+    },
+    {
+     "behavior": "serve:B-OUT",
+     "id": "b"
+    }
+   ]
+  },
+  {
+   "expected": {
+    "some": "B-OUT"
+   },
+   "expected_causes": [
+    "miss:a"
+   ],
+   "expected_consults": [
+    "a",
+    "b"
+   ],
+   "id": "F4",
+   "kind": "fallback",
+   "op": "ladder",
+   "rungs": [
+    {
+     "behavior": "miss",
+     "id": "a"
+    },
+    {
+     "behavior": "serve:B-OUT",
+     "id": "b"
+    }
+   ]
+  },
+  {
+   "expected": {
+    "some": "C-OUT"
+   },
+   "expected_causes": [
+    "err:a",
+    "miss:b"
+   ],
+   "expected_consults": [
+    "a",
+    "b",
+    "c"
+   ],
+   "id": "F5",
+   "kind": "fallback",
+   "op": "ladder",
+   "rungs": [
+    {
+     "behavior": "err-continue:down",
+     "id": "a"
+    },
+    {
+     "behavior": "miss",
+     "id": "b"
+    },
+    {
+     "behavior": "serve:C-OUT",
+     "id": "c"
+    }
+   ]
+  },
+  {
+   "entries": {
+    "a": {
+     "intelligence": 2
+    },
+    "b": {
+     "intelligence": 6
+    }
+   },
+   "expected_causes": [],
+   "expected_order": [
+    "b",
+    "a"
+   ],
+   "expected_probes": [],
+   "group": "g",
+   "id": "F6",
+   "kind": "fallback",
+   "loaded": [],
+   "members": [
+    "last",
+    "a",
+    "b"
+   ],
+   "op": "expand",
+   "recency": {
+    "g": "key:b"
+   }
+  },
+  {
+   "entries": {
+    "a": {
+     "intelligence": 2
+    },
+    "b": {
+     "intelligence": 6
+    }
+   },
+   "expected_causes": [
+    "last-miss:no-record"
+   ],
+   "expected_order": [
+    "a",
+    "b"
+   ],
+   "expected_probes": [],
+   "group": "g",
+   "id": "F7",
+   "kind": "fallback",
+   "loaded": [],
+   "members": [
+    "last",
+    "a",
+    "b"
+   ],
+   "op": "expand",
+   "recency": {}
+  },
+  {
+   "entries": {
+    "a": {
+     "intelligence": 2
+    },
+    "b": {
+     "intelligence": 6
+    }
+   },
+   "expected_causes": [
+    "last-miss:removed-member"
+   ],
+   "expected_order": [
+    "a"
+   ],
+   "expected_probes": [],
+   "group": "g",
+   "id": "F8",
+   "kind": "fallback",
+   "loaded": [],
+   "members": [
+    "last",
+    "a"
+   ],
+   "op": "expand",
+   "recency": {
+    "g": "wire:zzz-removed"
+   }
+  },
+  {
+   "entries": {
+    "a": {
+     "intelligence": 2
+    },
+    "b": {
+     "intelligence": 6
+    }
+   },
+   "expected_causes": [
+    "unloaded:a"
+   ],
+   "expected_order": [
+    "b",
+    "a"
+   ],
+   "expected_probes": [
+    "a",
+    "b"
+   ],
+   "group": "g",
+   "id": "F9",
+   "kind": "fallback",
+   "loaded": [
+    "b"
+   ],
+   "members": [
+    "any",
+    "a",
+    "b"
+   ],
+   "op": "expand",
+   "recency": {}
+  },
+  {
+   "entries": {
+    "a": {
+     "intelligence": 2
+    },
+    "b": {
+     "intelligence": 6
+    }
+   },
+   "expected_causes": [],
+   "expected_order": [
+    "a",
+    "b"
+   ],
+   "expected_probes": [
+    "a",
+    "b"
+   ],
+   "group": "g",
+   "id": "F10",
+   "kind": "fallback",
+   "loaded": [],
+   "members": [
+    "any",
+    "a",
+    "b"
+   ],
+   "op": "expand",
+   "recency": {}
+  },
+  {
+   "entries": {
+    "a": {
+     "intelligence": 2
+    },
+    "b": {
+     "intelligence": 6
+    }
+   },
+   "expected_causes": [],
+   "expected_order": [
+    "a",
+    "b"
+   ],
+   "expected_probes": [
+    "a",
+    "b"
+   ],
+   "group": "g",
+   "id": "F11",
+   "kind": "fallback",
+   "loaded": [
+    "a",
+    "b"
+   ],
+   "members": [
+    "any",
+    "a",
+    "b"
+   ],
+   "op": "expand",
+   "recency": {}
+  },
+  {
+   "entries": {
+    "a": {
+     "intelligence": 2
+    }
+   },
+   "expected_causes": [],
+   "expected_order": [
+    "a"
+   ],
+   "expected_probes": [],
+   "group": "g",
+   "id": "F12",
+   "kind": "fallback",
+   "loaded": [],
+   "members": [
+    "last",
+    "last",
+    "a"
+   ],
+   "op": "expand",
+   "recency": {
+    "g": "key:a"
+   }
+  },
+  {
+   "assess": {
+    "a": "err",
+    "b": "2:fits"
+   },
+   "classifier_complexity": null,
+   "entries": {
+    "a": {
+     "intelligence": 2
+    },
+    "b": {
+     "intelligence": 6
+    }
+   },
+   "expected_assessments": [
+    "a",
+    "b"
+   ],
+   "expected_causes": [
+    "assess-err:a"
+   ],
+   "expected_matched": "b",
+   "group": "g",
+   "id": "F13",
+   "kind": "fallback",
+   "loaded": [],
+   "members": [
+    "a",
+    "b"
+   ],
+   "op": "climb",
+   "recency": {}
+  },
+  {
+   "assess": {
+    "a": "1:trivial",
+    "b": "7:hard"
+   },
+   "classifier_complexity": null,
+   "entries": {
+    "a": {
+     "intelligence": 2
+    },
+    "b": {
+     "intelligence": 6
+    }
+   },
+   "expected_assessments": [
+    "b",
+    "a"
+   ],
+   "expected_causes": [],
+   "expected_matched": "a",
+   "group": "g",
+   "id": "F14",
+   "kind": "fallback",
+   "loaded": [],
+   "members": [
+    "last",
+    "a",
+    "b"
+   ],
+   "op": "climb",
+   "recency": {
+    "g": "key:b"
+   }
+  },
+  {
+   "expected_causes": [
+    "endpoint-rewrite:code"
+   ],
+   "expected_consults": [
+    "code",
+    "code"
+   ],
+   "expected_first": "http://one",
+   "expected_second": "http://two",
+   "id": "F15",
+   "kind": "fallback",
+   "op": "latebind",
+   "resolve": "code",
+   "rewrite": {
+    "code": "http://two"
+   },
+   "table": {
+    "code": "http://one"
+   }
+  },
+  {
+   "expected_causes": [
+    "load:code"
+   ],
+   "expected_consults": [
+    "code",
+    "code"
+   ],
+   "expected_first": null,
+   "expected_second": "http://one",
+   "id": "F16",
+   "kind": "fallback",
+   "op": "latebind",
+   "resolve": "code",
+   "rewrite": {
+    "code": "http://one"
+   },
+   "table": {}
+  },
+  {
+   "entries": {
+    "a": {
+     "intelligence": 2
+    }
+   },
+   "expected_causes": [
+    "unloaded:a"
+   ],
+   "expected_order": [
+    "onnx/llm",
+    "a"
+   ],
+   "expected_probes": [
+    "a"
+   ],
+   "group": "g",
+   "id": "F17",
+   "kind": "fallback",
+   "loaded": [],
+   "members": [
+    "any",
+    "onnx/llm",
+    "a"
+   ],
+   "onnx_keys": [
+    "onnx/llm"
+   ],
+   "op": "expand",
+   "recency": {}
+  },
+  {
+   "assess": {
+    "a": "1:trivial",
+    "b": "1:trivial"
+   },
+   "classifier_complexity": null,
+   "entries": {
+    "a": {
+     "intelligence": 2
+    },
+    "b": {
+     "intelligence": 6
+    }
+   },
+   "expected_assessments": [
+    "a"
+   ],
+   "expected_matched": "a",
+   "group": "g",
+   "id": "C1",
+   "kind": "control",
+   "loaded": [],
+   "members": [
+    "last",
+    "a",
+    "b"
+   ],
+   "op": "climb",
+   "recency": {
+    "g": "key:a"
+   }
+  },
+  {
+   "assess": {
+    "b": "5:fits"
+   },
+   "classifier_complexity": 5,
+   "entries": {
+    "a": {
+     "intelligence": 2
+    },
+    "b": {
+     "intelligence": 6
+    }
+   },
+   "expected_assessments": [
+    "b"
+   ],
+   "expected_matched": "b",
+   "group": "g",
+   "id": "C2a",
+   "kind": "control",
+   "loaded": [],
+   "members": [
+    "a",
+    "b"
+   ],
+   "op": "climb",
+   "pair": "climb-invariance",
+   "recency": {}
+  },
+  {
+   "assess": {
+    "b": "5:fits"
+   },
+   "classifier_complexity": 5,
+   "entries": {
+    "a": {
+     "intelligence": 2
+    },
+    "b": {
+     "intelligence": 6
+    }
+   },
+   "expected_assessments": [
+    "b"
+   ],
+   "expected_matched": "b",
+   "group": "g",
+   "id": "C2b",
+   "kind": "control",
+   "loaded": [],
+   "members": [
+    "last",
+    "a",
+    "b"
+   ],
+   "op": "climb",
+   "pair": "climb-invariance",
+   "recency": {
+    "g": "key:b"
+   }
+  },
+  {
+   "assess": {
+    "a": "9:too-hard",
+    "b": "9:hard"
+   },
+   "classifier_complexity": 9,
+   "entries": {
+    "a": {
+     "intelligence": 2
+    },
+    "b": {
+     "intelligence": 6
+    }
+   },
+   "expected_assessments": [
+    "a",
+    "b"
+   ],
+   "expected_matched": "b",
+   "group": "g",
+   "id": "C3",
+   "kind": "control",
+   "loaded": [],
+   "members": [
+    "last",
+    "a",
+    "b"
+   ],
+   "op": "climb",
+   "recency": {
+    "g": "key:a"
+   }
+  },
+  {
+   "expected": {
+    "multi": {
+     "resume": true,
+     "session": true
+    },
+    "scratch": {
+     "resume": false,
+     "session": false
+    }
+   },
+   "id": "C4",
+   "kind": "control",
+   "op": "oneshot",
+   "profiles": {
+    "multi": {
+     "num_ctx": 4096,
+     "resume": true,
+     "session": true
+    },
+    "scratch": {
+     "num_ctx": 4096
+    }
+   }
+  },
+  {
+   "expected_backend_calls": 0,
+   "expected_matched": true,
+   "id": "C5",
+   "input": "this contains secret here",
+   "kind": "control",
+   "op": "prefilter",
+   "outcome": "hard_reject",
+   "patterns": [
+    "secret"
+   ]
+  },
+  {
+   "entries": {
+    "a": {
+     "intelligence": 2
+    },
+    "b": {
+     "intelligence": 6
+    }
+   },
+   "expected_order": [
+    "a",
+    "b"
+   ],
+   "group": "g",
+   "id": "C6",
+   "kind": "control",
+   "loaded": [],
+   "members": [
+    "a",
+    "b"
+   ],
+   "op": "expand",
+   "recency": {}
+  },
+  {
+   "assess": {
+    "a": "1:t"
+   },
+   "classifier_complexity": null,
+   "entries": {
+    "a": {
+     "intelligence": 2
+    }
+   },
+   "expected_assessments": [
+    "a"
+   ],
+   "expected_matched": "a",
+   "group": "g",
+   "id": "C7",
+   "kind": "control",
+   "loaded": [],
+   "members": [
+    "last",
+    "a"
+   ],
+   "op": "climb",
+   "recency": {
+    "g": "key:a"
+   }
+  },
+  {
+   "entries": {
+    "a": {
+     "intelligence": 2
+    }
+   },
+   "expected_order": [
+    "a"
+   ],
+   "expected_probes": [
+    "a"
+   ],
+   "group": "g",
+   "id": "C8",
+   "kind": "control",
+   "loaded": [
+    "a"
+   ],
+   "members": [
+    "any",
+    "a"
+   ],
+   "op": "expand",
+   "recency": {}
+  },
+  {
+   "expected_builds": 0,
+   "expected_first": null,
+   "id": "C9",
+   "kind": "control",
+   "op": "latebind",
+   "resolve": "nosuch",
+   "table": {},
+   "expected_consults": [
+    "nosuch"
+   ]
+  }
+ ]
+}

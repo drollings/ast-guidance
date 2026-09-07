@@ -488,8 +488,9 @@ pub fn onnx_context_backend(
     Ok(Some(Arc::new(backend)))
 }
 
-/// The role's **pool context** — the largest non-default `instances` group,
-/// mirroring `ModelEntry::pool_qualifier` for the llama fleet (ROADMAP M6 §3.5).
+/// The role's **pool context** — the largest non-default `instances` group.
+/// The onnx fleet's own work-context rule for role `instances` blocks (the
+/// llama fleet names its work point through the roles table instead).
 pub fn onnx_pool_context(role: &fluent_llm::onnx_config::OnnxRoleConfig) -> Option<String> {
     let instances = role.instances.as_ref()?;
     if instances.is_empty() {

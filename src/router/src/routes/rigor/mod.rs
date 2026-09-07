@@ -563,6 +563,8 @@ pub async fn handle_rigor_request(
         ledger,
         classifier,
         models,
+        roles,
+        default_instances,
         ..
     } = &deps;
     let Some(route) = rigor_route else {
@@ -623,14 +625,18 @@ pub async fn handle_rigor_request(
     let session = sessions.as_ref().map(|s| s.get_or_create(&session_id));
     // The session model is set so KV snapshot save/rewind can key by it
     // (`dag_session.rs` refuses to key without a model). The blue instance is
-    // the model's internal work group (the pool).
+    // the model's inference point through the single qualifier precedence.
     if let Some(session) = &session {
         let mut s = lock(session);
         s.set_model(model_endpoint.clone());
     }
-    let kv_instance = models
-        .get(&model_endpoint)
-        .and_then(crate::config::ModelEntry::pool_qualifier);
+    let kv_instance = crate::config::resolve_inference_point(
+        models,
+        roles,
+        &model_endpoint,
+        None,
+        default_instances.as_ref(),
+    );
     let ledger = ledger.clone();
 
     let ctx = RigorContext {

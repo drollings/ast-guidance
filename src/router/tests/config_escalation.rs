@@ -95,6 +95,77 @@ fn empty_models_object_deserializes() {
 }
 
 #[test]
+fn group_member_parse_accepts_bare_sentinels_only() {
+    assert_eq!(GroupMember::parse("last"), GroupMember::Last);
+    assert_eq!(GroupMember::parse("any"), GroupMember::Any);
+    // Case-sensitive: upper/mixed case stays a literal key.
+    assert_eq!(GroupMember::parse("LAST"), GroupMember::Key("LAST".into()));
+    assert_eq!(GroupMember::parse("Any"), GroupMember::Key("Any".into()));
+    // Qualified forms stay literal qualifiers — never sentinels.
+    assert_eq!(
+        GroupMember::parse("code:last"),
+        GroupMember::Key("code:last".into())
+    );
+    assert_eq!(
+        GroupMember::parse("base:any"),
+        GroupMember::Key("base:any".into())
+    );
+    assert_eq!(
+        GroupMember::parse("code:default"),
+        GroupMember::Key("code:default".into())
+    );
+}
+
+#[test]
+fn group_member_key_round_trips_through_raw() {
+    for raw in ["last", "any", "LAST", "code:default", "code:last", "fast"] {
+        let member = GroupMember::parse(raw);
+        assert_eq!(member.raw(), raw, "parse→raw must be identity");
+    }
+}
+
+#[test]
+fn model_group_models_shape_unchanged_with_sentinels_present() {
+    // `models()` keeps returning the raw member strings; sentinel expansion
+    // is a dispatch-time concern, not a config-shape one.
+    let group: ModelGroup =
+        serde_json::from_str(r#"["code:default", "last", "any"]"#).unwrap();
+    assert_eq!(
+        group.models(),
+        &[
+            "code:default".to_string(),
+            "last".to_string(),
+            "any".to_string()
+        ]
+    );
+    assert_eq!(
+        group.members(),
+        vec![
+            GroupMember::Key("code:default".into()),
+            GroupMember::Last,
+            GroupMember::Any,
+        ]
+    );
+}
+
+#[test]
+fn unknown_qualified_key_still_resolves_none() {
+    // `base:last` is a literal qualifier: with no such base model the lookup
+    // fails closed exactly as any unknown qualifier does today.
+    let cfg: crate::config::RoutingConfig = serde_json::from_value(serde_json::json!({
+        "routes": {"r": {"group": "g"}},
+        "models": {},
+        "model_groups": {"g": ["tiny"]},
+        "system_prompt": "s",
+        "safety_threshold": 0.5,
+        "default_route": "r",
+    }))
+    .expect("config");
+    assert!(cfg.target_for_key("nosuch:last").is_none());
+    assert!(cfg.target_for_key("nosuch:any").is_none());
+}
+
+#[test]
 fn router_config_shipped_array_shape_still_parses() {
     // The shipped `env/coral-router.json` shape: array-form model_groups.
     let cfg: crate::config::RouterConfig = serde_json::from_str(

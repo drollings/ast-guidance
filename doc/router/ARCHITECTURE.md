@@ -698,18 +698,16 @@ false — no pinned instance), so it is still absent until first use.
 **Model id translation.** Config keys are the public model ids; llama.cpp model
 names are internal. `ModelEntry::llama_model_name` resolves the server's
 `--alias`, and dispatch always sends the translated id (`<llama-name>[:<instance>]`).
-Two distinct qualifier intents stay separate:
-
-- `ModelEntry::default_dispatch_qualifier()` - the pool's **default instance**
-  (`:ledger`), used by `RoutingTarget::from_model_entry` for client-facing
-  bare-`<base>` dispatch.
-- `ModelEntry::pool_qualifier()` - the router's **internal work group** (the
-  pool, `:swarm`): the largest non-default `count` profile's group, else the
-  default profile's group, else the single shared group, else `None`.
-  `local_backend` (the single DIP `LlmClient` factory behind the classifier,
-  chart selector/adjudicator/reranker, target-matching ladder, and rigor roles)
-  routes internal work through this pool so those calls spread across the
-  shared-weight instances instead of pinning to the default.
+Roles are the routing vocabulary: `model_groups` members name roles (fanning
+out to candidate keys per request) or literal keys, plus the `last`/`any`
+availability sentinels. One qualifier precedence serves every path
+(`resolve_inference_point`): explicit qualifier, else the role's instance
+point, else the entry default (the `default: true` profile's group, else the
+single shared group), else a bare key. Backend construction
+(`llama_chat_backend_for_key`/`for_instance`, shared with the `LlamaBackend`
+adapter), dispatch wire ids (`RoutingTarget::from_model_entry`), and the
+classifier/rigor ensure paths all compose it, so backend model ids and
+dispatch wire ids agree.
 
 `RoutingTarget::from_model_entry_instance` targets a named point
 (`<base>:ledger`, `<base>:scratch`); `local_backend_for_instance` merges the

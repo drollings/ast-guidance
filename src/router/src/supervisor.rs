@@ -111,7 +111,7 @@ impl LlamaServerSpec {
         api_key: Option<String>,
         defaults: crate::config::DefaultModelParams,
     ) -> Self {
-        let instances = entry.instance_profiles();
+        let instances = entry.instance_profiles_with(defaults.instances.as_ref());
         let boot = instances.iter().any(|p| p.pinned);
         Self {
             model_key: model_key.to_string(),

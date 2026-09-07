@@ -21,13 +21,13 @@ pub use self::addr::{hosts_equivalent, parse_bind_addr, validate_no_self_routing
 pub use self::builder::{NlpConfig, NlpOrdering, PipelineParams, TargetMatchMode};
 pub use self::refine_policy::{RouterRefineMode, RouterRefinePolicy};
 pub use self::classification::{ClassificationChild, ClassificationNode, ClassificationTree};
-pub use self::escalation::{EscalationLadderConfig, FrontierConfig, ModelGroup};
+pub use self::escalation::{EscalationLadderConfig, FrontierConfig, GroupMember, ModelGroup};
 pub use self::rounds::{BoundedRounds, EscalationConfidence, SeverityThreshold};
 pub use self::filters::{
     CommandConfig, ConfidenceGate, FilterAction, FilterOutcome, FilterScope, MockConfig,
     PatternEntry, RejectPatterns,
 };
-pub use self::routing::{RouteRef, RoutingConfig};
+pub use self::routing::{RoleEntry, RouteRef, RoutingConfig};
 pub use common_core::constants::default_true;
 pub use self::root::{
     AuditLogConfig, ArcReadyConfig, ChartsConfig, ClassifierFailurePolicy, ClassifierOutput,
@@ -35,7 +35,7 @@ pub use self::root::{
     OrchestratorSection, OverlayConfig, PostProcessConfig, ReviewConfig, RigorConfig,
     RouterConfig, ServerConfig, SessionConfig, SidecarConfig, WorkflowExtractionMode,
     DECLARATION_PARAM_KEYS, DEFAULT_LEDGER_MAX_SUMMARY_TOKENS, detect_device_vram_total,
-    strip_declaration_params,
+    resolve_inference_point, role_head_key, strip_declaration_params,
 };
 #[allow(unused_imports)]
 pub(crate) use self::root::{merge_sampling_params, split_model_key};

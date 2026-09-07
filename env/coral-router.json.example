@@ -1,34 +1,17 @@
 {
-  "_comment_review_pii_example": "Review + PII documented example (not live — this file has no `review` section, so the review worker is off). To enable the PII pre-filter + auto-enqueue: add a `review` block with `auto_enqueue: true` (opt-in). The PII pre-filter is the deterministic `RegexPiiDetector` (the canonical `fluent_llm::pii_patterns` table behind `env/pii-patterns.json`'s builtins). `pii_threshold` (default 0.5) is the review candidate-flag floor. Fail-open: the pre-filter only ADDS spans to a review job, never drops a manually enqueued one. `POST /v1/sessions/{id}/review-parse` is unchanged. Example: {\"review_model\": \"onnx/llm\", \"queue_capacity\": 32, \"credit_limit\": 16, \"auto_enqueue\": true}. Review corrections are served by the onnx generative role (`onnx/llm`) with the `ParseReview` grammar.",
-  "_comment_overlay_example": "Overlay documented example (not live — this file has no `overlay` section, so the overlay worker is off). To enable the lazy at-most-once node overlays: add an `overlay` block with `arc_ready: true` (opt-in). The `ArcReadyAnnotation` overlay (spacy-rs structural index), LLM enrichment, and embedding overlays are derived lazily, at-most-once, and in parallel from LOD0; the LLM enrichment uses the onnx generative role (`onnx/llm`) via `set_overlay_llm`. Fail-open: no overlay pipeline yields no overlays; a derivation failure never takes the request path down. Requires a ledger. Example: {\"arc_ready\": {}}.",
-  "_comment_onnx_roles": "In-process ONNX fleet — the ONE model wiring point (ROADMAP_20260829_GENERAL_ONNX). The `onnx` section keys one role per model; this file ships the single generative role, `llm` (a `CausalLm` session — the general-purpose local LLM served behind the `fluent_llm::client::ChatBackend` seam as the default annotation / review / enrichment backend). Every role is optional; the pipeline is fully functional (pure-deterministic) with none loaded. The model runs in-process via ONNX Runtime (ort), never a spawned llama-server, and is supervised by the onnx residency loop (idle release + working-set LRU, sibling of the llama sidecar — the llama fleet stays on GPU). `execution_provider` selects the runtime: `cpu` (`intra_threads: 1` — deterministic decode) or `gpu`/`migraphx` (the AMD ROCm MIGraphX EP — successor to the ROCm EP removed upstream in ORT 1.23; the loader probes the linked onnxruntime and fails open to CPU with a loud warning if it lacks MIGraphX, so this file's `gpu` is honored only when a MIGraphX-enabled onnxruntime is linked via `ORT_LIB_PATH`). `resident: true` loads at boot (Always); `pinned` forbids release; `sleep_idle_seconds` controls idle unload; `params` are sampling defaults (per-request wins). A mismatched config.json / missing `logits` output is a loud boot error; absent onnx config is fully fail-open (the HTTP llama/deterministic ladder remains).",
-  "_comment_onnx_instances": "ONNX context-declaration vocabulary (ROADMAP_20260830_LLMS M3) — LIVE for `onnx/llm` in this file. An onnx role may declare an `instances` block exactly like a llama `ModelEntry.instances` (same profile shape: name/group/count/num_ctx/parallel/pinned/warm/sleep_idle_seconds/default/resume/params/max_ctx), giving the onnx fleet the same 'one weights load, N named context windows, per-context KV' contract the llama fork already serves. Here the single `default` profile materializes one pinned 8192-token context window that stays resident (never evicted), bound to bare `onnx/llm` dispatch via `default: true`. `max_ctx` (per-profile or on the flattened model block / top-level `default_params`) caps how large a context may grow; a cap below `num_ctx` clamps the window at materialization. Absent `instances` keeps today's single-shot decode. Example: {\"instances\": {\"swarm\": {\"num_ctx\": 16384, \"count\": 3, \"group\": \"swarm\", \"max_ctx\": 8192}, \"ledger\": {\"num_ctx\": 131072, \"pinned\": true, \"default\": true}}}.",
-  "_comment_max_ctx": "Context-size cap vocabulary (ROADMAP_20260830_LLMS M7) — `max_ctx` ships ABSENT everywhere in this file (behavior identical to today). It may appear on: (1) `default_params.max_ctx` — the global cap for every managed model that does not declare its own; (2) an instance profile's `max_ctx` (`models.<id>.instances.<name>.max_ctx`, or the onnx `instances` block) — the per-context cap; a cap below that context's `num_ctx` clamps the window at materialization. Resize-to-demand: a request that declares a bigger context window than the targeted context is allocated grows the context to fit (up to `max_ctx`); a request beyond `max_ctx` fails loudly with the same error a too-large llama request gets. Absent `max_ctx` = no cap (today's behavior).",
-  "_comment_onnx": {
-    "llm": {
-      "resident": false,
-      "pinned": false,
-      "quantization": "q4",
-      "execution_provider": "cpu",
-      "intra_threads": 1,
-      "model_path": "/ai/models/lfm2/2.6b/LiquidAI/LFM2.5-2.6B-ONNX",
-      "tokenizer_path": "/ai/models/lfm2/2.6b/LiquidAI/LFM2.5-2.6B-ONNX/tokenizer.json",
-      "max_gen_tokens": 108192,
-      "sleep_idle_seconds": 30,
-      "total_timeout_ms": 120000,
-      "params": { "temperature": 0.1 }
-    }
-  },
+  "_comment_review_pii_example": "Review worker is opt-in: add a review section to enable async parse review.",
+  "_comment_overlay_example": "Overlay worker is opt-in: add an overlay section for the entity-link plane.",
   "pipelines": {
     "default": {
       "deterministic_prefilter": true,
       "classifier": true,
-      "classifier_model": "lfm2.5-2.6b:default",
+      "classifier_model": "code:default",
       "coherence_threshold": 0.5
     }
   },
   "default_params": {
-    "num_ctx": 16384,
+    "num_ctx": 8192,
+    "max_ctx": 262144,
     "batch_size": 4096,
     "ubatch_size": 1024,
     "cache_type_k": "q8_0",
@@ -36,16 +19,33 @@
     "flash_attn": "on",
     "n_gpu_layers": 999,
     "n_cpu_moe": 0,
-    "sleep_idle_seconds": 15,
+    "sleep_idle_seconds": 60,
     "stream": true,
     "filter_thinking": true,
     "params": {
       "temperature": 0.1
+    },
+    "instances": {
+      "default": {
+        "num_ctx": 8192,
+        "max_ctx": 262144,
+        "pinned": false,
+        "default": true,
+        "params": {
+          "sleep-idle-seconds": 7200,
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        }
+      }
     }
   },
   "models": {
     "lfm2.5-350m": {
       "name": "liquidai/lfm2.5-350m",
+      "endpoint": "http://localhost:8181/v1/chat/completions",
       "weights": "/app/ai/models/gguf/liquidai/lfm2.5-350m-gguf/latest.gguf",
       "intelligence": 2,
       "cost_input": 1e-06,
@@ -61,6 +61,7 @@
     },
     "lfm2.5-2.6b": {
       "name": "liquidai/lfm2.6-2.6b",
+      "endpoint": "http://localhost:8181/v1/chat/completions",
       "weights": "/app/ai/models/gguf/liquidai/lfm2.5-2.6b-gguf/latest.gguf",
       "intelligence": 1,
       "cost_input": 1e-06,
@@ -78,33 +79,51 @@
         "default": {
           "num_ctx": 8192,
           "max_ctx": 128000,
-          "pinned": true,
-          "default": true
+          "pinned": false,
+          "default": false
         }
       }
     },
     "qwen3.6-27b": {
       "name": "vinpix/ternary-bonsai-27b-stock-mtp",
+      "endpoint": "http://localhost:8181/v1/chat/completions",
       "weights": "/app/ai/models/gguf/vinpix/ternary-bonsai-27b-stock-mtp-gguf/latest.gguf",
       "intelligence": 5,
       "cost_input": 3e-06,
       "cost_output": 1.8e-05,
       "cost_cached_read": 1.2e-06,
       "speed": 3,
-      "total_timeout_ms": 300000, 
+      "total_timeout_ms": 300000,
       "idle_timeout_ms": 30000,
       "stream": true,
       "filter_thinking": true,
       "retry_count": 1,
       "retry_base_interval_s": 2,
       "params": {
-        "num_ctx": 65536,
-        "repeat_penalty": 1.05,
+        "num-ctx": 65536,
+        "repeat-penalty": 1.05,
         "temperature": 0.7
       }
     },
+    "code": {
+      "name": "code",
+      "endpoint": "http://localhost:8181/v1/chat/completions",
+      "weights": "/app/ai/models/gguf/code/latest.gguf",
+      "intelligence": 4,
+      "cost_input": 3e-06,
+      "cost_output": 1.8e-05,
+      "cost_cached_read": 1.2e-06,
+      "speed": 4,
+      "total_timeout_ms": 150000,
+      "idle_timeout_ms": 30000,
+      "stream": true,
+      "filter_thinking": true,
+      "retry_count": 1,
+      "retry_base_interval_s": 2
+    },
     "gemma4-12b": {
       "name": "mradermacher/gemma-4-12b-styletune-i1",
+      "endpoint": "http://localhost:8181/v1/chat/completions",
       "weights": "/app/ai/models/gguf/mradermacher/gemma-4-12b-styletune-i1-gguf/latest.gguf",
       "intelligence": 4,
       "cost_input": 3e-06,
@@ -121,27 +140,9 @@
         "temperature": 0.6
       }
     },
-    "code": {
-      "endpoint": "http://localhost:8080/v1/chat/completions",
-      "name": "code",
-      "intelligence": 4,
-      "cost_input": 3e-06,
-      "cost_output": 1.8e-05,
-      "cost_cached_read": 1.2e-06,
-      "speed": 5,
-      "total_timeout_ms": 120000,
-      "idle_timeout_ms": 10000,
-      "stream": true,
-      "filter_thinking": true,
-      "retry_count": 3,
-      "retry_base_interval_s": 2,
-      "params": {
-        "temperature": 0.6
-      }
-    },
     "embed": {
       "name": "google/embeddinggemma-300m",
-      "endpoint": "http://localhost:8080/v1/chat/completions",
+      "endpoint": "http://localhost:8181/v1/chat/completions",
       "weights": "/app/ai/models/gguf/google/embeddinggemma-300m/latest.gguf",
       "intelligence": 1,
       "cost_input": 1e-06,
@@ -156,84 +157,123 @@
       "retry_base_interval_s": 1
     }
   },
-  "_comment_routes": "`always_route: true` marks the route as dispatch-only: its response function is a dispatch to the route's group, never a classifier direct answer, even at maximum confidence. Routes without it keep `always_route: false` so the classifier may answer simple prompts directly; `local` is the sole direct-answer (respond-eligible) domain. The route table is the functional tool taxonomy: each route key is a functionally-disjoint response function (code / summarize / explore / explain / prose), plus `local` as the general Q&A category that is the classifier's own territory (see needle.schema_overrides.local.general). Subject-matter routing (science, medical, legal, translation, entity recognition) is handled as bounded subagent plans dispatched after a tool is selected, not as separate top-level routes.",
-  "routes": {
-    "local": {
-      "group": "default",
-      "pipelines": [
-        "default"
-      ],
-      "description": "General Q&A, simple questions, chitchat, research queries, brainstorming, and help formulating prompts. Answered directly by the classifier when simple.",
-      "always_route": false
-    },
-    "code": {
-      "group": "code",
-      "pipelines": [
-        "default"
-      ],
-      "description": "Programming, software development, Linux, bash, Python, Rust, dev-ops, debugging, and technical implementation - write, debug, or explain code.",
-      "always_route": true
-    },
-    "summarize": {
-      "group": "summarize",
-      "pipelines": [
-        "default"
-      ],
-      "description": "Summarize or condense text - an article, report, email thread, meeting notes, or other content, into a shorter form."
-    },
-    "explore": {
-      "group": "explore",
-      "pipelines": [
-        "default"
-      ],
-      "description": "Search, navigate, look up, or pull a value - search the web, open a page, look up an API, query data storage or a knowledge graph, or extract a specific value (a date, amount, email, or identifier) from text.",
-      "always_route": true
-    },
-    "explain": {
-      "group": "explain",
-      "pipelines": [
-        "default"
-      ],
-      "description": "A deep answer - translate between languages, analyze or reason about a topic, identify named entities in text, or explain a concept from the sciences, mathematics, medicine, or law.",
-      "always_route": true
-    },
-    "prose": {
-      "group": "prose",
-      "pipelines": [
-        "default"
-      ],
-      "description": "Write a story, novel, poem, essay, screenplay, or letter - any substantial creative writing.",
-      "always_route": true
+  "_comment_onnx": "In-process ONNX roles are optional; declare under onnx or as top-level role keys.",
+  "classification": {
+    "root": {
+      "type": "classifier",
+      "description": "Coral request router",
+      "model": "code:default",
+      "coherence_threshold": 0.5,
+      "safety_threshold": 0.3,
+      "children": [
+        {
+          "key": "local",
+          "description": "General Q&A, simple questions, chitchat, research queries, brainstorming, and help formulating prompts. Answered directly by the classifier when simple.",
+          "node": {
+            "type": "terminal",
+            "route": "local",
+            "group": "default",
+            "description": "General Q&A",
+            "always_route": false
+          }
+        },
+        {
+          "key": "code",
+          "description": "Programming, software development, Linux, bash, Python, Rust, dev-ops, debugging, and technical implementation - write, debug, or explain code.",
+          "node": {
+            "type": "terminal",
+            "route": "code",
+            "group": "code",
+            "description": "Code",
+            "always_route": true
+          }
+        },
+        {
+          "key": "summarize",
+          "description": "Summarize or condense text - an article, report, email thread, meeting notes, or other content, into a shorter form.",
+          "node": {
+            "type": "terminal",
+            "route": "summarize",
+            "group": "summarize",
+            "description": "Summarize",
+            "always_route": false
+          }
+        },
+        {
+          "key": "explore",
+          "description": "Search, navigate, look up, or pull a value - search the web, open a page, look up an API, query data storage or a knowledge graph, or extract a specific value (a date, amount, email, or identifier) from text.",
+          "node": {
+            "type": "terminal",
+            "route": "explore",
+            "group": "explore",
+            "description": "Explore",
+            "always_route": true
+          }
+        },
+        {
+          "key": "explain",
+          "description": "A deep answer - translate between languages, analyze or reason about a topic, identify named entities in text, or explain a concept from the sciences, mathematics, medicine, or law.",
+          "node": {
+            "type": "terminal",
+            "route": "explain",
+            "group": "explain",
+            "description": "Explain",
+            "always_route": true
+          }
+        },
+        {
+          "key": "prose",
+          "description": "Write a story, novel, poem, essay, screenplay, or letter - any substantial creative writing.",
+          "node": {
+            "type": "terminal",
+            "route": "prose",
+            "group": "prose",
+            "description": "Prose",
+            "always_route": true
+          }
+        }
+      ]
     }
   },
-  "_comment_model_groups": "Each model_group is an ordered target-matching ladder (VISION 'Target selection within a group'): the cheapest candidate self-assesses the request's complexity first and defers to the next, more-intelligent member when the assessed complexity exceeds its `intelligence`. `explore` leads with a cheap capable model (the value-pull fast path); `explain` leads with the capable model (deep answers). Single-member groups resolve statically. Controlled per pipeline via `pipelines.<name>.target_match` (\"self_assess\" default | \"static\") and `target_match_timeout_ms`.",
   "model_groups": {
     "default": [
-      "lfm2.5-2.6b:default"
+      "default",
+      "last",
+      "any"
     ],
     "code": [
-      "qwen3.6-27b"
+      "code",
+      "last",
+      "any"
     ],
     "summarize": [
-      "lfm2.5-2.6b:default"
+      "default",
+      "last",
+      "any"
     ],
     "explore": [
-      "lfm2.5-2.6b:default"
+      "default",
+      "last",
+      "any"
     ],
     "explain": [
-      "qwen3.6-27b"
+      "default",
+      "last",
+      "any"
     ],
     "prose": [
-      "qwen3.6-27b"
+      "default",
+      "last",
+      "any"
     ]
   },
-  "system_prompt": "You are Coral, an AI assistant based on a team of edge language models. Analyze the user's message and output JSON only.",
+  "_comment_model_groups": "Each group lists member model keys in escalation order; first is the default.",
   "safety_threshold": 0.3,
   "default_route": "local",
   "charts": {
     "dir": "env/workflows/charts",
     "index_path": "data/workflow_library.sqlite",
-    "selector_model": "lfm2.5-2.6b:default",
+    "selector_model": "code:default",
     "max_candidates": 5,
     "min_score": 0.6,
     "entity_context": true
@@ -243,7 +283,7 @@
   },
   "ledger": {
     "path": "data/ledger.sqlite",
-    "model": "lfm2.5-2.6b:default"
+    "model": "code:default"
   },
   "session": {
     "root": "data/sessions"
@@ -262,6 +302,7 @@
     "minimum_remaining_vram": 2048000000,
     "slot_save_path": "data/slots",
     "resume_ttl_s": 3600,
+    "server_state_path": "data/server_state.json",
     "api_key_env": null
   },
   "logging": {
@@ -279,5 +320,38 @@
       "json_format": true,
       "console_output": false
     }
-  }
+  },
+  "roles": {
+    "default": {
+      "models": [
+        "code:default"
+      ],
+      "instance": "default"
+    },
+    "classifier": {
+      "models": [
+        "code:default"
+      ],
+      "instance": "default"
+    },
+    "code": {
+      "models": [
+        "code:default"
+      ],
+      "instance": "default"
+    },
+    "reasoning": {
+      "models": [
+        "code:default"
+      ],
+      "instance": "default"
+    },
+    "ledger": {
+      "models": [
+        "code:default"
+      ],
+      "instance": "default"
+    }
+  },
+  "_comment_roles": "Roles are the routing vocabulary: groups reference roles (expanded per request to candidate keys), and a role's instance point is the single qualifier default. lfm2.5-2.6b keeps a per-model instances override (whole-profile replace): its context cap differs from the fleet default hoisted under default_params.instances."
 }

@@ -42,6 +42,8 @@ fn golden_corpus_config() -> RouterConfig {
     let llama = crate::instances::traits::LlamaBackend::new(
         pool,
         config.models.clone(),
+        config.roles.clone(),
+        config.default_params.instances.clone(),
         config.onnx_role_keys(),
         config.sidecar.clone(),
     );
@@ -130,6 +132,8 @@ fn registry_prefers_llama_for_llama_keys_and_onnx_for_onnx_keys() {
     let llama = crate::instances::traits::LlamaBackend::new(
         pool,
         corpus.models.clone(),
+        corpus.roles.clone(),
+        corpus.default_params.instances.clone(),
         corpus.onnx_role_keys(),
         corpus.sidecar.clone(),
     );
@@ -187,6 +191,8 @@ fn llama_backend_yields_onnx_keys_on_collision() {
     let llama = crate::instances::traits::LlamaBackend::new(
         pool,
         corpus.models.clone(),
+        corpus.roles.clone(),
+        corpus.default_params.instances.clone(),
         corpus.onnx_role_keys(),
         corpus.sidecar.clone(),
     );

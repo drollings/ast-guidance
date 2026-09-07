@@ -788,6 +788,8 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
         let llama = fluent_router::instances::traits::LlamaBackend::new(
             instance_pool.clone(),
             config.models.clone(),
+            config.roles.clone(),
+            config.default_params.instances.clone(),
             config.onnx_role_keys(),
             config.sidecar.clone(),
         );
@@ -1195,6 +1197,8 @@ async fn run_start(config_path: &str, args: StartArgs) -> Result<(), Box<dyn std
 
     let mut server =
         RouterServer::new(pipelines, routes, config.models, &config.server, classifier)
+            .with_roles(config.roles.clone())
+            .with_default_instances(config.default_params.instances.clone())
             .with_plan_route(plan_route)
             .with_rigor_route(rigor_route)
             .with_ladders(ladders);

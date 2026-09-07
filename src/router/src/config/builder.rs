@@ -37,6 +37,7 @@ use super::{
 };
 use crate::pipeline::PipelineOrchestrator;
 use crate::score_matrix::ScoreMatrix;
+use crate::stages::classifier::ClassifierBackendResolver;
 use crate::target_match::{TargetBackends, TargetMatcher};
 
 /// In-group target-matching policy for a pipeline (-4.6 of the routing
@@ -377,15 +378,34 @@ impl RouterConfig {
             .as_ref()
             .and_then(super::ClassificationTree::derive_system_prompt)
             .unwrap_or_default();
+        // Effective instance maps: entries declaring none inherit the whole
+        // fleet-default map (the R1 fallback), materialized into this derived
+        // view so every routing path below resolves through one code path.
+        // The authoritative `RouterConfig` is untouched (round-trips clean;
+        // supervision keeps reading the originals).
+        let models = self
+            .models
+            .iter()
+            .map(|(key, entry)| {
+                let mut effective = entry.clone();
+                if effective.instances.is_none() {
+                    effective
+                        .instances
+                        .clone_from(&self.default_params.instances);
+                }
+                (key.clone(), effective)
+            })
+            .collect();
         super::RoutingConfig {
             routes: self.routes_view(),
-            models: self.models.clone(),
+            models,
             model_groups: self.model_groups.clone(),
             system_prompt,
             safety_threshold: self.safety_threshold,
             default_route: self.default_route.clone(),
             score_matrix: None,
             onnx_keys: self.onnx_role_keys(),
+            roles: self.roles.clone(),
         }
     }
 
@@ -681,6 +701,11 @@ impl RouterConfig {
 
         if params.classifier {
             let injected_backend = classifier_backend.is_some();
+            // Real mode keeps the resolved classifier key and re-resolves the
+            // backend per request; the injected mock path serves its frozen
+            // backend with no resolver installed.
+            let backend_resolver =
+                (!injected_backend).then(|| classifier_backend_resolver(self));
             let routing_config = self.routing_config();
             let classifier_intel = classifier_intelligence(self, params);
             let classifier_model = resolve_classifier_model_key(self, params)
@@ -770,6 +795,7 @@ impl RouterConfig {
                     params.coherence_threshold,
                     !injected_backend,
                     target_matcher.clone(),
+                    backend_resolver.clone(),
                 );
                 tracing::info!(
                     target: "router.config",
@@ -790,6 +816,7 @@ impl RouterConfig {
                     target_matcher,
                     self.classifier_failure_policy,
                     failure_dir,
+                    backend_resolver.clone(),
                 )
             } else {
                 crate::stages::classifier::ClassifierStage::new(
@@ -804,6 +831,7 @@ impl RouterConfig {
                     target_matcher,
                     self.classifier_failure_policy,
                     failure_dir,
+                    backend_resolver.clone(),
                 )
             };
             // When configured, wrap the classifier in the retry decorator
@@ -982,6 +1010,18 @@ fn classifier_intelligence(config: &RouterConfig, params: &PipelineParams) -> u8
         .map_or(0, |m| m.intelligence)
 }
 
+/// Per-request classifier backend resolution over the live config: the
+/// single `local_backend` factory (never a second one), so endpoint rewrites
+/// and lazy loads after boot are always current. The shared config snapshot
+/// stays current because nothing mutates the models map after the pipeline
+/// build, while the inference registry inside it is live-shared and observes
+/// every post-build registration. One map lookup plus an `LlmClient` build
+/// per request (no I/O).
+fn classifier_backend_resolver(config: &RouterConfig) -> ClassifierBackendResolver {
+    let shared = Arc::new(config.clone());
+    Arc::new(move |key: &str| shared.local_backend(key))
+}
+
 /// Build a classifier LLM client from the model config.
 ///
 /// # DIP note
@@ -1016,6 +1056,7 @@ fn build_classification_engine(
     coherence_threshold: f64,
     use_per_node_backends: bool,
     target_matcher: Option<TargetMatcher>,
+    backend_resolver: Option<ClassifierBackendResolver>,
 ) -> crate::stages::tree::ClassificationEngine {
     let default_params = PipelineParams::default();
     let default_model_key = resolve_classifier_model_key(config, &default_params);
@@ -1038,6 +1079,7 @@ fn build_classification_engine(
         limiter,
         coherence_threshold,
         target_matcher,
+        backend_resolver,
     )
 }
 
@@ -1046,20 +1088,25 @@ fn build_classification_engine(
 /// inference adapter so the construction site stays singular. `None` for an
 /// unknown base key. Never touches the onnx resolver (fail-open): onnx keys
 /// have no `models` entry and fall out here naturally.
+///
+/// A role name resolves to its head candidate's backend, qualified to the
+/// single inference point (`resolve_inference_point`); literal keys behave
+/// exactly as before.
 pub(crate) fn llama_chat_backend_for_key(
     models: &HashMap<String, ModelEntry>,
+    roles: &HashMap<String, crate::config::RoleEntry>,
     key: &str,
+    default_instances: Option<&HashMap<String, crate::config::InstanceProfile>>,
 ) -> Option<Arc<dyn ChatBackend>> {
-    let (base, explicit) = crate::config::split_model_key(key);
+    let resolved = crate::config::role_head_key(models, roles, key, true)?;
+    let (base, _) = crate::config::split_model_key(&resolved);
     let entry = models.get(base)?;
     let base_name = entry.name.as_deref().unwrap_or(base);
-    // A qualified key (`base:qualifier`) pins the named instance/group
-    // explicitly; a bare key uses the entry's internal pool qualifier
-    // (`latest` normalizes to the pool, i.e. the bare-key behavior).
-    let qualifier = explicit
-        .filter(|q| *q != "latest")
-        .map(String::from)
-        .or_else(|| entry.pool_qualifier());
+    // One qualifier resolver for every path: explicit qualifier, else the
+    // role's instance point, else the entry default (over the fleet-default
+    // map when the entry declares none), else bare.
+    let qualifier =
+        crate::config::resolve_inference_point(models, roles, key, None, default_instances);
     let model = match &qualifier {
         Some(qualifier) => format!("{base_name}:{qualifier}"),
         None => base_name.to_string(),
@@ -1068,7 +1115,7 @@ pub(crate) fn llama_chat_backend_for_key(
     // params (e.g. the swarm work pool's temperature) reach the body.
     let params = qualifier
         .as_deref()
-        .and_then(|q| entry.instance_params_for(q))
+        .and_then(|q| entry.instance_params_for_with(q, default_instances))
         .or_else(|| entry.params.clone().map(strip_declaration_params));
     let llm_config = LlmConfig::new()
         .api_url(entry.endpoint.clone())
@@ -1083,22 +1130,28 @@ pub(crate) fn llama_chat_backend_for_key(
 /// (`<base>:<instance_or_group>`) — the llama construction half of
 /// `RouterConfig::local_backend_for_instance`, shared with the
 /// `LlamaBackend` adapter. `None` for an unknown key or instance.
+/// Fleet-wide default profiles (`default_params.instances`) back entries
+/// that declare none, so a hoisted profile is addressable by name.
+/// A role name resolves to its head candidate's entry first.
 pub(crate) fn llama_chat_backend_for_instance(
     models: &HashMap<String, ModelEntry>,
+    roles: &HashMap<String, crate::config::RoleEntry>,
     key: &str,
     instance_or_group: &str,
+    default_instances: Option<&HashMap<String, crate::config::InstanceProfile>>,
 ) -> Option<Arc<dyn ChatBackend>> {
-    let (base, _) = crate::config::split_model_key(key);
+    let resolved = crate::config::role_head_key(models, roles, key, true)?;
+    let (base, _) = crate::config::split_model_key(&resolved);
     let entry = models.get(base)?;
     // Resolve the named profile; an unknown instance name -> None.
     entry
-        .instance_profiles()
+        .instance_profiles_with(default_instances)
         .into_iter()
         .find(|p| p.name.as_deref() == Some(instance_or_group))?;
     let base_name = entry.name.as_deref().unwrap_or(base);
     let model = format!("{base_name}:{instance_or_group}");
     let params = entry
-        .instance_params_for(instance_or_group)
+        .instance_params_for_with(instance_or_group, default_instances)
         .unwrap_or_else(|| strip_declaration_params(serde_json::Value::Null));
     let llm_config = LlmConfig::new()
         .api_url(entry.endpoint.clone())
@@ -1177,10 +1230,10 @@ impl RouterConfig {
     /// Build a sync local-model `ChatBackend` from a `models` key - the single
     /// `LlmClient` construction site shared by the classifier and the
     /// escalation ladder's local roles (DIP: exactly one concrete
-    /// `ChatBackend` factory in the crate). The model id is qualified to the
-    /// entry's *internal work group* (the pool); client-facing default dispatch
-    /// keeps `default_dispatch_qualifier` via `from_model_entry`. When
-    /// `pool_qualifier()` is `None` the id is bare `<base>` (upstream models,
+    /// `ChatBackend` factory in the crate). A role name resolves to its head
+    /// candidate, qualified to the single inference point
+    /// (`resolve_inference_point`); a literal key behaves exactly as before.
+    /// When the point is `None` the id is bare `<base>` (upstream models,
     /// byte-identical to today). Declaration-only params are stripped.
     ///
     /// **ONNX branch:** a key served by a registered inference backend (the
@@ -1193,7 +1246,12 @@ impl RouterConfig {
         }) {
             return Some(backend);
         }
-        llama_chat_backend_for_key(&self.models, key)
+        llama_chat_backend_for_key(
+            &self.models,
+            &self.roles,
+            key,
+            self.default_params.instances.as_ref(),
+        )
     }
 
     /// The onnx LLM role's registry key when the generative role is configured
@@ -1253,7 +1311,13 @@ impl RouterConfig {
         }) {
             return Some(backend);
         }
-        llama_chat_backend_for_instance(&self.models, key, instance_or_group)
+        llama_chat_backend_for_instance(
+            &self.models,
+            &self.roles,
+            key,
+            instance_or_group,
+            self.default_params.instances.as_ref(),
+        )
     }
 
     /// Build the ledger `Summarizer`'s DIP backend - the ledger
@@ -1383,17 +1447,23 @@ impl RouterConfig {
     /// factory; no second construction site).
     ///
     /// Iterates every model key referenced by any `model_groups` member and
-    /// maps it to its dedicated `ChatBackend`. The matcher's `default` (for
-    /// keys absent from the map) is supplied by the caller: the injected
-    /// mock/transcript backend when one is provided, otherwise a real client
-    /// (defense in depth - every real group member has a dedicated backend,
-    /// so the default is only reached for a key outside all groups).
+    /// maps it to its dedicated `ChatBackend`. Role members fan out to their
+    /// candidate keys (availability sentinels build nothing, exactly as
+    /// unknown keys today). The matcher's `default` (for keys absent from the
+    /// map) is supplied by the caller: the injected mock/transcript backend
+    /// when one is provided, otherwise a real client (defense in depth - every
+    /// real group member has a dedicated backend, so the default is only
+    /// reached for a key outside all groups).
     pub fn target_backends(&self) -> HashMap<String, Arc<dyn ChatBackend>> {
         let mut backends = HashMap::new();
-        for group in self.model_groups.values() {
-            for key in group.models() {
-                if let Some(backend) = self.local_backend(key) {
-                    backends.insert(key.clone(), backend);
+        let routing = self.routing_config();
+        for group_key in self.model_groups.keys() {
+            for key in routing.role_expanded_members(group_key) {
+                if key == "last" || key == "any" {
+                    continue;
+                }
+                if let Some(backend) = self.local_backend(&key) {
+                    backends.insert(key, backend);
                 }
             }
         }

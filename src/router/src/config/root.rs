@@ -15,7 +15,7 @@ use crate::config::classification::ClassificationTree;
 use crate::config::escalation::ModelGroup;
 use crate::config::filters::MockConfig;
 use crate::config::rounds::{BoundedRounds, EscalationConfidence, SeverityThreshold};
-use crate::config::routing::RouteRef;
+use crate::config::routing::{RoleEntry, RouteRef};
 
 /// Decompose a possibly-qualified model key (`base:qualifier`) into the base
 /// `models` config key and the optional qualifier. A bare key (or a malformed
@@ -51,6 +51,13 @@ pub struct RouterConfig {
     #[field(skip)]
     #[serde(default)]
     pub model_groups: HashMap<String, ModelGroup>,
+    /// Routing-vocabulary table: role name → candidate model keys + the
+    /// inference point each candidate serves. Absent (the default) leaves
+    /// today's key-based routing untouched; roles resolve to concrete
+    /// `base:qualifier` targets per request once consumed.
+    #[field(skip)]
+    #[serde(default)]
+    pub roles: HashMap<String, RoleEntry>,
     #[field(desc="safety threshold", min=0.0, max=1.0)]
     #[serde(default)]
     pub safety_threshold: f64,
@@ -220,6 +227,7 @@ impl Default for RouterConfig {
             pipelines,
             models: HashMap::new(),
             model_groups: HashMap::new(),
+            roles: HashMap::new(),
             safety_threshold: 0.5,
             default_route: "local".into(),
             classifier_failure_policy: ClassifierFailurePolicy::Reject,
@@ -479,7 +487,7 @@ impl ModelEntry {
 /// Sampling `params` are merged into the request body for dispatches through
 /// these instances; declaration-only keys (`num_ctx`/`parallel`/
 /// `sleep_idle_seconds`) are stripped before dispatch.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct InstanceProfile {
     /// Instance name; default = the map key (expanded `<name><i>` for count > 1).
@@ -529,6 +537,13 @@ pub struct InstanceProfile {
     /// (`ModelEntry::instance_profiles`).
     #[serde(default)]
     pub max_ctx: Option<u64>,
+    /// Multi-step instance: holds snapshottable state across requests (the
+    /// resume/snapshot path applies). Absent (`false`, the default) means the
+    /// profile is one-shot — never snapshotted, and snapshot-scoped request
+    /// fields do not apply to its contexts. Declared intent, not a
+    /// measurement: the author states the instance carries multi-step state.
+    #[serde(default)]
+    pub session: bool,
 }
 
 fn default_instance_count() -> u32 {
@@ -541,14 +556,51 @@ impl ModelEntry {
     /// and resolves the name/group defaults (name = map key, group = name when
     /// absent). Empty when no instances are configured.
     pub fn instance_profiles(&self) -> Vec<InstanceProfile> {
-        let Some(instances) = &self.instances else {
-            return Vec::new();
-        };
-        let mut keys: Vec<&String> = instances.keys().collect();
+        self.instance_profiles_with(None)
+    }
+
+    /// Expand over the fleet-wide default profiles merged under this entry's
+    /// own `instances`. A model that declares none inherits the whole default
+    /// map; a model that declares some keeps them, and any map key present in
+    /// both resolves to the entry's profile **whole** — profiles are replaced
+    /// per key, never field-merged, so two `default: true` flags can never
+    /// fuse silently. `None` (no fleet defaults) is byte-identical to
+    /// [`Self::instance_profiles`]: the merge, the `count` expansion, and the
+    /// `max_ctx` clamp below all run on one code path, never a fork.
+    pub fn instance_profiles_with(
+        &self,
+        defaults: Option<&HashMap<String, InstanceProfile>>,
+    ) -> Vec<InstanceProfile> {
+        let mut merged: HashMap<String, InstanceProfile> =
+            defaults.cloned().unwrap_or_default();
+        if let Some(own) = &self.instances {
+            for (key, profile) in own {
+                merged.insert(key.clone(), profile.clone());
+            }
+        }
+        // Exactly one profile may carry `default: true`: a second flag is a
+        // declaration collision, warned loudly and resolved first-wins in
+        // deterministic map order (the same order the expansion below and
+        // every `find(|p| p.default)` consumer observe).
+        if merged.values().filter(|p| p.default).count() > 1 {
+            let mut keys: Vec<&str> = merged
+                .iter()
+                .filter(|(_, p)| p.default)
+                .map(|(k, _)| k.as_str())
+                .collect();
+            keys.sort_unstable();
+            tracing::warn!(
+                target: "router.config",
+                keys = ?keys,
+                "multiple `default: true` instance profiles merged; \
+                 the first in map order wins",
+            );
+        }
+        let mut keys: Vec<&String> = merged.keys().collect();
         keys.sort();
         let mut out = Vec::new();
         for key in keys {
-            let profile = &instances[key];
+            let profile = &merged[key];
             let base_name = profile.name.clone().unwrap_or_else(|| key.clone());
             let count = profile.count.max(1);
             // All siblings share the profile's group (default = base name).
@@ -568,6 +620,19 @@ impl ModelEntry {
                         p.num_ctx = cap;
                     }
                 }
+                // One-shot profiles (the default) never carry multi-step
+                // state: a `resume: true` on them is inapplicable, forced
+                // false fail-open with a loud warn. Session profiles keep
+                // their declared `resume` value unchanged.
+                if !p.session && p.resume {
+                    tracing::warn!(
+                        target: "router.config",
+                        profile = %key,
+                        "resume:true on a one-shot instance profile is inapplicable \
+                         (multi-step state needs session:true); forcing resume:false",
+                    );
+                    p.resume = false;
+                }
                 p.name = Some(name);
                 p.group = Some(group.clone());
                 out.push(p);
@@ -575,71 +640,110 @@ impl ModelEntry {
         }
         out
     }
+}
 
-    /// The dispatch qualifier for the model's default inference point: the
-    /// `default: true` profile's group, else the single shared group across all
-    /// profiles, else `None` (bare `<base>`). `None` also when no instances are
-    /// configured. Encoded as `model = "<base>:<qualifier>"`.
-    pub fn default_dispatch_qualifier(&self) -> Option<String> {
-        let profiles = self.instance_profiles();
-        if profiles.is_empty() {
-            return None;
-        }
-        if let Some(d) = profiles.iter().find(|p| p.default) {
-            return d.group.clone();
-        }
-        let first = profiles[0].group.clone()?;
-        if profiles.iter().all(|p| p.group.as_deref() == Some(first.as_str())) {
-            Some(first)
-        } else {
-            None
+/// The entry-default step of the inference-point precedence: the `default:
+/// true` profile's group, else the single shared group across all profiles,
+/// else `None` (bare `<base>`). `None` also when no instances are configured.
+/// Runs over the fleet-default-merged map, so entries declaring none inherit
+/// the fleet default through the same code path. Shared by the single
+/// precedence function below and `RoutingTarget` construction (whose entries
+/// arrive with fleet defaults materialized, hence `None` there) so backend
+/// model ids and dispatch wire ids agree; not a second path — the rule lives
+/// here once.
+pub(crate) fn default_inference_point(
+    entry: &ModelEntry,
+    defaults: Option<&HashMap<String, InstanceProfile>>,
+) -> Option<String> {
+    let profiles = entry.instance_profiles_with(defaults);
+    if profiles.is_empty() {
+        return None;
+    }
+    if let Some(d) = profiles.iter().find(|p| p.default) {
+        return d.group.clone();
+    }
+    let first = profiles[0].group.clone()?;
+    if profiles
+        .iter()
+        .all(|p| p.group.as_deref() == Some(first.as_str()))
+    {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+/// Resolve the inference point a role or model key serves, as the qualifier
+/// of the dispatch `base:qualifier` id (`None` = bare `<base>`). The single
+/// qualifier resolver — every construction path and adapter composes it, so
+/// the precedence is documented once, here:
+///
+/// 1. Explicit qualifier — embedded (`base:point`) or parametric — wins,
+///    except `latest`, which normalizes away and falls through.
+/// 2. A role's named instance point (`roles[name].instance`).
+/// 3. The entry default over the fleet-default-merged map (the `default: true`
+///    profile's group, else the single shared group — [`default_inference_point`]).
+/// 4. Bare key (`None`): no instances, or no rule matched.
+///
+/// A bare role name resolves its qualifier through step 2; the role's model
+/// key itself (head candidate, config order) is resolved by the caller via
+/// [`role_head_key`]. Unknown roles and keys fail closed (`None`); a role
+/// with no instance point on a model without a pool stays bare.
+#[allow(clippy::implicit_hasher)]
+pub fn resolve_inference_point(
+    models: &HashMap<String, ModelEntry>,
+    roles: &HashMap<String, RoleEntry>,
+    role_or_key: &str,
+    qualifier: Option<&str>,
+    default_instances: Option<&HashMap<String, InstanceProfile>>,
+) -> Option<String> {
+    let (base, embedded) = split_model_key(role_or_key);
+    if let Some(point) = embedded {
+        if point != "latest" {
+            return Some(point.to_string());
         }
     }
-
-    /// The dispatch qualifier for the router's *internal work group* (the
-    /// "pool"): the classifier, chart selector/adjudicator/reranker,
-    /// target-matching ladder, and rigor role backends spread across the
-    /// instance pool rather than pinning to the client-facing default instance.
-    /// This is a distinct intent from `default_dispatch_qualifier`, which
-    /// resolves the fork's *default instance* for client-facing bare-`<base>`
-    /// dispatch. Resolution order (D1), deterministic:
-    ///
-    /// 1. The group of the `default: false` profile with the largest `count`
-    ///    (the "work pool"; for the reference config this is `swarm`).
-    /// 2. Else the `default: true` profile's group.
-    /// 3. Else the single group shared by all profiles.
-    /// 4. Else `None` (bare `<base>`, upstream models unchanged).
-    pub fn pool_qualifier(&self) -> Option<String> {
-        let profiles = self.instance_profiles();
-        if profiles.is_empty() {
-            return None;
-        }
-        // 1. The non-default profile with the largest sibling count (ties
-        //    resolve to the first encountered in deterministic map order).
-        let mut best: Option<&InstanceProfile> = None;
-        let mut best_count: u32 = 0;
-        for p in profiles.iter().filter(|p| !p.default) {
-            let c = p.count.max(1);
-            if best.is_none() || c > best_count {
-                best = Some(p);
-                best_count = c;
-            }
-        }
-        if let Some(b) = best {
-            return b.group.clone();
-        }
-        // 2. The default profile's group.
-        if let Some(d) = profiles.iter().find(|p| p.default) {
-            return d.group.clone();
-        }
-        // 3. The single group shared by all profiles.
-        let first = profiles[0].group.clone()?;
-        if profiles.iter().all(|p| p.group.as_deref() == Some(first.as_str())) {
-            Some(first)
-        } else {
-            None
+    if let Some(point) = qualifier {
+        if point != "latest" {
+            return Some(point.to_string());
         }
     }
+    if let Some(role) = roles.get(base) {
+        if let Some(point) = role.instance.as_deref() {
+            return Some(point.to_string());
+        }
+    }
+    models
+        .get(base)
+        .and_then(|entry| default_inference_point(entry, default_instances))
+}
+
+/// Resolve a role or model key to its serving model key: a role name fans out
+/// to its head candidate (config order), everything else passes through
+/// unchanged. `None` for unknown roles, roles with no candidates, and (when
+/// `require_entry` is set) keys with no `models` entry. The companion to
+/// [`resolve_inference_point`]: the key identifies *what* serves, the point
+/// identifies *where* on it.
+#[allow(clippy::implicit_hasher)]
+pub fn role_head_key(
+    models: &HashMap<String, ModelEntry>,
+    roles: &HashMap<String, RoleEntry>,
+    role_or_key: &str,
+    require_entry: bool,
+) -> Option<String> {
+    let (base, _) = split_model_key(role_or_key);
+    if let Some(role) = roles.get(base) {
+        let head = role.models.first()?;
+        if require_entry {
+            let (head_base, _) = split_model_key(head);
+            models.get(head_base)?;
+        }
+        return Some(head.clone());
+    }
+    if require_entry {
+        models.get(base)?;
+    }
+    Some(role_or_key.to_string())
 }
 
 /// Declaration-only request-body keys the fork ignores: the instance grammar
@@ -688,7 +792,19 @@ impl ModelEntry {
     /// (profile wins), declaration-only keys stripped. `None` when no profile
     /// matches `qualifier` — callers fall back to the entry's bare params.
     pub fn instance_params_for(&self, qualifier: &str) -> Option<serde_json::Value> {
-        let profile = self.instance_profiles().into_iter().find(|p| {
+        self.instance_params_for_with(qualifier, None)
+    }
+
+    /// [`Self::instance_params_for`] over the fleet-default-merged profile
+    /// map, so a profile inherited from `default_params.instances` contributes
+    /// the same sampling knobs as a per-model one. `None` defaults are
+    /// byte-identical to [`Self::instance_params_for`].
+    pub fn instance_params_for_with(
+        &self,
+        qualifier: &str,
+        defaults: Option<&HashMap<String, InstanceProfile>>,
+    ) -> Option<serde_json::Value> {
+        let profile = self.instance_profiles_with(defaults).into_iter().find(|p| {
             p.name.as_deref() == Some(qualifier) || p.group.as_deref() == Some(qualifier)
         })?;
         let merged =
@@ -1278,6 +1394,12 @@ pub struct DefaultModelParams {
     /// a model's `num_ctx`/`ctx_size` is the sole bound).
     #[serde(default)]
     pub max_ctx: Option<u64>,
+    /// Fleet-wide instance-profile map. A model entry that declares its own
+    /// `instances` keeps them; one that declares none inherits this map
+    /// (whole-profile replace per map key, never field merge). `None` (the
+    /// default) leaves today's per-model declarations untouched.
+    #[serde(default)]
+    pub instances: Option<HashMap<String, InstanceProfile>>,
 }
 
 impl Default for DefaultModelParams {
@@ -1296,6 +1418,7 @@ impl Default for DefaultModelParams {
             filter_thinking: false,
             params: None,
             max_ctx: None,
+            instances: None,
         }
     }
 }

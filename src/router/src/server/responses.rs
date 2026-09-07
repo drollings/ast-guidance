@@ -21,6 +21,10 @@ pub struct ServerStats {
     pub rejections: AtomicU64,
     pub cache_hits: AtomicU64,
     pub cache_misses: AtomicU64,
+    /// Per-group most-recently-successful dispatch, backing `last`-sentinel
+    /// expansion. A small map beside the stats — not a subsystem — written by
+    /// the dispatch path on every success and read at match time.
+    pub recency: std::sync::Arc<crate::target_match::GroupRecency>,
 }
 
 impl ServerStats {
@@ -31,6 +35,7 @@ impl ServerStats {
             rejections: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
+            recency: std::sync::Arc::new(crate::target_match::GroupRecency::new()),
         }
     }
 }

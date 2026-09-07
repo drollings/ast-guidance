@@ -729,7 +729,169 @@ fn instance_profiles_cap_above_num_ctx_is_noop() {
     assert_eq!(profiles[0].num_ctx, 16384, "cap above num_ctx is a no-op");
 }
 
-// -- Pool vs default qualifier -------------------------------
+// -- Fleet-wide `default_params.instances` inheritance ---------------------
+
+/// Parse a fleet-default profile map (`default_params.instances` shape).
+fn fleet_defaults(
+    json: serde_json::Value,
+) -> std::collections::HashMap<String, InstanceProfile> {
+    serde_json::from_value(json).unwrap()
+}
+
+fn bare_entry() -> ModelEntry {
+    serde_json::from_value(serde_json::json!({
+        "endpoint": "http://x/v1/chat/completions",
+        "intelligence": 1,
+        "cost_input": 0.0, "cost_output": 0.0, "cost_cached_read": 0.0,
+        "speed": 1,
+    }))
+    .unwrap()
+}
+
+#[test]
+fn fleet_default_key_inherited_when_entry_declares_none() {
+    // An entry with no `instances` of its own serves the fleet defaults.
+    let entry = bare_entry();
+    assert!(entry.instance_profiles().is_empty());
+    let defaults = fleet_defaults(serde_json::json!({
+        "scratch": { "num_ctx": 4096 }
+    }));
+    let profiles = entry.instance_profiles_with(Some(&defaults));
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].name.as_deref(), Some("scratch"));
+    assert_eq!(profiles[0].group.as_deref(), Some("scratch"));
+    assert_eq!(profiles[0].num_ctx, 4096);
+}
+
+#[test]
+fn entry_profile_replaces_fleet_default_whole_on_key_collision() {
+    // Same map key in both tables: the entry's profile replaces the fleet
+    // one whole — no field-level merge fuses the two declarations.
+    let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+        "endpoint": "http://x/v1/chat/completions",
+        "intelligence": 1,
+        "cost_input": 0.0, "cost_output": 0.0, "cost_cached_read": 0.0,
+        "speed": 1,
+        "instances": { "scratch": { "num_ctx": 16384 } }
+    }))
+    .unwrap();
+    let defaults = fleet_defaults(serde_json::json!({
+        "scratch": { "num_ctx": 4096, "pinned": true, "default": true,
+                     "params": { "temperature": 0.9 } },
+        "ledger": { "num_ctx": 131072, "pinned": true, "default": true }
+    }));
+    let profiles = entry.instance_profiles_with(Some(&defaults));
+    assert_eq!(profiles.len(), 2);
+    // Sorted map-key order: ledger < scratch.
+    let ledger = &profiles[0];
+    assert_eq!(ledger.name.as_deref(), Some("ledger"));
+    assert_eq!(ledger.num_ctx, 131072);
+    let scratch = &profiles[1];
+    assert_eq!(scratch.name.as_deref(), Some("scratch"));
+    assert_eq!(scratch.num_ctx, 16384, "entry value wins");
+    assert!(!scratch.pinned, "fleet `pinned` does not leak through a replace");
+    assert!(
+        !scratch.default,
+        "fleet `default` does not leak through a replace"
+    );
+    assert!(
+        scratch.params.is_none(),
+        "fleet `params` do not leak through a replace"
+    );
+}
+
+#[test]
+fn both_tables_default_collision_first_wins() {
+    // Two `default: true` flags (one fleet, one per-model) must never fuse
+    // silently: exactly one profile answers the default lookup — the
+    // lexicographically-first key in deterministic map order.
+    let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+        "endpoint": "http://x/v1/chat/completions",
+        "intelligence": 1,
+        "cost_input": 0.0, "cost_output": 0.0, "cost_cached_read": 0.0,
+        "speed": 1,
+        "instances": { "beta": { "num_ctx": 8192, "default": true } }
+    }))
+    .unwrap();
+    let defaults = fleet_defaults(serde_json::json!({
+        "alpha": { "num_ctx": 4096, "default": true }
+    }));
+    let profiles = entry.instance_profiles_with(Some(&defaults));
+    let defaulted: Vec<&str> = profiles
+        .iter()
+        .filter(|p| p.default)
+        .filter_map(|p| p.name.as_deref())
+        .collect();
+    assert_eq!(defaulted.len(), 2, "both flags survive the merge");
+    let winner = profiles
+        .iter()
+        .find(|p| p.default)
+        .and_then(|p| p.name.clone())
+        .expect("a default exists");
+    assert_eq!(winner.as_str(), "alpha", "first in map order wins");
+}
+
+#[test]
+fn inherited_profile_expands_count_and_clamps_max_ctx() {
+    // `count` sibling expansion and the `max_ctx` clamp run on the merged
+    // map through the same code path — never a fork.
+    let entry = bare_entry();
+    let defaults = fleet_defaults(serde_json::json!({
+        "worker": { "num_ctx": 65536, "max_ctx": 16384, "count": 3 }
+    }));
+    let profiles = entry.instance_profiles_with(Some(&defaults));
+    assert_eq!(profiles.len(), 3);
+    for (i, profile) in profiles.iter().enumerate() {
+        assert_eq!(
+            profile.name.as_deref(),
+            Some(format!("worker-{i}").as_str())
+        );
+        assert_eq!(profile.group.as_deref(), Some("worker"));
+        assert_eq!(profile.num_ctx, 16384, "inherited clamp applies");
+    }
+}
+
+#[test]
+fn migrated_live_config_expands_effective_profiles() {
+    // The hoisted fleet default reproduces the removed per-model block: the
+    // `code` entry (no own `instances`) materializes exactly its old `default`
+    // profile, and the `lfm2.5-2.6b` override survives whole (distinct cap).
+    // (Covers the earlier expansion test it replaces alongside the
+    // role golden.)
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../env/coral-router.json");
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let cfg: RouterConfig = serde_json::from_str(&raw)
+        .unwrap_or_else(|e| panic!("live config must deserialize: {e}"));
+    let defaults = cfg.default_params.instances.as_ref().expect("hoisted");
+    let code = &cfg.models["code"];
+    let profiles = code.instance_profiles_with(Some(defaults));
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].name.as_deref(), Some("default"));
+    assert_eq!(profiles[0].num_ctx, 8192);
+    assert_eq!(profiles[0].max_ctx, Some(262144));
+    assert!(profiles[0].default);
+    assert_eq!(
+        profiles[0]
+            .params
+            .as_ref()
+            .and_then(|p| p.get("temperature")),
+        Some(&serde_json::json!(0.6)),
+        "hoisted sampling knobs reach the dispatched profile"
+    );
+    // The override keeps its declared shape byte-identically.
+    let lfm = &cfg.models["lfm2.5-2.6b"].instances.as_ref().expect("override")["default"];
+    assert_eq!(lfm.max_ctx, Some(128000));
+    assert!(!lfm.default);
+    assert!(lfm.params.is_none());
+}
+
+// -- Single inference-point resolver -------------------------------
+// (Covers the removed `pool_qualifier` / `default_dispatch_qualifier` pair:
+// the work-pool intent now rides a role's instance point, the entry default
+// is one step of the single precedence. The shipped-config equivalence is
+// pinned by the role golden.)
 
 /// The reference swarm entry: a count=3 non-default `swarm` work pool, a
 /// pinned `default: true` ledger, and a non-default scratch profile.
@@ -749,31 +911,57 @@ fn reference_swarm_entry() -> ModelEntry {
     .expect("reference swarm entry parses")
 }
 
+fn reference_swarm_models() -> std::collections::HashMap<String, ModelEntry> {
+    std::collections::HashMap::from([("swarm".to_string(), reference_swarm_entry())])
+}
+
+fn work_role() -> std::collections::HashMap<String, crate::config::RoleEntry> {
+    serde_json::from_value(serde_json::json!({
+        "work": {"models": ["swarm"], "instance": "swarm"}
+    }))
+    .expect("work role parses")
+}
+
+fn no_roles() -> std::collections::HashMap<String, crate::config::RoleEntry> {
+    std::collections::HashMap::new()
+}
+
 #[test]
-fn pool_qualifier_reference_config_targets_swarm() {
-    let entry = reference_swarm_entry();
+fn inference_point_bare_key_answers_entry_default() {
+    // One resolver, one answer for a bare key: the entry default (the
+    // `default: true` profile's group, else the single shared group, else
+    // bare). The old work-pool guess is gone — that intent rides a role now.
+    let models = reference_swarm_models();
     assert_eq!(
-        entry.pool_qualifier().as_deref(),
+        resolve_inference_point(&models, &no_roles(), "swarm", None, None).as_deref(),
+        Some("ledger"),
+        "bare key serves the default instance"
+    );
+}
+
+#[test]
+fn inference_point_role_carries_work_pool_intent() {
+    // The removed pool rule's answer (the count=3 work pool) is reachable by
+    // naming it as a role's instance point — explicit routing vocabulary
+    // instead of a largest-count guess.
+    let models = reference_swarm_models();
+    assert_eq!(
+        resolve_inference_point(&models, &work_role(), "work", None, None).as_deref(),
         Some("swarm"),
-        "the largest non-default profile (count=3) is the work pool"
+        "role instance point serves the work pool"
     );
-}
-
-#[test]
-fn pool_qualifier_vs_default_qualifier_two_intents_two_answers() {
-    // The two intents must diverge on the same entry: pool = swarm (the
-    // work group), default = ledger (the client-facing default instance).
-    let entry = reference_swarm_entry();
-    assert_eq!(entry.pool_qualifier().as_deref(), Some("swarm"));
     assert_eq!(
-        entry.default_dispatch_qualifier().as_deref(),
-        Some("ledger")
+        resolve_inference_point(&models, &work_role(), "swarm", None, None).as_deref(),
+        Some("ledger"),
+        "the same entry's bare key still serves its default"
     );
 }
 
 #[test]
-fn pool_qualifier_ledger_only_defaults_to_ledger() {
-    let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+fn inference_point_entry_default_shapes() {
+    // The entry-default step across profile shapes (the kept rule, now one
+    // step of the single precedence).
+    let ledger_only: ModelEntry = serde_json::from_value(serde_json::json!({
         "endpoint": "http://x/v1/chat/completions",
         "intelligence": 1,
         "cost_input": 0.0, "cost_output": 0.0, "cost_cached_read": 0.0,
@@ -781,12 +969,14 @@ fn pool_qualifier_ledger_only_defaults_to_ledger() {
         "instances": { "ledger": { "num_ctx": 131072, "default": true } }
     }))
     .unwrap();
-    assert_eq!(entry.pool_qualifier().as_deref(), Some("ledger"));
-}
+    let models =
+        std::collections::HashMap::from([("m".to_string(), ledger_only)]);
+    assert_eq!(
+        resolve_inference_point(&models, &no_roles(), "m", None, None).as_deref(),
+        Some("ledger")
+    );
 
-#[test]
-fn pool_qualifier_single_shared_group() {
-    let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+    let shared: ModelEntry = serde_json::from_value(serde_json::json!({
         "endpoint": "http://x/v1/chat/completions",
         "intelligence": 1,
         "cost_input": 0.0, "cost_output": 0.0, "cost_cached_read": 0.0,
@@ -797,19 +987,25 @@ fn pool_qualifier_single_shared_group() {
         }
     }))
     .unwrap();
-    assert_eq!(entry.pool_qualifier().as_deref(), Some("shared"));
-}
+    let models = std::collections::HashMap::from([("m".to_string(), shared)]);
+    assert_eq!(
+        resolve_inference_point(&models, &no_roles(), "m", None, None).as_deref(),
+        Some("shared")
+    );
 
-#[test]
-fn pool_qualifier_no_instances_is_none() {
-    let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+    let bare: ModelEntry = serde_json::from_value(serde_json::json!({
         "endpoint": "http://x/v1/chat/completions",
         "intelligence": 1,
         "cost_input": 0.0, "cost_output": 0.0, "cost_cached_read": 0.0,
         "speed": 1,
     }))
     .unwrap();
-    assert!(entry.pool_qualifier().is_none());
+    let models = std::collections::HashMap::from([("m".to_string(), bare)]);
+    assert_eq!(
+        resolve_inference_point(&models, &no_roles(), "m", None, None),
+        None,
+        "no instances stays bare"
+    );
 }
 
 #[test]
@@ -1368,6 +1564,224 @@ fn flat_config_rejected_without_tree() {
     assert!(err.contains("classification.tree"), "got: {err}");
 }
 
+#[test]
+fn legacy_config_without_routing_additions_loads_inert() {
+    // Old deployments predate the routing vocabulary: absent `roles` is an
+    // empty table, absent `default_params.instances` is `None`, and every
+    // declared profile defaults to the one-shot kind — so they load
+    // byte-identically under the new schema.
+    let cfg: RouterConfig = serde_json::from_value(serde_json::json!({
+        "models": {
+            "code": {
+                "endpoint": "http://x/v1/chat/completions",
+                "intelligence": 4,
+                "cost_input": 1e-6, "cost_output": 1e-6, "cost_cached_read": 1e-7,
+                "speed": 4,
+                "instances": {"default": {"num_ctx": 8192}}
+            }
+        }
+    }))
+    .expect("legacy config parses");
+    assert!(cfg.roles.is_empty(), "absent roles → empty table");
+    assert!(
+        cfg.default_params.instances.is_none(),
+        "absent default instances → None"
+    );
+    for entry in cfg.models.values() {
+        for profile in entry.instance_profiles() {
+            assert!(
+                !profile.session,
+                "absent session flag → one-shot (no multi-step state)"
+            );
+        }
+    }
+}
+
+#[test]
+fn migrated_live_config_declares_role_vocabulary() {
+    // The shipped config carries the role-first vocabulary: the five roles,
+    // the hoisted fleet-default profile, and role-referencing groups.
+    // (Covers the R0 absence test it replaces alongside the role golden.)
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../env/coral-router.json");
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let cfg: RouterConfig = serde_json::from_str(&raw)
+        .unwrap_or_else(|e| panic!("live config must deserialize: {e}"));
+    for role in ["default", "classifier", "code", "reasoning", "ledger"] {
+        let entry = cfg.roles.get(role).unwrap_or_else(|| panic!("role '{role}' declared"));
+        assert_eq!(
+            entry.models,
+            vec!["code:default"],
+            "role '{role}' serves today's fleet target"
+        );
+    }
+    let hoisted = cfg
+        .default_params
+        .instances
+        .as_ref()
+        .expect("fleet defaults hoisted")
+        .get("default")
+        .expect("hoisted default profile");
+    assert_eq!(hoisted.num_ctx, 8192);
+    assert!(hoisted.default, "hoisted profile is the default point");
+    assert!(
+        cfg.models["code"].instances.is_none(),
+        "code rides the fleet default (repeat removed)"
+    );
+    assert!(
+        cfg.models["lfm2.5-2.6b"].instances.is_some(),
+        "lfm keeps its per-model override (distinct context cap)"
+    );
+    // Every shipped group resolves through roles + sentinels only.
+    for (group, members) in &cfg.model_groups {
+        let models = members.models();
+        assert!(
+            models.iter().any(|m| cfg.roles.contains_key(m)),
+            "group '{group}' references a role"
+        );
+        for m in models {
+            assert!(
+                cfg.roles.contains_key(m) || m == "last" || m == "any",
+                "group '{group}' member '{m}' is a role or a sentinel"
+            );
+        }
+    }
+}
+
+#[test]
+fn routing_additions_round_trip_byte_identically() {
+    // A fixture carrying all three additions survives a serde round trip
+    // with every value intact.
+    let cfg: RouterConfig = serde_json::from_value(serde_json::json!({
+        "roles": {
+            "code": {"models": ["code:default"], "instance": "default"},
+            "default": {"models": ["code:default"]}
+        },
+        "default_params": {
+            "instances": {
+                "default": {"num_ctx": 8192, "pinned": false, "default": true}
+            }
+        },
+        "models": {
+            "code": {
+                "endpoint": "http://x/v1/chat/completions",
+                "intelligence": 4,
+                "cost_input": 1e-6, "cost_output": 1e-6, "cost_cached_read": 1e-7,
+                "speed": 4,
+                "instances": {
+                    "scratch": {"num_ctx": 4096, "session": true}
+                }
+            }
+        },
+        "model_groups": {"code": ["code:default", "last", "any"]},
+        "default_route": "local"
+    }))
+    .expect("fixture with routing additions");
+    assert_eq!(cfg.roles.len(), 2);
+    assert_eq!(cfg.roles["code"].models, vec!["code:default"]);
+    assert_eq!(cfg.roles["code"].instance.as_deref(), Some("default"));
+    assert!(cfg.roles["default"].instance.is_none());
+    let defaults = cfg.default_params.instances.as_ref().expect("default instances");
+    assert!(defaults.contains_key("default"));
+    let scratch = &cfg.models["code"].instances.as_ref().expect("instances")["scratch"];
+    assert!(scratch.session, "session:true survives the round trip");
+
+    let back: RouterConfig =
+        serde_json::from_str(&serde_json::to_string(&cfg).expect("serialize"))
+            .expect("round trip");
+    assert_eq!(back.roles.len(), 2);
+    assert_eq!(back.roles["code"].models, cfg.roles["code"].models);
+    assert_eq!(back.roles["code"].instance, cfg.roles["code"].instance);
+    assert!(back.default_params.instances.is_some());
+    assert!(back.models["code"].instances.as_ref().unwrap()["scratch"].session);
+}
+
+#[test]
+fn instance_profile_session_defaults_to_one_shot() {
+    let profile: InstanceProfile =
+        serde_json::from_value(serde_json::json!({"num_ctx": 8192}))
+            .expect("minimal profile");
+    assert!(!profile.session, "absent session → one-shot");
+    let explicit: InstanceProfile =
+        serde_json::from_value(serde_json::json!({"num_ctx": 8192, "session": true}))
+            .expect("session profile");
+    assert!(explicit.session);
+}
+
+#[test]
+fn one_shot_profile_forces_resume_false_at_materialization() {
+    // A one-shot profile (`session` absent/false) carrying `resume: true`
+    // materializes with `resume: false` — fail-open, never an error.
+    let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+        "endpoint": "http://x/v1/chat/completions",
+        "intelligence": 1,
+        "cost_input": 0.0, "cost_output": 0.0, "cost_cached_read": 0.0,
+        "speed": 1,
+        "instances": { "scratch": { "num_ctx": 8192, "resume": true } }
+    }))
+    .unwrap();
+    let profiles = entry.instance_profiles();
+    assert_eq!(profiles.len(), 1);
+    assert!(!profiles[0].session, "absent session → one-shot");
+    assert!(
+        !profiles[0].resume,
+        "one-shot + resume:true materializes as resume:false"
+    );
+}
+
+#[test]
+fn session_profile_keeps_resume_semantics() {
+    // `session: true` keeps today's `resume` semantics byte-identically.
+    let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+        "endpoint": "http://x/v1/chat/completions",
+        "intelligence": 1,
+        "cost_input": 0.0, "cost_output": 0.0, "cost_cached_read": 0.0,
+        "speed": 1,
+        "instances": {
+            "agent": { "num_ctx": 8192, "session": true, "resume": true },
+            "plain": { "num_ctx": 8192, "session": true }
+        }
+    }))
+    .unwrap();
+    let profiles = entry.instance_profiles();
+    assert_eq!(profiles.len(), 2);
+    let agent = profiles
+        .iter()
+        .find(|p| p.name.as_deref() == Some("agent"))
+        .expect("agent profile");
+    assert!(agent.session);
+    assert!(agent.resume, "session:true + resume:true unchanged");
+    let plain = profiles
+        .iter()
+        .find(|p| p.name.as_deref() == Some("plain"))
+        .expect("plain profile");
+    assert!(plain.session);
+    assert!(!plain.resume, "session:true without resume stays false");
+}
+
+#[test]
+fn live_config_materializes_all_one_shot_without_resume() {
+    // The shipped config declares no `session` flags: every materialized
+    // profile is one-shot with `resume: false` (matching current use — no
+    // snapshots flow today).
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../env/coral-router.json");
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let cfg: RouterConfig = serde_json::from_str(&raw)
+        .unwrap_or_else(|e| panic!("live config must deserialize: {e}"));
+    let mut count = 0;
+    for entry in cfg.models.values() {
+        for profile in entry.instance_profiles_with(cfg.default_params.instances.as_ref()) {
+            count += 1;
+            assert!(!profile.session, "live config has no session profiles");
+            assert!(!profile.resume, "one-shot materializes resume:false");
+        }
+    }
+    assert!(count > 0, "live config declares instance profiles");
+}
+
 fn tree_only_snapshot() -> Vec<(&'static str, &'static str)> {
     vec![
         ("code", "code"),
@@ -1377,4 +1791,131 @@ fn tree_only_snapshot() -> Vec<(&'static str, &'static str)> {
         ("prose", "prose"),
         ("summarize", "summarize"),
     ]
+}
+
+fn inference_point_fixture() -> (
+    std::collections::HashMap<String, ModelEntry>,
+    std::collections::HashMap<String, crate::config::RoleEntry>,
+) {
+    let models: std::collections::HashMap<String, ModelEntry> =
+        serde_json::from_value(serde_json::json!({
+            "swarm": {
+                "endpoint": "http://x/v1/chat/completions",
+                "name": "workhorse",
+                "intelligence": 2,
+                "cost_input": 1.0, "cost_output": 6.0, "cost_cached_read": 0.4,
+                "speed": 8,
+                "instances": {
+                    "swarm": { "count": 3, "group": "swarm", "num_ctx": 16384 },
+                    "ledger": { "num_ctx": 131072, "pinned": true, "default": true }
+                }
+            },
+            "plain": {
+                "endpoint": "http://y/v1/chat/completions",
+                "name": "plain",
+                "intelligence": 1,
+                "cost_input": 1.0, "cost_output": 1.0, "cost_cached_read": 0.0,
+                "speed": 1
+            }
+        }))
+        .expect("models parse");
+    let roles: std::collections::HashMap<String, crate::config::RoleEntry> =
+        serde_json::from_value(serde_json::json!({
+            "work": {"models": ["swarm:default"], "instance": "swarm"},
+            "bare-role": {"models": ["plain"]}
+        }))
+        .expect("roles parse");
+    (models, roles)
+}
+
+#[test]
+fn inference_point_explicit_qualifier_wins() {
+    // An explicit qualifier (embedded or parametric) beats every default —
+    // and `latest` normalizes away so the remaining precedence applies.
+    let (models, roles) = inference_point_fixture();
+    assert_eq!(
+        resolve_inference_point(&models, &roles, "swarm:scratch", None, None).as_deref(),
+        Some("scratch"),
+        "embedded qualifier pins the point"
+    );
+    assert_eq!(
+        resolve_inference_point(&models, &roles, "swarm", Some("scratch"), None).as_deref(),
+        Some("scratch"),
+        "parametric qualifier pins the point"
+    );
+    assert_eq!(
+        resolve_inference_point(&models, &roles, "swarm:latest", None, None).as_deref(),
+        Some("ledger"),
+        "latest falls through to the entry default"
+    );
+    assert_eq!(
+        resolve_inference_point(&models, &roles, "work", Some("scratch"), None).as_deref(),
+        Some("scratch"),
+        "explicit beats the role's instance point"
+    );
+}
+
+#[test]
+fn inference_point_role_instance_then_entry_default_then_bare() {
+    let (models, roles) = inference_point_fixture();
+    assert_eq!(
+        resolve_inference_point(&models, &roles, "work", None, None).as_deref(),
+        Some("swarm"),
+        "role's instance point serves the role"
+    );
+    assert_eq!(
+        resolve_inference_point(&models, &roles, "bare-role", None, None).as_deref(),
+        None,
+        "role without an instance point and a model without a pool stays bare"
+    );
+    assert_eq!(
+        resolve_inference_point(&models, &roles, "swarm", None, None).as_deref(),
+        Some("ledger"),
+        "bare model key falls to the entry default"
+    );
+    assert_eq!(
+        resolve_inference_point(&models, &roles, "plain", None, None).as_deref(),
+        None,
+        "model without instances stays bare"
+    );
+    assert_eq!(
+        resolve_inference_point(&models, &roles, "nope", None, None),
+        None,
+        "unknown keys fail closed"
+    );
+    assert_eq!(
+        resolve_inference_point(&models, &roles, "empty-role", None, None),
+        None,
+        "unknown roles fail closed"
+    );
+}
+
+#[test]
+fn inference_point_inherits_fleet_default_map() {
+    // An entry declaring no `instances` inherits the fleet-default map
+    // through the same code path (the R1 fallback): its bare key serves the
+    // hoisted default point, and unknown fleet maps stay bare.
+    let bare: ModelEntry = serde_json::from_value(serde_json::json!({
+        "endpoint": "http://x/v1/chat/completions",
+        "intelligence": 1,
+        "cost_input": 0.0, "cost_output": 0.0, "cost_cached_read": 0.0,
+        "speed": 1,
+    }))
+    .unwrap();
+    let models = std::collections::HashMap::from([("m".to_string(), bare)]);
+    let defaults: std::collections::HashMap<String, InstanceProfile> =
+        serde_json::from_value(serde_json::json!({
+            "default": {"num_ctx": 8192, "default": true}
+        }))
+        .unwrap();
+    assert_eq!(
+        resolve_inference_point(&models, &no_roles(), "m", None, Some(&defaults)).as_deref(),
+        Some("default"),
+        "fleet default supplies the point"
+    );
+    assert_eq!(
+        resolve_inference_point(&models, &no_roles(), "m", None, None),
+        None,
+        "without fleet defaults the bare key stays bare"
+    );
 }

@@ -1,0 +1,9 @@
+{
+  "_doc": "Sentinel fallback + late-binding calibration report. Recomputed from routing_sentinel_corpus.json on every test run; the test fails unless the recomputed values equal these AND the 1.0 targets. precision = fallback steps with a genuine recorded cause (rung miss / non-terminal error, last-miss skip, unloaded-member deprioritization, assess-err escalation, endpoint-rewrite, load-after-miss) / all fallback steps. recall = genuine availability gaps absorbed by the walk (fallback or clean exhaustion) / all genuine gaps. control_pass_rate = controls with zero fallback steps and exact expected sequences / all controls. No caching, persistence, or traffic-shaping follows from this report \u2014 measurement only.",
+  "control_cases": 10,
+  "control_pass_rate": 1.0,
+  "fallback_cases": 17,
+  "precision": 1.0,
+  "recall": 1.0,
+  "total_cases": 27
+}

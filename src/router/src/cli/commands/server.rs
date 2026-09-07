@@ -522,7 +522,8 @@ pub async fn speedtest(
 }
 
 /// Resolve the speedtest model: the arg if given, else the default route's
-/// first model, else the first configured model key.
+/// first model, else the first configured model key. Role members fan out to
+/// their head candidate so a role-first group still yields a concrete model.
 fn resolve_speedtest_model(config: Option<&RouterConfig>, arg: &str) -> String {
     if !arg.is_empty() {
         return arg.to_string();
@@ -531,6 +532,11 @@ fn resolve_speedtest_model(config: Option<&RouterConfig>, arg: &str) -> String {
         if let Some(route) = cfg.routes_view().get(&cfg.default_route) {
             if let Some(group) = cfg.model_groups.get(&route.group) {
                 if let Some(first) = group.models().first() {
+                    if let Some(role) = cfg.roles.get(first) {
+                        if let Some(head) = role.models.first() {
+                            return head.clone();
+                        }
+                    }
                     return first.clone();
                 }
             }

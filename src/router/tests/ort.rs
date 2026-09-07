@@ -615,8 +615,8 @@ fn local_backend_for_instance_onnx_branch_routes_to_resolver() {
     assert_eq!(default_backend.unwrap().chat_complete(&[]).unwrap(), "onnx-default");
 }
 
-/// ROADMAP M6: `onnx_pool_context` mirrors the llama `pool_qualifier` rule
-/// for an onnx role's `instances` block (largest non-default group wins).
+/// `onnx_pool_context` picks an onnx role's work context (largest
+/// non-default group wins) from the role's `instances` block.
 #[test]
 fn onnx_pool_context_uses_largest_non_default_group() {
 

@@ -138,6 +138,31 @@ fn routing_fields_merge_into_existing_params() {
     assert!(obj.get("snapshot").is_none());
 }
 
+#[test]
+fn snapshot_fields_ignored_for_one_shot_contexts() {
+    // `snapshot`/`id_slot` targeting a one-shot context are dropped with a
+    // debug log (inapplicable fields, never errors); the instance itself
+    // still reaches the body.
+    let (instance, snapshot, id_slot) =
+        filter_routing_fields_for_session(Some("scratch"), Some("snap"), Some(2), false);
+    assert_eq!(instance.as_deref(), Some("scratch"));
+    assert!(snapshot.is_none(), "one-shot drops snapshot");
+    assert!(id_slot.is_none(), "one-shot drops id_slot");
+
+    let (instance, snapshot, id_slot) =
+        filter_routing_fields_for_session(Some("agent"), Some("snap"), Some(2), true);
+    assert_eq!(instance.as_deref(), Some("agent"));
+    assert_eq!(snapshot.as_deref(), Some("snap"), "session keeps snapshot");
+    assert_eq!(id_slot, Some(2), "session keeps id_slot");
+
+    // No instance targeted: fields pass through untouched (group dispatch
+    // resolves the concrete context server-side).
+    let (_, snapshot, id_slot) =
+        filter_routing_fields_for_session(None, Some("snap"), Some(2), false);
+    assert_eq!(snapshot.as_deref(), Some("snap"));
+    assert_eq!(id_slot, Some(2));
+}
+
 // -----------------------------------------------------------------------
 // RetryBackend tests
 // -----------------------------------------------------------------------

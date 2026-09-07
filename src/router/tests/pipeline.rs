@@ -74,53 +74,11 @@ fn entry_with_instances(instances: serde_json::Value) -> ModelEntry {
     .expect("valid ModelEntry")
 }
 
-#[test]
-fn from_model_entry_qualifies_single_shared_group() {
-    // swarm: count 3, all in group "swarm", no explicit default -> group.
-    let entry = entry_with_instances(serde_json::json!({
-        "swarm": { "count": 3, "group": "swarm", "num_ctx": 16384, "warm": true }
-    }));
-    let rt = RoutingTarget::from_model_entry("swarm", &entry);
-    assert_eq!(
-        rt.model,
-        "abiray/lfm2.5-2.6b-heretic-abliterated:swarm"
-    );
-}
-
-#[test]
-fn from_model_entry_qualifies_default_profile() {
-    // ledger: pinned + default -> its group ("ledger").
-    let entry = entry_with_instances(serde_json::json!({
-        "ledger": { "num_ctx": 131072, "pinned": true, "default": true }
-    }));
-    let rt = RoutingTarget::from_model_entry("ledger", &entry);
-    assert_eq!(
-        rt.model,
-        "abiray/lfm2.5-2.6b-heretic-abliterated:ledger"
-    );
-}
-
-#[test]
-fn from_model_entry_no_instances_leaves_bare_base() {
-    let rt = RoutingTarget::from_model_entry("lfm", &test_entry());
-    assert_eq!(rt.model, "unsloth/lfm2.5-1.2b-instruct");
-}
-
-#[test]
-fn from_model_entry_instance_targets_named_point() {
-    let entry = entry_with_instances(serde_json::json!({
-        "ledger": { "num_ctx": 131072, "pinned": true, "default": true },
-        "scratch": { "num_ctx": 131072, "sleep_idle_seconds": 30 }
-    }));
-    let rt = RoutingTarget::from_model_entry_instance("swarm", &entry, "scratch");
-    assert_eq!(
-        rt.model,
-        "abiray/lfm2.5-2.6b-heretic-abliterated:scratch"
-    );
-    assert_eq!(rt.instance.as_deref(), Some("scratch"));
-    assert_eq!(rt.snapshot, None);
-    assert_eq!(rt.id_slot, None);
-}
+// NOTE (pruned): single-shared-group, default-profile, bare-base, and
+// named-point wire shapes were pinned here and are now covered once per tier
+// by the role golden (`target_for_key.lfm2.5-2.6b` / `.code` / `.code:missing`
+// cases), the single-resolver precedence tests (`inference_point_*`), and the
+// named-instance backend test — one assertion per tier, no duplicates.
 
 #[test]
 fn from_model_entry_merges_instance_profile_params() {

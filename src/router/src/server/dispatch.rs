@@ -286,11 +286,35 @@ async fn dispatch_to_single_target(
 ) -> Result<DispatchOutcome, DispatchError> {
     let backend = make_backend(deps, target);
 
+    // One-shot contexts hold no multi-step state: snapshot-scoped fields
+    // targeting them are inapplicable and dropped (debug log, never an
+    // error). Session-ness is read from the owning manager's configured
+    // profiles; an unknown manager or instance is one-shot only when an
+    // explicit instance is targeted (group dispatch leaves the fields for
+    // the server-side resolution).
+    let (instance, snapshot, id_slot) = match (&target.instance, &deps.instance_pool) {
+        (Some(name), Some(pool)) => {
+            let is_session = pool
+                .manager_for_url(&target.url)
+                .is_some_and(|m| m.session_for(name));
+            crate::dispatch::backend::filter_routing_fields_for_session(
+                Some(name),
+                target.snapshot.as_deref(),
+                target.id_slot,
+                is_session,
+            )
+        }
+        _ => (
+            target.instance.clone(),
+            target.snapshot.clone(),
+            target.id_slot,
+        ),
+    };
     let params = crate::dispatch::backend::params_with_routing_fields(
         target.params.clone(),
-        target.instance.as_deref(),
-        target.snapshot.as_deref(),
-        target.id_slot,
+        instance.as_deref(),
+        snapshot.as_deref(),
+        id_slot,
     );
 
     if stream {
@@ -514,6 +538,13 @@ pub async fn dispatch_real(
                 .await
                 {
                     Ok(outcome) => {
+                        // Recency for `last`-sentinel expansion: the serving
+                        // target's wire id, recorded behind the existing audit
+                        // path. Ordering only — the intelligence climb above
+                        // still decides capability fit.
+                        if let Some(group) = rt.group.as_deref() {
+                            deps.stats.recency.record(group, &target.model);
+                        }
                         crate::audit::AuditRecord::route(
                             crate::pipeline_types::PipelineStage::Classifier,
                             crate::pipeline_types::StageVerdict::Passed,

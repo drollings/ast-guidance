@@ -6,7 +6,7 @@ use common_core::hash::uuid_v4;
 use fluent_llm::cache::ResponseCache;
 use http_body_util::BodyExt;
 
-use crate::config::{ModelEntry, RouteRef};
+use crate::config::{ModelEntry, RoleEntry, RouteRef};
 use crate::dag_session::{DependencySession, SessionRegistry, SessionStep, StepResult};
 use crate::dispatch::escalation::{EscalationContext, Ladder};
 use crate::ledger::ContentNodeLedger;
@@ -86,6 +86,15 @@ pub struct ServerDeps {
     /// (the default) leaves the overlay plane idle — no entity-link candidates
     /// are produced.
     pub entity_link_worker: Option<Arc<crate::server::entity_link::EntityLinkWorker>>,
+    /// Routing-vocabulary table (mirrors `RouterConfig.roles`): role name →
+    /// candidate model keys + the inference point each candidate serves. Used
+    /// for the single inference-point precedence and role expansion on paths
+    /// that only carry the `models` map otherwise.
+    pub roles: Arc<HashMap<String, RoleEntry>>,
+    /// Fleet-default instance map (mirrors
+    /// `RouterConfig.default_params.instances`): entries declaring no
+    /// `instances` of their own inherit it through the same code path.
+    pub default_instances: Option<HashMap<String, crate::config::InstanceProfile>>,
 }
 
 impl ServerDeps {
@@ -394,11 +403,14 @@ fn begin_session_step(
 /// request is rejected. Before the pipeline runs, ensure the classifier's
 /// managed model is loaded and its work-pool group exists — created on demand
 /// exactly as the dispatch path would. Everything is derived from config
-/// (`RouterConfig.classifier_model` → the model entry's `pool_qualifier`);
+/// (`RouterConfig.classifier_model` → the single inference-point precedence);
 /// nothing is hardcoded. Best-effort: a load/allocate failure degrades to the
 /// classifier's own error path below.
 async fn ensure_classifier_ready(
     classifier: Option<&(String, ModelEntry)>,
+    models: &HashMap<String, ModelEntry>,
+    roles: &HashMap<String, RoleEntry>,
+    default_instances: Option<&HashMap<String, crate::config::InstanceProfile>>,
     instance_pool: Option<&Arc<crate::instances::InstancePool>>,
 ) {
     let (Some((key, entry)), Some(pool)) = (classifier, instance_pool) else {
@@ -410,7 +422,13 @@ async fn ensure_classifier_ready(
     if !entry.is_managed() {
         return;
     }
-    let Some(group) = entry.pool_qualifier() else {
+    let Some(group) = crate::config::resolve_inference_point(
+        models,
+        roles,
+        key,
+        None,
+        default_instances,
+    ) else {
         return;
     };
     let Some(manager) = pool.manager_for_url(&entry.endpoint) else {
@@ -450,7 +468,7 @@ async fn handle_chat_completion(
         context_cache,
         instance_pool,
         api_key_env_name: _,
-        supervisor: _,
+        supervisor,
         coordinator,
         review_worker: _,
         review_fetch: _,
@@ -458,6 +476,8 @@ async fn handle_chat_completion(
         onnx: _,
         fleet: _,
         onnx_llm_backend,
+        roles,
+        default_instances,
     } = deps;
     // The dispatch post-processing hook (workflow extraction), if the
     // operator configured it. Passed through to successful dispatches only.
@@ -628,10 +648,25 @@ async fn handle_chat_completion(
     // On-demand residency for the classifier: ensure its managed model is
     // loaded and its work-pool group is resident before the pipeline's
     // (sync, sidecar-less) classifier LLM call would 400 on a missing group.
-    ensure_classifier_ready(classifier.as_ref(), instance_pool.as_ref()).await;
+    ensure_classifier_ready(
+        classifier.as_ref(),
+        &models,
+        &roles,
+        default_instances.as_ref(),
+        instance_pool.as_ref(),
+    )
+    .await;
 
-    let pipeline_result =
-        resolve_pipeline(&model_name, &routes, &models, &pipelines, &router_request);
+    let pipeline_result = resolve_pipeline(
+        &model_name,
+        &routes,
+        &models,
+        default_instances.as_ref(),
+        &pipelines,
+        &router_request,
+        &stats,
+        supervisor.as_ref(),
+    );
 
     // Milestone 6: when the pipeline ran the NLP parse stage, persist the
     // per-sentence routing signals as a ledger parse node (best-effort).
@@ -1323,10 +1358,39 @@ fn resolve_pipeline(
     model_name: &str,
     routes: &std::collections::HashMap<String, RouteRef>,
     models: &std::collections::HashMap<String, ModelEntry>,
+    default_instances: Option<&std::collections::HashMap<String, crate::config::InstanceProfile>>,
     pipelines: &std::collections::HashMap<String, Arc<PipelineOrchestrator>>,
     router_request: &RouterRequest,
+    stats: &Arc<ServerStats>,
+    supervisor: Option<&Arc<crate::supervisor::LlamaServerSupervisor>>,
 ) -> crate::pipeline::PipelineResult {
     use fluent_wvr::prelude::*;
+
+    // Direct-model requests resolve against the effective entry: an entry
+    // declaring no `instances` inherits the fleet-default map (the same
+    // fallback the routing view materializes), so direct wire ids agree with
+    // route-resolved ones. Materialized into the caller-held slot on this
+    // cold path only, never the pipeline.
+    fn effective_entry<'a>(
+        models: &'a std::collections::HashMap<String, ModelEntry>,
+        default_instances: Option<&std::collections::HashMap<String, crate::config::InstanceProfile>>,
+        key: &str,
+        slot: &'a mut Option<ModelEntry>,
+    ) -> Option<&'a ModelEntry> {
+        let entry = models.get(key)?;
+        if entry.instances.is_none() {
+            if let Some(defaults) = default_instances {
+                *slot = Some(ModelEntry {
+                    instances: Some(defaults.clone()),
+                    ..entry.clone()
+                });
+                return slot.as_ref();
+            }
+        }
+        Some(entry)
+    }
+    let mut qualified_slot: Option<ModelEntry> = None;
+    let mut bare_slot: Option<ModelEntry> = None;
 
     // The model id grammar `<model_id>[:<instance|group|latest>]`: a qualified
     // id resolves directly to the owning model's server, bypassing the route
@@ -1334,7 +1398,7 @@ fn resolve_pipeline(
     // Canonical model-id split — zero-alloc callers use split_model_key (see pipeline.rs).
     let (base_model, qual_opt) = crate::config::split_model_key(model_name);
     if let Some(qualifier) = qual_opt {
-        if let Some(entry) = models.get(base_model) {
+        if let Some(entry) = effective_entry(models, default_instances, base_model, &mut qualified_slot) {
             let rt = if qualifier == "latest" {
                 RoutingTarget::from_model_entry(base_model, entry)
             } else {
@@ -1361,7 +1425,9 @@ fn resolve_pipeline(
 
     let pipeline_names: Vec<String> = if let Some(ref r) = route {
         r.pipelines.clone()
-    } else if let Some(model_entry) = models.get(model_name) {
+    } else if let Some(model_entry) =
+        effective_entry(models, default_instances, model_name, &mut bare_slot)
+    {
         let rt = RoutingTarget::from_model_entry(model_name, model_entry);
         return crate::pipeline::PipelineResult {
             decisions: vec![],
@@ -1379,6 +1445,17 @@ fn resolve_pipeline(
 
     let mut ctx = WorkContext::default();
     ctx.set_structured("request", router_request);
+    // Availability view for group-member sentinel expansion: the shared
+    // dispatch-success recency beside the stats, plus the supervisor liveness
+    // probe. Stages without these channels degrade to unexpanded behavior.
+    ctx.set(
+        crate::target_match::RECENCY_CTX_KEY,
+        Arc::clone(&stats.recency),
+    );
+    ctx.set(
+        crate::target_match::LIVENESS_CTX_KEY,
+        crate::target_match::LivenessProbe::new(supervisor.cloned()),
+    );
 
     let mut all_decisions = Vec::new();
     let mut last_result: Option<crate::pipeline::PipelineResult> = None;

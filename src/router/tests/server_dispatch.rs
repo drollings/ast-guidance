@@ -102,6 +102,7 @@ async fn allocate_on_503_creates_instance_and_retries_once() {
         resume: false,
         params: None,
         max_ctx: None,
+        session: false,
     };
     let manager = Arc::new(InstanceManager::new(
         "base",

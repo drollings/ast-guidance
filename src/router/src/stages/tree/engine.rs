@@ -16,8 +16,9 @@ use crate::config::classification::InterlinguaMatch;
 use crate::config::filters::FilterOutcome;
 use crate::config::{ClassificationNode, ClassificationTree, RoutingConfig};
 use crate::pipeline::RoutingTarget;
+use crate::stages::classifier::ClassifierBackendResolver;
 use crate::pipeline_types::{StageDecision, StageVerdict};
-use crate::target_match::{candidates_for_group, AssessmentRecord, TargetMatcher};
+use crate::target_match::{AssessmentRecord, GroupExpansion, TargetMatcher};
 
 use super::decisions::{fallback_child, final_decision, node_decision, terminal_decision, TreeEvaluation, TreeOutcome};
 use super::verdict::{parse_tree_verdict, TreeClassifierVerdict};
@@ -32,6 +33,11 @@ pub struct ClassificationEngine {
     /// only), so a sub-classifier on a different model dispatches to its own
     /// endpoint.
     clients: HashMap<String, Arc<dyn ChatBackend>>,
+    /// Late-bound backend resolution shared with the owning classifier stage.
+    /// `Some` re-resolves each node key per request; a miss falls back to
+    /// the boot-built `clients` map and `default_client` unchanged. `None`
+    /// (injected mock path) serves the boot-built backends exactly as before.
+    backend_resolver: Option<ClassifierBackendResolver>,
     /// Bounds concurrent classifier LLM calls (same primitive as the flat
     /// stage).
     limiter: Arc<Limiter>,
@@ -55,12 +61,14 @@ impl ClassificationEngine {
         limiter: Arc<Limiter>,
         default_coherence_threshold: f64,
         target_matcher: Option<TargetMatcher>,
+        backend_resolver: Option<ClassifierBackendResolver>,
     ) -> Self {
         Self {
             tree,
             routing,
             default_client,
             clients,
+            backend_resolver,
             limiter,
             default_coherence_threshold,
             target_matcher,
@@ -80,6 +88,20 @@ impl ClassificationEngine {
         interlingua: Option<&[spacy_rs::routing::InterlinguaSignal]>,
         route_hints: Option<&[crate::pipeline_types::RouteHint]>,
     ) -> Result<TreeEvaluation, WorkError> {
+        self.evaluate_with_expansion(user_text, interlingua, route_hints, &GroupExpansion::default())
+    }
+
+    /// [`Self::evaluate`] with the request's availability view for
+    /// group-member sentinel expansion. Callers on the serving path (which
+    /// carry a request context) pass the context-derived expansion; all other
+    /// callers use `evaluate` and get unexpanded behavior.
+    pub fn evaluate_with_expansion(
+        &self,
+        user_text: &str,
+        interlingua: Option<&[spacy_rs::routing::InterlinguaSignal]>,
+        route_hints: Option<&[crate::pipeline_types::RouteHint]>,
+        expansion: &GroupExpansion,
+    ) -> Result<TreeEvaluation, WorkError> {
         let mut visited: Vec<StageDecision> = Vec::new();
         let siblings = HashMap::new();
         let outcome = self.evaluate_node(
@@ -90,6 +112,7 @@ impl ClassificationEngine {
             route_hints,
             None,
             &mut visited,
+            expansion,
         )?;
 
         for d in &visited {
@@ -110,6 +133,7 @@ impl ClassificationEngine {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn evaluate_node(
         &self,
         node: &ClassificationNode,
@@ -119,6 +143,7 @@ impl ClassificationEngine {
         route_hints: Option<&[crate::pipeline_types::RouteHint]>,
         complexity: Option<u8>,
         visited: &mut Vec<StageDecision>,
+        expansion: &GroupExpansion,
     ) -> Result<TreeOutcome, WorkError> {
         match node {
             ClassificationNode::Classifier {
@@ -138,6 +163,7 @@ impl ClassificationEngine {
                 interlingua,
                 route_hints,
                 visited,
+                expansion,
             ),
             ClassificationNode::Terminal {
                 route,
@@ -151,6 +177,7 @@ impl ClassificationEngine {
                 complexity,
                 user_text,
                 visited,
+                expansion,
             )),
             ClassificationNode::Filter {
                 description,
@@ -170,6 +197,7 @@ impl ClassificationEngine {
                 route_hints,
                 complexity,
                 visited,
+                expansion,
             ),
             ClassificationNode::Fallback { node, .. } => self.evaluate_node(
                 node,
@@ -179,6 +207,7 @@ impl ClassificationEngine {
                 route_hints,
                 complexity,
                 visited,
+                expansion,
             ),
         }
     }
@@ -198,6 +227,7 @@ impl ClassificationEngine {
         interlingua: Option<&[spacy_rs::routing::InterlinguaSignal]>,
         route_hints: Option<&[crate::pipeline_types::RouteHint]>,
         visited: &mut Vec<StageDecision>,
+        expansion: &GroupExpansion,
     ) -> Result<TreeOutcome, WorkError> {
         // Deterministic filter children short-circuit before any LLM call.
         let siblings: HashMap<String, ClassificationNode> = children
@@ -214,6 +244,7 @@ impl ClassificationEngine {
                     route_hints,
                     None,
                     visited,
+                    expansion,
                 )? {
                     TreeOutcome::Pass => {}
                     other => return Ok(other),
@@ -253,7 +284,7 @@ impl ClassificationEngine {
                         format!("classifier LLM error, falling back: {e}"),
                         serde_json::json!({ "model": model, "route": fb.key }),
                     ));
-                    return self.evaluate_node(&fb.node, &siblings, user_text, interlingua, route_hints, None, visited);
+                    return self.evaluate_node(&fb.node, &siblings, user_text, interlingua, route_hints, None, visited, expansion);
                 }
                 let reason = format!("classifier LLM error: {e}");
                 visited.push(node_decision(
@@ -321,6 +352,7 @@ impl ClassificationEngine {
                     route_hints,
                     Some(verdict.complexity),
                     visited,
+                    expansion,
                 );
             }
         }
@@ -352,6 +384,7 @@ impl ClassificationEngine {
                 route_hints,
                 Some(verdict.complexity),
                 visited,
+                expansion,
             );
         }
 
@@ -386,13 +419,14 @@ impl ClassificationEngine {
         complexity: Option<u8>,
         user_text: &str,
         visited: &mut Vec<StageDecision>,
+        expansion: &GroupExpansion,
     ) -> TreeOutcome {
         // Strict resolution: a terminal names an explicit route. Unknown route
         // names must not silently divert to the default route — `resolve_route`
         // would fall back; check the flat map first.
         if self.routing.routes.contains_key(route) {
             if let Some((rt, assessments)) =
-                self.resolve_route_with_matcher(route, complexity, user_text)
+                self.resolve_route_with_matcher(route, complexity, user_text, expansion)
             {
                 visited.push(terminal_decision(description, &rt, complexity, assessments));
                 return TreeOutcome::Route(Box::new(rt));
@@ -403,7 +437,7 @@ impl ClassificationEngine {
         // group's models (the flat routes map has no entry for this route).
         if let Some(group) = group {
             if let Some((rt, assessments)) =
-                self.resolve_group_target(route, group, complexity, user_text)
+                self.resolve_group_target(route, group, complexity, user_text, expansion)
             {
                 visited.push(terminal_decision(description, &rt, complexity, assessments));
                 return TreeOutcome::Route(Box::new(rt));
@@ -430,10 +464,16 @@ impl ClassificationEngine {
         route: &str,
         complexity: Option<u8>,
         user_text: &str,
+        expansion: &GroupExpansion,
     ) -> Option<(RoutingTarget, Option<Vec<AssessmentRecord>>)> {
         if let Some(matcher) = &self.target_matcher {
             if let Some(group) = self.routing.route_group(route) {
-                let candidates = candidates_for_group(&self.routing, group);
+                let candidates = crate::target_match::expanded_candidates_for_group(
+                    &self.routing,
+                    group,
+                    expansion.recency(),
+                    &|base| expansion.supervisor_loaded(base),
+                );
                 if candidates.len() >= 2 {
                     if let Some(tm) = matcher.match_target(
                         route,
@@ -464,9 +504,15 @@ impl ClassificationEngine {
         group: &str,
         min_complexity: Option<u8>,
         user_text: &str,
+        expansion: &GroupExpansion,
     ) -> Option<(RoutingTarget, Option<Vec<AssessmentRecord>>)> {
         if let Some(matcher) = &self.target_matcher {
-            let candidates = candidates_for_group(&self.routing, group);
+            let candidates = crate::target_match::expanded_candidates_for_group(
+                &self.routing,
+                group,
+                expansion.recency(),
+                &|base| expansion.supervisor_loaded(base),
+            );
             if candidates.len() >= 2 {
                 if let Some(tm) = matcher.match_target(
                     route,
@@ -481,7 +527,15 @@ impl ClassificationEngine {
             }
         }
 
-        let model_keys = self.routing.model_groups.get(group)?.models();
+        // Static fallback: role members fan out to candidate keys;
+        // availability sentinels have no meaning here (no recency/liveness)
+        // and unknown literals fall out through the entry lookup, as today.
+        let model_keys: Vec<String> = self
+            .routing
+            .role_expanded_members(group)
+            .into_iter()
+            .filter(|k| k != "last" && k != "any")
+            .collect();
         let candidates: Vec<&String> = model_keys
             .iter()
             .filter(|k| {
@@ -532,6 +586,7 @@ impl ClassificationEngine {
         route_hints: Option<&[crate::pipeline_types::RouteHint]>,
         complexity: Option<u8>,
         visited: &mut Vec<StageDecision>,
+        expansion: &GroupExpansion,
     ) -> Result<TreeOutcome, WorkError> {
         let matched = if let Some(m) = match_interlingua {
             // Interlingua dispatch: AND of the set fields across any sentence,
@@ -610,7 +665,7 @@ impl ClassificationEngine {
                             format!("soft redirect to '{target}'"),
                             serde_json::json!({ "outcome": "soft_redirect", "redirect_to": target }),
                         ));
-                        return self.evaluate_node(node, siblings, user_text, interlingua, route_hints, complexity, visited);
+                        return self.evaluate_node(node, siblings, user_text, interlingua, route_hints, complexity, visited, expansion);
                     }
                     tracing::warn!(
                         target: "router.pipeline.stage2.tree",
@@ -671,7 +726,17 @@ impl ClassificationEngine {
             },
         ];
 
-        let client = self.clients.get(model).unwrap_or(&self.default_client);
+        // Late-bound first: a backend registered (or rewritten) after boot
+        // wins; otherwise the boot-built per-node map and default serve
+        // unchanged (injected mock path and unknown keys behave as before).
+        let live = self
+            .backend_resolver
+            .as_ref()
+            .and_then(|resolve| resolve(model));
+        let client: &Arc<dyn ChatBackend> = live
+            .as_ref()
+            .or_else(|| self.clients.get(model))
+            .unwrap_or(&self.default_client);
         tracing::info!(
             target: "router.pipeline.stage2.tree",
             model = %model,

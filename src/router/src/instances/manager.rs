@@ -191,6 +191,17 @@ impl InstanceManager {
             .unwrap_or(false)
     }
 
+    /// Whether the named instance holds multi-step state across requests.
+    /// Read from the configured profiles' declared intent (`session: true`);
+    /// unknown names are one-shot (fail-open: no snapshot is ever taken for
+    /// a context the config did not declare as multi-step).
+    pub fn session_for(&self, name: &str) -> bool {
+        self.profiles
+            .iter()
+            .find(|p| p.name.as_deref() == Some(name))
+            .is_some_and(|p| p.session)
+    }
+
     /// Set (or clear) the preserve-on-evict flag for a named instance.
     pub fn set_resume(&self, name: &str, enabled: bool) {
         self.resume
@@ -748,7 +759,8 @@ pub fn build_instance_managers(
         if !entry.is_managed() {
             continue;
         }
-        let profiles = entry.instance_profiles();
+        let profiles =
+            entry.instance_profiles_with(config.default_params.instances.as_ref());
         validate_instances(&profiles)
             .map_err(|e| format!("model {key}: invalid instance grammar: {e}"))?;
         let model_name = entry.llama_model_name(key);

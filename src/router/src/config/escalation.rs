@@ -32,12 +32,57 @@ pub enum ModelGroup {
     },
 }
 
+/// One member of a `model_groups` list: either a literal model key or an
+/// availability-ordering sentinel. `Last` expands to the group's
+/// most-recently-successful key (when still a member); `Any` orders the
+/// currently-loaded members first, in config order. Both only *order*
+/// candidates — the intelligence climb underneath is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupMember {
+    /// A literal model key (possibly qualified, e.g. `code:default`).
+    Key(String),
+    /// The group's most-recently-successful member.
+    Last,
+    /// Any loaded member first, then the rest in config order.
+    Any,
+}
+
+impl GroupMember {
+    /// Parse one raw group member. Only the bare, lowercase `last`/`any`
+    /// spellings are sentinels (case-sensitive); every other spelling —
+    /// including qualified forms like `base:last` — stays a literal key and
+    /// keeps today's fail-closed lookup when unknown.
+    pub fn parse(raw: &str) -> Self {
+        match raw {
+            "last" => GroupMember::Last,
+            "any" => GroupMember::Any,
+            _ => GroupMember::Key(raw.to_string()),
+        }
+    }
+
+    /// The raw member spelling this parsed from (identity round trip).
+    pub fn raw(&self) -> &str {
+        match self {
+            GroupMember::Key(key) => key,
+            GroupMember::Last => "last",
+            GroupMember::Any => "any",
+        }
+    }
+}
+
 impl ModelGroup {
     /// The member model keys, regardless of which form was configured.
     pub fn models(&self) -> &[String] {
         match self {
             ModelGroup::Array(models) | ModelGroup::Object { models, .. } => models,
         }
+    }
+
+    /// The members parsed into literal keys vs. availability sentinels, in
+    /// config order. Pure parsing — no registry or residency reads — so the
+    /// raw `models()` shape stays the dispatch-neutral source of truth.
+    pub fn members(&self) -> Vec<GroupMember> {
+        self.models().iter().map(|m| GroupMember::parse(m)).collect()
     }
 
     /// The escalation ladder configured for this group, if any. Array-form

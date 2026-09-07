@@ -256,12 +256,17 @@ fn overlay_redirect_threshold_is_inert_without_the_golden_corpus_gate() {
 }
 
 #[test]
-fn local_backend_uses_pool_qualifier_while_from_model_entry_keeps_default() {
-    // router-internal work (local_backend) targets the pool group
-    // (swarm), while the client-facing canonical target builder
-    // (from_model_entry) still resolves the fork's default instance
-    // (ledger). Two intents, two answers on the same entry.
+fn local_backend_single_resolver_with_role_work_point() {
+    // One inference-point precedence for construction: an explicit qualifier
+    // wins, else the role's instance point, else the entry default. The work
+    // pool is named by a role — no largest-count guess — while the canonical
+    // target builder keeps resolving the fork's default instance (ledger).
+    // (Covers the removed pool/default resolver pair alongside the role
+    // golden.)
     let config: RouterConfig = serde_json::from_value(serde_json::json!({
+        "roles": {
+            "work": {"models": ["swarm"], "instance": "swarm"}
+        },
         "models": {
             "swarm": {
                 "endpoint": "http://x/v1/chat/completions",
@@ -278,11 +283,36 @@ fn local_backend_uses_pool_qualifier_while_from_model_entry_keeps_default() {
         }
     })).expect("valid config");
 
-    // local_backend builds (is_some) and routes to the pool group.
+    // Every construction path builds (is_some); the qualifier each serves is
+    // pinned through the single precedence below.
     assert!(config.local_backend("swarm").is_some());
+    assert!(config.local_backend("work").is_some());
+    assert!(config.local_backend("swarm:scratch").is_some());
     let entry = config.models.get("swarm").expect("swarm");
-    assert_eq!(entry.pool_qualifier().as_deref(), Some("swarm"));
-    assert_eq!(entry.default_dispatch_qualifier().as_deref(), Some("ledger"));
+    assert_eq!(
+        crate::config::resolve_inference_point(&config.models, &config.roles, "swarm", None, None)
+            .as_deref(),
+        Some("ledger"),
+        "bare key serves the entry default"
+    );
+    assert_eq!(
+        crate::config::resolve_inference_point(&config.models, &config.roles, "work", None, None)
+            .as_deref(),
+        Some("swarm"),
+        "role serves its instance point"
+    );
+    assert_eq!(
+        crate::config::resolve_inference_point(
+            &config.models,
+            &config.roles,
+            "swarm",
+            Some("scratch"),
+            None
+        )
+        .as_deref(),
+        Some("scratch"),
+        "explicit qualifier wins over every default"
+    );
 
     // The canonical target builder keeps bare-base default dispatch: :ledger.
     let rt = crate::pipeline::RoutingTarget::from_model_entry("swarm", entry);
@@ -984,4 +1014,113 @@ fn summarizer_and_tier_fall_back_to_onnx_llm_when_no_llama_ledger_instance() {
         .into_registry(),
     );
     assert!(config.summarizer_for_ledger().is_some(), "no ledger instance → onnx fallback");
+}
+
+// -- Late-bound classifier backend -------------------------------------------
+// The classifier stage keeps the resolved model *key*; the backend is
+// re-resolved per request through `local_backend` (the single factory), so
+// a post-boot endpoint rewrite is observed instead of a boot-frozen client.
+
+fn late_bound_test_config(endpoint: &str) -> RouterConfig {
+    serde_json::from_value(serde_json::json!({
+        "models": {
+            "clf": {
+                "endpoint": endpoint,
+                "intelligence": 2,
+                "cost_input": 1e-6, "cost_output": 6e-6, "cost_cached_read": 4e-7,
+                "speed": 8,
+                "total_timeout_ms": 5000,
+                "idle_timeout_ms": 1000
+            }
+        },
+        "model_groups": {"g": ["clf"]}
+    }))
+    .expect("valid config")
+}
+
+fn openai_ok_marker(marker: &str) -> String {
+    serde_json::json!({
+        "id": "stub",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "clf",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": marker},
+            "finish_reason": "stop"
+        }]
+    })
+    .to_string()
+}
+
+#[test]
+fn classifier_backend_resolver_resolves_known_key_per_request() {
+    let config = late_bound_test_config("http://127.0.0.1:9/v1/chat/completions");
+    let resolve = classifier_backend_resolver(&config);
+    assert!(resolve("clf").is_some(), "known key resolves");
+    assert!(resolve("unknown-model").is_none(), "unknown key misses");
+    // The factory behind the resolver still builds without I/O.
+    assert!(resolve("clf").expect("resolves").chat_complete(&[]).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_bound_local_backend_follows_endpoint_rewrite() {
+    use crate::instances::stub::StubServer;
+
+    let server = StubServer::start(Arc::new(|_, _, _| (200, openai_ok_marker("live-marker"))));
+    let mut config = late_bound_test_config("http://127.0.0.1:9/v1/chat/completions");
+
+    // Pre-rewrite the placeholder is unreachable: a backend builds (no I/O
+    // at construction) but the call fails — the boot-frozen shape.
+    let before = config.local_backend("clf").expect("backend builds");
+    assert!(before.chat_complete(&[]).is_err(), "placeholder dial fails");
+
+    // The post-boot rewrite (supervisor start, lazy load) moves the endpoint;
+    // the next resolution serves the live server — nothing frozen in between.
+    config.models.get_mut("clf").expect("clf").endpoint =
+        format!("{}/v1/chat/completions", server.base_url());
+    let after = config.local_backend("clf").expect("backend builds");
+    let body = after.chat_complete(&[]).expect("live server answers");
+    assert!(body.contains("live-marker"), "live body served, got: {body}");
+    assert!(!server.recorded().is_empty(), "live server was dialed");
+}
+
+#[test]
+fn local_backend_resolves_role_keys_to_candidate_backends() {
+    // A role key builds the head candidate's backend (fail-open `None` when
+    // the role is unknown or names nothing buildable); literal keys behave
+    // exactly as before.
+    let config: RouterConfig = serde_json::from_value(serde_json::json!({
+        "roles": {
+            "work": {"models": ["swarm:default"], "instance": "swarm"},
+            "empty": {"models": []}
+        },
+        "models": {
+            "swarm": {
+                "endpoint": "http://x/v1/chat/completions",
+                "name": "swarm",
+                "intelligence": 2,
+                "cost_input": 1.0, "cost_output": 6.0, "cost_cached_read": 0.4,
+                "speed": 8,
+                "instances": {
+                    "swarm": { "count": 3, "group": "swarm", "num_ctx": 16384 },
+                    "ledger": { "num_ctx": 131072, "pinned": true, "default": true }
+                }
+            }
+        }
+    })).expect("valid config");
+
+    assert!(config.local_backend("work").is_some(), "role builds head candidate");
+    assert!(config.local_backend("swarm:default").is_some(), "literal keys unchanged");
+    assert!(config.local_backend("swarm").is_some(), "bare keys unchanged");
+    assert!(config.local_backend("nope").is_none(), "unknown keys fail closed");
+    assert!(config.local_backend("empty").is_none(), "empty roles fail closed");
+    assert!(
+        config.local_backend_for_instance("work", "ledger").is_some(),
+        "role + named instance builds"
+    );
+    assert!(
+        config.local_backend_for_instance("work", "missing").is_none(),
+        "unknown instances still fail closed through roles"
+    );
 }

@@ -34,6 +34,23 @@ fn default_pipelines() -> Vec<String> {
     vec!["default".into()]
 }
 
+/// One entry of the routing-vocabulary table: the candidate model keys a role
+/// resolves to (in config order) plus the named inference point each
+/// candidate serves. Roles name *what the request needs*; `models` stays the
+/// fleet inventory of *what exists*. Resolution to a concrete
+/// `base:qualifier` target happens per request at dispatch time, never at
+/// boot, so lazy models load correctly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleEntry {
+    /// Candidate model keys, in config order.
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// Named inference point each candidate serves. `None` leaves the
+    /// qualifier to the entry default / bare key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingConfig {
     pub routes: HashMap<String, RouteRef>,
@@ -51,9 +68,39 @@ pub struct RoutingConfig {
     /// from `RouterConfig.onnx`; empty for a config with no onnx fleet.
     #[serde(default)]
     pub onnx_keys: BTreeSet<String>,
+    /// Routing-vocabulary table (mirrors `RouterConfig.roles`): role name →
+    /// candidate model keys + the inference point each candidate serves.
+    /// Absent (the default) leaves group members untouched.
+    #[serde(default)]
+    pub roles: HashMap<String, RoleEntry>,
 }
 
 impl RoutingConfig {
+    /// Expand a group's raw members through the roles table: a bare member
+    /// naming a role fans out to the role's candidate keys (config order);
+    /// sentinel members (`last`/`any`), qualified members (`base:point`), and
+    /// unknown literals pass through untouched for the downstream stage
+    /// (sentinel expansion / explicit-point / fail-closed lookup) to own.
+    /// Without roles the expansion is identity. A bare role name shadows a
+    /// same-named model key — address the model directly with a qualified
+    /// member when both exist.
+    pub fn role_expanded_members(&self, group: &str) -> Vec<String> {
+        let Some(group_cfg) = self.model_groups.get(group) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(group_cfg.models().len());
+        for member in group_cfg.models() {
+            if member.contains(':') || member == "last" || member == "any" {
+                out.push(member.clone());
+            } else if let Some(role) = self.roles.get(member.as_str()) {
+                out.extend(role.models.iter().cloned());
+            } else {
+                out.push(member.clone());
+            }
+        }
+        out
+    }
+
     /// The `model_group` a route resolves through — the route's own `RouteRef`
     /// group, or the default route's group when the route is unknown (mirrors
     /// the `resolve_route` lookup at the top of [`Self::resolve_route`]).
@@ -108,7 +155,7 @@ impl RoutingConfig {
             return Some(rt);
         }
         let member = self.resolve_route_member(route, min_complexity)?;
-        let mut rt = self.target_for_key(member)?;
+        let mut rt = self.target_for_key(&member)?;
         let group = self
             .routes
             .get(route)
@@ -135,12 +182,14 @@ impl RoutingConfig {
             .routes
             .get(route)
             .or_else(|| self.routes.get(&self.default_route))?;
-        let group = self.model_groups.get(&route_ref.group)?;
-        let key = group.models().iter().find(|k| {
-            let (base, _) = split_model_key(k);
-            self.onnx_keys.contains(base)
-        })?;
-        let (base, qualifier) = split_model_key(key);
+        let key = self
+            .role_expanded_members(&route_ref.group)
+            .into_iter()
+            .find(|k| {
+                let (base, _) = split_model_key(k);
+                self.onnx_keys.contains(base)
+            })?;
+        let (base, qualifier) = split_model_key(&key);
         let mut rt = RoutingTarget::from_onnx_role(base);
         if let Some(q) = qualifier {
             rt.instance = Some(q.to_string());
@@ -191,8 +240,8 @@ impl RoutingConfig {
         }
 
         let member = self.resolve_route_member(route_name, min_complexity)?;
-        let entry = self.entry_for_key(member)?;
-        let name = entry.name.clone().unwrap_or_else(|| split_model_key(member).0.to_string());
+        let entry = self.entry_for_key(&member)?;
+        let name = entry.name.clone().unwrap_or_else(|| split_model_key(&member).0.to_string());
         tracing::info!(target: "router.config", route = %route_name, model = %name, member = %member, "route resolved");
         Some((entry, name))
     }
@@ -201,18 +250,29 @@ impl RoutingConfig {
     /// member whose base `models` entry's `intelligence` meets `min_complexity`,
     /// else the cheapest member in the group. Returns the full member key
     /// (possibly qualified, e.g. `lfm2.5-2.6b:default`) so the caller can
-    /// preserve any instance qualifier.
-    fn resolve_route_member(&self, route_name: &str, min_complexity: Option<u8>) -> Option<&str> {
+    /// preserve any instance qualifier. Role members fan out to their
+    /// candidate keys first; availability sentinels (`last`/`any`) have no
+    /// meaning on this static path (no recency/liveness) and are skipped —
+    /// the dispatch climb owns them.
+    fn resolve_route_member(
+        &self,
+        route_name: &str,
+        min_complexity: Option<u8>,
+    ) -> Option<String> {
         let route_ref = self
             .routes
             .get(route_name)
             .or_else(|| self.routes.get(&self.default_route))?;
-        let model_names = self.model_groups.get(route_ref.group.as_str());
-        let Some(model_names) = model_names else {
+        if !self.model_groups.contains_key(route_ref.group.as_str()) {
             tracing::warn!(target: "router.config", route = %route_name, group = %route_ref.group, "model group not found for route");
             return None;
-        };
-        let model_keys = model_names.models();
+        }
+        let expanded = self.role_expanded_members(&route_ref.group);
+        let model_keys: Vec<&str> = expanded
+            .iter()
+            .map(String::as_str)
+            .filter(|m| *m != "last" && *m != "any")
+            .collect();
 
         tracing::debug!(target: "router.config",
             route = %route_name,
@@ -222,7 +282,7 @@ impl RoutingConfig {
             "resolving route"
         );
 
-        let passing: Vec<&String> = model_keys
+        let passing: Vec<&&str> = model_keys
             .iter()
             .filter(|n| {
                 self.entry_for_key(n)
@@ -230,7 +290,7 @@ impl RoutingConfig {
             })
             .collect();
 
-        let cheapest = |a: &&String, b: &&String| {
+        let cheapest = |a: &&&str, b: &&&str| {
             let (ca, cb) = (
                 self.entry_for_key(a).map_or(f64::MAX, |m| m.cost_input + m.cost_output),
                 self.entry_for_key(b).map_or(f64::MAX, |m| m.cost_input + m.cost_output),
@@ -240,11 +300,11 @@ impl RoutingConfig {
 
         if passing.is_empty() {
             tracing::debug!(target: "router.config", route = %route_name, "no candidates passed complexity filter, falling back to cheapest in group");
-            model_keys.iter().min_by(cheapest).map(String::as_str)
+            model_keys.iter().min_by(cheapest).map(|s| (*s).to_string())
         } else {
             let entry_key = passing.into_iter().min_by(cheapest)?;
             tracing::info!(target: "router.config", route = %route_name, model = %entry_key, "route resolved (complexity match)");
-            Some(entry_key)
+            Some((*entry_key).to_string())
         }
     }
 
@@ -276,13 +336,15 @@ impl RoutingConfig {
 
         let target_intelligence = f64::from(min_complexity.unwrap_or(0));
 
-        for (group_key, group) in &self.model_groups {
+        for group_key in self.model_groups.keys() {
             let is_primary = primary_group == Some(group_key.as_str());
-            for model_key in group.models() {
+            // Role members fan out to candidate keys; sentinels and unknown
+            // literals fall out below through the entry lookup, as today.
+            for model_key in self.role_expanded_members(group_key) {
                 if !seen.insert(model_key.clone()) {
                     continue;
                 }
-                if let Some(entry) = self.entry_for_key(model_key) {
+                if let Some(entry) = self.entry_for_key(&model_key) {
                     // Keep the full (possibly-qualified) member key so the
                     // caller can preserve the instance qualifier when building
                     // the fallback target.
@@ -328,3 +390,7 @@ impl RoutingConfig {
 #[cfg(test)]
 #[path = "../../tests/config_routing.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/routing_role_golden.rs"]
+mod routing_role_golden_tests;

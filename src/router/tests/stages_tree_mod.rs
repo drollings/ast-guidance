@@ -102,6 +102,7 @@ fn test_routing() -> RoutingConfig {
         default_route: "local".into(),
         score_matrix: None,
         onnx_keys: std::collections::BTreeSet::new(),
+        roles: Default::default(),
     }
 }
 
@@ -131,6 +132,7 @@ fn engine_with_routing(
         Arc::new(Limiter::new(4)),
         0.5,
         matcher,
+        None,
     )
 }
 
@@ -1030,5 +1032,70 @@ fn final_decision_returns_same_target_both_channels() {
     assert!(
         handoff.decision.metadata.get("routing_target").is_none(),
         "metadata carries no routing_target shim (typed-only handoff)",
+    );
+}
+
+// -- Late-bound classifier backend -------------------------------------------
+// The engine shares the owning stage's resolver: each classifier-node key is
+// re-resolved per request, so a backend that appears (or moves) after boot
+// is observed instead of the boot-frozen map/default.
+
+use crate::stages::classifier::ClassifierBackendResolver;
+
+fn live_engine(
+    frozen_verdict_route: &str,
+    live_verdict_route: Option<&str>,
+) -> ClassificationEngine {
+    let frozen: Arc<dyn ChatBackend> = Arc::new(StubChatBackend::always(verdict(
+        frozen_verdict_route,
+        0.9,
+        0.9,
+        2,
+    )));
+    let resolver: ClassifierBackendResolver = match live_verdict_route {
+        Some(route) => {
+            let live: Arc<dyn ChatBackend> =
+                Arc::new(StubChatBackend::always(verdict(route, 0.9, 0.9, 2)));
+            Arc::new(move |_: &str| Some(Arc::clone(&live)))
+        }
+        None => Arc::new(|_: &str| None),
+    };
+    ClassificationEngine::new(
+        simple_tree(),
+        test_routing(),
+        frozen,
+        HashMap::new(),
+        Arc::new(Limiter::new(4)),
+        0.5,
+        None,
+        Some(resolver),
+    )
+}
+
+#[test]
+fn tree_engine_prefers_live_backend_over_frozen_default() {
+    // The root classifier node runs on model "fast", which has no dedicated
+    // map entry: the live resolver's "code" verdict wins over the frozen
+    // default's "translation" verdict.
+    let engine = live_engine("translation", Some("code"));
+    let evaluation = engine.evaluate("write a rust function", None, None).unwrap();
+    assert_eq!(
+        routed_target(&evaluation).target_name.as_deref(),
+        Some("code"),
+        "live backend wins",
+    );
+}
+
+#[test]
+fn tree_engine_miss_falls_back_to_frozen_default() {
+    // A resolver miss is not a new error path: the boot-built default serves
+    // exactly as before (the stage-level miss policy lives one layer up, on
+    // the flat path that has no engine to fall back to).
+    let engine = live_engine("translation", None);
+    let evaluation = engine.evaluate("write a rust function", None, None).unwrap();
+    assert_eq!(
+        routed_target(&evaluation).target_name.as_deref(),
+        Some("translation"),
+        "frozen default serves on miss",
     );
 }

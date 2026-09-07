@@ -163,6 +163,8 @@ pub fn test_deps(
         onnx: None,
         fleet: None,
         onnx_llm_backend: None,
+        roles: Arc::new(config.roles.clone()),
+        default_instances: config.default_params.instances.clone(),
     }
 }
 

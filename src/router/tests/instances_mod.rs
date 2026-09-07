@@ -23,6 +23,7 @@ fn profile(name: &str, group: &str) -> InstanceProfile {
         resume: false,
         params: None,
         max_ctx: None,
+        session: false,
     }
 }
 
@@ -81,6 +82,7 @@ impl Raw {
             resume: false,
             params: None,
             max_ctx: None,
+            session: false,
         }
     }
 }
@@ -124,6 +126,7 @@ fn grammar_matches_reference_deployment() {
         resume: false,
         params: None,
         max_ctx: None,
+        session: false,
     };
     // Expand the count as instance_profiles() would.
     let profiles: Vec<InstanceProfile> = (0..3)
@@ -573,6 +576,7 @@ async fn reconcile_creates_missing_pinned_and_resizes_n_ctx_drift() {
         resume: false,
             params: None,
             max_ctx: None,
+            session: false,
         },
         InstanceProfile {
             name: Some("swarm0".into()),
@@ -587,6 +591,7 @@ async fn reconcile_creates_missing_pinned_and_resizes_n_ctx_drift() {
         resume: false,
             params: None,
             max_ctx: None,
+            session: false,
         },
         InstanceProfile {
             name: Some("swarm1".into()),
@@ -601,6 +606,7 @@ async fn reconcile_creates_missing_pinned_and_resizes_n_ctx_drift() {
         resume: false,
             params: None,
             max_ctx: None,
+            session: false,
         },
     ];
     let manager = InstanceManager::new("base", client, profiles, sidecar_policy());
@@ -658,6 +664,7 @@ async fn ensure_instance_creates_missing_unpinned_on_demand() {
         resume: false,
         params: None,
         max_ctx: None,
+        session: false,
     }];
     let manager = InstanceManager::new("base", client, profiles, sidecar_policy());
     manager.ensure_instance("scratch").await.expect("ensure_instance");
@@ -699,6 +706,7 @@ async fn ensure_instance_skips_when_already_present_or_unknown() {
         resume: false,
         params: None,
         max_ctx: None,
+        session: false,
     }];
     let manager = InstanceManager::new("base", client, profiles, sidecar_policy());
     // Already present -> no create.
@@ -768,6 +776,7 @@ async fn reconcile_tolerates_duplicate_create() {
         resume: false,
         params: None,
         max_ctx: None,
+        session: false,
     }];
     let manager = InstanceManager::new("base", client, profiles, sidecar_policy());
     // A 409 during reconcile is tolerated - reconcile completes Ok.
@@ -865,9 +874,9 @@ async fn residency_eviction_frees_largest_lru_context_first() {
 #[tokio::test]
 async fn llama_context_evict_snapshots_resume_marked_context_before_destroy() {
     // The save-before-evict order through the real adapter: a resume-marked
-    // context's KV snapshot must reach the fork before the destroy. The
-    // engine drives eviction through `LlmContext::evict`, so this order is
-    // the snapshot-before-destroy regression net.
+    // *session* context's KV snapshot must reach the fork before the destroy.
+    // The engine drives eviction through `LlmContext::evict`, so this order
+    // is the snapshot-before-destroy regression net.
     use fluent_llm::runtime::LlmContext as _LlmContext;
 
     let stub = residency_stub(serde_json::json!({
@@ -878,7 +887,7 @@ async fn llama_context_evict_snapshots_resume_marked_context_before_destroy() {
     let manager = Arc::new(InstanceManager::new(
         "base",
         InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
-        Vec::new(),
+        vec![session_profile("work", "g", true)],
         sidecar_policy(),
     ));
     manager.set_resume("work", true);
@@ -995,6 +1004,7 @@ async fn ensure_group_allocates_fresh_instance_from_profile() {
         resume: false,
         params: None,
         max_ctx: None,
+        session: false,
     }];
     let manager = InstanceManager::new("base", client, profiles, sidecar_policy());
     manager.ensure_group("swarm").await.expect("ensure_group");
@@ -1047,6 +1057,7 @@ async fn ensure_group_ready_is_noop_when_member_present() {
         resume: false,
         params: None,
         max_ctx: None,
+        session: false,
     }];
     let manager = InstanceManager::new("base", client, profiles, sidecar_policy());
     manager
@@ -1101,6 +1112,7 @@ async fn ensure_group_ready_reconciles_pinned_group_when_absent() {
             resume: false,
             params: None,
             max_ctx: None,
+            session: false,
         },
         InstanceProfile {
             name: Some("swarm".into()),
@@ -1115,6 +1127,7 @@ async fn ensure_group_ready_reconciles_pinned_group_when_absent() {
             resume: false,
             params: None,
             max_ctx: None,
+            session: false,
         },
     ];
     let manager = InstanceManager::new("base", client, profiles, sidecar_policy());
@@ -1177,6 +1190,7 @@ async fn ensure_group_ready_allocates_unpinned_group_when_absent() {
         resume: false,
         params: None,
         max_ctx: None,
+        session: false,
     }];
     let manager = InstanceManager::new("base", client, profiles, sidecar_policy());
     manager
@@ -1462,6 +1476,7 @@ async fn resize_to_demand_grows_within_max_ctx_and_refuses_beyond() {
         resume: false,
         params: None,
         max_ctx: Some(32768),
+        session: false,
     };
     let manager = Arc::new(InstanceManager::new(
         "swarm",
@@ -2137,7 +2152,7 @@ async fn eviction_snapshots_resume_context_before_destroy() {
     let manager = Arc::new(InstanceManager::new(
         "base",
         InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
-        Vec::new(),
+        vec![session_profile("agent", "g", true)],
         policy.clone(),
     ));
     manager.set_resume("agent", true);
@@ -2184,7 +2199,7 @@ async fn expire_resume_clears_idle_context_and_deletes_snapshot() {
     let manager = Arc::new(InstanceManager::new(
         "base",
         InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
-        Vec::new(),
+        vec![session_profile("agent", "g", true)],
         policy.clone(),
     ));
     manager.set_resume("agent", true);
@@ -2293,5 +2308,133 @@ async fn residency_all_pinned_over_budget_evicts_nothing() {
     assert!(
         stub.recorded().iter().all(|(m, _, _)| m != "DELETE"),
         "all-pinned device over budget must still evict nothing"
+    );
+}
+
+fn session_profile(name: &str, group: &str, resume: bool) -> InstanceProfile {
+    InstanceProfile {
+        name: Some(name.into()),
+        group: Some(group.into()),
+        count: 1,
+        num_ctx: 16384,
+        parallel: None,
+        pinned: false,
+        no_sleep: false,
+        sleep_idle_seconds: None,
+        default: false,
+        resume,
+        params: None,
+        max_ctx: None,
+        session: true,
+    }
+}
+
+#[test]
+fn session_for_reports_declared_intent() {
+    // The manager answers whether a named context holds multi-step state
+    // from its configured profiles; unknown names are one-shot (fail-open:
+    // no snapshot).
+    let manager = InstanceManager::new(
+        "base",
+        InstanceClient::new(reqwest::Client::new(), "http://x", None),
+        vec![session_profile("agent", "g", true), profile("scratch", "g")],
+        sidecar_policy(),
+    );
+    assert!(manager.session_for("agent"), "session:true profile");
+    assert!(!manager.session_for("scratch"), "one-shot profile");
+    assert!(
+        !manager.session_for("unknown"),
+        "unknown instance → one-shot (no snapshot)"
+    );
+}
+
+#[tokio::test]
+async fn one_shot_evict_destroys_without_snapshot() {
+    // A one-shot context is plain-destroyed: zero snapshot calls even when
+    // its router-side resume flag was set — inapplicable fields are dropped,
+    // never errors.
+    use fluent_llm::runtime::LlmContext as _LlmContext;
+
+    let stub = residency_stub(serde_json::json!({
+        "instances": [],
+        "snapshots": [],
+        "total": { "model": 0, "context": 0, "compute": 0, "total": 0 }
+    }));
+    let manager = Arc::new(InstanceManager::new(
+        "base",
+        InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
+        vec![profile("work", "g")],
+        sidecar_policy(),
+    ));
+    manager.set_resume("work", true);
+    let info = instance_info("work", "g", false, 100);
+    let ctx = LlamaContext::from_info(
+        Arc::clone(&manager),
+        manager.client().clone(),
+        &info,
+        None,
+    );
+    ctx.evict().await.expect("evict");
+
+    let posts: Vec<String> = stub
+        .recorded()
+        .iter()
+        .filter(|(m, p, _)| *m == "POST" && p.as_str().ends_with("/snapshot"))
+        .map(|(m, p, _)| format!("{m} {p}"))
+        .collect();
+    assert!(
+        posts.is_empty(),
+        "one-shot eviction must issue zero snapshot calls, got: {posts:?}"
+    );
+    assert!(
+        stub.recorded()
+            .iter()
+            .any(|(m, p, _)| *m == "DELETE" && p.as_str() == "/instances/work"),
+        "one-shot eviction still destroys the context"
+    );
+}
+
+#[tokio::test]
+async fn session_evict_snapshots_before_destroy() {
+    // A `session: true` context with `resume: true` keeps the
+    // snapshot-before-destroy order through the real adapter.
+    use fluent_llm::runtime::LlmContext as _LlmContext;
+
+    let stub = residency_stub(serde_json::json!({
+        "instances": [],
+        "snapshots": [],
+        "total": { "model": 0, "context": 0, "compute": 0, "total": 0 }
+    }));
+    let manager = Arc::new(InstanceManager::new(
+        "base",
+        InstanceClient::new(reqwest::Client::new(), stub.base_url(), None),
+        vec![session_profile("work", "g", true)],
+        sidecar_policy(),
+    ));
+    let info = instance_info("work", "g", false, 100);
+    let ctx = LlamaContext::from_info(
+        Arc::clone(&manager),
+        manager.client().clone(),
+        &info,
+        None,
+    );
+    ctx.evict().await.expect("evict");
+
+    let order: Vec<String> = stub
+        .recorded()
+        .iter()
+        .filter(|(m, p, _)| {
+            (*m == "POST" && p.as_str() == "/instances/work/snapshot")
+                || (*m == "DELETE" && p.as_str() == "/instances/work")
+        })
+        .map(|(m, p, _)| format!("{m} {p}"))
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            "POST /instances/work/snapshot".to_string(),
+            "DELETE /instances/work".to_string(),
+        ],
+        "session eviction snapshots before destroying"
     );
 }

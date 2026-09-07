@@ -366,6 +366,7 @@ mod tests {
             default_route: "fast".into(),
             score_matrix: None,
             onnx_keys: BTreeSet::new(),
+            roles: Default::default(),
         };
         let limiter = Arc::new(fluent_concurrency::pool::Limiter::new(1));
         let stage = ClassifierStage::new(
@@ -379,6 +380,7 @@ mod tests {
             limiter,
             None,
             crate::config::ClassifierFailurePolicy::Reject,
+            None,
             None,
         );
 
@@ -448,6 +450,7 @@ mod tests {
             default_route: "fast".into(),
             score_matrix: None,
             onnx_keys: std::collections::BTreeSet::new(),
+            roles: Default::default(),
         };
         crate::stages::classifier::ClassifierStage::new(
             backend,
@@ -460,6 +463,7 @@ mod tests {
             Arc::new(fluent_concurrency::pool::Limiter::new(4)),
             None,
             policy,
+            None,
             None,
         )
     }
@@ -559,6 +563,7 @@ mod tests {
             default_route: "fast".into(),
             score_matrix: None,
             onnx_keys: std::collections::BTreeSet::new(),
+            roles: Default::default(),
         };
         routing_config.routes.insert(
             "test".into(),
@@ -582,6 +587,7 @@ mod tests {
             Arc::new(fluent_concurrency::pool::Limiter::new(4)),
             None,
             crate::config::ClassifierFailurePolicy::Reject,
+            None,
             None,
         );
         let decision: StageDecision = stage
@@ -825,6 +831,7 @@ mod tests {
             default_route: config.default_route.clone(),
             score_matrix: None,
             onnx_keys: BTreeSet::new(),
+            roles: Default::default(),
         };
         let client = Arc::clone(&backend);
         let limiter = Arc::new(fluent_concurrency::pool::Limiter::new(4));
@@ -849,6 +856,7 @@ mod tests {
             limiter,
             matcher,
             config.classifier_failure_policy,
+            None,
             None,
         ));
         let mut orchestrator = PipelineOrchestrator::builder();
@@ -1747,6 +1755,7 @@ mod tests {
             limiter,
             None,
             crate::config::ClassifierFailurePolicy::Reject,
+            None,
             None,
         );
 

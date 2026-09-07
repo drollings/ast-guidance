@@ -191,6 +191,30 @@ fn routing_target_resolves_onnx_role_group_member() {
 }
 
 #[test]
+fn role_entry_deserializes_models_and_instance() {
+    let role: RoleEntry = serde_json::from_value(serde_json::json!({
+        "models": ["code:default", "qwen3.6-27b"],
+        "instance": "default",
+    }))
+    .expect("role entry");
+    assert_eq!(role.models, vec!["code:default", "qwen3.6-27b"]);
+    assert_eq!(role.instance.as_deref(), Some("default"));
+
+    // `instance` is optional; absent means the role carries no pinned point.
+    let bare: RoleEntry =
+        serde_json::from_value(serde_json::json!({"models": ["code:default"]}))
+            .expect("bare role entry");
+    assert_eq!(bare.models, vec!["code:default"]);
+    assert!(bare.instance.is_none());
+
+    let back: RoleEntry =
+        serde_json::from_str(&serde_json::to_string(&role).expect("serialize"))
+            .expect("round trip");
+    assert_eq!(back.models, role.models);
+    assert_eq!(back.instance, role.instance);
+}
+
+#[test]
 fn all_dispatch_targets_orders_primary_group_first() {
     let c = sample_config();
     let targets = c.all_dispatch_targets("smart", None);
@@ -199,4 +223,65 @@ fn all_dispatch_targets_orders_primary_group_first() {
     // (huge int 8 before big int 5), then other groups (tiny).
     assert_eq!(&names[..2], &["huge", "big"]);
     assert!(names.contains(&"tiny"));
+}
+
+fn role_config() -> RoutingConfig {
+    serde_json::from_value(serde_json::json!({
+        "routes": {
+            "fast": {"group": "fast", "pipelines": ["default"], "description": "fast route"},
+        },
+        "models": {
+            "tiny": {"endpoint": "http://a", "name": "tiny", "intelligence": 1,
+                     "cost_input": 1.0, "cost_output": 1.0, "cost_cached_read": 0.0, "speed": 10},
+            "big": {"endpoint": "http://b", "name": "big", "intelligence": 5,
+                    "cost_input": 9.0, "cost_output": 9.0, "cost_cached_read": 0.0, "speed": 10},
+        },
+        "model_groups": {
+            "fast": ["quick", "last", "tiny", "any", "unknown-key"],
+            "smart": ["big"]
+        },
+        "roles": {
+            "quick": {"models": ["tiny", "big"], "instance": "scratch"}
+        },
+        "system_prompt": "sys",
+        "safety_threshold": 0.5,
+        "default_route": "fast",
+    }))
+    .expect("valid routing config")
+}
+
+#[test]
+fn role_members_expand_to_candidate_keys_in_order() {
+    // A member naming a role fans out to the role's candidate keys (config
+    // order); sentinels and unknown literals pass through for the downstream
+    // stage (sentinel expansion / fail-closed lookup) to own.
+    let c = role_config();
+    assert_eq!(
+        c.role_expanded_members("fast"),
+        vec!["tiny", "big", "last", "tiny", "any", "unknown-key"],
+    );
+    assert_eq!(c.role_expanded_members("smart"), vec!["big"]);
+    assert!(c.role_expanded_members("missing").is_empty());
+}
+
+#[test]
+fn static_route_resolution_reaches_through_roles() {
+    // The static path (no recency/liveness) resolves through role candidates
+    // and skips availability sentinels: the cheapest intelligence-passing
+    // candidate answers.
+    let c = role_config();
+    let rt = c
+        .routing_target("fast", Some(1))
+        .expect("role resolves to a target");
+    assert_eq!(rt.model, "tiny", "cheapest candidate meeting complexity");
+    assert_eq!(rt.group.as_deref(), Some("fast"));
+}
+
+#[test]
+fn roles_absent_leaves_groups_untouched() {
+    // No roles table: expansion is identity, sentinel-free configs resolve
+    // exactly as today.
+    let c = sample_config();
+    assert_eq!(c.role_expanded_members("fast"), vec!["tiny"]);
+    assert_eq!(c.role_expanded_members("smart"), vec!["big", "huge"]);
 }

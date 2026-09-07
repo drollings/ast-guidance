@@ -93,17 +93,19 @@ pub struct TargetCandidate {
 
 /// Build the ordered `TargetCandidate` list for a `model_group` — the DRY
 /// shape both the flat classifier path and the classification-tree engine feed
-/// the matcher. Group members are in config order (ascending cost and
-/// intelligence, as shipped); members with no `models` entry are skipped
-/// (defense-in-depth — the caller falls back to static resolution when the
-/// resulting list is empty or single-member).
+/// the matcher. Role members fan out to their candidate keys first; members
+/// with no `models` entry are skipped (defense-in-depth — the caller falls
+/// back to static resolution when the resulting list is empty or
+/// single-member).
 pub fn candidates_for_group(routing: &RoutingConfig, group: &str) -> Vec<TargetCandidate> {
-    let Some(group_cfg) = routing.model_groups.get(group) else {
-        return Vec::new();
-    };
-    group_cfg
-        .models()
-        .iter()
+    candidates_for_keys(routing, &routing.role_expanded_members(group))
+}
+
+/// The shared member-keys → candidates mapping: literal keys resolve through
+/// their `models` entry, anything else (unknown keys, and — when called with
+/// raw members — unexpanded sentinels) is skipped.
+fn candidates_for_keys(routing: &RoutingConfig, keys: &[String]) -> Vec<TargetCandidate> {
+    keys.iter()
         .filter_map(|key| {
             routing.entry_for_key(key).map(|entry| TargetCandidate {
                 model_key: key.clone(),
@@ -116,6 +118,202 @@ pub fn candidates_for_group(routing: &RoutingConfig, group: &str) -> Vec<TargetC
             })
         })
         .collect()
+}
+
+/// Per-group most-recently-successful dispatch, keyed by group name to the
+/// wire `model` id of the target that last served it. Written by the dispatch
+/// path on every `Ok` outcome, read by sentinel expansion at match time. A
+/// plain mutex map beside the server stats — not a subsystem — with no expiry:
+/// a failed `Last` target falls through to the next rung via the existing
+/// fallback combinator.
+#[derive(Debug, Default)]
+pub struct GroupRecency {
+    inner: std::sync::Mutex<HashMap<String, (String, i64)>>,
+}
+
+impl GroupRecency {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Record a successful dispatch of `group` served by the target whose wire
+    /// `model` id is `model_wire`.
+    pub fn record(&self, group: &str, model_wire: &str) {
+        let now = i64::try_from(common_core::now_secs()).unwrap_or(i64::MAX);
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(group.to_string(), (model_wire.to_string(), now));
+    }
+
+    /// The wire `model` id of the group's last successful dispatch, if any.
+    pub fn last_for(&self, group: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(group)
+            .map(|(model_wire, _)| model_wire.clone())
+    }
+}
+
+/// The supervisor liveness view a request carries: which managed models are
+/// currently running. `None` (mock mode, no managed fleet) probes as
+/// all-down, so `Any` degrades to config order.
+#[derive(Clone, Default)]
+pub struct LivenessProbe {
+    supervisor: Option<Arc<crate::supervisor::LlamaServerSupervisor>>,
+}
+
+impl LivenessProbe {
+    pub fn new(supervisor: Option<Arc<crate::supervisor::LlamaServerSupervisor>>) -> Self {
+        Self { supervisor }
+    }
+
+    /// Whether the managed model behind a base key is currently running.
+    /// `None` when the model is not managed.
+    pub fn is_running(&self, base_key: &str) -> Option<bool> {
+        self.supervisor.as_ref().and_then(|s| s.is_running(base_key))
+    }
+}
+
+/// Request-scoped availability view for sentinel expansion, assembled from
+/// the per-request context channels the handler populates. Absent channels
+/// (unit tests, paths that bypass the handler) degrade gracefully: no recency
+/// and an all-down fleet, so expansion is identity for sentinel-free groups.
+#[derive(Clone, Default)]
+pub struct GroupExpansion {
+    recency: Option<Arc<GroupRecency>>,
+    liveness: LivenessProbe,
+}
+
+/// The per-request context channels [`GroupExpansion::from_ctx`] reads.
+pub const RECENCY_CTX_KEY: &str = "group_recency";
+pub const LIVENESS_CTX_KEY: &str = "group_liveness";
+
+impl GroupExpansion {
+    pub fn from_ctx(ctx: &WorkContext) -> Self {
+        Self {
+            recency: ctx.get::<Arc<GroupRecency>>(RECENCY_CTX_KEY).cloned(),
+            liveness: ctx
+                .get::<LivenessProbe>(LIVENESS_CTX_KEY)
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+
+    pub fn recency(&self) -> Option<&GroupRecency> {
+        self.recency.as_deref()
+    }
+
+    /// Supervisor liveness for a base model key. Onnx roles never reach this
+    /// probe — expansion treats them as loaded via the existing registry
+    /// readiness, with no new probe.
+    pub fn supervisor_loaded(&self, base_key: &str) -> bool {
+        self.liveness.is_running(base_key) == Some(true)
+    }
+}
+
+/// The wire `model` id a literal group member dispatches as: the built
+/// target's `model` for `models` entries, the raw member string for in-process
+/// onnx roles (served by the onnx backend, with no `models` entry). `None`
+/// when the member resolves to nothing.
+fn member_wire_id(routing: &RoutingConfig, member: &str) -> Option<String> {
+    let (base, _) = crate::config::split_model_key(member);
+    if routing.onnx_keys.contains(base) {
+        return Some(member.to_string());
+    }
+    routing.target_for_key(member).map(|rt| rt.model)
+}
+
+/// Expand a group's raw members (literal keys plus the `last`/`any`
+/// availability sentinels) into ordered literal keys. Role members fan out to
+/// their candidate keys first; without roles or sentinels the expansion is
+/// identity, so role-free configs resolve byte-identically.
+///
+/// - `Last` expands to the group's last-success key when it is still a member,
+///   else it is skipped (no expiry heuristic — a failed target falls to the
+///   next rung via the combinator).
+/// - `Any` expands, in config order, to the currently-loaded members first
+///   (supervisor `is_running`, plus onnx-registry members via the existing
+///   readiness), then the remaining members in config order (which load on
+///   demand through the unchanged readiness path).
+/// - `is_running` is the supervisor probe over *base* model keys
+///   (`is_running == Some(true)` counts as loaded).
+/// - Sentinels only order candidates; the intelligence climb underneath is
+///   unchanged, so recency never outranks capability.
+pub fn expand_group_keys(
+    routing: &RoutingConfig,
+    group: &str,
+    recency: Option<&GroupRecency>,
+    is_running: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    use crate::config::GroupMember;
+    if !routing.model_groups.contains_key(group) {
+        return Vec::new();
+    }
+    let raw = routing.role_expanded_members(group);
+    let literals: Vec<&String> = raw
+        .iter()
+        .filter(|m| matches!(GroupMember::parse(m), GroupMember::Key(_)))
+        .collect();
+    let is_loaded = |member: &str| {
+        let (base, _) = crate::config::split_model_key(member);
+        if routing.onnx_keys.contains(base) {
+            return true;
+        }
+        is_running(base)
+    };
+    let last_member: Option<&str> = recency
+        .and_then(|r| r.last_for(group))
+        .and_then(|wire| {
+            literals
+                .iter()
+                .find(|m| member_wire_id(routing, m).as_deref() == Some(wire.as_str()))
+                .map(|m| m.as_str())
+        });
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    let mut seen: HashSet<String> = HashSet::new();
+    let push = |key: &str, out: &mut Vec<String>, seen: &mut HashSet<String>| {
+        if seen.insert(key.to_string()) {
+            out.push(key.to_string());
+        }
+    };
+    for member in &raw {
+        match GroupMember::parse(member) {
+            GroupMember::Key(key) => push(&key, &mut out, &mut seen),
+            GroupMember::Last => {
+                if let Some(last) = last_member {
+                    push(last, &mut out, &mut seen);
+                }
+            }
+            GroupMember::Any => {
+                // Single partition pass: each literal is probed once, loaded
+                // members keep config order ahead of the unloaded remainder.
+                let (loaded, unloaded): (Vec<&&String>, Vec<&&String>) =
+                    literals.iter().partition(|m| is_loaded(m));
+                for m in loaded.into_iter().chain(unloaded) {
+                    push(m, &mut out, &mut seen);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The expanded-candidate variant of [`candidates_for_group`]: sentinel
+/// members resolve to ordered literal keys first, then the same
+/// entry-resolution mapping runs (unknown keys skipped, onnx roles excluded —
+/// they carry no `models` entry and are served outside the climb, as today).
+pub fn expanded_candidates_for_group(
+    routing: &RoutingConfig,
+    group: &str,
+    recency: Option<&GroupRecency>,
+    is_running: &dyn Fn(&str) -> bool,
+) -> Vec<TargetCandidate> {
+    let keys = expand_group_keys(routing, group, recency, is_running);
+    candidates_for_keys(routing, &keys)
 }
 
 /// One assessed step of the climb — the audit/observability payload.
@@ -524,3 +722,7 @@ impl TargetMatcher {
 #[cfg(test)]
 #[path = "../tests/target_match.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/routing_sentinel_golden.rs"]
+mod routing_sentinel_golden;

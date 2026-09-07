@@ -282,6 +282,7 @@ fn classifier_sends_response_format_through_extras_seam() {
         default_route: "local".into(),
         score_matrix: None,
         onnx_keys: std::collections::BTreeSet::new(),
+        roles: Default::default(),
     };
     let stage = ClassifierStage::new(
         Arc::new(backend),
@@ -293,9 +294,10 @@ fn classifier_sends_response_format_through_extras_seam() {
         "lfm2.5-2.6b",
         Arc::new(fluent_concurrency::pool::Limiter::new(4)),
         None,
-        crate::config::ClassifierFailurePolicy::Reject,
-        None,
-    );
+            crate::config::ClassifierFailurePolicy::Reject,
+            None,
+            None,
+        );
 
     let mut ctx = WorkContext::default();
     ctx.set_structured(
@@ -421,6 +423,7 @@ fn classifier_merges_overlay_route_hints_into_the_prompt() {
         default_route: "local".into(),
         score_matrix: None,
         onnx_keys: std::collections::BTreeSet::new(),
+        roles: Default::default(),
     };
     let stage = ClassifierStage::new(
         Arc::new(backend),
@@ -432,9 +435,10 @@ fn classifier_merges_overlay_route_hints_into_the_prompt() {
         "lfm2.5-2.6b",
         Arc::new(fluent_concurrency::pool::Limiter::new(4)),
         None,
-        crate::config::ClassifierFailurePolicy::Reject,
-        None,
-    );
+            crate::config::ClassifierFailurePolicy::Reject,
+            None,
+            None,
+        );
 
     let mut ctx = WorkContext::default();
     ctx.set_structured(
@@ -486,6 +490,7 @@ fn classifier_prompt_unchanged_without_overlay_hints() {
         default_route: "local".into(),
         score_matrix: None,
         onnx_keys: std::collections::BTreeSet::new(),
+        roles: Default::default(),
     };
     let stage = ClassifierStage::new(
         Arc::new(backend),
@@ -497,9 +502,10 @@ fn classifier_prompt_unchanged_without_overlay_hints() {
         "lfm2.5-2.6b",
         Arc::new(fluent_concurrency::pool::Limiter::new(4)),
         None,
-        crate::config::ClassifierFailurePolicy::Reject,
-        None,
-    );
+            crate::config::ClassifierFailurePolicy::Reject,
+            None,
+            None,
+        );
 
     let mut ctx = WorkContext::default();
     ctx.set_structured(
@@ -588,4 +594,220 @@ fn metadata_has_no_routing_target_key() {
         value.pointer("/metadata/routing_target").is_none(),
         "serialized decision has no metadata.routing_target key",
     );
+}
+
+// -- Late-bound classifier backend -------------------------------------------
+// The stage keeps the resolved model *key*; the backend is resolved per
+// request through the live registry + pool, so a backend that appears (or
+// moves) after boot is observed instead of a boot-frozen client.
+
+/// Backend whose answer can be swapped after the stage is built, standing
+/// in for a registry entry that appears or is rewritten post-boot.
+struct SwappableBackend {
+    response: std::sync::Mutex<String>,
+}
+
+impl fluent_llm::client::ChatBackend for SwappableBackend {
+    fn chat_complete(
+        &self,
+        _messages: &[fluent_llm::ChatMessage],
+    ) -> Result<String, fluent_llm::LlmError> {
+        Ok(self.response.lock().expect("lock").clone())
+    }
+}
+
+/// Backend that counts the calls it serves, so the test can tell which of
+/// two backends the stage actually consulted.
+struct CallCountingBackend {
+    calls: std::sync::Mutex<usize>,
+    response: String,
+}
+
+impl fluent_llm::client::ChatBackend for CallCountingBackend {
+    fn chat_complete(
+        &self,
+        _messages: &[fluent_llm::ChatMessage],
+    ) -> Result<String, fluent_llm::LlmError> {
+        *self.calls.lock().expect("lock") += 1;
+        Ok(self.response.clone())
+    }
+}
+
+fn empty_routing_config() -> RoutingConfig {
+    RoutingConfig {
+        routes: std::collections::HashMap::new(),
+        models: std::collections::HashMap::new(),
+        model_groups: std::collections::HashMap::new(),
+        system_prompt: String::new(),
+        safety_threshold: 0.5,
+        default_route: "local".into(),
+        score_matrix: None,
+        onnx_keys: std::collections::BTreeSet::new(),
+        roles: Default::default(),
+    }
+}
+
+fn respond_json(text: &str) -> String {
+    serde_json::json!({
+        "action": "respond",
+        "response": text,
+        "coherence_score": 0.99,
+        "safety_score": 1.0,
+        "complexity": 2,
+        "reason": "trivial",
+    })
+    .to_string()
+}
+
+fn late_bound_stage(
+    frozen: Arc<dyn fluent_llm::client::ChatBackend>,
+    live: Arc<SwappableBackend>,
+    model_key: &str,
+) -> ClassifierStage {
+    let resolver: ClassifierBackendResolver = Arc::new(move |_: &str| {
+        Some(Arc::clone(&live) as Arc<dyn fluent_llm::client::ChatBackend>)
+    });
+    ClassifierStage::new(
+        frozen,
+        empty_routing_config(),
+        0.2,
+        None,
+        false,
+        1,
+        model_key,
+        Arc::new(fluent_concurrency::pool::Limiter::new(4)),
+        None,
+        crate::config::ClassifierFailurePolicy::Reject,
+        None,
+        Some(resolver),
+    )
+}
+
+fn classifier_request_ctx() -> WorkContext {
+    let mut ctx = WorkContext::default();
+    ctx.set_structured(
+        "request",
+        &serde_json::json!({
+            "model": "local",
+            "messages": [{"role": "user", "content": "hello"}],
+        }),
+    );
+    ctx
+}
+
+#[test]
+fn late_bound_resolution_observes_post_build_swap() {
+    // A backend that appears (or is rewritten) after the stage is built is
+    // observed per request; a boot-frozen client would keep serving stale.
+    let live = Arc::new(SwappableBackend {
+        response: std::sync::Mutex::new("live-A".into()),
+    });
+    let frozen = Arc::new(SwappableBackend {
+        response: std::sync::Mutex::new("frozen".into()),
+    });
+    let stage = late_bound_stage(frozen, Arc::clone(&live), "clf");
+    assert!(stage.has_backend_resolver());
+
+    let seen = |stage: &ClassifierStage| {
+        stage
+            .resolve_backend()
+            .expect("resolves")
+            .chat_complete(&[])
+            .expect("answers")
+    };
+    assert_eq!(seen(&stage), "live-A");
+    *live.response.lock().expect("lock") = "live-B".into();
+    assert_eq!(seen(&stage), "live-B", "post-build swap is observed");
+}
+
+#[test]
+fn late_bound_flat_path_consults_resolved_backend_not_frozen() {
+    let frozen = Arc::new(CallCountingBackend {
+        calls: std::sync::Mutex::new(0),
+        response: respond_json("frozen"),
+    });
+    let live = Arc::new(CallCountingBackend {
+        calls: std::sync::Mutex::new(0),
+        response: respond_json("live"),
+    });
+    let live_backend: Arc<dyn fluent_llm::client::ChatBackend> = Arc::clone(&live) as _;
+    let resolver: ClassifierBackendResolver = Arc::new(move |_: &str| Some(Arc::clone(&live_backend)));
+    let stage = ClassifierStage::new(
+        frozen.clone() as Arc<dyn fluent_llm::client::ChatBackend>,
+        empty_routing_config(),
+        0.2,
+        None,
+        false,
+        1,
+        "clf",
+        Arc::new(fluent_concurrency::pool::Limiter::new(4)),
+        None,
+        crate::config::ClassifierFailurePolicy::Reject,
+        None,
+        Some(resolver),
+    );
+
+    let decision = stage.evaluate(&classifier_request_ctx(), &[]).expect("evaluate");
+    assert_eq!(decision.verdict, StageVerdict::Passed);
+    assert_eq!(*live.calls.lock().expect("lock"), 1, "resolved backend serves");
+    assert_eq!(*frozen.calls.lock().expect("lock"), 0, "frozen client untouched");
+}
+
+#[test]
+fn late_bound_miss_rejects_without_fabricated_route() {
+    // A resolution miss degrades to the failure policy (reject here) — never
+    // a fabricated route.
+    let frozen = Arc::new(CallCountingBackend {
+        calls: std::sync::Mutex::new(0),
+        response: respond_json("frozen"),
+    });
+    let resolver: ClassifierBackendResolver = Arc::new(|_: &str| None);
+    let stage = ClassifierStage::new(
+        frozen.clone() as Arc<dyn fluent_llm::client::ChatBackend>,
+        empty_routing_config(),
+        0.2,
+        None,
+        false,
+        1,
+        "clf",
+        Arc::new(fluent_concurrency::pool::Limiter::new(4)),
+        None,
+        crate::config::ClassifierFailurePolicy::Reject,
+        None,
+        Some(resolver),
+    );
+
+    assert!(stage.resolve_backend().is_none());
+    let decision = stage.evaluate(&classifier_request_ctx(), &[]).expect("evaluate");
+    assert_eq!(decision.verdict, StageVerdict::Rejected);
+    assert_eq!(*frozen.calls.lock().expect("lock"), 0, "no backend consulted");
+}
+
+#[test]
+fn frozen_client_serves_when_no_resolver_installed() {
+    // No resolver (injected mock path): the boot client serves exactly as
+    // before — byte-identical behavior for tests and `--mock` runs.
+    let frozen = Arc::new(CallCountingBackend {
+        calls: std::sync::Mutex::new(0),
+        response: respond_json("frozen"),
+    });
+    let stage = ClassifierStage::new(
+        frozen.clone() as Arc<dyn fluent_llm::client::ChatBackend>,
+        empty_routing_config(),
+        0.2,
+        None,
+        false,
+        1,
+        "clf",
+        Arc::new(fluent_concurrency::pool::Limiter::new(4)),
+        None,
+        crate::config::ClassifierFailurePolicy::Reject,
+        None,
+        None,
+    );
+
+    assert!(!stage.has_backend_resolver());
+    let decision = stage.evaluate(&classifier_request_ctx(), &[]).expect("evaluate");
+    assert_eq!(decision.verdict, StageVerdict::Passed);
+    assert_eq!(*frozen.calls.lock().expect("lock"), 1);
 }

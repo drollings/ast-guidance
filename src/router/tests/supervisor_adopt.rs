@@ -233,6 +233,7 @@ fn pinned_profile(name: &str) -> InstanceProfile {
         resume: false,
         params: None,
         max_ctx: None,
+        session: false,
     }
 }
 

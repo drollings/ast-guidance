@@ -74,6 +74,7 @@ fn routing_with(group: &str, keys: &[&str]) -> RoutingConfig {
         default_route: "local".into(),
         score_matrix: None,
         onnx_keys: std::collections::BTreeSet::new(),
+        roles: Default::default(),
     }
 }
 
@@ -390,4 +391,122 @@ fn empty_candidates_is_none() {
             .match_target("local", "default", &routing, &[], Some(3), "hello")
             .is_none()
     );
+}
+
+// ── Availability-sentinel expansion (`last` / `any`) ────────────────────
+
+fn routing_with_members(group: &str, entries: &[&str], members: &[&str]) -> RoutingConfig {
+    RoutingConfig {
+        routes: HashMap::from([(
+            "local".into(),
+            RouteRef {
+                group: group.into(),
+                pipelines: vec!["default".into()],
+                description: "local".into(),
+                always_route: false,
+            },
+        )]),
+        models: entries
+            .iter()
+            .map(|k| (k.to_string(), model_entry(k, 0, 1.0)))
+            .collect(),
+        model_groups: HashMap::from([(
+            group.into(),
+            ModelGroup::Array(members.iter().map(ToString::to_string).collect()),
+        )]),
+        system_prompt: String::new(),
+        safety_threshold: 0.3,
+        default_route: "local".into(),
+        score_matrix: None,
+        onnx_keys: std::collections::BTreeSet::new(),
+        roles: Default::default(),
+    }
+}
+
+fn wire_of(routing: &RoutingConfig, key: &str) -> String {
+    routing
+        .target_for_key(key)
+        .unwrap_or_else(|| panic!("member {key} resolves"))
+        .model
+}
+
+#[test]
+fn expansion_without_sentinels_is_identity() {
+    let routing = routing_with_members("g", &["a", "b"], &["a", "b"]);
+    let expanded = expand_group_keys(&routing, "g", None, &|_| false);
+    assert_eq!(expanded, vec!["a".to_string(), "b".to_string()]);
+}
+
+#[test]
+fn expansion_last_with_recorded_success_orders_first() {
+    let routing = routing_with_members("g", &["a", "b"], &["last", "a", "b"]);
+    let recency = GroupRecency::new();
+    recency.record("g", &wire_of(&routing, "b"));
+    let expanded = expand_group_keys(&routing, "g", Some(&recency), &|_| false);
+    assert_eq!(expanded, vec!["b".to_string(), "a".to_string()]);
+}
+
+#[test]
+fn expansion_last_without_success_skips_sentinel() {
+    let routing = routing_with_members("g", &["a", "b"], &["last", "a", "b"]);
+    let expanded = expand_group_keys(&routing, "g", None, &|_| false);
+    assert_eq!(expanded, vec!["a".to_string(), "b".to_string()]);
+}
+
+#[test]
+fn expansion_last_pointing_at_removed_member_skips() {
+    let routing = routing_with_members("g", &["a", "b"], &["last", "a"]);
+    let recency = GroupRecency::new();
+    recency.record("g", "zzz-removed-model");
+    let expanded = expand_group_keys(&routing, "g", Some(&recency), &|_| false);
+    assert_eq!(expanded, vec!["a".to_string()]);
+}
+
+#[test]
+fn expansion_any_orders_loaded_first() {
+    let routing = routing_with_members("g", &["a", "b"], &["any", "a", "b"]);
+    let expanded = expand_group_keys(&routing, "g", None, &|m| m == "b");
+    assert_eq!(expanded, vec!["b".to_string(), "a".to_string()]);
+    let expanded = expand_group_keys(&routing, "g", None, &|m| m == "a");
+    assert_eq!(expanded, vec!["a".to_string(), "b".to_string()]);
+}
+
+#[test]
+fn expansion_any_all_down_keeps_config_order() {
+    let routing = routing_with_members("g", &["a", "b"], &["any", "a", "b"]);
+    let expanded = expand_group_keys(&routing, "g", None, &|_| false);
+    assert_eq!(expanded, vec!["a".to_string(), "b".to_string()]);
+}
+
+#[test]
+fn expansion_any_onnx_members_count_as_loaded() {
+    let mut routing = routing_with_members("g", &["a"], &["any", "onnx/llm", "a"]);
+    routing.onnx_keys.insert("onnx/llm".to_string());
+    // No server is running anywhere; the onnx role still orders first via the
+    // existing registry readiness (no new probe).
+    let expanded = expand_group_keys(&routing, "g", None, &|_| false);
+    assert_eq!(expanded, vec!["onnx/llm".to_string(), "a".to_string()]);
+}
+
+#[test]
+fn recency_record_and_last_for_roundtrip() {
+    let recency = GroupRecency::new();
+    assert!(recency.last_for("g").is_none());
+    recency.record("g", "b-wire");
+    assert_eq!(recency.last_for("g").as_deref(), Some("b-wire"));
+    recency.record("g", "a-wire");
+    assert_eq!(recency.last_for("g").as_deref(), Some("a-wire"));
+    assert!(recency.last_for("other-group").is_none());
+}
+
+#[test]
+fn expanded_candidates_yield_literal_targets_only() {
+    let routing = routing_with_members("g", &["a", "b"], &["last", "a", "any", "zzz-unknown"]);
+    let recency = GroupRecency::new();
+    recency.record("g", &wire_of(&routing, "a"));
+    let cands = expanded_candidates_for_group(&routing, "g", Some(&recency), &|_| false);
+    let keys: Vec<&str> = cands.iter().map(|c| c.model_key.as_str()).collect();
+    // Sentinels never become candidates; unknown literals are skipped exactly
+    // as the literal path skips members with no `models` entry.
+    assert_eq!(keys, vec!["a"]);
 }

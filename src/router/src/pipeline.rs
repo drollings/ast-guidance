@@ -146,7 +146,10 @@ pub struct RoutingTarget {
 /// a `default: true` profile, else a group's first available member.
 fn base_target(entry: &ModelEntry, model_key: &str) -> (String, Option<serde_json::Value>, String) {
     let base = entry.name.clone().unwrap_or_else(|| model_key.to_string());
-    let qualifier = entry.default_dispatch_qualifier();
+    // The entry-default inference point — the shared step of the single
+    // qualifier precedence, so dispatch wire ids agree with backend ids.
+    // Routing entries arrive with fleet defaults materialized, hence `None`.
+    let qualifier = crate::config::root::default_inference_point(entry, None);
     let model = QualifiedModelId::new(base.clone(), qualifier.clone()).as_wire();
     let params = qualifier
         .as_deref()

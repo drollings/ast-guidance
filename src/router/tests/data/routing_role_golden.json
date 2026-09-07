@@ -1,0 +1,735 @@
+{
+  "backends": {
+    "any": false,
+    "code": true,
+    "code:default": true,
+    "last": false,
+    "lfm2.5-2.6b": true,
+    "nope": false
+  },
+  "cases": [
+    {
+      "id": "group.default.route.local.complexity.none",
+      "target": {
+        "filter_thinking": true,
+        "group": "default",
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "local",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "group.default.route.local.complexity.zero",
+      "target": {
+        "filter_thinking": true,
+        "group": "default",
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "local",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "group.default.route.local.complexity.four",
+      "target": {
+        "filter_thinking": true,
+        "group": "default",
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "local",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "group.default.route.local.complexity.ten",
+      "target": {
+        "filter_thinking": true,
+        "group": "default",
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "local",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "group.code.route.code.complexity.none",
+      "target": {
+        "filter_thinking": true,
+        "group": "code",
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "code",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "group.code.route.code.complexity.zero",
+      "target": {
+        "filter_thinking": true,
+        "group": "code",
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "code",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "group.code.route.code.complexity.four",
+      "target": {
+        "filter_thinking": true,
+        "group": "code",
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "code",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "group.code.route.code.complexity.ten",
+      "target": {
+        "filter_thinking": true,
+        "group": "code",
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "code",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "group.summarize.route.summarize.complexity.none",
+      "target": {
+        "filter_thinking": true,
+        "group": "summarize",
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "summarize",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "group.summarize.route.summarize.complexity.zero",
+      "target": {
+        "filter_thinking": true,
+        "group": "summarize",
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "summarize",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "group.summarize.route.summarize.complexity.four",
+      "target": {
+        "filter_thinking": true,
+        "group": "summarize",
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "summarize",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "group.summarize.route.summarize.complexity.ten",
+      "target": {
+        "filter_thinking": true,
+        "group": "summarize",
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "summarize",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "group.explore.route.explore.complexity.none",
+      "target": {
+        "filter_thinking": true,
+        "group": "explore",
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "explore",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "group.explore.route.explore.complexity.zero",
+      "target": {
+        "filter_thinking": true,
+        "group": "explore",
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "explore",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "group.explore.route.explore.complexity.four",
+      "target": {
+        "filter_thinking": true,
+        "group": "explore",
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "explore",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "group.explore.route.explore.complexity.ten",
+      "target": {
+        "filter_thinking": true,
+        "group": "explore",
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "explore",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "group.explain.route.explain.complexity.none",
+      "target": {
+        "filter_thinking": true,
+        "group": "explain",
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "explain",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "group.explain.route.explain.complexity.zero",
+      "target": {
+        "filter_thinking": true,
+        "group": "explain",
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "explain",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "group.explain.route.explain.complexity.four",
+      "target": {
+        "filter_thinking": true,
+        "group": "explain",
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "explain",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "group.explain.route.explain.complexity.ten",
+      "target": {
+        "filter_thinking": true,
+        "group": "explain",
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "explain",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "group.prose.route.prose.complexity.none",
+      "target": {
+        "filter_thinking": true,
+        "group": "prose",
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "prose",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "group.prose.route.prose.complexity.zero",
+      "target": {
+        "filter_thinking": true,
+        "group": "prose",
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "prose",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "group.prose.route.prose.complexity.four",
+      "target": {
+        "filter_thinking": true,
+        "group": "prose",
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "prose",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "group.prose.route.prose.complexity.ten",
+      "target": {
+        "filter_thinking": true,
+        "group": "prose",
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "prose",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "target_for_key.code:default",
+      "target": {
+        "filter_thinking": true,
+        "idle_timeout_ms": 30000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "code",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "target_for_key.code:latest",
+      "target": {
+        "filter_thinking": true,
+        "idle_timeout_ms": 30000,
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "code",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "target_for_key.code",
+      "target": {
+        "filter_thinking": true,
+        "idle_timeout_ms": 30000,
+        "is_onnx": false,
+        "model": "code:default",
+        "params": {
+          "n-cpu-moe": 10,
+          "repeat-penalty": 1.01,
+          "sleep-idle-seconds": 7200,
+          "temperature": 0.6,
+          "top_k": 40,
+          "top_p": 0.9
+        },
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "code",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "target_for_key.lfm2.5-2.6b:default",
+      "target": {
+        "filter_thinking": true,
+        "idle_timeout_ms": 3000,
+        "instance": "default",
+        "is_onnx": false,
+        "model": "liquidai/lfm2.6-2.6b:default",
+        "params": {},
+        "retry_base_interval_s": 1,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "lfm2.5-2.6b",
+        "total_timeout_ms": 50000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "target_for_key.lfm2.5-2.6b",
+      "target": {
+        "filter_thinking": true,
+        "idle_timeout_ms": 3000,
+        "is_onnx": false,
+        "model": "liquidai/lfm2.6-2.6b:default",
+        "params": {},
+        "retry_base_interval_s": 1,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "lfm2.5-2.6b",
+        "total_timeout_ms": 50000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "target_for_key.code:missing",
+      "target": {
+        "filter_thinking": true,
+        "idle_timeout_ms": 30000,
+        "instance": "missing",
+        "is_onnx": false,
+        "model": "code:missing",
+        "retry_base_interval_s": 2,
+        "retry_count": 1,
+        "stream": true,
+        "target_name": "code",
+        "total_timeout_ms": 150000,
+        "url": "http://localhost:8181/v1/chat/completions"
+      }
+    },
+    {
+      "id": "target_for_key.nope:default",
+      "target": null
+    }
+  ]
+}

@@ -36,6 +36,7 @@ use crate::score_matrix::ScoreMatrix;
 use crate::stages::common::{coerce_float, coerce_string, coerce_u8, extract_user_message};
 use crate::stages::tree::ClassificationEngine;
 use crate::target_match::TargetMatcher;
+use crate::target_match::GroupExpansion;
 
 pub mod action;
 pub use action::{ClassifierAction, UnknownAction};
@@ -43,6 +44,15 @@ pub use action::{ClassifierAction, UnknownAction};
 const DEFAULT_COMPLEXITY: u8 = 5;
 const COMPLEXITY_SCALE: f64 = 10.0;
 const DEFAULT_COMPLETENESS: f64 = 0.5;
+
+/// Per-request classifier backend resolution: given the resolved model key,
+/// return the backend to consult. Installed in real mode (closing over the
+/// live config's `local_backend` factory, so endpoint rewrites and lazy
+/// loads after boot are always current); absent for injected mock backends,
+/// which serve frozen. One map lookup plus an `LlmClient` build per request
+/// (no I/O).
+pub type ClassifierBackendResolver =
+    Arc<dyn Fn(&str) -> Option<Arc<dyn ChatBackend>> + Send + Sync>;
 
 /// Build the per-call `response_format` extras for the classifier LLM call.
 ///
@@ -325,10 +335,16 @@ fn resolve_via_matcher(
     route: &str,
     complexity: Option<u8>,
     user_text: &str,
+    expansion: &GroupExpansion,
 ) -> Option<RoutingTarget> {
     if let Some(matcher) = matcher {
         if let Some(group) = routing_config.route_group(route) {
-            let candidates = crate::target_match::candidates_for_group(routing_config, group);
+            let candidates = crate::target_match::expanded_candidates_for_group(
+                routing_config,
+                group,
+                expansion.recency(),
+                &|base| expansion.supervisor_loaded(base),
+            );
             if candidates.len() >= 2 {
                 if let Some(tm) = matcher.match_target(
                     route,
@@ -371,6 +387,7 @@ fn try_resolve_routing_target(
     routing_config: &RoutingConfig,
     matcher: Option<&TargetMatcher>,
     user_text: &str,
+    expansion: &GroupExpansion,
 ) -> Option<RoutingTarget> {
     let route = match action {
         ClassifierAction::Respond(_) => {
@@ -387,7 +404,7 @@ fn try_resolve_routing_target(
         }
     };
 
-    if let Some(rt) = resolve_via_matcher(routing_config, matcher, route, output.complexity, user_text) {
+    if let Some(rt) = resolve_via_matcher(routing_config, matcher, route, output.complexity, user_text, expansion) {
         tracing::info!(target: "router.pipeline.stage2",
             route = %route,
             model = %rt.model,
@@ -413,18 +430,23 @@ fn resolve_routing_target(
     routing_config: &RoutingConfig,
     matcher: Option<&TargetMatcher>,
     user_text: &str,
+    expansion: &GroupExpansion,
 ) -> Result<Option<RoutingTarget>, UnknownAction> {
     let typed = ClassifierAction::from_output(output)?;
     // Guard against caller passing mismatched action string vs output.action (defensive)
     if typed.is_respond() && action != "respond" || typed.is_route() && action != "route" || typed.is_reject() && action != "reject" {
         // Still respect the typed output — the string arg is just for parity with old call sites
     }
-    Ok(try_resolve_routing_target(&typed, output, routing_config, matcher, user_text))
+    Ok(try_resolve_routing_target(&typed, output, routing_config, matcher, user_text, expansion))
 }
 
 pub struct ClassifierStage {
     name: ArcIntern<str>,
     client: Arc<dyn ChatBackend>,
+    /// Late-bound backend resolution for the classifier model key. `Some`
+    /// re-resolves per request (real mode); `None` serves the boot-built
+    /// `client` (injected mock path, unchanged).
+    backend_resolver: Option<ClassifierBackendResolver>,
     routing_config: RoutingConfig,
     coherence_threshold: f64,
     score_matrix: Option<ScoreMatrix>,
@@ -533,10 +555,12 @@ impl ClassifierStage {
         target_matcher: Option<TargetMatcher>,
         failure_policy: ClassifierFailurePolicy,
         failure_dir: Option<std::path::PathBuf>,
+        backend_resolver: Option<ClassifierBackendResolver>,
     ) -> Self {
         Self {
             name: ArcIntern::from("pipeline.stage2.classifier"),
             client,
+            backend_resolver,
             routing_config,
             coherence_threshold,
             score_matrix,
@@ -571,10 +595,12 @@ impl ClassifierStage {
         target_matcher: Option<TargetMatcher>,
         failure_policy: ClassifierFailurePolicy,
         failure_dir: Option<std::path::PathBuf>,
+        backend_resolver: Option<ClassifierBackendResolver>,
     ) -> Self {
         Self {
             name: ArcIntern::from("pipeline.stage2.classifier.tree"),
             client,
+            backend_resolver,
             routing_config,
             coherence_threshold,
             score_matrix,
@@ -588,6 +614,23 @@ impl ClassifierStage {
             failure_dir,
             depends: vec![ArcIntern::from("pipeline.stage1.output")],
             provides: vec![ArcIntern::from("pipeline.stage2.output")],
+        }
+    }
+
+    /// Whether per-request backend resolution is installed (real mode).
+    /// Absent for injected mock/transcript backends, which serve frozen.
+    pub fn has_backend_resolver(&self) -> bool {
+        self.backend_resolver.is_some()
+    }
+
+    /// Resolve the backend for the classifier model key: per request through
+    /// the installed resolver when present, else the boot-built client.
+    /// `None` only when a resolver is installed and the key no longer
+    /// resolves — the caller degrades to the failure policy.
+    pub fn resolve_backend(&self) -> Option<Arc<dyn ChatBackend>> {
+        match &self.backend_resolver {
+            Some(resolve) => resolve(&self.classifier_model),
+            None => Some(Arc::clone(&self.client)),
         }
     }
 
@@ -762,6 +805,9 @@ impl ClassifierStage {
         route_hints: Option<&[crate::pipeline_types::RouteHint]>,
     ) -> Result<(String, StageDecision, Option<RoutingTarget>), WorkError> {
         let input = extract_user_message(ctx)?;
+        // Availability view for group-member sentinel expansion, carried on
+        // the per-request context the handler populated.
+        let expansion = GroupExpansion::from_ctx(ctx);
         // The route the client requested (the request's `model`). Used to
         // enforce route-level `always_route`: a route configured to always
         // dispatch never lets the classifier answer directly.
@@ -778,7 +824,8 @@ impl ClassifierStage {
         // parse's ids before any LLM call; route hints feed the classifier
         // nodes' LLM context (§2.6).
         if let Some(engine) = &self.tree_engine {
-            let evaluation = engine.evaluate(&input, interlingua, route_hints)?;
+            let evaluation =
+                engine.evaluate_with_expansion(&input, interlingua, route_hints, &expansion)?;
             return Ok(("classified".into(), evaluation.decision, evaluation.target));
         }
 
@@ -832,11 +879,20 @@ impl ClassifierStage {
             "classifier LLM request"
         );
 
+        // Late-bound backend: the kept model key is re-resolved per request,
+        // so a backend that appeared (or moved) after boot is observed. A
+        // miss degrades to the failure policy — never a fabricated route.
+        let Some(client) = self.resolve_backend() else {
+            return Ok(self.failure_decision(&format!(
+                "classifier backend for '{}' did not resolve",
+                self.classifier_model
+            )));
+        };
         let call_start = Instant::now();
         let mut llm_latency_ms = 0u64;
         let response = self.limiter.run_sync(|| async {
             let llm_start = Instant::now();
-            let result = self.client.chat_complete_with_extras(&messages, &classifier_response_format());
+            let result = client.chat_complete_with_extras(&messages, &classifier_response_format());
             llm_latency_ms = llm_start.elapsed().as_millis() as u64;
             if let Ok(s) = &result {
                 tracing::info!(
@@ -1009,6 +1065,7 @@ impl ClassifierStage {
                             &top.route_name,
                             output.complexity,
                             &input,
+                            &expansion,
                         )
                     };
                     return Ok(Self::build_decision(
@@ -1028,6 +1085,7 @@ impl ClassifierStage {
             &self.routing_config,
             self.target_matcher.as_ref(),
             &input,
+            &expansion,
         ) {
             Ok(rt) => rt,
             Err(e) => {
@@ -1112,6 +1170,7 @@ impl ClassifierStage {
                     &self.routing_config,
                     self.target_matcher.as_ref(),
                     "",
+                    &GroupExpansion::default(),
                 )
                 .ok()
                 .flatten();
